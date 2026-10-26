@@ -306,9 +306,7 @@
 }
 
 /* Each real tool keeps its disclosure/body; only its visual frame changes.
-   Settled successes and live non-command tools (an await) are plain rows, as
-   in prototype A. In Flow, running commands, pending decisions and failures
-   get a frame so they stand out from the stretch. */
+   Settled successes and live non-command tools keep the same compact rows. */
 .chat-view[data-chat-chrome="ink"] .chat-card-tools {
     border: 0;
     border-radius: 0;
@@ -326,13 +324,6 @@
     position: relative;
 }
 
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)),
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending) {
-    margin-block: 4px;
-    border: 1px solid var(--border-primary);
-    background: var(--surface-0);
-}
-
 .chat-view[data-chat-chrome="ink"] .tool-card-header {
     position: relative;
     display: flex;
@@ -343,11 +334,6 @@
     padding: 4px 8px;
     border-radius: 5px;
     list-style: none;
-}
-
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-header {
-    margin-inline: 0;
-    padding: 7px 12px;
 }
 
 .chat-view[data-chat-chrome="ink"] .tool-card-header::-webkit-details-marker {
@@ -470,15 +456,6 @@
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     background: var(--surface-0);
-}
-
-.chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-body {
-    margin: 0;
-    padding: 8px 14px 10px 38px;
-    border: 0;
-    border-top: 1px solid var(--border-primary);
-    border-radius: 0 0 6px 6px;
-    background: transparent;
 }
 
 .chat-view[data-chat-chrome="ink"] .tool-result-command {
@@ -660,10 +637,6 @@
         padding: 8px 10px;
     }
 
-    .chat-view[data-chat-appearance="ink"] .chat-card-tools > .tool-card:is(.tool-card:has(> .tool-card-header :is(.failure, .cancelled, .rejected)), :is([data-tool-kind="command"], [data-tool-kind="decision"]):has(> .tool-card-header .pending)) > .tool-card-body {
-        padding-left: 12px;
-    }
-
     .chat-view[data-chat-chrome="ink"] .chat-composer {
         padding-inline: 8px;
     }
@@ -711,11 +684,9 @@
     line-height: 1.5;
 }
 
-
 .chat-view[data-chat-chrome="ink"] .chat-textarea {
     max-height: calc(1.077rem * 1.5 * 5 + 16px);
 }
-
 
 .chat-view .file-change-group,
 .chat-view .file-change-entries,
@@ -1340,4 +1311,292 @@
     margin: 4px 0 8px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+/* Flow is a continuous transcript. Notebook retains the shared card chrome. */
+.chat-view[data-chat-appearance="ink"] {
+    --ink-activity-indent: 10px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-messages {
+    padding: 20px clamp(18px, 3%, 40px) 24px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user {
+    width: 100%;
+    max-width: none;
+    margin-left: 0;
+    padding: 18px 0 0;
+    border-top: 1px solid var(--border-primary);
+    border-radius: 0;
+    background: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-phase {
+    align-items: flex-start;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-sender {
+    font-weight: 500;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body {
+    line-height: 1.6;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body p {
+    margin-bottom: 10px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body > :last-child {
+    margin-bottom: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .token-stat-model,
+.chat-view[data-chat-appearance="ink"] .chat-card-model {
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-tools {
+    margin-block: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-gap-tight.ink-actions-only {
+    padding-top: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-body + .chat-card-tools {
+    margin-top: 8px;
+}
+
+.chat-view[data-chat-appearance="ink"] .file-change-group,
+.chat-view[data-chat-appearance="ink"] .file-change-group .file-change-entries,
+.chat-view[data-chat-appearance="ink"] .file-change-group.file-change-collapsed .file-change-entries,
+.chat-view[data-chat-appearance="ink"] .file-change-group .file-tool-row {
+    display: contents;
+}
+
+.chat-view[data-chat-appearance="ink"] .file-change-group .file-change-heading {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header {
+    display: flex;
+    gap: 10px;
+    min-height: 32px;
+    margin: 0;
+    padding: 4px 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header::before {
+    content: "";
+    flex: 0 0 12px;
+    width: 12px;
+    height: 7px;
+    margin: 0 2px 4px;
+    border: 0;
+    border-left: 1.5px solid var(--success);
+    border-bottom: 1.5px solid var(--success);
+    transform: rotate(-45deg);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header:has(.failure, .rejected, .cancelled)::before {
+    content: "!";
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 16px;
+    margin-bottom: 0;
+    border: 0;
+    transform: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header:has(.cancelled)::before {
+    content: "–";
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header:has(.pending)::before {
+    content: "";
+    flex-basis: 14px;
+    width: 14px;
+    height: 14px;
+    margin: 0 1px;
+    border: 1.5px solid color-mix(in srgb, var(--ink-accent) 25%, transparent);
+    border-top-color: var(--ink-accent);
+    border-radius: 50%;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header :is(.tool-card-name, .ink-file-icon, .ink-file-path, .ink-file-counts) {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-action {
+    display: block;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font: 500 1em var(--font-sans);
+    color: var(--text-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-action {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-name {
+    display: block;
+    max-width: 30%;
+    color: var(--ink-accent);
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail {
+    font-size: 1em;
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"][open] > .tool-card-header > .tool-card-detail {
+    white-space: nowrap;
+}
+
+.chat-view[data-chat-appearance="ink"] .file-change-row .tool-completion-summary,
+.chat-view[data-chat-appearance="ink"] .file-change-row .tool-file-path {
+    display: block;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header .tool-card-detail {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail::before {
+    content: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card .tool-card-body {
+    margin: 2px 0 10px 26px;
+    padding: 10px 14px;
+    border: 0;
+    border-left: 1px solid var(--border-secondary);
+    border-radius: 0 4px 4px 0;
+    background: var(--surface-0);
+    min-width: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] [data-tool-kind="command"] .tool-command-line {
+    display: block;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    -webkit-user-select: text;
+    user-select: text;
+    padding: 0;
+    background: transparent;
+    border-radius: 0;
+    color: var(--text-primary);
+}
+
+@media (min-width: 761px) {
+    .chat-view[data-chat-appearance="ink"] .tool-card:has(.tool-completion-summary) .tool-status-text.failure {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+    }
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-result-command-content {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card:has(.tool-status-text.cancelled) .tool-completion-summary,
+.chat-view[data-chat-appearance="ink"] .tool-error-icon,
+.chat-view[data-chat-appearance="ink"] .chat-card-cancelled .chat-card-header {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-cancelled {
+    padding: 4px 0 4px calc(var(--ink-activity-indent) + 26px);
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+@media (max-width: 760px) {
+    .chat-view[data-chat-appearance="ink"] .tool-card .tool-card-header {
+        gap: 8px;
+    }
+    .chat-view[data-chat-appearance="ink"] .tool-card .tool-card-action {
+        max-width: 55%;
+    }
+    .chat-view[data-chat-appearance="ink"] .tool-card .tool-card-body {
+        margin-left: 24px;
+        padding: 8px 10px;
+    }
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-card[data-tool-kind="decision"]:has(> .tool-card-header .pending) {
+    border: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-appearance="ink"] .virt-row:has(> .chat-card-cancelled) {
+    padding-top: 6px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-cancelled .chat-card-body {
+    margin: 0;
+    width: auto;
+    text-align: left;
+    font-style: normal;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-time::before {
+    content: "· ";
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-result-error {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.tool-error-pre, .tool-error-detail) {
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--error);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-error-details summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    list-style: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-error-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-error-details summary::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(-45deg);
+}
+
+.chat-view[data-chat-appearance="ink"] .tool-error-details[open] summary::before {
+    transform: rotate(45deg);
 }

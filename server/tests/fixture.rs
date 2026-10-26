@@ -2036,7 +2036,6 @@ async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
 #[allow(dead_code)]
 pub struct ExhaustedFileDescriptors {
     original: libc::rlimit,
-    files: Vec<std::fs::File>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2052,24 +2051,20 @@ impl ExhaustedFileDescriptors {
             unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
             0
         );
-        let mut exhausted = Self {
-            original,
-            files: Vec::new(),
-        };
+        let released =
+            std::fs::File::open("/dev/null").expect("descriptor to release under pressure");
+        // Filling a nonzero limit races concurrent descriptor closes. Zero
+        // keeps real opens failing even when a Git child exits during a scan.
         let limited = libc::rlimit {
-            rlim_cur: original.rlim_cur.min(512),
+            rlim_cur: 0,
             ..original
         };
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
-        loop {
-            match std::fs::File::open("/dev/null") {
-                Ok(file) => exhausted.files.push(file),
-                Err(error) => {
-                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
-                    break;
-                }
-            }
-        }
+        let exhausted = Self { original };
+        drop(released);
+        let error = std::fs::File::open("/dev/null")
+            .expect_err("closing another descriptor must not lift injected exhaustion");
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
         exhausted
     }
 }
@@ -2077,7 +2072,6 @@ impl ExhaustedFileDescriptors {
 #[cfg(target_os = "linux")]
 impl Drop for ExhaustedFileDescriptors {
     fn drop(&mut self) {
-        self.files.clear();
         assert_eq!(
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.original) },
             0

@@ -5,13 +5,14 @@ import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { spawn, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
+import { chromium } from "playwright";
 import { once } from "node:events";
 
 // Real browser + HTTP + CacheStorage + IndexedDB + worker lifecycle. The tiny
 // immutable modules are executable loader fixtures, not fake agent backends.
 test("installed storage migrates once, then follows exact targets without losing pairing", async t => {
-  assert.ok(process.env.CHROME && process.env.CHROMEDRIVER, "dev.sh must provision browser tools");
+  assert.ok(process.env.CHROME, "dev.sh must provision Chrome");
   const root = new URL("../", import.meta.url);
   const old = "1.0.0", capable = "1.0.1", upgraded = "1.0.2";
   const wasm = Buffer.from([0,97,115,109,1,0,0,0]);
@@ -105,34 +106,27 @@ test("installed storage migrates once, then follows exact targets without losing
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const origin = `http://127.0.0.1:${server.address().port}`;
-  const driver = spawn(process.env.CHROMEDRIVER, ["--port=0"], {stdio:["ignore","pipe","pipe"]});
-  let session;
-  let request;
+  let browser;
   try {
-    const port = await new Promise((resolve,reject) => {
-      let output = "";
-      const read = chunk => { output = (output + chunk).slice(-2000); const match = /started successfully on port (\d+)/.exec(output); if (match) {resolve(Number(match[1]));} };
-      driver.stdout.on("data",read);driver.stderr.on("data",read);
-      driver.once("error",reject);
-      driver.once("exit",(code,signal)=>reject(new Error(`zxcv driver exited before readiness; exit=${code}; signal=${signal}; startup=${output}`)));
+    // Use the pinned pipe transport: ChromeDriver's two-family port=0 bind
+    // can select an IPv6 port already occupied by an unrelated IPv4 listener.
+    browser = await chromium.launch({
+      executablePath: process.env.CHROME,
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      timeout: 0,
     });
-    request = async (path, body, method="POST") => {
-      const response = await fetch(`http://127.0.0.1:${port}${path}`, {method, headers:{"Content-Type":"application/json"}, ...(body ? {body:JSON.stringify(body)} : {})});
-      const result = await response.json();
-      if (result.value?.error) throw new Error(`WebDriver ${result.value.error}: ${result.value.message}`);
-      return result.value;
-    };
-    const started = await request("/session", {capabilities:{alwaysMatch:{browserName:"chrome","goog:chromeOptions":{binary:process.env.CHROME,args:["--headless=new","--no-sandbox","--disable-dev-shm-usage"]}}}});
-    session = started.sessionId;
-    await request(`/session/${session}/timeouts`, {script:null,pageLoad:600000,implicit:0});
-    const command = (path, body) => request(`/session/${session}/${path}`,body);
-    const evaluate = script => command("execute/sync",{script,args:[]});
-    const evaluateAsync = script => command("execute/async",{script,args:[]});
-    const navigate = path => command("url",{url:origin+path});
-    const waitFor = text => evaluateAsync(`const done=arguments[arguments.length-1];
-      const check=()=>document.body.textContent.includes(${JSON.stringify(text)});
-      if(check()){done(true);return;} const observer=new MutationObserver(()=>{if(check()){observer.disconnect();done(true);}});
-      observer.observe(document.body,{subtree:true,childList:true,characterData:true});`);
+    const page = await browser.newPage();
+    page.setDefaultTimeout(0);
+    page.setDefaultNavigationTimeout(0);
+    const evaluate = script => page.evaluate(`(function(){${script}})()`);
+    const evaluateAsync = script => page.evaluate(`new Promise(resolve => { (function(){${script}})(resolve); })`);
+    const navigate = path => page.goto(origin + path, {waitUntil: "load"});
+    // Repair and host-switch commits reload the page; Playwright re-runs this
+    // predicate in each replacement document until the boot renders the text.
+    const waitFor = text => page.waitForFunction(
+      expected => document.body !== null && document.body.textContent.includes(expected), text,
+    ).then(handle => handle.jsonValue());
     await navigate("/setup");
     assert.deepEqual(await evaluate("return [location.origin,location.pathname,document.title];"),
       [origin,"/setup","Loader storage setup"],"storage setup must execute in the fixture document");
@@ -292,14 +286,11 @@ test("installed storage migrates once, then follows exact targets without losing
       await writeFile(manifestPath,JSON.stringify({...manifest(),servedClientRelease:capable}));
       await assert.rejects(promisify(execFile)("python3",[...args,"--direct-hosted"]),error => error.stderr.includes("servedClientRelease"),"the release guard must reject an incorrect startup declaration");
     });
-    await request(`/session/${session}`,null,"DELETE");session=null;
   } finally {
-    if (session && request) {
-      try { await request('/session/'+session,null,"DELETE"); }
-      catch { console.error("loader fixture browser-session cleanup failed"); }
+    try {
+      if (browser) await browser.close();
+    } finally {
+      server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
     }
-    const exited = driver.exitCode !== null ? Promise.resolve() : once(driver,"exit");
-    driver.kill("SIGTERM");await exited;
-    server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
   }
 });

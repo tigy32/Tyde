@@ -463,7 +463,28 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
             "Every supported backend must be advertised for ordinary text analysis"
         );
     }
-    let agent = fixture.spawn("Author", "One-off task").await;
+    // A fresh NewAgent precedes session binding; AgentStart carries the
+    // persisted session that restart restoration republishes.
+    let (agent, agent_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: AgentLaunchContext::Standard,
+            name: Some("Author".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".into()],
+                prompt: "One-off task".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    let session = agent_start.session_id.expect("persisted author session");
     fixture.finish_turn(&agent).await;
     human(
         &mut fixture,
@@ -502,6 +523,11 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
     assert!(snapshot.usage.is_empty());
     assert!(snapshot.changes.is_empty());
     let bootstrap = fixture.restart_host().await;
+    // Restoration publishes NewAgent asynchronously after host bootstrap.
+    // Drain its exact session before spawn() waits for the next NewAgent.
+    let restored_agents = fixture.restored_agents(&bootstrap, &[session]).await;
+    assert_eq!(restored_agents.len(), 1);
+    eprintln!("LEARNING FENCED phase=restored_author_bootstrap_joined");
     assert_eq!(bootstrap.settings.self_improvement.host, unsupported);
     let restored = state(&mut fixture, |state| {
         state

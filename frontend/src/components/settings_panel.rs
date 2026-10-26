@@ -10768,7 +10768,7 @@ mod wasm_tests {
         let painted_layout = js_sys::Function::new_no_args(
             "return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));",
         );
-        for (iteration, id) in ["ink", "current", "notebook", "ink"]
+        for (iteration, id) in ["notebook", "current", "ink", "ink"]
             .into_iter()
             .enumerate()
         {
@@ -11015,10 +11015,34 @@ mod wasm_tests {
                         crate::appearance::ChatAppearance::Notebook,
                         "a saved Notebook choice restores on the next launch"
                     );
+                    heading.click();
                 } else {
+                    assert_eq!(
+                        heading.get_bounding_client_rect().height(),
+                        0.0,
+                        "Flow has no completed-action aggregate"
+                    );
+                    let rows = changes.query_selector_all(".tool-card-header").unwrap();
+                    for index in 0..rows.length() {
+                        let header = rows
+                            .item(index)
+                            .unwrap()
+                            .dyn_into::<web_sys::Element>()
+                            .unwrap();
+                        assert!(
+                            header.get_bounding_client_rect().height() > 0.0,
+                            "Flow shows every file action even after Notebook folded the group"
+                        );
+                    }
                     assert!(
-                        !disclosure.text_content().unwrap().contains("Ran command"),
-                        "Flow keeps its existing action rows"
+                        disclosure
+                            .query_selector(".tool-card-action")
+                            .unwrap()
+                            .unwrap()
+                            .get_bounding_client_rect()
+                            .height()
+                            == 0.0,
+                        "Flow commands use their actual tool name, not a second action label"
                     );
                 }
             } else {
@@ -11180,6 +11204,24 @@ mod wasm_tests {
                 },
             },
         ));
+        next_tick().await;
+        // File-group folding belongs to Notebook; Flow keeps every action visible.
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Notebook);
+        next_tick().await;
+        // The earlier Flow visibility check deliberately left Notebook folded.
+        let folded: web_sys::HtmlElement = chat
+            .query_selector(".file-change-heading")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            folded.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        folded.click();
         next_tick().await;
         let joining_group: web_sys::HtmlElement = chat
             .query_selector(".ink-file-path[title='src/joined.rs']")

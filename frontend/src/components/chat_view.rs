@@ -2648,7 +2648,44 @@ mod wasm_tests {
         dispatch(ChatEvent::MessageAdded(
             mk_user_msg("Inspect the workspace").message,
         ));
-        let commands = ["python3 first.py", "python3 second.py", "python3 third.py"];
+        async fn settle() {
+            next_tick().await;
+            next_animation_frame().await;
+            next_animation_frame().await;
+        }
+        // Measure before streaming scrolls this row out of the virtualized viewport.
+        for width in [960, 360] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            settle().await;
+            let user = container
+                .query_selector(".chat-card-user")
+                .unwrap()
+                .unwrap();
+            let sender = user
+                .query_selector(".chat-card-sender")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            let body = user
+                .query_selector(".chat-card-body")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                (sender.left() - body.left()).abs() < 1.0,
+                "short user text starts beneath its sender at wide and narrow widths"
+            );
+        }
+        container.style().set_property("width", "800px").unwrap();
+        settle().await;
+        let commands = [
+            "python3 /workspace/a-long-directory-name/another-long-directory-name/first.py --description 'Keep the actual command readable without a large wrapping header'",
+            "python3 second.py",
+            "python3 third.py",
+        ];
         for (index, command) in commands.into_iter().enumerate() {
             let text = if index == 0 {
                 "I'll inspect the workspace."
@@ -2673,6 +2710,39 @@ mod wasm_tests {
                     working_directory: "/workspace".to_owned(),
                 },
             }));
+            if index == 0 {
+                settle().await;
+                for mode in [
+                    ToolOutputMode::Summary,
+                    ToolOutputMode::Full,
+                    ToolOutputMode::Compact,
+                ] {
+                    state.tool_output_mode.set(mode);
+                    settle().await;
+                    let card = container
+                        .query_selector("details.tool-card")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<web_sys::HtmlDetailsElement>()
+                        .unwrap();
+                    assert_eq!(
+                        card.open(),
+                        mode == ToolOutputMode::Full,
+                        "running commands obey output-mode defaults"
+                    );
+                    assert!(card.text_content().unwrap().contains("Running"));
+                    let style = web_sys::window()
+                        .unwrap()
+                        .get_computed_style(&card)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        style.get_property_value("border-top-width").unwrap(),
+                        "0px",
+                        "running commands do not gain a heavy frame"
+                    );
+                }
+            }
             dispatch(ChatEvent::ToolExecutionCompleted(
                 protocol::ToolExecutionCompletedData {
                     tool_call_id: tool_call_id.clone(),
@@ -2681,7 +2751,10 @@ mod wasm_tests {
                             message: "Probe failed".to_owned(),
                             details: None,
                             normalization_failure: None,
-                            result: None,
+                            result: Some(protocol::ToolExecutionResult::NativeContent {
+                                text: "Native failure output".to_owned(),
+                                images: Vec::new(),
+                            }),
                         }
                     } else {
                         protocol::ToolExecutionOutcome::Succeeded {
@@ -2723,11 +2796,6 @@ mod wasm_tests {
             message: assistant("All done."),
         }));
 
-        async fn settle() {
-            next_tick().await;
-            next_animation_frame().await;
-            next_animation_frame().await;
-        }
         let text_of = |element: &Element| element.text_content().unwrap_or_default();
         let visible = |selector: &str| {
             let nodes = container.query_selector_all(selector).unwrap();
@@ -2801,6 +2869,74 @@ mod wasm_tests {
             "actions stay chronological"
         );
 
+        // A narrow container does not exercise viewport media queries. Adopt
+        // the actual mounted card into an iframe with the production styles.
+        let document = web_sys::window().unwrap().document().unwrap();
+        let frame = document
+            .create_element("iframe")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlIFrameElement>()
+            .unwrap();
+        frame
+            .set_attribute("style", "width:360px;height:240px;border:0")
+            .unwrap();
+        let loaded = js_sys::Function::new_with_args(
+            "frame",
+            "return new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));",
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, &frame)
+        .unwrap();
+        let ink_styles = include_str!("../../ink-chat.css");
+        frame.set_attribute("srcdoc", &format!(
+            "<style>{PROD_STYLES}{ink_styles}</style><div class='chat-view' data-chat-chrome='ink' data-chat-appearance='ink'><div class='chat-card-tools' id='activity'></div></div>"
+        )).unwrap();
+        document.body().unwrap().append_child(&frame).unwrap();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(loaded))
+            .await
+            .unwrap();
+        // Child-realm Document/Window fail parent-realm instanceof checks.
+        let frame_document = frame.content_document().unwrap();
+        let frame_window = frame.content_window().unwrap();
+        let parent = cards[1].parent_node().unwrap();
+        let next = cards[1].next_sibling();
+        frame_document
+            .get_element_by_id("activity")
+            .unwrap()
+            .append_child(&cards[1])
+            .unwrap();
+        settle().await;
+        let failure = cards[1]
+            .query_selector(".tool-status-text.failure")
+            .unwrap()
+            .unwrap();
+        let summary = cards[1]
+            .query_selector(".tool-completion-summary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame_window
+                .get_computed_style(&summary)
+                .unwrap()
+                .unwrap()
+                .get_property_value("display")
+                .unwrap(),
+            "none"
+        );
+        assert_eq!(failure.text_content().as_deref(), Some("Failed"));
+        for expanded in [false, true] {
+            cards[1].set_open(expanded);
+            settle().await;
+            assert!(
+                failure.get_bounding_client_rect().width() > 10.0
+                    && failure.get_bounding_client_rect().height() > 5.0,
+                "narrow failed tools retain a readable status with output closed or open"
+            );
+        }
+        cards[1].set_open(false);
+        parent.insert_before(&cards[1], next.as_ref()).unwrap();
+        frame.remove();
+        settle().await;
+
         state.tool_output_mode.set(ToolOutputMode::Summary);
         settle().await;
         assert_eq!(
@@ -2822,7 +2958,42 @@ mod wasm_tests {
             "Summary reveals the command output only when requested"
         );
         assert!(stdout.get_bounding_client_rect().height() > 0.0);
+        let literal = cards[0]
+            .query_selector(".tool-command-line")
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.text_content().as_deref(), Some(commands[0]));
+        assert!(
+            literal.get_bounding_client_rect().height() > 0.0,
+            "expanded details show the selectable literal command, not only the truncated header"
+        );
+        assert!(
+            literal.get_bounding_client_rect().bottom() <= stdout.get_bounding_client_rect().top()
+        );
+        assert!(
+            cards[0].get_bounding_client_rect().height() < 180.0,
+            "short output has no forced empty panel"
+        );
+        assert_eq!(
+            visible(".tool-card-header")[0]
+                .get_bounding_client_rect()
+                .height(),
+            visible(".tool-card-header")[1]
+                .get_bounding_client_rect()
+                .height(),
+            "success and failure share the same compact line"
+        );
         assert!(!cards[1].open());
+        headers[1].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        let failed_request = cards[1]
+            .query_selector(".tool-command-line")
+            .unwrap()
+            .expect("Summary exposes an explicitly opened native failure's request");
+        assert_eq!(failed_request.text_content().as_deref(), Some(commands[1]));
+        assert!(failed_request.get_bounding_client_rect().height() > 0.0);
+        headers[1].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
 
         state.tool_output_mode.set(ToolOutputMode::Full);
         settle().await;
@@ -2830,6 +3001,38 @@ mod wasm_tests {
         assert!(
             cards.iter().all(|card| card.open()),
             "Full opens all outputs"
+        );
+        let failed_output = cards[1].query_selector(".tool-error-pre").unwrap().unwrap();
+        assert_eq!(
+            failed_output.text_content().as_deref(),
+            Some("Probe failed")
+        );
+        let failed_command = cards[1]
+            .query_selector(".tool-command-line")
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_command.text_content().as_deref(), Some(commands[1]));
+        assert!(
+            failed_command.get_bounding_client_rect().height() > 0.0,
+            "failed command details keep the full literal request accessible"
+        );
+        assert!(
+            failed_output.get_bounding_client_rect().height() > 0.0,
+            "genuine failure remains inspectable"
+        );
+        let error_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&failed_output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            error_style.get_property_value("border-top-width").unwrap(),
+            "0px",
+            "failure details stay unframed"
+        );
+        assert_eq!(
+            error_style.get_property_value("background-color").unwrap(),
+            "rgba(0, 0, 0, 0)"
         );
         state.tool_output_mode.set(ToolOutputMode::Compact);
         settle().await;
@@ -3097,6 +3300,210 @@ mod wasm_tests {
                 "appearance changes retain the message output expansion"
             );
         }
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: None,
+        }));
+        let image = protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=".to_owned(),
+        };
+        dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "flow-media".to_owned(),
+            tool_name: "InspectArtifact".to_owned(),
+            tool_type: protocol::ToolRequestType::RunCommand {
+                command: "inspect /workspace/artifact.png".to_owned(),
+                working_directory: "/workspace".to_owned(),
+            },
+        }));
+        dispatch(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "flow-media".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::NativeContent {
+                        text: "Artifact output remains selectable".to_owned(),
+                        images: vec![image],
+                    },
+                },
+            },
+        ));
+        let mut media_message = assistant("```rust\nlet artifact = true;\n```");
+        media_message.tool_calls.push(protocol::ToolUseData {
+            tool_call_id: "flow-media".to_owned(),
+            name: "InspectArtifact".to_owned(),
+            arguments: serde_json::json!({}),
+            content_offset: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: media_message,
+        }));
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            state.tool_output_mode.set(mode);
+            settle().await;
+            let image = container
+                .query_selector(".tool-native-content img")
+                .unwrap();
+            let media_header = visible(".tool-card-header")
+                .into_iter()
+                .find(|header| text_of(header).contains("InspectArtifact"))
+                .unwrap();
+            let media_card = media_header
+                .parent_element()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlDetailsElement>()
+                .unwrap();
+            assert_eq!(media_card.open(), mode == ToolOutputMode::Full);
+            if mode == ToolOutputMode::Summary {
+                assert!(
+                    image.is_none(),
+                    "Summary does not automatically mount raw native output"
+                );
+            }
+            if !media_card.open() {
+                media_header.dyn_ref::<HtmlElement>().unwrap().click();
+                settle().await;
+            }
+            let native_request = media_card
+                .query_selector(".tool-command-line")
+                .unwrap()
+                .expect("native command results retain their request in every expanded mode");
+            assert_eq!(
+                native_request.text_content().as_deref(),
+                Some("inspect /workspace/artifact.png")
+            );
+            let image = media_card.query_selector("img").unwrap().unwrap();
+            assert_eq!(image.get_attribute("alt").as_deref(), Some("Chat image"));
+            let output = media_card
+                .query_selector(".tool-raw-result")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                output.text_content().as_deref(),
+                Some("Artifact output remains selectable")
+            );
+            assert!(output.get_bounding_client_rect().height() > 0.0);
+        }
+        assert!(
+            visible(".md-code-block pre")
+                .iter()
+                .any(|code| text_of(code).contains("let artifact = true;"))
+        );
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: None,
+        }));
+        dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "flow-cancelled-command".to_owned(),
+            tool_name: "Bash".to_owned(),
+            tool_type: protocol::ToolRequestType::RunCommand {
+                command: commands[0].to_owned(),
+                working_directory: "/workspace".to_owned(),
+            },
+        }));
+        dispatch(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "flow-cancelled-command".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Cancelled {
+                    message: "Command interrupted".to_owned(),
+                },
+            },
+        ));
+        let mut cancelled_message = assistant("");
+        cancelled_message.tool_calls.push(protocol::ToolUseData {
+            tool_call_id: "flow-cancelled-command".to_owned(),
+            name: "Bash".to_owned(),
+            arguments: serde_json::json!({}),
+            content_offset: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: cancelled_message,
+        }));
+        settle().await;
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            state.tool_output_mode.set(mode);
+            settle().await;
+            let cancelled_header = visible(".tool-card-header")
+                .into_iter()
+                .find(|header| text_of(header).contains("Cancelled"))
+                .unwrap();
+            let cancelled_card = cancelled_header
+                .parent_element()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlDetailsElement>()
+                .unwrap();
+            assert_eq!(cancelled_card.open(), mode == ToolOutputMode::Full);
+            if !cancelled_card.open() {
+                cancelled_header.dyn_ref::<HtmlElement>().unwrap().click();
+                settle().await;
+            }
+            let literal = cancelled_card
+                .query_selector(".tool-command-line")
+                .unwrap()
+                .expect("explicit cancellation details retain the request in Summary too");
+            assert_eq!(literal.text_content().as_deref(), Some(commands[0]));
+            assert!(
+                literal.get_bounding_client_rect().height() > 0.0,
+                "cancelled commands retain the full readable request in every mode"
+            );
+        }
+        dispatch(ChatEvent::OperationCancelled(
+            protocol::OperationCancelledData {
+                message: "Operation cancelled".to_owned(),
+            },
+        ));
+        settle().await;
+        let notice = container
+            .query_selector("[data-test=chat-notice-cancelled]")
+            .unwrap()
+            .unwrap();
+        assert!(
+            notice
+                .query_selector(".chat-card-header")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect()
+                .height()
+                == 0.0,
+            "one cancellation event has one quiet message, not a duplicate Cancelled heading"
+        );
+        let notice_body = notice.query_selector(".chat-card-body").unwrap().unwrap();
+        let notice_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&notice_body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notice_style.get_property_value("text-align").unwrap(),
+            "left"
+        );
+        assert_eq!(
+            notice_style.get_property_value("font-style").unwrap(),
+            "normal"
+        );
+        assert_eq!(
+            notice
+                .query_selector(".chat-card-body")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Operation cancelled")
+        );
+        container.style().set_property("width", "360px").unwrap();
+        settle().await;
+        let messages = container.query_selector(".chat-messages").unwrap().unwrap();
+        assert!(
+            messages.scroll_width() <= messages.client_width(),
+            "narrow Flow contains expanded command, code, image, and failure output"
+        );
         drop(handle);
         container.remove();
     }
@@ -3463,7 +3870,18 @@ mod wasm_tests {
         };
         state.chat_appearance.set(ChatAppearance::Ink);
         settle().await;
-        no_notebook_labels("Flow");
+        for header in headers() {
+            let action = header.query_selector(".tool-card-action").unwrap().unwrap();
+            let command = header
+                .closest("[data-tool-kind=command]")
+                .unwrap()
+                .is_some();
+            assert_eq!(
+                action.get_bounding_client_rect().height() > 0.0,
+                !command,
+                "Flow shows human-readable actions, but commands retain their actual tool name"
+            );
+        }
         let messages = container.query_selector(".chat-messages").unwrap().unwrap();
         let bounds = messages.get_bounding_client_rect();
         let style = window.get_computed_style(&messages).unwrap().unwrap();
@@ -3497,7 +3915,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn ink_keeps_the_shared_long_list_overflow_accessible() {
+    async fn flow_keeps_every_action_visible_in_long_lists() {
         use crate::appearance::ChatAppearance;
         ensure_styles_loaded();
         let container = make_container();
@@ -3584,24 +4002,10 @@ mod wasm_tests {
         dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
         settle().await;
 
-        let bars = visible(".tool-list-summary");
-        assert_eq!(
-            bars.len(),
-            1,
-            "the existing long-list limit remains explicit, never hidden under an Ink action fold"
-        );
         assert!(
-            !visible(".tool-card-header").is_empty(),
-            "compact action rows are visible by default"
+            visible(".tool-list-summary").is_empty(),
+            "Flow never folds completed actions into an aggregate"
         );
-        bars[0]
-            .query_selector("button")
-            .unwrap()
-            .unwrap()
-            .dyn_ref::<HtmlElement>()
-            .unwrap()
-            .click();
-        settle().await;
         let headers = visible(".tool-card-header");
         assert_eq!(headers.len(), 90);
         for (index, header) in headers.iter().enumerate() {

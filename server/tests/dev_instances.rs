@@ -356,6 +356,25 @@ async fn start_dev_instance_expecting_exit(
     let frontend_listener = std::sync::Arc::new(
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind owned fixture frontend"),
     );
+    #[cfg(target_os = "linux")]
+    let listener_is_open = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(format!("/proc/self/fd/{}", frontend_listener.as_raw_fd()))
+            .expect("identify owned listener socket")
+            .ino();
+        move || {
+            std::fs::read_to_string("/proc/net/tcp")
+                .expect("inspect owned IPv4 listener state")
+                .lines()
+                .skip(1)
+                .any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields[3] == "0A"
+                        && fields[9].parse::<u64>().expect("kernel socket inode") == inode
+                })
+        }
+    };
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
         dev_frontend_listener: Some(frontend_listener),
         debug_mcp_bind_addr: Some("127.0.0.1:0".parse().unwrap()),
@@ -675,12 +694,19 @@ async fn start_dev_instance_expecting_exit(
         matches!(ownership, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
         "frontend gate must retain its actual bound endpoint"
     );
-    // Bind the cleanup probe while the child owns its port, so the later
-    // release check cannot accidentally establish a TCP self-connection.
-    let cleanup_probe = tokio::net::TcpSocket::new_v4().expect("create endpoint release probe");
-    cleanup_probe
-        .bind("127.0.0.1:0".parse().unwrap())
-        .expect("bind distinct cleanup probe endpoint");
+    #[cfg(target_os = "linux")]
+    assert!(
+        listener_is_open(),
+        "owned child listener must be observable while held"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let cleanup_probe = {
+        let socket = tokio::net::TcpSocket::new_v4().expect("create endpoint release probe");
+        socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("bind distinct cleanup probe endpoint");
+        socket
+    };
     release_probe
         .send(())
         .expect("release actual canonical frontend probe");
@@ -968,11 +994,21 @@ async fn start_dev_instance_expecting_exit(
         0,
         "failed dev start must stop its owned frontend"
     );
-    let released = cleanup_probe
-        .connect((std::net::Ipv4Addr::LOCALHOST, port).into())
-        .await
-        .expect_err("joined startup cleanup must release the child's listener");
-    assert_eq!(released.kind(), std::io::ErrorKind::ConnectionRefused);
+    // A port can already belong to an unrelated listener after cleanup. Test
+    // the original kernel socket, not a new connection to that port number.
+    #[cfg(target_os = "linux")]
+    assert!(
+        !listener_is_open(),
+        "joined startup cleanup must release the owned child's listener"
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        let released = cleanup_probe
+            .connect((std::net::Ipv4Addr::LOCALHOST, port).into())
+            .await
+            .expect_err("joined startup cleanup must release the child's listener");
+        assert_eq!(released.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
     eprintln!("DEV READINESS scenario={scenario:?} phase=endpoint-released-after-cleanup");
     service.cancel().await.expect("cancel debug MCP client");
     let error = startup_error;

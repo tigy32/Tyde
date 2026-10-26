@@ -2450,8 +2450,20 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
         "must appear after recovery",
     )
     .unwrap();
-    let error =
-        expect_project_command_error(&mut fixture.client, "file-descriptor exhaustion").await;
+    let event = next_frame_matching_on(
+        &mut fixture.client,
+        "file scan descriptor exhaustion",
+        |event| {
+            if event.kind != FrameKind::CommandError {
+                return false;
+            }
+            let error: CommandErrorPayload = event.parse_payload().unwrap();
+            assert!(!error.fatal);
+            error.operation == "project_files"
+        },
+    )
+    .await;
+    let error: CommandErrorPayload = event.parse_payload().unwrap();
     let exhausted = held
         .lock()
         .unwrap()

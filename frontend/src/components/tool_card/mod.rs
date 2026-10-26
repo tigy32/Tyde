@@ -296,14 +296,17 @@ pub fn ToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: Vec<ToolRequestEntry>,
 ) -> impl IntoView {
+    let appearance = expect_context::<AppState>().chat_appearance;
     let entries = Arc::new(entries);
     let expanded = RwSignal::new(false);
     let total = entries.len();
     let group_entries = entries.clone();
     let groups = Memo::new(move |_| {
-        let visible_ids = visible_tool_indexes(group_entries.len(), expanded.get(), |index| {
-            is_important_tool(&group_entries[index])
-        })
+        let visible_ids = visible_tool_indexes(
+            group_entries.len(),
+            expanded.get() || appearance.get() == crate::appearance::ChatAppearance::Ink,
+            |index| is_important_tool(&group_entries[index]),
+        )
         .into_iter()
         .map(|index| group_entries[index].request.tool_call_id.clone())
         .collect();
@@ -372,13 +375,16 @@ pub fn StreamingToolCardListView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     entries: ArcRwSignal<Vec<StreamingToolRequest>>,
 ) -> impl IntoView {
+    let appearance = expect_context::<AppState>().chat_appearance;
     let expanded = RwSignal::new(false);
     let group_entries = entries.clone();
     let groups = Memo::new(move |_| {
         group_entries.with(|tools| {
-            let visible_ids = visible_tool_indexes(tools.len(), expanded.get(), |index| {
-                tools[index].entry.with_untracked(is_important_tool)
-            })
+            let visible_ids = visible_tool_indexes(
+                tools.len(),
+                expanded.get() || appearance.get() == crate::appearance::ChatAppearance::Ink,
+                |index| tools[index].entry.with_untracked(is_important_tool),
+            )
             .into_iter()
             .map(|index| tools[index].tool_call_id.clone())
             .collect();
@@ -468,10 +474,11 @@ fn ToolListSummary(
     hidden_count: impl Fn() -> usize + Send + Sync + 'static,
     expanded: RwSignal<bool>,
 ) -> impl IntoView {
+    let appearance = expect_context::<AppState>().chat_appearance;
     view! {
         {move || {
             let total = total();
-            if total <= TOOL_LIST_INLINE_LIMIT {
+            if total <= TOOL_LIST_INLINE_LIMIT || appearance.get() == crate::appearance::ChatAppearance::Ink {
                 None
             } else {
                 let is_expanded = expanded.get();
@@ -829,7 +836,14 @@ pub fn ToolCardView(
                 ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. } => "decision",
                 _ => "tool",
             }
-            aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
+            aria-label={let tool_name = tool_name.clone(); move || {
+                if normalization_failed {
+                    Some("Tool failed: canonical data could not be normalized".to_owned())
+                } else {
+                    (chat_appearance.get() == crate::appearance::ChatAppearance::Ink)
+                        .then(|| format!("{tool_name}: {}", status_label()))
+                }
+            }}
             prop:open=card_open
             on:toggle=move |ev: leptos::ev::Event| {
                 if let Some(target) = ev.target()
@@ -846,7 +860,7 @@ pub fn ToolCardView(
                 // Purely decorative: the tool name beside it is the accessible
                 // label, so a screen reader announcing the emoji adds only noise.
                 <span class="tool-card-icon" aria-hidden="true">{icon}</span>
-                <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Notebook>
+                <Show when=move || chat_appearance.get().uses_ink_chrome()>
                     <span class="tool-card-action">{action_label.clone()}</span>
                 </Show>
                 <span class="tool-card-name" title={let title = tool_name.clone(); move || chat_appearance.get().uses_ink_chrome().then(|| title.clone())}>{tool_name.clone()}</span>
@@ -948,6 +962,27 @@ fn render_body(
     mode: ToolOutputMode,
     result_failed: bool,
 ) -> AnyView {
+    let terminal_command_request = (matches!(
+        outcome,
+        Some(
+            ToolExecutionOutcome::Failed { .. }
+                | ToolExecutionOutcome::Cancelled { .. }
+                | ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::NativeContent { .. }
+                }
+        )
+    ) && matches!(req, ToolRequestType::RunCommand { .. })
+        && expect_context::<AppState>().chat_appearance.get()
+            == crate::appearance::ChatAppearance::Ink)
+        .then(|| {
+            // Summary reaches this body only through explicit disclosure.
+            let request_mode = if mode == ToolOutputMode::Summary {
+                ToolOutputMode::Compact
+            } else {
+                mode
+            };
+            run_command::render(req, None, request_mode)
+        });
     let native_content = match outcome {
         Some(ToolExecutionOutcome::Succeeded {
             result: ToolExecutionResult::NativeContent { text, images },
@@ -969,12 +1004,14 @@ fn render_body(
             .then(|| other::render(req, None, malformed_payload, mode));
         return view! {
             {request}
+            {terminal_command_request}
             {native_content}
         }
         .into_any();
     }
     if let Some(ToolExecutionOutcome::Cancelled { message }) = outcome {
         return view! {
+            {terminal_command_request}
             <div class="tool-cancelled" role="status">{message.clone()}</div>
         }
         .into_any();
@@ -983,8 +1020,8 @@ fn render_body(
         message, details, ..
     }) = outcome
     {
-        return error_result::render(message, details.as_deref(), malformed_payload, mode)
-            .into_any();
+        let error = error_result::render(message, details.as_deref(), malformed_payload, mode);
+        return view! { {terminal_command_request} {error} }.into_any();
     }
     let result = match outcome {
         Some(ToolExecutionOutcome::Succeeded { result }) => Some(result),
