@@ -33,9 +33,10 @@ Admissions and restoration stop first. Parked agent waits expire with a typed
 host-stopped error; every registered actor (including children and team members)
 persists its interruption before interrupting and shutting down its backend.
 This is not Close: queued messages and restore intent survive. Concurrent callers
-share one shutdown, with a host-wide 25-second budget. At the deadline, owned
-process scopes synchronously kill their groups; runtime Drop/reaper scheduling
-is not relied on to deliver that signal. No process is selected by name.
+share one shutdown. Required actor checkpoints must be durably committed before
+owned process scopes are sealed; runtime Drop/reaper scheduling is not relied
+on to deliver that signal. No deadline substitutes for the accounting guard,
+and no process is selected by name.
 
 The embedded host cannot serve again after this shutdown. If the installer fails
 or is rejected (for example, cancelled administrator authentication) after the
@@ -84,6 +85,76 @@ parent-exit race before exec. This is best effort: it covers the direct backend
 child, not descendants that detach or escape its process group. macOS has no
 parent-death signal equivalent here; an uncatchable host SIGKILL can leave backend
 processes running. Graceful shutdown kills owned groups on both platforms.
+
+## Missing-checkpoint diagnostics
+
+A missing final task accounting checkpoint still refuses shutdown and therefore
+installation. This diagnostic change does **not** fix the original updater
+failure. No snapshot is reconstructed or substituted, and no continuation or
+queue state is inferred from history.
+
+The default info-level native disk logs (`~/.tyde/tracing/tyde-shell.log*`, or
+`tyde-host-stdio.log*` / `tyde-host-uds.log*`) include the content-free target
+`server::restart_accounting`. `TYDE_TRACING_DIR_PATH` selects an explicit log
+directory. Explicit logging filters can disable these records.
+
+Each process gets an independent random `diagnostic_run` nonce, and each actor
+gets an `accounting_actor` slot within it. Neither derives from an agent,
+session, provider or OS identifier. Both fields accompany every actor record;
+the nonce also scopes host phases across concurrent processes and app launches. Its records name creation, stop request,
+dispatch, acknowledgement settlement, final checkpoint publication, cancellation
+request and termination. Missing-checkpoint errors carry that same slot and the
+observed termination class. Host records name preparation, settled stops,
+accounting commit/refusal and shutdown settlement. Booleans distinguish a
+rejected command from a lost acknowledgement and publication from a missing
+checkpoint. No panic payload, error payload, prompt, name, path, argv, environment
+or credential is added to these records.
+
+Termination classes come from the lifetime of the submitted actor future:
+
+- `Returned`: the actor's process-scoped future returned normally.
+- `Unwinding`: it was dropped while the thread was unwinding. No panic payload
+  is read or logged, and the existing panic hook/propagation is unchanged.
+- `Dropped`: the future was dropped without return or unwind. An explicit abort
+  and runtime teardown are not distinguishable from that observation alone;
+  `CancellationRequested` records the explicit abort call when present.
+- `Running`: termination has not yet been recorded at the observation point.
+  Use the later `ActorTerminated` record for that slot, not an inferred cause.
+
+These observations never drive product lifecycle or accounting decisions. They
+add no supervisor, recovery path, waits, timeouts or locks to production shutdown.
+A process kill, aborting panic, power loss or full/dropped log sink can prevent a
+final record. Missing records are not evidence of normal completion. Correlate by `(diagnostic_run, accounting_actor)`, never by the slot alone. Older builds cannot
+retroactively provide a termination class they never recorded.
+
+### Redacted export of existing logs
+
+No new reproduction, provider run, restart, settings change or upload is needed.
+From a checkout, run:
+
+```sh
+python3 tools/export-restart-diagnostics.py > tyde-update-diagnostics.jsonl
+```
+
+An explicit directory can be supplied as the only argument. The exporter reads
+existing Tyde tracing files only and emits allowlisted phases, classes,
+diagnostic correlation values, booleans, counts and timestamps, never whole lines or file paths. It also recognizes the
+older accounting refusal/commit and updater-failure records. An existing runtime
+panic header, if retained in those files, is reported without its payload and
+without claiming attribution to an actor. Zero records is an evidence limit,
+not a successful shutdown or a finding that no panic occurred. Unreadable
+files or damaged UTF-8 fail explicitly with content-free context; partial output
+from a failed export is not complete evidence.
+
+The protocol-level disk-log regression uses the real server and shared mock
+fixture: clean idle shutdown, cancellation after a stop is accepted but before
+publication, and a controlled unwind during startup. It checks the unchanged
+missing-checkpoint error, byte-identical archived accounting in the actual SQLite store, and typed client
+recovery of original identity, continuation, queued input and known tokens.
+Archived root rollups are intentionally not advertised before their live actor
+is restored; storage auditing supplements the protocol assertions, not a
+server-internal method test. Fault injection demonstrates
+observability; it does not reproduce or identify the screenshot's original cause.
 
 ## Publishing
 

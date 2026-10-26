@@ -1,3 +1,4 @@
+use crate::agent::{AccountingDiagnosticPhase, accounting_diagnostic_run};
 #[path = "host_state.rs"]
 mod state_owner;
 use state_owner::StateOwner;
@@ -2338,6 +2339,17 @@ impl HostHandle {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn wait_agent_termination_for_test(&self, agent_id: &AgentId) {
+        let agent_id = agent_id.clone();
+        let handle = self
+            .state
+            .with(move |state| state.registry.agent_handle(&agent_id))
+            .await
+            .expect("registered agent for termination observation");
+        handle.wait_termination_for_test().await;
+    }
+
     pub async fn force_agent_backend_shutdown_for_conformance(&self, agent_id: &AgentId) -> bool {
         let handle = {
             let agent_id = agent_id.to_owned();
@@ -4262,6 +4274,7 @@ impl HostHandle {
             start
         });
         if start {
+            tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::ShutdownStarted);
             self.project_catalog.stop();
             self.restart.stopped.cancel();
             if let Some(owner) = self.spawn_operations.owner.upgrade() {
@@ -4275,6 +4288,7 @@ impl HostHandle {
                     .lock()
                     .expect("restart handles mutex poisoned")
                     .clone();
+                tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::AgentsCaptured, agents = handles.len());
                 let control = host
                     .restart
                     .control
@@ -4295,6 +4309,7 @@ impl HostHandle {
                         handles.iter().map(|handle| handle.prepare_restart()),
                     )
                     .await;
+                    tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::AgentsPrepared, agents = handles.len());
                     control.expire_await_requests();
                     #[cfg(feature = "test-support")]
                     {
@@ -4312,6 +4327,7 @@ impl HostHandle {
                         handles.iter().map(|handle| handle.stop_for_restart()),
                     )
                     .await;
+                    tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::AgentStopsSettled, agents = snapshots.len(), missing_checkpoints = snapshots.iter().filter(|snapshot| snapshot.is_err()).count());
                     host.shutdown_spawn_operations().await;
                     for snapshot in snapshots {
                         let mut snapshot = snapshot?;
@@ -4334,6 +4350,7 @@ impl HostHandle {
                         }
                         snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
                         if let Err(error) = store.save_task_usage_snapshot(snapshot.clone()).await {
+                            tracing::error!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::ArchiveFailed);
                             let message = format!(
                                 "Cannot preserve task accounting for restart; restart cancelled: {error}"
                             );
@@ -4359,6 +4376,7 @@ impl HostHandle {
                             return Err(message);
                         }
                     }
+                    tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::AccountingCommitted, agents = handles.len());
                     Ok::<(), String>(())
                 };
                 let result = graceful.await;
@@ -4401,6 +4419,7 @@ impl HostHandle {
                 } else {
                     tracing::error!("host restart stopped without committing required accounting");
                 }
+                tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::ShutdownSettled, success = result.is_ok());
                 let retry = result.is_err();
                 host.restart.complete.send_modify(|completion| {
                     *completion = Some(result);

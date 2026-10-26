@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
@@ -96,6 +96,7 @@ const INITIAL_HISTORY_TAIL_LIMIT: usize = 15;
 #[derive(Default)]
 struct AgentEventLog {
     final_usage_tx: Option<watch::Sender<Option<AgentUsageSnapshot>>>,
+    accounting_actor: u64,
     timing_context: Option<(Arc<SessionStoreHandle>, SessionId)>,
     live_archive_start: Option<watch::Receiver<AgentStartPayload>>,
     message_accounting: bool,
@@ -797,10 +798,103 @@ struct ReplayActiveStream {
     tool_events: Vec<ChatEvent>,
 }
 
+pub(crate) fn accounting_diagnostic_run() -> &'static Uuid {
+    static RUN: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+    RUN.get_or_init(Uuid::new_v4)
+}
+
+#[derive(Debug)]
+pub(crate) enum AccountingDiagnosticPhase {
+    ActorCreated,
+    ActorTerminated,
+    StopRequested,
+    StopDispatched,
+    StopSettled,
+    CancellationRequested,
+    CheckpointMissing,
+    CheckpointPublished,
+    ShutdownStarted,
+    AgentsCaptured,
+    AgentsPrepared,
+    AgentStopsSettled,
+    ArchiveFailed,
+    AccountingCommitted,
+    ShutdownSettled,
+}
+
+// These process-local slots correlate diagnostics without retaining agent/session identifiers.
+#[derive(Clone)]
+struct ActorDiagnostics {
+    slot: u64,
+    termination: watch::Receiver<ActorTermination>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActorTermination {
+    Running,
+    Returned,
+    Unwinding,
+    Dropped,
+}
+
+struct ActorTerminationGuard {
+    slot: u64,
+    returned: bool,
+    termination: watch::Sender<ActorTermination>,
+    final_usage: watch::Receiver<Option<AgentUsageSnapshot>>,
+}
+
+impl ActorDiagnostics {
+    fn new(
+        final_usage: watch::Receiver<Option<AgentUsageSnapshot>>,
+    ) -> (Self, ActorTerminationGuard) {
+        static NEXT_SLOT: AtomicU64 = AtomicU64::new(1);
+        let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        let (sender, termination) = watch::channel(ActorTermination::Running);
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = slot, phase = ?AccountingDiagnosticPhase::ActorCreated);
+        (
+            Self { slot, termination },
+            ActorTerminationGuard {
+                slot,
+                returned: false,
+                termination: sender,
+                final_usage,
+            },
+        )
+    }
+}
+
+impl ActorTerminationGuard {
+    fn returned(&mut self) {
+        self.returned = true;
+    }
+}
+
+impl Drop for ActorTerminationGuard {
+    fn drop(&mut self) {
+        let termination = if std::thread::panicking() {
+            ActorTermination::Unwinding
+        } else if self.returned {
+            ActorTermination::Returned
+        } else {
+            // A dropped future proves neither an explicit abort nor runtime shutdown alone.
+            ActorTermination::Dropped
+        };
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(),
+            accounting_actor = self.slot,
+            phase = ?AccountingDiagnosticPhase::ActorTerminated,
+            ?termination,
+            checkpoint_present = self.final_usage.borrow().is_some(),
+        );
+        self.termination.send_replace(termination);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentHandle {
     processes: crate::backend::subprocess::ProcessOwner,
     actor_abort: tokio::task::AbortHandle,
+    diagnostics: ActorDiagnostics,
     actor_status: registry::AgentStatusHandle,
     startup_completion: watch::Receiver<Option<Result<SessionId, StartupFailure>>>,
     #[cfg(feature = "test-support")]
@@ -2332,12 +2426,33 @@ impl AgentHandle {
     }
 
     pub async fn stop_for_restart(&self) -> Result<AgentUsageSnapshot, String> {
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = self.diagnostics.slot, phase = ?AccountingDiagnosticPhase::StopRequested);
         self.prepare_restart().await;
         let (reply, done) = oneshot::channel();
-        if self.tx.send(AgentCommand::StopForRestart { reply }).is_ok() {
-            let _ = done.await;
-        }
+        let command_sent = self.tx.send(AgentCommand::StopForRestart { reply }).is_ok();
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = self.diagnostics.slot, phase = ?AccountingDiagnosticPhase::StopDispatched, command_sent);
+        let acknowledged = command_sent && done.await.is_ok();
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(),
+            accounting_actor = self.diagnostics.slot,
+            phase = ?AccountingDiagnosticPhase::StopSettled,
+            termination = ?*self.diagnostics.termination.borrow(),
+            command_sent,
+            acknowledged,
+            actor_finished = self.actor_finished(),
+            checkpoint_present = self.final_usage.borrow().is_some(),
+            "agent restart stop settled"
+        );
         self.final_usage_snapshot()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_termination_for_test(&self) {
+        self.diagnostics
+            .termination
+            .clone()
+            .wait_for(|termination| *termination != ActorTermination::Running)
+            .await
+            .expect("actor termination diagnostic publisher");
     }
 
     pub fn actor_finished(&self) -> bool {
@@ -2345,12 +2460,24 @@ impl AgentHandle {
     }
 
     pub fn kill_for_restart(&self) {
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = self.diagnostics.slot,
+            phase = ?AccountingDiagnosticPhase::CancellationRequested, checkpoint_present = self.final_usage.borrow().is_some());
         self.processes.kill_all();
         self.actor_abort.abort();
     }
 
     pub(crate) fn final_usage_snapshot(&self) -> Result<AgentUsageSnapshot, String> {
-        self.final_usage.borrow().clone().ok_or_else(|| "The actor ended without a final task accounting checkpoint; durable observations were not replaced".to_owned())
+        self.final_usage.borrow().clone().ok_or_else(|| {
+            tracing::error!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(),
+                accounting_actor = self.diagnostics.slot,
+                phase = ?AccountingDiagnosticPhase::CheckpointMissing,
+                termination = ?*self.diagnostics.termination.borrow(),
+                actor_finished = self.actor_finished(),
+                checkpoint_channel_closed = self.final_usage.has_changed().is_err(),
+                "required final task accounting checkpoint is absent"
+            );
+            "The actor ended without a final task accounting checkpoint; durable observations were not replaced".to_owned()
+        })
     }
 
     pub async fn close(&self) -> bool {
@@ -3590,6 +3717,8 @@ pub(crate) fn spawn_agent_actor(
     );
     let (start_tx, start_rx) = watch::channel(start.clone());
     let (final_usage_tx, final_usage) = watch::channel(None);
+    let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
+    let accounting_actor = diagnostics.slot;
     let actor_tx = tx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
@@ -3669,6 +3798,7 @@ pub(crate) fn spawn_agent_actor(
             message_accounting: crate::backend::token_usage_tracking_mode(backend_kind)
                 == TokenUsageTrackingMode::Messages,
             final_usage_tx: Some(final_usage_tx),
+            accounting_actor,
             parent_session_id: parent_session_id.clone(),
             ..Default::default()
         };
@@ -10934,12 +11064,14 @@ pub(crate) fn spawn_agent_actor(
     let actor = Box::pin(actor);
     let actor_task = crate::backend::subprocess::spawn(async move {
         actor_processes.scope(actor).await;
+        termination_guard.returned();
     });
 
     (
         AgentHandle {
             processes,
             actor_abort: actor_task.abort_handle(),
+            diagnostics,
             actor_status,
             startup_completion,
             #[cfg(feature = "test-support")]
@@ -11027,6 +11159,8 @@ pub(crate) fn spawn_relay_agent_actor(
     );
     let (start_tx, start_rx) = watch::channel(start.clone());
     let (final_usage_tx, final_usage) = watch::channel(None);
+    let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
+    let accounting_actor = diagnostics.slot;
     let live_archive_start = start_rx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
@@ -11043,6 +11177,7 @@ pub(crate) fn spawn_relay_agent_actor(
             message_accounting: crate::backend::token_usage_tracking_mode(start.backend_kind)
                 == TokenUsageTrackingMode::Messages,
             final_usage_tx: Some(final_usage_tx),
+            accounting_actor,
             timing_context: Some((Arc::clone(&session_store), session_id.clone())),
             parent_session_id: Some(parent_session_id),
             ..Default::default()
@@ -11797,11 +11932,13 @@ pub(crate) fn spawn_relay_agent_actor(
     let actor = Box::pin(actor);
     let actor_task = crate::backend::subprocess::spawn(async move {
         actor_processes.scope(actor).await;
+        termination_guard.returned();
     });
 
     AgentHandle {
         processes,
         actor_abort: actor_task.abort_handle(),
+        diagnostics,
         actor_status,
         startup_completion,
         #[cfg(feature = "test-support")]
@@ -12041,6 +12178,8 @@ fn publish_final_usage(
     snapshot.observation = protocol::TaskUsageObservation::Closed;
     if let Some(publisher) = &event_log.final_usage_tx {
         publisher.send_replace(Some(snapshot.clone()));
+        tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = event_log.accounting_actor,
+            phase = ?AccountingDiagnosticPhase::CheckpointPublished);
     }
     snapshot
 }
@@ -12963,6 +13102,8 @@ async fn park_terminal_agent(
                 event_log.own_usage = Some((usage.usage.clone(), usage.model.clone()));
                 if let Some(publisher) = &event_log.final_usage_tx {
                     publisher.send_replace(Some(usage.clone()));
+                    tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), accounting_actor = event_log.accounting_actor,
+                        phase = ?AccountingDiagnosticPhase::CheckpointPublished);
                 }
                 let _ = reply.send(Ok(()));
             }
