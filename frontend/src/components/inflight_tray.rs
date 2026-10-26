@@ -42,7 +42,6 @@ use protocol::{
     ToolExecutionMode, ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 
-use crate::appearance::ChatAppearance;
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
 use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::components::tool_card::{
@@ -683,7 +682,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
     };
 
     let chat_appearance = state.chat_appearance;
-    let is_ink = move || chat_appearance.get() == ChatAppearance::Ink;
+    let is_ink = move || chat_appearance.get().uses_ink_chrome();
     let has_work = move || !snapshot.get().is_empty() || !queued_row_ids.get().is_empty();
     let ink_open = RwSignal::new(false);
     let ink_tab = NodeRef::<leptos::html::Button>::new();

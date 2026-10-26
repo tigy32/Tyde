@@ -569,8 +569,9 @@ impl SettingsTab {
             Self::Appearance => &[
                 "Appearance",
                 "Chat presentation",
-                "Current chat",
-                "Ink",
+                "Default",
+                "Flow",
+                "Notebook",
                 "Color Theme",
                 "Choose the color scheme for the interface",
                 "Dark",
@@ -2114,7 +2115,6 @@ fn AppearanceTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label" for="chat-appearance">"Chat presentation"</label>
-            <p class="settings-description">"Current chat keeps the existing presentation. Ink uses a continuous, quieter reading flow. Only the chat changes, on this device."</p>
             <select
                 id="chat-appearance"
                 aria-label="Chat presentation"
@@ -10684,7 +10684,16 @@ mod wasm_tests {
         assert_eq!(
             picker.value(),
             "current",
-            "new and upgraded clients retain Current chat"
+            "new and upgraded clients retain the Default presentation"
+        );
+        let options = picker.query_selector_all("option").unwrap();
+        let labels: Vec<_> = (0..options.length())
+            .map(|index| options.item(index).unwrap().text_content().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Default", "Flow", "Notebook"],
+            "Appearance names each presentation once"
         );
         assert!(
             storage.get_item(STORAGE_CHAT_APPEARANCE).unwrap().is_none(),
@@ -10759,7 +10768,10 @@ mod wasm_tests {
         let painted_layout = js_sys::Function::new_no_args(
             "return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));",
         );
-        for (iteration, id) in ["ink", "current", "ink"].into_iter().enumerate() {
+        for (iteration, id) in ["ink", "current", "notebook", "ink"]
+            .into_iter()
+            .enumerate()
+        {
             picker.set_value(id);
             picker
                 .dispatch_event(&web_sys::Event::new("change").unwrap())
@@ -10846,7 +10858,7 @@ mod wasm_tests {
                 .unwrap()
                 .get_property_value("background-color")
                 .unwrap();
-            if id == "ink" {
+            if id != "current" {
                 let heading: web_sys::HtmlElement = chat
                     .query_selector(".file-change-heading")
                     .unwrap()
@@ -10986,8 +10998,31 @@ mod wasm_tests {
                         .unwrap(),
                     "rgb(205, 214, 244)"
                 );
+                if id == "notebook" {
+                    let action = disclosure
+                        .query_selector(".tool-card-action")
+                        .unwrap()
+                        .expect("Notebook names the action in words");
+                    assert_eq!(action.text_content().unwrap(), "Ran command");
+                    assert!(
+                        action.get_bounding_client_rect().height() > 0.0,
+                        "the action label is visible"
+                    );
+                    let restored = AppState::new();
+                    restore_appearance(&restored);
+                    assert_eq!(
+                        restored.chat_appearance.get_untracked(),
+                        crate::appearance::ChatAppearance::Notebook,
+                        "a saved Notebook choice restores on the next launch"
+                    );
+                } else {
+                    assert!(
+                        !disclosure.text_content().unwrap().contains("Ran command"),
+                        "Flow keeps its existing action rows"
+                    );
+                }
             } else {
-                assert_eq!(background, before, "switching back restores Current chat");
+                assert_eq!(background, before, "switching back restores Default");
                 assert_eq!(
                     window
                         .get_computed_style(&code)

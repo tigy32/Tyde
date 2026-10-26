@@ -1,0 +1,298 @@
+/* Notebook layers on the shared Ink chrome. Conversation reads in the prose
+   column; each turn's actions sit beside the prose they belong to, so the
+   transcript stays one chronological, virtualized list. */
+.chat-view[data-chat-appearance="notebook"] {
+    --nb-activity: clamp(20rem, 38%, 40rem);
+    --nb-gap: clamp(28px, 4%, 56px);
+    --nb-prose-size: 1.154rem;
+    --ink-activity-indent: 0px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-messages {
+    container: notebook-transcript / inline-size;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant,
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase:has(> .chat-card-tools) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--nb-activity);
+    column-gap: var(--nb-gap);
+    align-items: start;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > *,
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase > * {
+    grid-column: 1;
+    min-width: 0;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools),
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase > .chat-card-tools {
+    grid-column: 2;
+    margin: 0;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase:has(> .chat-card-tools) {
+    grid-column: 1 / -1;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-phase + .chat-card-phase {
+    margin-top: 16px;
+}
+
+/* One quiet rule marks the activity column through a working stretch. */
+.chat-view[data-chat-appearance="notebook"] .virt-row:has(> .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools), > .chat-card-assistant > .chat-card-phase > .chat-card-tools) {
+    position: relative;
+}
+
+.chat-view[data-chat-appearance="notebook"] .virt-row:has(> .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools), > .chat-card-assistant > .chat-card-phase > .chat-card-tools)::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: calc(var(--nb-activity) + var(--nb-gap) / 2);
+    border-left: 1px solid var(--border-primary);
+    pointer-events: none;
+}
+
+.chat-view[data-chat-appearance="notebook"] :is(.chat-card-assistant, .chat-card-user) .chat-card-body {
+    font-size: var(--nb-prose-size);
+    line-height: 1.6;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant .chat-card-body p {
+    margin-block: 0 14px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-assistant .chat-card-body p:last-child {
+    margin-bottom: 0;
+}
+
+/* Each user turn opens a new section of the notebook. */
+.chat-view[data-chat-appearance="notebook"] .chat-card-user {
+    width: 100%;
+    max-width: none;
+    margin-left: 0;
+    padding: 18px calc(var(--nb-activity) + var(--nb-gap)) 0 0;
+    border-top: 1px solid var(--border-primary);
+    border-radius: 0;
+    background: transparent;
+    align-items: stretch;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-user .chat-card-phase {
+    align-items: flex-start;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-user .chat-card-header {
+    margin-bottom: 6px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-user .chat-card-sender {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* A quiet byline: names and times, no chips. */
+.chat-view[data-chat-appearance="notebook"] :is(.token-stat-agent, .chat-card-assistant .chat-card-sender) {
+    color: var(--text-primary);
+}
+
+.chat-view[data-chat-appearance="notebook"] :is(.token-stat-model, .chat-card-model) {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="notebook"] .chat-card-reasoning {
+    max-width: 100%;
+}
+
+/* Activity rows: what happened in words, then the real tool and its target. */
+.chat-view[data-chat-appearance="notebook"] .tool-card-header {
+    display: grid;
+    grid-template-columns: 16px fit-content(45%) minmax(0, 1fr) max-content max-content 10px;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 1px;
+    min-height: 34px;
+    padding-block: 5px;
+    font-size: 1rem;
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-header::before {
+    grid-column: 1;
+    grid-row: 1;
+    color: var(--success);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-header:has(.cancelled)::before {
+    color: var(--text-tertiary);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-action {
+    grid-column: 2 / 4;
+    grid-row: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-header:has(.failure, .rejected) > .tool-card-action {
+    color: var(--error);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-name,
+.chat-view[data-chat-appearance="notebook"] [data-tool-kind="command"] > .tool-card-header > .tool-card-name {
+    display: block;
+    grid-column: 2;
+    grid-row: 2;
+    max-width: none;
+    color: var(--text-tertiary);
+    font: 400 .846rem/1.5 var(--font-mono);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-card-detail,
+.chat-view[data-chat-appearance="notebook"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail {
+    grid-column: 3 / 7;
+    grid-row: 2;
+    color: var(--text-secondary);
+    font-size: .846rem;
+    line-height: 1.5;
+}
+
+.chat-view[data-chat-appearance="notebook"] [data-tool-kind="command"] > .tool-card-header > .tool-card-detail::before {
+    margin-right: 6px;
+    color: var(--text-tertiary);
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-completion-summary {
+    grid-column: 4;
+    grid-row: 1;
+    margin-left: 0;
+    font-size: .846rem;
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-status-text {
+    grid-column: 5;
+    grid-row: 1;
+    font-size: .923rem;
+}
+
+/* The spinner and the action's progressive wording already say it runs. */
+.chat-view[data-chat-appearance="notebook"] .tool-card:not([data-tool-kind="decision"]) > .tool-card-header > .tool-status-text.pending {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-chevron {
+    grid-column: 6;
+    grid-row: 1;
+    justify-self: center;
+    margin: 0;
+}
+
+.chat-view[data-chat-appearance="notebook"] .tool-list-summary {
+    padding-inline: 0;
+}
+
+/* Edits read as one quiet action with their files beneath it. */
+.chat-view[data-chat-appearance="notebook"] .file-change-group.has-file-changes {
+    margin-bottom: 4px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-heading {
+    gap: 10px;
+    min-height: 34px;
+    padding: 5px 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    font-weight: 400;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-entries {
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row {
+    padding: 0 0 0 26px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .tool-card-header {
+    grid-template-columns: 16px minmax(0, 1fr) max-content max-content 10px;
+    row-gap: 0;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .tool-card-action {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .tool-card-name {
+    display: block;
+    grid-column: 3;
+    grid-row: 1;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .ink-file-counts {
+    grid-column: 4;
+    gap: 10px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .tool-chevron {
+    grid-column: 5;
+}
+
+.chat-view[data-chat-appearance="notebook"] .file-change-row .tool-inline-diff {
+    margin-left: 0;
+}
+
+@container notebook-transcript (max-width: 56rem) {
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant,
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase:has(> .chat-card-tools) {
+        grid-template-columns: minmax(0, 1fr);
+        column-gap: 0;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools),
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase > .chat-card-tools {
+        grid-column: 1;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-reasoning {
+        margin-top: 2px;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-tools,
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase > .chat-card-tools {
+        margin: 8px 0 4px 2px;
+        padding-left: 14px;
+        border-left: 1px solid var(--border-primary);
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .chat-card-assistant > .chat-card-phase > .chat-card-tools:first-child {
+        margin-top: 0;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .virt-row:has(> .chat-card-assistant > :is(.chat-card-reasoning, .chat-card-tools), > .chat-card-assistant > .chat-card-phase > .chat-card-tools)::after {
+        content: none;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .chat-card-user {
+        padding-right: 0;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .tool-card-body {
+        margin-left: 0;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] .tool-completion-summary {
+        display: none;
+    }
+}

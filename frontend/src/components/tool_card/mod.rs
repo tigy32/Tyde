@@ -685,6 +685,19 @@ pub fn ToolCardView(
         }
     };
 
+    let action = Arc::new(ToolAction::of(&tool_name, &tool_type));
+    let action_label = move || {
+        if !has_result && (is_ask_user_question || is_exit_plan_mode) {
+            action.done.clone()
+        } else if !has_result || (background_running.get() && !result_failed) {
+            action.running.clone()
+        } else if result_success {
+            action.done.clone()
+        } else {
+            action.base.clone()
+        }
+    };
+
     let (icon, header_detail) = tool_icon_and_detail(&tool_name, &tool_type);
 
     // A send-message card names its recipient in the header, so "who was
@@ -801,7 +814,7 @@ pub fn ToolCardView(
         let mode = tool_output_mode.get();
         if summary_hides_output
             && mode == ToolOutputMode::Summary
-            && chat_appearance.get() == crate::appearance::ChatAppearance::Ink
+            && chat_appearance.get().uses_ink_chrome()
         {
             ToolOutputMode::Compact
         } else {
@@ -833,15 +846,25 @@ pub fn ToolCardView(
                 // Purely decorative: the tool name beside it is the accessible
                 // label, so a screen reader announcing the emoji adds only noise.
                 <span class="tool-card-icon" aria-hidden="true">{icon}</span>
-                <span class="tool-card-name" title={let title = tool_name.clone(); move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then(|| title.clone())}>{tool_name.clone()}</span>
+                <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Notebook>
+                    <span class="tool-card-action">{action_label.clone()}</span>
+                </Show>
+                <span class="tool-card-name" title={let title = tool_name.clone(); move || chat_appearance.get().uses_ink_chrome().then(|| title.clone())}>{tool_name.clone()}</span>
                 <span class="ink-command-label">"Command"</span>
                 {move || header_detail().map(|d| view! {
-                    <span class="tool-card-detail" title={let title = d.clone(); move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then(|| title.clone())}>{d.clone()}</span>
+                    <span class="tool-card-detail" title={let title = d.clone(); move || chat_appearance.get().uses_ink_chrome().then(|| title.clone())}>{d.clone()}</span>
                 })}
-                {file_change.map(|(path, added, removed)| view! {
+                {file_change.map(|(path, added, removed)| {
+                    let short = short_path(&path);
+                    let shown = {
+                        let path = path.clone();
+                        move || if chat_appearance.get() == crate::appearance::ChatAppearance::Notebook { short.clone() } else { path.clone() }
+                    };
+                    view! {
                     <svg class="ink-file-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h6M9 16h6" /></svg>
-                    <span class="ink-file-path" title=path.clone()>{path.clone()}</span>
+                    <span class="ink-file-path" title=path>{shown}</span>
                     <span class="ink-file-counts"><span class="ink-file-added">{format!("+{added}")}</span><span class="ink-file-removed">{format!("−{removed}")}</span></span>
+                    }
                 })}
                 {completion_summary.map(|s| view! {
                     <span class="tool-completion-summary">{s}</span>
@@ -1446,6 +1469,120 @@ fn failed_result_body(result: Option<&ToolExecutionResult>) -> AnyView {
 }
 
 // ── Header bits ─────────────────────────────────────────────────────────
+
+/// Notebook's plain-language name for a tool call, in each tense its canonical
+/// status can take. Untyped tools are named by their own tool name, so the
+/// label never claims more than the request says.
+struct ToolAction {
+    base: String,
+    running: String,
+    done: String,
+}
+
+impl ToolAction {
+    fn of(name: &str, tool_type: &ToolRequestType) -> Self {
+        let plural = |count: usize, one: &str, many: &str| {
+            if count == 1 {
+                one.to_owned()
+            } else {
+                many.to_owned()
+            }
+        };
+        let (verb, running, done, object) = match tool_type {
+            ToolRequestType::ModifyFile { .. } => ("Edit", "Editing", "Edited", "file".to_owned()),
+            ToolRequestType::RunCommand { .. } => ("Run", "Running", "Ran", "command".to_owned()),
+            ToolRequestType::ReadFiles { file_paths } => (
+                "Read",
+                "Reading",
+                "Read",
+                plural(file_paths.len(), "file", "files"),
+            ),
+            ToolRequestType::SearchTypes { .. } => {
+                ("Search", "Searching", "Searched", "types".to_owned())
+            }
+            ToolRequestType::GetTypeDocs { .. } => {
+                ("Read", "Reading", "Read", "type docs".to_owned())
+            }
+            ToolRequestType::AskUserQuestion { questions, .. } => (
+                "Ask",
+                "Asking",
+                "Asked",
+                plural(questions.len(), "question", "questions"),
+            ),
+            ToolRequestType::ExitPlanMode { .. } => {
+                ("Propose", "Proposing", "Proposed", "plan".to_owned())
+            }
+            ToolRequestType::AgentSpawn { .. } => {
+                ("Start", "Starting", "Started", "agent".to_owned())
+            }
+            ToolRequestType::GenerateImage { .. } => {
+                ("Generate", "Generating", "Generated", "image".to_owned())
+            }
+            ToolRequestType::WebSearch { .. } => {
+                ("Search", "Searching", "Searched", "the web".to_owned())
+            }
+            ToolRequestType::ViewImage { .. } => ("View", "Viewing", "Viewed", "image".to_owned()),
+            ToolRequestType::Sleep { .. } => ("Wait", "Waiting", "Waited", String::new()),
+            ToolRequestType::TydeSendAgentMessage { .. } => {
+                ("Message", "Messaging", "Messaged", "agent".to_owned())
+            }
+            ToolRequestType::TydeAwaitAgents { agent_ids } => (
+                "Wait for",
+                "Waiting for",
+                "Waited for",
+                plural(agent_ids.len(), "agent", "agents"),
+            ),
+            ToolRequestType::Other { .. } => {
+                let label = humanized_tool_name(name);
+                return Self {
+                    base: label.clone(),
+                    running: label.clone(),
+                    done: label,
+                };
+            }
+        };
+        let phrase = |verb: &str| {
+            if object.is_empty() {
+                verb.to_owned()
+            } else {
+                format!("{verb} {object}")
+            }
+        };
+        Self {
+            base: phrase(verb),
+            running: phrase(running),
+            done: phrase(done),
+        }
+    }
+}
+
+/// `mcp__tyde-agent-control__tyde_create_workbench` → "Tyde create workbench";
+/// `WebFetch` → "Web fetch".
+fn humanized_tool_name(name: &str) -> String {
+    let local = name.rsplit_once("__").map_or(name, |(_, local)| local);
+    let mut words = String::with_capacity(local.len() + 4);
+    let mut previous: Option<char> = None;
+    for ch in local.chars() {
+        if ch == '_' || ch == '-' || ch.is_whitespace() {
+            if !words.is_empty() && !words.ends_with(' ') {
+                words.push(' ');
+            }
+        } else {
+            if ch.is_uppercase() && previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit())
+            {
+                words.push(' ');
+            }
+            words.extend(ch.to_lowercase());
+        }
+        previous = Some(ch);
+    }
+    let words = words.trim();
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
 
 fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static str, Option<String>) {
     match tool_type {

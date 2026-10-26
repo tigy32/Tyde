@@ -200,7 +200,7 @@ pub fn ChatView(
     // and subscribes to nothing here.
     let ink_state = state.clone();
     let ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>> = Memo::new(move |_| {
-        if ink_state.chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
+        if !ink_state.chat_appearance.get().uses_ink_chrome() {
             return None;
         }
         active_agent_id()?;
@@ -1567,7 +1567,7 @@ fn ChatNoticeView(
                 </div>
             }.into_any(),
             ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms }
-                if appearance.get() == crate::appearance::ChatAppearance::Ink => view! {
+                if appearance.get().uses_ink_chrome() => view! {
                 <details class="ink-retry" data-test="chat-notice-retry">
                     <summary>
                         <span>"Retry"</span>
@@ -2958,7 +2958,11 @@ mod wasm_tests {
         answer
             .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
-        for appearance in [ChatAppearance::Current, ChatAppearance::Ink] {
+        for appearance in [
+            ChatAppearance::Current,
+            ChatAppearance::Notebook,
+            ChatAppearance::Ink,
+        ] {
             state.chat_appearance.set(appearance);
             settle().await;
             let current_answer = container
@@ -3064,7 +3068,11 @@ mod wasm_tests {
             show_more.get_attribute("aria-expanded").as_deref(),
             Some("true")
         );
-        for appearance in [ChatAppearance::Current, ChatAppearance::Ink] {
+        for appearance in [
+            ChatAppearance::Current,
+            ChatAppearance::Notebook,
+            ChatAppearance::Ink,
+        ] {
             state.chat_appearance.set(appearance);
             settle().await;
             let current_body = container
@@ -3089,6 +3097,401 @@ mod wasm_tests {
                 "appearance changes retain the message output expansion"
             );
         }
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn notebook_sets_visible_actions_beside_prose_and_flow_fills_the_pane() {
+        use crate::appearance::ChatAppearance;
+        use crate::state::ToolOutputMode;
+        ensure_styles_loaded();
+        let container = make_container();
+        container.style().set_property("width", "960px").unwrap();
+        container.style().set_property("height", "900px").unwrap();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-notebook".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-notebook".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_042)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        state.chat_appearance.set(ChatAppearance::Notebook);
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        let assistant = |text: &str| {
+            let mut message = mk_user_msg(text).message;
+            message.sender = MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            };
+            message
+        };
+        let long_token = "unbroken".repeat(60);
+        let tools = [
+            ("notebook-ok", "Bash", "python3 first.py"),
+            ("notebook-fail", "Bash", "python3 second.py"),
+            (
+                "notebook-mcp",
+                "mcp__tyde-agent-control__tyde_create_workbench",
+                "",
+            ),
+        ];
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Inspect the workspace").message,
+        ));
+        for (index, (tool_call_id, tool_name, command)) in tools.into_iter().enumerate() {
+            let text = match index {
+                0 => "I'll inspect the workspace.".to_owned(),
+                2 => format!("Both probes ran. {long_token}"),
+                _ => String::new(),
+            };
+            dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: Some("claude-test".to_owned()),
+            }));
+            if !text.is_empty() {
+                dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                    text: text.clone(),
+                }));
+            }
+            let tool_type = if command.is_empty() {
+                protocol::ToolRequestType::Other {
+                    args: serde_json::json!({ "name": "notebook" }),
+                }
+            } else {
+                protocol::ToolRequestType::RunCommand {
+                    command: command.to_owned(),
+                    working_directory: "/workspace".to_owned(),
+                }
+            };
+            dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_type,
+            }));
+            let outcome = match index {
+                0 => protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout: "ok\n".to_owned(),
+                        stderr: String::new(),
+                    },
+                },
+                1 => protocol::ToolExecutionOutcome::Failed {
+                    message: "Probe failed".to_owned(),
+                    details: None,
+                    normalization_failure: None,
+                    result: None,
+                },
+                _ => protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::Other {
+                        result: serde_json::json!({ "created": true }),
+                    },
+                },
+            };
+            dispatch(ChatEvent::ToolExecutionCompleted(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.to_owned(),
+                    outcome,
+                },
+            ));
+            let mut message = assistant(&text);
+            message.tool_calls.push(protocol::ToolUseData {
+                tool_call_id: tool_call_id.to_owned(),
+                name: tool_name.to_owned(),
+                arguments: serde_json::json!({}),
+                content_offset: None,
+            });
+            dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
+        }
+
+        async fn settle() {
+            next_tick().await;
+            next_animation_frame().await;
+            next_animation_frame().await;
+        }
+        let window = web_sys::window().unwrap();
+        let text_of = |element: &Element| element.text_content().unwrap_or_default();
+        let visible = |selector: &str| {
+            let nodes = container.query_selector_all(selector).unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
+                .collect::<Vec<_>>()
+        };
+        let headers = || {
+            let headers = visible(".tool-card-header");
+            [
+                "python3 first.py",
+                "python3 second.py",
+                "tyde_create_workbench",
+            ]
+            .iter()
+            .map(|needle| {
+                headers
+                    .iter()
+                    .find(|header| text_of(header).contains(needle))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("action {needle} stays visible"))
+            })
+            .collect::<Vec<_>>()
+        };
+        let part = |header: &Element, selector: &str| {
+            header
+                .query_selector(selector)
+                .unwrap()
+                .filter(|element| element.get_bounding_client_rect().height() > 0.0)
+        };
+        let prose = || {
+            visible(".chat-card-assistant .chat-card-body")
+                .into_iter()
+                .find(|body| text_of(body).contains("inspect the workspace"))
+                .expect("assistant prose")
+        };
+        let user_text = || {
+            visible(".chat-card-user .chat-card-body")
+                .into_iter()
+                .next()
+                .expect("user prose")
+        };
+        let font_px = |element: &Element| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-size")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+        };
+        let no_horizontal_overflow = |context: &str| {
+            let messages = container.query_selector(".chat-messages").unwrap().unwrap();
+            assert!(
+                messages.scroll_width() <= messages.client_width(),
+                "{context}: the transcript never scrolls sideways ({} > {})",
+                messages.scroll_width(),
+                messages.client_width()
+            );
+            let bounds = messages.get_bounding_client_rect();
+            for header in headers() {
+                let rect = header.get_bounding_client_rect();
+                assert!(
+                    rect.left() >= bounds.left() && rect.right() <= bounds.right() + 0.5,
+                    "{context}: every action stays on screen"
+                );
+            }
+        };
+
+        settle().await;
+        let wide = headers();
+        let labels: Vec<String> = wide
+            .iter()
+            .map(|header| {
+                part(header, ".tool-card-action")
+                    .map(|label| text_of(&label))
+                    .expect("each action reads as words")
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["Ran command", "Run command", "Tyde create workbench"],
+            "actions carry human labels in their real outcome"
+        );
+        for (header, name) in wide.iter().zip([
+            "Bash",
+            "Bash",
+            "mcp__tyde-agent-control__tyde_create_workbench",
+        ]) {
+            assert_eq!(
+                part(header, ".tool-card-name")
+                    .map(|name| text_of(&name))
+                    .as_deref(),
+                Some(name),
+                "the real tool identity stays visible beside its label"
+            );
+        }
+        assert!(
+            part(&wide[0], ".tool-card-detail")
+                .is_some_and(|detail| text_of(&detail).contains("python3 first.py")),
+            "the command itself stays visible"
+        );
+        assert!(text_of(&wide[1]).contains("Failed"));
+        assert!(
+            wide.windows(2)
+                .all(|pair| pair[0].get_bounding_client_rect().top()
+                    < pair[1].get_bounding_client_rect().top()),
+            "actions stay chronological"
+        );
+        let body = prose().get_bounding_client_rect();
+        let action = wide[0].get_bounding_client_rect();
+        assert!(
+            action.left() - body.right() >= 24.0,
+            "wide panes separate actions from prose: prose ends {}, action starts {}",
+            body.right(),
+            action.left()
+        );
+        assert!(
+            action.top() < body.bottom() && body.top() < action.bottom(),
+            "an action sits beside the prose it belongs to"
+        );
+        assert!(
+            action.width() >= 240.0 && body.width() >= 480.0,
+            "neither column collapses: prose {}px, actions {}px",
+            body.width(),
+            action.width()
+        );
+        let user = user_text().get_bounding_client_rect();
+        assert!(
+            (user.left() - body.left()).abs() < 1.0 && user.right() <= action.left(),
+            "the user's words read in the prose column, not a right bubble"
+        );
+        assert!(
+            font_px(&prose()) > font_px(&part(&wide[0], ".tool-card-action").unwrap()),
+            "prose reads larger than activity"
+        );
+        no_horizontal_overflow("wide");
+
+        let cards: Vec<web_sys::HtmlDetailsElement> = wide
+            .iter()
+            .map(|header| header.parent_element().unwrap().dyn_into().unwrap())
+            .collect();
+        assert!(cards.iter().all(|card| !card.open()));
+        state.tool_output_mode.set(ToolOutputMode::Summary);
+        settle().await;
+        wide[0].dyn_ref::<HtmlElement>().unwrap().click();
+        settle().await;
+        let stdout = cards[0]
+            .query_selector(".tool-result-stdout")
+            .unwrap()
+            .expect("an explicitly opened action shows its output");
+        assert_eq!(stdout.text_content().unwrap().trim(), "ok");
+        assert!(stdout.get_bounding_client_rect().height() > 0.0);
+        assert!(!cards[1].open(), "Summary opens only the requested output");
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        settle().await;
+        assert!(
+            cards.iter().all(|card| card.open()),
+            "Full opens every output"
+        );
+        state.tool_output_mode.set(ToolOutputMode::Compact);
+        settle().await;
+
+        container.style().set_property("width", "600px").unwrap();
+        settle().await;
+        let narrow = headers();
+        let body = prose().get_bounding_client_rect();
+        let action = narrow[0].get_bounding_client_rect();
+        assert!(
+            action.top() >= body.bottom() && action.left() >= body.left(),
+            "narrow panes stack actions under their prose"
+        );
+        assert!(
+            body.width() >= 480.0,
+            "narrow prose keeps the whole pane: {}px",
+            body.width()
+        );
+        no_horizontal_overflow("narrow");
+        container.style().set_property("width", "960px").unwrap();
+        settle().await;
+
+        let root = window
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let original_style = root.get_attribute("style");
+        root.style()
+            .set_property("--font-sans", "monospace")
+            .unwrap();
+        for size in [11.0, 20.0] {
+            root.style()
+                .set_property("--base-font-size", &format!("{size}px"))
+                .unwrap();
+            settle().await;
+            let body = prose();
+            let ratio = font_px(&body) / size;
+            assert!(
+                (ratio - 1.154).abs() < 0.01,
+                "Notebook prose scales with the configured size: {ratio}"
+            );
+            assert!(
+                window
+                    .get_computed_style(&body)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("font-family")
+                    .unwrap()
+                    .contains("monospace"),
+                "Notebook honors the selected typeface"
+            );
+            no_horizontal_overflow("custom font");
+        }
+        match original_style {
+            Some(style) => root.set_attribute("style", &style).unwrap(),
+            None => root.remove_attribute("style").unwrap(),
+        }
+
+        let no_notebook_labels = |style: &str| {
+            for header in headers() {
+                let text = text_of(&header);
+                for label in ["Ran command", "Run command", "Tyde create workbench"] {
+                    assert!(
+                        !text.contains(label),
+                        "{style} keeps its existing action rows without \"{label}\""
+                    );
+                }
+            }
+        };
+        state.chat_appearance.set(ChatAppearance::Ink);
+        settle().await;
+        no_notebook_labels("Flow");
+        let messages = container.query_selector(".chat-messages").unwrap().unwrap();
+        let bounds = messages.get_bounding_client_rect();
+        let style = window.get_computed_style(&messages).unwrap().unwrap();
+        let inset = |side: &str| {
+            style
+                .get_property_value(&format!("padding-{side}"))
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+        };
+        let pane_right = bounds.left() + f64::from(messages.client_width()) - inset("right");
+        let body = prose().get_bounding_client_rect();
+        assert!(
+            (body.left() - (bounds.left() + inset("left"))).abs() < 1.0
+                && (pane_right - body.right()).abs() < 1.0,
+            "Flow prose fills the chat pane between its gutters: {}..{} of {}..{}",
+            body.left(),
+            body.right(),
+            bounds.left() + inset("left"),
+            pane_right
+        );
+        no_horizontal_overflow("Flow");
+
+        state.chat_appearance.set(ChatAppearance::Current);
+        settle().await;
+        no_notebook_labels("Default");
+        assert_eq!(visible(".tool-card-header").len(), 3);
         drop(handle);
         container.remove();
     }

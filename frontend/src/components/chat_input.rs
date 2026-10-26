@@ -1783,7 +1783,7 @@ pub fn ChatInput(
         let observed_textarea = textarea.clone();
         let observed_measure = measure.clone();
         let callback = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
-            if sizing_appearance.get_untracked() == crate::appearance::ChatAppearance::Ink {
+            if sizing_appearance.get_untracked().uses_ink_chrome() {
                 resize_composer(&textarea, &measure);
             }
         });
@@ -2041,7 +2041,7 @@ pub fn ChatInput(
                         }}
                     </div>
                 </Show>
-                <Show when=move || can_attach.get() && chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                <Show when=move || can_attach.get() && chat_appearance.get().uses_ink_chrome()>
                     <button
                         class="ink-composer-attach"
                         type="button"
@@ -3807,66 +3807,69 @@ mod wasm_tests {
             .set("Keep this draft".to_owned());
         for width in ["800px", "390px"] {
             container.style().set_property("width", width).unwrap();
-            state
-                .chat_appearance
-                .set(crate::appearance::ChatAppearance::Ink);
-            next_tick().await;
-            // Ink attaches running work as a tab inside the input area, above
-            // the composer box; the shimmer outlines the box, not the tab.
-            let bounds = ring.get_bounding_client_rect();
-            let area = query(&container, ".chat-input-content")
-                .expect("composer box")
-                .get_bounding_client_rect();
-            for (actual, expected) in [
-                (bounds.top(), area.top()),
-                (bounds.bottom(), area.bottom()),
-                (bounds.left(), area.left()),
-                (bounds.right(), area.right()),
+            for appearance in [
+                crate::appearance::ChatAppearance::Ink,
+                crate::appearance::ChatAppearance::Notebook,
             ] {
-                assert!((actual - expected).abs() < 0.5, "Ink outlines the composer");
+                state.chat_appearance.set(appearance);
+                next_tick().await;
+                // Ink attaches running work as a tab inside the input area, above
+                // the composer box; the shimmer outlines the box, not the tab.
+                let bounds = ring.get_bounding_client_rect();
+                let area = query(&container, ".chat-input-content")
+                    .expect("composer box")
+                    .get_bounding_client_rect();
+                for (actual, expected) in [
+                    (bounds.top(), area.top()),
+                    (bounds.bottom(), area.bottom()),
+                    (bounds.left(), area.left()),
+                    (bounds.right(), area.right()),
+                ] {
+                    assert!((actual - expected).abs() < 0.5, "Ink outlines the composer");
+                }
+                let tab = query(&container, "[data-testid='ink-activity']")
+                    .expect("Ink attaches the running child to the composer")
+                    .get_bounding_client_rect();
+                assert!(
+                    (tab.bottom() - bounds.top()).abs() < 0.5,
+                    "the activity tab sits on the shimmer, never under it"
+                );
+                assert_eq!(prop("padding-top"), "1px");
+                assert_eq!(
+                    prop("mask-composite"),
+                    "exclude, exclude",
+                    "Ink leaves the center clear"
+                );
+                assert_eq!(prop("border-top-left-radius"), "9px");
+                assert_eq!(prop("animation-duration"), "1.6s");
+                seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &800.into())
+                    .unwrap();
+                assert_eq!(prop("background-position"), "0% 0px");
+                let content = query(&container, ".chat-input-content").unwrap();
+                textarea.blur().unwrap();
+                let neutral_border = window
+                    .get_computed_style(&content)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("border-top-color")
+                    .unwrap();
+                textarea.focus().unwrap();
+                let focused_border = window
+                    .get_computed_style(&content)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("border-top-color")
+                    .unwrap();
+                assert_eq!(
+                    focused_border, neutral_border,
+                    "focusing a working composer must not erase the shimmer with a same-color solid border"
+                );
+                assert_eq!(textarea.value(), "Keep this draft");
+                assert!(
+                    window.document().unwrap().active_element()
+                        == Some(textarea.clone().unchecked_into())
+                );
             }
-            let tab = query(&container, "[data-testid='ink-activity']")
-                .expect("Ink attaches the running child to the composer")
-                .get_bounding_client_rect();
-            assert!(
-                (tab.bottom() - bounds.top()).abs() < 0.5,
-                "the activity tab sits on the shimmer, never under it"
-            );
-            assert_eq!(prop("padding-top"), "1px");
-            assert_eq!(
-                prop("mask-composite"),
-                "exclude, exclude",
-                "Ink leaves the center clear"
-            );
-            assert_eq!(prop("border-top-left-radius"), "9px");
-            assert_eq!(prop("animation-duration"), "1.6s");
-            seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &800.into())
-                .unwrap();
-            assert_eq!(prop("background-position"), "0% 0px");
-            let content = query(&container, ".chat-input-content").unwrap();
-            textarea.blur().unwrap();
-            let neutral_border = window
-                .get_computed_style(&content)
-                .unwrap()
-                .unwrap()
-                .get_property_value("border-top-color")
-                .unwrap();
-            textarea.focus().unwrap();
-            let focused_border = window
-                .get_computed_style(&content)
-                .unwrap()
-                .unwrap()
-                .get_property_value("border-top-color")
-                .unwrap();
-            assert_eq!(
-                focused_border, neutral_border,
-                "focusing a working composer must not erase the shimmer with a same-color solid border"
-            );
-            assert_eq!(textarea.value(), "Keep this draft");
-            assert!(
-                window.document().unwrap().active_element()
-                    == Some(textarea.clone().unchecked_into())
-            );
             state
                 .chat_appearance
                 .set(crate::appearance::ChatAppearance::Current);

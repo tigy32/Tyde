@@ -465,7 +465,7 @@ pub(crate) fn session_settings_views(
         }
     });
     Effect::new(move |focused: Option<bool>| {
-        if !expanded.get() || chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
+        if !expanded.get() || !chat_appearance.get().uses_ink_chrome() {
             return false;
         }
         if focused == Some(true) {
@@ -701,7 +701,7 @@ pub(crate) fn session_settings_views(
 
     let inline = view! {
         <div class="ink-session-slot">
-            <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+            <Show when=move || chat_appearance.get().uses_ink_chrome()>
             {move || match schema_status.get() {
                 Some((backend, Some(SessionSchemaEntry::Ready { schema }))) if !schema.fields.is_empty() => {
                     let label = header_label(backend);
@@ -750,22 +750,22 @@ pub(crate) fn session_settings_views(
                                 <TaskUsageBadge rollup=task_rollup binding=current_binding />
                             </div>
                             <Show when=move || expanded.get()>
-                                <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                                <Show when=move || chat_appearance.get().uses_ink_chrome()>
                                     <div class="ink-session-backdrop" on:click=move |_| close_inline.run(())></div>
                                 </Show>
                                 <div class="session-settings-panel"
                                     node_ref=inline_panel
-                                    role=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("dialog")
-                                    aria-label=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("Model and session settings")
-                                    tabindex=move || (chat_appearance.get() == crate::appearance::ChatAppearance::Ink).then_some("-1")
+                                    role=move || chat_appearance.get().uses_ink_chrome().then_some("dialog")
+                                    aria-label=move || chat_appearance.get().uses_ink_chrome().then_some("Model and session settings")
+                                    tabindex=move || chat_appearance.get().uses_ink_chrome().then_some("-1")
                                     on:keydown=move |event: leptos::ev::KeyboardEvent| {
-                                        if event.key() == "Escape" && chat_appearance.get() == crate::appearance::ChatAppearance::Ink {
+                                        if event.key() == "Escape" && chat_appearance.get().uses_ink_chrome() {
                                             event.prevent_default();
                                             close_inline.run(());
                                         }
                                     }
                                 >
-                                    <Show when=move || chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                                    <Show when=move || chat_appearance.get().uses_ink_chrome()>
                                     <div class="ink-session-panel-heading">
                                         <span>"Model and session settings"</span>
                                         <button type="button" aria-label="Close session settings" on:click=move |_| close_inline.run(())>"×"</button>
@@ -970,7 +970,7 @@ fn TaskUsageBadge(
             .map(|payload| format!("session-task-popover-{}", payload.root_agent_id))
     });
     view! {
-        <Show when=move || chat_appearance.get() != crate::appearance::ChatAppearance::Ink || rollup.with(|payload| payload.is_some())>
+        <Show when=move || !chat_appearance.get().uses_ink_chrome() || rollup.with(|payload| payload.is_some())>
         <span class="session-task-usage" node_ref=wrapper_ref>
             <button class="session-task-toggle" node_ref=toggle_ref aria-haspopup="dialog"
                 aria-expanded=move || open.get().to_string() aria-controls=move || popover_id.get()
