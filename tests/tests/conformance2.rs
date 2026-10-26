@@ -7401,18 +7401,32 @@ fn protected_web_search_prompt(backend: BackendKind) -> String {
         BackendKind::Kiro => "native web_search tool",
         _ => "native provider's built-in web-search tool",
     };
+    let invocation = match backend {
+        BackendKind::Codex => {
+            "Use web.run directly when exposed. In code mode, invoke only \
+            tools.web__run with search_query containing that single query; do not discover \
+            or list tools, log, or invoke anything else."
+        }
+        _ => "Use the native search tool directly.",
+    };
     format!(
-        "This is an authorized native web-search probe in this read-only session. First emit a \
+        "This is an authorized native web-search probe. First emit a \
          short assistant preamble containing {NATIVE_WEB_SEARCH_PREAMBLE} before using any \
          tool. Then use your {tool} exactly once with the single search query exactly \
          `{NATIVE_WEB_SEARCH_QUERY}`. Do not alter the query, issue multiple queries, fetch or \
-         open a result, or use a shell, code-mode wrapper, MCP tool, or any other tool. After \
+         open a result, or use a shell, MCP tool, or any other tool. {invocation} After \
          the real search result completes, reply with exactly {MAPPED_WEB_MARKER} and nothing \
          else. Do not include that final marker in your preamble."
     )
 }
 
 fn assert_protected_web_search(turn: &Turn) {
+    eprintln!(
+        "native web search tool evidence: names={:?}",
+        turn.tool_requests()
+            .map(|request| request.tool_name.as_str())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         turn.tool_requests().count(),
         1,
@@ -7423,20 +7437,19 @@ fn assert_protected_web_search(turn: &Turn) {
         .next()
         .expect("the single native search request was verified");
     let ToolRequestType::WebSearch { query } = &request.tool_type else {
+        eprintln!(
+            "native web search unexpected tool: name={}",
+            request.tool_name
+        );
         panic!("protected search must expose a canonical WebSearch request");
     };
-    // Every phase here is a rejoin. Codex starts a typed webSearch item with
-    // an empty query and delivers the invocation's raw arguments only on
-    // thread/start, so a rejoined card may carry no query. That is an
-    // accepted upstream limitation; a query that is shown must be exact.
-    eprintln!(
-        "protected web search evidence: backend={:?}; query_shown={}",
-        turn.backend(),
-        !query.is_empty()
-    );
     assert!(
-        query.is_empty() || query == NATIVE_WEB_SEARCH_QUERY,
-        "protected search must preserve the exact authorized query"
+        query == NATIVE_WEB_SEARCH_QUERY,
+        "native search must preserve the exact authorized query"
+    );
+    eprintln!(
+        "native web search evidence: backend={:?}; exact_query=true",
+        turn.backend()
     );
     let completions = turn
         .tool_completions()
@@ -7463,60 +7476,54 @@ fn assert_protected_web_search(turn: &Turn) {
 }
 
 async fn real_protected_native_web_search_lifecycle<B: Backend>(host: &mut Harness<B>) {
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::Unrestricted;
-    let (original, launched) = tokio::time::timeout(Duration::from_secs(90), async {
-        let prompt = launch_prompt();
-        let agent = spawn_agent(host, &prompt).await;
-        let turn = collect_turn(host, &agent, &prompt).await;
-        (agent, turn)
-    })
-    .await
-    .expect("native search source handshake exceeded its bound");
-    assert_ready_handshake(&launched);
-    assert_eq!(
-        launched.tool_requests().count(),
-        0,
-        "native search source handshake must not invoke a tool"
-    );
-    let session = original.session_id.clone();
-    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &original))
-        .await
-        .expect("native search source shutdown exceeded its bound");
+    for access_mode in [
+        protocol::BackendAccessMode::Unrestricted,
+        protocol::BackendAccessMode::EnforcedReadOnly,
+    ] {
+        host.config.resolved_spawn_config.access_mode = access_mode;
+        let handshake = launch_prompt();
+        let original = spawn_agent(host, &handshake).await;
+        let launched = collect_turn(host, &original, &handshake).await;
+        assert_ready_handshake(&launched);
+        assert_eq!(
+            launched.tool_requests().count(),
+            0,
+            "native search source handshake must not invoke a tool"
+        );
+        let prompt = protected_web_search_prompt(host.backend());
+        let searched_fresh = ask(host, &original, &prompt).await;
+        assert_protected_web_search(&searched_fresh);
+        eprintln!(
+            "native web search lifecycle: access_mode={access_mode:?}; phase=fresh; query_and_completion_verified=true"
+        );
+        let session = original.session_id.clone();
+        assert_clean_close(host, &original).await;
 
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-    let prompt = protected_web_search_prompt(host.backend());
-    let (forked, searched_fork) = tokio::time::timeout(Duration::from_secs(120), async {
-        let agent = fork_agent(host, &session, &prompt).await;
+        let forked = fork_agent(host, &session, &prompt).await;
         assert!(
-            agent.session_id != session,
+            forked.session_id != session,
             "native search fork must establish a new provider identity"
         );
-        let turn = collect_turn(host, &agent, &prompt).await;
-        (agent, turn)
-    })
-    .await
-    .expect("protected native fork search exceeded its bound");
-    assert_protected_web_search(&searched_fork);
-    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &forked))
-        .await
-        .expect("protected native fork shutdown exceeded its bound");
+        let searched_fork = collect_turn(host, &forked, &prompt).await;
+        assert_protected_web_search(&searched_fork);
+        eprintln!(
+            "native web search lifecycle: access_mode={access_mode:?}; phase=fork; query_and_completion_verified=true"
+        );
+        assert_clean_close(host, &forked).await;
 
-    let (resumed, searched_resume) = tokio::time::timeout(Duration::from_secs(120), async {
-        let agent = resume_agent(host, &session).await;
+        let resumed = resume_agent(host, &session).await;
         assert!(
-            agent.session_id == session,
+            resumed.session_id == session,
             "native search resume must preserve the original provider identity"
         );
-        let turn = ask(host, &agent, &prompt).await;
-        (agent, turn)
-    })
-    .await
-    .expect("protected native resumed search exceeded its bound");
-    assert_protected_web_search(&searched_resume);
-    assert_universal_contract(&[launched, searched_fork, searched_resume]);
-    tokio::time::timeout(Duration::from_secs(45), assert_clean_close(host, &resumed))
-        .await
-        .expect("protected native resumed shutdown exceeded its bound");
+        let searched_resume = ask(host, &resumed, &prompt).await;
+        assert_protected_web_search(&searched_resume);
+        eprintln!(
+            "native web search lifecycle: access_mode={access_mode:?}; phase=resume; query_and_completion_verified=true"
+        );
+        assert_universal_contract(&[launched, searched_fresh, searched_fork, searched_resume]);
+        assert_clean_close(host, &resumed).await;
+    }
 }
 conformance2_scenario!(
     real_protected_native_web_search_lifecycle,

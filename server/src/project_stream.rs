@@ -719,7 +719,7 @@ async fn run_project_subscription(
     mut snapshot: ProjectSnapshotState,
     mut watcher: Option<ProjectWatcher>,
     mut watched_roots: Vec<ProjectRootPath>,
-    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+    mut watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
     force_watch_limit: bool,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
@@ -1125,6 +1125,9 @@ async fn run_project_subscription(
             _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing && !subscribers.is_empty() => {
                 tracing::debug!(%project_id, "retrying project filesystem watcher initialization");
                 watched_roots = watchable_roots(&project);
+                // Retired watchers and their pending observations must not
+                // deliver errors into the replacement watcher's mailbox.
+                (watch_tx, watch_rx) = mpsc::unbounded_channel();
                 watcher_ready_rx = start_project_watcher(shared_watcher.clone(), watched_roots.clone(), watch_tx.clone(), force_watch_limit);
                 watcher_initializing = true;
             }
@@ -1133,7 +1136,7 @@ async fn run_project_subscription(
                 watcher_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
                 match maybe_watcher {
                     Some(Ok(mut ready_watcher)) => {
-                        for path in &observed_files {
+                        for path in observed_files.iter().filter(|path| watched_roots.contains(&path.root)) {
                             let observation = ready_watcher.observe(path).map(Some);
                             complete_after_file_watch(&mut observation_tasks, watch_tx.clone(), observation, || {});
                         }
@@ -1141,11 +1144,17 @@ async fn run_project_subscription(
                         invalidate_file_views(&mut subscribers, None, &watcher_roots);
                         if watcher_warning.take().is_some() {
                             tracing::info!(%project_id, observed_files = observed_files.len(), "project filesystem watching recovered");
-                            // Changes during the watch gap have no OS events to replay.
-                            for path in &observed_files {
-                                let version = bump_file_version(&mut file_versions, path);
-                                pending_file_version_changes.insert(path.clone(), version);
-                            }
+                        }
+                        // Every adoption closes a watch gap and discards retired
+                        // content events, including root changes with no warning.
+                        for path in &observed_files {
+                            let version = bump_file_version(&mut file_versions, path);
+                            pending_file_version_changes.insert(path.clone(), version);
+                        }
+                        tracing::debug!(%project_id, watched_roots = watched_roots.len(), observed_files = observed_files.len(), deferred_observations = observed_files.iter().filter(|path| !watched_roots.contains(&path.root)).count(), "project filesystem watcher adopted; observed versions invalidated");
+                        #[cfg(feature = "test-support")]
+                        for root in &watched_roots {
+                            scan_test_support::run(Path::new(&root.0), scan_test_support::ScanPoint::WatcherAdopted);
                         }
                         pending_update.merge(PendingProjectUpdate { files: true, git: true });
                         debounce_active = true;
@@ -4253,6 +4262,8 @@ pub mod scan_test_support {
         WatcherInitialize,
         WatcherInitialized,
         WatcherReady,
+        WatcherAdopted,
+        WatcherQueued,
         WatcherProcess,
         WatcherReconcile,
         WatcherProcessed,

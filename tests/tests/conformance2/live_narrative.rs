@@ -258,8 +258,8 @@ pub async fn interrupted_held_request<B: Backend>(
         "the held request's interrupt must be reported exactly once"
     );
     let follow_up = ask(host, agent, prompt).await;
-    eprintln!("REQUEST INTERRUPT EVIDENCE phase={phase} request_held=true follow_up_answered=true");
     super::super::assert_ready_handshake(&follow_up);
+    eprintln!("REQUEST INTERRUPT EVIDENCE phase={phase} request_held=true follow_up_answered=true");
     follow_up
 }
 

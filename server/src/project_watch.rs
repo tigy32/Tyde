@@ -40,6 +40,14 @@ impl EventSink {
         if self.pending.fetch_add(1, Ordering::Relaxed) < 128 {
             if self.tx.send(Command::Event(event.clone())).is_err() {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                #[cfg(feature = "test-support")]
+                for path in &event.paths {
+                    crate::project_stream::scan_test_support::run(
+                        path,
+                        crate::project_stream::scan_test_support::ScanPoint::WatcherQueued,
+                    );
+                }
             }
             false
         } else {

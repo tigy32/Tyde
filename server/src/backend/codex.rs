@@ -4002,38 +4002,6 @@ impl CodexResponseSplitter {
         self.suppressed_raw_tool_requests.shift_remove(call_id)
     }
 
-    fn suppressed_web_search_query(&self, native_item_id: Option<&str>) -> Option<String> {
-        if let Some(request) =
-            native_item_id.and_then(|id| self.suppressed_raw_tool_requests.get(id))
-            && request.tool_name == "web.run"
-        {
-            // Native direct web.run starts with an empty typed query; the same
-            // call ID binds its exact original JSON arguments, not model text.
-            let queries = request.arguments.get("search_query")?.as_array()?;
-            tracing::debug!(
-                source = "native_direct_web_arguments",
-                native_identity_matched = true,
-                query_count = queries.len(),
-                "Resolving native web query from its original invocation"
-            );
-            let [query] = queries.as_slice() else {
-                return None;
-            };
-            return query
-                .get("q")?
-                .as_str()
-                .filter(|query| !query.trim().is_empty())
-                .map(str::to_owned);
-        }
-        let mut queries = self
-            .suppressed_raw_tool_requests
-            .values()
-            .filter_map(|request| request.arguments.as_str())
-            .filter_map(codex_web_search_query_from_source);
-        let query = queries.next()?;
-        queries.next().is_none().then_some(query)
-    }
-
     fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
         let owner = self.pending_raw_tool_owners.shift_remove(call_id);
         if let Some(owner) = owner.as_ref() {
@@ -16050,58 +16018,20 @@ let stream_key = stream_key.as_str();
                 .await;
             }
             "webSearch" => {
+                eprintln!(
+                    "TYDE CODEX WEB SEARCH phase=started query_present={}",
+                    item.get("query")
+                        .and_then(Value::as_str)
+                        .is_some_and(|query| !query.is_empty())
+                );
                 tracing::debug!(?item, "Codex started a native webSearch item");
                 let item_id = self
                     .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "web_search")
                     .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
-                let query = item
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .filter(|query| !query.trim().is_empty())
-                    .map(str::to_owned);
-                let query = match query {
-                    Some(query) => query,
-                    None => {
-                        // Native direct and code-mode web calls can start with
-                        // an empty typed query. Retain the actual invocation's query.
-                        // Resumed and forked sessions receive no raw invocation
-                        // from upstream Codex, so their card keeps the empty
-                        // query; that is an accepted upstream limitation.
-                        let notification_thread_id = notification_thread_id.clone();
-                        let provider_item_id =
-                            item.get("id").and_then(Value::as_str).map(str::to_owned);
-                        self.state
-                            .with(move |state| {
-                                notification_thread_id
-                                    .as_deref()
-                                    .and_then(|thread_id| {
-                                        state
-                                            .response_projections
-                                            .get(thread_id)
-                                            .and_then(CodexResponseProjection::responses)
-                                    })
-                                    .and_then(|splitter| {
-                                        splitter.suppressed_web_search_query(
-                                            provider_item_id.as_deref(),
-                                        )
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .await
-                    }
-                };
-                self.emit_tool_request(
-                    &item_id,
-                    "web_search",
-                    CodexToolRequest::from_item(
-                        item,
-                        serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
-                            .expect("serialize Codex web search request"),
-                    ),
-                )
-                .await;
+                // The native completion carries the action query. Do not
+                // publish an empty start or reconstruct code-mode arguments.
             }
             "imageView" => {
                 tracing::debug!(?item, "Codex started a native imageView item");
@@ -16716,7 +16646,44 @@ let stream_key = stream_key.as_str();
                     .await;
                 self.complete_image_generation(&item_id, item).await;
             }
-            "webSearch" | "imageView" | "sleep" => {
+            "webSearch" => {
+                eprintln!(
+                    "TYDE CODEX WEB SEARCH phase=completed query_present={}",
+                    item.get("query")
+                        .and_then(Value::as_str)
+                        .is_some_and(|query| !query.is_empty())
+                );
+                let Some(provider_item_id) = item_id.filter(|id| !id.trim().is_empty()) else {
+                    self.emitter
+                        .backend_error("Codex completed a web search without an item identity");
+                    return;
+                };
+                let Some(query) = item.get("query").and_then(Value::as_str) else {
+                    self.emitter
+                        .backend_error("Codex completed a web search without a query");
+                    return;
+                };
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, "web_search")
+                    .await;
+                if !self.emitter.has_known_tool_request(&item_id) {
+                    let mut request = CodexToolRequest::from_item(
+                        item,
+                        json!(protocol::ToolRequestType::WebSearch {
+                            query: query.to_owned(),
+                        }),
+                    );
+                    request.native_provider_item_id = Some(provider_item_id.to_owned());
+                    self.emit_tool_request(&item_id, "web_search", request)
+                        .await;
+                    tracing::debug!(
+                        query_present = !query.trim().is_empty(),
+                        "Codex projected the native web-search completion query"
+                    );
+                }
+                self.complete_native_tool(&item_id, item_type).await;
+            }
+            "imageView" | "sleep" => {
                 let tool_name = codex_native_tool_completion(item_type)
                     .map(|(tool_name, _)| tool_name)
                     .unwrap_or(item_type);
@@ -19379,21 +19346,6 @@ fn codex_image_generation_prompt(item: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .map(str::to_owned)
-}
-
-fn codex_web_search_query_from_source(source: &str) -> Option<String> {
-    let source = source.split_once("tools.web__run")?.1;
-    let search = source.split_once("search_query")?.1;
-    let encoded = search
-        .split_once("\"q\":")
-        .or_else(|| search.split_once("q:"))?
-        .1
-        .trim_start();
-    serde_json::Deserializer::from_str(encoded)
-        .into_iter::<String>()
-        .next()?
-        .ok()
-        .filter(|query| !query.trim().is_empty())
 }
 
 fn codex_native_tool_completion(item_type: &str) -> Option<(&'static str, Value)> {

@@ -116,9 +116,10 @@ preserving the native call ID and exactly one tool card.
 
 Upstream Codex delivers raw-response events only on `thread/start`; Resume
 and Fork receive typed items only. A resumed or forked session therefore shows
-no card for a command rejected before it starts, or for raw-only polling, and
-its web-search card has no query. Tyde accepts this upstream limitation: it
-reconstructs nothing and shows no warning.
+no card for a command rejected before it starts, or for raw-only polling.
+Tyde accepts these upstream limitations: it reconstructs nothing and shows no
+warning. Native web-search completion items do carry the actual query after
+rejoin; Tyde projects that query directly into the search card.
 Protected Resume and Fork use the same rejoin path as unrestricted sessions;
 the native sandbox alone enforces read-only.
 

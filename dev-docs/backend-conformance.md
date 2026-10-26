@@ -1717,8 +1717,12 @@ and the native sandbox remains the only read-only enforcement.
 
 Known limitation: raw-only polling (`write_stdin` cells and `wait`
 continuations) and commands rejected before they start are not shown after
-rejoin, and a rejoined web-search card has no query. No card or argument is
-fabricated or reconstructed from provider history.
+rejoin. No card or argument is fabricated or reconstructed from provider
+history. Web-search queries are not a raw-event limitation: typed native
+`item/completed` notifications carry the actual query on fresh, resumed and
+forked sessions. The adapter declares the search from that completion rather
+than publishing an empty start query or guessing arguments from code-mode
+source.
 
 `real_watched_command_shows_every_interaction` keeps the full polling oracle
 for the fresh session. A rejoined turn must show either no `write_stdin` or
@@ -1731,9 +1735,12 @@ after idle.
 denied-write oracle for fresh sessions. A protected Fork or Resume turn may
 show no write-command card; any card shown must satisfy the full oracle. Every
 phase must still leave the protected files unchanged, create none, and report
-`WRITE_BLOCKED`. `real_protected_native_web_search_lifecycle` accepts an
-empty query on its rejoined search card; a shown query must be exact, and the
-card must still complete successfully once and in order.
+`WRITE_BLOCKED`. `real_protected_native_web_search_lifecycle` requires the
+exact authorized query on fresh, forked and resumed search cards in both
+unrestricted and enforced-read-only modes. Each phase must expose exactly one
+request and one correlated successful completion, in preamble/search/final
+order, while preserving session identity and the universal usage contract.
+Only Codex declares all four required capabilities.
 
 `real_narrative_streams_live` routes real inference bytes through a local
 proxy using a temporary `CODEX_HOME` with copied auth. Per armed phase the
@@ -1779,10 +1786,37 @@ no write card. With the rejoin oracle, `real_enforced_read_only`,
 `real_enforced_file_access` (Codex and Claude) and `real_review_context_forks`
 (Codex) passed (`1d02fc7f-7dfc-44d6-8dbe-12f769d06053`). Codex showed no write
 card on all four rejoined phases; Claude showed full cards.
-`real_protected_native_web_search_lifecycle` passed with no query shown on
-either rejoined card (`56915040-760b-4252-afb9-77a636ba6b76`). Content-free
+The old `real_protected_native_web_search_lifecycle` run accepted no query on
+either rejoined card (`56915040-760b-4252-afb9-77a636ba6b76`). Final review
+identified this as a Tyde regression hidden by a weakened oracle, not an
+upstream limitation: typed completions already contained the query. The
+strict exact-query oracle is restored and extended to both access modes.
+Content-free
 logs are retained under `/home/tyggs/tyde-evidence/codex-beta8-recovery/` and
 `/home/tyggs/tyde-evidence/codex-drop-native-trace/`.
+
+The recovery's restored strict oracle failed on unchanged `60b26902` at the
+unrestricted fork (`23d36258-610b-4372-bb6f-ac5e27dbc5a1`), after fresh search
+passed. Direct completion projection then passed all six fresh/fork/resume
+phases across both access modes on Codex `gpt-6-luna`, low reasoning
+(`1d236fef-c29f-4845-907b-1c8082ffde93`, 32.2 seconds). Diagnostics confirm
+empty native starts and populated native completions, without logging queries
+or provider identities. The unrestricted prompt permits the required native
+code-mode invocation; the one-request, exact-query and chronology oracles are
+identical in both modes. Full receipts, including harness and prompt failures,
+are retained in `/home/tyggs/tyde-evidence/codex-final-review-findings/`.
+
+The final scoped Codex run (`a44d1ba8-7817-442c-9d4e-04380ec3b0fd`) passed
+the query lifecycle (33.7 seconds), enforced read-only flow, and live narrative
+flow (70.1 seconds). Live narrative retained all seven terminal holds/releases,
+interrupted text and stored reload, exact four-request/four-response boundaries,
+and successful protected resume/fork follow-ups. Read-only checks retained
+unchanged existing files and absence of newly created files. No sandbox,
+interrupt, response-boundary or usage code changed in the query correction.
+A disposable desktop instance reached typed readiness but its WebKit process
+then terminated with `exceeded_memory_limit`; rendered-query QA is blocked,
+not passed. Its failure and supported cleanup receipt are retained alongside
+the provider results.
 
 ## Claude reviewer native configuration
 

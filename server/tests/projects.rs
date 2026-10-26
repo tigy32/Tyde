@@ -1814,6 +1814,8 @@ async fn unavailable_project_root_keeps_other_roots_live() {
     let parent = tempfile::tempdir().unwrap();
     let missing = parent.path().join("moved-away");
 
+    let (adoption, adopted) =
+        watch_completion(&fixture, repo_a.path(), server::ScanPoint::WatcherAdopted);
     let project = create_project(
         &mut fixture.client,
         "Missing Root",
@@ -1848,6 +1850,13 @@ async fn unavailable_project_root_keeps_other_roots_live() {
         "Git status covers the readable roots only"
     );
 
+    adopted.await.unwrap();
+    drop(adoption);
+    let healthy_path = ProjectPath {
+        root: ProjectRootPath(project_root(&project, 0)),
+        relative_path: "src/lib.rs".to_owned(),
+    };
+    let mut retired_reader = fixture.connect().await;
     fixture
         .client
         .project_read_file(
@@ -1870,6 +1879,167 @@ async fn unavailable_project_root_keeps_other_roots_live() {
     })
     .await;
 
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocked = fixture.on_project_scan(
+        repo_b.path().join("app/retirement-trigger"),
+        server::ScanPoint::WatcherReconcile,
+        move || {
+            let _ = blocked_tx.send(());
+            release_rx.recv().expect("release retired watcher");
+        },
+    );
+    fs::create_dir(repo_b.path().join("app/retirement-trigger")).unwrap();
+    blocked_rx.await.unwrap();
+    let (observation, mut waiting) = watch_completion(
+        &fixture,
+        &repo_a.path().join("src/lib.rs"),
+        server::ScanPoint::FileObservationWaiting,
+    );
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "src/lib.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        tokio::select! {
+            result = &mut waiting => { result.unwrap(); break; }
+            event = fixture.client.next_event() => {
+                let event = event.unwrap().unwrap();
+                assert_ne!(event.kind, FrameKind::CommandError);
+                assert_ne!(event.kind, FrameKind::ProjectFileContents, "read must queue observation on the adopted watcher");
+            }
+        }
+    }
+    drop(observation);
+    let retired_path = ProjectPath {
+        root: ProjectRootPath(project_root(&project, 2)),
+        relative_path: "app/main.rs".to_owned(),
+    };
+    let (retired_observation, mut retired_waiting) = watch_completion(
+        &fixture,
+        &repo_b.path().join("app/main.rs"),
+        server::ScanPoint::FileObservationWaiting,
+    );
+    retired_reader
+        .project_read_file(&project.id, ProjectReadFilePayload { path: retired_path })
+        .await
+        .unwrap();
+    loop {
+        tokio::select! {
+            result = &mut retired_waiting => { result.unwrap(); break; }
+            event = retired_reader.next_event() => {
+                let event = event.unwrap().unwrap();
+                assert_ne!(event.kind, FrameKind::CommandError);
+                assert_ne!(event.kind, FrameKind::ProjectFileContents, "unavailable-root read must queue before retirement");
+            }
+        }
+    }
+    drop(retired_observation);
+    let (queued, changed) = watch_completion(
+        &fixture,
+        &repo_a.path().join("src/lib.rs"),
+        server::ScanPoint::WatcherQueued,
+    );
+    fs::write(repo_a.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+    changed.await.unwrap();
+    drop(queued);
+    let drain_path = repo_b.path().join("app/dispatch-drain.rs");
+    let (drain, drained) =
+        watch_completion(&fixture, &drain_path, server::ScanPoint::WatcherQueued);
+    fs::write(&drain_path, "// native dispatch boundary\n").unwrap();
+    drained.await.unwrap();
+    drop(drain);
+    let (replacement, adopted) =
+        watch_completion(&fixture, repo_a.path(), server::ScanPoint::WatcherAdopted);
+    fs::remove_dir_all(repo_b.path()).unwrap();
+    adopted.await.unwrap();
+    drop(replacement);
+    let mut fresh_reader = fixture.connect().await;
+    fresh_reader
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: healthy_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let fresh =
+        expect_project_file_contents(&mut fresh_reader, "read during held retirement").await;
+    assert_eq!(fresh.contents.as_deref(), Some("pub fn changed() {}\n"));
+    release_tx.send(()).unwrap();
+    drop(blocked);
+    let mut got_listing = false;
+    let mut got_invalidation = false;
+    let mut got_retired_read = false;
+    while !got_listing || !got_invalidation || !got_retired_read {
+        let event = fixture.client.next_event().await.unwrap().unwrap();
+        assert_ne!(event.kind, FrameKind::CommandError);
+        assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+        match event.kind {
+            FrameKind::ProjectFileList => {
+                let list: ProjectFileListPayload = event.parse_payload().unwrap();
+                if root_unavailable_message(&list, repo_b.path()).is_some() {
+                    assert!(root_lists(&list, repo_a.path(), "src/added.rs"));
+                    got_listing = true;
+                }
+            }
+            FrameKind::ProjectFileContents => {
+                let retired: ProjectFileContentsPayload = event.parse_payload().unwrap();
+                assert_eq!(retired.contents.as_deref(), Some("pub fn a() {}\n"));
+                assert!(
+                    fresh.version > retired.version,
+                    "replacement must invalidate the queued healthy-root edit"
+                );
+                got_retired_read = true;
+            }
+            FrameKind::ProjectEvent => {
+                if let protocol::ProjectEventPayload::FilesChanged { files } =
+                    event.parse_payload().unwrap()
+                {
+                    got_invalidation |= files.iter().any(|file| {
+                        file.path == healthy_path
+                            && file.version > contents.version
+                            && file.version <= fresh.version
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let retired = expect_project_file_contents(
+        &mut retired_reader,
+        "unavailable-root observation completes",
+    )
+    .await;
+    assert_eq!(retired.contents.as_deref(), Some("fn main() {}\n"));
+    eprintln!(
+        "PROJECT WATCH OWNER EVIDENCE actor_adopted=true retired_observation_completed=true queued_edit_invalidated=true"
+    );
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
+        "src/lib.rs",
+        "pub fn still_watched() {}\n",
+    )
+    .await;
+    write_file(&repo_a.path().join("src/after.rs"), "// after\n");
+    expect_project_file_list_matching(
+        &mut fixture.client,
+        "healthy root survives another root's deletion",
+        |list| root_lists(list, repo_a.path(), "src/after.rs"),
+    )
+    .await;
+
     fs::create_dir_all(missing.join("docs")).unwrap();
     fs::write(missing.join("docs/readme.md"), "back\n").unwrap();
     next_frame_matching_on(&mut fixture.client, "restored root is picked up", |env| {
@@ -1882,21 +2052,6 @@ async fn unavailable_project_root_keeps_other_roots_live() {
     expect_project_file_list_matching(&mut fixture.client, "restored root is watched", |list| {
         root_lists(list, &missing, "docs/later.md")
     })
-    .await;
-
-    fs::remove_dir_all(repo_b.path()).unwrap();
-    let file_list =
-        expect_project_file_list_matching(&mut fixture.client, "root deleted while live", |list| {
-            root_unavailable_message(list, repo_b.path()).is_some()
-        })
-        .await;
-    assert!(root_lists(&file_list, repo_a.path(), "src/added.rs"));
-    write_file(&repo_a.path().join("src/after.rs"), "// after\n");
-    expect_project_file_list_matching(
-        &mut fixture.client,
-        "healthy root survives another root's deletion",
-        |list| root_lists(list, repo_a.path(), "src/after.rs"),
-    )
     .await;
 
     fixture
