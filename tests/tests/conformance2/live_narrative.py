@@ -40,8 +40,32 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.forward()
 
+    def request_held(self):
+        """Hold one armed request before upstream; the interrupted turn never needs it."""
+        if not self.path.split("?")[0].endswith("/responses") or not (run / "armed").is_file():
+            return False
+        phase = (run / "armed").read_text()
+        with lock:
+            hold = phase.startswith("request:") and phase not in used
+            if hold:
+                used.add(phase)
+                state["held"] += 1
+        if not hold:
+            return False
+        with socket.socket(socket.AF_UNIX) as gate:
+            gate.connect(str(run / "gate.sock"))
+            gate.sendall(b"\x01")
+            if gate.recv(1) != b"\x01":
+                raise RuntimeError("request gate closed without release")
+        with lock:
+            state["released"] += 1
+        return True
+
     def forward(self):
         payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.request_held():
+            self.close_connection = True
+            return
         headers = {k: v for k, v in self.headers.items() if k.lower() not in {
             "host", "connection", "content-length", "accept-encoding", "proxy-authorization",
         }}
@@ -82,7 +106,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                     if terminal and text_seen and (run / "armed").is_file():
                         phase = (run / "armed").read_text()
                         with lock:
-                            hold = phase not in used
+                            hold = not phase.startswith("request:") and phase not in used
                             if hold:
                                 used.add(phase)
                                 state["held"] += 1
@@ -152,7 +176,8 @@ finally:
     print("Real stream gate receipt:", json.dumps(state), flush=True)
 panic = False
 for line in (run / "run.log").read_text().splitlines():
-    if panic or line.startswith(("LIVE NARRATIVE EVIDENCE", "REQUEST BOUNDARY EVIDENCE", "test result:")):
+    if panic or line.startswith(("LIVE NARRATIVE EVIDENCE", "REQUEST BOUNDARY EVIDENCE",
+                                  "REQUEST INTERRUPT EVIDENCE", "test result:")):
         print(line)
     panic = "panicked at" in line
 assert state["held"] > 0 and state["held"] == state["released"], "no completed real stream gate"

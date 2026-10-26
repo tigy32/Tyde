@@ -203,6 +203,66 @@ pub async fn interrupted_held_narrative<B: Backend>(host: &mut Harness<B>, agent
     turn
 }
 
+/// Interrupts a turn while its real model request is held before any response
+/// byte, then requires the same session to answer its next turn.
+pub async fn interrupted_held_request<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    phase: &str,
+) -> Turn {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("TYDE_NARRATIVE_GATE_DIR").expect("stream gate directory"),
+    );
+    let listener = tokio::net::UnixListener::bind(directory.join("gate.sock"))
+        .expect("bind model request gate");
+    std::fs::write(directory.join("armed"), format!("request:{phase}"))
+        .expect("arm held model request");
+    let prompt = "Reply TYDE_READY without tools.";
+    send_prompt(host, agent, prompt).await;
+    let (mut gate, _) = listener.accept().await.expect("real model request gate");
+    assert_eq!(gate.read_u8().await.expect("model request held"), 1);
+    let mut interrupted = host.turn(prompt);
+    interrupt_backend(host).await;
+    let events = host.events.as_mut().expect("live backend events");
+    loop {
+        match events
+            .recv_backend()
+            .await
+            .expect("backend closed during interrupted request")
+        {
+            BackendEvent::Chat(event) => {
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                interrupted.events.push(event);
+                if idle {
+                    break;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => interrupted.model_requests.push(usage),
+            BackendEvent::Compaction(_) => panic!("unexpected compaction in held request"),
+            BackendEvent::ResumeReplayComplete(_) => panic!("resume was already replayed"),
+        }
+    }
+    gate.write_u8(1)
+        .await
+        .expect("release cancelled model request");
+    drop(listener);
+    std::fs::remove_file(directory.join("gate.sock")).expect("remove completed request control");
+    super::super::assert_no_error_message(&interrupted.label(), &interrupted.events);
+    assert_eq!(
+        interrupted
+            .events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+            .count(),
+        1,
+        "the held request's interrupt must be reported exactly once"
+    );
+    let follow_up = ask(host, agent, prompt).await;
+    eprintln!("REQUEST INTERRUPT EVIDENCE phase={phase} request_held=true follow_up_answered=true");
+    super::super::assert_ready_handshake(&follow_up);
+    follow_up
+}
+
 fn assert_exact_streamed_content(turn: &Turn) {
     let mut stream = None;
     for event in &turn.events {

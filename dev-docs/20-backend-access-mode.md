@@ -114,19 +114,16 @@ A denied command is still an actual tool attempt. Codex can reject an
 recover the actual call and terminal result from native raw-response events,
 preserving the native call ID and exactly one tool card.
 
-Installed Codex runtimes without raw-response subscriptions for protected
-Fork/Resume use the owning process's native execution trace as the sole model
-narrative source. This is native protocol evidence, not transcript inference.
-Bounded, no-follow reads validate source identities, sequence continuity,
-payload references, and the exact native turn-end fence. Original output-item
-order anchors actual runtime receipts; typed execution remains their owner.
-Missing or corrupt observation fails visibly without inventing an outcome or
-losing the actual terminal receipt.
+Upstream Codex delivers raw-response events only on `thread/start`; Resume
+and Fork receive typed items only. A resumed or forked session therefore shows
+no card for a command rejected before it starts, or for raw-only polling, and
+its web-search card has no query. Tyde accepts this upstream limitation: it
+reconstructs nothing and shows no warning.
+Protected Resume and Fork use the same rejoin path as unrestricted sessions;
+the native sandbox alone enforces read-only.
 
-Private narrative can arrive at native inference boundaries on that transport.
 Shared board posts remain live server events and are never copied from private
-final messages. An unavailable trace transport is an explicit lifecycle error;
-a remote Tyde host running its CLI locally uses the same server-owned path.
+final messages.
 
 ## Advisory backend implementations
 

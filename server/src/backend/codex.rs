@@ -8,7 +8,7 @@ use std::io::{Read, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
@@ -71,9 +71,6 @@ const CODEX_AGENT_DELEGATION_EXCLUSION_KEYS: [&str; 3] = [
 const CODEX_READ_ONLY_MCP_OMITTED_SURFACES: [&str; 2] = ["code_mode", "deferred"];
 const CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES: [&str; 3] =
     ["functions", "web", "mcp__tyde_review_feedback"];
-const CODEX_READ_ONLY_TOOL_METADATA_CONFIG_KEY: &str =
-    "features.tool_registry.turn_metadata_includes_tool_info";
-const CODEX_MODEL_TOOL_DIAGNOSTIC_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const CODEX_MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 /// How often a thread is asked which of its command executions are still
 /// running as background terminals. A matched yielded-session raw result
@@ -100,17 +97,6 @@ const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "test-support")]
 const CODEX_LEGACY_DYNAMIC_AWAIT_MARKER: &str = ".tyde-conformance-legacy-dynamic-await";
-pub const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "The installed Codex app-server does not deliver raw tool events for resumed or forked sessions. Some tool activity, including process polling and plan updates, cannot appear in chat. Start a new Codex session to receive those events.";
-
-fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
-    if !strict {
-        tracing::warn!(
-            "Codex resumed or forked without raw event delivery; raw-only tool activity is unavailable"
-        );
-        emitter.warning_message(CODEX_RAW_EVENTS_UNAVAILABLE_WARNING);
-    }
-}
-
 fn parse_codex_goal(value: &Value) -> Result<protocol::NativeGoal, String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2210,11 +2196,6 @@ impl CodexSession {
         let mut skill_setup = skill_setup;
         skill_setup.diagnostics.splice(0..0, skill_notices);
 
-        if access_mode == BackendAccessMode::EnforcedReadOnly && rpc.rollout_trace_root.is_none() {
-            cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-            return Err("Codex protected Fork requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned());
-        }
-
         let mut fork_params = json!({
             "threadId": from_thread_id,
             "cwd": cwd.clone(),
@@ -2252,25 +2233,15 @@ impl CodexSession {
                 return Err(format!("Codex thread/fork failed: {err}"));
             }
         };
-        let Some(forked_thread_id) = thread_forked
+        if thread_forked
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(Value::as_str)
-        else {
+            .is_none()
+        {
             cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
             return Err("Codex thread/fork response missing thread.id".to_string());
-        };
-        if access_mode == BackendAccessMode::EnforcedReadOnly {
-            if forked_thread_id.trim().is_empty() || forked_thread_id == from_thread_id {
-                cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-                return Err("Codex protected fork did not return a new thread identity".to_owned());
-            }
-            if let Err(error) = rpc.install_native_execution_trace(forked_thread_id).await {
-                cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-                return Err(error);
-            }
         }
-
         Self::from_thread_response(
             rpc,
             inbound_rx,
@@ -2317,26 +2288,20 @@ impl CodexSession {
             "thread/start" => {
                 CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(&thread_id)))
             }
-            "thread/fork" => {
-                if config.access_mode == BackendAccessMode::EnforcedReadOnly
-                    && config.execution_mode == BackendExecutionMode::Agent
-                {
-                    CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(
-                        &thread_id,
-                    )))
-                } else {
-                    CodexResponseProjection::Items {
-                        last_token_usage: None,
-                    }
-                }
-            }
+            // Upstream Codex accepts experimentalRawEvents only on thread/start;
+            // thread/fork never delivers raw response items, so forks project
+            // typed items. Raw-only activity (process polling, update_plan
+            // calls, commands denied before they start) has no typed event and
+            // is an accepted upstream limitation, not something Tyde recovers.
+            "thread/fork" => CodexResponseProjection::Items {
+                last_token_usage: None,
+            },
             _ => {
                 return Err(format!(
                     "Codex response projection is undefined for {method}"
                 ));
             }
         };
-        let strict_response_splitting = matches!(projection, CodexResponseProjection::Responses(_));
         let mut response_projections = HashMap::new();
         response_projections.insert(thread_id.clone(), projection);
 
@@ -2352,7 +2317,7 @@ impl CodexSession {
         ));
 
         let initial_capacity_emitter = subagent_emitter.clone();
-        let mut state = initial_codex_state(
+        let state = initial_codex_state(
             thread_id,
             response_projections,
             model,
@@ -2361,9 +2326,6 @@ impl CodexSession {
             codex_has_http_mcp_servers(config.startup_mcp_servers),
             subagent_emitter,
         );
-        if method == "thread/fork" && config.access_mode == BackendAccessMode::EnforcedReadOnly {
-            state.experimental_raw_events_requested = false;
-        }
         let inner = Arc::new(CodexInner {
             launch_cwd: config.cwd,
             rpc,
@@ -2389,21 +2351,6 @@ impl CodexSession {
                 .emitter
                 .subprocess_stderr(&format!("Codex warning: {diagnostic}"));
         }
-        if matches!(
-            inner
-                .rpc
-                .native_execution_trace
-                .status()
-                .await
-                .map_err(str::to_owned)?,
-            CodexNativeTraceStatus::Absent
-        ) {
-            emit_codex_raw_events_warning_if_needed(
-                inner.emitter.as_ref(),
-                strict_response_splitting,
-            );
-        }
-
         // The sender lives in rpc; a weak receiver owner avoids retaining
         // the session through its own inbound queue after teardown.
         let forward_inner = Arc::downgrade(&inner);
@@ -2547,27 +2494,10 @@ impl CodexSession {
     }
 
     pub async fn shutdown(self) {
-        self.inner
-            .rpc
-            .expected_transport_close
-            .store(true, Ordering::Release);
         self.inner.terminate_background_terminals().await;
         self.inner.drain_background_commands().await;
         self.inner.complete_all_codex_subagents().await;
         self.inner.rpc.shutdown().await;
-        let (reply, finished) = oneshot::channel();
-        if self
-            .inner
-            .rpc
-            .inbound
-            .send(CodexInbound::FinishTrace { reply })
-            .is_err()
-            || finished.await.is_err()
-        {
-            self.inner
-                .emitter
-                .backend_error("Codex inbound processor stopped before trace finalization");
-        }
         remove_codex_skill_projection_guard(&self.inner.skill_projection);
         remove_codex_steering_tempfile(&self.inner.steering_tempfile);
     }
@@ -3278,8 +3208,6 @@ struct OpenCodexProviderResponse {
 enum CodexResponseEnd {
     Completed,
     RetryableFailure,
-    NativeFailed,
-    Interrupted,
     Abandoned,
 }
 
@@ -3836,34 +3764,6 @@ impl CodexResponseSplitter {
             response.text.push_str(&missing);
         }
         Some(CodexResponseDelta { delta: missing })
-    }
-
-    fn observe_trace_item_once(
-        &mut self,
-        turn_id: &str,
-        completed: &str,
-        reasoning: bool,
-    ) -> Option<CodexResponseDelta> {
-        if !contains_non_whitespace(completed)
-            && self.open.as_ref().is_none_or(|response| {
-                !contains_non_whitespace(&response.text)
-                    && !contains_non_whitespace(&response.reasoning)
-            })
-        {
-            return None;
-        }
-        self.ensure_open(Some(turn_id))?;
-        let response = self.open.as_mut()?;
-        // The native inference output slot is consumed once by the trace cursor;
-        // an absent provider item ID must not merge distinct complete items.
-        if reasoning {
-            response.reasoning.push_str(completed);
-        } else {
-            response.text.push_str(completed);
-        }
-        Some(CodexResponseDelta {
-            delta: completed.to_owned(),
-        })
     }
 
     fn buffer_tool_request(
@@ -9347,17 +9247,6 @@ impl CodexInner {
         session_id: String,
         settings: &Value,
     ) -> Result<(), String> {
-        let protected = {
-            self.state
-                .with(move |state| {
-                    state.access_mode == BackendAccessMode::EnforcedReadOnly
-                        && state.execution_mode == BackendExecutionMode::Agent
-                })
-                .await
-        };
-        if protected && self.rpc.rollout_trace_root.is_none() {
-            return Err("Codex protected Resume requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned());
-        }
         {
             let session_id = session_id.clone();
             self.state
@@ -9424,9 +9313,10 @@ impl CodexInner {
                         .clone(),
                 );
             }
-            if !protected {
-                params["experimentalRawEvents"] = json!(CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS);
-            }
+            // Upstream Codex ignores this on thread/resume and acknowledges
+            // false; resumed sessions therefore lack raw-only activity. That
+            // is an accepted upstream limitation, not something Tyde recovers.
+            params["experimentalRawEvents"] = json!(CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS);
             tracing::info!(
                 sandbox = params["sandbox"].as_str(),
                 workspace_root_count = params["runtimeWorkspaceRoots"].as_array().map(Vec::len),
@@ -9440,7 +9330,6 @@ impl CodexInner {
             }
             let response = self.rpc.request("thread/resume", params).await?;
 
-            // Ordinary resume retains its existing best-effort raw negotiation.
             let raw_events_enabled = match response.get("experimentalRawEvents") {
                 Some(Value::Bool(enabled)) => *enabled,
                 None => false,
@@ -9451,7 +9340,7 @@ impl CodexInner {
                 }
             };
             tracing::info!(
-                raw_events_requested = !protected && CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
+                raw_events_requested = CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
                 raw_events_enabled,
                 "Codex resume raw event negotiation"
             );
@@ -9464,16 +9353,6 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .ok_or("Codex thread/resume response missing thread.id")?
                 .to_string();
-            if protected {
-                if resumed_thread_id != session_id {
-                    return Err(
-                        "Codex protected Resume returned a different native identity".to_owned(),
-                    );
-                }
-                self.rpc
-                    .install_native_execution_trace(&resumed_thread_id)
-                    .await?;
-            }
             let resumed_model = response
                 .get("model")
                 .and_then(Value::as_str)
@@ -9483,10 +9362,10 @@ impl CodexInner {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
-            Ok::<_, String>((resumed_thread_id, resumed_model, turns, raw_events_enabled))
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
         }
         .await;
-        let (resumed_thread_id, resumed_model, turns, raw_events_enabled) = match resumed {
+        let (resumed_thread_id, resumed_model, turns) = match resumed {
             Ok(resumed) => resumed,
             Err(error) => {
                 self.state
@@ -9517,7 +9396,7 @@ impl CodexInner {
                             )),
                         );
                         state.experimental_raw_events_requested =
-                            !protected && CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS;
+                            CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS;
                         state.raw_response_item_completed_seen = false;
                         state.raw_contract_drift_warned = false;
                         if let Some(model) = resumed_model.clone() {
@@ -9548,9 +9427,6 @@ impl CodexInner {
         self.apply_local_settings(settings).await;
 
         self.emitter.conversation_cleared();
-        if !protected {
-            emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), raw_events_enabled);
-        }
         self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
@@ -9987,10 +9863,6 @@ impl CodexInner {
                     }
                 }
             }
-            CodexInbound::FinishTrace { reply } => {
-                self.finish_native_execution_trace().await;
-                let _ = reply.send(());
-            }
             CodexInbound::Stderr(line) => {
                 if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&line) {
                     self.emitter.retry_attempt(RetryAttemptPayload {
@@ -10015,7 +9887,6 @@ impl CodexInner {
                 ));
             }
             CodexInbound::Closed { exit_code } => {
-                self.finish_native_execution_trace().await;
                 self.finalize_all_incomplete_strict_responses(
                     "Codex transport closed before rawResponse/completed",
                 )
@@ -11731,315 +11602,6 @@ impl CodexInner {
     }
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
-        let outcome = self
-            .rpc
-            .native_execution_trace
-            .notification(method, params)
-            .await;
-        let (deliveries, failure) = match outcome {
-            Ok(CodexNativeTraceOutcome::NativeNotification) => {
-                self.handle_native_notification(method, params).await;
-                return;
-            }
-            Ok(CodexNativeTraceOutcome::Failed) => {
-                let narrative = CodexResponseEvent::from_notification(method, params).is_some()
-                    || matches!(
-                        method,
-                        "rawResponse/completed" | "rawResponseItem/completed"
-                    );
-                if !narrative {
-                    if method == "thread/tokenUsage/updated" {
-                        self.handle_root_token_usage_updated(params).await;
-                    } else {
-                        self.handle_native_notification(method, params).await;
-                    }
-                }
-                return;
-            }
-            Ok(CodexNativeTraceOutcome::Deliveries {
-                deliveries,
-                failure,
-            }) => (deliveries, failure),
-            Err(reason) => {
-                self.report_native_trace_error(reason);
-                return;
-            }
-        };
-        if let Some(reason) = failure {
-            self.report_native_trace_error(reason);
-        }
-        self.deliver_native_execution_trace(deliveries).await;
-    }
-
-    fn report_native_trace_error(&self, reason: &'static str) {
-        tracing::error!(
-            target: "tyde_codex_model_tools",
-            source = "native_execution_trace",
-            observation_available = false,
-            reason,
-            "Codex protected native execution observation unavailable"
-        );
-        self.emitter.backend_error(&format!(
-            "Codex protected native execution observation unavailable: {reason}; no execution outcome was inferred"
-        ));
-    }
-
-    async fn deliver_native_execution_trace(
-        self: &Arc<Self>,
-        deliveries: Vec<CodexNativeTraceDelivery>,
-    ) {
-        for delivery in deliveries {
-            match delivery {
-                CodexNativeTraceDelivery::Notification(notification) => {
-                    if notification.method == "thread/tokenUsage/updated" {
-                        self.handle_root_token_usage_updated(&notification.params)
-                            .await;
-                    } else {
-                        self.handle_native_notification(&notification.method, &notification.params)
-                            .await;
-                    }
-                }
-                CodexNativeTraceDelivery::ModelItem { turn_id, item } => {
-                    self.project_native_trace_model_item(&turn_id, &item).await;
-                }
-                CodexNativeTraceDelivery::InferenceEnd {
-                    turn_id,
-                    response_id,
-                    usage,
-                    ending,
-                } => {
-                    let ending_turn_id = turn_id.clone();
-                    let Some(thread_id) = self
-                        .state
-                        .with(move |state| {
-                            (state.active_turn_id.as_deref() == Some(ending_turn_id.as_str()))
-                                .then(|| state.thread_id.clone())
-                        })
-                        .await
-                    else {
-                        continue;
-                    };
-                    if let Some(response_id) = response_id {
-                        self.observe_raw_response_completed(&json!({"threadId": thread_id, "turnId": turn_id, "responseId": response_id})).await;
-                    }
-                    self.finalize_strict_response(
-                        &json!({"threadId": thread_id, "turnId": turn_id, "usage": usage}),
-                        ending,
-                    )
-                    .await;
-                }
-                CodexNativeTraceDelivery::ObservationError(reason) => {
-                    self.report_native_trace_error(reason)
-                }
-                CodexNativeTraceDelivery::CompletedCall(call) => {
-                    let thread_id = self.state.with(move |state| state.thread_id.clone()).await;
-                    let typed_owner = {
-                        {
-                            let thread_id = thread_id.clone();
-                            let call_id = call.call_id.clone();
-                            self.state
-                                .with(move |state| {
-                                    state
-                                        .response_projections
-                                        .get(&thread_id)
-                                        .and_then(CodexResponseProjection::responses)
-                                        .is_some_and(|splitter| {
-                                            splitter.typed_item_owns_call(&call_id)
-                                        })
-                                })
-                                .await
-                        }
-                    };
-                    if typed_owner || self.emitter.has_known_tool_request(&call.call_id) {
-                        continue;
-                    }
-                    if self
-                        .state
-                        .with(|state| state.active_turn_id.clone())
-                        .await
-                        .as_deref()
-                        != Some(call.turn_id.as_str())
-                    {
-                        let turn_id = call.turn_id.clone();
-                        if !self
-                            .state
-                            .with(move |state| {
-                                state
-                                    .terminated_turns
-                                    .iter()
-                                    .any(|turn| turn.turn_id == turn_id)
-                            })
-                            .await
-                        {
-                            self.report_native_trace_error(
-                                "native_trace_active_turn_owner_mismatch",
-                            );
-                        }
-                        continue;
-                    }
-                    let tool_type = json!({
-                        "kind": "RunCommand",
-                        "command": call.arguments.get("cmd").and_then(Value::as_str).unwrap_or_default(),
-                        "working_directory": call.arguments.get("workdir").and_then(Value::as_str).unwrap_or_default(),
-                    });
-                    if !self
-                        .buffer_strict_tool_request(
-                            &thread_id,
-                            &call.call_id,
-                            "exec_command",
-                            call.arguments,
-                            tool_type,
-                            None,
-                        )
-                        .await
-                    {
-                        self.report_native_trace_error(
-                            "native_trace_direct_request_declaration_failed",
-                        );
-                        continue;
-                    }
-                    if let Some((_, outcome)) = call.completion {
-                        self.emit_or_defer_tool_completion(
-                            &thread_id,
-                            &self.emitter,
-                            &call.call_id,
-                            outcome,
-                        )
-                        .await;
-                    }
-                    let call_id = call.call_id;
-                    self.state
-                        .with(move |state| {
-                            if let Some(splitter) = state
-                                .response_projections
-                                .get_mut(&thread_id)
-                                .and_then(CodexResponseProjection::responses_mut)
-                            {
-                                splitter.complete_raw_tool_call(&call_id);
-                                splitter.remove_suppressed_raw_tool_request(&call_id);
-                            }
-                        })
-                        .await;
-                    tracing::info!(
-                        target: "tyde_codex_model_tools",
-                        source = "native_execution_trace",
-                        typed_owner_present = false,
-                        native_identity_verified = true,
-                        "Recovered native direct command declaration and terminal result"
-                    );
-                }
-            }
-        }
-    }
-
-    async fn project_native_trace_model_item(&self, turn_id: &str, item: &Value) {
-        let item_turn_id = turn_id.to_owned();
-        let Some(thread_id) = self
-            .state
-            .with(move |state| {
-                (state.active_turn_id.as_deref() == Some(item_turn_id.as_str()))
-                    .then(|| state.thread_id.clone())
-            })
-            .await
-        else {
-            return;
-        };
-        let params = json!({"threadId": thread_id, "turnId": turn_id, "item": item});
-        if item.get("call_id").is_some() {
-            let typed_thread_id = thread_id.clone();
-            self.state
-                .with(move |state| {
-                    if let Some(response) = state
-                        .response_projections
-                        .get_mut(&typed_thread_id)
-                        .and_then(CodexResponseProjection::responses_mut)
-                        .and_then(|splitter| splitter.open.as_mut())
-                    {
-                        response.pending_typed_tool_item_id = None;
-                        response.pending_typed_tool_call_id = None;
-                    }
-                })
-                .await;
-        }
-        self.observe_strict_raw_response_item(&params).await;
-        let (content, reasoning) = match item.get("type").and_then(Value::as_str) {
-            Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
-                (extract_codex_item_text(item), false)
-            }
-            Some("reasoning") => (extract_codex_item_reasoning(item).unwrap_or_default(), true),
-            _ => return,
-        };
-        let emission = {
-            {
-                let thread_id = thread_id.clone();
-                let turn_id = turn_id.to_owned();
-                self.state
-                    .with(move |state| {
-                        let turn_id = turn_id.as_str();
-                        state
-                            .response_projections
-                            .get_mut(&thread_id)
-                            .and_then(CodexResponseProjection::responses_mut)
-                            .and_then(|splitter| {
-                                splitter.observe_trace_item_once(turn_id, &content, reasoning)
-                            })
-                    })
-                    .await
-            }
-        };
-        if let Some(emission) = emission
-            && !emission.delta.is_empty()
-        {
-            let model = self
-                .state
-                .with(move |state| {
-                    state
-                        .effective_model
-                        .clone()
-                        .unwrap_or_else(|| "codex".to_owned())
-                })
-                .await;
-            if let Some(response) = self
-                .ensure_strict_response_handle(&thread_id, &self.emitter, &model)
-                .await
-            {
-                if reasoning {
-                    self.emitter
-                        .stream_reasoning_delta(&response, &emission.delta);
-                } else {
-                    self.emitter.stream_delta(&response, &emission.delta);
-                }
-            }
-        }
-    }
-
-    async fn finish_native_execution_trace(self: &Arc<Self>) {
-        let active_turn = self
-            .state
-            .with(move |state| state.active_turn_id.clone())
-            .await;
-        let (deliveries, failure) = match self
-            .rpc
-            .native_execution_trace
-            .close(
-                active_turn,
-                self.rpc.expected_transport_close.load(Ordering::Acquire),
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(reason) => {
-                self.report_native_trace_error(reason);
-                return;
-            }
-        };
-        if let Some(reason) = failure {
-            self.report_native_trace_error(reason);
-        }
-        self.deliver_native_execution_trace(deliveries).await;
-    }
-
-    async fn handle_native_notification(self: &Arc<Self>, method: &str, params: &Value) {
         if method == "thread/goal/updated" || method == "thread/goal/cleared" {
             let thread_id = self.state.with(move |state| state.thread_id.clone()).await;
             if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str()) {
@@ -16504,6 +16066,9 @@ let stream_key = stream_key.as_str();
                     None => {
                         // Native direct and code-mode web calls can start with
                         // an empty typed query. Retain the actual invocation's query.
+                        // Resumed and forked sessions receive no raw invocation
+                        // from upstream Codex, so their card keeps the empty
+                        // query; that is an accepted upstream limitation.
                         let notification_thread_id = notification_thread_id.clone();
                         let provider_item_id =
                             item.get("id").and_then(Value::as_str).map(str::to_owned);
@@ -21258,9 +20823,6 @@ enum CodexInbound {
         roots: Vec<String>,
         reply: oneshot::Sender<Result<(), super::WorkspaceRelocationError>>,
     },
-    FinishTrace {
-        reply: oneshot::Sender<()>,
-    },
     Notification {
         method: String,
         params: Value,
@@ -21375,1543 +20937,10 @@ fn codex_rollout_code_cell_key(
     })
 }
 
-// Native session events omit the inventory; the private trace references the
-// actual request, whose metadata comes from the finalized native tool router.
-async fn log_codex_read_only_model_tools(
-    line: &[u8],
-    bundle_root: &Path,
-) -> Result<(), &'static str> {
-    let record: Value = serde_json::from_slice(line).map_err(|_| "invalid_native_trace_json")?;
-    if record.pointer("/payload/type").and_then(Value::as_str) != Some("inference_started") {
-        return Ok(());
-    }
-    if record.get("schema_version").and_then(Value::as_u64) != Some(1) {
-        return Err("unsupported_native_trace_schema");
-    }
-    if record
-        .pointer("/payload/request_payload/kind/type")
-        .and_then(Value::as_str)
-        != Some("inference_request")
-    {
-        return Err("invalid_native_request_payload_kind");
-    }
-    let payload_path = record
-        .pointer("/payload/request_payload/path")
-        .and_then(Value::as_str)
-        .ok_or("missing_native_request_payload_path")?;
-    let ordinal = payload_path
-        .strip_prefix("payloads/")
-        .and_then(|path| path.strip_suffix(".json"))
-        .filter(|ordinal| !ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or("invalid_native_request_payload_path")?;
-    let payload_path = bundle_root.join("payloads").join(format!("{ordinal}.json"));
-    let metadata = tokio::fs::symlink_metadata(&payload_path)
-        .await
-        .map_err(|_| "native_request_payload_metadata_unavailable")?;
-    if !metadata.is_file() || metadata.len() > CODEX_MODEL_TOOL_DIAGNOSTIC_MAX_BYTES {
-        return Err("native_request_payload_exceeds_diagnostic_bound_or_not_file");
-    }
-    let bytes = tokio::fs::read(&payload_path)
-        .await
-        .map_err(|_| "native_request_payload_unreadable")?;
-    let request: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid_native_request_payload_json")?;
-    let metadata = request
-        .pointer("/client_metadata/x-codex-turn-metadata")
-        .and_then(Value::as_str)
-        .ok_or("native_request_tool_metadata_absent")?;
-    let metadata: Value =
-        serde_json::from_str(metadata).map_err(|_| "invalid_native_request_tool_metadata_json")?;
-    let namespaces = metadata
-        .get("tool_namespaces_info")
-        .and_then(Value::as_object)
-        .ok_or("native_model_tool_inventory_absent")?;
-    let mut tools = Vec::new();
-    let mut redacted_name_count = 0;
-    for namespace in namespaces.values() {
-        let namespace_name = namespace
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or("native_tool_namespace_name_absent")?;
-        let functions = namespace
-            .get("functions")
-            .and_then(Value::as_object)
-            .ok_or("native_tool_namespace_functions_absent")?;
-        for function in functions.values() {
-            if tools.len() >= 4096 {
-                return Err("native_model_tool_inventory_exceeds_diagnostic_bound");
-            }
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or("native_tool_function_name_absent")?;
-            let direct = function
-                .get("direct")
-                .and_then(Value::as_bool)
-                .ok_or("native_tool_direct_exposure_absent")?;
-            let deferred = function
-                .get("deferred")
-                .and_then(Value::as_bool)
-                .ok_or("native_tool_deferred_exposure_absent")?;
-            let code_mode_exposed = match function.get("code_mode_name") {
-                Some(Value::String(_)) => true,
-                Some(Value::Null) => false,
-                _ => return Err("native_tool_code_mode_exposure_absent"),
-            };
-            let source = match function.pointer("/source/kind").and_then(Value::as_str) {
-                Some("harness") => "harness",
-                Some("mcp") => "mcp",
-                _ => return Err("native_tool_source_unavailable"),
-            };
-            let safe_name = [namespace_name, name].iter().all(|name| {
-                !name.is_empty()
-                    && name.len() <= 256
-                    && name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-                    })
-            });
-            let qualified_name = if safe_name {
-                Some(format!("{namespace_name}.{name}"))
-            } else {
-                redacted_name_count += 1;
-                None
-            };
-            tools.push((qualified_name, direct, deferred, code_mode_exposed, source));
-        }
-    }
-    tracing::info!(
-        target: "tyde_codex_model_tools",
-        inventory_available = true,
-        native_tool_count = tools.len(),
-        direct_tool_count = tools.iter().filter(|tool| tool.1).count(),
-        deferred_tool_count = tools.iter().filter(|tool| tool.2).count(),
-        code_mode_tool_count = tools.iter().filter(|tool| tool.3).count(),
-        redacted_name_count,
-        "Native Codex EnforcedReadOnly model-visible tool inventory"
-    );
-    for (name, direct, deferred, code_mode_exposed, native_source) in tools {
-        if let Some(native_tool_name) = name {
-            tracing::info!(
-                target: "tyde_codex_model_tools",
-                native_tool_name,
-                direct,
-                deferred,
-                code_mode_exposed,
-                native_source,
-                "Native Codex EnforcedReadOnly model-visible tool"
-            );
-        }
-    }
-    Ok(())
-}
-
-const CODEX_NATIVE_TRACE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const CODEX_NATIVE_TRACE_MAX_LINE: usize = 1024 * 1024;
-const CODEX_NATIVE_TRACE_MAX_ENTRIES: usize = 4096;
-const CODEX_NATIVE_TRACE_MAX_BUNDLES: usize = 128;
-
-struct CodexNativeTraceCall {
-    turn_id: String,
-    call_id: String,
-    arguments: Value,
-    typed_runtime_started: bool,
-    completion: Option<(u64, ToolExecutionOutcome)>,
-}
-
-struct CodexNativeTraceNotification {
-    method: String,
-    params: Value,
-    bytes: usize,
-}
-
-enum CodexNativeTraceDelivery {
-    Notification(CodexNativeTraceNotification),
-    CompletedCall(CodexNativeTraceCall),
-    ModelItem {
-        turn_id: String,
-        item: Value,
-    },
-    InferenceEnd {
-        turn_id: String,
-        response_id: Option<String>,
-        usage: Option<Value>,
-        ending: CodexResponseEnd,
-    },
-    ObservationError(&'static str),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CodexNativeTraceTurnEnd {
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-struct CodexNativeTraceInference {
-    started_seq: u64,
-    items: Option<Vec<Value>>,
-    response_id: Option<String>,
-    usage: Option<Value>,
-    ending: CodexResponseEnd,
-}
-
-fn codex_native_trace_notification_call(
-    notification: &CodexNativeTraceNotification,
-) -> Option<&str> {
-    notification
-        .params
-        .pointer("/item/callId")
-        .or_else(|| notification.params.pointer("/item/call_id"))
-        .or_else(|| notification.params.pointer("/item/id"))
-        .or_else(|| notification.params.get("itemId"))
-        .and_then(Value::as_str)
-}
-
-fn codex_native_trace_model_call(item: &Value) -> Result<Option<&str>, &'static str> {
-    match item.get("type").and_then(Value::as_str) {
-        // These native output types reuse the provider item ID for their typed
-        // runtime item, rather than carrying a separate model call ID.
-        Some("web_search_call" | "image_generation_call") => {
-            codex_native_trace_id(item.get("id")).map(Some)
-        }
-        _ => item
-            .get("call_id")
-            .map(|id| codex_native_trace_id(Some(id)))
-            .transpose(),
-    }
-}
-
-fn codex_native_trace_dependent_call(
-    method: &str,
-    params: &Value,
-) -> Result<Option<(String, String)>, &'static str> {
-    let dependent = if matches!(method, "item/started" | "item/completed") {
-        params
-            .pointer("/item/type")
-            .and_then(Value::as_str)
-            .is_some_and(is_codex_provider_tool_item_type)
-    } else {
-        matches!(
-            method,
-            "item/commandExecution/outputDelta"
-                | "item/commandExecution/terminalInteraction"
-                | "item/fileChange/outputDelta"
-                | "item/fileChange/patchUpdated"
-                | "item/mcpToolCall/progress"
-        )
-    };
-    if !dependent {
-        return Ok(None);
-    }
-    let turn = extract_turn_id(params).ok_or("native_trace_typed_call_turn_missing")?;
-    let id = params
-        .pointer("/item/callId")
-        .or_else(|| params.pointer("/item/call_id"))
-        .or_else(|| params.pointer("/item/id"))
-        .or_else(|| params.get("itemId"));
-    Ok(Some((turn, codex_native_trace_id(id)?.to_owned())))
-}
-
-enum CodexNativeTraceStatus {
-    Absent,
-    Ready,
-    Failed(&'static str),
-}
-
-enum CodexNativeTraceOutcome {
-    NativeNotification,
-    Failed,
-    Deliveries {
-        deliveries: Vec<CodexNativeTraceDelivery>,
-        failure: Option<&'static str>,
-    },
-}
-
-enum CodexNativeTraceCommand {
-    Install {
-        root: PathBuf,
-        thread_id: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Status(oneshot::Sender<CodexNativeTraceStatus>),
-    Notification {
-        method: String,
-        params: Value,
-        reply: oneshot::Sender<CodexNativeTraceOutcome>,
-    },
-    Close {
-        active_turn: Option<String>,
-        expected_close: bool,
-        reply: oneshot::Sender<(Vec<CodexNativeTraceDelivery>, Option<&'static str>)>,
-    },
-}
-
-const CODEX_NATIVE_TRACE_OWNER_STOPPED: &str = "native_trace_owner_stopped";
-
-#[derive(Clone)]
-struct CodexNativeTraceOwner {
-    commands: mpsc::UnboundedSender<CodexNativeTraceCommand>,
-}
-
-impl CodexNativeTraceOwner {
-    fn spawn() -> Self {
-        let (commands, mut inbox) = mpsc::unbounded_channel::<CodexNativeTraceCommand>();
-        crate::backend::subprocess::spawn(async move {
-            let mut trace = None;
-            while let Some(command) = inbox.recv().await {
-                // Transfer the only cursor into an I/O job; filesystem work
-                // never runs on the adapter's synchronous state owner.
-                match crate::backend::subprocess::spawn_blocking(move || {
-                    run_codex_native_trace_io(trace, command)
-                })
-                .await
-                {
-                    Ok(next) => trace = next,
-                    Err(error) => {
-                        tracing::error!(
-                            cancelled = error.is_cancelled(),
-                            panicked = error.is_panic(),
-                            "Codex native execution trace I/O owner stopped"
-                        );
-                        return;
-                    }
-                }
-            }
-        });
-        Self { commands }
-    }
-
-    async fn exchange<R: Send + 'static>(
-        &self,
-        command: impl FnOnce(oneshot::Sender<R>) -> CodexNativeTraceCommand + Send,
-    ) -> Result<R, &'static str> {
-        let (reply, result) = oneshot::channel();
-        self.commands
-            .send(command(reply))
-            .map_err(|_| CODEX_NATIVE_TRACE_OWNER_STOPPED)?;
-        result.await.map_err(|_| CODEX_NATIVE_TRACE_OWNER_STOPPED)
-    }
-
-    async fn install(&self, root: PathBuf, thread_id: String) -> Result<(), String> {
-        self.exchange(move |reply| CodexNativeTraceCommand::Install {
-            root,
-            thread_id,
-            reply,
-        })
-        .await
-        .map_err(str::to_owned)?
-    }
-
-    async fn status(&self) -> Result<CodexNativeTraceStatus, &'static str> {
-        self.exchange(CodexNativeTraceCommand::Status).await
-    }
-
-    async fn notification(
-        &self,
-        method: &str,
-        params: &Value,
-    ) -> Result<CodexNativeTraceOutcome, &'static str> {
-        self.exchange(|reply| CodexNativeTraceCommand::Notification {
-            method: method.to_owned(),
-            params: params.clone(),
-            reply,
-        })
-        .await
-    }
-
-    async fn close(
-        &self,
-        active_turn: Option<String>,
-        expected_close: bool,
-    ) -> Result<(Vec<CodexNativeTraceDelivery>, Option<&'static str>), &'static str> {
-        self.exchange(move |reply| CodexNativeTraceCommand::Close {
-            active_turn,
-            expected_close,
-            reply,
-        })
-        .await
-    }
-}
-
-fn run_codex_native_trace_io(
-    mut transport: Option<CodexNativeExecutionTrace>,
-    command: CodexNativeTraceCommand,
-) -> Option<CodexNativeExecutionTrace> {
-    match command {
-        CodexNativeTraceCommand::Install {
-            root,
-            thread_id,
-            reply,
-        } => {
-            let outcome = CodexNativeExecutionTrace::open(&root, &thread_id)
-                .map(|trace| transport = Some(trace))
-                .map_err(|reason| format!("Codex protected execution trace unavailable: {reason}"));
-            let _ = reply.send(outcome);
-        }
-        CodexNativeTraceCommand::Status(reply) => {
-            let status = match transport.as_ref() {
-                None => CodexNativeTraceStatus::Absent,
-                Some(trace) => match trace.failure {
-                    Some(reason) => CodexNativeTraceStatus::Failed(reason),
-                    None => CodexNativeTraceStatus::Ready,
-                },
-            };
-            let _ = reply.send(status);
-        }
-        CodexNativeTraceCommand::Notification {
-            method,
-            params,
-            reply,
-        } => {
-            let outcome = match transport.as_mut() {
-                Some(trace)
-                    if extract_notification_thread_id(&params).as_deref()
-                        == Some(trace.thread_id.as_str()) =>
-                {
-                    if trace.failure.is_some() {
-                        CodexNativeTraceOutcome::Failed
-                    } else {
-                        let (deliveries, failure) = match trace.enqueue(&method, &params) {
-                            Ok(deliveries) => (deliveries, None),
-                            Err(reason) => (trace.fail(reason), Some(reason)),
-                        };
-                        CodexNativeTraceOutcome::Deliveries {
-                            deliveries,
-                            failure,
-                        }
-                    }
-                }
-                _ => CodexNativeTraceOutcome::NativeNotification,
-            };
-            let _ = reply.send(outcome);
-        }
-        CodexNativeTraceCommand::Close {
-            active_turn,
-            expected_close,
-            reply,
-        } => {
-            let outcome = match transport.as_mut() {
-                Some(trace) if trace.failure.is_none() => {
-                    match trace.close(active_turn.as_deref(), expected_close) {
-                        Ok(deliveries) => (deliveries, None),
-                        Err(reason) => (trace.fail(reason), Some(reason)),
-                    }
-                }
-                _ => (Vec::new(), None),
-            };
-            let _ = reply.send(outcome);
-        }
-    }
-    transport
-}
-
-// A provider transport cursor: this native trace is the sole raw narrative
-// source for protected rejoined threads. Never merge its original item IDs with
-// the optional replacement IDs assigned later by native stdout projection.
-struct CodexNativeExecutionTrace {
-    root: std::fs::File,
-    bundle: std::fs::File,
-    bundle_name: OsString,
-    payloads: std::fs::File,
-    log: std::fs::File,
-    thread_id: String,
-    offset: u64,
-    buffered: Vec<u8>,
-    next_seq: u64,
-    payload_bytes_read: usize,
-    thread_started: bool,
-    active_turn: Option<String>,
-    started_turns: HashSet<String>,
-    calls: HashMap<(String, String), CodexNativeTraceCall>,
-    inferences: HashMap<(String, String), CodexNativeTraceInference>,
-    inference_order: VecDeque<(String, String)>,
-    runtime_calls: HashSet<(String, String)>,
-    released_call_slots: HashSet<(String, String)>,
-    typed_completion_receipts: HashSet<(String, String)>,
-    native_terminal_calls: HashMap<(String, String), u64>,
-    ended_turns: HashMap<String, (u64, CodexNativeTraceTurnEnd)>,
-    notifications: VecDeque<CodexNativeTraceNotification>,
-    notification_bytes: usize,
-    incoming_notification: Option<CodexNativeTraceNotification>,
-    pending_deliveries: Vec<CodexNativeTraceDelivery>,
-    failure: Option<&'static str>,
-}
-
-fn codex_native_trace_id(value: Option<&Value>) -> Result<&str, &'static str> {
-    value
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty() && id.len() <= 512)
-        .ok_or("invalid_native_trace_identity")
-}
-
-#[cfg(unix)]
-fn codex_native_trace_open_root(path: &Path) -> Result<std::fs::File, &'static str> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
-    let mut directory = open("/", flags, Mode::empty()).map_err(|_| "trace_root_open_failed")?;
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(part) => {
-                directory = openat(&directory, part, flags, Mode::empty())
-                    .map_err(|_| "trace_root_component_open_failed")?;
-            }
-            _ => return Err("invalid_native_trace_root"),
-        }
-    }
-    Ok(directory.into())
-}
-
-#[cfg(not(unix))]
-fn codex_native_trace_open_root(_: &Path) -> Result<std::fs::File, &'static str> {
-    Err("native_trace_secure_transport_unsupported")
-}
-
-#[cfg(unix)]
-fn codex_native_trace_open_at(
-    directory: &std::fs::File,
-    name: &std::ffi::OsStr,
-    is_directory: bool,
-) -> Result<std::fs::File, &'static str> {
-    use rustix::fs::{Mode, OFlags, openat};
-    if Path::new(name).components().count() != 1
-        || !matches!(
-            Path::new(name).components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
-        return Err("invalid_native_trace_component");
-    }
-    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
-    if is_directory {
-        flags |= OFlags::DIRECTORY;
-    }
-    let file: std::fs::File = openat(directory, name, flags, Mode::empty())
-        .map_err(|_| "native_trace_component_open_failed")?
-        .into();
-    let metadata = file
-        .metadata()
-        .map_err(|_| "native_trace_metadata_failed")?;
-    if (is_directory && !metadata.is_dir()) || (!is_directory && !metadata.is_file()) {
-        return Err("native_trace_component_not_regular");
-    }
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn codex_native_trace_open_at(
-    _: &std::fs::File,
-    _: &std::ffi::OsStr,
-    _: bool,
-) -> Result<std::fs::File, &'static str> {
-    Err("native_trace_secure_transport_unsupported")
-}
-
-#[cfg(unix)]
-fn codex_native_trace_same_file(
-    left: &std::fs::File,
-    right: &std::fs::File,
-) -> Result<bool, &'static str> {
-    use std::os::unix::fs::MetadataExt;
-    let left = left
-        .metadata()
-        .map_err(|_| "native_trace_metadata_failed")?;
-    let right = right
-        .metadata()
-        .map_err(|_| "native_trace_metadata_failed")?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
-}
-
-#[cfg(not(unix))]
-fn codex_native_trace_same_file(
-    _: &std::fs::File,
-    _: &std::fs::File,
-) -> Result<bool, &'static str> {
-    Err("native_trace_secure_transport_unsupported")
-}
-
-fn codex_native_trace_json(
-    file: &mut std::fs::File,
-    budget: u64,
-) -> Result<(Value, usize), &'static str> {
-    let mut bytes = Vec::new();
-    std::io::Read::take(file, budget + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "native_trace_payload_read_failed")?;
-    if bytes.len() as u64 > budget {
-        return Err("native_trace_payload_budget_exceeded");
-    }
-    let value = serde_json::from_slice(&bytes).map_err(|_| "invalid_native_trace_payload_json")?;
-    Ok((value, bytes.len()))
-}
-
-impl CodexNativeExecutionTrace {
-    fn open(root_path: &Path, thread_id: &str) -> Result<Self, &'static str> {
-        codex_native_trace_id(Some(&Value::String(thread_id.to_owned())))?;
-        let root = codex_native_trace_open_root(root_path)?;
-        let entries =
-            std::fs::read_dir(root_path).map_err(|_| "native_trace_enumeration_failed")?;
-        let mut found = None;
-        for (index, entry) in entries.enumerate() {
-            if index >= CODEX_NATIVE_TRACE_MAX_BUNDLES {
-                return Err("native_trace_bundle_budget_exceeded");
-            }
-            let entry = entry.map_err(|_| "native_trace_enumeration_failed")?;
-            let name = entry.file_name();
-            let bundle = codex_native_trace_open_at(&root, &name, true)?;
-            let mut manifest =
-                codex_native_trace_open_at(&bundle, "manifest.json".as_ref(), false)?;
-            let (manifest, _) = codex_native_trace_json(&mut manifest, 64 * 1024)?;
-            if manifest.get("schema_version").and_then(Value::as_u64) != Some(1)
-                || manifest.get("raw_event_log").and_then(Value::as_str) != Some("trace.jsonl")
-                || manifest.get("payloads_dir").and_then(Value::as_str) != Some("payloads")
-            {
-                return Err("invalid_native_trace_manifest");
-            }
-            if manifest.get("root_thread_id").and_then(Value::as_str) != Some(thread_id) {
-                continue;
-            }
-            if found.is_some() {
-                return Err("ambiguous_native_trace_root_thread");
-            }
-            let payloads = codex_native_trace_open_at(&bundle, "payloads".as_ref(), true)?;
-            let log = codex_native_trace_open_at(&bundle, "trace.jsonl".as_ref(), false)?;
-            found = Some((name, bundle, payloads, log));
-        }
-        let (bundle_name, bundle, payloads, log) =
-            found.ok_or("native_trace_root_bundle_missing")?;
-        let mut trace = Self {
-            root,
-            bundle,
-            bundle_name,
-            payloads,
-            log,
-            thread_id: thread_id.to_owned(),
-            offset: 0,
-            buffered: Vec::new(),
-            next_seq: 1,
-            payload_bytes_read: 0,
-            thread_started: false,
-            active_turn: None,
-            started_turns: HashSet::new(),
-            calls: HashMap::new(),
-            inferences: HashMap::new(),
-            inference_order: VecDeque::new(),
-            runtime_calls: HashSet::new(),
-            released_call_slots: HashSet::new(),
-            typed_completion_receipts: HashSet::new(),
-            native_terminal_calls: HashMap::new(),
-            ended_turns: HashMap::new(),
-            notifications: VecDeque::new(),
-            notification_bytes: 0,
-            incoming_notification: None,
-            pending_deliveries: Vec::new(),
-            failure: None,
-        };
-        trace.drain()?;
-        if !trace.thread_started {
-            return Err("native_trace_thread_start_missing");
-        }
-        // The new binding must not republish earlier turns of this process.
-        trace.started_turns.clear();
-        trace.calls.clear();
-        trace.inferences.clear();
-        trace.inference_order.clear();
-        trace.runtime_calls.clear();
-        trace.released_call_slots.clear();
-        trace.typed_completion_receipts.clear();
-        trace.native_terminal_calls.clear();
-        trace.ended_turns.clear();
-        Ok(trace)
-    }
-
-    fn payload(&mut self, reference: &Value, expected_kind: &str) -> Result<Value, &'static str> {
-        if reference.pointer("/kind/type").and_then(Value::as_str) != Some(expected_kind) {
-            return Err("invalid_native_trace_payload_role");
-        }
-        let path = reference
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or("native_trace_payload_path_missing")?;
-        let ordinal = path
-            .strip_prefix("payloads/")
-            .and_then(|path| path.strip_suffix(".json"))
-            .ok_or("invalid_native_trace_payload_path")?;
-        let number = ordinal
-            .parse::<u64>()
-            .ok()
-            .filter(|number| *number > 0)
-            .ok_or("invalid_native_trace_payload_ordinal")?;
-        if number.to_string() != ordinal
-            || reference.get("raw_payload_id").and_then(Value::as_str)
-                != Some(format!("raw_payload:{ordinal}").as_str())
-        {
-            return Err("invalid_native_trace_payload_identity");
-        }
-        let mut file =
-            codex_native_trace_open_at(&self.payloads, format!("{ordinal}.json").as_ref(), false)?;
-        let remaining = CODEX_NATIVE_TRACE_MAX_BYTES.saturating_sub(self.payload_bytes_read as u64);
-        let (payload, bytes) = codex_native_trace_json(&mut file, remaining)?;
-        self.payload_bytes_read += bytes;
-        Ok(payload)
-    }
-
-    fn drain(&mut self) -> Result<(), &'static str> {
-        self.payload_bytes_read = 0;
-        let bundle = codex_native_trace_open_at(&self.root, &self.bundle_name, true)?;
-        let payloads = codex_native_trace_open_at(&self.bundle, "payloads".as_ref(), true)?;
-        let log = codex_native_trace_open_at(&self.bundle, "trace.jsonl".as_ref(), false)?;
-        if !codex_native_trace_same_file(&bundle, &self.bundle)?
-            || !codex_native_trace_same_file(&payloads, &self.payloads)?
-            || !codex_native_trace_same_file(&log, &self.log)?
-        {
-            return Err("native_trace_descriptor_replaced");
-        }
-        let high_water = self
-            .log
-            .metadata()
-            .map_err(|_| "native_trace_metadata_failed")?
-            .len();
-        let remaining = high_water
-            .checked_sub(self.offset)
-            .ok_or("native_trace_log_truncated")?;
-        if remaining > CODEX_NATIVE_TRACE_MAX_BYTES {
-            return Err("native_trace_drain_budget_exceeded");
-        }
-        std::io::Seek::seek(&mut self.log, SeekFrom::Start(self.offset))
-            .map_err(|_| "native_trace_seek_failed")?;
-        let mut bytes = Vec::new();
-        std::io::Read::take(&mut self.log, remaining)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "native_trace_read_failed")?;
-        if bytes.len() as u64 != remaining {
-            return Err("native_trace_snapshot_short_read");
-        }
-        self.offset = high_water;
-        self.buffered.extend(bytes);
-        let mut consumed = 0;
-        while let Some(relative) = self.buffered[consumed..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-        {
-            if relative > CODEX_NATIVE_TRACE_MAX_LINE {
-                return Err("native_trace_record_budget_exceeded");
-            }
-            let end = consumed + relative;
-            let record: Value = serde_json::from_slice(&self.buffered[consumed..end])
-                .map_err(|_| "invalid_native_trace_record_json")?;
-            consumed = end + 1;
-            self.observe(record)?;
-        }
-        self.buffered.drain(..consumed);
-        if self.buffered.len() > CODEX_NATIVE_TRACE_MAX_LINE {
-            return Err("native_trace_record_budget_exceeded");
-        }
-        let mut retained_bytes = 0usize;
-        for call in self.calls.values() {
-            retained_bytes = retained_bytes.saturating_add(
-                serde_json::to_vec(&call.arguments)
-                    .map_err(|_| "native_trace_retained_encoding_failed")?
-                    .len(),
-            );
-            if let Some((_, outcome)) = &call.completion {
-                retained_bytes = retained_bytes.saturating_add(
-                    serde_json::to_vec(outcome)
-                        .map_err(|_| "native_trace_retained_encoding_failed")?
-                        .len(),
-                );
-            }
-        }
-        for inference in self.inferences.values() {
-            retained_bytes = retained_bytes.saturating_add(
-                serde_json::to_vec(&inference.items)
-                    .map_err(|_| "native_trace_retained_encoding_failed")?
-                    .len(),
-            );
-        }
-        if retained_bytes as u64 > 2 * CODEX_NATIVE_TRACE_MAX_BYTES {
-            return Err("native_trace_retained_payload_budget_exceeded");
-        }
-        Ok(())
-    }
-
-    fn observe(&mut self, record: Value) -> Result<(), &'static str> {
-        let seq = record
-            .get("seq")
-            .and_then(Value::as_u64)
-            .ok_or("native_trace_sequence_missing")?;
-        if record.get("schema_version").and_then(Value::as_u64) != Some(1) || seq != self.next_seq {
-            return Err("native_trace_sequence_or_schema_invalid");
-        }
-        self.next_seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or("native_trace_sequence_overflow")?;
-        let payload = record
-            .get("payload")
-            .ok_or("native_trace_payload_missing")?;
-        let kind = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or("native_trace_event_type_missing")?;
-        if kind == "thread_started"
-            && payload.get("thread_id").and_then(Value::as_str) == Some(self.thread_id.as_str())
-        {
-            self.thread_started = true;
-        }
-        if record.get("thread_id").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
-            return Ok(());
-        }
-        if !matches!(
-            kind,
-            "tool_call_started"
-                | "tool_call_runtime_started"
-                | "tool_call_runtime_ended"
-                | "tool_call_ended"
-                | "inference_started"
-                | "inference_completed"
-                | "inference_failed"
-                | "inference_cancelled"
-                | "codex_turn_started"
-                | "codex_turn_ended"
-        ) {
-            return Ok(());
-        }
-        let turn_id = codex_native_trace_id(record.get("codex_turn_id"))?.to_owned();
-        match kind {
-            "codex_turn_started" => {
-                if payload.get("codex_turn_id").and_then(Value::as_str) != Some(turn_id.as_str())
-                    || payload.get("thread_id").and_then(Value::as_str)
-                        != Some(self.thread_id.as_str())
-                    || self.started_turns.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    || !self.started_turns.insert(turn_id)
-                {
-                    return Err("native_trace_turn_start_identity_or_budget_invalid");
-                }
-            }
-            "inference_started" => {
-                let id = codex_native_trace_id(payload.get("inference_call_id"))?.to_owned();
-                let key = (turn_id, id);
-                if self.inferences.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    || self
-                        .inferences
-                        .insert(
-                            key.clone(),
-                            CodexNativeTraceInference {
-                                started_seq: seq,
-                                items: None,
-                                response_id: None,
-                                usage: None,
-                                ending: CodexResponseEnd::Abandoned,
-                            },
-                        )
-                        .is_some()
-                {
-                    return Err("native_trace_inference_identity_or_budget_invalid");
-                }
-                self.inference_order.push_back(key);
-            }
-            "inference_completed" | "inference_failed" | "inference_cancelled" => {
-                let id = codex_native_trace_id(payload.get("inference_call_id"))?;
-                let key = (turn_id, id.to_owned());
-                let reference = payload
-                    .get("response_payload")
-                    .or_else(|| payload.get("partial_response_payload"));
-                let response = reference
-                    .filter(|reference| !reference.is_null())
-                    .map(|reference| self.payload(reference, "inference_response"))
-                    .transpose()?;
-                let items = match response.as_ref() {
-                    Some(response) => response
-                        .get("output_items")
-                        .and_then(Value::as_array)
-                        .ok_or("native_trace_inference_items_missing")?
-                        .clone(),
-                    None if kind != "inference_completed" => Vec::new(),
-                    None => return Err("native_trace_completed_inference_payload_missing"),
-                };
-                if items.len() > CODEX_NATIVE_TRACE_MAX_ENTRIES {
-                    return Err("native_trace_inference_item_budget_exceeded");
-                }
-                let response_id = response
-                    .as_ref()
-                    .and_then(|response| response.get("response_id"))
-                    .filter(|id| !id.is_null())
-                    .map(|id| codex_native_trace_id(Some(id)).map(str::to_owned))
-                    .transpose()?;
-                if kind == "inference_completed"
-                    && (response_id.is_none()
-                        || payload.get("response_id").and_then(Value::as_str)
-                            != response_id.as_deref())
-                {
-                    return Err("native_trace_response_identity_mismatch");
-                }
-                let inference = self
-                    .inferences
-                    .get_mut(&key)
-                    .ok_or("native_trace_inference_start_missing")?;
-                if inference.items.replace(items).is_some() {
-                    return Err("native_trace_inference_terminal_repeated");
-                }
-                inference.response_id = response_id;
-                inference.usage = response.and_then(|response| {
-                    response
-                        .get("token_usage")
-                        .filter(|usage| !usage.is_null())
-                        .cloned()
-                });
-                inference.ending = if kind == "inference_completed" {
-                    CodexResponseEnd::Completed
-                } else if kind == "inference_failed" {
-                    CodexResponseEnd::NativeFailed
-                } else {
-                    CodexResponseEnd::Interrupted
-                };
-            }
-            "tool_call_started" => {
-                if payload.pointer("/requester/type").and_then(Value::as_str) != Some("model") {
-                    return Ok(());
-                }
-                let call_id = codex_native_trace_id(payload.get("tool_call_id"))?.to_owned();
-                if payload.get("model_visible_call_id").and_then(Value::as_str)
-                    != Some(call_id.as_str())
-                    || payload
-                        .get("code_mode_runtime_tool_id")
-                        .is_some_and(|id| !id.is_null())
-                {
-                    return Err("native_trace_model_call_identity_mismatch");
-                }
-                let invocation = self.payload(
-                    payload
-                        .get("invocation_payload")
-                        .ok_or("native_trace_invocation_missing")?,
-                    "tool_invocation",
-                )?;
-                if invocation.get("tool_name").and_then(Value::as_str) != Some("exec_command")
-                    || invocation.get("tool_namespace").is_some_and(|namespace| {
-                        !namespace.is_null() && namespace.as_str() != Some("functions")
-                    })
-                {
-                    return Ok(());
-                }
-                if invocation.pointer("/payload/type").and_then(Value::as_str) != Some("function") {
-                    return Err("native_trace_direct_invocation_shape_invalid");
-                }
-                let arguments = invocation
-                    .pointer("/payload/arguments")
-                    .and_then(Value::as_str)
-                    .ok_or("native_trace_direct_arguments_missing")?;
-                let arguments: Value = serde_json::from_str(arguments)
-                    .map_err(|_| "native_trace_direct_arguments_invalid")?;
-                if arguments.get("cmd").and_then(Value::as_str).is_none() {
-                    return Err("native_trace_direct_command_missing");
-                }
-                let call = CodexNativeTraceCall {
-                    turn_id: turn_id.clone(),
-                    call_id: call_id.clone(),
-                    arguments,
-                    typed_runtime_started: false,
-                    completion: None,
-                };
-                if self.calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    || self.calls.insert((turn_id, call_id), call).is_some()
-                {
-                    return Err("native_trace_call_identity_or_budget_invalid");
-                }
-            }
-            "tool_call_runtime_started" => {
-                let id = codex_native_trace_id(payload.get("tool_call_id"))?;
-                if self.runtime_calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES {
-                    return Err("native_trace_runtime_call_budget_exceeded");
-                }
-                self.runtime_calls.insert((turn_id.clone(), id.to_owned()));
-                if let Some(call) = self.calls.get_mut(&(turn_id, id.to_owned())) {
-                    // Native runtime Begin precedes stdout typed items; absence
-                    // of a received item alone cannot transfer their ownership.
-                    call.typed_runtime_started = true;
-                }
-            }
-            "tool_call_runtime_ended" => {
-                let id = codex_native_trace_id(payload.get("tool_call_id"))?.to_owned();
-                let key = (turn_id, id);
-                if self.native_terminal_calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    && !self.native_terminal_calls.contains_key(&key)
-                {
-                    return Err("native_trace_terminal_call_budget_exceeded");
-                }
-                self.native_terminal_calls.entry(key).or_insert(seq);
-            }
-            "tool_call_ended" => {
-                let id = codex_native_trace_id(payload.get("tool_call_id"))?.to_owned();
-                let key = (turn_id, id.clone());
-                if !self.calls.contains_key(&key) {
-                    return Ok(());
-                }
-                let result = self.payload(
-                    payload
-                        .get("result_payload")
-                        .ok_or("native_trace_direct_result_missing")?,
-                    "tool_result",
-                )?;
-                let outcome = match result.get("type").and_then(Value::as_str) {
-                    Some("direct_response") => {
-                        let response = result
-                            .get("response_item")
-                            .ok_or("native_trace_direct_response_missing")?;
-                        if response.get("type").and_then(Value::as_str)
-                            != Some("function_call_output")
-                            || response.get("call_id").and_then(Value::as_str) != Some(id.as_str())
-                        {
-                            return Err("native_trace_direct_result_identity_mismatch");
-                        }
-                        let output = response
-                            .get("output")
-                            .and_then(Value::as_str)
-                            .ok_or("native_trace_direct_result_output_invalid")?;
-                        match raw_codex_exec_command_result(output) {
-                            Some((exit_code, stdout)) => {
-                                let result = ToolExecutionResult::RunCommand {
-                                    exit_code,
-                                    stdout: stdout.to_owned(),
-                                    stderr: String::new(),
-                                };
-                                codex_tool_execution_outcome(
-                                    serde_json::to_value(result)
-                                        .map_err(|_| "native_trace_result_encoding_failed")?,
-                                    exit_code == 0,
-                                    (exit_code != 0).then(|| {
-                                        format!("Command failed with exit code {exit_code}")
-                                    }),
-                                    None,
-                                )
-                            }
-                            None if self
-                                .calls
-                                .get(&key)
-                                .is_some_and(|call| call.typed_runtime_started) =>
-                            {
-                                return Ok(());
-                            }
-                            None => return Err("native_trace_direct_terminal_result_unavailable"),
-                        }
-                    }
-                    Some("error") => {
-                        let message = result
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .ok_or("native_trace_direct_error_missing")?
-                            .to_owned();
-                        ToolExecutionOutcome::Failed {
-                            message,
-                            details: None,
-                            normalization_failure: None,
-                            result: None,
-                        }
-                    }
-                    _ => return Err("native_trace_direct_result_shape_invalid"),
-                };
-                let call = self
-                    .calls
-                    .get_mut(&key)
-                    .ok_or("native_trace_call_start_missing")?;
-                if call.completion.replace((seq, outcome)).is_some() {
-                    return Err("native_trace_direct_result_repeated");
-                }
-                if call.typed_runtime_started {
-                    if self.native_terminal_calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                        && !self.native_terminal_calls.contains_key(&key)
-                    {
-                        return Err("native_trace_terminal_call_budget_exceeded");
-                    }
-                    self.native_terminal_calls.entry(key).or_insert(seq);
-                }
-            }
-            "codex_turn_ended" => {
-                if payload.get("codex_turn_id").and_then(Value::as_str) != Some(turn_id.as_str()) {
-                    return Err("native_trace_turn_fence_identity_mismatch");
-                }
-                let status = match payload.get("status").and_then(Value::as_str) {
-                    Some("completed") => CodexNativeTraceTurnEnd::Completed,
-                    Some("failed") => CodexNativeTraceTurnEnd::Failed,
-                    Some("cancelled") => CodexNativeTraceTurnEnd::Cancelled,
-                    _ => return Err("native_trace_turn_fence_status_invalid"),
-                };
-                if self.ended_turns.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    || self.ended_turns.insert(turn_id, (seq, status)).is_some()
-                {
-                    return Err("native_trace_turn_fence_repeated_or_budget_invalid");
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn enqueue(
-        &mut self,
-        method: &str,
-        params: &Value,
-    ) -> Result<Vec<CodexNativeTraceDelivery>, &'static str> {
-        self.incoming_notification = Some(CodexNativeTraceNotification {
-            method: method.to_owned(),
-            params: params.clone(),
-            bytes: 0,
-        });
-        self.drain()?;
-        if CodexResponseEvent::from_notification(method, params).is_some()
-            || matches!(
-                method,
-                "rawResponse/completed" | "rawResponseItem/completed"
-            )
-        {
-            drop(self.incoming_notification.take());
-            return self.release(None);
-        }
-        if method == "turn/started" {
-            let turn = extract_turn_id(params)
-                .ok_or("native_trace_turn_start_notification_identity_missing")?;
-            if !self.started_turns.contains(&turn) {
-                return Err("native_trace_turn_start_fence_missing");
-            }
-            self.active_turn = Some(turn);
-            let notification = self
-                .incoming_notification
-                .take()
-                .ok_or("native_trace_incoming_notification_missing")?;
-            self.pending_deliveries
-                .push(CodexNativeTraceDelivery::Notification(notification));
-            return Ok(std::mem::take(&mut self.pending_deliveries));
-        }
-        let bytes = serde_json::to_vec(params)
-            .map_err(|_| "native_trace_notification_encoding_failed")?
-            .len()
-            + method.len();
-        if bytes > CODEX_NATIVE_TRACE_MAX_BYTES as usize {
-            return Err("native_trace_notification_budget_exceeded");
-        }
-        if let Some(notification) = self.incoming_notification.as_mut() {
-            notification.bytes = bytes;
-        }
-        let call_key = codex_native_trace_dependent_call(method, params)?;
-        if let Some(key) = call_key.as_ref() {
-            if method == "item/completed" {
-                if self.typed_completion_receipts.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    && !self.typed_completion_receipts.contains(key)
-                {
-                    return Err("native_trace_completion_receipt_budget_exceeded");
-                }
-                self.typed_completion_receipts.insert(key.clone());
-            }
-            if matches!(method, "item/started" | "item/completed") {
-                if self.runtime_calls.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-                    && !self.runtime_calls.contains(key)
-                {
-                    return Err("native_trace_runtime_call_budget_exceeded");
-                }
-                self.runtime_calls.insert(key.clone());
-                if let Some(call) = self.calls.get_mut(key) {
-                    call.typed_runtime_started = true;
-                }
-            }
-        }
-        // Only unreleased native call slots depend on the narrative source.
-        // Output/progress for a published slot must never accumulate here.
-        if method != "turn/completed"
-            && call_key
-                .as_ref()
-                .is_none_or(|key| self.released_call_slots.contains(key))
-        {
-            let notification = self
-                .incoming_notification
-                .take()
-                .ok_or("native_trace_incoming_notification_missing")?;
-            self.pending_deliveries
-                .push(CodexNativeTraceDelivery::Notification(notification));
-            let deliveries = self.release(None)?;
-            if let Some(key) = call_key
-                && self.active_turn.as_deref() != Some(key.0.as_str())
-                && self.typed_completion_receipts.contains(&key)
-            {
-                self.released_call_slots.remove(&key);
-                self.typed_completion_receipts.remove(&key);
-                self.native_terminal_calls.remove(&key);
-                self.runtime_calls.remove(&key);
-            }
-            return Ok(deliveries);
-        }
-        if self.notifications.len() >= CODEX_NATIVE_TRACE_MAX_ENTRIES
-            || self.notification_bytes.saturating_add(bytes) > CODEX_NATIVE_TRACE_MAX_BYTES as usize
-        {
-            return Err("native_trace_notification_budget_exceeded");
-        }
-        let notification = self
-            .incoming_notification
-            .take()
-            .ok_or("native_trace_incoming_notification_missing")?;
-        self.notifications.push_back(notification);
-        self.notification_bytes += bytes;
-        let terminal = if method == "turn/completed" {
-            Some(extract_turn_id(params).ok_or("native_trace_terminal_turn_missing")?)
-        } else {
-            None
-        };
-        if let Some(turn_id) = terminal.as_deref() {
-            if self.active_turn.as_deref() != Some(turn_id) {
-                return Err("native_trace_turn_completion_owner_mismatch");
-            }
-            let (fence, _) = self
-                .ended_turns
-                .get(turn_id)
-                .ok_or("native_trace_turn_completion_fence_missing")?;
-            if *fence >= self.next_seq {
-                return Err("native_trace_turn_completion_fence_invalid");
-            }
-        }
-        self.release(terminal.as_deref())
-    }
-
-    fn release(
-        &mut self,
-        terminal: Option<&str>,
-    ) -> Result<Vec<CodexNativeTraceDelivery>, &'static str> {
-        while let Some(key) = self.inference_order.front().cloned() {
-            if self.active_turn.as_deref() != Some(key.0.as_str()) {
-                break;
-            }
-            let inference = self
-                .inferences
-                .get(&key)
-                .ok_or("native_trace_inference_queue_invalid")?;
-            let pending_earlier_terminal = self.native_terminal_calls.iter().any(|(call, seq)| {
-                *seq < inference.started_seq
-                    && self.released_call_slots.contains(call)
-                    && self.runtime_calls.contains(call)
-                    && !self.typed_completion_receipts.contains(call)
-            });
-            if pending_earlier_terminal {
-                if terminal == Some(key.0.as_str()) {
-                    return Err("native_trace_earlier_typed_completion_receipt_missing");
-                }
-                break;
-            }
-            let Some(items) = inference.items.as_ref() else {
-                if terminal == Some(key.0.as_str()) {
-                    return Err("native_trace_inference_terminal_payload_missing");
-                }
-                break;
-            };
-            let model_slots = items
-                .iter()
-                .map(|item| codex_native_trace_model_call(item).map(|id| id.map(str::to_owned)))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut ready = true;
-            for (item, id) in items.iter().zip(&model_slots) {
-                let Some(id) = id.as_deref() else {
-                    continue;
-                };
-                if matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("web_search_call" | "image_generation_call")
-                ) && !self
-                    .typed_completion_receipts
-                    .contains(&(key.0.clone(), id.to_owned()))
-                {
-                    // Trace output_items contain native OutputItemDone records;
-                    // wait for their actual typed completion, not EOF read-ahead.
-                    if terminal == Some(key.0.as_str())
-                        && self.ended_turns.get(&key.0).is_some_and(|(_, status)| {
-                            *status == CodexNativeTraceTurnEnd::Completed
-                        })
-                    {
-                        return Err("native_trace_provider_tool_completion_receipt_missing");
-                    }
-                    ready = false;
-                }
-                if item.get("name").and_then(Value::as_str) == Some("exec_command") {
-                    let call = self
-                        .calls
-                        .get(&(key.0.clone(), id.to_owned()))
-                        .ok_or("native_trace_model_dispatch_pair_missing")?;
-                    // Trace recording is best-effort. Only the real stdout
-                    // terminal receipt proves all prior typed items reconciled;
-                    // a marker seen by reading ahead does not prove absence.
-                    if !call.typed_runtime_started && terminal != Some(key.0.as_str()) {
-                        ready = false;
-                    }
-                    if !call.typed_runtime_started && call.completion.is_none() {
-                        if terminal == Some(key.0.as_str())
-                            && self.ended_turns.get(&key.0).is_some_and(|(_, status)| {
-                                *status == CodexNativeTraceTurnEnd::Completed
-                            })
-                        {
-                            return Err("native_trace_completed_turn_call_result_missing");
-                        }
-                        ready = false;
-                    }
-                }
-                if self.runtime_calls.contains(&(key.0.clone(), id.to_owned()))
-                    && !self.notifications.iter().any(|notification| {
-                        extract_turn_id(&notification.params).as_deref() == Some(key.0.as_str())
-                            && codex_native_trace_notification_call(notification) == Some(id)
-                    })
-                {
-                    if terminal == Some(key.0.as_str()) {
-                        return Err("native_trace_typed_runtime_notification_missing");
-                    }
-                    ready = false;
-                }
-            }
-            if !ready && terminal != Some(key.0.as_str()) {
-                break;
-            }
-            let new_slots = model_slots
-                .iter()
-                .flatten()
-                .map(|id| (key.0.clone(), id.clone()))
-                .collect::<HashSet<_>>();
-            if self
-                .released_call_slots
-                .len()
-                .saturating_add(new_slots.difference(&self.released_call_slots).count())
-                > CODEX_NATIVE_TRACE_MAX_ENTRIES
-            {
-                return Err("native_trace_released_slot_budget_exceeded");
-            }
-            // Existing stdout runtime records remain authoritative. Narrative
-            // is replayed ONLY from this native response, in original item order.
-            let mut inference = self
-                .inferences
-                .remove(&key)
-                .ok_or("native_trace_inference_queue_invalid")?;
-            self.inference_order.pop_front();
-            for (item, call_id) in inference
-                .items
-                .take()
-                .ok_or("native_trace_inference_items_missing")?
-                .into_iter()
-                .zip(model_slots)
-            {
-                let provider_tool = matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("web_search_call" | "image_generation_call")
-                );
-                let hosted_search =
-                    item.get("type").and_then(Value::as_str) == Some("web_search_call");
-                self.pending_deliveries
-                    .push(CodexNativeTraceDelivery::ModelItem {
-                        turn_id: key.0.clone(),
-                        item,
-                    });
-                if let Some(call_id) = call_id {
-                    let call_key = (key.0.clone(), call_id.clone());
-                    self.released_call_slots.insert(call_key.clone());
-                    if provider_tool && !self.typed_completion_receipts.contains(&call_key) {
-                        // Cancellation can preempt native image-save/projection
-                        // after OutputItemDone. Preserve its partial source slot
-                        // and real terminal receipt; do not invent completion.
-                        self.pending_deliveries
-                            .push(CodexNativeTraceDelivery::ObservationError(
-                                "native_trace_interrupted_provider_tool_has_no_completion_receipt",
-                            ));
-                    }
-                    if let Some(call) = self.calls.remove(&call_key)
-                        && !call.typed_runtime_started
-                    {
-                        if call.completion.is_some() {
-                            self.pending_deliveries
-                                .push(CodexNativeTraceDelivery::CompletedCall(call));
-                        } else {
-                            self.pending_deliveries.push(
-                                CodexNativeTraceDelivery::ObservationError(
-                                    "native_trace_interrupted_call_has_no_terminal_result",
-                                ),
-                            );
-                        }
-                    }
-                    // Hosted starts precede action metadata. The same native
-                    // item's completion carries its authoritative action query.
-                    let hosted_query = if hosted_search {
-                        self.notifications
-                            .iter()
-                            .find(|notification| {
-                                notification.method == "item/completed"
-                                    && extract_turn_id(&notification.params).as_deref()
-                                        == Some(key.0.as_str())
-                                    && codex_native_trace_notification_call(notification)
-                                        == Some(call_id.as_str())
-                                    && notification
-                                        .params
-                                        .pointer("/item/type")
-                                        .and_then(Value::as_str)
-                                        == Some("webSearch")
-                            })
-                            .and_then(|notification| {
-                                notification
-                                    .params
-                                    .pointer("/item/query")
-                                    .and_then(Value::as_str)
-                            })
-                            .filter(|query| !query.trim().is_empty())
-                            .map(str::to_owned)
-                    } else {
-                        None
-                    };
-                    let mut remaining = VecDeque::new();
-                    while let Some(mut notification) = self.notifications.pop_front() {
-                        if extract_turn_id(&notification.params).as_deref() == Some(key.0.as_str())
-                            && codex_native_trace_notification_call(&notification)
-                                == Some(call_id.as_str())
-                        {
-                            self.notification_bytes -= notification.bytes;
-                            if let Some(query) = hosted_query.as_ref()
-                                && notification.method == "item/started"
-                                && notification
-                                    .params
-                                    .pointer("/item/type")
-                                    .and_then(Value::as_str)
-                                    == Some("webSearch")
-                                && notification
-                                    .params
-                                    .pointer("/item/query")
-                                    .and_then(Value::as_str)
-                                    .is_none_or(|query| query.trim().is_empty())
-                                && let Some(item) = notification
-                                    .params
-                                    .get_mut("item")
-                                    .and_then(Value::as_object_mut)
-                            {
-                                item.insert("query".to_owned(), Value::String(query.clone()));
-                                tracing::debug!(target: "tyde_codex_model_tools",
-                                    source = "native_hosted_action_metadata",
-                                    native_identity_matched = true,
-                                    "Preserved the native hosted search action query");
-                            }
-                            self.pending_deliveries
-                                .push(CodexNativeTraceDelivery::Notification(notification));
-                        } else {
-                            remaining.push_back(notification);
-                        }
-                    }
-                    self.notifications = remaining;
-                }
-            }
-            self.pending_deliveries
-                .push(CodexNativeTraceDelivery::InferenceEnd {
-                    turn_id: key.0,
-                    response_id: inference.response_id,
-                    usage: inference.usage,
-                    ending: inference.ending,
-                });
-        }
-        if let Some(turn) = terminal {
-            if self.inference_order.iter().any(|(id, _)| id == turn) {
-                return Err("native_trace_terminal_inference_not_reconciled");
-            }
-            if self
-                .calls
-                .values()
-                .any(|call| call.turn_id == turn && !call.typed_runtime_started)
-            {
-                self.pending_deliveries
-                    .push(CodexNativeTraceDelivery::ObservationError(
-                        "native_trace_terminal_dispatch_without_model_slot",
-                    ));
-            }
-            self.calls.retain(|(id, _), _| id != turn);
-            self.released_call_slots.retain(|key| {
-                key.0 != turn
-                    || (self.runtime_calls.contains(key)
-                        && !self.typed_completion_receipts.contains(key))
-            });
-            self.runtime_calls
-                .retain(|key| key.0 != turn || self.released_call_slots.contains(key));
-            self.native_terminal_calls
-                .retain(|key, _| key.0 != turn || self.released_call_slots.contains(key));
-            self.typed_completion_receipts.retain(|(id, _)| id != turn);
-            self.ended_turns.remove(turn);
-            self.started_turns.remove(turn);
-            self.active_turn = None;
-            while let Some(notification) = self.notifications.pop_front() {
-                self.notification_bytes -= notification.bytes;
-                self.pending_deliveries
-                    .push(CodexNativeTraceDelivery::Notification(notification));
-            }
-        }
-        Ok(std::mem::take(&mut self.pending_deliveries))
-    }
-
-    fn close(
-        &mut self,
-        active_turn: Option<&str>,
-        expected_close: bool,
-    ) -> Result<Vec<CodexNativeTraceDelivery>, &'static str> {
-        self.drain()?;
-        let active_turn = active_turn
-            .map(str::to_owned)
-            .or_else(|| self.active_turn.clone());
-        if let Some(turn) = active_turn.as_deref()
-            && !self.ended_turns.contains_key(turn)
-        {
-            if expected_close {
-                // Requested process teardown can legitimately preempt the
-                // native terminal event. Never publish an invented outcome or
-                // new card after the owner has deliberately closed the session.
-                self.notifications.clear();
-                drop(self.incoming_notification.take());
-                self.pending_deliveries.clear();
-                self.notification_bytes = 0;
-                self.inferences.clear();
-                self.inference_order.clear();
-                self.calls.clear();
-                self.active_turn = None;
-                tracing::debug!(target: "tyde_codex_model_tools", expected_close = true,
-                    native_terminal_fence_present = false, "Discarded unpublished native trace observations during requested close");
-                return Ok(Vec::new());
-            }
-            return Err("native_trace_transport_closed_before_turn_fence");
-        }
-        self.release(active_turn.as_deref())
-    }
-
-    fn fail(&mut self, reason: &'static str) -> Vec<CodexNativeTraceDelivery> {
-        self.failure = Some(reason);
-        self.notification_bytes = 0;
-        let mut deliveries = std::mem::take(&mut self.pending_deliveries);
-        deliveries.extend(
-            self.notifications
-                .drain(..)
-                .map(CodexNativeTraceDelivery::Notification),
-        );
-        let unconsumed_ingress_present = self.incoming_notification.is_some();
-        if let Some(notification) = self.incoming_notification.take()
-            && CodexResponseEvent::from_notification(&notification.method, &notification.params)
-                .is_none()
-            && !matches!(
-                notification.method.as_str(),
-                "rawResponse/completed" | "rawResponseItem/completed"
-            )
-        {
-            deliveries.push(CodexNativeTraceDelivery::Notification(notification));
-        }
-        tracing::error!(target: "tyde_codex_model_tools",
-            preserved_delivery_count = deliveries.len(),
-            unconsumed_ingress_present,
-            "Preserved native receipts and validated delivery prefix after trace observation failure");
-        deliveries
-    }
-}
-
-async fn forward_codex_rollout_trace(
-    root: PathBuf,
-    inbound: mpsc::UnboundedSender<CodexInbound>,
-    include_model_tool_inventory: bool,
-) {
+async fn forward_codex_rollout_trace(root: PathBuf, inbound: mpsc::UnboundedSender<CodexInbound>) {
     let mut cursors = HashMap::<PathBuf, CodexRolloutTraceCursor>::new();
     loop {
-        if let Err(error) =
-            read_codex_rollout_trace(&root, &inbound, &mut cursors, include_model_tool_inventory)
-                .await
-        {
+        if let Err(error) = read_codex_rollout_trace(&root, &inbound, &mut cursors).await {
             let _ = inbound.send(CodexInbound::RolloutTraceError(error));
             return;
         }
@@ -22923,7 +20952,6 @@ async fn read_codex_rollout_trace(
     root: &Path,
     inbound: &mpsc::UnboundedSender<CodexInbound>,
     cursors: &mut HashMap<PathBuf, CodexRolloutTraceCursor>,
-    include_model_tool_inventory: bool,
 ) -> Result<(), String> {
     let mut entries = tokio::fs::read_dir(root)
         .await
@@ -22963,17 +20991,6 @@ async fn read_codex_rollout_trace(
             line.pop();
             if line.is_empty() {
                 continue;
-            }
-            if include_model_tool_inventory
-                && tracing::enabled!(target: "tyde_codex_model_tools", tracing::Level::INFO)
-                && let Err(reason) = log_codex_read_only_model_tools(&line, &entry.path()).await
-            {
-                tracing::warn!(
-                    target: "tyde_codex_model_tools",
-                    inventory_available = false,
-                    reason,
-                    "Native Codex EnforcedReadOnly tool inventory unavailable"
-                );
             }
             if let Some(event) = codex_rollout_trace_event(&line)?
                 && inbound.send(CodexInbound::RolloutTrace(event)).is_err()
@@ -23587,8 +21604,6 @@ struct CodexRpc {
     stderr_task: JoinHandle<()>,
     rollout_trace_task: Option<JoinHandle<()>>,
     rollout_trace_root: Option<tempfile::TempDir>,
-    native_execution_trace: CodexNativeTraceOwner,
-    expected_transport_close: AtomicBool,
     tool_catalog: Option<tempfile::NamedTempFile>,
     agent_delegation_excluded: bool,
     read_only_agentcontrol_direct_tools: bool,
@@ -23698,7 +21713,6 @@ impl CodexRpc {
                 "features.code_mode.direct_only_tool_namespaces={}",
                 json!(CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES)
             ));
-            config_overrides.push(format!("{CODEX_READ_ONLY_TOOL_METADATA_CONFIG_KEY}=true"));
         }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
@@ -23733,8 +21747,11 @@ impl CodexRpc {
                 toml_quoted(&path.display().to_string())
             ));
         }
+        // The rollout trace only reconciles code-mode cells, which enforced
+        // read-only sessions disable.
         let rollout_trace_root = if ssh_host.is_none()
             && execution_mode == BackendExecutionMode::Agent
+            && !read_only_builtins_direct_tools
         {
             let root = tempfile::Builder::new()
                 .prefix(CODEX_ROLLOUT_TRACE_ROOT_PREFIX)
@@ -23849,7 +21866,6 @@ impl CodexRpc {
             crate::backend::subprocess::spawn(forward_codex_rollout_trace(
                 root.path().to_path_buf(),
                 inbound_tx.clone(),
-                read_only_builtins_direct_tools,
             ))
         });
 
@@ -23864,8 +21880,6 @@ impl CodexRpc {
                 stderr_task,
                 rollout_trace_task,
                 rollout_trace_root,
-                native_execution_trace: CodexNativeTraceOwner::spawn(),
-                expected_transport_close: AtomicBool::new(false),
                 tool_catalog,
                 agent_delegation_excluded,
                 read_only_agentcontrol_direct_tools,
@@ -23882,37 +21896,7 @@ impl CodexRpc {
         ))
     }
 
-    async fn install_native_execution_trace(&self, thread_id: &str) -> Result<(), String> {
-        let root = self.rollout_trace_root.as_ref().ok_or_else(|| {
-            "Codex protected Fork/Resume requires the process-owned local execution trace; SSH-launched native processes do not expose that transport".to_owned()
-        })?;
-        self.native_execution_trace
-            .install(root.path().to_path_buf(), thread_id.to_owned())
-            .await?;
-        tracing::info!(
-            target: "tyde_codex_model_tools",
-            source = "native_execution_trace",
-            native_thread_start_verified = true,
-            "Codex protected lifecycle execution source installed"
-        );
-        Ok(())
-    }
-
     async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
-        if method == "turn/start" {
-            let status = self
-                .native_execution_trace
-                .status()
-                .await
-                .map_err(|reason| {
-                    format!("Codex protected execution trace unavailable: {reason}")
-                })?;
-            if let CodexNativeTraceStatus::Failed(reason) = status {
-                return Err(format!(
-                    "Codex protected execution trace unavailable: {reason}"
-                ));
-            }
-        }
         if (self.agent_delegation_excluded || self.read_only_builtins_direct_tools)
             && matches!(method, "thread/start" | "thread/fork" | "thread/resume")
         {
@@ -23943,10 +21927,6 @@ impl CodexRpc {
                 config.insert(
                     "features.code_mode.direct_only_tool_namespaces".to_owned(),
                     json!(CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES),
-                );
-                config.insert(
-                    CODEX_READ_ONLY_TOOL_METADATA_CONFIG_KEY.to_owned(),
-                    Value::Bool(true),
                 );
                 tracing::info!(
                     native_operation = method,
@@ -24071,7 +22051,6 @@ impl CodexRpc {
 
     /// Tear the app-server down.
     async fn shutdown(&self) {
-        self.expected_transport_close.store(true, Ordering::Release);
         self.close_stdin().await;
         let _ = self.child.shutdown().await;
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
@@ -24082,7 +22061,6 @@ impl CodexRpc {
     }
 
     async fn terminate(&self) -> Result<(), String> {
-        self.expected_transport_close.store(true, Ordering::Release);
         self.close_stdin().await;
         let result = self.child.shutdown().await;
         self.abort_readers();

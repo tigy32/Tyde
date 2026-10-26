@@ -1704,23 +1704,36 @@ inference-attempt identity, and a Tyde-only streaming-first candidate lost
 interrupted text. That behavior is reverted. Ordinary Resume again negotiates
 `experimentalRawEvents`, ordinary Fork uses the typed item projection, and
 neither installs the trace. Typed narrative, commands and usage stream live.
-Codex CLI 0.162.1 does not deliver raw events after rejoin, so the adapter
-shows its existing warning that polling cannot appear. Protected
-`EnforcedReadOnly` Resume/Fork keep the trace exactly as before 44909734: their
-read-only enforcement is unchanged, their narrative remains terminal-buffered
-and a trace failure still refuses further turns.
+Codex CLI 0.162.1 does not deliver raw events after rejoin; that is an
+accepted upstream limitation with no warning or reconstruction.
+
+Protected `EnforcedReadOnly` Resume/Fork then still kept the trace, and
+reviewers rejoin that way. Codex writes its turn end before the detached
+`inference_cancelled` record, and no inference terminal at all when an
+interrupt lands during request establishment, so an interrupted reviewer
+failed with `native_trace_inference_terminal_payload_missing` and refused its
+next turn. The trace is now deleted: protected rejoin uses the ordinary path
+and the native sandbox remains the only read-only enforcement.
 
 Known limitation: raw-only polling (`write_stdin` cells and `wait`
-continuations) is not shown after ordinary rejoin. The warning discloses this;
-no poll card is fabricated or reconstructed from provider history.
+continuations) and commands rejected before they start are not shown after
+rejoin, and a rejoined web-search card has no query. No card or argument is
+fabricated or reconstructed from provider history.
 
 `real_watched_command_shows_every_interaction` keeps the full polling oracle
-for the fresh session. A rejoined turn gets the same oracle unless the adapter
-showed its exact raw-events-unavailable warning before the turn acted. Then the
-turn must show no `write_stdin` or `wait` card at all; any partial set must
-satisfy the full oracle. It must still show exactly the launch and FIFO-release
-commands, and the launch must complete with its actual output. The fork's late
-nested command must still complete after idle.
+for the fresh session. A rejoined turn must show either no `write_stdin` or
+`wait` card at all or a set satisfying the full oracle. It must still show
+exactly the launch and FIFO-release commands, and the launch must complete
+with its actual output. The fork's late nested command must still complete
+after idle.
+
+`real_enforced_read_only` and `real_enforced_file_access` keep the full
+denied-write oracle for fresh sessions. A protected Fork or Resume turn may
+show no write-command card; any card shown must satisfy the full oracle. Every
+phase must still leave the protected files unchanged, create none, and report
+`WRITE_BLOCKED`. `real_protected_native_web_search_lifecycle` accepts an
+empty query on its rejoined search card; a shown query must be exact, and the
+card must still complete successfully once and in order.
 
 `real_narrative_streams_live` routes real inference bytes through a local
 proxy using a temporary `CODEX_HOME` with copied auth. Per armed phase the
@@ -1742,16 +1755,34 @@ response's end. A final tool-free response must carry the last file's
 contents. This is the live model-request boundary contract; saved history
 replays these same emitted events.
 
-Only Codex declares `YieldedCodeCells`, so only Codex is eligible for either
-case. Real runs on 2026-10-26 used CLI 0.162.1 with the default test profile.
-Against main d0e40291 the narrative case streamed fresh text and failed at
-resume with no live text (nextest `8c61d810-ea24-4b06-bb45-d54a26729634`). With
-the revert the narrative case, including the chained-read boundaries, passed
-every phase in 77.7 seconds (`b74fb9f0-eb72-483b-a46f-c3c558b35864`). The
-watched case passed in 101.9 seconds with four poll and two wait cards fresh
-and disclosed zero-card resumed and forked turns
-(`96a47d98-70b9-4a88-83aa-aaf8f255a2f8`). Content-free logs are retained under
-`/home/tyggs/tyde-evidence/codex-beta8-recovery/`.
+The scenario then resumes and forks as `EnforcedReadOnly`. Each protected
+session sends a turn whose model request the proxy holds before contacting
+upstream, is interrupted while held, and must answer its next turn.
+
+Only Codex declares `YieldedCodeCells`, so only Codex is eligible for the
+narrative and watched cases. Real runs on 2026-10-26 used CLI 0.162.1 with the
+default test profile. Against main d0e40291 the narrative case streamed fresh
+text and failed at resume with no live text (nextest
+`8c61d810-ea24-4b06-bb45-d54a26729634`). With the revert the narrative case,
+including the chained-read boundaries, passed every phase in 77.7 seconds
+(`b74fb9f0-eb72-483b-a46f-c3c558b35864`).
+
+With the trace still present (2fcb4d66), the first protected held-request
+interrupt emitted `native_trace_inference_terminal_payload_missing` and failed
+(`185d0371-7fd4-4b22-a62f-77da69a68e5e`). With the trace deleted, the narrative
+case passed in 93.0 seconds, and both protected phases answered their follow-up
+(`6ca9ca6d-d427-4c9f-b9c3-9f5054e58db7`). The watched case passed in 115.2
+seconds with four poll and two wait cards fresh and none on rejoin
+(`0079bb38-e5f8-448c-a59a-1e223d467f0e`). The same run failed
+`real_enforced_read_only` on the old strict oracle: the protected fork showed
+no write card. With the rejoin oracle, `real_enforced_read_only`,
+`real_enforced_file_access` (Codex and Claude) and `real_review_context_forks`
+(Codex) passed (`1d02fc7f-7dfc-44d6-8dbe-12f769d06053`). Codex showed no write
+card on all four rejoined phases; Claude showed full cards.
+`real_protected_native_web_search_lifecycle` passed with no query shown on
+either rejoined card (`56915040-760b-4252-afb9-77a636ba6b76`). Content-free
+logs are retained under `/home/tyggs/tyde-evidence/codex-beta8-recovery/` and
+`/home/tyggs/tyde-evidence/codex-drop-native-trace/`.
 
 ## Claude reviewer native configuration
 
