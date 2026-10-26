@@ -383,7 +383,7 @@ pub fn Header() -> impl IntoView {
                     </button>
                 </div>
             </Show>
-            <crate::notices::ProjectOperationNotices />
+            <crate::notices::ProjectDialogs />
         </>
     }
 }

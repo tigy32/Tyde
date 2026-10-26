@@ -748,6 +748,48 @@ fn RailContextMenuView(
     }
 }
 
+fn failed_workbench_removal(
+    state: &AppState,
+    host_id: &str,
+    workbench_id: &protocol::ProjectId,
+) -> Option<(protocol::StreamPath, String)> {
+    state.project_operations.with(|operations| {
+        let mut failed = operations
+            .iter()
+            .filter_map(|((host, stream), operation)| {
+                if host != host_id {
+                    return None;
+                }
+                let protocol::ProjectMutation::RemoveWorkbench(payload) = &operation.mutation
+                else {
+                    return None;
+                };
+                if &payload.id != workbench_id {
+                    return None;
+                }
+                let protocol::ProjectOperationState::Failed {
+                    message,
+                    cleanup_may_be_partial,
+                    ..
+                } = &operation.state
+                else {
+                    return None;
+                };
+                let message = if *cleanup_may_be_partial {
+                    format!(
+                        "{message} Cleanup may be incomplete; inspect the workbench before trying again."
+                    )
+                } else {
+                    message.clone()
+                };
+                Some((stream.clone(), message))
+            })
+            .collect::<Vec<_>>();
+        failed.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+        failed.into_iter().next()
+    })
+}
+
 #[component]
 fn ProjectContextMenuItems(
     project: ActiveProjectRef,
@@ -779,6 +821,14 @@ fn ProjectContextMenuItems(
         let project = project.clone();
         Memo::new(move |_| {
             crate::notices::project_mutation_pending(&state, &project.host_id, &project.project_id)
+        })
+    };
+
+    let recoverable_removal = {
+        let state = state.clone();
+        let project = project.clone();
+        Memo::new(move |_| {
+            failed_workbench_removal(&state, &project.host_id, &project.project_id).is_some()
         })
     };
 
@@ -895,6 +945,20 @@ fn ProjectContextMenuItems(
                 }
             })
             .unwrap_or_default();
+        if let Some((operation_stream, message)) =
+            failed_workbench_removal(&state, &host_id, &workbench_id)
+        {
+            state
+                .workbench_remove_prompt
+                .set(Some(WorkbenchRemovePrompt {
+                    host_id,
+                    operation_stream,
+                    project_id: workbench_id,
+                    project_name: workbench_name,
+                    message,
+                }));
+            return;
+        }
         spawn_local(async move {
             let message = format!(
                 "Remove workbench '{workbench_name}'? This will remove its git worktree and all associated agents, terminals, sessions, steering, team references, reviews, and workflow runs."
@@ -931,7 +995,11 @@ fn ProjectContextMenuItems(
                 })}
             })}
             {move || is_workbench().then(|| view! {
-                <button class="context-menu-item" disabled=move || busy.get() on:click=on_remove_workbench.clone()>
+                <button
+                    class="context-menu-item"
+                    disabled=move || busy.get() && !recoverable_removal.get()
+                    on:click=on_remove_workbench.clone()
+                >
                     "Remove Workbench"
                 </button>
             })}
@@ -1011,6 +1079,7 @@ fn WorkbenchCreateModal(
             >
                 <div class="modal-title">{title}</div>
                 <div class="modal-body">
+                    <crate::notices::ProjectOperationDetails host=prompt.host_id.clone() project=prompt.parent_project_id.clone() />
                     <label class="modal-label">"Branch name (a new git branch will be created):"</label>
                     <input
                         type="text"
@@ -1042,6 +1111,13 @@ fn WorkbenchCreateModal(
 #[component]
 pub(crate) fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let busy = {
+        let state = state.clone();
+        let prompt = prompt.clone();
+        Memo::new(move |_| {
+            crate::notices::project_mutation_pending(&state, &prompt.host_id, &prompt.project_id)
+        })
+    };
     let close = {
         let state = state.clone();
         move || state.workbench_remove_prompt.set(None)
@@ -1063,6 +1139,9 @@ pub(crate) fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoVi
     let state_for_force = state.clone();
     let force_prompt = prompt.clone();
     let on_force = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
         state_for_force.workbench_remove_prompt.set(None);
         state_for_force.project_operations.update(|operations| {
             operations.remove(&(
@@ -1119,7 +1198,7 @@ pub(crate) fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoVi
                     <button class="modal-button" on:click=move |_| close_for_cancel()>
                         "Cancel"
                     </button>
-                    <button class="modal-button danger" on:click=on_force>
+                    <button class="modal-button danger" disabled=move || busy.get() on:click=on_force>
                         "Delete Anyway"
                     </button>
                 </div>
@@ -1243,29 +1322,6 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
             }
         })
     };
-    let delete_errors = {
-        let state = state.clone();
-        let project = project.clone();
-        move || {
-            let mut errors = state.project_operations.with(|operations| {
-                operations.iter().filter_map(|((host, stream), operation)| {
-                    if host == &project.host_id
-                        && matches!(&operation.mutation, protocol::ProjectMutation::Delete(payload) if payload.id == project.project_id)
-                        && let protocol::ProjectOperationState::Failed { message, .. } = &operation.state
-                    {
-                        Some((stream.clone(), message.clone()))
-                    } else {
-                        None
-                    }
-                }).collect::<Vec<_>>()
-            });
-            errors.sort_by(|left, right| left.0.0.cmp(&right.0.0));
-            errors
-                .into_iter()
-                .map(|(_, message)| view! { <p role="alert">{message}</p> })
-                .collect_view()
-        }
-    };
     let confirming = RwSignal::new(false);
     let delete_state = state.clone();
     let delete_target = project.clone();
@@ -1362,7 +1418,7 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
             >
                 <h2 class="modal-title">"Edit project"</h2>
                 <div class="modal-body">
-                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser, crate::notices::NoticeScope::Project(project.host_id.clone(), project.project_id.clone())] />
+                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
                     <Show when=move || info.get().is_none()><p role="status">"Project is no longer available"</p></Show>
                     <label class="modal-label" for="project-editor-name">"Project name"</label>
                     <div class="project-editor-name-row">
@@ -1407,7 +1463,7 @@ fn ProjectEditorDialog(project: ActiveProjectRef) -> impl IntoView {
                 <Show when=move || delete_blocked.get().is_some()>
                     <p id="project-delete-blocked" role="status">{move || delete_blocked.get()}</p>
                 </Show>
-                {delete_errors}
+                <crate::notices::ProjectOperationDetails host=project.host_id.clone() project=project.project_id.clone() />
                 <div class="modal-actions">
                     <button class="modal-button danger" aria-describedby=move || delete_blocked.get().map(|_| "project-delete-blocked")
                         disabled=move || confirming.get() || busy.get() || info.get().is_none() || delete_blocked.get().is_some()
@@ -1772,6 +1828,23 @@ mod wasm_tests {
         }
     }
 
+    fn open_workbench_menu(container: &HtmlElement, name: &str) {
+        let buttons = container
+            .query_selector_all(".project-rail button[title]")
+            .unwrap();
+        let row = (0..buttons.length())
+            .filter_map(|index| buttons.item(index)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.get_attribute("title").as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("workbench {name}"));
+        let event_options = web_sys::MouseEventInit::new();
+        event_options.set_cancelable(true);
+        event_options.set_bubbles(true);
+        let event =
+            web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &event_options)
+                .unwrap();
+        row.dispatch_event(&event).unwrap();
+    }
+
     fn button(container: &HtmlElement, text: &str) -> HtmlElement {
         let buttons = container.query_selector_all("button").unwrap();
         (0..buttons.length())
@@ -1927,7 +2000,7 @@ mod wasm_tests {
         assert!(!container.text_content().unwrap().contains("Queued"));
         assert!(
             container
-                .query_selector(".project-operation-notices .inline-notice")
+                .query_selector(".browser-notices .inline-notice")
                 .unwrap()
                 .is_none(),
             "routine in-flight progress must not render global notice"
@@ -1945,25 +2018,61 @@ mod wasm_tests {
             "/project-operation/create",
             mutation.clone(),
             ProjectOperationState::Running {
-                stage: ProjectOperationStage::Git,
+                stage: ProjectOperationStage::PrepareBuilds,
             },
         );
         next_tick().await;
         assert!(
-            !container.text_content().unwrap().contains("Working in Git"),
-            "routine running stage keeps global notices quiet"
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Preparing or restoring a verified warm build baseline"),
+            "preparing must not render an app-wide banner"
         );
         assert!(
             container
-                .query_selector(".project-operation-notices .inline-notice")
+                .query_selector(".browser-notices .inline-notice")
                 .unwrap()
                 .is_none(),
-            "routine running stage keeps global notices quiet"
+            "preparing must not render an app-wide banner"
         );
         assert!(
             textarea.value() == "Unrelated chat draft",
             "unrelated draft must remain unchanged"
         );
+        let header = container.query_selector("header").unwrap().unwrap();
+        let header_bottom = header.get_bounding_client_rect().bottom();
+        let rail_top = container
+            .query_selector(".project-rail")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect()
+            .top();
+        assert_eq!(
+            header_bottom, rail_top,
+            "preparation must not insert a strip between header and navigation"
+        );
+        assert!(
+            container
+                .query_selector(".project-operation-notices")
+                .unwrap()
+                .is_none(),
+            "the global workbench banner must not exist"
+        );
+        open_workbench_menu(&container, "Tyde2");
+        next_tick().await;
+        assert!(
+            button(&container, "New Workbench").has_attribute("disabled"),
+            "preparation still owns its pending actions"
+        );
+        container
+            .query_selector(".rail-context-backdrop")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
         let project = workbench(
             "wb-new",
             "experiment",
@@ -2005,16 +2114,23 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("Saved, with warnings")
+                .contains("Saved, with warnings"),
+            "a committed warning must not paint an app-wide notice"
         );
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
                 .contains("Do not repeat this operation")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Workflow discovery unavailable")
         );
         assert!(
             container
@@ -2049,10 +2165,17 @@ mod wasm_tests {
         state.prepare_host_refresh("host-a");
         next_tick().await;
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("Completion is unknown")
+                .contains("Completion is unknown"),
+            "host refresh must not paint an app-wide notice"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Preparing or restoring a verified warm build baseline")
         );
         // An empty bootstrap removes p-orphan and disables Save because its
         // record is missing, not because another project's mutation is pending.
@@ -2087,6 +2210,10 @@ mod wasm_tests {
                 .is_some(),
             "replayed catalog must keep the unrelated project available"
         );
+        let branch_conflict = format!(
+            "Branch already exists {}",
+            "unbroken-diagnostic".repeat(1000)
+        );
         operation_event(
             &state,
             1,
@@ -2094,17 +2221,28 @@ mod wasm_tests {
             mutation,
             ProjectOperationState::Failed {
                 code: protocol::CommandErrorCode::Conflict,
-                message: "Branch already exists".to_owned(),
+                message: branch_conflict.clone(),
                 cleanup_may_be_partial: false,
             },
         );
         next_tick().await;
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("Branch already exists")
+                .contains("Branch already exists"),
+            "a failed create must not paint an app-wide notice"
         );
+        assert!(state.project_operations.with(|operations| {
+            operations.iter().any(|((host, _), operation)| {
+                host == "host-a"
+                    && matches!(
+                        &operation.state,
+                        ProjectOperationState::Failed { message, .. }
+                            if message == &branch_conflict
+                    )
+            })
+        }));
         assert!(
             container
                 .query_selector(".workbench-create-modal")
@@ -2189,10 +2327,11 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("Could not save added root")
+                .contains("Could not save added root"),
+            "a failed root change must not paint an app-wide notice"
         );
         assert!(
             container
@@ -2201,6 +2340,23 @@ mod wasm_tests {
                 .is_none(),
             "late add-root error cannot reopen a browser"
         );
+        state.project_editor.set(Some(ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("p-orphan".to_owned()),
+        }));
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Edit project']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Could not save added root"),
+            "closed-editor failures remain accessible in their project"
+        );
+        button(&container, "Done").click();
+        next_tick().await;
         let mutations = [
             (
                 ProjectMutation::Create(protocol::ProjectCreatePayload {
@@ -2293,31 +2449,134 @@ mod wasm_tests {
             ProjectId("p-orphan".to_owned()),
         );
         next_tick().await;
-        let errors = container
-            .query_selector_all(".project-operation-notices .inline-notice.error")
-            .unwrap();
-        let unsent = (0..errors.length())
-            .filter_map(|index| errors.item(index))
-            .find(|node| {
-                node.text_content()
-                    .unwrap()
-                    .contains("recover-submitted-branch could not be sent")
-                    || node
-                        .text_content()
-                        .unwrap()
-                        .contains("recover-submitted-branch in Tyde2 could not be sent")
-            })
-            .expect("recoverable unsent branch")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        js_sys::eval("window.__TAURI__.core.invoke = window.__normal_project_invoke;").unwrap();
-        button(&unsent, "Retry").click();
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("could not be sent"),
+            "a failed send must not paint an app-wide notice"
+        );
+        prompt.set(Some(WorkbenchCreatePrompt {
+            host_id: "host-a".to_owned(),
+            parent_project_id: ProjectId("p-tyde".to_owned()),
+            parent_name: "Tyde2".to_owned(),
+        }));
         next_tick().await;
+        let modal = container
+            .query_selector(".workbench-create-modal")
+            .unwrap()
+            .unwrap();
+        assert!(
+            modal
+                .text_content()
+                .unwrap()
+                .contains("recover-submitted-branch"),
+            "the scoped dialog must expose the unsent branch"
+        );
+        assert!(
+            modal.text_content().unwrap().contains("Connection closed"),
+            "the scoped dialog must expose the send failure"
+        );
+        let viewport = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            button(&container, "Cancel")
+                .get_bounding_client_rect()
+                .bottom()
+                <= viewport,
+            "retained long errors must leave create controls reachable"
+        );
+        let diagnostics = modal
+            .query_selector(".project-operation-details")
+            .unwrap()
+            .unwrap();
+        assert!(
+            diagnostics.scroll_height() > diagnostics.client_height(),
+            "the complete long diagnostic stays scrollable"
+        );
+        button(&container, "Retry").click();
+        next_tick().await;
+        button(&container, "Cancel").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-create-modal")
+                .unwrap()
+                .is_none()
+        );
         assert!(js_sys::eval(r#"window.__test_send_calls.some(([cmd,args]) => cmd === 'send_host_line' && JSON.parse(JSON.parse(args).line).kind === 'workbench_create' && JSON.parse(JSON.parse(args).line).payload.branch === 'recover-submitted-branch')"#).unwrap().as_bool().unwrap());
-        // A long error cannot take navigation/chat out of the viewport.
         operation_event(
             &state,
             10,
+            "/project-operation/open-failed",
+            ProjectMutation::Create(protocol::ProjectCreatePayload {
+                name: "Unavailable project".to_owned(),
+                roots: vec![ProjectRootPath("/tmp/unavailable".to_owned())],
+            }),
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Internal,
+                message: "Could not open project".to_owned(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        operation_event(
+            &state,
+            11,
+            "/project-operation/reorder-failed",
+            ProjectMutation::Reorder(protocol::ProjectReorderPayload {
+                scope: protocol::ProjectReorderScope::TopLevel,
+                project_ids: vec![
+                    ProjectId("p-tyde".to_owned()),
+                    ProjectId("p-orphan".to_owned()),
+                ],
+            }),
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Internal,
+                message: "Could not reorder projects".to_owned(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Could not open project")
+        );
+        crate::components::host_browser::open_project_browser_for_host(&state, "host-a");
+        next_tick().await;
+        let browser = container
+            .query_selector("[aria-label='Folder browser']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            browser
+                .text_content()
+                .unwrap()
+                .contains("Could not open project")
+        );
+        assert!(
+            browser
+                .text_content()
+                .unwrap()
+                .contains("Could not reorder projects")
+        );
+        button(&container, "Cancel").click();
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Could not open project")
+        );
+        // A long error cannot take navigation/chat out of the viewport.
+        operation_event(
+            &state,
+            12,
             "/project-operation/long",
             ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
                 id: ProjectId("wb-feat".to_owned()),
@@ -2331,7 +2590,7 @@ mod wasm_tests {
         );
         next_tick().await;
         let notices = container
-            .query_selector(".project-operation-notices")
+            .query_selector(".browser-notices")
             .unwrap()
             .unwrap();
         let viewport = web_sys::window()
@@ -2340,12 +2599,21 @@ mod wasm_tests {
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!(notices.get_bounding_client_rect().height() <= viewport * 0.2 + 1.0);
-        assert!(
-            notices.scroll_height() > notices.client_height(),
-            "complete errors remain reachable by scrolling"
+        assert_eq!(
+            notices.client_height(),
+            0,
+            "a long removal failure must not take app-wide space"
         );
-        button(&container, "Review removal…").click();
+        assert!(
+            !notices
+                .text_content()
+                .unwrap_or_default()
+                .contains("untracked file diagnostic"),
+            "a long removal failure must not paint an app-wide notice"
+        );
+        open_workbench_menu(&container, "feature-login");
+        next_tick().await;
+        button(&container, "Remove Workbench").click();
         next_tick().await;
         let modal = container
             .query_selector(".workbench-remove-modal")
@@ -2371,12 +2639,24 @@ mod wasm_tests {
                 .is_none()
         );
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
                 .contains("Cleanup may be incomplete"),
-            "cancelling review must retain partial-cleanup guidance"
+            "closing the dialog must not leave an app-wide notice"
         );
+        assert!(state.project_operations.with(|operations| {
+            operations.iter().any(|((host, _), operation)| {
+                host == "host-a"
+                    && matches!(
+                        &operation.state,
+                        ProjectOperationState::Failed {
+                            cleanup_may_be_partial: true,
+                            ..
+                        }
+                    )
+            })
+        }));
         assert!(
             textarea.value() == "Unrelated chat draft",
             "unrelated draft must remain unchanged"
@@ -2498,18 +2778,25 @@ mod wasm_tests {
             "remote failure must not open a modal"
         );
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
-                .contains("?? implementation.md")
+                .contains("?? implementation.md"),
+            "a dirty removal must not paint an app-wide notice"
         );
-        button(&container, "Review removal…").click();
+        open_workbench_menu(&container, "feature-login");
+        next_tick().await;
+        button(&container, "Remove Workbench").click();
         next_tick().await;
         let modal = container
             .query_selector(".workbench-remove-modal")
             .unwrap()
             .expect("dirty removal modal");
         assert_eq!(modal.get_attribute("role").as_deref(), Some("alertdialog"));
+        assert!(
+            button(&container, "Delete Anyway").has_attribute("disabled"),
+            "inspection must not allow force removal while another family operation is running"
+        );
         assert!(
             modal
                 .text_content()
@@ -2543,13 +2830,15 @@ mod wasm_tests {
                 .is_none()
         );
         assert!(
-            container
+            !container
                 .text_content()
                 .unwrap()
                 .contains("?? implementation.md"),
-            "cancel must retain the failure and its recovery action"
+            "closing the dialog must not leave an app-wide notice"
         );
-        button(&container, "Review removal…").click();
+        open_workbench_menu(&container, "feature-login");
+        next_tick().await;
+        button(&container, "Remove Workbench").click();
         next_tick().await;
         button(&container, "Open Workbench").click();
         next_tick().await;
@@ -2559,61 +2848,27 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
+        let state = state_signal.get_value().expect("state");
         assert!(
-            container
+            state.project_operations.with(|operations| {
+                operations.iter().any(|((host, _), operation)| {
+                    host == "host-a"
+                        && matches!(
+                            &operation.state,
+                            protocol::ProjectOperationState::Failed { message, .. }
+                                if message.contains("implementation.md")
+                        )
+                })
+            }),
+            "opening the workbench must keep the failed removal"
+        );
+        assert!(
+            !container
                 .text_content()
                 .unwrap()
                 .contains("?? implementation.md"),
-            "inspection must not dismiss the error"
+            "inspection must not leave an app-wide notice"
         );
-        button(&container, "Review removal…").click();
-        next_tick().await;
-        button(&container, "Delete Anyway").click();
-        next_tick().await;
-        next_tick().await;
-        assert!(
-            container
-                .query_selector(".workbench-remove-modal")
-                .unwrap()
-                .is_none()
-        );
-
-        let forced = js_sys::eval(
-            r#"
-            (window.__test_send_calls || []).some(([cmd, args]) => {
-                if (cmd !== "send_host_line") return false;
-                const envelope = JSON.parse(JSON.parse(args).line);
-                return envelope.kind === "workbench_remove"
-                    && envelope.payload.id === "wb-feat"
-                    && envelope.payload.force === true;
-            })
-            "#,
-        )
-        .expect("inspect forced removal")
-        .as_bool()
-        .unwrap_or(false);
-        assert!(forced, "Delete Anyway must send force=true");
-        assert!(
-            !container.text_content().unwrap().contains("Cleaning up"),
-            "routine operation progress must not appear in global header notices"
-        );
-        assert!(
-            container
-                .query_selector(".project-operation-notices .inline-notice")
-                .unwrap()
-                .is_none(),
-            "routine in-flight operations must not render global notice banner"
-        );
-        let notices_el = container
-            .query_selector(".project-operation-notices")
-            .unwrap()
-            .expect("project operation notices container");
-        assert_eq!(
-            notices_el.client_height(),
-            0,
-            "no empty container height or layout shift when nothing real visible"
-        );
-
         // Verify that the other in-flight removal (wb-fix / bugfix-x) is deterministically
         // reflected in the user-visible UI via disabled pending actions on the workbench.
         let buttons = container
@@ -2660,6 +2915,73 @@ mod wasm_tests {
         assert!(
             rename_btn.disabled(),
             "Rename action must be disabled while removal is in flight"
+        );
+        container
+            .query_selector(".rail-context-backdrop")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        operation_event(
+            &state,
+            2,
+            "/project-operation/remove-other",
+            protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
+                id: ProjectId("wb-fix".to_owned()),
+                force: false,
+            }),
+            protocol::ProjectOperationState::Committed { warnings: vec![] },
+        );
+        next_tick().await;
+        open_workbench_menu(&container, "feature-login");
+        next_tick().await;
+        button(&container, "Remove Workbench").click();
+        next_tick().await;
+        button(&container, "Delete Anyway").click();
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none()
+        );
+
+        let forced = js_sys::eval(
+            r#"
+            (window.__test_send_calls || []).some(([cmd, args]) => {
+                if (cmd !== "send_host_line") return false;
+                const envelope = JSON.parse(JSON.parse(args).line);
+                return envelope.kind === "workbench_remove"
+                    && envelope.payload.id === "wb-feat"
+                    && envelope.payload.force === true;
+            })
+            "#,
+        )
+        .expect("inspect forced removal")
+        .as_bool()
+        .unwrap_or(false);
+        assert!(forced, "Delete Anyway must send force=true");
+        assert!(
+            !container.text_content().unwrap().contains("Cleaning up"),
+            "routine operation progress must not appear in global header notices"
+        );
+        assert!(
+            container
+                .query_selector(".browser-notices .inline-notice")
+                .unwrap()
+                .is_none(),
+            "routine in-flight operations must not render global notice banner"
+        );
+        let notices_el = container
+            .query_selector(".browser-notices")
+            .unwrap()
+            .expect("project operation notices container");
+        assert_eq!(
+            notices_el.client_height(),
+            0,
+            "no empty container height or layout shift when nothing real visible"
         );
     }
 

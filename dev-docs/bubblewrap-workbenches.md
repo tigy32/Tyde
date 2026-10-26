@@ -46,8 +46,9 @@ Modes requiring nested namespaces fail explicitly if host policy denies them.
 
 Selecting Bubblewrap is sufficient for normal supported projects. There is no
 second enable switch, recipe approval or baseline-production approval. During
-creation the server emits `ProjectOperationStage::PrepareBuilds`; the existing
-operation notice explains that initial preparation may require a full build.
+creation the server emits `ProjectOperationStage::PrepareBuilds`. The app does
+not show an app-wide notice for any workbench operation state. Failures and
+warnings remain available in the affected project or workbench dialog.
 
 Language-aware discovery (`setup.py`) selects normal commands and artifact
 boundaries; the generic engine (`runner.py`) executes opaque producers and

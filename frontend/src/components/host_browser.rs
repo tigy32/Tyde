@@ -813,6 +813,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 <div class="browser-host-row">{dropdown_view}</div>
                 <div class="browser-path">{path_display}</div>
                 <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
+                {move || view! { <crate::notices::ProjectOperationDetails host=host_id_signal.get() /> }}
                 {error_view}
                 {loading_view}
                 <div class="browser-entries">{entries_view}</div>

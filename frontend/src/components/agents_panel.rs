@@ -6036,7 +6036,7 @@ mod wasm_tests {
         let mounted = state.clone();
         let handle = mount_to(container.clone(), move || {
             provide_context(mounted.clone());
-            view! { <style>{include_str!("../../styles.css")}</style><crate::notices::ProjectOperationNotices /><AgentsPanel /><crate::components::project_rail::ProjectEditor /><crate::components::host_browser::HostBrowser /> }
+            view! { <style>{include_str!("../../styles.css")}</style><crate::notices::ProjectDialogs /><AgentsPanel /><crate::components::project_rail::ProjectEditor /><crate::components::host_browser::HostBrowser /> }
         });
         for _ in 0..4 {
             next_tick().await;
@@ -6440,11 +6440,17 @@ mod wasm_tests {
         );
         next_tick().await;
         assert!(
-            container
+            crate::notices::has_notice(&crate::notices::NoticeScope::ProjectOperations(
+                "remote".into(),
+            )),
+            "the send failure stays recorded"
+        );
+        assert!(
+            !container
                 .text_content()
                 .unwrap()
                 .contains("Another project's deletion could not be sent"),
-            "Host-wide failures remain visible in the operation notices"
+            "a send failure must not paint an app-wide notice"
         );
         assert!(
             !editor

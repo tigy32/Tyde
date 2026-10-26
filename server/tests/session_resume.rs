@@ -925,6 +925,17 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
 #[tokio::test]
 async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     let mut fixture = Fixture::new().await;
+    let first_turn = server::backend::mock::MockGateHandle::new();
+    // A completed bootstrap replays text, not a second live idle transition.
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "raced session",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: hello",
+                &first_turn,
+            )),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -954,6 +965,9 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
         expect_agent_start_on_stream(&mut fixture.client, &first.instance_stream, "first start")
             .await;
     let session = start.session_id.expect("raced session id");
+    first_turn.wait_until_entered().await;
+    first_turn.release_one();
+    eprintln!("RESUME RACE FIXTURE phase=initial-live-turn-released");
     expect_turn_on_stream(
         &mut fixture.client,
         &first.instance_stream,
@@ -966,6 +980,7 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     // close would not even be dispatched until the close it is racing had
     // finished. Two clients on one host is the ordinary case this race comes
     // from.
+    drop(reservation);
     let mut resumer = fixture.connect().await;
 
     // Hold the close after it has decided nobody else owns this session and
@@ -997,25 +1012,22 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
         })
         .await
         .expect("resume the session the close is withdrawing");
-    // The claim makes this resume wait, so its start may never arrive here. A
-    // bounded wait keeps the unclaimed build deterministic without making the
-    // claimed build depend on a sleep being long enough.
+    // No descriptor may be published while withdrawal owns this session.
     let raced_agent = first.agent_id.clone();
-    let raced = tokio::time::timeout(
-        Duration::from_secs(3),
-        fixture::next_frame_matching_on(&mut resumer, "raced NewAgent", |env| {
-            env.kind == FrameKind::NewAgent
-                && env
-                    .parse_payload::<NewAgentPayload>()
-                    .is_ok_and(|payload| payload.agent_id != raced_agent)
-        }),
-    )
-    .await
-    .ok();
-    if raced.is_some() {
-        // Let the actor's own startup persist land before the held write runs.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fixture::next_frame_matching_on(&mut resumer, "raced NewAgent", |env| {
+                env.kind == FrameKind::NewAgent
+                    && env
+                        .parse_payload::<NewAgentPayload>()
+                        .is_ok_and(|payload| payload.agent_id != raced_agent)
+            }),
+        )
+        .await
+        .is_err(),
+        "resume must not publish a card during held withdrawal"
+    );
 
     // One permit for the held decision, one for the re-clear this close runs
     // after its actor stops. The second also holds the claim, so the resume
@@ -1023,9 +1035,8 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     withdraw_gate.release_one();
     withdraw_gate.release_one();
 
-    let second: NewAgentPayload = match raced {
-        Some(frame) => frame.parse_payload().expect("parse raced NewAgent"),
-        None => fixture::next_frame_matching_on(&mut resumer, "second NewAgent", |env| {
+    let second: NewAgentPayload =
+        fixture::next_frame_matching_on(&mut resumer, "second NewAgent", |env| {
             env.kind == FrameKind::NewAgent
                 && env
                     .parse_payload::<NewAgentPayload>()
@@ -1033,8 +1044,7 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
         })
         .await
         .parse_payload()
-        .expect("parse second NewAgent"),
-    };
+        .expect("parse second NewAgent");
     expect_agent_start_on_stream(&mut resumer, &second.instance_stream, "second start").await;
 
     // Closing the gate lets the shutdown inside the restart run unheld.

@@ -316,6 +316,7 @@ pub fn is_background_send(kind: FrameKind) -> bool {
 pub fn InlineNotices(
     #[prop(into)] scopes: Signal<Vec<NoticeScope>>,
     #[prop(optional)] include_operation: Option<FrameKind>,
+    #[prop(optional)] project_operation_target: Option<(String, Option<ProjectId>)>,
 ) -> impl IntoView {
     let notices = NOTICES.with(Clone::clone);
     let state = expect_context::<AppState>();
@@ -326,6 +327,14 @@ pub fn InlineNotices(
                 .iter()
                 .filter(|notice| {
                     scopes.contains(&notice.scope)
+                        || project_operation_target
+                            .as_ref()
+                            .is_some_and(|(host, project)| {
+                                notice.scope == NoticeScope::ProjectOperations(host.clone())
+                                    && notice.retry.as_ref().is_none_or(|mutation| {
+                                        mutation_project(mutation) == project.as_ref()
+                                    })
+                            })
                         || include_operation
                             .is_some_and(|operation| notice.operation == Some(operation))
                 })
@@ -454,309 +463,73 @@ pub(crate) fn mutation_label(
 }
 
 #[component]
-pub fn ProjectOperationNotices() -> impl IntoView {
-    use protocol::ProjectOperationState;
+pub fn ProjectDialogs() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let operations = state.project_operations;
-    let hosts = state.configured_hosts;
     let remove_prompt = state.workbench_remove_prompt;
     let browser = state.browse_dialog;
     let scopes = move || {
-        let mut scopes = Vec::new();
         if browser.with(|dialog| dialog.is_none()) {
-            scopes.push(NoticeScope::Browser);
+            vec![NoticeScope::Browser]
+        } else {
+            Vec::new()
         }
-        scopes.extend(
-            hosts
-                .get()
-                .into_iter()
-                .map(|host| NoticeScope::ProjectOperations(host.id)),
-        );
-        scopes
     };
     view! {
-        <div class="project-operation-notices">
+        <div class="browser-notices">
             <InlineNotices scopes=Signal::derive(scopes) />
-            <For each=move || {
-                let mut keys = operations.with(|operations| {
-                    operations
-                        .iter()
-                        .filter(|(_, operation)| {
-                            matches!(&operation.state, ProjectOperationState::Failed { .. } | ProjectOperationState::Running { stage: protocol::ProjectOperationStage::PrepareBuilds })
-                                || matches!(
-                                    &operation.state,
-                                    ProjectOperationState::Committed { warnings } if !warnings.is_empty()
-                                )
-                        })
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>()
-                });
-                keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
-                keys
-            } key=|key| key.clone() let:key>
-                {
-                    let state = state.clone();
-                    // Operation identity is server-owned; a keyed row reads the current payload.
-                    let current = Signal::derive({ let key = key.clone(); move || operations.with(|operations| operations.get(&key).cloned()) });
-                    let label = { let host = key.0.clone(); let state = state.clone(); move || current.get().map(|operation| {
-                        let host_label = hosts.with(|hosts| hosts.iter().find(|entry| entry.id == host).map(|entry| entry.label.clone()));
-                        format!("{} · {}", host_label.unwrap_or_else(|| host.clone()), mutation_label(&state, &host, &operation.mutation))
-                    }) };
-                    let detail = move || current.get().map(|operation| match operation.state {
-                        ProjectOperationState::Running { stage: protocol::ProjectOperationStage::PrepareBuilds } => "Preparing or restoring a verified warm build baseline; initial preparation may require a full build.".to_owned(),
-                        ProjectOperationState::Admitted | ProjectOperationState::Running { .. } => String::new(),
-                        ProjectOperationState::Committed { warnings } => format!("Saved, with warnings: {}. Do not repeat this operation.", warnings.iter().map(|warning| warning.message.as_str()).collect::<Vec<_>>().join("; ")),
-                        ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } => if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },
-                    });
-                    let settled = move || current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Committed { .. } | ProjectOperationState::Failed { .. }));
-                    let state_for_retry = state.clone();
-                    let host_for_retry = key.0.clone();
-                    let key_for_retry = key.clone();
-                    let retry = move |_| {
-                        let Some(operation) = current.get_untracked() else { return; };
-                        let ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } = operation.state else { return; };
-                        if let protocol::ProjectMutation::RemoveWorkbench(payload) = &operation.mutation {
-                            state_for_retry.workbench_remove_prompt.set(Some(crate::state::WorkbenchRemovePrompt {
-                                host_id: host_for_retry.clone(), project_id: payload.id.clone(),
-                                operation_stream: operation.stream,
-                                project_name: project_label(&state_for_retry, &host_for_retry, &payload.id),
-                                message: if cleanup_may_be_partial { format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.") } else { message },
-                            }));
-                        } else {
-                            crate::actions::submit_project_mutation(&state_for_retry, host_for_retry.clone(), operation.mutation);
-                            operations.update(|operations| { operations.remove(&key_for_retry); });
-                        }
-                    };
-                    view! {
-                        <div class=move || if current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Failed { .. })) { "inline-notice error" } else if current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Committed { .. })) { "inline-notice warning" } else { "inline-notice" } role="status">
-                            <span><strong>{label}</strong>{" — "}{detail}</span>
-                            <Show when=move || current.get().is_some_and(|operation| matches!(operation.state, ProjectOperationState::Failed { cleanup_may_be_partial: false, .. }) || (matches!(operation.state, ProjectOperationState::Failed { .. }) && matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(_))))>
-                                <button type="button" on:click=retry.clone()>{move || if current.get().is_some_and(|operation| matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(_))) { "Review removal…" } else { "Retry" }}</button>
-                            </Show>
-                            <Show when=settled>
-                                <button type="button" aria-label="Dismiss project operation" on:click={let key = key.clone(); move |_| operations.update(|operations| { operations.remove(&key); })}>"×"</button>
-                            </Show>
-                        </div>
-                    }
-                }
-            </For>
-            {move || remove_prompt.get().map(|prompt| view! { <crate::components::project_rail::WorkbenchRemoveModal prompt /> })}
         </div>
+        {move || remove_prompt.get().map(|prompt| view! { <crate::components::project_rail::WorkbenchRemoveModal prompt /> })}
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
-    use super::*;
-    use leptos::mount::mount_to;
-    use protocol::ProjectOperationState;
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_test::*;
-    use web_sys::HtmlElement;
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    fn make_container() -> HtmlElement {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let container = document.create_element("div").unwrap();
-        document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
-    }
-
-    async fn next_tick() {
-        let promise = js_sys::Promise::new(&mut |resolve, _| {
-            web_sys::window()
-                .unwrap()
-                .request_animation_frame(&resolve)
-                .unwrap();
+#[component]
+pub fn ProjectOperationDetails(
+    host: String,
+    #[prop(optional)] project: Option<ProjectId>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let target = (host.clone(), project.clone());
+    let notices = Signal::derive(move || {
+        project
+            .as_ref()
+            .map(|project| NoticeScope::Project(host.clone(), project.clone()))
+            .into_iter()
+            .collect::<Vec<_>>()
+    });
+    let operation_target = target.clone();
+    let details = move || {
+        let mut operations = state.project_operations.with(|operations| {
+            operations
+                .iter()
+                .filter(|((host, _), operation)| {
+                    host == &operation_target.0
+                        && mutation_project(&operation.mutation) == operation_target.1.as_ref()
+                })
+                .map(|((_, stream), operation)| (stream.clone(), operation.clone()))
+                .collect::<Vec<_>>()
         });
-        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    }
-
-    #[wasm_bindgen_test]
-    async fn project_operation_notices_quiets_routine_progress_and_renders_failures() {
-        let container = make_container();
-        let state = AppState::new();
-        let mount_state = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(mount_state.clone());
-            view! { <ProjectOperationNotices /> }
-        });
-        next_tick().await;
-
-        let notices_el = container
-            .query_selector(".project-operation-notices")
-            .unwrap()
-            .expect("notices container");
-        assert_eq!(
-            notices_el.client_height(),
-            0,
-            "empty notices container has 0 height"
-        );
-        assert!(
-            container
-                .query_selector(".inline-notice")
-                .unwrap()
-                .is_none()
-        );
-
-        let host = "host-a".to_owned();
-        let stream = StreamPath("/project-operation/wb-test".to_owned());
-        let mutation =
-            protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
-                id: ProjectId("wb-test".to_owned()),
-                force: false,
-            });
-
-        // 1. Routine in-flight operations (Admitted, Running) must NOT render global notice
-        state.project_operations.update(|ops| {
-            ops.insert(
-                (host.clone(), stream.clone()),
-                protocol::ProjectOperationPayload {
-                    host_id: protocol::HostFilterId("local".to_owned()),
-                    stream: stream.clone(),
-                    mutation: mutation.clone(),
-                    state: ProjectOperationState::Admitted,
-                },
-            );
-        });
-        next_tick().await;
-        assert_eq!(
-            notices_el.client_height(),
-            0,
-            "Admitted operation leaves notices quiet"
-        );
-        assert!(
-            container
-                .query_selector(".inline-notice")
-                .unwrap()
-                .is_none()
-        );
-
-        state.project_operations.update(|ops| {
-            ops.insert(
-                (host.clone(), stream.clone()),
-                protocol::ProjectOperationPayload {
-                    host_id: protocol::HostFilterId("local".to_owned()),
-                    stream: stream.clone(),
-                    mutation: mutation.clone(),
-                    state: ProjectOperationState::Running {
-                        stage: protocol::ProjectOperationStage::Cleanup,
-                    },
-                },
-            );
-        });
-        next_tick().await;
-        assert_eq!(
-            notices_el.client_height(),
-            0,
-            "Running stage leaves notices quiet"
-        );
-        assert!(!container.text_content().unwrap().contains("Cleaning up"));
-        assert!(
-            container
-                .query_selector(".inline-notice")
-                .unwrap()
-                .is_none()
-        );
-
-        // 2. Clean committed operation leaves notices quiet
-        state.project_operations.update(|ops| {
-            ops.remove(&(host.clone(), stream.clone()));
-        });
-        next_tick().await;
-        assert_eq!(notices_el.client_height(), 0);
-        assert!(
-            container
-                .query_selector(".inline-notice")
-                .unwrap()
-                .is_none()
-        );
-
-        // 3. Committed with warnings renders warning notice
-        state.project_operations.update(|ops| {
-            ops.insert(
-                (host.clone(), stream.clone()),
-                protocol::ProjectOperationPayload {
-                    host_id: protocol::HostFilterId("local".to_owned()),
-                    stream: stream.clone(),
-                    mutation: mutation.clone(),
-                    state: ProjectOperationState::Committed {
-                        warnings: vec![protocol::ProjectOperationWarning {
-                            stage: protocol::ProjectOperationStage::Git,
-                            message: "Branch lock could not be cleared immediately".to_owned(),
-                        }],
-                    },
-                },
-            );
-        });
-        next_tick().await;
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("Saved, with warnings")
-        );
-        assert!(
-            container
-                .query_selector(".inline-notice.warning")
-                .unwrap()
-                .is_some()
-        );
-
-        // Dismiss warning
-        let dismiss_btn = container
-            .query_selector("button[aria-label='Dismiss project operation']")
-            .unwrap()
-            .expect("dismiss button")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        dismiss_btn.click();
-        next_tick().await;
-        assert!(
-            container
-                .query_selector(".inline-notice")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(notices_el.client_height(), 0);
-
-        // 4. Failed operation renders error notice with review/retry affordance
-        state.project_operations.update(|ops| {
-            ops.insert(
-                (host.clone(), stream.clone()),
-                protocol::ProjectOperationPayload {
-                    host_id: protocol::HostFilterId("local".to_owned()),
-                    stream: stream.clone(),
-                    mutation: mutation.clone(),
-                    state: ProjectOperationState::Failed {
-                        code: protocol::CommandErrorCode::Conflict,
-                        message: "Worktree roots are dirty".to_owned(),
-                        cleanup_may_be_partial: false,
-                    },
-                },
-            );
-        });
-        next_tick().await;
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("Worktree roots are dirty")
-        );
-        let error_notice = container
-            .query_selector(".inline-notice.error")
-            .unwrap()
-            .expect("error notice");
-        let review_btn = error_notice
-            .query_selector("button")
-            .unwrap()
-            .expect("review button")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        assert_eq!(
-            review_btn.text_content().as_deref().map(str::trim),
-            Some("Review removal…")
-        );
+        operations.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        operations.into_iter().filter_map(|(_, operation)| {
+            let (role, message) = match operation.state {
+                protocol::ProjectOperationState::Failed { message, cleanup_may_be_partial, .. } => (
+                    "alert",
+                    if cleanup_may_be_partial {
+                        format!("{message} Cleanup may be incomplete; inspect the workbench before trying again.")
+                    } else { message },
+                ),
+                protocol::ProjectOperationState::Committed { warnings } if !warnings.is_empty() => (
+                    "status", warnings.into_iter().map(|warning| warning.message).collect::<Vec<_>>().join("; "),
+                ),
+                _ => return None,
+            };
+            let label = mutation_label(&state, &operation_target.0, &operation.mutation);
+            Some(view! { <p role=role>{format!("{label}: {message}")}</p> })
+        }).collect_view()
+    };
+    view! {
+        <div class="project-operation-details">
+            <InlineNotices scopes=notices project_operation_target=target />
+            {details}
+        </div>
     }
 }
