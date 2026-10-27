@@ -3117,50 +3117,166 @@ mod wasm_tests {
             agent: "claude".to_owned(),
             model: Some("claude-test".to_owned()),
         }));
+        let long_answer = format!("Workspace note {}", "unbroken".repeat(40));
+        let option = |label: &str, description: Option<String>| protocol::AskUserQuestionOption {
+            label: label.to_owned(),
+            description,
+        };
         dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
             tool_call_id: "ink-stretch-ask".to_owned(),
             tool_name: "AskUserQuestion".to_owned(),
             tool_type: protocol::ToolRequestType::AskUserQuestion {
                 mode: protocol::UserQuestionMode::Blocking,
-                questions: vec![protocol::AskUserQuestion {
-                    id: None,
-                    question: "Which workspace?".to_owned(),
-                    header: Some("Workspace".to_owned()),
-                    answer_schema: None,
-                    multi_select: false,
-                    options: vec![protocol::AskUserQuestionOption {
-                        label: "Current".to_owned(),
-                        description: None,
-                    }],
-                }],
+                questions: vec![
+                    protocol::AskUserQuestion {
+                        id: None,
+                        question: "Which workspace?".to_owned(),
+                        header: Some("Workspace".to_owned()),
+                        answer_schema: None,
+                        multi_select: false,
+                        options: vec![
+                            option("Current", None),
+                            option(
+                                "Fresh workbench",
+                                Some(format!(
+                                    "Create /workbenches/{} before editing",
+                                    "unbroken".repeat(30)
+                                )),
+                            ),
+                        ],
+                    },
+                    protocol::AskUserQuestion {
+                        id: None,
+                        question: "Which checks should run before landing?".to_owned(),
+                        header: Some("Checks".to_owned()),
+                        answer_schema: None,
+                        multi_select: true,
+                        options: vec![
+                            option("Format", Some("Rewrite whitespace only".to_owned())),
+                            option("Lint", None),
+                        ],
+                    },
+                ],
             },
         }));
+        settle().await;
+        state.tool_output_mode.set(ToolOutputMode::Summary);
         settle().await;
         let question = visible(".tool-card-header")
             .into_iter()
             .find(|header| text_of(header).contains("Awaiting answer"))
             .expect("a live pending decision stays readable alongside settled actions");
         let card = question.parent_element().expect("decision card");
-        let frame = web_sys::window()
+        let css = |element: &Element, property: &str| {
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value(property)
+                .unwrap()
+        };
+        assert_eq!(
+            css(&card, "border-top-width"),
+            "0px",
+            "a pending question is not boxed inside the transcript"
+        );
+        let decision = card
+            .query_selector(".ask-question-card")
             .unwrap()
-            .get_computed_style(&card)
+            .expect("the pending question renders its choices");
+        let decision_body = decision.closest(".tool-card-body").unwrap().unwrap();
+        assert_eq!(
+            css(&decision_body, "border-left-width"),
+            "2px",
+            "a pending question is marked by a single rule"
+        );
+        let options = |label: &str| {
+            let nodes = decision.query_selector_all("button").unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+                .find(|button| {
+                    button
+                        .first_element_child()
+                        .is_some_and(|child| text_of(&child) == label)
+                })
+                .unwrap_or_else(|| panic!("option {label} is offered"))
+        };
+        let submit = || {
+            decision
+                .query_selector("button.ask-question-submit")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+        };
+        let prompt_size = |selector: &str| {
+            css(
+                &decision.query_selector(selector).unwrap().unwrap(),
+                "font-size",
+            )
+            .trim_end_matches("px")
+            .parse::<f64>()
             .unwrap()
-            .unwrap()
-            .get_property_value("border-top-width")
-            .unwrap();
-        assert_eq!(frame, "1px", "a pending decision is framed");
-        state.tool_output_mode.set(ToolOutputMode::Summary);
+        };
+        assert!(
+            prompt_size(".ask-question-text") > prompt_size(".ask-question-header"),
+            "the question reads above its header"
+        );
+        assert!(submit().disabled(), "nothing submits before an answer");
+        options("Fresh workbench").click();
+        options("Format").click();
+        options("Lint").click();
         settle().await;
-        let answer = container
+        assert_ne!(
+            css(options("Fresh workbench").as_ref(), "background-color"),
+            css(options("Current").as_ref(), "background-color"),
+            "a chosen option is visibly selected"
+        );
+        for (label, pressed) in [
+            ("Current", "false"),
+            ("Fresh workbench", "true"),
+            ("Format", "true"),
+            ("Lint", "true"),
+        ] {
+            assert_eq!(
+                options(label).get_attribute("aria-pressed").as_deref(),
+                Some(pressed),
+                "{label} reports its selection"
+            );
+        }
+        let described = options("Fresh workbench");
+        assert!(
+            described.scroll_width() <= described.client_width()
+                && described.get_bounding_client_rect().right()
+                    <= decision.get_bounding_client_rect().right() + 0.5,
+            "long option descriptions wrap inside their choice"
+        );
+        let answer = decision
             .query_selector("input.ask-question-custom")
             .unwrap()
             .expect("pending question accepts a custom answer")
             .dyn_into::<web_sys::HtmlInputElement>()
             .unwrap();
-        answer.set_value("Workspace note");
+        answer.set_value(&long_answer);
         answer
             .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
+        settle().await;
+        assert!(
+            !submit().disabled(),
+            "an answered decision can be submitted"
+        );
+        assert_eq!(submit().text_content().as_deref(), Some("Submit answer"));
+        let indicator = |option: &HtmlElement| {
+            web_sys::window()
+                .unwrap()
+                .get_computed_style_with_pseudo_elt(option, "::before")
+                .unwrap()
+                .unwrap()
+                .get_property_value("display")
+                .unwrap()
+        };
         for appearance in [
             ChatAppearance::Current,
             ChatAppearance::Notebook,
@@ -3168,17 +3284,110 @@ mod wasm_tests {
         ] {
             state.chat_appearance.set(appearance);
             settle().await;
-            let current_answer = container
-                .query_selector("input.ask-question-custom")
+            let current = container
+                .query_selector(".ask-question-card")
                 .unwrap()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
                 .unwrap();
             assert!(
-                answer.is_same_node(Some(current_answer.as_ref())),
+                decision.is_same_node(Some(&current)),
                 "appearance switches do not rebuild an interactive decision"
             );
-            assert_eq!(current_answer.value(), "Workspace note");
+            let field = decision
+                .query_selector("input.ask-question-custom")
+                .unwrap()
+                .unwrap();
+            assert!(
+                answer.is_same_node(Some(&field)),
+                "appearance switches keep the same answer field"
+            );
+            assert_eq!(
+                answer.value(),
+                long_answer,
+                "the draft answer survives appearance switches"
+            );
+            assert_eq!(
+                options("Fresh workbench")
+                    .get_attribute("aria-pressed")
+                    .as_deref(),
+                Some("true"),
+                "selections survive appearance switches"
+            );
+            assert!(!submit().disabled(), "appearance switches never submit");
+            if appearance != ChatAppearance::Current {
+                assert_ne!(
+                    indicator(&options("Current")),
+                    "none",
+                    "{appearance:?} marks an open choice while the question is pending"
+                );
+            }
+            let messages = container.query_selector(".chat-messages").unwrap().unwrap();
+            assert!(
+                messages.scroll_width() <= messages.client_width()
+                    && decision.get_bounding_client_rect().right()
+                        <= messages.get_bounding_client_rect().right() + 0.5,
+                "the question stays inside the pane"
+            );
+        }
+        dispatch(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "ink-stretch-ask".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::AskUserQuestion { answers: vec![] },
+                },
+            },
+        ));
+        for appearance in [ChatAppearance::Notebook, ChatAppearance::Ink] {
+            state.chat_appearance.set(appearance);
+            settle().await;
+            let nodes = container
+                .query_selector_all(".ask-question-option")
+                .unwrap();
+            let settled: Vec<HtmlElement> = (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+                .filter(|option| option.get_bounding_client_rect().height() > 0.0)
+                .collect();
+            assert_eq!(
+                settled.len(),
+                4,
+                "{appearance:?} keeps every settled choice readable"
+            );
+            for option in &settled {
+                assert_eq!(
+                    indicator(option),
+                    "none",
+                    "{appearance:?} draws no empty choice marks when the answer is unknown"
+                );
+                let label = option
+                    .query_selector(".ask-question-option-label")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    label.get_bounding_client_rect().left()
+                        - option.get_bounding_client_rect().left()
+                        < 16.0,
+                    "{appearance:?} leaves no empty mark gutter beside settled choices"
+                );
+                assert_eq!(
+                    css(option.as_ref(), "opacity"),
+                    "1",
+                    "{appearance:?} does not dim choices the answer may have used"
+                );
+            }
+            let fields = settled[0]
+                .closest(".ask-question-card")
+                .unwrap()
+                .unwrap()
+                .query_selector_all(".ask-question-custom")
+                .unwrap();
+            assert!(fields.length() > 0);
+            for i in 0..fields.length() {
+                let field = fields.item(i).unwrap().dyn_into::<Element>().unwrap();
+                assert_eq!(
+                    field.get_bounding_client_rect().height(),
+                    0.0,
+                    "{appearance:?} shows no empty, editable-looking answer field once answered"
+                );
+            }
         }
         let mut question_message = assistant("");
         question_message.tool_calls.push(protocol::ToolUseData {
@@ -3245,7 +3454,7 @@ mod wasm_tests {
             .unwrap()
             .unwrap();
         let current_question = container
-            .query_selector("input.ask-question-custom")
+            .query_selector(".ask-question-custom")
             .unwrap()
             .unwrap()
             .closest(".tool-card")
@@ -3550,6 +3759,7 @@ mod wasm_tests {
             message
         };
         let long_token = "unbroken".repeat(60);
+        let long_path = format!("/workspace/{long_token}/probe.log");
         let tools = [
             ("notebook-ok", "Bash", "python3 first.py"),
             ("notebook-fail", "Bash", "python3 second.py"),
@@ -3601,8 +3811,8 @@ mod wasm_tests {
                     },
                 },
                 1 => protocol::ToolExecutionOutcome::Failed {
-                    message: "Probe failed".to_owned(),
-                    details: None,
+                    message: format!("Probe failed: cannot open {long_path}"),
+                    details: Some(format!("{long_token}\n{long_path}")),
                     normalization_failure: None,
                     result: None,
                 },
@@ -3626,6 +3836,15 @@ mod wasm_tests {
                 content_offset: None,
             });
             dispatch(ChatEvent::StreamEnd(protocol::StreamEndData { message }));
+        }
+        let error_texts = [
+            format!("failed to start agent backend: {long_path}"),
+            "No matching pending tool request for this response".to_owned(),
+        ];
+        for text in &error_texts {
+            let mut error = mk_user_msg(text).message;
+            error.sender = MessageSender::Error;
+            dispatch(ChatEvent::MessageAdded(error));
         }
 
         async fn settle() {
@@ -3705,6 +3924,44 @@ mod wasm_tests {
                 );
             }
         };
+        let errors = || {
+            let errors = visible(".chat-card-error");
+            assert_eq!(errors.len(), 2, "every error row stays visible");
+            for (error, text) in errors.iter().zip(&error_texts) {
+                assert!(
+                    text_of(error).contains(text.as_str()),
+                    "the full technical message stays readable"
+                );
+            }
+            errors
+        };
+        let quiet_errors = |style: &str| {
+            let errors = errors();
+            for error in &errors {
+                let css = window.get_computed_style(error).unwrap().unwrap();
+                assert_eq!(
+                    css.get_property_value("background-color").unwrap(),
+                    "rgba(0, 0, 0, 0)",
+                    "{style} errors are not filled slabs"
+                );
+                assert_eq!(
+                    css.get_property_value("border-top-width").unwrap(),
+                    "0px",
+                    "{style} errors are not boxed"
+                );
+                assert!(
+                    error.scroll_width() <= error.client_width(),
+                    "{style} wraps long unbroken error text inside its row"
+                );
+            }
+            let gap = errors[1].get_bounding_client_rect().top()
+                - errors[0].get_bounding_client_rect().bottom();
+            assert!(
+                (0.0..=12.0).contains(&gap),
+                "{style} stacks consecutive errors closely: {gap}px"
+            );
+            errors
+        };
 
         settle().await;
         let wide = headers();
@@ -3774,6 +4031,17 @@ mod wasm_tests {
             "prose reads larger than activity"
         );
         no_horizontal_overflow("wide");
+        for error in quiet_errors("Notebook") {
+            let rect = error.get_bounding_client_rect();
+            assert!(
+                rect.right() <= action.left() - 24.0 && rect.width() >= 400.0,
+                "Notebook errors read in the prose column, clear of the actions: \
+                 error {}..{}, actions start {}",
+                rect.left(),
+                rect.right(),
+                action.left()
+            );
+        }
 
         let cards: Vec<web_sys::HtmlDetailsElement> = wide
             .iter()
@@ -3797,6 +4065,40 @@ mod wasm_tests {
             cards.iter().all(|card| card.open()),
             "Full opens every output"
         );
+        let failure = &cards[1];
+        failure
+            .query_selector(".tool-error-details summary")
+            .unwrap()
+            .expect("the failure keeps its details")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        settle().await;
+        let column = failure.get_bounding_client_rect();
+        let messages = container.query_selector(".chat-messages").unwrap().unwrap();
+        let pane = messages.get_bounding_client_rect();
+        assert!(
+            column.left() >= pane.left() && column.right() <= pane.right() + 0.5,
+            "the failed action stays inside the activity column"
+        );
+        for selector in [".tool-error-pre", ".tool-error-detail"] {
+            let text = failure.query_selector(selector).unwrap().unwrap();
+            let rect = text.get_bounding_client_rect();
+            assert!(
+                rect.height() > 0.0
+                    && rect.left() >= column.left() - 0.5
+                    && rect.right() <= column.right() + 0.5
+                    && text.scroll_width() <= text.client_width(),
+                "long unbroken failure text wraps inside its action: {selector} \
+                 {}..{} in {}..{}",
+                rect.left(),
+                rect.right(),
+                column.left(),
+                column.right()
+            );
+            assert!(text_of(&text).contains(&long_path));
+        }
+        no_horizontal_overflow("expanded failure details");
         state.tool_output_mode.set(ToolOutputMode::Compact);
         settle().await;
 
@@ -3815,6 +4117,13 @@ mod wasm_tests {
             body.width()
         );
         no_horizontal_overflow("narrow");
+        for error in quiet_errors("Narrow Notebook") {
+            let rect = error.get_bounding_client_rect();
+            assert!(
+                rect.left() <= body.left() + 1.0 && rect.right() >= body.right() - 1.0,
+                "narrow Notebook errors span the prose column"
+            );
+        }
         container.style().set_property("width", "960px").unwrap();
         settle().await;
 
@@ -3851,6 +4160,7 @@ mod wasm_tests {
                 "Notebook honors the selected typeface"
             );
             no_horizontal_overflow("custom font");
+            quiet_errors("Notebook with a custom font");
         }
         match original_style {
             Some(style) => root.set_attribute("style", &style).unwrap(),
@@ -3905,10 +4215,29 @@ mod wasm_tests {
             pane_right
         );
         no_horizontal_overflow("Flow");
+        for error in quiet_errors("Flow") {
+            assert!(
+                error.get_bounding_client_rect().right() <= pane_right + 1.0,
+                "Flow errors stay inside the pane"
+            );
+        }
 
         state.chat_appearance.set(ChatAppearance::Current);
         settle().await;
         no_notebook_labels("Default");
+        for error in errors() {
+            let css = window.get_computed_style(&error).unwrap().unwrap();
+            assert_ne!(
+                css.get_property_value("background-color").unwrap(),
+                "rgba(0, 0, 0, 0)",
+                "Default keeps its existing filled error card"
+            );
+            assert_eq!(
+                css.get_property_value("border-top-width").unwrap(),
+                "1px",
+                "Default keeps its existing error frame"
+            );
+        }
         assert_eq!(visible(".tool-card-header").len(), 3);
         drop(handle);
         container.remove();

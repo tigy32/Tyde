@@ -93,6 +93,12 @@
     font-weight: 600;
 }
 
+/* Errors and warnings read in the prose column, clear of the actions. */
+.chat-view[data-chat-appearance="notebook"] :is(.chat-card-error, .chat-card-warning) {
+    width: auto;
+    margin-right: calc(var(--nb-activity) + var(--nb-gap));
+}
+
 /* A quiet byline: names and times, no chips. */
 .chat-view[data-chat-appearance="notebook"] :is(.token-stat-agent, .chat-card-assistant .chat-card-sender) {
     color: var(--text-primary);
@@ -112,7 +118,7 @@
 /* Activity rows: what happened in words, then the real tool and its target. */
 .chat-view[data-chat-appearance="notebook"] .tool-card-header {
     display: grid;
-    grid-template-columns: 16px fit-content(45%) minmax(0, 1fr) max-content max-content 10px;
+    grid-template-columns: 16px fit-content(45%) minmax(0, 1fr) minmax(0, max-content) max-content 10px;
     align-items: center;
     column-gap: 10px;
     row-gap: 1px;
@@ -286,6 +292,10 @@
 
     .chat-view[data-chat-appearance="notebook"] .chat-card-user {
         padding-right: 0;
+    }
+
+    .chat-view[data-chat-appearance="notebook"] :is(.chat-card-error, .chat-card-warning) {
+        margin-right: 0;
     }
 
     .chat-view[data-chat-appearance="notebook"] .tool-card-body {

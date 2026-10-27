@@ -406,7 +406,11 @@
 }
 
 .chat-view[data-chat-chrome="ink"] .tool-completion-summary {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     margin-left: auto;
     color: var(--text-tertiary);
     font-family: var(--font-sans);
@@ -1313,6 +1317,349 @@
     overflow-wrap: anywhere;
 }
 
+/* Errors and warnings annotate the turn: a thin rule and a small label, with
+   the full message selectable and wrapped inside the pane. */
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) {
+    --ink-annotation: var(--error);
+    min-width: 0;
+    padding: 1px 0 2px 12px;
+    border: 0;
+    border-left: 2px solid color-mix(in srgb, var(--ink-annotation) 65%, transparent);
+    border-radius: 0;
+    background: transparent;
+}
+
+.chat-view[data-chat-chrome="ink"] .chat-card-warning {
+    --ink-annotation: var(--warning);
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) .chat-card-header {
+    gap: 8px;
+    min-height: 0;
+    margin-bottom: 2px;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) .chat-card-sender {
+    color: var(--ink-annotation);
+    font-weight: 500;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) .chat-card-time {
+    color: var(--text-tertiary);
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) .chat-card-body {
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: 1rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.chat-card-error, .chat-card-warning) .chat-card-body pre {
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* A failed action states its message once; details expand in place. */
+.chat-view[data-chat-chrome="ink"] .tool-card-body:has(.tool-result-error) {
+    min-width: 0;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-result-error {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    min-width: 0;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-error-icon {
+    display: none;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.tool-error-pre, .tool-error-detail) {
+    min-width: 0;
+    max-width: 100%;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--error);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-error-details summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: fit-content;
+    list-style: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-error-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-error-details summary::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(-45deg);
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-error-details[open] summary::before {
+    transform: rotate(45deg);
+}
+
+/* A question is the turn's input: one rule, the prompt, then choices that
+   show their own state. Waiting on the user is not shown as work. */
+.chat-view[data-chat-chrome="ink"] .tool-card[data-tool-kind="decision"]:has(.ask-question-card) > .tool-card-header:has(.pending)::before {
+    content: "?";
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    color: var(--ink-accent);
+    font-weight: 700;
+    animation: none;
+    transform: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-card[data-tool-kind="decision"] > .tool-card-body:has(.ask-question-card) {
+    min-width: 0;
+    margin: 2px 0 12px 26px;
+    padding: 2px 0 4px 16px;
+    border: 0;
+    border-left: 2px solid var(--ink-accent);
+    border-radius: 0;
+    background: transparent;
+}
+
+.chat-view[data-chat-chrome="ink"] .tool-card[data-tool-kind="decision"]:not(:has(> .tool-card-header .pending)) > .tool-card-body:has(.ask-question-card) {
+    border-left-color: var(--border-secondary);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-card {
+    gap: 14px;
+    min-width: 0;
+    max-width: 46rem;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question {
+    gap: 6px;
+    min-width: 0;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question + .ask-question {
+    padding-top: 14px;
+    border-top: 1px solid var(--border-primary);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-header {
+    color: var(--text-secondary);
+    font: 500 .846rem/1.4 var(--font-sans);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-text {
+    margin-bottom: 4px;
+    color: var(--text-primary);
+    font-size: 1.077rem;
+    font-weight: 500;
+    line-height: 1.5;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.ask-question-options, .ask-question-options.multi) {
+    gap: 2px;
+    min-width: 0;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+    column-gap: 10px;
+    row-gap: 1px;
+    align-items: start;
+    box-sizing: border-box;
+    min-width: 0;
+    padding: 6px 10px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    line-height: 1.45;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option::before {
+    content: "";
+    grid-column: 1;
+    grid-row: 1 / span 2;
+    box-sizing: border-box;
+    width: 14px;
+    height: 14px;
+    margin-top: calc((1.45em - 14px) / 2);
+    border: 1.5px solid var(--text-secondary);
+    border-radius: 50%;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-options.multi .ask-question-option::before {
+    border-radius: 3px;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option > * {
+    grid-column: 2;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option-label {
+    font-weight: 500;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option-desc {
+    font-size: .923rem;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option:hover:not(:disabled) {
+    border-color: transparent;
+    background: var(--surface-hover);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option.selected,
+.chat-view[data-chat-chrome="ink"] .ask-question-option.selected:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--ink-accent) 40%, transparent);
+    background: var(--accent-subtle);
+    box-shadow: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option.selected::before {
+    border-color: var(--ink-accent);
+    background: radial-gradient(circle, var(--ink-accent) 0 3px, transparent 3.5px);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-options.multi .ask-question-option.selected::before {
+    background: var(--ink-accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2 5 8.6l4.5-5' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 11px no-repeat;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-option:disabled {
+    color: var(--text-primary);
+    cursor: default;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-options:has(.selected) .ask-question-option:disabled:not(.selected) {
+    opacity: .55;
+}
+
+/* A settled answer without typed selections cannot say what was chosen. */
+.chat-view[data-chat-chrome="ink"] .ask-question-card:has(.ask-question-sent-note) .ask-question-options:not(:has(.selected)) .ask-question-option {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-card:has(.ask-question-sent-note) .ask-question-options:not(:has(.selected)) .ask-question-option::before {
+    display: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-card:has(.ask-question-sent-note) .ask-question-options:not(:has(.selected)) .ask-question-option > * {
+    grid-column: 1;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-card:has(.ask-question-sent-note) .ask-question-custom:placeholder-shown {
+    display: none;
+}
+
+.chat-view[data-chat-chrome="ink"] button.ask-question-option:focus-visible {
+    outline-offset: 1px;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-selection-hint {
+    color: var(--text-secondary);
+    font-size: .846rem;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-custom {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin-top: 4px;
+    padding: 7px 10px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 6px;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font: inherit;
+    line-height: 1.45;
+    resize: vertical;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-custom:focus-visible {
+    outline: 0;
+    border-color: var(--ink-accent);
+    box-shadow: 0 0 0 1px var(--ink-accent);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-custom:disabled {
+    opacity: .6;
+    resize: none;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-actions {
+    gap: 8px 14px;
+    margin-top: 2px;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-submit {
+    min-height: 30px;
+    padding: 5px 14px;
+    border: 1px solid var(--accent-primary);
+    border-radius: 6px;
+    background: var(--accent-primary);
+    color: var(--text-on-accent);
+    font: 500 .923rem/1.3 var(--font-sans);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-submit:hover:not(:disabled) {
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-submit:disabled {
+    border-color: var(--border-secondary);
+    background: transparent;
+    color: var(--text-secondary);
+    opacity: 1;
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-actions:has(.ask-question-sent-note) > .ask-question-submit {
+    display: none;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.ask-question-sent-note, .ask-question-pending-note, .ask-question-error-note) {
+    font-size: .923rem;
+    overflow-wrap: anywhere;
+}
+
+.chat-view[data-chat-chrome="ink"] :is(.ask-question-sent-note, .ask-question-pending-note) {
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-chrome="ink"] .ask-question-sent-note::before {
+    content: "✓" / "";
+    margin-right: 6px;
+    color: var(--success);
+}
+
 /* Flow is a continuous transcript. Notebook retains the shared card chrome. */
 .chat-view[data-chat-appearance="ink"] {
     --ink-activity-indent: 10px;
@@ -1512,6 +1859,10 @@
     }
 }
 
+.chat-view[data-chat-appearance="ink"] .tool-completion-summary {
+    max-width: 50%;
+}
+
 .chat-view[data-chat-appearance="ink"] .tool-result-command-content {
     margin-top: 8px;
     padding-top: 8px;
@@ -1519,7 +1870,6 @@
 }
 
 .chat-view[data-chat-appearance="ink"] .tool-card:has(.tool-status-text.cancelled) .tool-completion-summary,
-.chat-view[data-chat-appearance="ink"] .tool-error-icon,
 .chat-view[data-chat-appearance="ink"] .chat-card-cancelled .chat-card-header {
     display: none;
 }
@@ -1544,7 +1894,7 @@
     }
 }
 
-.chat-view[data-chat-appearance="ink"] .tool-card[data-tool-kind="decision"]:has(> .tool-card-header .pending) {
+.chat-view[data-chat-appearance="ink"] .tool-card[data-tool-kind="decision"]:has(> .tool-card-header .pending):not(:has(.ask-question-card)) {
     border: 1px solid var(--border-primary);
 }
 
@@ -1561,42 +1911,4 @@
 
 .chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-time::before {
     content: "· ";
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-result-error {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
-}
-
-.chat-view[data-chat-appearance="ink"] :is(.tool-error-pre, .tool-error-detail) {
-    border: 0;
-    border-radius: 0;
-    padding: 0;
-    background: transparent;
-    color: var(--error);
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-error-details summary {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    list-style: none;
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-error-details summary::-webkit-details-marker {
-    display: none;
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-error-details summary::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-right: 1px solid currentColor;
-    border-bottom: 1px solid currentColor;
-    transform: rotate(-45deg);
-}
-
-.chat-view[data-chat-appearance="ink"] .tool-error-details[open] summary::before {
-    transform: rotate(45deg);
 }

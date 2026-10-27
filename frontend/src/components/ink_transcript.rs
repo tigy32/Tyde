@@ -1,4 +1,5 @@
 //! Ink keeps one byline per input stretch without hiding or reordering actions.
+//! Errors and warnings annotate the turn they follow, so they sit close to it.
 
 use std::collections::HashMap;
 
@@ -30,7 +31,7 @@ pub(crate) fn ink_row_layouts(rows: &[ChatRowHandle]) -> HashMap<ChatRowId, InkR
     let mut previous_assistant = false;
     for (index, row) in rows.iter().enumerate() {
         let mut layout = InkRowLayout::default();
-        let (input, assistant, actions_only) = match &row.content {
+        let (input, assistant, actions_only, annotation) = match &row.content {
             ChatRowContent::Message(entry) => entry.with(|entry| {
                 let message = &entry.message;
                 let input = message.origin.is_some()
@@ -47,7 +48,12 @@ pub(crate) fn ink_row_layouts(rows: &[ChatRowHandle]) -> HashMap<ChatRowId, InkR
                         .as_ref()
                         .is_none_or(|images| images.is_empty())
                     && !entry.tool_requests.is_empty();
-                (input, assistant, actions_only)
+                let annotation = !input
+                    && matches!(
+                        message.sender,
+                        MessageSender::Error | MessageSender::Warning
+                    );
+                (input, assistant, actions_only, annotation)
             }),
             ChatRowContent::Streaming(stream) => (
                 false,
@@ -55,9 +61,10 @@ pub(crate) fn ink_row_layouts(rows: &[ChatRowHandle]) -> HashMap<ChatRowId, InkR
                 stream.text.with(|text| text.trim().is_empty())
                     && stream.reasoning.with(|text| text.trim().is_empty())
                     && stream.tool_requests.with(|tools| !tools.is_empty()),
+                false,
             ),
             ChatRowContent::ContextCompaction(_) | ChatRowContent::Notice(_) => {
-                (false, false, false)
+                (false, false, false, false)
             }
         };
         if input {
@@ -76,7 +83,8 @@ pub(crate) fn ink_row_layouts(rows: &[ChatRowHandle]) -> HashMap<ChatRowId, InkR
             }
             stretch_has_byline = true;
         }
-        if matches!(&row.content, ChatRowContent::Notice(notice) if notice.with(|notice| matches!(notice, crate::state::ChatNotice::RetryAttempt { .. })))
+        if annotation
+            || matches!(&row.content, ChatRowContent::Notice(notice) if notice.with(|notice| matches!(notice, crate::state::ChatNotice::RetryAttempt { .. })))
         {
             layout.gap = InkGap::Tight;
         }
