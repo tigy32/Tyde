@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::components::swarms_view::SwarmsView;
+use crate::components::swarms_view::{LegacyTeams, SwarmsView};
 use crate::components::ui::{
     Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Spinner, StatusDot,
     StatusTone,
@@ -95,6 +95,21 @@ pub fn AgentsView() -> impl IntoView {
         segment.set(AgentsSegment::Swarms);
     });
 
+    let swarm_state = state.clone();
+    let has_swarms = Memo::new(move |_| {
+        swarm_state.active_local_host_id.get().is_some_and(|host| {
+            swarm_state
+                .swarms_by_host
+                .with(|hosts| hosts.get(&host).is_some_and(|swarms| !swarms.is_empty()))
+        })
+    });
+    Effect::new(move |_| {
+        if !has_swarms.get() {
+            segment.set(AgentsSegment::Agents);
+            selected_swarm.set(None);
+        }
+    });
+
     let on_new_chat = crate::components::new_chat_callback(&state);
 
     view! {
@@ -112,6 +127,7 @@ pub fn AgentsView() -> impl IntoView {
                 />
                 </Show>
             </header>
+            <Show when=move || has_swarms.get()>
             <div class="agents-segmented" role="tablist" aria-label="Agents and swarms" data-mobile-test="agents-segmented">
                 {
                     let on_agents = move |_| segment.set(AgentsSegment::Agents);
@@ -142,6 +158,7 @@ pub fn AgentsView() -> impl IntoView {
                     }
                 }
             </div>
+            </Show>
             </div>
             <div class="view-body">
                 <div class="shell-flow">
@@ -152,6 +169,9 @@ pub fn AgentsView() -> impl IntoView {
                     view! {
                         <AgentRestorationNotice />
                         {render_agents_body(&state, hide_sub_agents, collapsed_parents, open_swarm)}
+                        <Show when=move || !has_swarms.get()>
+                            <LegacyTeams />
+                        </Show>
                     }
                     .into_any()
                 }}
@@ -1633,8 +1653,33 @@ mod wasm_tests {
         })
         .collect();
         let swarm_id = swarm.id.clone();
+        let team = protocol::Team {
+            id: protocol::TeamId("legacy".to_owned()),
+            name: "Legacy crew".to_owned(),
+            manager_member_id: protocol::TeamMemberId("legacy-lead".to_owned()),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let member = protocol::TeamMember {
+            id: team.manager_member_id.clone(),
+            team_id: team.id.clone(),
+            role: protocol::TeamMemberRole::Manager,
+            state: protocol::TeamMemberState::Active,
+            name: "Legacy lead".to_owned(),
+            description: String::new(),
+            profile: None,
+            custom_agent_id: None,
+            backend_kind: protocol::BackendKind::Claude,
+            cost_hint: None,
+            session_id: None,
+            project_ids: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
         crate::dispatch::prime_host_with_bootstrap_for_tests(&state, &host, |bootstrap| {
-            bootstrap.swarms = vec![swarm.clone()]
+            bootstrap.swarms = vec![swarm.clone()];
+            bootstrap.teams = vec![team.clone()];
+            bootstrap.team_members = vec![member.clone()];
         });
         state.active_local_host_id.set(Some(host.clone()));
         state.projects.set(projects);
@@ -1657,6 +1702,64 @@ mod wasm_tests {
             view! { <AgentsView /> }
         });
         next_tick().await;
+
+        let switch = || {
+            container
+                .query_selector("[data-mobile-test='agents-segmented']")
+                .unwrap()
+        };
+        assert!(switch().is_some(), "a populated host exposes the switch");
+        let other_host = LocalHostId("host-without-swarms".to_owned());
+        state.active_local_host_id.set(Some(other_host.clone()));
+        next_tick().await;
+        assert!(switch().is_none());
+        assert!(
+            container
+                .query_selector("[data-mobile-test='legacy-teams']")
+                .unwrap()
+                .is_none(),
+            "an empty host has neither swarm navigation nor a legacy entry"
+        );
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, &other_host, |bootstrap| {
+            bootstrap.teams = vec![team.clone()];
+            bootstrap.team_members = vec![member.clone()];
+        });
+        state.active_local_host_id.set(Some(other_host.clone()));
+        next_tick().await;
+        assert!(
+            switch().is_none(),
+            "another host's swarm must not expose the switch"
+        );
+        let open_legacy = || {
+            let summary = container
+                .query_selector("[data-mobile-test='legacy-teams'] summary")
+                .unwrap()
+                .expect("team-only hosts retain a quiet legacy entry");
+            assert_eq!(summary.text_content().unwrap(), "Legacy teams");
+            summary.dyn_into::<HtmlElement>().unwrap().click();
+        };
+        let assert_legacy_controls = || {
+            let roster = container
+                .query_selector("[data-mobile-test='teams-view']")
+                .unwrap()
+                .unwrap();
+            let text = roster.text_content().unwrap();
+            assert!(text.contains("Legacy crew") && text.contains("Legacy lead"));
+            for control in ["teams-member-open-chat", "teams-row-compact-button"] {
+                let button = roster
+                    .query_selector(&format!("[data-mobile-test='{control}']"))
+                    .unwrap()
+                    .unwrap();
+                assert!(button.get_bounding_client_rect().height() > 0.0);
+                assert!(!button.has_attribute("disabled"));
+            }
+        };
+        open_legacy();
+        next_tick().await;
+        assert_legacy_controls();
+        state.active_local_host_id.set(Some(host.clone()));
+        next_tick().await;
+        assert!(switch().is_some());
 
         let text = container.text_content().unwrap_or_default();
         assert!(
@@ -1755,6 +1858,92 @@ mod wasm_tests {
                 .contains("Bamboo crew"),
             "the opened swarm is the one tapped"
         );
+        let active_before = state.active_agent.get_untracked();
+        state.chat_input.set("keep this draft".to_owned());
+        state.swarms_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().clear();
+        });
+        next_tick().await;
+        assert!(switch().is_none(), "last removal removes the entire switch");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='swarms-view']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(container.text_content().unwrap().contains("Normal agent"));
+        assert!(state.active_agent.get_untracked() == active_before);
+        assert!(state.chat_input.get_untracked() == "keep this draft");
+        open_legacy();
+        next_tick().await;
+        assert_legacy_controls();
+
+        state.swarms_by_host.update(|hosts| {
+            hosts
+                .get_mut(&host)
+                .unwrap()
+                .insert(swarm_id.clone(), swarm.clone());
+        });
+        next_tick().await;
+        assert!(switch().is_some(), "a new swarm restores the switch");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='swarms-view']")
+                .unwrap()
+                .is_none(),
+            "reappearance must not reopen a removed selection"
+        );
+
+        update_swarm(&|swarm| swarm.legacy_team_id = Some(team.id.clone()));
+        container
+            .query_selector("[data-mobile-test='agents-segment-swarms']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='legacy-teams']")
+                .unwrap()
+                .is_none()
+        );
+        update_swarm(&|swarm| swarm.legacy_team_id = None);
+        next_tick().await;
+        open_legacy();
+        next_tick().await;
+        assert_legacy_controls();
+        state.teams_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().clear();
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='legacy-teams']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(switch().is_some(), "team removal does not hide real swarms");
+        state.active_local_host_id.set(Some(other_host.clone()));
+        next_tick().await;
+        assert!(switch().is_none());
+        open_legacy();
+        next_tick().await;
+        assert_legacy_controls();
+        state.teams_by_host.update(|hosts| {
+            hosts.get_mut(&other_host).unwrap().clear();
+        });
+        next_tick().await;
+        assert!(switch().is_none());
+        assert!(
+            container
+                .query_selector("[data-mobile-test='legacy-teams']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.active_agent.get_untracked() == active_before);
+        assert!(state.chat_input.get_untracked() == "keep this draft");
 
         clear_hide_sub_agents_pref();
     }

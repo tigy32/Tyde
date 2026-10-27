@@ -80,12 +80,41 @@ pub fn SwarmsView(selected: RwSignal<Option<(LocalHostId, SwarmId)>>) -> impl In
                             view! { <SwarmCard host=host swarm_id=id on_open=Callback::new(move |value| selected.set(Some(value))) /> }
                         }).collect_view().into_any()
                     }}
-                    <Show when=move || state.active_local_host_id.get().is_some_and(|host| state.teams_by_host.with(|m| m.get(&host).is_some_and(|teams| teams.keys().any(|id| !state.swarms_by_host.with(|m| m.get(&host).is_some_and(|swarms| swarms.values().any(|s| s.legacy_team_id.as_ref() == Some(id))))))))>
-                        <details class="mobile-swarm-legacy"><summary>"Legacy teams"</summary><p class="mobile-swarm-muted">"Old team sessions stay separate. Convert them on desktop to use shared boards."</p><TeamsView /></details>
-                    </Show>
+                    <LegacyTeams />
                 }.into_any(),
             }}
         </div>
+    }
+}
+
+#[component]
+pub(crate) fn LegacyTeams() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let has_legacy_teams = move || {
+        let Some(host) = state.active_local_host_id.get() else {
+            return false;
+        };
+        state.teams_by_host.with(|hosts| {
+            hosts.get(&host).is_some_and(|teams| {
+                teams.keys().any(|id| {
+                    !state.swarms_by_host.with(|hosts| {
+                        hosts.get(&host).is_some_and(|swarms| {
+                            swarms
+                                .values()
+                                .any(|swarm| swarm.legacy_team_id.as_ref() == Some(id))
+                        })
+                    })
+                })
+            })
+        })
+    };
+    view! {
+        <Show when=has_legacy_teams>
+            <details class="mobile-swarm-legacy" data-mobile-test="legacy-teams">
+                <summary>"Legacy teams"</summary>
+                <TeamsView />
+            </details>
+        </Show>
     }
 }
 
