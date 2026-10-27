@@ -3794,6 +3794,7 @@ pub struct AppState {
     pub tabs_enabled: RwSignal<bool>,
     pub sidebar_backend_labels: RwSignal<bool>,
     pub sidebar_layout: RwSignal<crate::sidebar_layout::ClientLayouts>,
+    pub sidebar_workbench_width: RwSignal<f64>,
     pub sidebar_storage_blocked: RwSignal<bool>,
     pub sidebar_drag: RwSignal<Option<SidebarTab>>,
     pub project_editor: RwSignal<Option<ActiveProjectRef>>,
@@ -3860,6 +3861,11 @@ pub struct AppState {
     pub project_view_memory: RwSignal<HashMap<ActiveProjectRef, ProjectViewMemory>>,
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
+    pub self_improvement_open_after_write:
+        RwSignal<Option<(String, protocol::SettingsWriteId, protocol::SteeringScope)>>,
+    pub self_improvement_settings_scope_request:
+        RwSignal<Option<(String, protocol::SteeringScope)>>,
+    pub self_improvement_scope_request: RwSignal<Option<(String, protocol::SteeringScope)>>,
     /// When set, the settings panel jumps to the tab with this label (e.g.
     /// "Backends") the next time it renders. Used to deep-link from onboarding
     /// CTAs. Cleared by the panel once consumed.
@@ -4353,6 +4359,7 @@ impl AppState {
             tabs_enabled: RwSignal::new(true),
             sidebar_backend_labels: RwSignal::new(true),
             sidebar_layout: RwSignal::new(crate::sidebar_layout::ClientLayouts::default()),
+            sidebar_workbench_width: RwSignal::new(0.0),
             sidebar_storage_blocked: RwSignal::new(false),
             sidebar_drag: RwSignal::new(None),
             project_editor: RwSignal::new(None),
@@ -4379,6 +4386,9 @@ impl AppState {
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
+            self_improvement_open_after_write: RwSignal::new(None),
+            self_improvement_settings_scope_request: RwSignal::new(None),
+            self_improvement_scope_request: RwSignal::new(None),
             settings_tab_request: RwSignal::new(None),
             help_tour_step: RwSignal::new(None),
             getting_started_open: RwSignal::new(false),

@@ -978,6 +978,14 @@ fn is_high_volume_code_intel_frame(kind: FrameKind) -> bool {
 
 fn command_error_context(envelope: &Envelope) -> Option<protocol::CommandErrorContext> {
     match envelope.kind {
+        FrameKind::SelfImprovementAction => envelope
+            .parse_payload::<protocol::SelfImprovementAction>()
+            .ok()
+            .map(
+                |action| protocol::CommandErrorContext::SelfImprovementChange {
+                    id: action.id().clone(),
+                },
+            ),
         FrameKind::ProjectReadFile => envelope
             .parse_payload::<protocol::ProjectReadFilePayload>()
             .ok()

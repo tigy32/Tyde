@@ -1131,7 +1131,6 @@ pub fn ChatView(
             // and neither pane's draft, backend choice, or session settings can
             // reach the other (dev-docs/32 §7).
             <Show when=move || has_composer.get()>
-                <crate::components::learning_change::LearningTray agent_ref />
                 <ChatInput
                     agent_ref=agent_ref
                     pending_team_member=composer_pending_team_member

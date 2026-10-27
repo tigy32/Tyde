@@ -280,3 +280,112 @@ locking and reset. The opt-in `real_codex_global_settings` conformance case
 runs the real host and Codex CLI in an isolated `CODEX_HOME`, checking native
 read/write/reset, stale-version rejection, invalid-value rejection and
 preservation. It creates no model conversations.
+
+
+## Self-improvement suggestion dock
+
+Settings is the only place that enables/disables learning, selects its scope,
+mode and analyzer. Suggestions live in the normal Self-improvement dock tab,
+not Settings or a chat tray. Its host and rule scope are explicit. The dock uses
+the existing client layout for placement, resizing and visibility; its pending
+badge never changes visibility or focus. Only this client's successful,
+correlated Settings enable write opens it once. Bootstrap and other clients'
+settings changes do not open it.
+
+Pending and History render the host's `SelfImprovementState`. Accept, Edit,
+Dismiss, Undo and Restore send typed `SelfImprovementAction`; transport completion
+never manufactures state. The diff preserves the server's before and proposed
+title/text; rationale is an optional disclosure, not raw feedback. Before means
+the proposal's recorded baseline, not a fresh canonical lookup. Existing-rule
+links open the owning host's Steering/Review settings. The sidebar gear carries
+its selected host and scope to Settings without navigating the active chat.
+
+Proposal rows keep one keyed lifetime across tab, scope, chat and host navigation
+so unsaved form drafts survive. Cancel closes an editor without deleting its
+draft. Edit carries the whole expected operation as an actor-checked CAS; a
+stale proposal is rejected without changing the durable journal. Each edit has
+a typed identity, persisted as `last_edit_id` only after successful save. Only
+that client's accepted edit with the submitted content closes its unchanged
+local draft. Coincident text from another client is not an acknowledgment.
+A newer local draft stays open. Latest proposal disclosure and Keep my edit
+allow explicit adoption of a changed baseline while retaining local text.
+
+Restore returns Dismissed/Undone to Pending only if the current canonical rule
+still matches the recorded baseline. It preserves proposal identity and content,
+uses the current per-rule revision and requires approval, even in Automatic mode.
+Unapplied Conflicts can be dismissed; an applied Undo conflict cannot be hidden
+as a dismissal. Apply/Undo retain their canonical revision and text protections.
+Proposal mutations are staged and persisted before publication; failed Edit,
+Restore or Dismiss never creates success-shaped in-memory state.
+
+Protocol92 adds required Edit expectations/identity, Restore and typed proposal
+error context. Older journals have no accepted new-contract edit identity. Action
+errors are scoped by `CommandErrorContext::SelfImprovementChange`, not inferred
+from host-error text. The existing inline-notice store displays them on the owning
+card, and edit rejections only alongside the corresponding submitted edit.
+Analyzer/input failures retain their existing host/scope ownership. No duplicate
+proposal cache, optimistic history, analyzer/provider or security-policy changes.
+
+The existing wasm settings/audit flow now exercises the single dock instead of
+two duplicate chat/Settings presentations. Old rich-markdown/source-feedback
+assertions described that removed UI; the replacement checks exact escaped
+diff text, absence of fetched images/raw feedback, draft identity and confirmed
+lifecycle transitions, stale-baseline adoption, correlated proposal errors and
+Restore. The real-server protocol flow checks Restore/Apply/Undo cycles,
+two-client stale edits and idempotent replay, real journal-write failure,
+canonical conflict dismissal, protected human text and reconnect durability.
+
+Narrow docking follows the workspace container's width, not a second mobile
+visibility preference. In a narrow workspace, opening this dock hides the other
+panes through the same persisted layout, including activation of a saved
+interface mode without a resize. Explicitly opening Agents or Terminal
+hides this dock instead; all components and proposal drafts retain their lifetime.
+Real native-window QA found that the welcome panel's
+intrinsic minimum pushed the composer below the compressed center. Only while
+this dock is open in a narrow workspace, the welcome content may scroll inside
+its allotted space; the composer remains inside the center. The existing dock
+DOM flow checks this non-overlap contract across all three chat presentations.
+This is not a physical iPhone/PWA viewport certification.
+
+The mode-switch regression caught a lazy reactive memo that was only tracked,
+never evaluated: selecting saved Vibe at unchanged390px left both panes visible.
+The effect now reads the memo before reconciliation. The same DOM visibility and
+non-overlap assertions remain intact; activation diagnostics record mode/width.
+
+Explicit dock hiding, tab-menu removal and compact activation of another pane
+cancel the same pending enable-open intent. A delayed successful Settings write
+cannot reinsert a removed suggestion tab or undo that later layout choice.
+Removing active Self-improvement selects a remaining listed tab. Existing
+non-Self-improvement tab-hiding semantics remain unchanged.
+The existing DOM audit flow exercises removal and compact hiding before delayed
+successful write events. No second visibility or proposal-state model is added.
+
+The removal DOM oracle targets the actual right tab strip, not every button in
+its component: the open menu deliberately retains an unchecked Self-improvement
+checkbox after removal. A broad button query rejected that correct output. The
+flow checks both absent tab and unchecked menu before the delayed result, then
+keeps the absent-tab assertion afterward. Downstream portal failures from the
+original panic were not separate product failures; no assertions were relaxed.
+
+The existing History flow caught an over-broad active-tab removal change: it
+intentionally retains the active History view after hiding its tab. That behavior
+is restored, with the new removal handling limited to Self-improvement. The
+proposal-focus flow restores its composer-focus precondition after the added menu
+interaction (Escape intentionally restores menu-anchor focus); the original
+post-notify focus assertion is unchanged.
+
+Settings Open suggestions requires the existing host and scope selection. The
+no-project/unselected-scope DOM case checks that the action is unavailable until
+a scope is chosen, then actionable. If the selection disappears during the action,
+an explicit Settings error replaces the old silent no-op. This does not restrict
+any server operation or add a sidebar feature toggle.
+
+Final visual triage: an empty-title edit now identifies the required title at
+server validation, without changing accepted inputs or analyzer behavior. Typed
+proposal Conflict uses the existing bordered error presentation (not a duplicate
+notice or inferred command failure); its Dismiss remains a normal button.
+The existing real-server flow verifies title rejection ownership, correction and
+unchanged durable proposal; the DOM flow verifies Conflict alert prominence.
+Normal tab removal removes Self-improvement but can leave the generic empty dock
+visible. This differs from closing the dock; neither action disables learning.
+Narrow scope/header vertical density remains a nonblocking layout-polish limit.

@@ -409,8 +409,39 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         })
     })
     .await;
-    assert!(conflict.error.is_some());
+    assert!(
+        conflict.error.is_none(),
+        "The typed proposal Conflict owns the failure; it must not also leak into unrelated scopes as a host error"
+    );
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Dismiss {
+            id: updated.id.clone(),
+        })
+        .await
+        .expect("reject dismissing an applied conflict");
+    let rejected: CommandErrorPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "applied conflict cannot be dismissed",
+        |frame| frame.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("command error");
+    assert!(
+        matches!(rejected.context, Some(CommandErrorContext::SelfImprovementChange { id }) if id == updated.id)
+    );
     let persisted = fixture.connect_with_bootstrap().await.1;
+    assert!(persisted.self_improvement.error.is_none());
+    assert!(
+        persisted
+            .self_improvement
+            .changes
+            .iter()
+            .any(|change| change.id == updated.id
+                && matches!(change.status, LearningChangeStatus::Conflict { .. })
+                && change.applied_revision.is_some())
+    );
     assert_eq!(
         persisted
             .steering
@@ -1168,6 +1199,144 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     })
     .await;
     assert!(fixture.connect_with_bootstrap().await.1.steering == fixture.bootstrap.steering);
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Restore {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("restore undone proposal");
+    let restored = state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Pending)
+        })
+    })
+    .await;
+    let restored = restored
+        .changes
+        .iter()
+        .find(|item| item.id == change.id)
+        .expect("restored proposal");
+    assert_eq!(restored.operation, change.operation);
+    assert_eq!(restored.scope, change.scope);
+    assert_eq!(restored.created_at_ms, change.created_at_ms);
+    assert_eq!(
+        restored.expected_revision,
+        change.applied_revision.expect("first application") + 1
+    );
+    assert!(
+        restored.requires_approval
+            && restored.applied_revision.is_none()
+            && restored.last_edit_id.is_none()
+    );
+    let first_restore_revision = restored.expected_revision;
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Apply {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("accept restored proposal");
+    let reapplied = state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Applied)
+        })
+    })
+    .await;
+    assert_eq!(
+        reapplied
+            .changes
+            .iter()
+            .find(|item| item.id == change.id)
+            .expect("reapplied")
+            .applied_revision,
+        Some(first_restore_revision + 1)
+    );
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Undo {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("undo restored application");
+    state(&mut fixture, |state| {
+        state
+            .changes
+            .iter()
+            .any(|item| item.id == change.id && matches!(item.status, LearningChangeStatus::Undone))
+    })
+    .await;
+    assert!(fixture.connect_with_bootstrap().await.1.steering == fixture.bootstrap.steering);
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Restore {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("restore a second cycle");
+    let restored_again = state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Pending)
+        })
+    })
+    .await;
+    assert_eq!(
+        restored_again
+            .changes
+            .iter()
+            .find(|item| item.id == change.id)
+            .expect("restored again")
+            .expected_revision,
+        first_restore_revision + 2
+    );
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Dismiss {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("dismiss restored proposal");
+    state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Dismissed)
+        })
+    })
+    .await;
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Restore {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("restore dismissed proposal");
+    let restored_dismissal = state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Pending)
+        })
+    })
+    .await;
+    assert_eq!(
+        restored_dismissal
+            .changes
+            .iter()
+            .find(|item| item.id == change.id)
+            .expect("restored dismissal")
+            .expected_revision,
+        first_restore_revision + 2
+    );
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Dismiss {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("dismiss again before canonical edit");
+    state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == change.id && matches!(item.status, LearningChangeStatus::Dismissed)
+        })
+    })
+    .await;
     let LearningRule::Steering {
         steering: human_rule,
     } = revised.clone()
@@ -1182,6 +1351,33 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         .await
         .expect("human canonical edit");
     canonical_steering(&mut fixture, "Explain focused project changes.").await;
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Restore {
+            id: change.id.clone(),
+        })
+        .await
+        .expect("request invalid restore");
+    let rejected: CommandErrorPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "restore protects canonical human text",
+        |frame| frame.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("restore error");
+    assert!(
+        matches!(rejected.context, Some(CommandErrorContext::SelfImprovementChange { id }) if id == change.id)
+    );
+    let rejected_restore = fixture.connect_with_bootstrap().await.1.self_improvement;
+    assert!(rejected_restore.error.is_none());
+    let unchanged = rejected_restore
+        .changes
+        .iter()
+        .find(|item| item.id == change.id)
+        .expect("dismissed proposal");
+    assert!(matches!(unchanged.status, LearningChangeStatus::Dismissed));
+    assert_eq!(unchanged.expected_revision, first_restore_revision + 2);
     human(
         &mut fixture,
         &author,
@@ -1191,7 +1387,10 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     )
     .await;
     let protected = state(&mut fixture, |state| {
-        state.changes.iter().any(|change| change.requires_approval)
+        state
+            .changes
+            .iter()
+            .any(|change| change.operation.origin_id.0 == "project-protected")
     })
     .await;
     assert!(
@@ -1216,10 +1415,211 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     let pending_id = protected
         .changes
         .iter()
-        .find(|change| change.requires_approval)
+        .find(|change| change.operation.origin_id.0 == "project-protected")
         .expect("protected proposal")
         .id
         .clone();
+    let original = protected
+        .changes
+        .iter()
+        .find(|item| item.id == pending_id)
+        .expect("pending operation")
+        .operation
+        .clone();
+    let mut untitled = original.after.clone();
+    if let LearningRule::Steering { steering } = &mut untitled {
+        steering.title.clear();
+    }
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Edit {
+            id: pending_id.clone(),
+            request_id: LearningEditId("edit-empty-title".into()),
+            expected: Box::new(original.clone()),
+            after: untitled,
+            reason: original.reason.clone(),
+        })
+        .await
+        .expect("request untitled edit");
+    let untitled: CommandErrorPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "empty-title edit identifies its correction",
+        |frame| frame.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("empty-title error");
+    assert_eq!(untitled.message, "Enter a rule title");
+    assert_eq!(untitled.request_id.as_deref(), Some("edit-empty-title"));
+    assert!(
+        matches!(untitled.context, Some(CommandErrorContext::SelfImprovementChange { id }) if id == pending_id)
+    );
+    let after_untitled = fixture.connect_with_bootstrap().await.1.self_improvement;
+    assert!(after_untitled.error.is_none());
+    assert!(
+        after_untitled
+            .changes
+            .iter()
+            .find(|item| item.id == pending_id)
+            == protected.changes.iter().find(|item| item.id == pending_id),
+        "An invalid edit preserves the entire proposal and durable acknowledgment"
+    );
+    let edited_rule = scoped_rule("Retain explicit project edits.");
+    let edit_a = SelfImprovementAction::Edit {
+        id: pending_id.clone(),
+        request_id: LearningEditId("edit-a1".into()),
+        expected: Box::new(original.clone()),
+        after: edited_rule.clone(),
+        reason: original.reason.clone(),
+    };
+    fixture
+        .client
+        .self_improvement_action(edit_a.clone())
+        .await
+        .expect("first client edit");
+    let edited_a = state(&mut fixture, |state| {
+        state
+            .changes
+            .iter()
+            .any(|item| item.last_edit_id == Some(LearningEditId("edit-a1".into())))
+    })
+    .await;
+    let edited_a = edited_a
+        .changes
+        .iter()
+        .find(|item| item.id == pending_id)
+        .expect("edited operation")
+        .clone();
+    fixture
+        .client
+        .self_improvement_action(edit_a)
+        .await
+        .expect("replay durable accepted edit");
+    let (mut other_client, _) = fixture.connect_with_bootstrap().await;
+    other_client
+        .self_improvement_action(SelfImprovementAction::Edit {
+            id: pending_id.clone(),
+            request_id: LearningEditId("edit-b1".into()),
+            expected: Box::new(edited_a.operation.clone()),
+            after: edited_rule.clone(),
+            reason: original.reason.clone(),
+        })
+        .await
+        .expect("other client edit with identical content");
+    let edited_b = state(&mut fixture, |state| {
+        state
+            .changes
+            .iter()
+            .any(|item| item.last_edit_id == Some(LearningEditId("edit-b1".into())))
+    })
+    .await;
+    let edited_b = edited_b
+        .changes
+        .iter()
+        .find(|item| item.id == pending_id)
+        .expect("other client accepted edit")
+        .clone();
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Edit {
+            id: pending_id.clone(),
+            request_id: LearningEditId("edit-a2".into()),
+            expected: Box::new(original.clone()),
+            after: scoped_rule("Do not overwrite another client."),
+            reason: original.reason.clone(),
+        })
+        .await
+        .expect("request stale edit");
+    let stale: CommandErrorPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "stale edit fenced after replay",
+        |frame| frame.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("stale edit error");
+    assert_eq!(
+        stale.request_id.as_deref(),
+        Some("edit-a2"),
+        "An idempotent earlier replay must not fail"
+    );
+    assert_eq!(stale.request_kind, FrameKind::SelfImprovementAction);
+    assert!(
+        matches!(stale.context, Some(CommandErrorContext::SelfImprovementChange { id }) if id == pending_id)
+    );
+    let after_stale = fixture.connect_with_bootstrap().await.1.self_improvement;
+    assert!(after_stale.error.is_none());
+    assert!(
+        after_stale
+            .changes
+            .iter()
+            .find(|item| item.id == pending_id)
+            == Some(&edited_b),
+        "Rejected stale edit must preserve the entire proposal without printing author input"
+    );
+    let blocked_transaction = fixture
+        .session_store_path()
+        .with_file_name("self-improvement.json.tmp");
+    std::fs::create_dir(&blocked_transaction)
+        .expect("block journal transaction with owned directory");
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Edit {
+            id: pending_id.clone(),
+            request_id: LearningEditId("edit-a-io".into()),
+            expected: Box::new(edited_b.operation.clone()),
+            after: scoped_rule("This must not acknowledge a failed save."),
+            reason: original.reason.clone(),
+        })
+        .await
+        .expect("request edit with failing durable write");
+    let io: CommandErrorPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "journal failure is proposal scoped",
+        |frame| frame.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload()
+    .expect("durable write error");
+    assert_eq!(io.request_id.as_deref(), Some("edit-a-io"));
+    assert!(
+        matches!(io.context, Some(CommandErrorContext::SelfImprovementChange { id }) if id == pending_id)
+    );
+    let after_io = fixture.connect_with_bootstrap().await.1.self_improvement;
+    assert!(after_io.error.is_none());
+    assert!(
+        after_io.changes.iter().find(|item| item.id == pending_id) == Some(&edited_b),
+        "Failed durable edit must preserve the entire proposal without printing author input"
+    );
+    std::fs::remove_dir(&blocked_transaction).expect("remove owned transaction blocker");
+    let LearningRule::Steering {
+        steering: same_canonical,
+    } = revised.clone()
+    else {
+        unreachable!()
+    };
+    other_client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: same_canonical,
+        })
+        .await
+        .expect("bump canonical revision without changing text");
+    canonical_steering(&mut fixture, "Explain focused project changes.").await;
+    fixture
+        .client
+        .self_improvement_action(SelfImprovementAction::Apply {
+            id: pending_id.clone(),
+        })
+        .await
+        .expect("request stale canonical apply");
+    state(&mut fixture, |state| {
+        state.changes.iter().any(|item| {
+            item.id == pending_id
+                && matches!(item.status, LearningChangeStatus::Conflict { .. })
+                && item.applied_revision.is_none()
+        })
+    })
+    .await;
     fixture
         .client
         .self_improvement_action(SelfImprovementAction::Dismiss {
@@ -1233,6 +1633,19 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         })
     })
     .await;
+    let reconnected = fixture.connect_with_bootstrap().await.1;
+    let dismissed = reconnected
+        .self_improvement
+        .changes
+        .iter()
+        .find(|change| change.id == pending_id)
+        .expect("dismissed audit row survives reconnect");
+    assert_eq!(dismissed.scope, scope);
+    assert!(matches!(dismissed.status, LearningChangeStatus::Dismissed));
+    assert_eq!(
+        dismissed.operation.after, edited_rule,
+        "Dismissal retains the proposed rule for truthful history"
+    );
     human(
         &mut fixture,
         &author,

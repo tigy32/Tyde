@@ -158,6 +158,9 @@ fn SidebarTabs(side: SidebarSide) -> impl IntoView {
                             on:click=move |_| toggle.toggle_sidebar_tab(tab, side)>
                             <span class="sidebar-tab-check" aria-hidden="true">{move || layouts.with(|layouts| layouts.current().side(tab).is_some()).then_some("✓")}</span>
                             {tab.label()}
+                            {move || (tab == SidebarTab::SelfImprovement).then(|| view! {
+                                <crate::components::learning_change::PendingBadge />
+                            })}
                         </button>
                     }
                 }).collect_view()}
@@ -214,6 +217,7 @@ pub fn SidebarPanels() -> impl IntoView {
                         SidebarTab::References => view! { <ReferencesPanel /> }.into_any(),
                         SidebarTab::Swarms => view! { <SwarmsPanel /> }.into_any(),
                         SidebarTab::Workflows => view! { <WorkflowsPanel /> }.into_any(),
+                        SidebarTab::SelfImprovement => view! { <crate::components::learning_change::SelfImprovementSidebar /> }.into_any(),
                         SidebarTab::Terminal => view! { <TerminalView /> }.into_any(),
                     }}
                 </section>

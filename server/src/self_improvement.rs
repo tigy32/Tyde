@@ -311,9 +311,6 @@ impl ConfigActor {
                 Command::InputFailure { reason } => self.error = Some(reason),
                 Command::Action { action, reply } => {
                     let result = self.action(action);
-                    if let Err(error) = &result {
-                        self.error = Some(error.clone());
-                    }
                     let _ = reply.send(result);
                 }
                 Command::Finished {
@@ -1026,6 +1023,7 @@ impl ConfigActor {
                 requires_approval,
                 expected_revision,
                 applied_revision: None,
+                last_edit_id: None,
             });
         }
         let ids = changes
@@ -1277,17 +1275,24 @@ impl ConfigActor {
         self.save()
     }
     fn conflict(&mut self, index: usize, reason: &str) -> Result<(), String> {
-        self.journal.changes[index].status = LearningChangeStatus::Conflict {
+        let mut next = self.journal.clone();
+        next.changes[index].status = LearningChangeStatus::Conflict {
             reason: reason.into(),
         };
-        self.save()?;
-        Err(reason.into())
+        self.save_journal(&next)?;
+        self.journal = next;
+        Ok(())
     }
     fn action(&mut self, action: SelfImprovementAction) -> Result<(), String> {
-        self.error = None;
         match action {
             SelfImprovementAction::Apply { id } => self.apply(&id),
-            SelfImprovementAction::Edit { id, after, reason } => {
+            SelfImprovementAction::Edit {
+                id,
+                request_id,
+                expected,
+                after,
+                reason,
+            } => {
                 let index = self
                     .journal
                     .changes
@@ -1295,6 +1300,13 @@ impl ConfigActor {
                     .position(|change| change.id == id)
                     .ok_or("Proposal not found")?;
                 let mut change = self.journal.changes[index].clone();
+                if change.last_edit_id.as_ref() == Some(&request_id) {
+                    return if change.operation.after == after && change.operation.reason == reason {
+                        Ok(())
+                    } else {
+                        Err("Edit identity was already used for different content".into())
+                    };
+                }
                 if !matches!(change.status, LearningChangeStatus::Pending)
                     || rule_key(&after) != rule_key(&change.operation.after)
                 {
@@ -1302,6 +1314,9 @@ impl ConfigActor {
                         "Only pending proposals can be edited, retaining their canonical identity"
                             .into(),
                     );
+                }
+                if change.operation != *expected {
+                    return Err("Suggestion changed on the host; review the latest proposal before saving your draft".into());
                 }
                 change.operation.after = after;
                 change.operation.reason = reason;
@@ -1311,22 +1326,69 @@ impl ConfigActor {
                     &change.scope,
                     &self.config(&change.scope)?,
                 )?;
-                self.journal.changes[index] = change;
-                self.save()
+                change.last_edit_id = Some(request_id);
+                let mut next = self.journal.clone();
+                next.changes[index] = change;
+                self.save_journal(&next)?;
+                self.journal = next;
+                Ok(())
             }
             SelfImprovementAction::Undo { id } => self.undo(&id),
             SelfImprovementAction::Dismiss { id } => {
-                let change = self
-                    .journal
+                let mut next = self.journal.clone();
+                let change = next
                     .changes
                     .iter_mut()
                     .find(|change| change.id == id)
                     .ok_or("Proposal not found")?;
-                if !matches!(change.status, LearningChangeStatus::Pending) {
-                    return Err("Only pending proposals can be dismissed".into());
+                if !matches!(change.status, LearningChangeStatus::Pending)
+                    && !(matches!(change.status, LearningChangeStatus::Conflict { .. })
+                        && change.applied_revision.is_none())
+                {
+                    return Err("Only unapplied proposals can be dismissed".into());
                 }
                 change.status = LearningChangeStatus::Dismissed;
-                self.save()
+                self.save_journal(&next)?;
+                self.journal = next;
+                Ok(())
+            }
+            SelfImprovementAction::Restore { id } => {
+                let index = self
+                    .journal
+                    .changes
+                    .iter()
+                    .position(|change| change.id == id)
+                    .ok_or("Proposal not found")?;
+                let mut change = self.journal.changes[index].clone();
+                if !matches!(
+                    change.status,
+                    LearningChangeStatus::Dismissed | LearningChangeStatus::Undone
+                ) {
+                    return Err("Only dismissed or undone proposals can be restored".into());
+                }
+                validate_operation(
+                    &change.operation,
+                    &change.scope,
+                    &self.config(&change.scope)?,
+                )?;
+                if self.current(&change.operation.after)? != change.operation.before {
+                    return Err("The canonical rule changed; restoring this proposal would target different text".into());
+                }
+                change.expected_revision = self
+                    .journal
+                    .revisions
+                    .get(&rule_key(&change.operation.after))
+                    .copied()
+                    .unwrap_or(0);
+                change.status = LearningChangeStatus::Pending;
+                change.applied_revision = None;
+                change.last_edit_id = None;
+                change.requires_approval = true;
+                let mut next = self.journal.clone();
+                next.changes[index] = change;
+                self.save_journal(&next)?;
+                self.journal = next;
+                Ok(())
             }
         }
     }
@@ -1455,8 +1517,10 @@ fn validate_operation(
         }
     };
     let (title, text) = rule_text(&operation.after);
+    if title.trim().is_empty() {
+        return Err("Enter a rule title".into());
+    }
     if id.trim().is_empty()
-        || title.trim().is_empty()
         || title.len() > 120
         || text.trim().is_empty()
         || text.len() > 2048

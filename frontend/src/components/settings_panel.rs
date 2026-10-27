@@ -7696,6 +7696,14 @@ pub(super) fn send_host_change(
     state: &AppState,
     prepare: impl FnOnce(&Value) -> Result<Vec<SettingOp>, String>,
 ) {
+    send_host_change_with_id(state, prepare, |_| {});
+}
+
+fn send_host_change_with_id(
+    state: &AppState,
+    prepare: impl FnOnce(&Value) -> Result<Vec<SettingOp>, String>,
+    prepared: impl FnOnce(SettingsWriteId),
+) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("settings write requested without a selected host stream");
         crate::notices::report_settings_error(
@@ -7738,11 +7746,29 @@ pub(super) fn send_host_change(
         ops,
     };
 
+    prepared(payload.write_id.clone());
+    let pending_open = state.self_improvement_open_after_write;
     spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, host_stream, FrameKind::SettingsWrite, &payload).await
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream.clone(),
+            FrameKind::SettingsWrite,
+            &payload,
+        )
+        .await
         {
-            log::error!("failed to send SettingsWrite: {error}");
+            if pending_open
+                .get_untracked()
+                .is_some_and(|(host, id, _)| host == host_id && id == payload.write_id)
+            {
+                pending_open.set(None);
+            }
+            crate::notices::report_send_failure(
+                &host_id,
+                &host_stream,
+                FrameKind::SettingsWrite,
+                &error,
+            );
         }
     });
 }
@@ -9200,16 +9226,12 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
 
 #[component]
 fn SelfImprovementTab() -> impl IntoView {
-    use crate::components::learning_change::LearningChangeCard;
     use protocol::{
-        LearningAnalyzer, LearningAnalyzerCapability, LearningChange, LearningChangeStatus,
-        LearningConfig, LearningMode, LearningRule, LearningStatus,
+        LearningAnalyzer, LearningAnalyzerCapability, LearningConfig, LearningMode, LearningStatus,
     };
     let state = expect_context::<AppState>();
     let store = StoredValue::new(state.clone());
     let scope = RwSignal::new(None::<SteeringScope>);
-    let steering_editor = RwSignal::new(None::<SteeringForm>);
-    let aspect_editor = RwSignal::new(None::<(String, protocol::ReviewAspectConfig)>);
     Effect::new(move |_| {
         let state = store.get_value();
         let host = state.selected_host_id.get();
@@ -9220,8 +9242,15 @@ fn SelfImprovementTab() -> impl IntoView {
                 .filter(|project| Some(&project.host_id) == host.as_ref())
                 .map(|project| SteeringScope::Project(project.project_id)),
         );
-        steering_editor.set(None);
-        aspect_editor.set(None);
+    });
+    Effect::new(move |_| {
+        let state = store.get_value();
+        if let Some((host, requested_scope)) = state.self_improvement_settings_scope_request.get()
+            && state.selected_host_id.get() == Some(host)
+        {
+            scope.set(Some(requested_scope));
+            state.self_improvement_settings_scope_request.set(None);
+        }
     });
     let config = Memo::new(move |_| {
         let settings = store.get_value().selected_host_settings()?;
@@ -9250,24 +9279,50 @@ fn SelfImprovementTab() -> impl IntoView {
             .into_iter()
             .find(|state| Some(&state.scope) == scope.get().as_ref())
     });
-    let changes = Memo::new(move |_| {
-        snapshot
-            .get()
-            .changes
-            .into_iter()
-            .filter(|change| Some(&change.scope) == scope.get().as_ref())
-            .collect::<Vec<_>>()
-    });
     let save = Callback::new(move |config: LearningConfig| {
-        let path = match scope.get_untracked() {
-            Some(SteeringScope::Host) => "/self_improvement/host".to_owned(),
-            Some(SteeringScope::Project(id)) => format!(
+        let Some(selected_scope) = scope.get_untracked() else {
+            return;
+        };
+        let path = match &selected_scope {
+            SteeringScope::Host => "/self_improvement/host".to_owned(),
+            SteeringScope::Project(id) => format!(
                 "/self_improvement/projects/{}",
                 settings_model::escape_pointer_token(&id.0)
             ),
-            None => return,
         };
-        send_host_replace(&store.get_value(), path, config);
+        let state = store.get_value();
+        let should_open = config.enabled
+            && !state
+                .selected_host_settings_untracked()
+                .is_some_and(|settings| match &selected_scope {
+                    SteeringScope::Host => settings.self_improvement.host.enabled,
+                    SteeringScope::Project(id) => settings
+                        .self_improvement
+                        .projects
+                        .get(id)
+                        .is_some_and(|config| config.enabled),
+                });
+        let value = match serde_json::to_value(config) {
+            Ok(value) => value,
+            Err(error) => {
+                crate::notices::report_settings_error(
+                    &state,
+                    format!("Cannot prepare self-improvement settings: {error}"),
+                );
+                return;
+            }
+        };
+        let host = state.selected_host_id.get_untracked();
+        let pending_open = state.self_improvement_open_after_write;
+        send_host_change_with_id(
+            &state,
+            move |doc| replace_setting_op(doc, path, value).map(|op| vec![op]),
+            move |id| {
+                if should_open && let Some(host) = host {
+                    pending_open.set(Some((host, id, selected_scope)));
+                }
+            },
+        );
     });
     let edit = move |apply: &dyn Fn(&mut LearningConfig)| {
         if let Some(mut config) = config.get_untracked() {
@@ -9343,48 +9398,6 @@ fn SelfImprovementTab() -> impl IntoView {
             LearningStatus::Failed { reason } => format!("Last run failed: {reason}"),
         }
     };
-    let on_edit_applied = Callback::new(move |change: LearningChange| {
-        let state = store.get_value();
-        match &change.operation.after {
-            LearningRule::Steering { steering } => {
-                let current = state.selected_host_id.get_untracked().and_then(|host| {
-                    state
-                        .steering
-                        .get_untracked()
-                        .get(&host)
-                        .and_then(|rules| rules.get(&steering.id).cloned())
-                });
-                if let Some(current) = current {
-                    steering_editor.set(Some(SteeringForm::from_steering(&current)));
-                }
-            }
-            LearningRule::ReviewAspect { id, .. } => {
-                if let Some(current) = state
-                    .selected_host_settings()
-                    .and_then(|settings| settings.review.aspects.get(id).cloned())
-                {
-                    aspect_editor.set(Some((id.clone(), current)));
-                }
-            }
-        }
-    });
-    let on_open_origin = Callback::new(move |change: LearningChange| {
-        let state = store.get_value();
-        let host = state.selected_host_id.get_untracked();
-        match state.agents.get_untracked().into_iter().find(|agent| {
-            agent.agent_id == change.origin_agent_id && Some(&agent.host_id) == host.as_ref()
-        }) {
-            Some(agent) => {
-                state.settings_open.set(false);
-                crate::components::agents_panel::open_agent_chat(&state, &agent);
-            }
-            None => crate::notices::report_settings_error(
-                &state,
-                "That conversation is closed. The suggestion keeps its source message.",
-            ),
-        }
-    });
-    let card_host = move || store.get_value().selected_host_id.get();
     let disabled = move || config.get().is_none();
     let toggle = move |label: &'static str,
                        read: fn(&LearningConfig) -> bool,
@@ -9529,37 +9542,17 @@ fn SelfImprovementTab() -> impl IntoView {
             <Show when=move || snapshot.get().error.is_some()>
                 <p class="learning-error" role="alert">{move || snapshot.get().error}</p>
             </Show>
-            <Show when=move || changes.get().is_empty() && config.get().is_some_and(|config| config.enabled)>
-                <h3 class="settings-section-title">"Suggestions"</h3>
-                <p class="settings-description">"No suggestions yet."</p>
-            </Show>
-            <div class="learning-changes">
-                <For each={move || {
-                    let mut changes = changes.get();
-                    changes.sort_by_key(|change| !matches!(change.status, LearningChangeStatus::Pending));
-                    changes.into_iter().filter_map(|change| card_host().map(|host| (host, change.id))).collect::<Vec<_>>()
-                }} key=|(host, id)| (host.clone(), id.clone()) children={move |(host_id, id)| {
-                    let row_id = StoredValue::new(id.clone());
-                    let heading = move || {
-                        let changes = changes.get();
-                        let pending = changes.iter().find(|change| matches!(change.status, LearningChangeStatus::Pending));
-                        let history = changes.iter().find(|change| !matches!(change.status, LearningChangeStatus::Pending));
-                        if pending.is_some_and(|change| change.id == row_id.get_value()) {
-                            Some("Suggestions")
-                        } else if history.is_some_and(|change| change.id == row_id.get_value()) {
-                            Some("History")
-                        } else {
-                            None
-                        }
-                    };
-                    view! {
-                        <div>
-                            {move || heading().map(|text| view! { <h3 class="settings-section-title">{text}</h3> })}
-                            <LearningChangeCard host_id id on_edit_applied on_open_origin />
-                        </div>
+            <button class="settings-btn" disabled=move || store.get_value().selected_host_id.get().is_none() || scope.get().is_none() on:click=move |_| {
+                let state = store.get_value();
+                match (state.selected_host_id.get_untracked(), scope.get_untracked()) {
+                    (Some(host), Some(scope)) => {
+                        state.self_improvement_scope_request.set(Some((host, scope)));
+                        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+                        state.settings_open.set(false);
                     }
-                }} />
-            </div>
+                    _ => crate::notices::report_settings_error(&state, "Choose a host and scope"),
+                }
+            }>"Open suggestions"</button>
             {move || {
                 let usage = snapshot.get().usage.into_iter()
                     .filter(|usage| Some(&usage.scope) == scope.get().as_ref())
@@ -9582,8 +9575,6 @@ fn SelfImprovementTab() -> impl IntoView {
                     </details>
                 })
             }}
-            {move || steering_editor.get().map(|form| view! { <SteeringEditor form editor_signal=steering_editor /> })}
-            {move || aspect_editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| aspect_editor.set(None)) /> })}
         </section>
     }
 }
@@ -22397,10 +22388,10 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn self_improvement_settings_and_audit_actions_follow_typed_state() {
         use protocol::{
-            HumanInputId, LearningAnalyzerCapability, LearningAnalyzerOption, LearningChange,
-            LearningChangeId, LearningChangeStatus, LearningMode, LearningOperation, LearningRule,
-            SelfImprovementState,
+            HumanInputId, LearningChange, LearningChangeId, LearningChangeStatus,
+            LearningOperation, LearningRule, SelfImprovementState,
         };
+        crate::components::header::reset_user_notice_for_tests();
         let calls = install_settings_send_stub();
         let document = web_sys::window().unwrap().document().unwrap();
         let style = document.create_element("style").unwrap();
@@ -22408,761 +22399,822 @@ mod wasm_tests {
         document.head().unwrap().append_child(&style).unwrap();
         let state = AppState::new();
         let host = "learning-dom";
-        // Connection routing is installed before bootstrap in the real app;
-        // bootstrap alone deliberately does not invent an outbound stream.
+        let stream = protocol::StreamPath(format!("/host/{host}"));
+        let actions = || {
+            calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().unwrap();
+                    if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                        return None;
+                    }
+                    let args: Value =
+                        serde_json::from_str(&entry.get(1).as_string().unwrap()).unwrap();
+                    let envelope: protocol::Envelope =
+                        serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                    if envelope.kind != FrameKind::SelfImprovementAction {
+                        return None;
+                    }
+                    assert_eq!(args["hostId"], host, "Actions must use their owning host");
+                    assert_eq!(envelope.stream, stream);
+                    Some(
+                        envelope
+                            .parse_payload::<protocol::SelfImprovementAction>()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         state.host_streams.update(|streams| {
-            streams.insert(host.into(), protocol::StreamPath(format!("/host/{host}")));
+            streams.insert(host.into(), stream.clone());
         });
         crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |_| {});
         state.selected_host_id.set(Some(host.into()));
-        state.projects.update(|projects| {
-            projects.push(crate::state::ProjectInfo {
-                host_id: host.into(),
-                project: protocol::Project {
-                    id: protocol::ProjectId("learning-long-name".into()),
-                    name: "a-project-name-much-wider-than-a-narrow-settings-pane".into(),
-                    sort_order: 0,
-                    source: protocol::ProjectSource::Standalone { roots: vec![] },
-                },
-            })
-        });
-        let container = make_container();
-        let mounted_state = state.clone();
-        let root = container;
+        state
+            .configured_hosts
+            .set(vec![settings_host(host, "Sidebar host")]);
+        let root = make_container();
+        root.set_attribute("style", "width: 1000px; height: 800px")
+            .unwrap();
+        let mounted = state.clone();
         let handle = mount_to(root.clone(), move || {
-            provide_context(mounted_state.clone());
-            let agent_ref = Signal::derive(move || {
-                Some(crate::state::ActiveAgentRef {
-                    host_id: host.into(),
-                    agent_id: protocol::AgentId("dom-agent".into()),
-                })
-            });
+            provide_context(mounted.clone());
             view! {
+                <div id="learning-header"><crate::components::header::Header /></div>
                 <div id="learning-settings"><SelfImprovementTab /></div>
-                <div id="learning-chat" style="height: 400px; width: 600px;">
-                    <crate::components::chat_view::ChatView tab_id=crate::state::TabId(987654321)
-                        agent_ref owns_composer=Signal::derive(|| true) />
-                </div>
+                <div id="learning-dock"><crate::components::dock_zone::DockZone position=crate::state::SidebarSide::Right /></div>
+                <div id="learning-sidebar" style="width:320px; height:500px"><crate::components::learning_change::SelfImprovementSidebar /></div>
+                <div id="learning-chat"><crate::components::chat_view::ChatView tab_id=crate::state::TabId(987654321)
+                    agent_ref=Signal::derive(move || Some(crate::state::ActiveAgentRef { host_id: host.into(), agent_id: protocol::AgentId("dom-agent".into()) }))
+                    owns_composer=Signal::derive(|| true) /></div>
             }
         });
         next_tick().await;
-        let container = root
-            .query_selector("#learning-settings")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let chat = root
-            .query_selector("#learning-chat")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let composer = chat
-            .query_selector("textarea")
-            .unwrap()
-            .unwrap()
+        let surface = |selector: &str| {
+            root.query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        let settings = surface("#learning-settings");
+        let sidebar = surface("#learning-sidebar");
+        let composer = surface("#learning-chat textarea")
             .dyn_into::<web_sys::HtmlTextAreaElement>()
             .unwrap();
         composer.set_value("Keep this unsent draft");
-        composer
-            .dispatch_event(&web_sys::Event::new("input").unwrap())
-            .unwrap();
+        dispatch_event_from_js(composer.unchecked_ref(), "input", None);
         composer.focus().unwrap();
-        let select = container
-            .query_selector("select[aria-label='Self-improvement scope']")
-            .unwrap()
-            .unwrap()
+        let select = surface("#learning-settings select[aria-label='Self-improvement scope']")
             .dyn_into::<HtmlSelectElement>()
             .unwrap();
-        container
-            .set_attribute(
-                "style",
-                "position: absolute; top: 0; left: 0; width: 320px;",
-            )
+        let open = find_button_by_text(&settings, "Open suggestions")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
             .unwrap();
+        assert_eq!(
+            select.value(),
+            "",
+            "New Chat without a project requires an explicit Settings scope"
+        );
+        assert!(
+            open.disabled(),
+            "A missing scope must not expose an enabled no-op"
+        );
+        open.click();
+        next_tick().await;
+        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
+        select.set_value("host");
+        dispatch_event_from_js(select.unchecked_ref(), "change", None);
         next_tick().await;
         assert!(
-            select.get_bounding_client_rect().right()
-                <= container.get_bounding_client_rect().right(),
-            "A long project name must not push the scope selector out of a narrow pane"
+            !open.disabled(),
+            "Choosing the existing host scope makes Open suggestions actionable"
         );
-        container
-            .set_attribute(
-                "style",
-                "position: absolute; top: 0; left: 0; width: 1024px; height: 768px;",
-            )
-            .unwrap();
-        select.set_value("host");
-        let event_init = web_sys::EventInit::new();
-        event_init.set_bubbles(true);
-        select
-            .dispatch_event(
-                &web_sys::Event::new_with_event_init_dict("change", &event_init).unwrap(),
-            )
-            .unwrap();
-        next_tick().await;
-        let enabled = container
-            .query_selector("input[aria-label='Enable self-improvement']")
-            .unwrap()
-            .unwrap()
+        let enabled = surface("input[aria-label='Enable self-improvement']")
             .dyn_into::<HtmlInputElement>()
             .unwrap();
+        assert!(!enabled.checked());
         assert!(
-            !enabled.checked(),
-            "Learning is off by default, including host-wide learning"
+            sidebar
+                .query_selector("input[role='switch']")
+                .unwrap()
+                .is_none(),
+            "Feature toggle lives only in Settings"
         );
-        assert!(
-            !enabled.disabled(),
-            "Selected connected scope must be editable"
-        );
-        assert!(state.selected_host_stream_untracked().is_some());
-        for name in [
-            "Enable self-improvement",
-            "Learn steering",
-            "Learn review aspects",
-        ] {
-            let input = container
-                .query_selector(&format!("input[aria-label='{name}']"))
-                .unwrap()
-                .unwrap();
-            assert_eq!(input.get_attribute("role").as_deref(), Some("switch"));
-            let rect = input
-                .closest("label")
-                .unwrap()
-                .unwrap()
-                .get_bounding_client_rect();
-            assert!(
-                (rect.width() - 36.0).abs() < 1.0 && (rect.height() - 20.0).abs() < 1.0,
-                "Every learning boolean must paint a toggle switch"
-            );
-        }
-        let selected = container
-            .query_selector("[aria-label='Self-improvement mode'] [aria-pressed='true']")
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected.text_content().unwrap(), "Suggest");
         enabled.click();
         next_tick().await;
-        let ops = recorded_settings_write_ops(&calls);
         assert!(
-            ops.iter()
-                .any(|op| op["path"] == "/self_improvement/host" && op["value"]["enabled"] == true),
-            "The real control must emit a persisted settings write"
+            recorded_settings_write_ops(&calls)
+                .iter()
+                .any(|op| op["path"] == "/self_improvement/host" && op["value"]["enabled"] == true)
         );
-        find_button_by_text(&container, "Automatic")
+        assert!(
+            !state.sidebar_layout.get_untracked().current().right.visible,
+            "Sending is not confirmation"
+        );
+        let (_, write_id, _) = state
+            .self_improvement_open_after_write
+            .get_untracked()
+            .unwrap();
+        let sequence = std::cell::Cell::new(0u64);
+        let next_seq = || {
+            let seq = sequence.get();
+            sequence.set(seq + 1);
+            seq
+        };
+        let confirm = |id: protocol::SettingsWriteId, applied| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                host,
+                protocol::Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::SettingsWriteResult,
+                    next_seq(),
+                    &protocol::SettingsWriteResultPayload {
+                        write_id: id,
+                        applied,
+                        current_etag: "dom-etag".into(),
+                        field_errors: vec![],
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        confirm(protocol::SettingsWriteId("other-client".into()), true);
+        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
+        confirm(write_id, true);
+        next_tick().await;
+        assert_eq!(
+            state.sidebar_layout.get_untracked().current().right.active,
+            Some(crate::state::SidebarTab::SelfImprovement)
+        );
+        assert!(state.sidebar_layout.get_untracked().current().right.visible);
+        state.toggle_sidebar(crate::state::SidebarSide::Right);
+        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
+        enabled.set_checked(true);
+        dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
+        next_tick().await;
+        let (_, rejected_id, _) = state
+            .self_improvement_open_after_write
+            .get_untracked()
+            .unwrap();
+        confirm(rejected_id.clone(), false);
+        confirm(rejected_id, true);
+        assert!(
+            !state.sidebar_layout.get_untracked().current().right.visible,
+            "Rejected or replayed writes cannot reopen the dock"
+        );
+        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+        enabled.set_checked(true);
+        dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
+        next_tick().await;
+        let (_, removed_write, _) = state
+            .self_improvement_open_after_write
+            .get_untracked()
+            .unwrap();
+        let strip = surface("#learning-dock [aria-label='Right sidebar tabs']");
+        strip
+            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
+            .unwrap();
+        next_tick().await;
+        document
+            .query_selector("[role='menuitemcheckbox'][aria-label='Self-improvement']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
             .unwrap()
             .click();
         next_tick().await;
-        assert!(recorded_settings_write_ops(&calls).iter().any(
-            |op| op["value"]["mode"] == serde_json::to_value(LearningMode::Automatic).unwrap()
-        ));
-        // The visible feedback control replaces the redundant introductory
-        // paragraph; the trigger has no separate editable setting.
         assert!(
-            container
-                .text_content()
+            root.query_selector("#learning-dock [aria-label='Right sidebar tabs'] button[aria-label='Self-improvement']")
                 .unwrap()
-                .contains("Learn from feedback")
+                .is_none(),
+            "The normal tab menu removes Self-improvement"
         );
-        assert!(!container.text_content().unwrap().contains("Idle trigger"));
-        let change = LearningChange {
-            id: LearningChangeId("dom-change".into()),
+        assert_eq!(
+            document
+                .query_selector("[role='menuitemcheckbox'][aria-label='Self-improvement']")
+                .unwrap()
+                .unwrap()
+                .get_attribute("aria-checked")
+                .as_deref(),
+            Some("false"),
+            "The open checklist truthfully shows the tab removed"
+        );
+        confirm(removed_write, true);
+        next_tick().await;
+        assert!(
+            root.query_selector("#learning-dock [aria-label='Right sidebar tabs'] button[aria-label='Self-improvement']")
+                .unwrap()
+                .is_none(),
+            "Delayed enable success must not reinsert a manually removed tab"
+        );
+        let menu = document
+            .query_selector("[role='menu'][aria-label='Sidebar tabs']")
+            .unwrap()
+            .unwrap();
+        dispatch_event_from_js(menu.unchecked_ref(), "keydown", Some("Escape"));
+        state.sidebar_workbench_width.set(390.0);
+        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+        enabled.set_checked(true);
+        dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
+        next_tick().await;
+        let (_, compact_write, _) = state
+            .self_improvement_open_after_write
+            .get_untracked()
+            .unwrap();
+        surface("#learning-header [aria-label='Toggle Left Dock']").click();
+        next_tick().await;
+        confirm(compact_write, true);
+        next_tick().await;
+        assert_eq!(
+            surface("#learning-header [aria-label='Toggle Right Dock']")
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("false"),
+            "Opening another compact dock overrides a delayed SI enable-open"
+        );
+        state.sidebar_workbench_width.set(0.0);
+        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+        state.toggle_sidebar(crate::state::SidebarSide::Right);
+        let rule = |text: &str| LearningRule::Steering {
+            steering: Steering {
+                id: SteeringId("focus".into()),
+                scope: SteeringScope::Host,
+                title: "Validation".into(),
+                content: text.into(),
+            },
+        };
+        let proposal = LearningChange {
+            id: LearningChangeId("dom-steering".into()),
             scope: SteeringScope::Host,
             operation: LearningOperation {
-                before: None,
-                after: LearningRule::Steering {
-                    steering: Steering {
-                        id: SteeringId("dom-rule".into()),
-                        scope: SteeringScope::Host,
-                        title: "Focus".into(),
-                        content: "Keep changes **focused**.\n\n- Read `AGENTS.md` first.\n\n![Reference](https://example.invalid/proposal-tracking)".into(),
-                    },
-                },
-                reason: "Explicit durable feedback".into(),
+                before: Some(rule("Run relevant checks.")),
+                after: rule("Validate across real system boundaries.\n![untrusted](https://example.invalid/diff.png)\n<img src='https://example.invalid/html.png'>"),
+                reason: "Keep validation meaningful.\n![untrusted](https://example.invalid/reason.png)\n<img src='https://example.invalid/reason-html.png'>".into(),
                 origin_id: HumanInputId("dom-input".into()),
             },
             origin_agent_id: protocol::AgentId("dom-agent".into()),
-            origin_message: "For future work, keep changes focused.".into(),
+            origin_message: "Private raw feedback must not be rendered".into(),
             created_at_ms: 1,
             status: LearningChangeStatus::Pending,
             requires_approval: false,
             expected_revision: 0,
             applied_revision: None,
+            last_edit_id: None,
         };
-        let aspect = |instructions: &str| LearningRule::ReviewAspect {
-            id: "explain-code".into(),
+        let aspect = |text: &str| LearningRule::ReviewAspect {
+            id: "comments".into(),
+            scope: SteeringScope::Host,
             aspect: protocol::ReviewAspectConfig {
-                name: "Explain non-obvious code".into(),
+                name: "Comments".into(),
                 description: String::new(),
-                instructions: instructions.into(),
+                instructions: text.into(),
                 enabled: true,
             },
-            scope: SteeringScope::Host,
         };
-        let dismissed_update = LearningChange {
-            id: LearningChangeId("dom-update".into()),
+        let second = LearningChange {
+            id: LearningChangeId("dom-aspect".into()),
+            created_at_ms: 0,
             operation: LearningOperation {
-                before: Some(aspect("Flag unexplained magic numbers.")),
-                after: aspect("Flag unexplained magic numbers and tuning constants."),
-                reason: "Reviewers missed a tuning constant".into(),
-                origin_id: HumanInputId("dom-update-input".into()),
+                before: Some(aspect("Explain changes.")),
+                after: aspect("Explain non-obvious constraints."),
+                reason: "Keep useful context.".into(),
+                origin_id: HumanInputId("dom-input-2".into()),
             },
-            status: LearningChangeStatus::Dismissed,
-            ..change.clone()
+            ..proposal.clone()
         };
-        let backend_kinds = [
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Kiro,
-            BackendKind::Antigravity,
-            BackendKind::Hermes,
-            BackendKind::Grok,
-            BackendKind::Opencode,
-            BackendKind::Muse,
-        ];
         let mut snapshot = SelfImprovementState {
-            analyzers: backend_kinds
-                .into_iter()
-                .map(|backend_kind| LearningAnalyzerOption {
-                    backend_kind,
-                    capability: LearningAnalyzerCapability::TextAnalysis,
-                })
-                .collect(),
-            changes: vec![change, dismissed_update],
+            changes: vec![proposal, second],
             ..Default::default()
         };
-        let stream = state.host_streams.get_untracked()[host].clone();
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                0,
-                &snapshot,
+        let publish = |snapshot: &SelfImprovementState| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                host,
+                protocol::Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::SelfImprovementNotify,
+                    next_seq(),
+                    snapshot,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
-        next_tick().await;
+        };
         composer.focus().unwrap();
-        let tray = chat
-            .query_selector("details.learning-tray")
-            .unwrap()
-            .expect("Chat exposes the canonical suggestions")
-            .dyn_into::<web_sys::HtmlDetailsElement>()
-            .unwrap();
         assert!(
-            !tray.open(),
-            "Suggestions never interrupt typing by opening themselves"
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(composer.unchecked_ref())),
+            "Focus preservation requires the composer to be focused before proposal delivery"
         );
+        publish(&snapshot);
+        next_tick().await;
         assert!(
-            chat.query_selector("textarea.chat-textarea")
-                .unwrap()
-                .unwrap()
-                .is_same_node(Some(composer.unchecked_ref()))
+            !state.sidebar_layout.get_untracked().current().right.visible,
+            "Proposals respect manual hiding"
         );
-        assert_eq!(composer.value(), "Keep this unsent draft");
         assert!(
             document
                 .active_element()
                 .unwrap()
                 .is_same_node(Some(composer.unchecked_ref()))
         );
-        tray.set_open(true);
-        next_tick().await;
+        assert_eq!(composer.value(), "Keep this unsent draft");
         assert!(
-            tray.text_content()
-                .unwrap()
-                .contains("Keep changes focused.")
+            settings.query_selector("article").unwrap().is_none(),
+            "Settings no longer duplicates suggestions"
         );
-        let tray_article = tray
-            .query_selector("article")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        find_button_by_text(&tray_article, "Edit").unwrap().click();
-        next_tick().await;
-        let editor = tray_article
-            .query_selector("textarea")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlTextAreaElement>()
-            .unwrap();
-        editor.set_value("Preserve this suggestion draft too");
-        editor
-            .dispatch_event(&web_sys::Event::new("input").unwrap())
-            .unwrap();
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                1,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
         assert!(
-            tray_article
-                .query_selector("textarea")
+            root.query_selector("#learning-chat article.learning-change")
                 .unwrap()
-                .unwrap()
-                .is_same_node(Some(editor.unchecked_ref()))
+                .is_none(),
+            "Chat has no inline suggestions"
         );
-        assert_eq!(editor.value(), "Preserve this suggestion draft too");
-        find_button_by_text(&tray_article, "Cancel")
-            .unwrap()
-            .click();
-        tray.set_open(false);
-        let backend_options = container
-            .query_selector_all("select[aria-label='Analyzer backend'] option")
-            .unwrap();
-        for backend_kind in backend_kinds {
-            let option = (0..backend_options.length())
-                .filter_map(|index| {
-                    backend_options
-                        .item(index)?
-                        .dyn_into::<HtmlOptionElement>()
-                        .ok()
-                })
-                .find(|option| option.value() == format!("{backend_kind:?}"))
-                .expect("every analyzer the server reports is listed");
-            assert!(
-                !option.disabled(),
-                "Every advertised text analyzer must be selectable"
-            );
-        }
-        let cards = container.query_selector_all("article").unwrap();
-        assert_eq!(cards.length(), 2, "One card per change in this scope");
-        let suggestion = cards.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
-        let suggestion_text = suggestion.text_content().unwrap();
-        for visible in [
-            "New rule",
-            "Focus",
-            "Keep changes focused.",
-            "Explicit durable feedback",
+        let cards = sidebar.query_selector_all("article").unwrap();
+        assert_eq!(cards.length(), 2);
+        let card = cards.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let text = sidebar.text_content().unwrap();
+        for value in [
+            "Update steering",
+            "Update review aspect",
+            "Run relevant checks.",
+            "Validate across real system boundaries.",
+            "Comments",
         ] {
             assert!(
-                suggestion_text.contains(visible),
-                "A suggestion shows {visible}"
+                text.contains(value),
+                "Missing visible proposal data: {value}"
             );
         }
-        assert_eq!(
-            suggestion
-                .query_selector("strong")
-                .unwrap()
-                .unwrap()
-                .text_content()
-                .unwrap(),
-            "focused"
-        );
-        assert_eq!(
-            suggestion
-                .query_selector("code")
-                .unwrap()
-                .unwrap()
-                .text_content()
-                .unwrap(),
-            "AGENTS.md"
-        );
-        assert_eq!(
-            suggestion
-                .query_selector("li")
-                .unwrap()
-                .unwrap()
-                .text_content()
-                .unwrap(),
-            "Read AGENTS.md first."
-        );
-        assert_eq!(
-            suggestion.query_selector_all("img").unwrap().length(),
-            0,
-            "Untrusted proposal formatting must not install auto-fetching images"
-        );
-        assert!(suggestion.text_content().unwrap().contains("Reference"));
-        let origin = suggestion
-            .query_selector("details p")
+        assert!(!text.contains("Private raw feedback"));
+        assert!(text.contains("![untrusted](https://example.invalid/diff.png)"));
+        assert!(text.contains("<img src='https://example.invalid/html.png'>"));
+        let rationale = card
+            .query_selector("details.learning-change-details")
             .unwrap()
             .unwrap()
-            .dyn_into::<HtmlElement>()
+            .dyn_into::<web_sys::HtmlDetailsElement>()
             .unwrap();
-        assert_eq!(
-            origin.text_content().unwrap(),
-            "For future work, keep changes focused."
-        );
-        let details = suggestion
+        rationale.set_open(true);
+        next_tick().await;
+        assert!(sidebar.query_selector("img").unwrap().is_none());
+        let diff = card
             .query_selector("details")
             .unwrap()
             .unwrap()
             .dyn_into::<web_sys::HtmlDetailsElement>()
             .unwrap();
-        let is_visible = |element: &HtmlElement| {
-            js_sys::Reflect::get(element, &JsValue::from_str("checkVisibility"))
-                .unwrap()
-                .dyn_into::<js_sys::Function>()
-                .unwrap()
-                .call0(element)
-                .unwrap()
-                .as_bool()
-                .unwrap()
-        };
-        // Provisioned Chrome keeps an 18px descendant layout box under closed
-        // details, while checkVisibility is false. Geometry is not visibility.
-        assert!(!details.open(), "Source feedback starts collapsed");
-        assert!(
-            !is_visible(&origin),
-            "Collapsed source feedback must not be rendered"
-        );
-        suggestion
-            .query_selector("summary")
+        assert!(diff.open());
+        card.query_selector("summary")
             .unwrap()
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap()
             .click();
         next_tick().await;
-        assert!(
-            details.open() && is_visible(&origin),
-            "Expanding source feedback renders it"
-        );
-        assert!(
-            origin.get_bounding_client_rect().height() > 0.0,
-            "Opening Details reveals the source message"
-        );
-        let history = cards.item(1).unwrap().text_content().unwrap();
-        assert!(
-            history.contains("Update Explain non-obvious code")
-                && history.contains("Dismissed")
-                && history.contains("tuning constants"),
-            "An update names the rule it changes"
-        );
-        assert!(!history.contains("New rule"));
-        assert!(
-            state
-                .steering
-                .get_untracked()
-                .get(host)
-                .is_none_or(|rules| rules.is_empty()),
-            "Rendering a suggestion cannot write canonical rules"
-        );
-        find_button_by_text(&container, "Edit").unwrap().click();
+        assert!(!diff.open());
+        find_button_by_text(&card, "Edit").unwrap().click();
         next_tick().await;
         assert!(
-            find_button_by_text(&container, "Apply").is_none(),
-            "Editing a suggestion is separate from applying it"
+            find_button_by_text(&card, "Save")
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+                .disabled(),
+            "Unchanged edits must not pretend to receive a server acknowledgement"
         );
-        let content = container
-            .query_selector("textarea[aria-label='Suggestion text']")
+        let editor = card
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        editor.set_value("Retain my draft across views");
+        dispatch_event_from_js(editor.unchecked_ref(), "input", None);
+        publish(&snapshot);
+        state.selected_host_id.set(Some("another-host".into()));
+        next_tick().await;
+        assert_eq!(editor.value(), "Retain my draft across views");
+        let before_calls = calls.length();
+        find_button_by_text(&card, "Save").unwrap().click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            before_calls,
+            "Stale scope must not send an action"
+        );
+        state.selected_host_id.set(Some(host.into()));
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.into(),
+                project_id: ProjectId("other-project".into()),
+            }));
+        next_tick().await;
+        state.active_project.set(None);
+        next_tick().await;
+        assert!(
+            card.query_selector("textarea")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(editor.unchecked_ref()))
+        );
+        find_button_by_text(&card, "Cancel").unwrap().click();
+        next_tick().await;
+        find_button_by_text(&card, "Edit").unwrap().click();
+        next_tick().await;
+        let editor = card
+            .query_selector("textarea")
             .unwrap()
             .unwrap()
             .dyn_into::<web_sys::HtmlTextAreaElement>()
             .unwrap();
         assert_eq!(
-            content.value(),
-            "Keep changes **focused**.\n\n- Read `AGENTS.md` first.\n\n![Reference](https://example.invalid/proposal-tracking)"
+            editor.value(),
+            "Retain my draft across views",
+            "Cancel does not silently discard a draft"
         );
-        content.set_value("Keep changes focused and report limitations.");
-        content
-            .dispatch_event(
-                &web_sys::Event::new_with_event_init_dict("input", &event_init).unwrap(),
-            )
-            .unwrap();
-        let title = container
-            .query_selector("input[aria-label='Suggestion title']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlInputElement>()
-            .unwrap();
-        title.set_value("");
-        dispatch_event_from_js(title.unchecked_ref(), "input", None);
+        find_button_by_text(&card, "Save").unwrap().click();
         next_tick().await;
-        find_button_by_text(&container, "Save").unwrap().click();
-        next_tick().await;
-        snapshot.error = Some("Suggestion title cannot be empty".into());
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                2,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
-        let retained = container
-            .query_selector("textarea[aria-label='Suggestion text']")
-            .unwrap()
-            .unwrap();
-        assert!(
-            retained.is_same_node(Some(content.unchecked_ref())),
-            "A rejected edit retains its editor"
-        );
-        assert_eq!(
-            content.value(),
-            "Keep changes focused and report limitations."
-        );
-        assert!(
-            find_button_by_text(&container, "Apply").is_none(),
-            "A rejected edit cannot expose Apply for stale text"
-        );
-        title.set_value("Focus");
-        dispatch_event_from_js(title.unchecked_ref(), "input", None);
-        next_tick().await;
-        find_button_by_text(&container, "Save").unwrap().click();
-        next_tick().await;
-        assert!(
-            find_button_by_text(&container, "Apply").is_none(),
-            "Transport success is not canonical edit acceptance"
-        );
-        title.set_value("Clear changes");
-        dispatch_event_from_js(title.unchecked_ref(), "input", None);
-        content.set_value("Keep changes focused and report limitations and uncertainties.");
-        dispatch_event_from_js(content.unchecked_ref(), "input", None);
-        next_tick().await;
-        let LearningRule::Steering { steering } = &mut snapshot.changes[0].operation.after else {
-            unreachable!()
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 1);
+        let first_edit_id = match &sent[0] {
+            protocol::SelfImprovementAction::Edit {
+                id,
+                request_id,
+                expected,
+                after,
+                reason,
+            } => {
+                assert_eq!(id, &snapshot.changes[0].id);
+                assert_eq!(expected.as_ref(), &snapshot.changes[0].operation);
+                assert!(!request_id.0.is_empty());
+                let LearningRule::Steering { steering } = after else {
+                    panic!("Wrong edited rule type");
+                };
+                assert_eq!(steering.title, "Validation");
+                assert_eq!(steering.content, "Retain my draft across views");
+                assert_eq!(reason, &snapshot.changes[0].operation.reason);
+                request_id.clone()
+            }
+            _ => panic!("Save must send Edit"),
         };
-        steering.content = "Keep changes focused and report limitations.".into();
-        snapshot.error = None;
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                3,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
         assert!(
-            container
-                .query_selector("textarea[aria-label='Suggestion text']")
-                .unwrap()
-                .is_some_and(|retained| retained.is_same_node(Some(content.unchecked_ref()))),
-            "Acknowledging an earlier save must retain the newer draft"
+            find_button_by_text(&card, "Accept").is_none(),
+            "Send success is not an accepted edit"
         );
-        assert_eq!(title.value(), "Clear changes");
-        assert_eq!(
-            content.value(),
-            "Keep changes focused and report limitations and uncertainties."
-        );
-        assert!(find_button_by_text(&container, "Apply").is_none());
-        find_button_by_text(&container, "Save").unwrap().click();
-        next_tick().await;
-        let LearningRule::Steering { steering } = &mut snapshot.changes[0].operation.after else {
-            unreachable!()
+        let mut rejection = protocol::CommandErrorPayload {
+            workbench_reason: None,
+            context: Some(protocol::CommandErrorContext::SelfImprovementChange {
+                id: snapshot.changes[0].id.clone(),
+            }),
+            request_id: Some(first_edit_id.0.clone()),
+            stream: stream.clone(),
+            request_kind: FrameKind::SelfImprovementAction,
+            operation: "self_improvement_action".into(),
+            code: protocol::CommandErrorCode::Conflict,
+            message: "Edit rejected by host".into(),
+            fatal: false,
         };
-        steering.title = title.value();
-        steering.content = content.value();
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                4,
-                &snapshot,
+        let reject = |rejection: &protocol::CommandErrorPayload| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                host,
+                protocol::Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::CommandError,
+                    next_seq(),
+                    rejection,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
-        next_tick().await;
-        find_button_by_text(&container, "Apply").unwrap().click();
-        next_tick().await;
-        let actions = calls
-            .iter()
-            .filter_map(|entry| {
-                let entry = entry.dyn_into::<js_sys::Array>().ok()?;
-                if entry.get(0).as_string()?.as_str() != "send_host_line" {
-                    return None;
-                }
-                let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
-                let envelope: protocol::Envelope =
-                    serde_json::from_str(args["line"].as_str()?).ok()?;
-                (envelope.kind == FrameKind::SelfImprovementAction).then(|| {
-                    envelope
-                        .parse_payload::<protocol::SelfImprovementAction>()
-                        .unwrap()
-                })
-            })
-            .collect::<Vec<_>>();
-        assert!(actions.iter().any(|action| matches!(action, protocol::SelfImprovementAction::Edit { after: LearningRule::Steering { steering }, .. } if steering.content.contains("limitations"))));
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, protocol::SelfImprovementAction::Apply { .. }))
-        );
-        let dirty_draft = |surface: &HtmlElement, text: &str| {
-            let draft = surface
-                .query_selector("textarea[aria-label='Suggestion text']")
-                .unwrap()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlTextAreaElement>()
-                .unwrap();
-            draft.set_value(text);
-            dispatch_event_from_js(draft.unchecked_ref(), "input", None);
-            draft
         };
-        find_button_by_text(&chat, "Edit").unwrap().click();
-        find_button_by_text(&container, "Edit").unwrap().click();
+        reject(&rejection);
         next_tick().await;
-        let chat_draft = chat
-            .query_selector("textarea[aria-label='Suggestion text']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlTextAreaElement>()
-            .unwrap();
-        let settings_draft = container
-            .query_selector("textarea[aria-label='Suggestion text']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlTextAreaElement>()
-            .unwrap();
-        chat_draft.set_value("Keep the unsaved chat policy");
-        settings_draft.set_value("Keep the unsaved settings policy");
-        dispatch_event_from_js(chat_draft.unchecked_ref(), "input", None);
-        dispatch_event_from_js(settings_draft.unchecked_ref(), "input", None);
-        snapshot.changes[0].status = LearningChangeStatus::Applied;
-        snapshot.changes[0].applied_revision = Some(1);
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                5,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
-        assert!(find_button_by_text(&container, "Apply").is_none());
-        for (surface, draft, expected) in [
-            (&chat, &chat_draft, "Keep the unsaved chat policy"),
-            (
-                &container,
-                &settings_draft,
-                "Keep the unsaved settings policy",
-            ),
-        ] {
-            assert!(
-                surface
-                    .query_selector("textarea[aria-label='Suggestion text']")
-                    .unwrap()
-                    .unwrap()
-                    .is_same_node(Some(draft.unchecked_ref())),
-                "Settling a proposal retains its editor, including when the settings row moves to history"
-            );
-            assert_eq!(draft.value(), expected);
-            assert!(draft.read_only());
-            assert!(find_button_by_text(surface, "Copy draft").is_some());
-            assert!(find_button_by_text(surface, "Save").is_none());
-            find_button_by_text(surface, "Discard draft")
+        let second_card = cards.item(1).unwrap().dyn_into::<HtmlElement>().unwrap();
+        assert!(
+            card.text_content()
                 .unwrap()
-                .click();
-        }
-        next_tick().await;
-        tray.set_open(true);
-        next_tick().await;
-        assert!(find_button_by_text(&chat, "Apply").is_none());
-        assert!(
-            find_button_by_text(&chat, "Undo").is_some(),
-            "Chat and settings render the same applied state"
+                .contains("Edit rejected by host")
         );
-        assert_eq!(composer.value(), "Keep this unsent draft");
-        find_button_by_text(&chat, "Undo").unwrap().click();
-        next_tick().await;
-        snapshot.changes[0].status = LearningChangeStatus::Conflict {
-            reason: "A subsequent human edit is protected".into(),
-        };
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                6,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
         assert!(
-            container
+            !second_card
                 .text_content()
                 .unwrap()
-                .contains("A subsequent human edit is protected")
+                .contains("Edit rejected by host"),
+            "Failure belongs to the exact proposal, not the host"
         );
-        assert!(find_button_by_text(&container, "Undo").is_none());
-        let mut dismissing = snapshot.changes[0].clone();
-        dismissing.id = LearningChangeId("dom-dismiss-draft".into());
-        dismissing.operation.origin_id = HumanInputId("dom-dismiss-input".into());
-        if let LearningRule::Steering { steering } = &mut dismissing.operation.after {
-            steering.id = SteeringId("dom-dismiss-rule".into());
+        assert!(
+            root.query_selector("#learning-header [role='alert']")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(editor.value(), "Retain my draft across views");
+        if let LearningRule::Steering { steering } = &mut snapshot.changes[0].operation.after {
+            steering.content = editor.value();
         }
-        dismissing.status = LearningChangeStatus::Pending;
-        dismissing.applied_revision = None;
-        snapshot.changes.insert(0, dismissing);
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream.clone(),
-                FrameKind::SelfImprovementNotify,
-                7,
-                &snapshot,
-            )
-            .unwrap(),
+        snapshot.changes[0].last_edit_id = Some(protocol::LearningEditId("another-client".into()));
+        publish(&snapshot);
+        next_tick().await;
+        assert!(
+            card.query_selector("textarea")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(editor.unchecked_ref())),
+            "Coincident other-client text is not acknowledgment of this edit"
         );
-        next_tick().await;
-        find_button_by_text(&chat, "Edit").unwrap().click();
-        find_button_by_text(&container, "Edit").unwrap().click();
-        next_tick().await;
-        let chat_draft = dirty_draft(&chat, "Keep draft after dismissal");
-        let settings_draft = dirty_draft(&container, "Keep settings draft after dismissal");
-        next_tick().await;
-        snapshot.changes[0].status = LearningChangeStatus::Dismissed;
-        crate::dispatch::dispatch_envelope(
-            &state,
-            host,
-            protocol::Envelope::from_payload(
-                stream,
-                FrameKind::SelfImprovementNotify,
-                8,
-                &snapshot,
-            )
-            .unwrap(),
-        );
-        next_tick().await;
-        for (surface, draft, expected) in [
-            (&chat, &chat_draft, "Keep draft after dismissal"),
-            (
-                &container,
-                &settings_draft,
-                "Keep settings draft after dismissal",
-            ),
-        ] {
-            assert!(
-                surface
-                    .query_selector("textarea[aria-label='Suggestion text']")
-                    .unwrap()
-                    .unwrap()
-                    .is_same_node(Some(draft.unchecked_ref()))
-            );
-            assert_eq!(draft.value(), expected);
-            assert!(draft.read_only());
-            assert!(find_button_by_text(surface, "Copy draft").is_some());
-            assert!(find_button_by_text(surface, "Save").is_none());
+        if let LearningRule::Steering { steering } = &mut snapshot.changes[0].operation.after {
+            steering.content = "New host proposal".into();
         }
+        publish(&snapshot);
+        next_tick().await;
+        assert!(card.text_content().unwrap().contains("Latest proposal"));
+        assert!(card.text_content().unwrap().contains("New host proposal"));
+        assert_eq!(editor.value(), "Retain my draft across views");
+        assert!(
+            find_button_by_text(&card, "Save")
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+                .disabled()
+        );
+        find_button_by_text(&card, "Keep my edit").unwrap().click();
+        next_tick().await;
+        assert_eq!(editor.value(), "Retain my draft across views");
+        find_button_by_text(&card, "Save").unwrap().click();
+        next_tick().await;
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 2);
+        let own_edit_id = match &sent[1] {
+            protocol::SelfImprovementAction::Edit {
+                id,
+                request_id,
+                expected,
+                after,
+                ..
+            } => {
+                assert_eq!(id, &snapshot.changes[0].id);
+                assert_ne!(request_id, &first_edit_id);
+                assert_eq!(
+                    expected.as_ref(),
+                    &snapshot.changes[0].operation,
+                    "Explicit adoption sends the latest CAS baseline"
+                );
+                let LearningRule::Steering { steering } = after else {
+                    panic!("wrong type");
+                };
+                assert_eq!(steering.content, editor.value());
+                request_id.clone()
+            }
+            _ => panic!("Save sends a new typed CAS edit"),
+        };
+        reject(&rejection);
+        next_tick().await;
+        assert!(
+            !card
+                .text_content()
+                .unwrap()
+                .contains("Edit rejected by host"),
+            "Delayed earlier rejection must not be attributed to a newer edit"
+        );
+        rejection.request_id = Some(own_edit_id.0.clone());
+        rejection.message = "Current edit rejected".into();
+        reject(&rejection);
+        next_tick().await;
+        assert!(
+            card.text_content()
+                .unwrap()
+                .contains("Current edit rejected")
+        );
+        assert_eq!(editor.value(), "Retain my draft across views");
+        if let LearningRule::Steering { steering } = &mut snapshot.changes[0].operation.after {
+            steering.content = editor.value();
+        }
+        snapshot.changes[0].last_edit_id = Some(own_edit_id);
+        publish(&snapshot);
+        next_tick().await;
+        find_button_by_text(&card, "Accept").unwrap().click();
+        next_tick().await;
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 3);
+        assert!(
+            matches!(&sent[2], protocol::SelfImprovementAction::Apply { id } if id == &snapshot.changes[0].id)
+        );
+        assert!(
+            card.text_content().unwrap().contains("Accept"),
+            "Transport does not fabricate applied history"
+        );
+        snapshot.changes[0].status = LearningChangeStatus::Applied;
+        snapshot.changes[0].applied_revision = Some(1);
+        publish(&snapshot);
+        next_tick().await;
+        let history_tab = sidebar
+            .query_selector("[role='tab']:last-child")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        history_tab.click();
+        next_tick().await;
+        find_button_by_text(&card, "Undo").unwrap().click();
+        next_tick().await;
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 4);
+        assert!(
+            matches!(&sent[3], protocol::SelfImprovementAction::Undo { id } if id == &snapshot.changes[0].id)
+        );
+        snapshot.changes[0].status = LearningChangeStatus::Conflict {
+            reason: "A newer human edit is protected".into(),
+        };
+        publish(&snapshot);
+        next_tick().await;
+        assert!(
+            card.get_bounding_client_rect().height() > 0.0,
+            "Failed Undo stays visible in History"
+        );
+        assert!(
+            card.text_content()
+                .unwrap()
+                .contains("A newer human edit is protected")
+        );
+        assert!(find_button_by_text(&card, "Undo").is_none());
+        let conflict = card.query_selector("[role='alert']").unwrap().unwrap();
+        assert!(
+            conflict
+                .text_content()
+                .unwrap()
+                .contains("A newer human edit is protected")
+        );
+        let conflict_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&conflict)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            conflict_style
+                .get_property_value("border-top-style")
+                .unwrap(),
+            "none",
+            "Typed conflicts use the same visible error border as rejected actions"
+        );
+        assert_eq!(
+            sidebar
+                .text_content()
+                .unwrap()
+                .matches("A newer human edit is protected")
+                .count(),
+            1,
+            "Typed proposal conflicts own their error, not a duplicate host line"
+        );
+        let second_card = cards.item(1).unwrap().dyn_into::<HtmlElement>().unwrap();
+        sidebar
+            .query_selector("[role='tab']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        state.host_streams.update(|streams| {
+            streams.remove(host);
+        });
+        find_button_by_text(&second_card, "Accept").unwrap().click();
+        next_tick().await;
+        assert!(
+            second_card
+                .text_content()
+                .unwrap()
+                .contains("host is disconnected")
+        );
+        state.host_streams.update(|streams| {
+            streams.insert(host.into(), stream.clone());
+        });
+        find_button_by_text(&second_card, "Dismiss")
+            .unwrap()
+            .click();
+        next_tick().await;
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 5);
+        assert!(
+            matches!(&sent[4], protocol::SelfImprovementAction::Dismiss { id } if id == &snapshot.changes[1].id)
+        );
+        assert!(
+            find_button_by_text(&second_card, "Dismiss").is_some(),
+            "No optimistic dismissal"
+        );
+        snapshot.changes[1].status = LearningChangeStatus::Dismissed;
+        publish(&snapshot);
+        next_tick().await;
+        history_tab.click();
+        next_tick().await;
+        assert!(second_card.text_content().unwrap().contains("Dismissed"));
+        find_button_by_text(&second_card, "Restore")
+            .unwrap()
+            .click();
+        next_tick().await;
+        crate::send::settle_stream(host, &stream).await;
+        let sent = actions();
+        assert_eq!(sent.len(), 6);
+        assert!(
+            matches!(&sent[5], protocol::SelfImprovementAction::Restore { id } if id == &snapshot.changes[1].id)
+        );
+        assert!(
+            second_card.text_content().unwrap().contains("Dismissed"),
+            "Restore transport does not fabricate Pending"
+        );
+        snapshot.changes[1].status = LearningChangeStatus::Pending;
+        snapshot.changes[1].last_edit_id = None;
+        publish(&snapshot);
+        next_tick().await;
+        assert_eq!(
+            second_card.get_bounding_client_rect().height(),
+            0.0,
+            "Canonical Pending leaves History"
+        );
+        sidebar
+            .query_selector("[role='tab']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(find_button_by_text(&second_card, "Accept").is_some());
+        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+        state.toggle_sidebar(crate::state::SidebarSide::Right);
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |bootstrap| {
+            bootstrap.self_improvement = snapshot.clone();
+            bootstrap.settings.self_improvement.host.enabled = true;
+        });
+        next_tick().await;
+        assert!(
+            !state.sidebar_layout.get_untracked().current().right.visible,
+            "Reconnect bootstrap cannot reopen a manually hidden dock"
+        );
+        let rect = sidebar.get_bounding_client_rect();
+        for selector in ["select", "article", "textarea"] {
+            let elements = sidebar.query_selector_all(selector).unwrap();
+            for i in 0..elements.length() {
+                let el = elements
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap();
+                let child = el.get_bounding_client_rect();
+                if child.width() > 0.0 {
+                    assert!(
+                        child.right() <= rect.right() + 1.0,
+                        "Proposal UI must fit a narrow pane"
+                    );
+                }
+            }
+        }
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.into(),
+                project_id: ProjectId("active-chat-project".into()),
+            }));
+        next_tick().await;
+        let sidebar_scope = sidebar
+            .query_selector("select[aria-label='Suggestions scope']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        sidebar_scope.set_value("");
+        dispatch_event_from_js(sidebar_scope.unchecked_ref(), "change", None);
+        next_tick().await;
+        sidebar
+            .query_selector("[aria-label='Self-improvement settings']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            select.value(),
+            "host",
+            "The gear preserves the dock's host-wide scope instead of configuring the active chat project"
+        );
+        assert_eq!(
+            state.active_project.get_untracked().unwrap().project_id.0,
+            "active-chat-project",
+            "Opening scoped Settings must not navigate the chat"
+        );
+        assert_eq!(composer.value(), "Keep this unsent draft");
         drop(handle);
         root.remove();
         style.remove();
+        crate::components::header::reset_user_notice_for_tests();
     }
 }

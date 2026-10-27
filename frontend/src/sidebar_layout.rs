@@ -48,10 +48,11 @@ pub enum SidebarTab {
     Swarms,
     Workflows,
     Terminal,
+    SelfImprovement,
 }
 
 impl SidebarTab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Agents,
         Self::Sessions,
         Self::Files,
@@ -61,6 +62,7 @@ impl SidebarTab {
         Self::Swarms,
         Self::Workflows,
         Self::Terminal,
+        Self::SelfImprovement,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -73,10 +75,12 @@ impl SidebarTab {
             Self::Swarms => "Swarms",
             Self::Workflows => "Workflows",
             Self::Terminal => "Terminal",
+            Self::SelfImprovement => "Self-improvement",
         }
     }
     pub fn default_side(self) -> SidebarSide {
         match self {
+            Self::SelfImprovement => SidebarSide::Right,
             Self::Terminal => SidebarSide::Bottom,
             Self::Files | Self::Git | Self::Search | Self::References => SidebarSide::Left,
             Self::Agents | Self::Sessions | Self::Swarms | Self::Workflows => SidebarSide::Right,
@@ -127,7 +131,9 @@ impl SidebarLayout {
         let right_tabs = if mode == InterfaceMode::Dinosaur {
             SidebarTab::ALL
                 .into_iter()
-                .filter(|tab| tab.default_side() == SidebarSide::Right)
+                .filter(|tab| {
+                    tab.default_side() == SidebarSide::Right && *tab != SidebarTab::SelfImprovement
+                })
                 .collect()
         } else {
             vec![]
@@ -157,6 +163,19 @@ impl SidebarLayout {
             SidebarSide::Left => &self.left,
             SidebarSide::Right => &self.right,
             SidebarSide::Bottom => &self.bottom,
+        }
+    }
+    fn fit_self_improvement_dock(&mut self, opened: SidebarSide, width: f64) {
+        if !(0.0 < width && width <= 700.0)
+            || !self.right.visible
+            || self.right.active != Some(SidebarTab::SelfImprovement)
+        {
+            return;
+        }
+        for side in [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom] {
+            if side != opened {
+                self.pane_mut(side).visible = false;
+            }
         }
     }
     pub fn pane_mut(&mut self, side: SidebarSide) -> &mut SidebarPane {
@@ -303,10 +322,46 @@ fn migrate_legacy_sidebar(storage: &web_sys::Storage) -> Result<Option<ClientLay
 }
 
 impl AppState {
+    fn self_improvement_visible(&self) -> bool {
+        self.sidebar_layout.with_untracked(|layouts| {
+            let layout = layouts.current();
+            layout
+                .side(SidebarTab::SelfImprovement)
+                .is_some_and(|side| {
+                    let pane = layout.pane(side);
+                    pane.visible && pane.active == Some(SidebarTab::SelfImprovement)
+                })
+        })
+    }
+    fn cancel_self_improvement_open_after_hide(&self, was_visible: bool) {
+        if was_visible && !self.self_improvement_visible() {
+            self.self_improvement_open_after_write.set(None);
+        }
+    }
+    pub fn fit_self_improvement_dock(&self, width: f64) {
+        self.sidebar_workbench_width.set(width);
+        if self.sidebar_storage_blocked.get_untracked() || !(0.0 < width && width <= 700.0) {
+            return;
+        }
+        if !self.sidebar_layout.with_untracked(|layouts| {
+            let layout = layouts.current();
+            layout.right.visible
+                && layout.right.active == Some(SidebarTab::SelfImprovement)
+                && (layout.left.visible || layout.bottom.visible)
+        }) {
+            return;
+        }
+        self.sidebar_layout.update(|layouts| {
+            layouts
+                .current_mut()
+                .fit_self_improvement_dock(SidebarSide::Right, width);
+        });
+    }
     pub fn activate_sidebar_tab(&self, tab: SidebarTab) {
         if self.sidebar_storage_blocked.get_untracked() {
             return;
         }
+        let was_visible = self.self_improvement_visible();
         self.sidebar_layout.update(|layouts| {
             let side = match layouts.current().side(tab) {
                 Some(side) => side,
@@ -326,20 +381,30 @@ impl AppState {
                 pane.active = Some(tab);
                 pane.visible = true;
             }
+            layouts
+                .current_mut()
+                .fit_self_improvement_dock(side, self.sidebar_workbench_width.get_untracked());
         });
+        self.cancel_self_improvement_open_after_hide(was_visible);
     }
     pub fn toggle_sidebar_tab(&self, tab: SidebarTab, side: SidebarSide) {
         if self.sidebar_storage_blocked.get_untracked() {
             return;
         }
+        let was_visible = self.self_improvement_visible();
         self.sidebar_layout.update(|layouts| {
             let layout = layouts.current_mut();
             match layout.side(tab) {
                 Some(current) => {
+                    if tab == SidebarTab::SelfImprovement {
+                        self.self_improvement_open_after_write.set(None);
+                    }
                     let pane = layout.pane_mut(current);
                     pane.tabs.retain(|item| *item != tab);
                     if pane.tabs.is_empty() {
                         pane.active = None;
+                    } else if tab == SidebarTab::SelfImprovement && pane.active == Some(tab) {
+                        pane.active = pane.tabs.first().copied();
                     }
                 }
                 None => {
@@ -355,25 +420,43 @@ impl AppState {
                         pane.active = Some(tab);
                     }
                     pane.visible = true;
+                    layout.fit_self_improvement_dock(
+                        side,
+                        self.sidebar_workbench_width.get_untracked(),
+                    );
                 }
             }
         });
+        self.cancel_self_improvement_open_after_hide(was_visible);
     }
     pub fn toggle_sidebar(&self, side: SidebarSide) {
         if self.sidebar_storage_blocked.get_untracked() {
             return;
         }
+        let was_visible = self.self_improvement_visible();
         self.sidebar_layout.update(|layouts| {
             let pane = layouts.current_mut().pane_mut(side);
             pane.visible = !pane.visible;
+            if pane.visible {
+                layouts
+                    .current_mut()
+                    .fit_self_improvement_dock(side, self.sidebar_workbench_width.get_untracked());
+            }
         });
+        self.cancel_self_improvement_open_after_hide(was_visible);
     }
     pub fn move_sidebar_tab(&self, tab: SidebarTab, side: SidebarSide, before: Option<SidebarTab>) {
         if self.sidebar_storage_blocked.get_untracked() {
             return;
         }
-        self.sidebar_layout
-            .update(|layouts| layouts.current_mut().move_tab(tab, side, before));
+        let was_visible = self.self_improvement_visible();
+        self.sidebar_layout.update(|layouts| {
+            layouts.current_mut().move_tab(tab, side, before);
+            layouts
+                .current_mut()
+                .fit_self_improvement_dock(side, self.sidebar_workbench_width.get_untracked());
+        });
+        self.cancel_self_improvement_open_after_hide(was_visible);
     }
     #[cfg(target_arch = "wasm32")]
     pub fn install_sidebar_persistence(&self) {

@@ -110,23 +110,32 @@ test("installed storage migrates once, then follows exact targets without losing
   try {
     // Use the pinned pipe transport: ChromeDriver's two-family port=0 bind
     // can select an IPv6 port already occupied by an unrelated IPv4 listener.
+    console.info("loader browser phase: launch");
     browser = await chromium.launch({
       executablePath: process.env.CHROME,
       headless: true,
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
       timeout: 0,
     });
+    console.info("loader browser phase: launched");
     const page = await browser.newPage();
+    console.info("loader browser phase: page created");
     page.setDefaultTimeout(0);
     page.setDefaultNavigationTimeout(0);
-    const evaluate = script => page.evaluate(`(function(){${script}})()`);
-    const evaluateAsync = script => page.evaluate(`new Promise(resolve => { (function(){${script}})(resolve); })`);
-    const navigate = path => page.goto(origin + path, {waitUntil: "load"});
-    // Repair and host-switch commits reload the page; Playwright re-runs this
-    // predicate in each replacement document until the boot renders the text.
-    const waitFor = text => page.waitForFunction(
+    let command = 0;
+    const run = async (kind, operation) => {
+      const id = ++command;
+      console.info(`loader browser command ${id}: ${kind} start`);
+      const result = await operation();
+      console.info(`loader browser command ${id}: ${kind} complete`);
+      return result;
+    };
+    const evaluate = script => run("evaluate", () => page.evaluate(`(function(){${script}})()`));
+    const evaluateAsync = script => run("async storage/worker", () => page.evaluate(`new Promise(resolve => { (function(){${script}})(resolve); })`));
+    const navigate = path => run("navigate", () => page.goto(origin + path, {waitUntil: "load"}));
+    const waitFor = text => run("rendered state", () => page.waitForFunction(
       expected => document.body !== null && document.body.textContent.includes(expected), text,
-    ).then(handle => handle.jsonValue());
+    ).then(handle => handle.jsonValue()));
     await navigate("/setup");
     assert.deepEqual(await evaluate("return [location.origin,location.pathname,document.title];"),
       [origin,"/setup","Loader storage setup"],"storage setup must execute in the fixture document");

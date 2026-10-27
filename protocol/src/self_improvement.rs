@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct HumanInputId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct LearningChangeId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct LearningEditId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanInputSource {
@@ -140,6 +142,8 @@ pub struct LearningChange {
     pub requires_approval: bool,
     pub expected_revision: u64,
     pub applied_revision: Option<u64>,
+    #[serde(default)]
+    pub last_edit_id: Option<LearningEditId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -185,6 +189,8 @@ pub enum SelfImprovementAction {
     },
     Edit {
         id: LearningChangeId,
+        request_id: LearningEditId,
+        expected: Box<LearningOperation>,
         after: LearningRule,
         reason: String,
     },
@@ -194,6 +200,20 @@ pub enum SelfImprovementAction {
     Undo {
         id: LearningChangeId,
     },
+    Restore {
+        id: LearningChangeId,
+    },
+}
+impl SelfImprovementAction {
+    pub fn id(&self) -> &LearningChangeId {
+        match self {
+            Self::Apply { id }
+            | Self::Edit { id, .. }
+            | Self::Dismiss { id }
+            | Self::Undo { id }
+            | Self::Restore { id } => id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

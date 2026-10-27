@@ -90,6 +90,45 @@ pub fn Workbench() -> impl IntoView {
     let workbench_ref = NodeRef::<leptos::html::Div>::new();
     on_cleanup(clear_drag_window_listeners);
 
+    type SizeObserver = Option<(web_sys::ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>;
+    let size_observer: StoredValue<SizeObserver, LocalStorage> = StoredValue::new_local(None);
+    let sizing_state = state.clone();
+    Effect::new(move |_| {
+        let Some(workbench) = workbench_ref.get() else {
+            return;
+        };
+        let element: web_sys::HtmlElement = (*workbench).clone().unchecked_into();
+        let state = sizing_state.clone();
+        state.fit_self_improvement_dock(element.get_bounding_client_rect().width());
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |_| {
+            state.fit_self_improvement_dock(element.get_bounding_client_rect().width());
+        });
+        match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => {
+                observer.observe(workbench.unchecked_ref());
+                size_observer.set_value(Some((observer, callback)));
+            }
+            Err(error) => crate::components::header::report_user_error(format!(
+                "Cannot observe sidebar layout: {error:?}"
+            )),
+        }
+    });
+    let interface_mode = Memo::new(move |_| layouts.with(|layouts| layouts.mode));
+    let mode_state = state.clone();
+    Effect::new(move |_| {
+        let mode = interface_mode.get();
+        let width = mode_state.sidebar_workbench_width.get_untracked();
+        log::debug!("Self-improvement dock layout activation mode={mode:?} width={width}");
+        mode_state.fit_self_improvement_dock(width);
+    });
+    on_cleanup(move || {
+        size_observer.update_value(|slot| {
+            if let Some((observer, _)) = slot.take() {
+                observer.disconnect();
+            }
+        })
+    });
+
     // Global mousemove + mouseup for drag
     Effect::new(move |_| {
         clear_drag_window_listeners();
@@ -263,7 +302,8 @@ pub fn Workbench() -> impl IntoView {
 
     view! {
         <div class="workbench" node_ref=workbench_ref>
-            <div class="workbench-main sidebar-workspace" style=grid_style>
+            <div class="workbench-main sidebar-workspace" style=grid_style
+                class:learning-sidebar-open=move || right_visible() && layouts.with(|l| l.current().right.active == Some(crate::state::SidebarTab::SelfImprovement))>
                 <div class="sidebar-bar sidebar-bar-left" node_ref=left_bar_ref
                     class:sidebar-empty-drop-target=move || !left_visible() && tab_drag.get().is_some()
                     style=move || if left_visible() || (!layout_blocked.get() && tab_drag.get().is_some()) { "" } else { "display:none" }><DockZone position=SidebarSide::Left /></div>
@@ -395,6 +435,106 @@ mod wasm_tests {
             true,
         );
         let handle = shell(&container, state.clone());
+        tick().await;
+        let original_layout = state.sidebar_layout.get_untracked();
+        state.activate_sidebar_tab(SidebarTab::SelfImprovement);
+        let workbench = element(&container, ".workbench");
+        // flex: 1 1 0% ignores a preferred width; constrain the real container.
+        workbench
+            .style()
+            .set_property("max-width", "390px")
+            .unwrap();
+        for appearance in crate::appearance::ChatAppearance::ALL {
+            state.chat_appearance.set(appearance);
+            tick().await;
+            assert!(
+                (380.0..=390.0).contains(&workbench.get_bounding_client_rect().width()),
+                "The narrow fixture must actually constrain its flex-grown workspace"
+            );
+            let center = element(&container, ".sidebar-center").get_bounding_client_rect();
+            let composer = element(&container, ".chat-textarea").get_bounding_client_rect();
+            let dock = element(&container, "[aria-label='Self-improvement panel']")
+                .get_bounding_client_rect();
+            assert!(
+                composer.height() > 0.0 && composer.bottom() <= center.bottom(),
+                "A docked narrow sidebar must keep the composer inside the visible center"
+            );
+            assert!(
+                dock.top() >= center.bottom()
+                    && dock.right() <= workbench.get_bounding_client_rect().right(),
+                "The narrow dock must stack below, never overlap or exceed the center"
+            );
+        }
+        assert!(!state.sidebar_layout.get_untracked().current().left.visible);
+        // Restore a wide saved mode while the window remains narrow.
+        mode(&container, "dinosaur").await;
+        tick().await;
+        state.sidebar_layout.update(|layouts| {
+            layouts.vibe.right.visible = true;
+            layouts.vibe.right.active = Some(SidebarTab::SelfImprovement);
+            layouts.vibe.left.visible = true;
+        });
+        mode(&container, "vibe").await;
+        tick().await;
+        assert!(state.sidebar_layout.get_untracked().current().right.visible);
+        assert!(
+            !state.sidebar_layout.get_untracked().current().left.visible,
+            "Activating a saved mode reconciles canonical compact panes without requiring resize"
+        );
+        let center = element(&container, ".sidebar-center").get_bounding_client_rect();
+        let dock =
+            element(&container, "[aria-label='Self-improvement panel']").get_bounding_client_rect();
+        assert!(dock.top() >= center.bottom());
+        element(&container, "[aria-label='Toggle Left Dock']").click();
+        tick().await;
+        assert!(state.sidebar_layout.get_untracked().current().left.visible);
+        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
+        assert!(
+            element(&container, "[aria-label='Agents panel']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+        element(&container, "[aria-label='Toggle Right Dock']").click();
+        tick().await;
+        state.activate_sidebar_tab(SidebarTab::Terminal);
+        tick().await;
+        assert!(
+            state
+                .sidebar_layout
+                .get_untracked()
+                .current()
+                .bottom
+                .visible
+        );
+        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
+        assert!(
+            element(&container, "[aria-label='Terminal panel']")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        state.activate_sidebar_tab(SidebarTab::SelfImprovement);
+        tick().await;
+        assert!(
+            !state
+                .sidebar_layout
+                .get_untracked()
+                .current()
+                .bottom
+                .visible
+        );
+        assert!(
+            element(&container, "[aria-label='Self-improvement panel']")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Current);
+        workbench.style().remove_property("max-width").unwrap();
+        state.sidebar_layout.set(original_layout);
         tick().await;
         assert!(
             container
@@ -1004,13 +1144,15 @@ mod wasm_tests {
             "End",
         );
         tick().await;
+        // The new visible last checklist item is Self-improvement. End must
+        // still focus the actual last item, not the former Terminal position.
         assert_eq!(
             document
                 .active_element()
                 .unwrap()
                 .get_attribute("aria-label")
                 .as_deref(),
-            Some("Terminal")
+            Some("Self-improvement")
         );
         press(
             &document

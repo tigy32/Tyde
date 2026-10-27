@@ -400,9 +400,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::SelfImprovementNotify => {
             match envelope.parse_payload::<protocol::SelfImprovementState>() {
-                Ok(payload) => state.self_improvement_by_host.update(|hosts| {
-                    hosts.insert(host_id.to_owned(), payload);
-                }),
+                Ok(payload) => {
+                    state.self_improvement_by_host.update(|hosts| {
+                        hosts.insert(host_id.to_owned(), payload);
+                    });
+                }
                 Err(error) => report_dispatch_error(
                     state,
                     host_id,
@@ -788,6 +790,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     let inline = state.native_settings_save_state.with_untracked(|states| states.get(host_id)
                         .is_some_and(|saves| saves.values().any(|save| matches!(save,
                             NativeSettingsSaveState::Pending { write_id, .. } if write_id == &payload.write_id))));
+                    apply_learning_settings_write_result(state, host_id, &payload);
                     apply_native_settings_write_result(state, host_id, &payload);
                     let message = payload
                         .field_errors
@@ -815,6 +818,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         &crate::notices::NoticeScope::Settings(Some(host_id.to_owned())),
                         FrameKind::SettingsWrite,
                     );
+                    apply_learning_settings_write_result(state, host_id, &payload);
                     apply_native_settings_write_result(state, host_id, &payload);
                 }
                 Err(error) => report_dispatch_error(
@@ -3303,6 +3307,26 @@ fn apply_swarm_draft_notify(
             entry.host_id != host_id || entry.error.draft_id.as_ref() != Some(&draft_id)
         })
     });
+}
+
+fn apply_learning_settings_write_result(
+    state: &AppState,
+    host_id: &str,
+    payload: &protocol::SettingsWriteResultPayload,
+) {
+    let pending = state.self_improvement_open_after_write.get_untracked();
+    if let Some((host, write_id, scope)) = pending
+        && host == host_id
+        && write_id == payload.write_id
+    {
+        state.self_improvement_open_after_write.set(None);
+        if payload.applied {
+            state
+                .self_improvement_scope_request
+                .set(Some((host, scope)));
+            state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+        }
+    }
 }
 
 fn apply_native_settings_write_result(

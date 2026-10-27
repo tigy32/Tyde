@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 91;
+pub const PROTOCOL_VERSION: u32 = 92;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -8920,6 +8920,9 @@ pub enum CommandErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandErrorContext {
+    SelfImprovementChange {
+        id: crate::LearningChangeId,
+    },
     ProjectMutation {
         mutation: ProjectMutation,
     },

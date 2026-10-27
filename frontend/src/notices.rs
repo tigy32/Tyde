@@ -17,6 +17,9 @@ pub enum NoticeScope {
     Browser,
     ProjectOperations(String),
     Workflows(String),
+    SelfImprovement(String),
+    SelfImprovementChange(String, protocol::LearningChangeId),
+    SelfImprovementEdit(String, protocol::LearningChangeId, protocol::LearningEditId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,6 +144,20 @@ pub fn clear_request(scope: &NoticeScope, operation: FrameKind) {
     });
 }
 
+pub fn clear_self_improvement_change(host: &str, id: &protocol::LearningChangeId) {
+    NOTICES.with(|notices| {
+        notices.update(|notices| {
+            notices.retain(|notice| match &notice.scope {
+                NoticeScope::SelfImprovementChange(owner, change)
+                | NoticeScope::SelfImprovementEdit(owner, change, _) => {
+                    owner != host || change != id
+                }
+                _ => true,
+            });
+        })
+    });
+}
+
 pub fn clear_host(host: &str) {
     NOTICES.with(|notices| {
         notices.update(|notices| {
@@ -151,7 +168,10 @@ pub fn clear_host(host: &str) {
                 | NoticeScope::Agent(owner, _)
                 | NoticeScope::Review(owner, _)
                 | NoticeScope::Terminal(owner, _)
-                | NoticeScope::Workflows(owner) => owner != host,
+                | NoticeScope::Workflows(owner)
+                | NoticeScope::SelfImprovement(owner)
+                | NoticeScope::SelfImprovementChange(owner, _)
+                | NoticeScope::SelfImprovementEdit(owner, _, _) => owner != host,
                 _ => true,
             })
         })
@@ -185,6 +205,7 @@ pub fn request_scope(host: &str, stream: &StreamPath, kind: FrameKind) -> Option
         return Some(NoticeScope::Browser);
     }
     match kind {
+        FrameKind::SelfImprovementAction => Some(NoticeScope::SelfImprovement(host.to_owned())),
         FrameKind::SettingsWrite
         | FrameKind::BackendNativeSettingsWrite
         | FrameKind::InvokeSettingsAction
@@ -226,6 +247,23 @@ pub fn request_scope(host: &str, stream: &StreamPath, kind: FrameKind) -> Option
 }
 
 pub fn report_command_error(state: &AppState, host: &str, error: &CommandErrorPayload) {
+    if let Some(protocol::CommandErrorContext::SelfImprovementChange { id }) = &error.context {
+        let scope = match &error.request_id {
+            Some(edit_id) => NoticeScope::SelfImprovementEdit(
+                host.to_owned(),
+                id.clone(),
+                protocol::LearningEditId(edit_id.clone()),
+            ),
+            None => NoticeScope::SelfImprovementChange(host.to_owned(), id.clone()),
+        };
+        report(
+            scope,
+            Some(error.request_kind),
+            NoticeSeverity::Error,
+            error.message.clone(),
+        );
+        return;
+    }
     let inline_diff = error.request_id.as_ref().is_some_and(|id| {
         state
             .diff_request_ids
