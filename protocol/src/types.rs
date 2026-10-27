@@ -2087,18 +2087,33 @@ pub enum AgentsSidebarProjectVisibility {
     AllProjects,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsSidebarPreferences {
     #[serde(default)]
     pub hide_empty_projects: bool,
     #[serde(default)]
     pub hide_inactive: bool,
+    /// Fresh stores and Reset hide sub-agents. A missing JSON field stays
+    /// false so an older file that omitted the key is not rewritten on upgrade.
+    /// An explicit saved value, including false, is always kept.
     #[serde(default)]
     pub hide_sub_agents: bool,
     #[serde(default)]
     pub show_workbenches: bool,
     #[serde(default)]
     pub project_visibility: AgentsSidebarProjectVisibility,
+}
+
+impl Default for AgentsSidebarPreferences {
+    fn default() -> Self {
+        Self {
+            hide_empty_projects: false,
+            hide_inactive: false,
+            hide_sub_agents: true,
+            show_workbenches: false,
+            project_visibility: AgentsSidebarProjectVisibility::ContextualDefault,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

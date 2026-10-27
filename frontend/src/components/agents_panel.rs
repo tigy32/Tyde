@@ -3862,6 +3862,10 @@ mod wasm_tests {
     }
 
     fn seed_sidebar_group_fixture(state: &AppState) {
+        // Nesting fixtures show children. The product default hides them.
+        state.agents_view_preferences.update(|snapshot| {
+            snapshot.sidebar.hide_sub_agents = false;
+        });
         state.configured_hosts.set(vec![
             configured_host("local", "Local Host"),
             configured_host("remote", "Remote Host"),
@@ -3921,7 +3925,10 @@ mod wasm_tests {
             "local",
             AgentsViewPreferencesSnapshot {
                 preferences: AgentsViewPreferences::default(),
-                sidebar: Default::default(),
+                sidebar: AgentsSidebarPreferences {
+                    hide_sub_agents: false,
+                    ..Default::default()
+                },
                 load_error: None,
                 smart_views: Default::default(),
                 tags: Default::default(),
@@ -9028,6 +9035,9 @@ mod wasm_tests {
     async fn forked_agent_renders_as_top_level_row() {
         let container = make_container();
         let state = make_app_state("h");
+        state.agents_view_preferences.update(|snapshot| {
+            snapshot.sidebar.hide_sub_agents = false;
+        });
         push_agent(&state, "h", "a-source", "Source", true);
         push_agent_with_scope(
             &state,
@@ -11086,7 +11096,11 @@ mod wasm_tests {
                 .is_some()
         };
 
+        assert!(!filter_enabled(&container, "Hide inactive"));
+        assert!(filter_enabled(&container, "Hide sub-agents"));
         assert!(filter_enabled(&container, "Show other projects"));
+        assert!(!filter_enabled(&container, "Show workbenches"));
+        assert!(!filter_enabled(&container, "Hide empty projects"));
         assert!(card_rendered("agent-abc") && card_rendered("agent-xyz"));
 
         agent_card_el(&container, "agent-abc").click();
@@ -11233,7 +11247,10 @@ mod wasm_tests {
     async fn sidebar_server_snapshot_overrides_overlay() {
         let _calls = install_send_stub_with_dialog_ok();
         let container = make_container();
-        let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        let state = primed_sidebar_state(AgentsSidebarPreferences {
+            hide_sub_agents: false,
+            ..Default::default()
+        });
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
 
@@ -12065,6 +12082,7 @@ mod wasm_tests {
         let group_id = AgentGroupId("custom-group".to_owned());
         let mut preferences = state.agents_view_preferences.get_untracked();
         preferences.sidebar.show_workbenches = true;
+        preferences.sidebar.hide_sub_agents = false;
         preferences
             .pins
             .pinned

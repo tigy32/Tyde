@@ -683,6 +683,23 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
 #[tokio::test]
 async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() {
     let mut fixture = Fixture::new().await;
+    let fresh = fixture
+        .bootstrap
+        .agents_view_preferences
+        .as_ref()
+        .expect("primary bootstrap preferences");
+    assert!(
+        fresh.sidebar.hide_sub_agents,
+        "a store with no saved sidebar hides sub-agents"
+    );
+    assert!(!fresh.sidebar.hide_inactive);
+    assert!(!fresh.sidebar.show_workbenches);
+    assert!(!fresh.sidebar.hide_empty_projects);
+    assert_eq!(
+        fresh.sidebar.project_visibility,
+        AgentsSidebarProjectVisibility::ContextualDefault
+    );
+
     let sidebar = AgentsSidebarPreferences {
         hide_empty_projects: true,
         hide_inactive: true,
@@ -714,6 +731,42 @@ async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() 
             .expect("fresh bootstrap preferences")
             .sidebar,
         sidebar
+    );
+
+    let saved_off = AgentsSidebarPreferences {
+        hide_sub_agents: false,
+        ..AgentsSidebarPreferences::default()
+    };
+    send_set_agents_view_preferences(
+        &mut fixture.client,
+        AgentsViewPreferencesUpdate::SetSidebarPreferences {
+            sidebar: saved_off.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "saved hide-sub-agents off").await;
+    assert!(!notify.snapshot.sidebar.hide_sub_agents);
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        fresh_bootstrap
+            .agents_view_preferences
+            .expect("reloaded preferences")
+            .sidebar,
+        saved_off,
+        "an explicit saved off survives relaunch"
+    );
+
+    send_set_agents_view_preferences(&mut fixture.client, AgentsViewPreferencesUpdate::Reset).await;
+    let notify = expect_preferences_notify(&mut fixture.client, "sidebar reset").await;
+    assert!(notify.snapshot.sidebar.hide_sub_agents);
+    assert!(!notify.snapshot.sidebar.hide_inactive);
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        fresh_bootstrap
+            .agents_view_preferences
+            .expect("reset bootstrap preferences")
+            .sidebar,
+        AgentsSidebarPreferences::default()
     );
 }
 
