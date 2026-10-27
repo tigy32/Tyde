@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::state::AppState;
 
@@ -25,10 +26,11 @@ static STEPS: [TourStep; 5] = [
     },
     TourStep {
         title: "Start a chat",
-        body: "New Chat opens a conversation with an agent inside the current \
-               project. Use the ▾ to pick a backend (Claude, Codex, Antigravity…) \
-               or a custom agent, then describe a task in plain language.",
-        selector: ".home-actions",
+        body: "New Chat starts a conversation with an agent on the chosen host \
+               and project. Use the ▾ to pick a backend (Claude, Codex, \
+               Antigravity…) or a custom agent, then describe a task in plain \
+               language.",
+        selector: ".home-launcher",
         hidden_hint: "The New Chat button lives on the home screen and at the \
                       top of every project.",
     },
@@ -133,6 +135,21 @@ fn card_position(rect: (f64, f64, f64, f64)) -> (f64, f64) {
 #[component]
 pub fn HelpTour() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> =
+        StoredValue::new_local(None);
+    let opener_state = state.clone();
+    Effect::new(move |was_open: Option<bool>| {
+        let open = opener_state.help_tour_step.with(Option::is_some);
+        if open && was_open != Some(true) {
+            opener.set_value(
+                web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.active_element())
+                    .and_then(|element| element.dyn_into().ok()),
+            );
+        }
+        open
+    });
 
     move || {
         let step_index = state.help_tour_step.get()?;
@@ -193,6 +210,11 @@ pub fn HelpTour() -> impl IntoView {
                 <div class="help-tour-card" style=card_style>
                     <div class="help-tour-card-top">
                         <button class="action-btn" on:click=move |_| {
+                            // This card unmounts as the guide opens; the guide
+                            // returns focus to whatever was focused when it opened.
+                            if let Some(opener) = opener.get_value() {
+                                let _ = opener.focus();
+                            }
                             setup_state.help_tour_step.set(None);
                             setup_state.getting_started_open.set(true);
                         }>"Getting started"</button>

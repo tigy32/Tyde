@@ -160,9 +160,15 @@ pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
 /// keeps its exact id so the server rejects the launch visibly, rather than
 /// silently selecting another profile.
 pub fn begin_new_chat_default(state: &AppState) {
-    if let Some(host_id) = state.chat_context_host_id_untracked() {
+    begin_default_chat_on(state, state.chat_context_host_id_untracked());
+}
+
+/// The default launch selection of [`begin_new_chat_default`], bound to an
+/// explicit `selection_host` rather than the inferred chat context.
+fn begin_default_chat_on(state: &AppState, selection_host: Option<String>) {
+    if let Some(host_id) = selection_host.as_ref() {
         let default_selection = state.launch_profile_catalog.with_untracked(|catalogs| {
-            let catalog = catalogs.get(&host_id)?;
+            let catalog = catalogs.get(host_id)?;
             let default_id = catalog.default_profile_id.as_ref()?;
             let entry = catalog
                 .entries
@@ -173,13 +179,14 @@ pub fn begin_new_chat_default(state: &AppState) {
         if let Some((default_id, entry)) = default_selection {
             match entry {
                 Some(LaunchProfileEntry::Ready { profile }) => {
-                    begin_new_chat_with_profile(state, profile, None);
+                    begin_new_chat_with_profile(state, profile, None, selection_host);
                 }
                 entry => {
-                    begin_new_chat_with(
+                    begin_chat_on(
                         state,
                         entry.as_ref().map(LaunchProfileEntry::backend_kind),
                         None,
+                        selection_host,
                     );
                     state
                         .composer_untracked()
@@ -190,7 +197,7 @@ pub fn begin_new_chat_default(state: &AppState) {
             return;
         }
     }
-    begin_new_chat_with(state, None, None);
+    begin_chat_on(state, None, None, selection_host);
 }
 
 pub fn begin_new_chat_with(
@@ -200,7 +207,30 @@ pub fn begin_new_chat_with(
 ) {
     // Bind the choice to the host it is being made against, captured before the
     // new tab opens and moves the chat context.
-    let selection_host = state.chat_context_host_id_untracked();
+    begin_chat_on(
+        state,
+        backend_override,
+        custom_agent_id,
+        state.chat_context_host_id_untracked(),
+    );
+}
+
+/// The Home role a no-project chat on `selection_host` starts with.
+fn home_custom_agent(state: &AppState, selection_host: Option<&String>) -> Option<CustomAgentId> {
+    if state.active_project_ref_untracked().is_some() {
+        return None;
+    }
+    state
+        .launch_profile_catalog
+        .with_untracked(|catalogs| catalogs.get(selection_host?)?.home_custom_agent_id.clone())
+}
+
+fn begin_chat_on(
+    state: &AppState,
+    backend_override: Option<BackendKind>,
+    custom_agent_id: Option<CustomAgentId>,
+    selection_host: Option<String>,
+) {
     // Opening (and activating) the new chat tab drives `active_agent` to None
     // via the Memo derived from `center_zone`.
     // An explicit New Chat outranks a restore still waiting on its host.
@@ -212,17 +242,9 @@ pub fn begin_new_chat_with(
     // open rather than before it.
     let composer = state.composer_for(tab);
     composer.backend_override.set(backend_override);
-    composer.custom_agent_id.set(custom_agent_id.or_else(|| {
-        if state.active_project_ref_untracked().is_some() {
-            return None;
-        }
-        state.launch_profile_catalog.with_untracked(|catalogs| {
-            catalogs
-                .get(selection_host.as_ref()?)?
-                .home_custom_agent_id
-                .clone()
-        })
-    }));
+    composer
+        .custom_agent_id
+        .set(custom_agent_id.or_else(|| home_custom_agent(state, selection_host.as_ref())));
     composer.launch_profile_id.set(None);
     composer.selection_host.set(selection_host);
     composer
@@ -231,27 +253,18 @@ pub fn begin_new_chat_with(
     composer.session_settings_dirty.set(false);
 }
 
-/// Begin a new chat from a server-provided ready launch profile. The profile
-/// carries the authoritative backend and session settings, so we set the draft
-/// directly from it — never by parsing the id. `custom_agent_id` composes a
-/// custom agent on top of the selected profile.
+/// Begin a new chat on `selection_host` from a server-provided ready launch
+/// profile. The profile carries the authoritative backend and session
+/// settings, so we set the draft directly from it — never by parsing the id.
+/// `custom_agent_id` composes a custom agent on top of the selected profile.
 pub fn begin_new_chat_with_profile(
     state: &AppState,
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
+    selection_host: Option<String>,
 ) {
-    let selection_host = state.chat_context_host_id_untracked();
-    let custom_agent_id = custom_agent_id.or_else(|| {
-        if state.active_project_ref_untracked().is_some() {
-            return None;
-        }
-        state.launch_profile_catalog.with_untracked(|catalogs| {
-            catalogs
-                .get(selection_host.as_ref()?)?
-                .home_custom_agent_id
-                .clone()
-        })
-    });
+    let custom_agent_id =
+        custom_agent_id.or_else(|| home_custom_agent(state, selection_host.as_ref()));
     begin_profile_chat(state, profile, custom_agent_id, selection_host);
 }
 
@@ -267,22 +280,54 @@ pub(crate) fn begin_new_chat_with_profile_in_project(
     begin_profile_chat(state, profile, custom_agent_id, Some(project.host_id));
 }
 
+/// Make `host_id` the host that no-project chats open on, persisting it in the
+/// configured-host store.
+pub(crate) async fn select_new_chat_host(state: &AppState, host_id: &str) -> Result<(), String> {
+    if state.selected_host_id.get_untracked().as_deref() == Some(host_id) {
+        return Ok(());
+    }
+    let store = crate::bridge::set_selected_host(crate::bridge::SetSelectedHostRequest {
+        host_id: Some(host_id.to_owned()),
+    })
+    .await?;
+    state.configured_hosts.set(store.hosts);
+    state.selected_host_id.set(store.selected_host_id);
+    Ok(())
+}
+
 pub(crate) async fn begin_new_chat_with_profile_at_home(
     state: &AppState,
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
     host_id: String,
 ) -> Result<(), String> {
-    if state.selected_host_id.get_untracked().as_ref() != Some(&host_id) {
-        let store = crate::bridge::set_selected_host(crate::bridge::SetSelectedHostRequest {
-            host_id: Some(host_id.clone()),
-        })
-        .await?;
-        state.configured_hosts.set(store.hosts);
-        state.selected_host_id.set(store.selected_host_id);
-    }
+    select_new_chat_host(state, &host_id).await?;
     state.switch_active_project(None);
     begin_profile_chat(state, profile, custom_agent_id, Some(host_id));
+    Ok(())
+}
+
+/// New Chat at an explicit destination — a project, or no project on `host_id`
+/// — with the same default launch selection New Chat applies in that context.
+pub(crate) async fn begin_new_chat_default_at(
+    state: &AppState,
+    host_id: String,
+    project: Option<ActiveProjectRef>,
+) -> Result<(), String> {
+    let selection_host = match project {
+        Some(project) => {
+            if state.active_project_ref_untracked().as_ref() != Some(&project) {
+                state.switch_active_project(Some(project.clone()));
+            }
+            project.host_id
+        }
+        None => {
+            select_new_chat_host(state, &host_id).await?;
+            state.switch_active_project(None);
+            host_id
+        }
+    };
+    begin_default_chat_on(state, Some(selection_host));
     Ok(())
 }
 
@@ -2126,7 +2171,12 @@ mod wasm_tests {
         owner.with(|| {
             let state = AppState::new();
             install_profile_host(&state);
-            begin_new_chat_with_profile(&state, profile_with_model("opus"), None);
+            begin_new_chat_with_profile(
+                &state,
+                profile_with_model("opus"),
+                None,
+                state.chat_context_host_id_untracked(),
+            );
             assert!(spawn_new_chat(
                 &state,
                 &state.composer_untracked(),
@@ -2164,7 +2214,12 @@ mod wasm_tests {
         owner.with(|| {
             let state = AppState::new();
             install_profile_host(&state);
-            begin_new_chat_with_profile(&state, profile_with_model("opus"), None);
+            begin_new_chat_with_profile(
+                &state,
+                profile_with_model("opus"),
+                None,
+                state.chat_context_host_id_untracked(),
+            );
             // Simulate a user edit in the session-settings bar.
             let mut edited = std::collections::HashMap::new();
             edited.insert(

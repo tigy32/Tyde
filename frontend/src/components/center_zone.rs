@@ -2435,7 +2435,7 @@ mod wasm_tests {
             "the single pane's active tab should be as tall as the content area"
         );
         assert!(
-            text_of(&mount).contains("Coding Agent Studio"),
+            text_of(&mount).contains("Manage Hosts"),
             "the default active tab renders Home, got {:?}",
             text_of(&mount)
         );
@@ -2579,7 +2579,7 @@ mod wasm_tests {
             "closing the only closeable tab should leave just Home"
         );
         assert!(
-            text_of(&visible_mount(&container)).contains("Coding Agent Studio"),
+            text_of(&visible_mount(&container)).contains("Manage Hosts"),
             "Home should become the visible tab after the last closeable tab closes"
         );
     }
@@ -2618,7 +2618,7 @@ mod wasm_tests {
             "Close All Tabs should close every closeable tab and keep Home"
         );
         assert!(
-            text_of(&visible_mount(&container)).contains("Coding Agent Studio"),
+            text_of(&visible_mount(&container)).contains("Manage Hosts"),
             "Home should be the visible tab after Close All Tabs"
         );
         assert_eq!(
@@ -2821,7 +2821,7 @@ mod wasm_tests {
             "opening a chat should replace the visible content"
         );
         assert!(
-            !text_of(&visible).contains("Coding Agent Studio"),
+            !text_of(&visible).contains("Manage Hosts"),
             "the replaced Home content should no longer render"
         );
 

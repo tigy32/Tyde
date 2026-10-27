@@ -2,7 +2,9 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::actions::{begin_new_chat_with_profile_at_home, begin_new_chat_with_profile_in_project};
-use crate::state::{ActiveProjectRef, AppState, ConnectionStatus, DEFAULT_CUSTOM_AGENT_ID};
+use crate::state::{
+    ActiveProjectRef, AppState, ConnectionStatus, DEFAULT_CUSTOM_AGENT_ID, ProjectInfo,
+};
 
 use protocol::{BackendKind, CustomAgent, CustomAgentId, LaunchProfileEntry, LaunchProfileKind};
 
@@ -129,13 +131,83 @@ pub(super) fn backend_icon(kind: BackendKind) -> impl IntoView {
     }
 }
 
+/// The label naming a launch destination's project, or the no-project choice.
+fn destination_label(projects: &[ProjectInfo], selected: Option<&ActiveProjectRef>) -> String {
+    let Some(selected) = selected else {
+        return "No project / Home".to_owned();
+    };
+    let Some(entry) = projects
+        .iter()
+        .find(|entry| entry.host_id == selected.host_id && entry.project.id == selected.project_id)
+    else {
+        return "Project unavailable".to_owned();
+    };
+    match entry.project.parent_project_id() {
+        Some(parent) => match projects.iter().find(|parent_entry| {
+            parent_entry.host_id == selected.host_id && &parent_entry.project.id == parent
+        }) {
+            Some(parent) => format!("{} / {}", parent.project.name, entry.project.name),
+            None => "Workbench parent unavailable".to_owned(),
+        },
+        None => entry.project.name.clone(),
+    }
+}
+
+/// Host and project choice for a new chat: configured hosts and the selected
+/// host's server project catalog. The caller decides what a choice commits.
+/// `id_prefix` keeps element ids unique when Home and the chooser coexist.
 #[component]
-fn LaunchProjectPicker(
-    selection: RwSignal<(Option<String>, Option<ActiveProjectRef>)>,
-    label: Memo<String>,
+pub(crate) fn LaunchDestinationPicker(
+    #[prop(into)] selection: Signal<(Option<String>, Option<ActiveProjectRef>)>,
     on_select: Callback<(Option<String>, Option<ActiveProjectRef>)>,
+    id_prefix: &'static str,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let hosts = state.configured_hosts;
+    let projects = state.projects;
+    let selected_host = Memo::new(move |_| selection.get().0);
+    let label = Memo::new(move |_| {
+        projects.with(|projects| destination_label(projects, selection.get().1.as_ref()))
+    });
+    let host_select_id = format!("{id_prefix}-host-select");
+    view! {
+        <div class="launch-destination-picker">
+            <div class="launch-host-picker">
+                <label for=host_select_id.clone()>"Host"</label>
+                <select id=host_select_id class="settings-select" aria-label="Host"
+                    on:change=move |ev| {
+                        let host = event_target_value(&ev);
+                        if hosts.with_untracked(|hosts| hosts.iter().any(|entry| entry.id == host)) {
+                            on_select.run((Some(host), None));
+                        }
+                    }>
+                    <Show when=move || selected_host.get().as_ref().is_none_or(|id| !hosts.with(|hosts| hosts.iter().any(|host| &host.id == id)))><option selected=true disabled=true>"Host unavailable"</option></Show>
+                    {move || hosts.get().into_iter().map(|host| {
+                        let label = hosts.with(|hosts| if hosts.iter().filter(|entry| entry.label == host.label).count() > 1 {
+                            format!("{} ({})", host.label, host.id)
+                        } else { host.label });
+                        let id = host.id.clone();
+                        view! { <option value=host.id prop:selected=move || selected_host.get().as_ref() == Some(&id)>{label}</option> }
+                    }).collect_view()}
+                </select>
+            </div>
+            <LaunchProjectPicker selection label on_select id_prefix />
+        </div>
+    }
+}
+
+#[component]
+fn LaunchProjectPicker(
+    selection: Signal<(Option<String>, Option<ActiveProjectRef>)>,
+    label: Memo<String>,
+    on_select: Callback<(Option<String>, Option<ActiveProjectRef>)>,
+    id_prefix: &'static str,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let select_id = format!("{id_prefix}-project-select");
+    let popover_id = format!("{id_prefix}-project-popover");
+    let value_id = format!("{id_prefix}-project-value");
+    let value_ref = value_id.clone();
     let projects = state.projects;
     let open = RwSignal::new(false);
     let query = RwSignal::new(String::new());
@@ -256,19 +328,19 @@ fn LaunchProjectPicker(
                     buttons[next].scroll_into_view_with_bool(false);
                 }
             }>
-            <label for="launch-project-select">"Project"</label>
-            <button id="launch-project-select" type="button" class="settings-select" aria-label="Project"
-                aria-expanded=move || open.get().to_string() aria-controls="launch-project-popover"
-                aria-describedby="launch-project-value" title=move || label.get()
+            <label for=select_id.clone()>"Project"</label>
+            <button id=select_id type="button" class="settings-select" aria-label="Project"
+                aria-expanded=move || open.get().to_string() aria-controls=popover_id.clone()
+                aria-describedby=value_ref title=move || label.get()
                 node_ref=trigger on:keydown=move |ev| {
                     if !open.get_untracked() && matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp") {
                         ev.prevent_default(); ev.stop_propagation(); query.set(String::new()); open.set(true);
                     }
                 } on:click=move |_| { query.set(String::new()); open.update(|open| *open = !*open); }>
-                <span id="launch-project-value">{move || label.get()}</span>
+                <span id=value_id>{move || label.get()}</span>
             </button>
             <Show when=move || open.get()>
-                <div id="launch-project-popover" class="launch-project-popover" role="group" aria-label="Project choices"
+                <div id=popover_id.clone() class="launch-project-popover" role="group" aria-label="Project choices"
                     on:mousedown=move |ev| {
                         // Presses inside the picker keep keyboard focus in it; macOS
                         // WebKit would otherwise strand focus on the page.
@@ -376,25 +448,7 @@ pub fn LaunchChooser(
         })
     });
     let context_label = Memo::new(move |_| {
-        let Some(selected) = selection.get().1 else {
-            return "No project / Home".to_owned();
-        };
-        projects.with(|projects| {
-            let Some(entry) = projects.iter().find(|entry| {
-                entry.host_id == selected.host_id && entry.project.id == selected.project_id
-            }) else {
-                return "Project unavailable".to_owned();
-            };
-            match entry.project.parent_project_id() {
-                Some(parent) => match projects.iter().find(|parent_entry| {
-                    parent_entry.host_id == selected.host_id && &parent_entry.project.id == parent
-                }) {
-                    Some(parent) => format!("{} / {}", parent.project.name, entry.project.name),
-                    None => "Workbench parent unavailable".to_owned(),
-                },
-                None => entry.project.name.clone(),
-            }
-        })
+        projects.with(|projects| destination_label(projects, selection.get().1.as_ref()))
     });
     let entries_state = state.clone();
     let entries_host = selected_host;
@@ -671,28 +725,7 @@ pub fn LaunchChooser(
                     <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
                     <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
                         on:click=move |_| open_sig.set(false)>"×"</button>
-                    <div class="launch-destination-picker">
-                        <div class="launch-host-picker">
-                            <label for="launch-host-select">"Host"</label>
-                            <select id="launch-host-select" class="settings-select" aria-label="Host"
-                                on:change=move |ev| {
-                                    let host = event_target_value(&ev);
-                                    if hosts.with_untracked(|hosts| hosts.iter().any(|entry| entry.id == host)) {
-                                        change_destination.run((Some(host), None));
-                                    }
-                                }>
-                                <Show when=move || selected_host.get().as_ref().is_none_or(|id| !hosts.with(|hosts| hosts.iter().any(|host| &host.id == id)))><option selected=true disabled=true>"Host unavailable"</option></Show>
-                                {move || hosts.get().into_iter().map(|host| {
-                                    let label = hosts.with(|hosts| if hosts.iter().filter(|entry| entry.label == host.label).count() > 1 {
-                                        format!("{} ({})", host.label, host.id)
-                                    } else { host.label });
-                                    let id = host.id.clone();
-                                    view! { <option value=host.id selected=move || selected_host.get().as_ref() == Some(&id)>{label}</option> }
-                                }).collect_view()}
-                            </select>
-                        </div>
-                        <LaunchProjectPicker selection=selection label=context_label on_select=change_destination />
-                    </div>
+                    <LaunchDestinationPicker selection on_select=change_destination id_prefix="launch" />
                 </header>
                 <div class="launch-chooser-body">
                     <section class="launch-backends" aria-label="Backend">
@@ -1296,8 +1329,16 @@ mod wasm_tests {
         let open = RwSignal::new(true);
         let _handle = mount_menu(&container, &state, open);
         next_tick().await;
-        let picker = || {
+        // CenterZone's Home has its own Host and Project controls; these
+        // assertions are about the chooser's.
+        let chooser = || {
             container
+                .query_selector("[role=dialog][aria-label='New agent']")
+                .unwrap()
+                .expect("the chooser is open")
+        };
+        let picker = || {
+            chooser()
                 .query_selector("button[aria-label='Project']")
                 .unwrap()
                 .unwrap()
@@ -1307,7 +1348,7 @@ mod wasm_tests {
         // The selected trigger also contains the workbench name when discovery
         // is hidden. Only buttons in the open choices group are discoverable rows.
         let project_choice = |text: &str| {
-            let nodes = container
+            let nodes = chooser()
                 .query_selector_all("[role=group][aria-label='Project choices'] button")
                 .unwrap();
             (0..nodes.length())
@@ -1315,7 +1356,7 @@ mod wasm_tests {
                 .find(|button| button.text_content().as_deref() == Some(text))
         };
         let choose_host = |host: &str| {
-            let select = container
+            let select = chooser()
                 .query_selector("select[aria-label='Host']")
                 .unwrap()
                 .unwrap()
@@ -1371,7 +1412,7 @@ mod wasm_tests {
             Some("Shared name / UI polish"),
             "hiding discovery does not hide the selected destination"
         );
-        let toggle = container
+        let toggle = chooser()
             .query_selector("[role=switch][aria-label='Show workbenches']")
             .unwrap()
             .unwrap()
@@ -1421,7 +1462,7 @@ mod wasm_tests {
         options.set_scroll_top(0);
         let child = project_choice("UI polish").unwrap();
         assert_eq!(child.get_attribute("aria-pressed").as_deref(), Some("true"));
-        let search = container
+        let search = chooser()
             .query_selector("input[aria-label='Find a project']")
             .unwrap()
             .unwrap()
@@ -1516,7 +1557,7 @@ mod wasm_tests {
         .unwrap();
         assert!(visible_text(&container).contains("Could not save workbench preferences"));
         assert!(
-            container
+            chooser()
                 .query_selector("[role=switch][aria-label='Show workbenches']")
                 .unwrap()
                 .is_none(),
@@ -2144,7 +2185,7 @@ mod wasm_tests {
         // The searchable picker uses a button with the same themed control;
         // requiring a native select rejects the approved rendered UI.
         let picker = container
-            .query_selector("button[aria-label='Project']")
+            .query_selector("[role=dialog][aria-label='New agent'] button[aria-label='Project']")
             .unwrap()
             .unwrap();
         let picker_style = web_sys::window()

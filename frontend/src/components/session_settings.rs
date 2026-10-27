@@ -1843,6 +1843,7 @@ mod wasm_tests {
                 session_settings: SessionSettingsValues::default(),
             },
             None,
+            Some(host_id.to_owned()),
         );
         let _draft_handle = mount_bar(&draft_container, draft_state.clone());
         for _ in 0..4 {

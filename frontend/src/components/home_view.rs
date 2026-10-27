@@ -1,14 +1,15 @@
 use leptos::portal::Portal;
 use leptos::prelude::*;
 
-use crate::actions::begin_new_chat_default;
-use crate::components::host_browser::{
-    open_project_browser, open_project_browser_on_selected_host,
-};
-use crate::components::launch_menu::{LaunchChooser, LaunchDestination};
+use crate::actions::{begin_new_chat_default_at, select_new_chat_host};
+use crate::app::refresh_configured_hosts;
+use crate::components::header::report_user_error;
+use crate::components::host_browser::open_project_browser_on_selected_host;
+use crate::components::launch_menu::{LaunchChooser, LaunchDestination, LaunchDestinationPicker};
 use crate::state::{AppState, ConnectionStatus};
 use protocol::{BackendKind, BackendSetupAction, BackendSetupStatus, LaunchProfileEntry};
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::components::launch_menu::backend_icon;
 use crate::components::settings_panel::{
@@ -19,18 +20,88 @@ use crate::state::ActiveProjectRef;
 #[component]
 pub fn HomeView() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let hosts = state.configured_hosts;
+    let projects = state.projects;
+    let selected_host_id = state.selected_host_id;
+    let active_project = state.active_project;
+
+    // Choosing a project is a draft until New Chat, so browsing the picker never
+    // navigates away from Home. The draft follows the active project when it
+    // changes elsewhere.
+    let project_choice = RwSignal::new(active_project.get_untracked());
+    Effect::new(move |previous: Option<Option<ActiveProjectRef>>| {
+        let active = active_project.get();
+        if previous.is_some_and(|previous| previous != active) {
+            project_choice.set(active.clone());
+        }
+        active
+    });
+    let selection = Memo::new(move |_| {
+        let project = project_choice.get();
+        let host = match &project {
+            Some(project) => Some(project.host_id.clone()),
+            None => selected_host_id.get(),
+        };
+        (host, project)
+    });
+
+    let select_state = state.clone();
+    let on_select = Callback::new(
+        move |(host, project): (Option<String>, Option<ActiveProjectRef>)| {
+            if project.is_some() {
+                project_choice.set(project);
+                return;
+            }
+            let Some(host) = host else {
+                return;
+            };
+            if selected_host_id.get_untracked().as_ref() == Some(&host) {
+                project_choice.set(None);
+                return;
+            }
+            let state = select_state.clone();
+            spawn_local(async move {
+                match select_new_chat_host(&state, &host).await {
+                    Ok(()) => project_choice.set(None),
+                    Err(error) => {
+                        report_user_error(format!("Could not switch host: {error}"));
+                        refresh_configured_hosts(&state).await;
+                    }
+                }
+            });
+        },
+    );
 
     let connected_state = state.clone();
     let connected = Memo::new(move |_| {
-        matches!(
-            connected_state.chat_context_connection_status(),
-            ConnectionStatus::Connected
-        )
+        selection.get().0.is_some_and(|host| {
+            hosts.with(|hosts| hosts.iter().any(|entry| entry.id == host))
+                && matches!(
+                    connected_state.connection_status_for_host(&host),
+                    ConnectionStatus::Connected
+                )
+        })
     });
+    let launchable = Memo::new(move |_| {
+        connected.get()
+            && selection.get().1.is_none_or(|selected| {
+                projects.with(|projects| {
+                    projects.iter().any(|entry| {
+                        entry.host_id == selected.host_id && entry.project.id == selected.project_id
+                    })
+                })
+            })
+    });
+    let destination = Memo::new(move |_| match selection.get() {
+        (_, Some(project)) => Some(LaunchDestination::Project(project)),
+        (Some(host_id), None) => Some(LaunchDestination::NoProject { host_id }),
+        (None, None) => None,
+    });
+
     let connection_problem_state = state.clone();
     let connection_problem = Memo::new(move |_| {
-        connection_problem_state.selected_host_id.get()?;
-        match connection_problem_state.selected_host_connection_status() {
+        let host = selection.get().0?;
+        match connection_problem_state.connection_status_for_host(&host) {
             ConnectionStatus::Error(message) => Some(format!(
                 "Tyde could not connect to the selected host: {message}"
             )),
@@ -42,31 +113,9 @@ pub fn HomeView() -> impl IntoView {
             ConnectionStatus::Connecting | ConnectionStatus::Connected => None,
         }
     });
-
-    // Setup progress for the getting-started guide. The guide is always on
-    // screen — it doubles as orientation for returning users — and only the
-    // step markers and CTAs react to progress.
-    let backend_state = state.clone();
-    let has_backend = Memo::new(move |_| {
-        let Some(host) = backend_state.selected_host_id.get() else {
-            return false;
-        };
-        let settings = backend_state.host_settings_by_host.get();
-        let setup = backend_state.backend_setup_by_host.get();
-        settings.get(&host).is_some_and(|settings| {
-            settings.enabled_backends.iter().any(|enabled| {
-                setup.get(&host).is_some_and(|infos| {
-                    infos.iter().any(|info| {
-                        info.backend_kind == *enabled
-                            && info.status == BackendSetupStatus::Installed
-                    })
-                })
-            })
-        })
-    });
     let backend_problem_state = state.clone();
     let backend_problem = Memo::new(move |_| {
-        let host_id = backend_problem_state.selected_host_id.get()?;
+        let host_id = selection.get().0?;
         let settings = backend_problem_state
             .host_settings_by_host
             .get()
@@ -102,46 +151,44 @@ pub fn HomeView() -> impl IntoView {
             }
         })
     });
-    let project_state = state.clone();
-    let has_project = Memo::new(move |_| !project_state.projects.get().is_empty());
-    let agents_state = state.clone();
-    let has_agent = Memo::new(move |_| !agents_state.agents.get().is_empty());
 
-    let open_backends_state = state.clone();
-    let open_backend_settings = move |_| {
-        open_backends_state
-            .settings_tab_request
-            .set(Some("Backends"));
-        open_backends_state.settings_open.set(true);
+    let launch_state = state.clone();
+    let on_new_chat = move |_| {
+        if !launchable.get_untracked() {
+            return;
+        }
+        let (Some(host), project) = selection.get_untracked() else {
+            return;
+        };
+        let state = launch_state.clone();
+        spawn_local(async move {
+            if let Err(error) = begin_new_chat_default_at(&state, host, project).await {
+                report_user_error(format!("Could not start a new chat: {error}"));
+            }
+        });
     };
-
-    let create_project_state = state.clone();
-    let on_create_project = move |_| open_project_browser(&create_project_state);
+    let chooser_open = RwSignal::new(false);
+    let on_toggle_chooser = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        chooser_open.update(|open| *open = !*open);
+    };
 
     let manage_hosts_state = state.clone();
     let on_manage_hosts = move |_| {
         manage_hosts_state.settings_tab_request.set(Some("Hosts"));
         manage_hosts_state.settings_open.set(true);
     };
-
-    let guide_state = state.clone();
-    let on_getting_started = move |_| guide_state.getting_started_open.set(true);
     let help_state = state.clone();
     let on_help = move |_| help_state.help_tour_step.set(Some(0));
 
     view! {
         <div class="home-view">
             <div class="home-hero">
-                <img class="home-logo" src="icon.png" alt="Tyde" />
+                <img class="home-logo" src="icon.png" alt="" />
                 <h1 class="home-title">"Tyde"</h1>
-                <p class="home-tagline">"Coding Agent Studio"</p>
             </div>
-
-            <div class="home-getstarted">
-                <h2 class="home-getstarted-title">"Your first agent, one step at a time"</h2>
-                <button class="action-btn primary home-getstarted-cta" on:click=on_getting_started>
-                    "Getting started"
-                </button>
+            <div class="home-launcher">
+                <LaunchDestinationPicker selection on_select id_prefix="home" />
                 <Show when=move || connection_problem.get().is_some()>
                     <div class="home-connection-error" role="alert">
                         {move || connection_problem.get().unwrap_or_default()}
@@ -152,131 +199,41 @@ pub fn HomeView() -> impl IntoView {
                         {move || backend_problem.get().unwrap_or_default()}
                     </div>
                 </Show>
-                <p class="home-getstarted-lede">
-                    "Tyde is a control center for AI coding agents. It runs the agent backends you already know — Claude, Codex, Antigravity and more — and keeps every session organized, so you can run many agents across many projects at once."
-                </p>
-                <ol class="home-getstarted-steps">
-                    <li class="home-getstarted-step" class:done=move || has_backend.get()>
-                        <span class="home-getstarted-marker">
-                            {move || if has_backend.get() { "✓" } else { "1" }}
-                        </span>
-                        <div class="home-getstarted-body">
-                            <div class="home-getstarted-step-title">"Connect an agent backend"</div>
-                            <p class="home-getstarted-step-desc">
-                                "Tyde brings no AI of its own — it runs external agent backends like Claude, Codex, and Antigravity. Pick one, install it, and sign in through its own CLI. Tyde checks installation, not your sign-in status."
-                            </p>
-                            <Show when=move || !has_backend.get()>
-                                <button
-                                    class="action-btn primary home-getstarted-cta"
-                                    on:click=open_backend_settings
-                                >
-                                    "Connect an agent backend →"
-                                </button>
-                            </Show>
-                        </div>
-                    </li>
-                    <li class="home-getstarted-step" class:done=move || has_project.get()>
-                        <span class="home-getstarted-marker">
-                            {move || if has_project.get() { "✓" } else { "2" }}
-                        </span>
-                        <div class="home-getstarted-body">
-                            <div class="home-getstarted-step-title">"Create a project"</div>
-                            <p class="home-getstarted-step-desc">
-                                "A project is one or more folders an agent can read and edit — usually a codebase. Your projects live in the left sidebar; switch between them anytime."
-                            </p>
-                            <Show when=move || !has_project.get()>
-                                <button
-                                    class="action-btn primary home-getstarted-cta"
-                                    on:click=on_create_project.clone()
-                                    disabled=move || !connected.get()
-                                    title=move || if connected.get() {
-                                        "Pick a folder to create your first project"
-                                    } else {
-                                        "Connect to a host first to create a project"
-                                    }
-                                >
-                                    "Choose a folder →"
-                                </button>
-                            </Show>
-                        </div>
-                    </li>
-                    <li class="home-getstarted-step" class:done=move || has_agent.get()>
-                        <span class="home-getstarted-marker">
-                            {move || if has_agent.get() { "✓" } else { "3" }}
-                        </span>
-                        <div class="home-getstarted-body">
-                            <div class="home-getstarted-step-title">"Run agents in it"</div>
-                            <p class="home-getstarted-step-desc">
-                                "Open a chat inside a project (New Chat, or ⌘N), describe a task, and an agent gets to work in that folder. Each project can run several agents at once — Tyde keeps every session organized so you can jump between them."
-                            </p>
-                        </div>
-                    </li>
-                </ol>
-            </div>
-
-            <div class="home-actions">
-                <NewChatButton connected_sig=connected />
-                <button class="action-btn" on:click=on_manage_hosts>
-                    "Manage Hosts"
-                </button>
-                <button
-                    class="action-btn"
-                    title="Take a quick tour of the interface"
-                    on:click=on_help
-                >
-                    "Help"
-                </button>
+                <div class="home-new-chat">
+                    <button
+                        class="action-btn primary home-new-chat-start"
+                        on:click=on_new_chat
+                        disabled=move || !launchable.get()
+                    >
+                        "New Chat"
+                    </button>
+                    <button
+                        class="action-btn primary home-new-chat-choose"
+                        on:click=on_toggle_chooser
+                        disabled=move || !connected.get()
+                        title="Choose backend and agent role"
+                        aria-label="Choose backend and agent role"
+                        aria-haspopup="dialog"
+                        aria-expanded=move || chooser_open.get().to_string()
+                    >
+                        "▾"
+                    </button>
+                    <Show when=move || chooser_open.get()>
+                        <Portal>
+                            <LaunchChooser open_sig=chooser_open destination />
+                        </Portal>
+                    </Show>
+                </div>
+                <div class="home-secondary-actions">
+                    <button class="action-btn" on:click=on_manage_hosts>
+                        "Manage Hosts"
+                    </button>
+                    <button class="action-btn" on:click=on_help>
+                        "Help"
+                    </button>
+                </div>
             </div>
         </div>
-    }
-}
-
-#[component]
-fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let open = RwSignal::new(false);
-
-    let state_for_default = state.clone();
-    let on_primary_click = move |_| {
-        if !connected_sig.get() {
-            return;
-        }
-        begin_new_chat_default(&state_for_default);
-    };
-
-    let on_toggle = move |ev: web_sys::MouseEvent| {
-        ev.stop_propagation();
-        open.update(|v| *v = !*v);
-    };
-
-    view! {
-        <>
-            <div class="new-chat-button-wrap" style="display:inline-flex;">
-                <button
-                    class="action-btn primary"
-                    style="border-radius:6px 0 0 6px;"
-                    on:click=on_primary_click
-                    disabled=move || !connected_sig.get()
-                >
-                    "New Chat"
-                </button>
-                <button
-                    class="action-btn primary"
-                    style="padding:0 0.6rem;border-left:1px solid rgba(255,255,255,0.15);border-radius:0 6px 6px 0;"
-                    on:click=on_toggle
-                    disabled=move || !connected_sig.get()
-                    title="Choose backend and agent role"
-                    aria-label="Choose backend and agent role"
-                    aria-haspopup="dialog"
-                    aria-expanded=move || open.get().to_string()
-                >
-                    "▾"
-                </button>
-                <Show when=move || open.get()>
-                    <Portal><LaunchChooser open_sig=open /></Portal>
-                </Show>
-            </div>
-        </>
     }
 }
 
@@ -687,7 +644,7 @@ fn SetupSignIn(kind: BackendKind, connected: Memo<bool>) -> impl IntoView {
                     send_run_backend_setup(&state, kind, BackendSetupAction::SignIn);
                     state.getting_started_open.set(false);
                 }>"Sign in in terminal"</button>
-            <p class="getting-started-hint">"The guide closes so you can use the terminal. Reopen Getting started from Home, Help or the command palette when you're done."</p>
+            <p class="getting-started-hint">"The guide closes so you can use the terminal. Reopen Getting started from Help or the command palette when you're done."</p>
         })
     }
 }
@@ -695,7 +652,7 @@ fn SetupSignIn(kind: BackendKind, connected: Memo<bool>) -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AgentInfo, ProjectInfo};
+    use crate::state::{ActiveAgentRef, AgentInfo, PaneId, ProjectInfo, TabContent};
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentOrigin, BackendKind, Project, ProjectId, ProjectRootPath, ProjectSource,
@@ -851,130 +808,514 @@ mod wasm_tests {
         });
     }
 
-    fn checkmark_count(container: &HtmlElement) -> usize {
-        visible_text(container).matches('✓').count()
+    fn configure_launch_host(
+        state: &AppState,
+        host: &str,
+        label: &str,
+        profile: &str,
+        backend: BackendKind,
+    ) {
+        state.configured_hosts.update(|hosts| {
+            hosts.push(crate::bridge::ConfiguredHost {
+                id: host.to_owned(),
+                label: label.to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: true,
+            })
+        });
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.to_owned(), ConnectionStatus::Connected);
+        });
+        state.launch_profile_catalog.update(|catalogs| {
+            catalogs.insert(
+                host.to_owned(),
+                protocol::LaunchProfileCatalog {
+                    home_custom_agent_id: Some(protocol::CustomAgentId(format!(
+                        "{host}-home-role"
+                    ))),
+                    entries: vec![LaunchProfileEntry::Ready {
+                        profile: protocol::LaunchProfile {
+                            id: protocol::LaunchProfileId(profile.to_owned()),
+                            kind: protocol::LaunchProfileKind::BackendDefault,
+                            label: label.to_owned(),
+                            description: None,
+                            backend_kind: backend,
+                            session_settings: Default::default(),
+                        },
+                    }],
+                    default_profile_id: Some(protocol::LaunchProfileId(profile.to_owned())),
+                    custom_profile_schemas: Vec::new(),
+                },
+            );
+        });
     }
 
-    /// A brand-new user (no backend enabled anywhere, no projects) must see the
-    /// getting-started guide explaining what Tyde is, with all three setup
-    /// steps pending and working calls-to-action: backend setup deep-links to
-    /// Settings → Backends, and project creation offers a folder picker.
-    #[wasm_bindgen_test]
-    async fn fresh_install_shows_getting_started_with_ctas() {
-        let container = make_container();
-        let state = AppState::new();
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            view! { <HomeView /> }
-        });
-        next_tick().await;
-
-        let text = visible_text(&container);
-        assert!(
-            text.contains("Getting started"),
-            "fresh install must show the getting-started guide, got: {text}"
-        );
-        for step in [
-            "Connect an agent backend",
-            "Create a project",
-            "Run agents in it",
-        ] {
-            assert!(text.contains(step), "missing setup step {step:?}: {text}");
-        }
-        assert_eq!(
-            checkmark_count(&container),
-            0,
-            "no step is complete yet, so no checkmarks expected: {text}"
-        );
-
-        let folder_cta = find_button_by_text(&container, "Choose a folder →")
-            .expect("step 2 must offer a folder picker button");
-        assert!(
-            folder_cta
-                .dyn_ref::<web_sys::HtmlButtonElement>()
-                .expect("button element")
-                .disabled(),
-            "folder CTA must be disabled while no host is connected"
-        );
-
-        let cta = find_button_by_text(&container, "Connect an agent backend →")
-            .expect("step 1 must offer a backend-setup button");
-        cta.click();
-        next_tick().await;
-        assert!(
-            state.settings_open.get_untracked(),
-            "backend CTA must open settings"
-        );
-        assert_eq!(
-            state.settings_tab_request.get_untracked(),
-            Some("Backends"),
-            "backend CTA must deep-link to the Backends tab"
-        );
+    fn element(root: &web_sys::Element, selector: &str) -> HtmlElement {
+        root.query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{selector} is rendered"))
+            .dyn_into()
+            .unwrap()
     }
 
-    /// The guide stays on screen permanently as orientation: each completed
-    /// step flips to a checkmark and drops its CTA, and the guide is still
-    /// visible once everything is set up.
+    fn computed(element: &web_sys::Element, property: &str) -> String {
+        web_sys::window()
+            .unwrap()
+            .get_computed_style(element)
+            .unwrap()
+            .unwrap()
+            .get_property_value(property)
+            .unwrap()
+    }
+
+    fn px(element: &web_sys::Element, property: &str) -> f64 {
+        computed(element, property)
+            .trim_end_matches("px")
+            .parse()
+            .unwrap()
+    }
+
+    /// Home is a compact launcher over the canonical host and project state:
+    /// New Chat opens at the chosen destination with that host's configured
+    /// default profile and Home role, a host change goes through the host
+    /// store, the full chooser opens on the same destination, and the layout
+    /// keeps the user's theme, font and scale while reflowing without overflow.
     #[wasm_bindgen_test]
-    async fn getting_started_tracks_progress_and_stays_visible() {
+    async fn home_launcher_starts_default_chats_at_the_chosen_destination() {
         let container = make_container();
         let state = AppState::new();
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            view! { <HomeView /> }
-        });
-        next_tick().await;
-
+        configure_launch_host(
+            &state,
+            "local",
+            "Laptop",
+            "local-claude",
+            BackendKind::Claude,
+        );
+        configure_launch_host(
+            &state,
+            "remote",
+            "Build box",
+            "remote-codex",
+            BackendKind::Codex,
+        );
         state.selected_host_id.set(Some("local".to_owned()));
-        enable_backend(&state, "local");
-        next_tick().await;
-        assert_eq!(
-            checkmark_count(&container),
-            1,
-            "backend step must show as completed"
-        );
-        assert!(
-            find_button_by_text(&container, "Connect an agent backend →").is_none(),
-            "backend CTA must disappear once a backend is enabled"
-        );
-
         add_project(&state, "local");
+        state.projects.update(|projects| {
+            projects.push(ProjectInfo {
+                host_id: "remote".to_owned(),
+                project: Project {
+                    id: ProjectId("p-remote".to_owned()),
+                    name: "builds".to_owned(),
+                    source: ProjectSource::Standalone { roots: Vec::new() },
+                    sort_order: 0,
+                },
+            })
+        });
+        let hosts = serde_json::to_string(&state.configured_hosts.get_untracked()).unwrap();
+        let previous_core = js_sys::eval("window.__TAURI__ && window.__TAURI__.core").unwrap();
+        let selected_hosts: js_sys::Array = js_sys::eval(&format!(
+            r#"(() => {{
+            const selected = [];
+            window.__TAURI__ = window.__TAURI__ || {{}};
+            window.__TAURI__.core = {{ invoke: (command, args) => {{
+                if (command !== 'set_selected_host') return Promise.resolve();
+                selected.push(args.hostId);
+                return Promise.resolve({{ hosts: {hosts}, selected_host_id: args.hostId }});
+            }}}};
+            return selected;
+        }})()"#
+        ))
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            let active_state = mount_state.clone();
+            Effect::new(move |_| {
+                if let Some(tab) = active_state.center_zone.with(|zone| zone.active_tab_id()) {
+                    active_state.bump_tab_lru(tab);
+                }
+            });
+            view! { <crate::components::center_zone::CenterZone /> }
+        });
         next_tick().await;
+
+        let home = || element(&container, ".home-view");
+        let host_select = || -> web_sys::HtmlSelectElement {
+            element(&home(), "select[aria-label='Host']").unchecked_into()
+        };
+        let project = || element(&home(), "button[aria-label='Project']");
+        let new_chat = || button(&home(), "New Chat");
+        let chooser = || -> web_sys::HtmlButtonElement {
+            element(
+                &home(),
+                "button[aria-label='Choose backend and agent role']",
+            )
+            .unchecked_into()
+        };
+        let project_choices = || {
+            let nodes = home()
+                .query_selector_all("[role=group][aria-label='Project choices'] button")
+                .unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+                .collect::<Vec<_>>()
+        };
+        let open_home_tab = async || {
+            element(&container, "[role=tab][aria-label='Home']").click();
+            next_tick().await;
+        };
+        let assert_new_chat_tab = |profile: &str, host: &str, role: Option<&str>| {
+            assert!(
+                container
+                    .query_selector("[role=tab][aria-selected=true][aria-label='New Chat']")
+                    .unwrap()
+                    .is_some(),
+                "New Chat opens and activates a draft tab"
+            );
+            let composer = state.composer_untracked();
+            assert_eq!(
+                composer.launch_profile_id.get_untracked(),
+                Some(protocol::LaunchProfileId(profile.to_owned())),
+                "the destination host's server default profile drives the draft"
+            );
+            assert_eq!(
+                composer.selection_host.get_untracked().as_deref(),
+                Some(host)
+            );
+            assert_eq!(
+                composer.custom_agent_id.get_untracked(),
+                role.map(|role| protocol::CustomAgentId(role.to_owned())),
+            );
+        };
+
+        let headings = container.query_selector_all("h1, h2, h3, h4").unwrap();
+        let headings: Vec<_> = (0..headings.length())
+            .filter_map(|i| headings.item(i)?.text_content())
+            .collect();
         assert_eq!(
-            checkmark_count(&container),
-            2,
-            "project step must show as completed"
+            headings,
+            vec!["Tyde"],
+            "the wordmark is Home's only heading"
         );
+        let text = visible_text(&home());
+        for removed in ["Coding Agent Studio", "Getting started", "first agent", "✓"] {
+            assert!(
+                !text.contains(removed),
+                "Home no longer shows {removed:?}: {text}"
+            );
+        }
+        assert_eq!(host_select().value(), "local");
+        assert_eq!(
+            project().text_content().as_deref(),
+            Some("No project / Home")
+        );
+        assert!(!new_chat().disabled() && !chooser().disabled());
+
+        let opener = project();
+        opener.focus().unwrap();
+        key(&opener, "ArrowDown", false);
+        next_tick().await;
+        let search = element(&home(), "input[aria-label='Find a project']");
         assert!(
-            find_button_by_text(&container, "Choose a folder →").is_none(),
-            "folder CTA must disappear once a project exists"
+            is_focused(&search),
+            "the project picker opens from the keyboard"
         );
-
-        add_agent(&state, "local");
-        next_tick().await;
+        key(&search, "ArrowDown", false);
+        key(&search, "ArrowDown", false);
+        let demo = project_choices()
+            .into_iter()
+            .find(|choice| choice.text_content().as_deref() == Some("demo"))
+            .expect("the selected host's project is offered");
+        assert!(is_focused(&demo), "arrow keys walk the project choices");
         assert_eq!(
-            checkmark_count(&container),
-            3,
-            "running an agent completes the last step"
+            project_choices()
+                .iter()
+                .filter_map(|choice| choice.text_content())
+                .collect::<Vec<_>>(),
+            vec!["No project / Home", "demo"],
+            "only the selected host's projects are offered"
         );
-
-        let text = visible_text(&container);
+        demo.click();
+        next_tick().await;
+        assert_eq!(project().text_content().as_deref(), Some("demo"));
         assert!(
-            text.contains("Getting started"),
-            "guide must stay visible after setup is complete: {text}"
+            is_focused(&project()),
+            "choosing returns focus to the picker"
+        );
+        assert_eq!(
+            state.active_project.get_untracked(),
+            None,
+            "choosing a project does not navigate away from Home"
         );
 
-        let help =
-            find_button_by_text(&container, "Help").expect("home screen must offer a Help button");
-        help.click();
+        new_chat().click();
+        next_tick().await;
+        let demo_ref = ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("p-1".to_owned()),
+        };
+        assert_eq!(state.active_project.get_untracked(), Some(demo_ref));
+        assert_new_chat_tab("local-claude", "local", None);
+        assert_eq!(
+            selected_hosts.length(),
+            0,
+            "a project chat keeps the host store"
+        );
+
+        open_home_tab().await;
+        assert_eq!(project().text_content().as_deref(), Some("demo"));
+        assert_eq!(host_select().value(), "local");
+        let select = host_select();
+        select.set_value("remote");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
         next_tick().await;
         assert_eq!(
-            state.help_tour_step.get_untracked(),
-            Some(0),
-            "Help button must start the guided tour at step 1"
+            selected_hosts.to_vec(),
+            vec![wasm_bindgen::JsValue::from("remote")]
         );
+        assert_eq!(
+            state.selected_host_id.get_untracked().as_deref(),
+            Some("remote")
+        );
+        assert_eq!(host_select().value(), "remote");
+        assert_eq!(
+            project().text_content().as_deref(),
+            Some("No project / Home")
+        );
+        project().click();
+        next_tick().await;
+        assert_eq!(
+            project_choices()
+                .iter()
+                .filter_map(|choice| choice.text_content())
+                .collect::<Vec<_>>(),
+            vec!["No project / Home", "builds"],
+            "a host change offers that host's projects"
+        );
+        key(
+            &element(&home(), "input[aria-label='Find a project']"),
+            "Escape",
+            false,
+        );
+        next_tick().await;
+        assert!(project_choices().is_empty());
+
+        new_chat().click();
+        next_tick().await;
+        assert_eq!(state.active_project.get_untracked(), None);
+        assert_new_chat_tab("remote-codex", "remote", Some("remote-home-role"));
+        assert_eq!(selected_hosts.length(), 1);
+
+        open_home_tab().await;
+        assert_eq!(host_select().value(), "remote");
+        assert_eq!(
+            project().text_content().as_deref(),
+            Some("No project / Home")
+        );
+        // An agent chat on another host in the other pane must not redirect
+        // the destination Home shows.
+        let local_agent = state
+            .open_tab(
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id: "local".to_owned(),
+                    agent_id: AgentId("local-agent".to_owned()),
+                }),
+                "Local agent".to_owned(),
+                true,
+            )
+            .unwrap();
+        state.split_tab_to(PaneId::Secondary, local_agent);
+        open_home_tab().await;
+        assert_eq!(
+            state
+                .active_agent
+                .get_untracked()
+                .map(|agent| agent.host_id)
+                .as_deref(),
+            Some("local"),
+            "the other pane's chat is the chat context"
+        );
+        assert_eq!(host_select().value(), "remote");
+        new_chat().click();
+        next_tick().await;
+        assert_new_chat_tab("remote-codex", "remote", Some("remote-home-role"));
+        state.close_tab(local_agent);
+        assert!(
+            state
+                .center_zone
+                .with_untracked(|zone| zone.split_ratio().is_none()),
+            "closing the split chat restores the single pane"
+        );
+        open_home_tab().await;
+        chooser().click();
+        next_tick().await;
+        assert_eq!(
+            chooser().get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let document = web_sys::window().unwrap().document().unwrap();
+        let dialogs = document
+            .query_selector_all("[role=dialog][aria-label='New agent']")
+            .unwrap();
+        assert_eq!(
+            dialogs.length(),
+            1,
+            "the full chooser stays reachable from Home"
+        );
+        let dialog: web_sys::Element = dialogs.item(0).unwrap().unchecked_into();
+        let dialog_host: web_sys::HtmlSelectElement =
+            element(&dialog, "select[aria-label='Host']").unchecked_into();
+        assert_eq!(
+            dialog_host.value(),
+            "remote",
+            "the chooser opens on Home's host"
+        );
+        assert_eq!(
+            element(&dialog, "button[aria-label='Project']")
+                .text_content()
+                .as_deref(),
+            Some("No project / Home")
+        );
+        element(&dialog, "button[aria-label='Close agent chooser']").click();
+        next_tick().await;
+        assert_eq!(
+            chooser().get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+
+        state.connection_statuses.update(|statuses| {
+            statuses.insert("remote".to_owned(), ConnectionStatus::Disconnected);
+        });
+        next_tick().await;
+        let alert = element(&home(), "[role=alert]");
+        assert!(visible_text(&alert).contains("offline"));
+        assert!(new_chat().disabled() && chooser().disabled());
+        state.connection_statuses.update(|statuses| {
+            statuses.insert("remote".to_owned(), ConnectionStatus::Connected);
+        });
+        next_tick().await;
+        assert!(home().query_selector("[role=alert]").unwrap().is_none());
+        assert!(!new_chat().disabled());
+
+        button(&home(), "Manage Hosts").click();
+        assert!(state.settings_open.get_untracked());
+        assert_eq!(state.settings_tab_request.get_untracked(), Some("Hosts"));
+        state.settings_open.set(false);
+        button(&home(), "Help").click();
+        assert_eq!(state.help_tour_step.get_untracked(), Some(0));
+        state.help_tour_step.set(None);
+        next_tick().await;
+
+        let root: HtmlElement = document.document_element().unwrap().unchecked_into();
+        let root_style = root.get_attribute("style");
+        let root_theme = root.get_attribute("data-theme");
+        root.style()
+            .set_property("--font-sans", "monospace")
+            .unwrap();
+        root.style()
+            .set_property("--base-font-size", "20px")
+            .unwrap();
+        let mut title_colors = Vec::new();
+        for theme in ["dark", "light"] {
+            // The theme lives on the root beside the configured font, as the
+            // appearance settings apply it.
+            root.set_attribute("data-theme", theme).unwrap();
+            for width in [900, 340] {
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                next_tick().await;
+                let title = element(&home(), "h1");
+                assert!((px(&title, "font-size") - 2.769 * 20.0).abs() < 0.1);
+                for control in [
+                    title.clone(),
+                    host_select().unchecked_into(),
+                    project(),
+                    new_chat().unchecked_into(),
+                ] {
+                    let family = computed(&control, "font-family");
+                    assert!(
+                        family.contains("monospace"),
+                        "Home keeps the configured font, got {family:?}"
+                    );
+                    if !control.is_same_node(Some(&title)) {
+                        assert_eq!(px(&control, "font-size"), 20.0, "controls keep 1rem text");
+                    }
+                }
+                let scroller = home()
+                    .closest(".center-content-scroll")
+                    .unwrap()
+                    .expect("Home renders in the center scroll area");
+                assert!(
+                    scroller.scroll_width() <= scroller.client_width(),
+                    "Home must not scroll sideways at {width}px"
+                );
+                let bounds = scroller.get_bounding_client_rect();
+                let host = host_select().get_bounding_client_rect();
+                let picker = project().get_bounding_client_rect();
+                let start = new_chat().get_bounding_client_rect();
+                let choose = chooser().get_bounding_client_rect();
+                for rect in [&host, &picker, &start, &choose] {
+                    assert!(rect.left() >= bounds.left() && rect.right() <= bounds.right() + 0.5);
+                }
+                if width == 900 {
+                    assert_eq!(
+                        host.top(),
+                        picker.top(),
+                        "Host and Project sit side by side"
+                    );
+                } else {
+                    assert!(
+                        picker.top() >= host.bottom(),
+                        "Host and Project stack when narrow"
+                    );
+                }
+                let form_right = host.right().max(picker.right());
+                assert!(
+                    (start.left() - host.left()).abs() < 0.5
+                        && (choose.right() - form_right).abs() < 0.5,
+                    "New Chat spans the form"
+                );
+                assert!(
+                    start.top() >= host.bottom().max(picker.bottom()),
+                    "New Chat follows the Host and Project choices at {width}px"
+                );
+                for label in ["Manage Hosts", "Help"] {
+                    let rect = button(&home(), label).get_bounding_client_rect();
+                    assert!(rect.width() > 0.0 && rect.right() <= bounds.right() + 0.5);
+                    assert!(
+                        rect.top() >= start.bottom(),
+                        "{label} follows New Chat at {width}px"
+                    );
+                }
+            }
+            title_colors.push(computed(&element(&home(), "h1"), "color"));
+        }
+        assert_ne!(
+            title_colors[0], title_colors[1],
+            "Home follows the active theme"
+        );
+        match root_style {
+            Some(style) => root.set_attribute("style", &style).unwrap(),
+            None => root.remove_attribute("style").unwrap(),
+        }
+        match root_theme {
+            Some(theme) => root.set_attribute("data-theme", &theme).unwrap(),
+            None => root.remove_attribute("data-theme").unwrap(),
+        }
+        drop(handle);
+        container.remove();
+        js_sys::Reflect::set(
+            &js_sys::eval("window.__TAURI__").unwrap(),
+            &"core".into(),
+            &previous_core,
+        )
+        .unwrap();
     }
 
     #[wasm_bindgen_test]
@@ -1039,11 +1380,6 @@ mod wasm_tests {
         });
 
         next_tick().await;
-        assert_eq!(
-            checkmark_count(&container),
-            0,
-            "an enabled but unusable backend must not complete first-run setup"
-        );
         let warning = container
             .query_selector(".home-backend-error")
             .unwrap()
@@ -1130,10 +1466,13 @@ mod wasm_tests {
             <crate::components::command_palette::CommandPalette /> }
         });
         next_tick().await;
-        let open = find_button_by_text(&container, "Getting started")
-            .expect("Home must have a permanent Getting started action");
-        open.focus().unwrap();
-        open.click();
+        let help_opener = button(&container, "Help");
+        help_opener.focus().unwrap();
+        help_opener.click();
+        next_tick().await;
+        let tour_start = button(&element(&container, ".help-tour-card"), "Getting started");
+        tour_start.focus().unwrap();
+        tour_start.click();
         next_tick().await;
         let dialog = guide(&container);
         assert!(visible_text(&dialog).contains("Choose a computer"));
@@ -1166,7 +1505,10 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(is_focused(&open), "closing restores focus to Home's opener");
+        assert!(
+            is_focused(&help_opener),
+            "closing returns focus to Home's Help, which opened the tour"
+        );
 
         state.selected_host_id.set(Some("local".to_owned()));
         enable_backend(&state, "local");
@@ -1182,7 +1524,7 @@ mod wasm_tests {
             .all_tabs()
             .map(|(_, tab)| tab.id)
             .collect();
-        open.click();
+        state.getting_started_open.set(true);
         next_tick().await;
         let text = visible_text(&guide(&container));
         assert!(text.contains("Installed") && text.contains("Enabled"));
@@ -1308,7 +1650,7 @@ mod wasm_tests {
             view! { <crate::components::center_zone::CenterZone /> <GettingStarted /> <crate::components::host_browser::HostBrowser /> <crate::components::terminal_view::TerminalView /> }
         });
         next_tick().await;
-        button(&container, "Getting started").click();
+        state.getting_started_open.set(true);
         next_tick().await;
         assert!(button(&guide(&container), "Continue to folder").disabled());
         button(&guide(&container), "Install").click();
@@ -1615,7 +1957,7 @@ mod wasm_tests {
             view! { <HomeView /> <GettingStarted /> <crate::components::settings_panel::SettingsPanel /> <crate::components::terminal_view::TerminalView /> }
         });
         next_tick().await;
-        button(&container, "Getting started").click();
+        state.getting_started_open.set(true);
         next_tick().await;
         assert!(
             button(&guide(&container), "Continue to folder").disabled(),
