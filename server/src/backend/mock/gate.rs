@@ -3,15 +3,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub(super) struct MockGate(Arc<MockGateInner>);
 
 #[derive(Debug)]
 pub(super) struct MockGateInner {
-    entered_tx: mpsc::UnboundedSender<()>,
-    entered_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    entered: Semaphore,
     release: Semaphore,
     busy_releases: AtomicUsize,
 }
@@ -20,7 +19,7 @@ impl MockGate {
     /// Parks until released; true when the release asked the provider to
     /// report itself busy with a turn of its own.
     pub(super) async fn wait(&self) -> bool {
-        let _ = self.0.entered_tx.send(());
+        self.signal();
         if let Ok(permit) = self.0.release.acquire().await {
             permit.forget();
         }
@@ -30,6 +29,11 @@ impl MockGate {
                 count.checked_sub(1)
             })
             .is_ok()
+    }
+
+    /// Records an entry without parking.
+    pub(super) fn signal(&self) {
+        self.0.entered.add_permits(1);
     }
 }
 
@@ -42,11 +46,9 @@ pub struct MockGateHandle {
 impl MockGateHandle {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let (entered_tx, entered_rx) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(MockGateInner {
-                entered_tx,
-                entered_rx: Mutex::new(entered_rx),
+                entered: Semaphore::new(0),
                 release: Semaphore::new(0),
                 busy_releases: AtomicUsize::new(0),
             }),
@@ -62,12 +64,11 @@ impl MockGateHandle {
     /// an event-deadline timeout; it is the happens-before edge itself.
     pub async fn wait_until_entered(&self) {
         self.inner
-            .entered_rx
-            .lock()
+            .entered
+            .acquire()
             .await
-            .recv()
-            .await
-            .expect("mock gate closed before a turn entered it");
+            .expect("mock gate closed before a turn entered it")
+            .forget();
     }
 
     pub fn release_one(&self) {

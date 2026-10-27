@@ -157,9 +157,18 @@ async fn singleton_settings_resume_reset_and_secret_boundary() {
         .filter(|entry| entry.mid_turn == MidTurnSteeringCapability::Supported)
         .map(|entry| entry.backend_kind)
         .collect();
+    // The real bootstrap describes Tychat's existing steer-or-cancel/send
+    // contract, including declared interruption without native steering.
     assert_eq!(
         capable,
-        vec![BackendKind::Claude, BackendKind::Codex, BackendKind::Hermes]
+        vec![
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Hermes,
+            BackendKind::Grok,
+            BackendKind::Muse,
+        ]
     );
     let (generation, agent) = pair(&mut fixture).await;
     let host = fixture.tychat_host();

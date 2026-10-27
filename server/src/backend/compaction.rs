@@ -305,6 +305,7 @@ pub enum BackendCompactionDeferredReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendCompactionNotDispatchedReason {
+    Interrupted,
     NativeUnavailable(BackendCompactionUnavailableReason),
     CapabilityUnknown(BackendCompactionUnknownReason),
     BackendClosed,

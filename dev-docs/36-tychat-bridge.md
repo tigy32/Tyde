@@ -73,10 +73,12 @@ credential and authorization checks remain intact.
 
 The typed host settings contain enablement, custom agent (`None` is the plain
 Default agent), backend, backend-native session values and optional launch
-profile. A custom agent that no longer exists is rejected. Only backends whose
-server declaration says they can steer mid-turn are admitted. Claude, Codex and
-Hermes implement `SteerOutcome` today; other providers inherit Unsupported.
-The frontend filters the server-published capability entries, not backend names.
+profile. A custom agent that no longer exists is rejected. A backend must
+support native steering or actual interruption. Tychat already routes an
+Unsupported steer through cancellation and acknowledged send; its published
+mid-turn eligibility describes this redirect contract, not native steering
+alone. Providers lacking both are rejected. The frontend filters the
+server-published capability entries, not backend names.
 Session controls reuse backend-defined schemas and launch-profile resolution.
 A changed launch profile definition also explicitly applies on reset.
 Live session settings use the existing acknowledged application path. Custom agent,

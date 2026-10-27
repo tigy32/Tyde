@@ -2868,13 +2868,14 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             .count(),
         2
     );
-    let (failed, _) = call_agent_control_request(
+    // The caller is answered once the message is sent, which is after the
+    // destination continuation.
+    let retained_global = tokio::spawn(call_agent_control_request(
         fixture.agent_control_http_url().await,
         Some(bearer.clone()),
         "tyde_send_agent_message".to_owned(),
         json!({"agent_id": start.agent_id, "message": "Retained global input", "interrupt": true, "global": true}),
-    ).await;
-    assert!(!failed, "idle explicit interrupt must retain the message");
+    ));
     fixture
         .next_chat_event_matching(&agent, "global interruption retires question", |event| {
             matches!(event, protocol::ChatEvent::ToolExecutionCompleted(completion)
@@ -2975,6 +2976,10 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             "retained input must execute only in destination"
         );
     }
+    let (failed, _) = retained_global
+        .await
+        .expect("retained global delivery task");
+    assert!(!failed, "idle explicit interrupt must deliver the message");
     fixture.mock(&agent).await;
     let delivered_requests = diagnostic_mock.requests_after_commands().await;
     assert_eq!(
@@ -3078,6 +3083,7 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             requests_before + 1,
             "idle question and pending move must not dispatch or cancel queued input"
         );
+        let mut cancelling_delivery = None;
         match case {
             0 | 3 => {
                 let (url, name, global) = if case == 0 {
@@ -3094,14 +3100,12 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
                 if global {
                     arguments["global"] = json!(true);
                 }
-                let (failed, _) = call_agent_control_request(
+                cancelling_delivery = Some(tokio::spawn(call_agent_control_request(
                     url,
                     Some(bearer.clone()),
                     name.to_owned(),
                     arguments,
-                )
-                .await;
-                assert!(!failed, "explicit idle cancellation must retain its input");
+                )));
             }
             1 => fixture
                 .client
@@ -3219,6 +3223,10 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
             serde_json::from_str::<Vec<String>>(&reported).unwrap() == destination_roots,
             "recovered input must use actual destination roots"
         );
+        if let Some(delivery) = cancelling_delivery {
+            let (failed, _) = delivery.await.expect("cancelling delivery task");
+            assert!(!failed, "explicit idle cancellation must deliver its input");
+        }
         fixture.mock(&agent).await;
         let final_requests = diagnostic_mock.requests_after_commands().await;
         let final_requests = &final_requests[requests_before..];

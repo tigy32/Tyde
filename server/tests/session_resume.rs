@@ -8631,7 +8631,6 @@ async fn restart_during_initial_prompt_startup_continues_the_spawned_turn() {
 /// continuation.
 #[tokio::test]
 async fn messages_held_by_replay_survive_a_second_restart() {
-    use protocol::MessageOrigin;
     let mut fixture = Fixture::new().await;
     let replay = server::backend::mock::MockResumeReplay::default();
     let (_agent, session) = spawn_restart_agent(
@@ -8668,44 +8667,38 @@ async fn messages_held_by_replay_survive_a_second_restart() {
     let bootstrap = restart_with_live_recovery_subscription(&mut fixture, false).await;
     let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
     let stream = restored.instance_stream.clone();
-    Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
-        observation.stream(&stream).settled_after("held second")
-    })
-    .await;
-    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
-    assert_eq!(
-        inputs
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).settled_after("held second")
+        })
+        .await;
+    let position = |needle: &str| {
+        let positions: Vec<_> = observation
+            .sequence
             .iter()
-            .map(|input| (
-                input.origin == Some(MessageOrigin::HostRestart),
-                input.message.starts_with(CONTINUATION_PREFIX)
-            ))
-            .collect::<Vec<_>>(),
-        vec![(true, true), (false, false), (false, false)],
-        "the held messages survive the second restart behind the continuation: {inputs:?}"
+            .enumerate()
+            .filter_map(|(index, (observed_stream, item))| {
+                (observed_stream == &stream
+                    && matches!(item, Observed::Delta(text) if text.contains(needle)))
+                .then_some(index)
+            })
+            .collect();
+        assert_eq!(
+            positions.len(),
+            1,
+            "each replay-held human message produces one visible answer after restart"
+        );
+        positions[0]
+    };
+    let first = position("held first");
+    let second = position("held second");
+    assert!(
+        observation.phase_position(&stream, &protocol::RestartRecoveryPhase::Continuing) < first,
+        "restart continuation is visible before held human input"
     );
-    assert_eq!(
-        inputs[1..]
-            .iter()
-            .map(|input| input.message.as_str())
-            .collect::<Vec<_>>(),
-        vec!["held first", "held second"]
-    );
-}
-
-/// Delivers `message` to a child through the parent's agent-control
-/// `tyde_send_agent_message`, the acknowledged delivery path.
-async fn deliver_agent_message(
-    fixture: &Fixture,
-    parent: &protocol::AgentId,
-    child: &protocol::AgentId,
-    message: &str,
-) {
-    let response = agent_control_delivery(fixture, parent, child, message).await;
-    assert_eq!(
-        response["result"]["isError"],
-        serde_json::Value::Bool(false),
-        "agent-control delivery failed: {response}"
+    assert!(
+        first < second,
+        "durable human input runs in its original order"
     );
 }
 
@@ -8746,7 +8739,8 @@ async fn agent_control_delivery(
 }
 
 /// A message queued on an idle agent held by its usage quota is not a turn in
-/// flight: a restart redelivers it without continuing anything.
+/// flight: a restart redelivers it without continuing anything. An
+/// agent-control follow-up is refused rather than queued behind the pause.
 #[tokio::test]
 async fn quota_queued_message_on_idle_agent_is_not_continued_after_restart() {
     let mut fixture = Fixture::new().await;
@@ -8781,13 +8775,24 @@ async fn quota_queued_message_on_idle_agent_is_not_continued_after_restart() {
     let agent_id = agent.new_agent.agent_id.clone();
     record_claude_quota(&fixture, 95).await;
     fixture.mock_by_id(&agent_id).await;
-    deliver_agent_message(
+    let refused = agent_control_delivery(
         &fixture,
         &parent.new_agent.agent_id,
         &agent_id,
-        "held by quota",
+        "refused by quota",
     )
     .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "an agent-control follow-up cannot steer or send a paused agent: {refused}"
+    );
+    assert!(refused.to_string().contains("usage limit"), "{refused}");
+    fixture
+        .client
+        .send_message(&agent.stream, "held by quota".to_owned())
+        .await
+        .expect("queue behind the usage pause");
     fixture.expect_queued_messages(&agent, 1).await;
     fixture.mock_by_id(&agent_id).await;
 
@@ -8965,7 +8970,8 @@ async fn busy_provider_retains_the_restart_continuation() {
 }
 
 /// When the provider runs a turn of its own after a restart, the owed
-/// continuation waits for it to end. A user who stops that turn and sends a
+/// continuation waits for it to end. An agent-control follow-up cannot run
+/// ahead of it and is refused. A user who stops that turn and sends a
 /// message has taken over: their message runs, the stale continuation never
 /// does, and no later restart revives it.
 #[tokio::test]
@@ -8977,17 +8983,30 @@ async fn user_interrupt_drops_the_owed_restart_continuation() {
     let replay = server::backend::mock::MockResumeReplay::default();
     let send_gate = server::backend::mock::MockGateHandle::new();
     replay.gate_sends(&send_gate);
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "owed continuation parent",
+        "parent prompt",
+        None,
+        MockScript::one(MockTurn::text("parent done")),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let parent_id = parent.new_agent.agent_id.clone();
     let (_agent, session) = spawn_restart_agent(
         &mut fixture,
         "interrupt owed continuation",
         "unfinished prompt",
-        None,
+        Some(parent_id.clone()),
         MockScript::one(MockTurn::held_text("unfinished")).with_controlled_resume_replay(&replay),
     )
     .await;
 
     let bootstrap = fixture.restart_host().await;
-    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let restored = RestoredReplay::seed(&bootstrap)
+        .agents(&mut fixture, &[parent_session, session.clone()])
+        .await
+        .remove(1);
     let stream = restored.instance_stream.clone();
     replay.wait_until_started().await;
     fixture
@@ -9015,6 +9034,19 @@ async fn user_interrupt_drops_the_owed_restart_continuation() {
         "the continuation is owed while the provider's own turn runs: {:?}",
         busy.stream(&stream).items
     );
+    let refused = agent_control_delivery(
+        &fixture,
+        &parent_id,
+        &restored.agent_id,
+        "ahead of the continuation",
+    )
+    .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "an agent-control follow-up cannot run ahead of the owed continuation: {refused}"
+    );
+    assert!(refused.to_string().contains("host restart"), "{refused}");
 
     fixture
         .client
@@ -9230,37 +9262,97 @@ async fn unrecordable_turn_is_refused() {
     );
 }
 
-/// The messages a live agent's provider has received, its launch prompt
-/// first, once there are at least `count` of them.
-async fn wait_for_provider_messages(
-    fixture: &Fixture,
+async fn restored_first_turn_output(
+    fixture: &mut Fixture,
+    bootstrap: &settings_model::HostBootstrapPayload,
     agent_id: &protocol::AgentId,
-    count: usize,
+    refused_control: Option<&str>,
 ) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut messages = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        if let Some(mock) = fixture.host_for_test().mock_control(agent_id).await {
-            messages = mock
-                .requests()
-                .await
-                .into_iter()
-                .filter_map(|request| match request {
-                    server::backend::mock::MockRequest::Launch { message } => Some(message),
-                    server::backend::mock::MockRequest::Input(input) => Some(input.message),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if messages.len() >= count {
-                return messages;
+    let mut descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|agent| &agent.agent_id == agent_id)
+        .cloned();
+    while descriptor.is_none() {
+        let env = fixture
+            .next_frame_matching("restored startup descriptor", |env| {
+                env.kind == FrameKind::NewAgent
+                    && env
+                        .parse_payload::<NewAgentPayload>()
+                        .is_ok_and(|agent| &agent.agent_id == agent_id)
+            })
+            .await;
+        descriptor = Some(env.parse_payload().expect("restored startup descriptor"));
+    }
+    let stream = descriptor.expect("observed descriptor").instance_stream;
+    let mut output = Vec::new();
+    let mut idle = false;
+    loop {
+        let env = fixture
+            .next_frame_matching("restored first-turn output and idle", |env| {
+                env.stream == stream
+                    && matches!(
+                        env.kind,
+                        FrameKind::AgentBootstrap
+                            | FrameKind::ChatEvent
+                            | FrameKind::AgentActivityChanged
+                            | FrameKind::AgentError
+                    )
+            })
+            .await;
+        let events = match env.kind {
+            FrameKind::AgentBootstrap => {
+                let payload: AgentBootstrapPayload =
+                    env.parse_payload().expect("restored bootstrap");
+                idle = payload.activity == protocol::AgentActivity::Idle;
+                payload
+                    .events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                        AgentBootstrapEvent::AgentError(_) => panic!("restored startup failed"),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            FrameKind::AgentActivityChanged => {
+                let payload: protocol::AgentActivityChangedPayload =
+                    env.parse_payload().expect("restored activity");
+                idle = payload.activity == protocol::AgentActivity::Idle;
+                Vec::new()
+            }
+            FrameKind::AgentError => panic!("restored first turn failed"),
+            FrameKind::ChatEvent => vec![env.parse_payload().expect("restored chat event")],
+            _ => unreachable!("selected restoration frame"),
+        };
+        for event in events {
+            let message = match event {
+                ChatEvent::TypingStatusChanged(active) => {
+                    idle = !active;
+                    None
+                }
+                ChatEvent::MessageAdded(message) => Some(message),
+                ChatEvent::StreamEnd(end) => Some(end.message),
+                _ => None,
+            };
+            if let Some(message) = message {
+                assert!(
+                    !matches!(message.sender, protocol::MessageSender::Error),
+                    "restored first turn must not emit an error"
+                );
+                assert!(
+                    !refused_control.is_some_and(|control| message.content.contains(control)),
+                    "the refused control must never appear as delivered input or output"
+                );
+                if matches!(message.sender, protocol::MessageSender::Assistant { .. }) {
+                    output.push(message.content);
+                }
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if idle && !output.is_empty() {
+            return output;
+        }
     }
-    panic!(
-        "the provider received {} of {count} messages: {messages:?}",
-        messages.len()
-    );
 }
 
 /// Spawns `params` under `name` with its backend startup held at the ready
@@ -9311,8 +9403,7 @@ fn new_agent_params(workspace_root: &str, prompt: &str) -> SpawnAgentParams {
 }
 
 /// A host killed while a new agent is still starting, before its provider
-/// session exists, restores that agent: its first prompt runs, followed by the
-/// message acknowledged while it was starting.
+/// session exists, restores its first prompt, never an undelivered control.
 #[tokio::test]
 async fn hard_kill_during_new_agent_startup_restores_its_first_turn() {
     let mut fixture = Fixture::new().await;
@@ -9333,14 +9424,30 @@ async fn hard_kill_during_new_agent_startup_restores_its_first_turn() {
         new_agent_params("/tmp/startup-kill-child", "first prompt"),
     )
     .await;
-    deliver_agent_message(&fixture, &parent_id, &child.agent_id, "sent during startup").await;
-
-    fixture.relaunch_host_after_kill().await;
+    let response =
+        agent_control_delivery(&fixture, &parent_id, &child.agent_id, "sent during startup").await;
+    assert!(
+        response["result"]["isError"] == true && response.to_string().contains("starting"),
+        "a control must refuse startup rather than acknowledge durable queue admission"
+    );
+    let bootstrap = fixture.relaunch_host_after_kill().await;
     drop(ready_gate);
+    let output = restored_first_turn_output(
+        &mut fixture,
+        &bootstrap,
+        &child.agent_id,
+        Some("sent during startup"),
+    )
+    .await;
+    // The mock's visible launch-configuration header precedes its exact echo.
     assert_eq!(
-        wait_for_provider_messages(&fixture, &child.agent_id, 2).await,
-        vec!["first prompt", "sent during startup"],
-        "the restored agent runs its first prompt, then the acknowledged message"
+        output.len(),
+        1,
+        "the restored first prompt produces one response"
+    );
+    assert!(
+        output[0].ends_with("mock backend response to: first prompt"),
+        "the restored first prompt runs without the refused control"
     );
 }
 
@@ -9371,56 +9478,35 @@ async fn hard_kill_during_fork_startup_restores_its_first_turn() {
     )
     .await;
 
-    fixture.relaunch_host_after_kill().await;
+    let bootstrap = fixture.relaunch_host_after_kill().await;
     drop(ready_gate);
-    assert_eq!(
-        wait_for_provider_messages(&fixture, &fork.agent_id, 1).await,
-        vec!["fork prompt"],
-        "the restored fork runs its first prompt"
+    let output = restored_first_turn_output(&mut fixture, &bootstrap, &fork.agent_id, None).await;
+    let inherited = output
+        .iter()
+        .filter(|text| text.as_str() == "source done")
+        .count();
+    let restored = output
+        .iter()
+        .filter(|text| text.ends_with("mock backend response to: fork prompt"))
+        .count();
+    eprintln!(
+        "RESTORED FORK VISIBLE responses={} inherited={inherited} restored={restored}",
+        output.len()
     );
-}
-
-/// A message delivered to a starting agent is acknowledged only once it is
-/// durably held; one the store refuses is rejected and never sent.
-#[tokio::test]
-async fn unretained_startup_delivery_is_rejected() {
-    let mut fixture = Fixture::new().await;
-    let (parent, _parent_session) = spawn_restart_agent(
-        &mut fixture,
-        "unretained startup parent",
-        "parent prompt",
-        None,
-        MockScript::one(MockTurn::text("parent done")),
-    )
-    .await;
-    fixture.finish_turn(&parent).await;
-    let parent_id = parent.new_agent.agent_id.clone();
-    let (ready_gate, child) = spawn_held_at_startup(
-        &mut fixture,
-        "unretained startup child",
-        Some(parent_id.clone()),
-        new_agent_params("/tmp/unretained-startup-child", "first prompt"),
-    )
-    .await;
-    let failure = fixture.fail_next_session_commit();
-    let response =
-        agent_control_delivery(&fixture, &parent_id, &child.agent_id, "unretained").await;
-    drop(failure);
+    // The client receives fork history as well as the recovered first turn.
+    // Require both identities once rather than counting history as execution.
     assert_eq!(
-        response["result"]["isError"],
-        serde_json::Value::Bool(true),
-        "an unretained startup delivery must not be acknowledged: {response}"
+        output.len(),
+        2,
+        "fork history and restored output remain visible"
     );
-    assert!(
-        response.to_string().contains("cannot record the turn"),
-        "{response}"
-    );
-    deliver_agent_message(&fixture, &parent_id, &child.agent_id, "retained").await;
-    drop(ready_gate);
     assert_eq!(
-        wait_for_provider_messages(&fixture, &child.agent_id, 2).await,
-        vec!["first prompt", "retained"],
-        "the rejected message never reaches the provider"
+        inherited, 1,
+        "the source assistant response survives the fork"
+    );
+    assert_eq!(
+        restored, 1,
+        "the restored fork runs its first prompt exactly once"
     );
 }
 
@@ -9448,24 +9534,17 @@ async fn unretained_replay_delivery_is_rejected() {
         .send_message(&stream, "held first".to_owned())
         .await
         .expect("send while replaying");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let store = SessionStore::load(fixture.session_store_path()).expect("load session store");
-        let held = store.get(&session).is_some_and(|record| {
-            record
-                .queued_messages
-                .iter()
-                .any(|entry| entry.message == "held first")
-        });
-        if held {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the first replay message is held durably"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("ordered replay send boundary");
+    fixture
+        .next_frame_matching("SessionList after replay input", |env| {
+            env.kind == FrameKind::SessionList
+        })
+        .await;
+    fixture.mock_by_id(&restored.agent_id).await;
     let (consumed_tx, consumed) = tokio::sync::oneshot::channel();
     let failure = server::store::session::commit_hooks::InstalledHook::install(
         SessionStore::database_path(&fixture.session_store_path()),
@@ -9518,24 +9597,64 @@ async fn unretained_replay_delivery_is_rejected() {
         "{error:?}"
     );
     drop(failure);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let inputs = loop {
-        let inputs = mock_inputs(&fixture, &restored.agent_id).await;
-        if inputs.iter().any(|input| input.message == "held first")
-            || tokio::time::Instant::now() >= deadline
-        {
-            break inputs;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observed| {
+        observed.stream(&stream).settled_after("held first")
+    })
+    .await;
+    // Recovery must preserve the accepted input exactly once in the visible
+    // transcript, not merely leave a row in a private store or mock input log.
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    expect_raw_event_on_stream(
+        &mut fixture.client,
+        &stream,
+        FrameKind::AgentBootstrap,
+        "restarted transcript bootstrap",
+    )
+    .await;
+    let history =
+        fetch_history_page(&mut fixture.client, &stream, restored.agent_id, None, 100).await;
+    assert!(
+        !history.has_more_before,
+        "the complete retained transcript is visible"
+    );
+    let visible: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, protocol::MessageSender::Assistant { .. }) =>
+            {
+                Some(message.content.as_str())
+            }
+            ChatEvent::StreamEnd(end)
+                if matches!(
+                    end.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                ) =>
+            {
+                Some(end.message.content.as_str())
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        inputs.last().map(|input| input.message.as_str()),
-        Some("held first"),
-        "{inputs:?}"
+        visible
+            .iter()
+            .filter(|text| text.contains("held first"))
+            .count(),
+        1,
+        "the accepted replay-held message produces exactly one visible restored answer"
     );
     assert!(
-        inputs.iter().all(|input| input.message != "unretained"),
-        "the rejected message never reaches the provider: {inputs:?}"
+        history.events.iter().all(|event| match event {
+            ChatEvent::MessageAdded(message) => !message.content.contains("unretained"),
+            ChatEvent::StreamEnd(end) => !end.message.content.contains("unretained"),
+            ChatEvent::StreamDelta(delta) => !delta.text.contains("unretained"),
+            _ => true,
+        }),
+        "the rejected input never becomes a visible restored message or response"
     );
 }
 

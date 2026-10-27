@@ -850,9 +850,7 @@ pub(crate) fn steering_capabilities() -> Vec<BackendSteeringCapability> {
         .into_iter()
         .map(|kind| BackendSteeringCapability {
             backend_kind: kind,
-            mid_turn: if crate::backend::capabilities_for_backend_kind(kind)
-                .contains(tyde_agent_adapter::BackendCapability::MidTurnSteering)
-            {
+            mid_turn: if crate::backend::supports_running_redirect(kind) {
                 MidTurnSteeringCapability::Supported
             } else {
                 MidTurnSteeringCapability::Unsupported

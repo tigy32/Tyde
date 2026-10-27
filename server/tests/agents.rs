@@ -8645,6 +8645,8 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
             script = script
                 .then(MockTurn::held_text("first follow-up reply"))
                 .then(MockTurn::held_text("second follow-up reply"));
+        } else {
+            script = script.then(MockTurn::held_text("completion-race reply"));
         }
         let mut script = script
             .then(MockTurn::gated_text("redirect reply", &redirect_gate))
@@ -8807,6 +8809,56 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
                 usize::from(!native_steering),
                 "native steering must not cancel; unavailable steering must cancel before delivery"
             );
+        }
+
+        if native_steering {
+            // The turn ends under the steer: the follow-up is sent as the next
+            // turn, never parked in the editable queue or answered early.
+            fixture
+                .mock_by_id(&child)
+                .await
+                .end_held_turn_before_steer()
+                .await;
+            let delivered = mcp_tool_call_as(
+                &caller,
+                false,
+                "tyde_send_agent_message",
+                json!({"agent_id": child.0, "message": "completion-race follow-up"}),
+            )
+            .await;
+            assert!(!mcp_result_is_error(&delivered));
+            fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "completion-race follow-up sent as the next turn",
+                |env| {
+                    if env.stream != *stream {
+                        return false;
+                    }
+                    if env.kind == FrameKind::QueuedMessages {
+                        assert!(
+                            env.parse_payload::<protocol::QueuedMessagesPayload>()
+                                .unwrap()
+                                .messages
+                                .iter()
+                                .all(|entry| entry.message != "completion-race follow-up"),
+                            "agent-control delivery must never become an editable queued message"
+                        );
+                    }
+                    if env.kind != FrameKind::ChatEvent {
+                        return false;
+                    }
+                    match env.parse_payload::<ChatEvent>().unwrap() {
+                        ChatEvent::OperationCancelled(_) => {
+                            panic!("a turn that ended on its own must not be cancelled")
+                        }
+                        ChatEvent::MessageAdded(message) => {
+                            message.content == "completion-race follow-up"
+                        }
+                        _ => false,
+                    }
+                },
+            )
+            .await;
         }
 
         fixture
@@ -9083,26 +9135,48 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
             !mcp_result_is_error(&redirected),
             "interrupt delivery must be accepted"
         );
-        fixture::next_chat_event_matching_on(
+        let mut redirect_cancelled = false;
+        fixture::next_frame_matching_on(
             &mut fixture.client,
-            stream,
-            "interrupt cancellation",
-            |event| matches!(event, ChatEvent::OperationCancelled(_)),
-        )
-        .await;
-        redirect_gate.wait_until_entered().await;
-        fixture::next_chat_event_matching_on(
-            &mut fixture.client,
-            stream,
-            "redirected input",
-            |event| {
-                matches!(event, ChatEvent::MessageAdded(message)
-                if matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
-                    && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &parent.agent_id)
-                    && message.content == "redirect now")
+            "interrupt cancels, then sends next",
+            |env| {
+                if env.stream != *stream {
+                    return false;
+                }
+                if env.kind == FrameKind::QueuedMessages {
+                    assert!(
+                        env.parse_payload::<protocol::QueuedMessagesPayload>()
+                            .unwrap()
+                            .messages
+                            .iter()
+                            .all(|entry| entry.message != "redirect now"),
+                        "agent-control delivery must never become an editable queued message"
+                    );
+                }
+                if env.kind != FrameKind::ChatEvent {
+                    return false;
+                }
+                match env.parse_payload::<ChatEvent>().unwrap() {
+                    ChatEvent::OperationCancelled(_) => {
+                        redirect_cancelled = true;
+                        false
+                    }
+                    ChatEvent::MessageAdded(message) => {
+                        let redirected = matches!(&message.sender, MessageSender::Agent { agent } if agent == &parent.name)
+                            && matches!(&message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(id), .. }) if id == &parent.agent_id)
+                            && message.content == "redirect now";
+                        assert!(
+                            !redirected || redirect_cancelled,
+                            "the redirect is sent after its cancellation"
+                        );
+                        redirected
+                    }
+                    _ => false,
+                }
             },
         )
         .await;
+        redirect_gate.wait_until_entered().await;
 
         let await_redirect = mcp_await_agent(&caller, &child);
         tokio::pin!(await_redirect);
@@ -9267,6 +9341,409 @@ async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
 
         fixture.mock(&resumed).await.assert_clean().await;
     }
+}
+
+/// Closing an agent refuses an agent-control interrupt still waiting for the
+/// turn it cancelled to end; the message is neither sent nor queued.
+#[tokio::test]
+async fn closing_agent_refuses_held_agent_control_interrupt() {
+    for backend_exit in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let parent = spawn_agent_control_parent(&mut fixture, "held-control-parent").await;
+        let caller = fixture.agent_control_caller(&parent.agent_id).await;
+        let interrupt_gate = MockGateHandle::new();
+        let reservation = fixture
+            .reserve_next_mock_launch(
+                "held-control-child",
+                MockScript::one(MockTurn::held_text("held reply"))
+                    .with_user_bubbles()
+                    .with_native_child_idle_gate(&interrupt_gate),
+            )
+            .await;
+        let child = mcp_spawn_agent_as(
+            &caller,
+            json!({
+                "workspace_roots": ["/tmp/held-control-child"],
+                "prompt": "start held turn",
+                "name": "held-control-child",
+                "backend_kind": "claude"
+            }),
+        )
+        .await;
+        drop(reservation);
+        let child_new =
+            expect_replayed_new_agent(&mut fixture.client, &child, "held control child").await;
+        let stream = child_new.instance_stream.clone();
+        fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &stream,
+        "held turn",
+        |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "held reply"),
+    )
+    .await;
+
+        let mock = fixture.mock_by_id(&child).await;
+        let refused = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_send_agent_message",
+            json!({"agent_id": child.0, "message": "refused by close", "interrupt": true}),
+        );
+        tokio::pin!(refused);
+        // The actor holds the message in the step that issues the interrupt, so a
+        // close sent once the backend parks on that interrupt finds it held.
+        tokio::select! {
+            biased;
+            () = interrupt_gate.wait_until_entered() => {}
+            _ = &mut refused => panic!("a follow-up must not be answered before the turn it cancelled ends"),
+        }
+        if backend_exit {
+            mock.close_stream().await;
+        } else {
+            fixture
+                .client
+                .close_agent(&stream)
+                .await
+                .expect("close held control agent");
+        }
+        let refused = refused.await;
+        assert!(
+            mcp_result_is_error(&refused),
+            "closing must refuse a held control message"
+        );
+        assert!(mcp_result_text(&refused).contains(if backend_exit {
+            "not running"
+        } else {
+            "closing"
+        }));
+        interrupt_gate.release_one();
+        fixture::next_frame_matching_on(&mut fixture.client, "held-control child closed", |env| {
+            if env.stream == stream && env.kind == FrameKind::QueuedMessages {
+                assert!(
+                    env.parse_payload::<protocol::QueuedMessagesPayload>()
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .all(|entry| entry.message != "refused by close"),
+                    "a refused control message must never be queued"
+                );
+            }
+            if env.stream == stream && env.kind == FrameKind::ChatEvent {
+                assert!(
+                    !matches!(
+                        env.parse_payload::<ChatEvent>().unwrap(),
+                        ChatEvent::MessageAdded(message) if message.content == "refused by close"
+                    ),
+                    "a refused control message must never be sent"
+                );
+            }
+            if backend_exit {
+                env.stream == stream
+                    && env.kind == FrameKind::AgentError
+                    && env
+                        .parse_payload::<AgentErrorPayload>()
+                        .is_ok_and(|error| error.fatal)
+            } else {
+                env.kind == FrameKind::AgentClosed
+            }
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn prior_stop_fences_agent_control_interrupt_delivery() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "stop-control-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let stop = MockGateHandle::new();
+    let finish = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "stop-control-child",
+            MockScript::one(MockTurn::held_text("held reply"))
+                .then(MockTurn::gated_text("follow-up reply", &finish))
+                .with_user_bubbles()
+                .with_native_child_idle_gate(&stop),
+        )
+        .await;
+    let child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/stop-control-child"], "prompt": "hold work",
+            "name": "stop-control-child", "backend_kind": "claude"
+        }),
+    )
+    .await;
+    drop(reservation);
+    let new = expect_replayed_new_agent(&mut fixture.client, &child, "Stop control child").await;
+    let stream = new.instance_stream;
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &stream,
+        "held reply",
+        |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "held reply"),
+    )
+    .await;
+    let mock = fixture.mock_by_id(&child).await;
+    fixture
+        .client
+        .interrupt(&stream)
+        .await
+        .expect("prior human Stop");
+    stop.wait_until_entered().await;
+    mock.wait_for_interrupt_request().await;
+    let send = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({
+            "agent_id": child.0, "message": "follow-up after Stop", "interrupt": true
+        }),
+    );
+    tokio::pin!(send);
+    tokio::select! {
+        biased;
+        () = mock.wait_for_interrupt_request() => {}
+        _ = &mut send => panic!("no delivery before the Stop boundary"),
+    }
+    stop.release_one();
+    assert!(
+        !mcp_result_is_error(&send.await),
+        "follow-up must be delivered after Stop"
+    );
+    finish.wait_until_entered().await;
+    let mut delivered = 0;
+    let mut replied = false;
+    fixture::next_frame_matching_on(&mut fixture.client, "follow-up settled after Stop", |env| {
+        if env.stream != stream { return false; }
+        if env.kind == FrameKind::QueuedMessages {
+            assert!(env.parse_payload::<protocol::QueuedMessagesPayload>().unwrap().messages.iter()
+                .all(|entry| entry.message != "follow-up after Stop"), "control must never enter the editable queue");
+        }
+        if env.kind != FrameKind::ChatEvent { return false; }
+        match env.parse_payload::<ChatEvent>().unwrap() {
+            ChatEvent::MessageAdded(message) if message.content == "follow-up after Stop" => {
+                assert!(matches!(message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(ref id), .. }) if id == &parent.agent_id));
+                delivered += 1;
+            }
+            ChatEvent::StreamEnd(end) if end.message.content == "follow-up reply" => replied = true,
+            _ => {}
+        }
+        replied
+    }).await;
+    assert_eq!(delivered, 1, "control is visible exactly once after Stop");
+    finish.release_one();
+    fixture::next_frame_matching_on(&mut fixture.client, "follow-up idle", |env| {
+        if env.stream != stream || env.kind != FrameKind::ChatEvent {
+            return false;
+        }
+        match env.parse_payload::<ChatEvent>().unwrap() {
+            ChatEvent::MessageAdded(message) if message.content == "follow-up after Stop" => {
+                panic!("control was delivered twice")
+            }
+            ChatEvent::OperationCancelled(_) => panic!("prior Stop cancelled the follow-up turn"),
+            ChatEvent::TypingStatusChanged(false) => return true,
+            _ => {}
+        }
+        false
+    })
+    .await;
+    mock.assert_clean().await;
+}
+
+#[tokio::test]
+async fn agent_control_steers_while_requested_compaction_waits_for_idle() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "compaction-control-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "compaction-control-child",
+            MockScript::one(MockTurn::held_text("held initial response"))
+                .with_mid_turn_steering()
+                .with_user_bubbles(),
+        )
+        .await;
+    let child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/compaction-control-child"],
+            "prompt": "hold this turn",
+            "name": "compaction-control-child",
+            "backend_kind": "claude"
+        }),
+    )
+    .await;
+    drop(reservation);
+    let child_new =
+        expect_replayed_new_agent(&mut fixture.client, &child, "compaction child").await;
+    let stream = &child_new.instance_stream;
+    fixture::next_chat_event_matching_on(&mut fixture.client, stream, "held turn", |event| {
+        matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "held initial response")
+            || matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Assistant { .. })
+                    && message.content == "held initial response")
+    })
+    .await;
+    eprintln!("COMPACTION CONTROL phase=held_response_observed");
+    fixture
+        .client
+        .compact_agent(stream, protocol::AgentCompactPayload::default())
+        .await
+        .expect("request compaction behind held turn");
+    let deferred =
+        fixture::next_frame_matching_on(&mut fixture.client, "deferred compaction", |frame| {
+            frame.stream == *stream && frame.kind == FrameKind::ContextCompactionNotify
+        })
+        .await;
+    assert!(matches!(
+        deferred
+            .parse_payload::<protocol::ContextCompactionNotifyPayload>()
+            .unwrap()
+            .status,
+        protocol::ContextCompactionStatus::Deferred {
+            stage: protocol::CompactionStage::WaitingForIdle
+        }
+    ));
+    eprintln!("COMPACTION CONTROL phase=deferred_notification_observed");
+    let response = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({"agent_id": child.0, "message": "redirect before compaction"}),
+    )
+    .await;
+    eprintln!("COMPACTION CONTROL phase=control_receipt_observed");
+    assert!(
+        !mcp_result_is_error(&response),
+        "deferred compaction must not postpone a steerable control"
+    );
+    fixture::next_chat_event_matching_on(&mut fixture.client, stream, "actual control delivery", |event| {
+        assert!(!matches!(event, ChatEvent::OperationCancelled(_)), "native steering must preserve its held turn");
+        matches!(event, ChatEvent::MessageAdded(message) if message.content == "redirect before compaction")
+    }).await;
+}
+
+#[tokio::test]
+async fn agent_control_steer_waits_for_unstarted_turn() {
+    const FOLLOW_UP: &str = "join when started";
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "turn-start-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let start = MockGateHandle::new();
+    let waiting = MockGateHandle::new();
+    let finish = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "turn-start-child",
+            MockScript::one(MockTurn::text("ready reply"))
+                .then(MockTurn::gated_text_after_turn_start(
+                    "work", &start, &waiting, &finish,
+                ))
+                .with_mid_turn_steering()
+                .with_user_bubbles(),
+        )
+        .await;
+    let child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/turn-start-child"],
+            "prompt": "get ready",
+            "name": "turn-start-child",
+            "backend_kind": "claude"
+        }),
+    )
+    .await;
+    drop(reservation);
+    let child_new =
+        expect_replayed_new_agent(&mut fixture.client, &child, "turn start child").await;
+    let stream = child_new.instance_stream.clone();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &stream,
+        "ready turn",
+        |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "ready reply"),
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&stream, "start work".to_owned())
+        .await
+        .expect("send work turn");
+    start.wait_until_entered().await;
+    let follow_up = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({"agent_id": child.0, "message": FOLLOW_UP}),
+    );
+    tokio::pin!(follow_up);
+    tokio::select! {
+        biased;
+        () = waiting.wait_until_entered() => {}
+        _ = &mut follow_up => panic!("a follow-up must not be answered before its turn starts"),
+    }
+    start.release_one();
+    let mut delivered = 0;
+    let mut work_seen = false;
+    fixture::next_frame_matching_on(&mut fixture.client, "visible steer in unfinished work", |env| {
+        if env.stream != stream { return false; }
+        if env.kind == FrameKind::QueuedMessages {
+            assert!(env.parse_payload::<protocol::QueuedMessagesPayload>().unwrap().messages.iter()
+                .all(|entry| entry.message != FOLLOW_UP), "control must never enter the editable queue");
+        }
+        if env.kind != FrameKind::ChatEvent { return false; }
+        match env.parse_payload::<ChatEvent>().unwrap() {
+            ChatEvent::MessageAdded(message) if message.content == FOLLOW_UP => {
+                assert!(matches!(message.origin, Some(protocol::MessageOrigin::Agent { agent_id: Some(ref id), .. }) if id == &parent.agent_id));
+                delivered += 1;
+            }
+            ChatEvent::StreamEnd(end) if end.message.content == "work" => work_seen = true,
+            ChatEvent::OperationCancelled(_) => panic!("steering cancelled the admitted work"),
+            _ => {}
+        }
+        work_seen && delivered > 0
+    }).await;
+    assert_eq!(
+        delivered, 1,
+        "steer is visible exactly once while work remains unfinished"
+    );
+    assert!(
+        !mcp_result_is_error(&follow_up.await),
+        "steer receipt confirms actual delivery before turn end"
+    );
+    finish.release_one();
+    fixture::next_frame_matching_on(&mut fixture.client, "work idle", |env| {
+        if env.stream != stream {
+            return false;
+        }
+        if env.kind == FrameKind::QueuedMessages {
+            assert!(
+                env.parse_payload::<protocol::QueuedMessagesPayload>()
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .all(|entry| entry.message != FOLLOW_UP),
+                "control must never enter the editable queue"
+            );
+        }
+        if env.kind != FrameKind::ChatEvent {
+            return false;
+        }
+        match env.parse_payload::<ChatEvent>().unwrap() {
+            ChatEvent::MessageAdded(message) if message.content == FOLLOW_UP => {
+                panic!("steer was delivered twice")
+            }
+            ChatEvent::OperationCancelled(_) => panic!("steering cancelled its turn"),
+            ChatEvent::TypingStatusChanged(false) => return true,
+            _ => {}
+        }
+        false
+    })
+    .await;
+    fixture.mock_by_id(&child).await.assert_clean().await;
 }
 
 #[tokio::test]

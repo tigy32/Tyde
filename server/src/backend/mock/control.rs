@@ -80,6 +80,9 @@ pub enum MockRequest {
 }
 
 pub(super) enum MockControlCommand {
+    CloseStream {
+        ack: oneshot::Sender<()>,
+    },
     SetWorkspaceRelocationResults {
         results: Vec<Result<(), crate::backend::WorkspaceRelocationError>>,
         ack: oneshot::Sender<()>,
@@ -144,6 +147,7 @@ pub struct MockControl {
     command_tx: mpsc::WeakUnboundedSender<MockCommand>,
     terminal: MockTerminalReportSlot,
     compaction_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    interrupt_requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl MockControl {
@@ -162,10 +166,23 @@ impl MockControl {
                 command_tx: command_tx.downgrade(),
                 terminal: Arc::clone(&terminal),
                 compaction_attempts: Arc::default(),
+                interrupt_requests: Arc::new(tokio::sync::Semaphore::new(0)),
             },
             rx,
             terminal,
         )
+    }
+
+    pub(super) fn record_interrupt_request(&self) {
+        self.interrupt_requests.add_permits(1);
+    }
+
+    pub async fn wait_for_interrupt_request(&self) {
+        self.interrupt_requests
+            .acquire()
+            .await
+            .expect(CONTROL_CLOSED)
+            .forget();
     }
 
     pub(super) fn record_compaction_attempt(&self) {
@@ -184,6 +201,14 @@ impl MockControl {
             .expect("mock terminal report mutex poisoned")
             .clone()
             .expect(TERMINAL_REPORT_MISSING)
+    }
+
+    pub async fn close_stream(&self) {
+        let (ack, applied) = oneshot::channel();
+        self.tx
+            .send(MockControlCommand::CloseStream { ack })
+            .expect(CONTROL_CLOSED);
+        applied.await.expect(CONTROL_CLOSED);
     }
 
     /// Delay complete typed user echoes while continuing to admit input and steering.

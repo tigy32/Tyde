@@ -23,10 +23,8 @@ pub(super) fn validate_tychat_settings(
             Ok(())
         };
     };
-    if !crate::backend::capabilities_for_backend_kind(kind)
-        .contains(tyde_agent_adapter::BackendCapability::MidTurnSteering)
-    {
-        return Err("Tychat requires a backend that can steer mid-turn".into());
+    if !crate::backend::supports_running_redirect(kind) {
+        return Err("Tychat requires a backend that can steer or interrupt".into());
     }
     if !settings.enabled_backends.contains(&kind) {
         return Err("Tychat backend must be enabled".into());

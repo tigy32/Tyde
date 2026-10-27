@@ -4573,11 +4573,7 @@ struct CodexState {
     foreground_response_completed: bool,
     interrupt_requested_turn_id: Option<String>,
     awaiting_root_turn_start: bool,
-    /// Set when the user cancels while no root turn is tracked. A root turn
-    /// that starts while this is set raced the cancel — the user has already
-    /// been told the agent is idle, so that turn is interrupted and
-    /// tombstoned instead of being adopted.
-    interrupt_next_root_turn: bool,
+    transport_closed: bool,
     pending_compaction: Option<PendingCodexCompaction>,
     active_stream: Option<ActiveStreamState>,
     tool_container: Option<ChatMessageId>,
@@ -4659,11 +4655,13 @@ impl CodexState {
         }
     }
 
+    fn root_turn_start_pending(&self) -> bool {
+        self.awaiting_root_turn_start || self.background_wake_request_in_flight
+    }
+
     /// A root turn, admitted or running, that will settle typing itself.
     fn root_turn_owns_typing(&self) -> bool {
-        self.active_turn_id.is_some()
-            || self.awaiting_root_turn_start
-            || self.background_wake_request_in_flight
+        self.active_turn_id.is_some() || self.root_turn_start_pending()
     }
 }
 
@@ -4747,7 +4745,7 @@ fn initial_codex_state(
         foreground_response_completed: false,
         interrupt_requested_turn_id: None,
         awaiting_root_turn_start: false,
-        interrupt_next_root_turn: false,
+        transport_closed: false,
         pending_compaction: None,
         active_stream: None,
         tool_container: None,
@@ -4967,6 +4965,10 @@ enum CodexStateTransition {
     /// Starts provider work, so it must not interleave with a workspace
     /// relocation whose `thread/settings/update` is still unresolved.
     AfterRelocation(CodexStateChange),
+    When {
+        ready: Box<dyn Fn(&CodexState) -> bool + Send>,
+        change: CodexStateChange,
+    },
 }
 
 /// Sole owner of the adapter state. Every read or change is one synchronous
@@ -4982,9 +4984,14 @@ impl CodexStateActor {
         let (transitions, mut inbox) = mpsc::unbounded_channel::<CodexStateTransition>();
         crate::backend::subprocess::spawn(async move {
             let mut held = VecDeque::new();
+            let mut waiting = Vec::new();
             while let Some(transition) = inbox.recv().await {
                 match transition {
                     CodexStateTransition::Now(change) => change(&mut state),
+                    CodexStateTransition::When { ready, change } => {
+                        tracing::debug!(target: "tyde_codex_dispatch_receipt", codex_control_start_pending = state.root_turn_start_pending(), "Codex control registered at native start boundary");
+                        waiting.push((ready, change));
+                    }
                     CodexStateTransition::AfterRelocation(change) => {
                         if state.workspace_relocation_in_flight {
                             held.push_back(change);
@@ -4998,6 +5005,15 @@ impl CodexStateActor {
                 {
                     change(&mut state);
                 }
+                let mut pending = Vec::new();
+                for (ready, change) in waiting.drain(..) {
+                    if state.transport_closed || ready(&state) {
+                        change(&mut state);
+                    } else {
+                        pending.push((ready, change));
+                    }
+                }
+                waiting = pending;
             }
         });
         Self { transitions }
@@ -5016,6 +5032,27 @@ impl CodexStateActor {
     ) -> R {
         self.run(CodexStateTransition::AfterRelocation, transition)
             .await
+    }
+
+    async fn when<R: Send + 'static>(
+        &self,
+        ready: impl Fn(&CodexState) -> bool + Send + 'static,
+        transition: impl FnOnce(&mut CodexState) -> R + Send + 'static,
+    ) -> Result<R, String> {
+        let (reply, result) = oneshot::channel();
+        self.transitions
+            .send(CodexStateTransition::When {
+                ready: Box::new(ready),
+                change: Box::new(move |state| {
+                    if !reply.is_closed() {
+                        let _ = reply.send(transition(state));
+                    }
+                }),
+            })
+            .map_err(|_| "Codex state owner stopped before a control boundary".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Codex state owner dropped a control boundary".to_owned())
     }
 
     fn apply(&self, change: impl FnOnce(&mut CodexState) + Send + 'static) {
@@ -6591,7 +6628,8 @@ impl CodexInner {
     /// A command Codex never gave a `processId` for has no handle to kill, and
     /// per the chosen semantics that case stays quiet rather than reporting a
     /// stop Tyde cannot perform.
-    async fn terminate_foreground_commands(&self) {
+    async fn terminate_foreground_commands(&self, turn_id: &str) {
+        let turn_id = turn_id.to_owned();
         let foreground = self
             .emitter
             .open_foreground_tool_ids()
@@ -6603,6 +6641,9 @@ impl CodexInner {
         let targets = {
             self.state
                 .with(move |state| {
+                    if state.active_turn_id.as_ref() != Some(&turn_id) {
+                        return Vec::new();
+                    }
                     state
                         .outstanding_command_executions
                         .iter()
@@ -8818,19 +8859,29 @@ impl CodexInner {
     }
 
     async fn steer_user_message(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
-        let Some((thread_id, turn_id)) = self
+        let turn = self
             .state
-            .with(|state| match state.active_turn_id.clone() {
-                Some(turn_id)
-                    if !state.awaiting_root_turn_start && state.pending_compaction.is_none() =>
-                {
-                    Some((state.thread_id.clone(), turn_id))
-                }
-                _ => None,
-            })
-            .await
-        else {
-            return SteerOutcome::NoActiveTurn(payload);
+            .when(
+                |state| !state.root_turn_start_pending(),
+                |state| {
+                    if state.transport_closed {
+                        return Err(());
+                    }
+                    Ok((
+                        state.pending_compaction.is_some(),
+                        state
+                            .active_turn_id
+                            .clone()
+                            .map(|turn_id| (state.thread_id.clone(), turn_id)),
+                    ))
+                },
+            )
+            .await;
+        let (thread_id, turn_id) = match turn {
+            Err(_) | Ok(Err(())) => return SteerOutcome::Closed,
+            Ok(Ok((true, _))) => return SteerOutcome::Unsupported(payload),
+            Ok(Ok((false, None))) => return SteerOutcome::NoActiveTurn(payload),
+            Ok(Ok((false, Some((thread_id, turn_id))))) => (thread_id, turn_id),
         };
         let images = protocol_images_to_attachments(payload.images.clone());
         let input_items = match codex_user_input_items(&payload.message, images.as_deref()).await {
@@ -8864,7 +8915,7 @@ impl CodexInner {
             }
             Err(error) => {
                 tracing::warn!(%error, "Codex declined turn/steer");
-                SteerOutcome::NoActiveTurn(payload)
+                SteerOutcome::Unsupported(payload)
             }
         }
     }
@@ -8885,9 +8936,6 @@ impl CodexInner {
         ) = {
             self.state
                 .with_after_relocation(move |state| {
-                    // This send supersedes any cancel that raced an earlier
-                    // turn start; the next turn/started belongs to it.
-                    state.interrupt_next_root_turn = false;
                     state.awaiting_root_turn_start = true;
                     (
                         state.thread_id.clone(),
@@ -8969,90 +9017,55 @@ impl CodexInner {
                     .await
             }
             SessionCommand::CancelConversation => {
-                let cancelling_async_questions = {
-                    self.state
-                        .with(move |state| {
-                            let pending = !state.pending_async_questions.is_empty();
-                            state.pending_async_questions.clear();
-                            pending
-                        })
-                        .await
-                };
-                let compaction_start_pending = {
-                    self.state
-                        .with(move |state| {
-                            state.active_turn_id.is_none()
-                                && state
-                                    .pending_compaction
-                                    .as_ref()
-                                    .is_some_and(|pending| pending.turn_id.is_none())
-                        })
-                        .await
-                };
-                if compaction_start_pending {
-                    tokio::time::timeout(Duration::from_secs(30), async {
-                        loop {
-                            let start_resolved = {
-                                self.state
-                                    .with(move |state| {
-                                        state
-                                            .pending_compaction
-                                            .as_ref()
-                                            .is_none_or(|pending| pending.turn_id.is_some())
-                                    })
-                                    .await
-                            };
-                            if start_resolved {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await
-                    .map_err(|_| {
-                        "Codex compaction did not publish a turn to interrupt".to_string()
-                    })?;
-                }
                 let (
                     thread_id,
                     turn_id_opt,
                     interrupting_compaction,
                     foreground_ended_with_background_work,
-                ) = {
-                    self.state
-                        .with(move |state| {
-                            let active_turn_id = state.active_turn_id.clone();
-                            state.interrupt_requested_turn_id = active_turn_id.clone();
-                            let compaction_turn_id = state
+                    cancelling_async_questions,
+                    foreground_response_completed,
+                    background_commands,
+                    subagent_streams,
+                ) = self
+                    .state
+                    .when(
+                        |state| {
+                            !state.root_turn_start_pending()
+                                && state
+                                    .pending_compaction
+                                    .as_ref()
+                                    .is_none_or(|pending| pending.turn_id.is_some())
+                        },
+                        |state| {
+                            if state.transport_closed {
+                                return Err(
+                                    "Codex closed before the turn to interrupt started".to_owned()
+                                );
+                            }
+                            let active = state.active_turn_id.clone();
+                            state.interrupt_requested_turn_id = active.clone();
+                            let compaction = state
                                 .pending_compaction
                                 .as_ref()
                                 .and_then(|pending| pending.turn_id.clone());
-                            (
+                            let cancelling_questions = !state.pending_async_questions.is_empty();
+                            state.pending_async_questions.clear();
+                            Ok((
                                 state.thread_id.clone(),
-                                active_turn_id
-                                    .clone()
-                                    .or_else(|| compaction_turn_id.clone()),
-                                active_turn_id.is_none() && compaction_turn_id.is_some(),
+                                active.clone().or_else(|| compaction.clone()),
+                                active.is_none() && compaction.is_some(),
                                 (!state.background_commands.is_empty()
                                     || !state.subagent_streams.is_empty())
-                                    && state.active_turn_id.is_none()
-                                    && compaction_turn_id.is_none()
-                                    && !state.awaiting_root_turn_start
-                                    && !state.background_wake_request_in_flight,
-                            )
-                        })
-                        .await
-                };
-                let (foreground_response_completed, background_commands, subagent_streams) = self
-                    .state
-                    .with(|state| {
-                        (
-                            state.foreground_response_completed,
-                            state.background_commands.len(),
-                            state.subagent_streams.len(),
-                        )
-                    })
-                    .await;
+                                    && active.is_none()
+                                    && compaction.is_none(),
+                                cancelling_questions,
+                                state.foreground_response_completed,
+                                state.background_commands.len(),
+                                state.subagent_streams.len(),
+                            ))
+                        },
+                    )
+                    .await??;
                 tracing::info!(
                     turn = turn_id_opt.is_some(),
                     foreground_response_completed,
@@ -9062,7 +9075,7 @@ impl CodexInner {
                     "Codex interrupt routing state"
                 );
                 eprintln!(
-                    "TYDE CODEX CANCEL STATE turn={} interrupting_compaction={interrupting_compaction} compaction_start_pending={compaction_start_pending}",
+                    "TYDE CODEX CANCEL STATE turn={} interrupting_compaction={interrupting_compaction}",
                     turn_id_opt.is_some()
                 );
                 // An answer can finish before its provider turn releases the
@@ -9074,19 +9087,8 @@ impl CodexInner {
                     return Ok(());
                 }
                 let Some(turn_id) = turn_id_opt else {
-                    // No tracked turn to interrupt. A turn may still be
-                    // spooling (turn/start dispatched, turn/started not yet
-                    // delivered), so latch an interrupt for the next root
-                    // turn and resolve the cancel now — returning a silent
-                    // Ok here leaves the client stuck on "Cancelling…"
-                    // forever waiting for events that will never come.
-                    // operation_cancelled ends with TypingStatusChanged(false).
-                    self.state
-                        .with(|state| {
-                            state.interrupt_next_root_turn = true;
-                            state.awaiting_root_turn_start = false;
-                        })
-                        .await;
+                    // The start reservation has settled; no future root turn
+                    // belongs to this cancellation.
                     self.emitter.operation_cancelled("Operation cancelled");
                     return Ok(());
                 };
@@ -9095,7 +9097,7 @@ impl CodexInner {
                 // tracks the process. The cards for these commands are marked
                 // cancelled when the interrupted turn completes; killing here
                 // is what makes that report true.
-                self.terminate_foreground_commands().await;
+                self.terminate_foreground_commands(&turn_id).await;
                 tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native turn/interrupt dispatch");
                 match self
                     .rpc
@@ -9114,35 +9116,24 @@ impl CodexInner {
                     }
                     Err(error) => return Err(error.to_string()),
                 }
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        let terminal = {
-                            {
-                                let turn_id = turn_id.clone();
-                                self.state
-                                    .with(move |state| {
-                                        if interrupting_compaction {
-                                            state
-                                                .pending_compaction
-                                                .as_ref()
-                                                .and_then(|pending| pending.turn_id.as_deref())
-                                                != Some(turn_id.as_str())
-                                        } else {
-                                            state.active_turn_id.as_deref()
-                                                != Some(turn_id.as_str())
-                                        }
-                                    })
-                                    .await
+                self.state
+                    .when(
+                        move |state| {
+                            if interrupting_compaction {
+                                state
+                                    .pending_compaction
+                                    .as_ref()
+                                    .and_then(|pending| pending.turn_id.as_deref())
+                                    != Some(turn_id.as_str())
+                            } else {
+                                state.active_turn_id.as_deref() != Some(turn_id.as_str())
                             }
-                        };
-                        if terminal {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .map_err(|_| format!("Codex turn {turn_id} did not terminalize after interrupt"))?;
+                        },
+                        |state| !state.transport_closed,
+                    )
+                    .await?
+                    .then_some(())
+                    .ok_or_else(|| "Codex closed while interrupting its turn".to_owned())?;
                 if interrupting_compaction {
                     self.emitter.operation_cancelled("Operation cancelled");
                 }
@@ -9855,6 +9846,7 @@ impl CodexInner {
                 ));
             }
             CodexInbound::Closed { exit_code } => {
+                self.state.with(|state| state.transport_closed = true).await;
                 self.finalize_all_incomplete_strict_responses(
                     "Codex transport closed before rawResponse/completed",
                 )
@@ -11591,19 +11583,19 @@ impl CodexInner {
         }
         self.observe_codex_notification_contract(method).await;
         if matches!(method, "turn/started" | "turn/completed" | "error") {
-            let (active_turn, awaiting_root_turn_start, interrupt_next_root_turn) = self
+            let (active_turn, awaiting_root_turn_start, transport_closed) = self
                 .state
                 .with(|state| {
                     (
                         state.active_turn_id.is_some(),
                         state.awaiting_root_turn_start,
-                        state.interrupt_next_root_turn,
+                        state.transport_closed,
                     )
                 })
                 .await;
             let param_keys = codex_param_keys(params);
             eprintln!(
-                "TYDE CODEX ROOT NOTIFICATION method={method} active_turn={active_turn} awaiting_root_turn_start={awaiting_root_turn_start} interrupt_next_root_turn={interrupt_next_root_turn} param_keys={param_keys:?}",
+                "TYDE CODEX ROOT NOTIFICATION method={method} active_turn={active_turn} awaiting_root_turn_start={awaiting_root_turn_start} transport_closed={transport_closed} param_keys={param_keys:?}",
             );
         }
         if self
@@ -11909,7 +11901,7 @@ impl CodexInner {
                     .unwrap_or("turn")
                     .to_string();
                 let started_turn_id = turn_id.clone();
-                let raced_cancel_thread_id = self
+                let adopted = self
                     .state
                     .with(move |state| {
                         let turn_id = started_turn_id;
@@ -11921,20 +11913,11 @@ impl CodexInner {
                             tracing::debug!(
                                 "Ignoring restarted Codex root turn after local termination"
                             );
-                            return ControlFlow::Break(None);
+                            return false;
                         }
                         if state.active_turn_id.as_ref() == Some(&turn_id) {
                             tracing::debug!("Ignoring duplicate Codex root turn start");
-                            return ControlFlow::Break(None);
-                        }
-                        if state.interrupt_next_root_turn {
-                            state.interrupt_next_root_turn = false;
-                            push_codex_terminated_turn(
-                                &mut state.terminated_turns,
-                                turn_id.clone(),
-                            );
-                            state.terminated_turn_awaiting_replacement = Some(turn_id.clone());
-                            return ControlFlow::Break(Some(state.thread_id.clone()));
+                            return false;
                         }
                         state.terminated_turn_awaiting_replacement = None;
                         state.awaiting_root_turn_start = false;
@@ -11950,20 +11933,10 @@ impl CodexInner {
                         state.tool_container_images.clear();
                         state.close_active_stream_when_tools_idle = false;
                         state.pending_message_metadata = None;
-                        ControlFlow::Continue(())
+                        true
                     })
                     .await;
-                if let ControlFlow::Break(raced_cancel_thread_id) = raced_cancel_thread_id {
-                    if let Some(thread_id) = raced_cancel_thread_id {
-                        tracing::info!("Interrupting Codex root turn that raced a cancel");
-                        self.rpc.spawn_request(
-                            "turn/interrupt",
-                            json!({
-                                "threadId": thread_id,
-                                "turnId": turn_id,
-                            }),
-                        );
-                    }
+                if !adopted {
                     return;
                 }
                 // The previous completion can consume the send-path typing edge.
@@ -17944,10 +17917,6 @@ let stream_key = stream_key.as_str();
             return;
         }
 
-        self.trace_terminal_emission("idle", None).await;
-        self.emitter.typing_status_changed(false);
-        self.spawn_pending_background_wake();
-
         if turn_status == "failed" {
             let message = params
                 .get("turn")
@@ -17959,6 +17928,9 @@ let stream_key = stream_key.as_str();
             self.complete_all_codex_subagents().await;
             self.emitter.backend_error(&message);
         }
+        self.trace_terminal_emission("idle", None).await;
+        self.emitter.typing_status_changed(false);
+        self.spawn_pending_background_wake();
     }
 
     async fn emit_tool_execution_completed(
@@ -18248,7 +18220,6 @@ let stream_key = stream_key.as_str();
                 {
                     self.state
                         .with_after_relocation(move |state| {
-                            state.interrupt_next_root_turn = false;
                             state.awaiting_root_turn_start = true;
                         })
                         .await
@@ -18418,7 +18389,7 @@ fn incomplete_turn_response_error(params: &Value) -> Option<&'static str> {
         .get("turn")
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str);
-    if status == Some("interrupted") {
+    if matches!(status, Some("interrupted" | "failed")) {
         return None;
     }
     Some("Codex turn ended before rawResponse/completed")
@@ -22507,8 +22478,15 @@ impl CodexBackend {
                 drop(initial_turn_tx);
             }
 
+            let mut controls = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    result = controls.join_next(), if !controls.is_empty() => {
+                        if !matches!(result, Some(Ok(Ok(())))) {
+                            tracing::error!("Codex control task failed");
+                            break;
+                        }
+                    }
                     result = &mut initial_turn_rx, if initial_turn_pending => {
                         initial_turn_pending = false;
                         match result {
@@ -22579,8 +22557,12 @@ impl CodexBackend {
                     }
                     steer = steer_rx.recv() => {
                         let Some(steer) = steer else { break; };
-                        let outcome = handle.steer(steer.payload).await;
-                        let _ = steer.reply.send(outcome);
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let outcome = handle.steer(steer.payload).await;
+                            let _ = steer.reply.send(outcome);
+                            Ok::<(), String>(())
+                        });
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break; };
@@ -22592,15 +22574,12 @@ impl CodexBackend {
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(interrupt) = interrupt else { break; };
-                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=spawn");
-                        let result = handle.execute(SessionCommand::CancelConversation).await;
-                        eprintln!("TYDE CODEX INTERRUPT RPC mode=spawn result={result:?}");
-                        let accepted = result.is_ok();
-                        let _ = interrupt.reply.send(accepted);
-                        if let Err(err) = result {
-                            tracing::error!(%err, "Failed to interrupt Codex turn");
-                            break;
-                        }
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let result = handle.execute(SessionCommand::CancelConversation).await;
+                            let _ = interrupt.reply.send(result.is_ok());
+                            result
+                        });
                     }
                 }
             }
@@ -23848,8 +23827,15 @@ impl Backend for CodexBackend {
                 .lock()
                 .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
 
+            let mut controls = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    result = controls.join_next(), if !controls.is_empty() => {
+                        if !matches!(result, Some(Ok(Ok(())))) {
+                            tracing::error!("Codex control task failed");
+                            break;
+                        }
+                    }
                     incoming = raw_events.recv() => {
                         let Some(raw) = incoming else {
                             break;
@@ -23908,8 +23894,12 @@ impl Backend for CodexBackend {
                     }
                     steer = steer_rx.recv() => {
                         let Some(steer) = steer else { break; };
-                        let outcome = handle.steer(steer.payload).await;
-                        let _ = steer.reply.send(outcome);
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let outcome = handle.steer(steer.payload).await;
+                            let _ = steer.reply.send(outcome);
+                            Ok::<(), String>(())
+                        });
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -23920,15 +23910,12 @@ impl Backend for CodexBackend {
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(interrupt) = interrupt else { break };
-                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=resume");
-                        let result = handle.execute(SessionCommand::CancelConversation).await;
-                        eprintln!("TYDE CODEX INTERRUPT RPC mode=resume result={result:?}");
-                        let accepted = result.is_ok();
-                        let _ = interrupt.reply.send(accepted);
-                        if let Err(err) = result {
-                            tracing::error!("Failed to interrupt resumed Codex turn: {err}");
-                            break;
-                        }
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let result = handle.execute(SessionCommand::CancelConversation).await;
+                            let _ = interrupt.reply.send(result.is_ok());
+                            result
+                        });
                     }
                 }
             }
@@ -24121,8 +24108,15 @@ impl Backend for CodexBackend {
             }
             let mut normalization_failures = HashMap::new();
 
+            let mut controls = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    result = controls.join_next(), if !controls.is_empty() => {
+                        if !matches!(result, Some(Ok(Ok(())))) {
+                            tracing::error!("Codex control task failed");
+                            break;
+                        }
+                    }
                     incoming = raw_events.recv() => {
                         let Some(raw) = incoming else {
                             break;
@@ -24181,8 +24175,12 @@ impl Backend for CodexBackend {
                     }
                     steer = steer_rx.recv() => {
                         let Some(steer) = steer else { break; };
-                        let outcome = handle.steer(steer.payload).await;
-                        let _ = steer.reply.send(outcome);
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let outcome = handle.steer(steer.payload).await;
+                            let _ = steer.reply.send(outcome);
+                            Ok::<(), String>(())
+                        });
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -24193,15 +24191,12 @@ impl Backend for CodexBackend {
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(interrupt) = interrupt else { break };
-                        eprintln!("TYDE CODEX INTERRUPT DEQUEUE mode=fork");
-                        let result = handle.execute(SessionCommand::CancelConversation).await;
-                        eprintln!("TYDE CODEX INTERRUPT RPC mode=fork result={result:?}");
-                        let accepted = result.is_ok();
-                        let _ = interrupt.reply.send(accepted);
-                        if let Err(err) = result {
-                            tracing::error!("Failed to interrupt forked Codex turn: {err}");
-                            break;
-                        }
+                        let handle = handle.clone();
+                        controls.spawn(async move {
+                            let result = handle.execute(SessionCommand::CancelConversation).await;
+                            let _ = interrupt.reply.send(result.is_ok());
+                            result
+                        });
                     }
                 }
             }

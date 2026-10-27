@@ -18,7 +18,7 @@ use protocol::{
     ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
 };
 use serde_json::Value;
-use server::backend::Backend;
+use server::backend::{Backend, SendOutcome, SteerOutcome};
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
 
@@ -132,18 +132,7 @@ macro_rules! conformance2_scenario {
             provider!(
                 claude,
                 server::backend::claude::ClaudeBackend,
-                Profile::new(
-                    // The CLI resolves the haiku alias to Haiku 5.5 since its
-                    // release. The OpenRouter gateway reports the pinned Haiku
-                    // 4.5 as anthropic/claude-haiku-4.5 in native model events.
-                    &[
-                        "haiku",
-                        "claude-haiku-5-5",
-                        "claude-haiku-4-5-20251001",
-                        "anthropic/claude-haiku-4.5",
-                    ],
-                    &[("model", "haiku"), ("effort", "low")]
-                )
+                Profile::claude()
             );
             provider!(
                 codex,
@@ -741,6 +730,7 @@ fn assert_streams_are_balanced(turn: &Turn) {
     let mut open = false;
     let mut starts = 0usize;
     let mut ends = 0usize;
+    let mut aborted = 0usize;
     for event in turn.events() {
         match event {
             ChatEvent::StreamStart(_) => {
@@ -761,17 +751,35 @@ fn assert_streams_are_balanced(turn: &Turn) {
                 open = false;
                 ends += 1;
             }
+            // The protocol explicitly lets OperationCancelled abort the one
+            // open response without persisting an empty/partial assistant.
+            ChatEvent::OperationCancelled(_) if open => {
+                open = false;
+                aborted += 1;
+            }
             _ => {}
         }
     }
-    assert!(
-        !open,
-        "{}: ended with an assistant response still open ({starts} StreamStart, {ends} StreamEnd)",
-        turn.label()
+    assert_eq!(
+        starts,
+        ends + aborted,
+        "response starts must end or be explicitly aborted"
     );
     assert!(
-        starts > 0,
-        "{}: produced no assistant response at all",
+        !open,
+        "{}: ended with an assistant response still open ({starts} StreamStart, {ends} StreamEnd, {aborted} aborted)",
+        turn.label()
+    );
+    // A real Codex interrupt can settle an accepted start before any response
+    // exists. Cancellation must account explicitly for that zero-response
+    // turn; requiring an empty assistant bubble would reject correct behavior.
+    assert!(
+        starts > 0
+            || turn
+                .events()
+                .iter()
+                .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        "{}: produced neither an assistant response nor cancellation",
         turn.label()
     );
 }
@@ -3564,10 +3572,11 @@ journal = sys.argv[1]
 # Optional, and zero for every caller that does not ask for it: the delay is
 # applied before the first read, so `initialize` sits unanswered in the pipe
 # and the server stays in whatever "still connecting" state the backend uses.
-if len(sys.argv) > 2:
+control_failure_gate = sys.argv[2:3] == ["--control-failure-gate"]
+if len(sys.argv) > 2 and not control_failure_gate:
     time.sleep(float(sys.argv[2]))
 
-if len(sys.argv) > 3:
+if len(sys.argv) > 3 and not control_failure_gate:
     delay = Path(sys.argv[3])
     if delay.exists():
         seconds = float(delay.read_text())
@@ -3596,6 +3605,14 @@ for line in sys.stdin:
             handle.flush()
         value = str(arguments.get("value", ""))
         if value == "{MCP_ERROR_VALUE}":
+            if control_failure_gate:
+                with open(sys.argv[3], "w") as ready:
+                    ready.write("started")
+                with open(sys.argv[4]) as gate:
+                    gate.read(1)
+                print(json.dumps({{"jsonrpc": "2.0", "id": request_id,
+                    "error": {{"code": -32603, "message": "{MCP_ERROR_TEXT}"}}}}), flush=True)
+                continue
             result = {{"content": [{{"type": "text", "text": "{MCP_ERROR_TEXT}"}}], "isError": True}}
         else:
             text = "{MCP_RESULT_PREFIX}" + ("{MCP_RISK_RESULT}" if value == "{MCP_RISK_VALUE}" else value)
@@ -4984,6 +5001,791 @@ async fn real_mid_turn_steering<B: Backend>(host: &mut Harness<B>) {
     assert_ready_handshake(&after);
 
     assert_universal_contract(&[launched, steered, after]);
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_immediate_turn_controls,
+    [
+        BackendCapability::Interrupt,
+        BackendCapability::BackgroundTasks,
+        BackendCapability::AgentInitiatedTurns,
+        BackendCapability::SlashCommands,
+        BackendCapability::StartupMcpServers
+    ]
+);
+
+conformance2_scenario!(
+    real_control_initialization_failure,
+    [
+        BackendCapability::Interrupt,
+        BackendCapability::BackgroundTasks,
+        BackendCapability::SlashCommands
+    ]
+);
+
+conformance2_scenario!(
+    real_control_at_native_halt,
+    [
+        BackendCapability::Interrupt,
+        BackendCapability::BackgroundTasks,
+        BackendCapability::AgentInitiatedTurns,
+        BackendCapability::SlashCommands,
+        BackendCapability::StartupMcpServers
+    ]
+);
+
+async fn real_control_at_native_halt<B: Backend>(host: &mut Harness<B>) {
+    use tokio::io::AsyncWriteExt;
+
+    if !real_control_native_policy_child(host).await {
+        return;
+    }
+    let script = host.workspace().join("halt-probe.py");
+    let journal = host.workspace().join("halt-calls.jsonl");
+    let started = host.workspace().join("halt-started.fifo");
+    let release = host.workspace().join("halt-release.fifo");
+    let status = tokio::process::Command::new("mkfifo")
+        .arg(&started)
+        .arg(&release)
+        .status()
+        .await
+        .expect("create native halt barriers");
+    assert!(status.success(), "native halt barriers are available");
+    let mut release = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release)
+        .await
+        .expect("open explicit native halt release");
+    std::fs::write(&script, mcp_probe_script()).expect("write real gated-error MCP server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+            "--control-failure-gate".to_owned(),
+            started.to_string_lossy().into_owned(),
+            host.workspace()
+                .join("halt-release.fifo")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+    )
+    .await;
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let prompt = format!(
+        "{} A fresh control message will override your final answer. Follow its WORD instruction after this one call ends; never retry the call.",
+        mcp_probe_prompt(host.backend(), MCP_ERROR_VALUE)
+    );
+    send_prompt(host, &agent, &prompt).await;
+    let acknowledged = tokio::fs::read(&started)
+        .await
+        .expect("observe real MCP handler entry");
+    assert_eq!(
+        acknowledged, b"started",
+        "the actual MCP call reached its held handler"
+    );
+    let mut turn = host.turn(&prompt);
+    collect_turn_until(host, &mut turn, |event| {
+        matches!(event, ChatEvent::ToolRequest(request)
+        if matches!(&request.tool_type, ToolRequestType::Other { args }
+            if args == &serde_json::json!({"value": MCP_ERROR_VALUE})))
+    })
+    .await;
+    let secret = unique_payload();
+    let redirect = user_message(&format!(
+        "Answer exactly WORD={secret}. Do not retry or start any tools. This replaces every earlier final-answer instruction."
+    ));
+    let cancelled_for_control = match host.backend_ref().steer(redirect).await {
+        SteerOutcome::Accepted => {
+            release
+                .write_all(b"R")
+                .await
+                .expect("release actual failed MCP result");
+            false
+        }
+        SteerOutcome::Unsupported(payload) => {
+            assert!(
+                host.backend_ref().interrupt().await,
+                "unconfirmed native control must cancel"
+            );
+            collect_control_events_until(host, &mut turn, |event| {
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+            assert!(
+                turn.events()
+                    .iter()
+                    .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+                "refused control must reach actual cancellation"
+            );
+            release
+                .write_all(b"R")
+                .await
+                .expect("release cancelled MCP handler");
+            assert!(
+                matches!(
+                    try_deliver_message(host, &agent, payload, false).await,
+                    SendOutcome::Accepted
+                ),
+                "cancelled control must actually be sent"
+            );
+            true
+        }
+        _ => panic!("an unfinished native call must steer or explicitly refuse"),
+    };
+    collect_control_events_until(host, &mut turn, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    assert_eq!(
+        turn.events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        cancelled_for_control,
+        "Accepted must join its turn; Unsupported must actually cancel before sending"
+    );
+    assert_final_text_contains(&turn, &format!("WORD={secret}"));
+    assert_no_error_message(&turn.label(), turn.events());
+    assert!(
+        mcp_journal(&journal).as_slice() == [serde_json::json!({"value": MCP_ERROR_VALUE})],
+        "exactly one genuine failed call must reach the server"
+    );
+    assert_universal_contract(&[launched, turn]);
+    assert_clean_close(host, &agent).await;
+}
+
+async fn real_control_initialization_failure<B: Backend>(host: &mut Harness<B>) {
+    let bad_model = std::env::var("TYDE_CONTROL_FAILURE_MODEL")
+        .expect("configure the native unavailable-provider/model fault explicitly");
+    let mut settings = host
+        .config
+        .session_settings
+        .clone()
+        .expect("selected native profile");
+    let healthy_model = settings
+        .0
+        .get("model")
+        .expect("explicit healthy native model")
+        .clone();
+    settings.0.insert(
+        "model".to_owned(),
+        protocol::SessionSettingValue::String(bad_model),
+    );
+    let prompt = launch_prompt();
+    let agent = spawn_agent_with_settings(host, &prompt, Some(settings)).await;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            send_prompt(host, &agent, &prompt).await;
+        }
+        let mut failed = host.turn(&prompt);
+        collect_control_events_until(host, &mut failed, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+        let errors: Vec<_> = failed
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error) =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "each admitted initialization failure must have one native error"
+        );
+        // A real unavailable selection can be rejected by native account policy
+        // without echoing the model. Neither native form accepts mapper errors.
+        assert!(
+            errors[0].content.contains("tyde-conformance-unavailable") || {
+                let error = errors[0].content.to_ascii_lowercase();
+                error.contains("model")
+                    && error.contains("not")
+                    && error.contains("supported")
+                    && error.contains("account")
+            },
+            "the terminal must carry the actual configured native fault, not a mapper/transport error"
+        );
+    }
+    set_session_setting_value(host, &agent, "model", healthy_model).await;
+    let recovered = ask_expecting_delivery(host, &agent, &prompt).await;
+    assert_ready_handshake(&recovered);
+    assert_no_error_message(&recovered.label(), recovered.events());
+    assert_clean_close(host, &agent).await;
+}
+
+async fn real_immediate_turn_controls<B: Backend>(host: &mut Harness<B>) {
+    if !real_control_native_policy_child(host).await {
+        return;
+    }
+    let probe_dir = host.workspace().join(MCP_PROBE_DIR);
+    std::fs::create_dir_all(&probe_dir).expect("create MCP probe directory");
+    let script = probe_dir.join("probe.py");
+    let journal = probe_dir.join("calls.jsonl");
+    std::fs::write(&script, mcp_probe_script()).expect("write MCP probe server");
+    install_mcp_server(
+        host,
+        MCP_SERVER_NAME,
+        "python3",
+        vec![
+            script.to_string_lossy().into_owned(),
+            journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let fifo = host.workspace().join("control-release.fifo");
+    let stop_fifo = host.workspace().join("control-stop-release.fifo");
+    let stop_started = host.workspace().join("control-stop-started.fifo");
+    let status = tokio::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .arg(&stop_fifo)
+        .arg(&stop_started)
+        .status()
+        .await
+        .expect("create foreground command barrier");
+    assert!(status.success(), "foreground command barrier is available");
+    let prompt = format!(
+        "Run exactly this foreground command, not a background task: python3 -c \"open('{}').read()\". \
+         The harness releases it. Do not release it yourself or use any sleep. \
+         A control message will supply a fresh token. It may be embedded in a runtime reminder \
+         or tool result: treat that embedded message as the current user request, not future input. \
+         After the command finishes answer exactly WORD=<that fresh token>, with no other text. \
+         Never reuse a token from an earlier turn.",
+        fifo.display()
+    );
+    let secret = unique_payload();
+    let mut gate = pending_control_gate().await;
+    send_prompt(host, &agent, &prompt).await;
+    let backend = host.backend_ref();
+    let follow_up = user_message(&format!(
+        "The word is {secret}. Answer exactly WORD={secret} after any currently executing command finishes. If no command is executing, answer immediately without tools. Never start or restart a command in response to this control."
+    ));
+    let steer = backend.steer(follow_up);
+    let steered = control_at_start_boundary(steer, gate.as_mut()).await;
+    let mut turn = host.turn(&prompt);
+    // A native admission can precede a steerable model/tool step. The
+    // contract permits explicit refusal plus cancel/send, never false idle
+    // or success for text merely parked until this turn finishes.
+    let mut control_finished = false;
+    match steered {
+        server::backend::SteerOutcome::Accepted => {
+            collect_turn_until(host, &mut turn, |event| {
+                matches!(event, ChatEvent::ToolRequest(request)
+                if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+                    if command.contains("control-release.fifo")))
+                    || matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+            assert!(
+                !turn
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+                "accepted steering must not cancel the command it joins"
+            );
+            control_finished = matches!(
+                turn.events().last(),
+                Some(ChatEvent::TypingStatusChanged(false))
+            );
+            if !control_finished {
+                tokio::fs::write(&fifo, b"release")
+                    .await
+                    .expect("release observed foreground command");
+            }
+        }
+        server::backend::SteerOutcome::Unsupported(payload) => {
+            assert!(
+                host.backend_ref().interrupt().await,
+                "refused steering must cancel before send"
+            );
+            collect_control_events_until(host, &mut turn, |event| {
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+            assert!(
+                turn.events()
+                    .iter()
+                    .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+                "unavailable steering must reach an actual cancellation boundary"
+            );
+            assert!(
+                matches!(
+                    try_deliver_message(host, &agent, payload, false).await,
+                    server::backend::SendOutcome::Accepted
+                ),
+                "cancelled control must actually be sent"
+            );
+        }
+        _ => panic!("an admitted turn must steer or explicitly refuse, never falsely report idle"),
+    }
+    if !control_finished {
+        collect_control_events_until(host, &mut turn, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    }
+    eprintln!(
+        "CONTROL FINAL content_chars={} has_word={} has_payload={} responses={} cancellations={}",
+        turn.final_text().len(),
+        turn.final_text().contains(&format!("WORD={secret}")),
+        turn.final_text().contains(&secret),
+        turn.events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+            .count(),
+        turn.events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+            .count()
+    );
+    assert_final_text_contains(&turn, &format!("WORD={secret}"));
+    assert_no_error_message(&turn.label(), turn.events());
+
+    let command = read_only_slash_command(&launched, &advertised_slash_commands(&launched));
+    let invocation = format!("/{command}");
+    let active_secret = unique_payload();
+    send_prompt(host, &agent, &prompt).await;
+    let mut active = host.turn(&prompt);
+    collect_turn_until(host, &mut active, |event| {
+        matches!(event, ChatEvent::ToolRequest(request)
+            if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+                if command.contains("control-release.fifo")))
+    })
+    .await;
+    match try_deliver_message(host, &agent, user_message(&invocation), false).await {
+        server::backend::SendOutcome::Busy(protocol::AgentInput::SendMessage(payload)) => {
+            assert!(
+                payload.message == invocation,
+                "refusal must return the untouched command"
+            );
+        }
+        _ => {
+            panic!("a command must be refused before native delivery while foreground work is held")
+        }
+    }
+    let control = user_message(&format!(
+        "The word is {active_secret}. Answer exactly WORD={active_secret}."
+    ));
+    let cancelled_for_control = match host.backend_ref().steer(control).await {
+        server::backend::SteerOutcome::Accepted => {
+            tokio::fs::write(&fifo, b"release")
+                .await
+                .expect("release natively steered command");
+            false
+        }
+        server::backend::SteerOutcome::Unsupported(payload) => {
+            assert!(
+                host.backend_ref().interrupt().await,
+                "refused live-tool control must cancel"
+            );
+            collect_control_events_until(host, &mut active, |event| {
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+            assert!(
+                active
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+                "a refused live-tool control must reach actual cancellation before delivery"
+            );
+            assert!(
+                matches!(
+                    try_deliver_message(host, &agent, payload, false).await,
+                    server::backend::SendOutcome::Accepted
+                ),
+                "cancelled live-tool control must actually be sent"
+            );
+            true
+        }
+        _ => panic!(
+            "an observed live tool must steer or explicitly refuse, never falsely report idle"
+        ),
+    };
+    collect_control_events_until(host, &mut active, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    eprintln!(
+        "CONTROL ACTIVE content_chars={} has_word={} has_payload={}",
+        active.final_text().len(),
+        active
+            .final_text()
+            .contains(&format!("WORD={active_secret}")),
+        active.final_text().contains(&active_secret)
+    );
+    assert_final_text_contains(&active, &format!("WORD={active_secret}"));
+    assert!(
+        active
+            .user_messages()
+            .all(|message| message.content != invocation),
+        "refused commands must not acquire a delivered user echo"
+    );
+
+    assert_eq!(
+        active
+            .events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        cancelled_for_control,
+        "Accepted must join its addressed turn without cancellation; Unsupported must actually cancel before sending"
+    );
+
+    let invoked = ask_expecting_delivery(host, &agent, &invocation).await;
+    assert!(
+        !invoked.final_text().trim().is_empty(),
+        "an admitted native command must produce its reply"
+    );
+    assert_no_error_message(&invoked.label(), invoked.events());
+    assert_reached_idle(&invoked);
+
+    let probe_secret = unique_payload();
+    let probed = ask(
+        host,
+        &agent,
+        mcp_probe_prompt(host.backend(), &probe_secret),
+    )
+    .await;
+    assert_no_error_message(&probed.label(), probed.events());
+    let served = mcp_journal(&journal);
+    assert!(
+        served.as_slice() == [serde_json::json!({"value": probe_secret})],
+        "the real MCP server must receive exactly the dictated native invocation"
+    );
+    let requests: Vec<_> = probed
+        .tool_requests()
+        .filter(|request| {
+            matches!(&request.tool_type, ToolRequestType::Other { args }
+            if args == &serde_json::json!({"value": probe_secret}))
+        })
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one resolved MCP request must be visible"
+    );
+    assert_final_text_contains(&probed, &format!("{MCP_RESULT_PREFIX}{probe_secret}"));
+
+    let policy_command = "python3 -c \"raise SystemExit('TYDE_NATIVE_POLICY_PROBE')\"";
+    let policy_tool = match host.backend() {
+        BackendKind::Claude => "Bash",
+        BackendKind::Hermes => "terminal (through tool_call if deferred)",
+        _ => "exec_command",
+    };
+    let policy_prompt = format!(
+        "This is a bounded native-policy conformance probe, not a repair task. Submit exactly ONE \
+         foreground call to {policy_tool} with this exact command: {policy_command}. It deliberately \
+         fails and changes no files. Native policy may deny it instead: accept that failure or \
+         denial without retrying, changing arguments, diagnosing, or using other tools. \
+         Then reply POLICY_PROBE_FINISHED."
+    );
+    let policy = ask(host, &agent, &policy_prompt).await;
+    assert_no_error_message(&policy.label(), policy.events());
+    let attempts: Vec<_> = policy
+        .tool_requests()
+        .filter(|request| {
+            matches!(&request.tool_type,
+            ToolRequestType::RunCommand { command, .. }
+                if command.contains("TYDE_NATIVE_POLICY_PROBE"))
+        })
+        .collect();
+    eprintln!("CONTROL POLICY visible_attempts={}", attempts.len());
+    assert_eq!(
+        attempts.len(),
+        1,
+        "the native attempt, including a policy denial, must remain visible"
+    );
+    for attempt in attempts {
+        let outcomes: Vec<_> = policy
+            .tool_completions()
+            .filter(|completion| completion.tool_call_id == attempt.tool_call_id)
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "each native attempt must settle exactly once"
+        );
+        assert!(
+            matches!(outcomes[0].outcome, ToolExecutionOutcome::Failed { .. }),
+            "a failed or natively denied probe must retain its failure, not become cancelled or successful"
+        );
+    }
+
+    let stop_prompt = format!(
+        "Run exactly this foreground command, not a background task: python3 -c \"ready=open('{}','w'); ready.write('started'); ready.close(); open('{}').read()\". \
+         Do not release either FIFO, use sleeps, or run any other command. The harness will stop you.",
+        stop_started.display(),
+        stop_fifo.display()
+    );
+    send_prompt(host, &agent, &stop_prompt).await;
+    let mut stopped_tool = host.turn(&stop_prompt);
+    collect_control_events_until(host, &mut stopped_tool, |event| matches!(event,
+        ChatEvent::ToolRequest(request) if matches!(&request.tool_type,
+            ToolRequestType::RunCommand { command, .. } if command.contains("control-stop-release.fifo"))))
+        .await;
+    let stopped_tool_id = stopped_tool
+        .tool_requests()
+        .find(|request| {
+            matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+            if command.contains("control-stop-release.fifo"))
+        })
+        .expect("observed foreground command request")
+        .tool_call_id
+        .clone();
+    assert_eq!(
+        tokio::fs::read(&stop_started)
+            .await
+            .expect("observe actual foreground process start"),
+        b"started",
+        "the command must actually run before Stop"
+    );
+    assert!(
+        host.backend_ref().interrupt().await,
+        "held foreground tool must stop"
+    );
+    collect_control_events_until(host, &mut stopped_tool, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    // Hermes can finish its native tool with exit 130 before the turn's Stop
+    // terminal. Preserve that result rather than reinterpret a settled tool.
+    assert!(
+        stopped_tool
+            .events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        "Stop must cancel the held turn"
+    );
+    assert_eq!(
+        stopped_tool
+            .tool_completions()
+            .filter(|completion| completion.tool_call_id == stopped_tool_id)
+            .count(),
+        1,
+        "held command must have exactly one completion"
+    );
+    assert_eq!(
+        stopped_tool
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamEnd(end) => Some(&end.message),
+                ChatEvent::MessageAdded(message) => Some(message),
+                _ => None,
+            })
+            .filter(|message| message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == stopped_tool_id))
+            .count(),
+        1,
+        "Stop must retain the completed provider response declaring its foreground tool in durable history"
+    );
+    assert_every_request_was_declared(&stopped_tool);
+
+    arm_pending_control_gate(gate.as_mut()).await;
+    let mut cancellation_gate = pending_cancellation_gate().await;
+    assert!(
+        gate.is_none() || cancellation_gate.is_none(),
+        "only one cancellation frontier is pinned"
+    );
+    send_prompt(host, &agent, &prompt).await;
+    let boundary = match cancellation_gate.as_mut() {
+        Some(boundary) => Some(boundary),
+        None => gate.as_mut(),
+    };
+    let cancelled = control_at_start_boundary(host.backend_ref().interrupt(), boundary).await;
+    assert!(
+        cancelled,
+        "an immediate interrupt must address the accepted turn"
+    );
+    let mut interrupted = host.turn(&prompt);
+    collect_control_events_until(host, &mut interrupted, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    assert!(
+        interrupted
+            .events()
+            .iter()
+            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+        "the accepted turn must reach a cancellation boundary"
+    );
+    let after = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&after);
+    let wake_secret = unique_payload();
+    for name in ["control-wake-release", "control-wake-work"] {
+        assert!(
+            tokio::process::Command::new("mkfifo")
+                .arg(host.workspace().join(name))
+                .status()
+                .await
+                .expect("create wake command barrier")
+                .success()
+        );
+    }
+    let background = "read -r release < control-wake-release; echo CONTROL_BACKGROUND_DONE";
+    let launch = match host.backend() {
+        BackendKind::Codex => format!(
+            "Run `{background}` as an ordinary foreground exec_command with yield_time_ms=1; do not wait or poll it."
+        ),
+        BackendKind::Hermes => format!(
+            "Call terminal exactly once with these literal JSON arguments: {{\"command\":\"{background}\",\"background\":true,\"notify\":true}}. The notify field is REQUIRED; do not omit it. Do not wait or poll it."
+        ),
+        _ => format!(
+            "Run `{background}` in the background with completion notification. Do not wait or poll it."
+        ),
+    };
+    let work = "read -r release < control-wake-work";
+    let background_prompt = format!(
+        "{launch} Only after starting it, reply {BG_MARKER}. On its completion notification, immediately run `{work}` in the FOREGROUND and await completion, then answer using the next control message. The harness releases both FIFOs; never release them yourself or use sleeps."
+    );
+    let mut settlement = pending_settlement_gate().await;
+    send_prompt(host, &agent, &background_prompt).await;
+    let mut started = host.turn(&background_prompt);
+    if settlement.is_some() {
+        let mut visible = String::new();
+        collect_turn_until(host, &mut started, |event| {
+            if let ChatEvent::StreamDelta(delta) = event {
+                visible.push_str(&delta.text);
+            }
+            visible.contains(BG_MARKER)
+        })
+        .await;
+        wait_pending_settlement(settlement.as_mut()).await;
+    } else {
+        collect_turn_until(host, &mut started, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+        assert_final_text_contains(&started, BG_MARKER);
+    }
+    let watched: Vec<_> = started
+        .tool_requests()
+        .filter(|request| {
+            !started
+                .tool_completions()
+                .any(|completion| completion.tool_call_id == request.tool_call_id)
+        })
+        .map(|request| request.tool_call_id.clone())
+        .collect();
+    assert!(
+        !watched.is_empty(),
+        "control wake scenario requires a live background command"
+    );
+    arm_pending_control_gate(gate.as_mut()).await;
+    tokio::fs::write(host.workspace().join("control-wake-release"), b"release\n")
+        .await
+        .expect("release native background command");
+    release_pending_settlement(settlement.as_mut()).await;
+    if settlement.is_some() {
+        collect_turn_until(host, &mut started, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+        assert_final_text_contains(&started, BG_MARKER);
+    }
+    let mut wake = started;
+    if !wake
+        .tool_completions()
+        .any(|completion| watched.contains(&completion.tool_call_id))
+    {
+        collect_control_events_until(host, &mut wake, |event| {
+            matches!(event,
+            ChatEvent::ToolExecutionCompleted(completion) if watched.contains(&completion.tool_call_id))
+        }).await;
+    }
+    if gate.is_some() {
+        // The transparent fixture holds the genuine native start notification.
+        wait_pending_control_start(gate.as_mut()).await;
+    } else if wake.events().iter().rev().find_map(|event| match event {
+        ChatEvent::TypingStatusChanged(typing) => Some(*typing),
+        _ => None,
+    }) != Some(true)
+    {
+        // The native wake can already have started while we collect the
+        // background completion. Consume that actual lifecycle event once.
+        collect_control_events_until(host, &mut wake, |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+    }
+    let follow_up = user_message(&format!(
+        "If not already running, run `{work}` in the FOREGROUND and await it. Then answer exactly WORD={wake_secret}. Never release the FIFO yourself."
+    ));
+    match try_deliver_message(host, &agent, follow_up, false).await {
+        server::backend::SendOutcome::Accepted => {}
+        server::backend::SendOutcome::Busy(protocol::AgentInput::SendMessage(payload)) => {
+            let outcome =
+                control_at_start_boundary(host.backend_ref().steer(payload), gate.as_mut()).await;
+            match outcome {
+                server::backend::SteerOutcome::Accepted => {}
+                server::backend::SteerOutcome::Unsupported(payload) => {
+                    assert!(
+                        host.backend_ref().interrupt().await,
+                        "unsteerable wake must cancel"
+                    );
+                    collect_control_events_until(host, &mut wake, |event| {
+                        matches!(event, ChatEvent::TypingStatusChanged(false))
+                    })
+                    .await;
+                    assert!(
+                        wake.events()
+                            .iter()
+                            .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+                        "wake cancellation must be observable"
+                    );
+                    assert!(
+                        matches!(
+                            try_deliver_message(host, &agent, payload, false).await,
+                            server::backend::SendOutcome::Accepted
+                        ),
+                        "cancelled wake control must actually be sent"
+                    );
+                }
+                _ => panic!(
+                    "a pending wake must steer or explicitly refuse, never falsely report idle"
+                ),
+            }
+        }
+        _ => panic!("background-completion control was neither sent nor steered"),
+    }
+    collect_control_events_until(host, &mut wake, |event| matches!(event, ChatEvent::ToolRequest(request)
+        if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains("control-wake-work")))).await;
+    tokio::fs::write(host.workspace().join("control-wake-work"), b"release\n")
+        .await
+        .expect("release foreground wake work");
+    collect_control_events_until(host, &mut wake, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    assert_final_text_contains(&wake, &format!("WORD={wake_secret}"));
+    assert_no_error_message(&wake.label(), wake.events());
+    assert_universal_contract(&[
+        launched,
+        turn,
+        active,
+        probed,
+        policy,
+        stopped_tool,
+        interrupted,
+        after,
+        wake,
+    ]);
     assert_clean_close(host, &agent).await;
 }
 

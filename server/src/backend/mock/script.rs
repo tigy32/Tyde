@@ -429,6 +429,28 @@ impl MockTurn {
         ))
     }
 
+    /// A gated text turn the provider has not started until `start` is
+    /// released; each steer held before then enters `steer_waiting`.
+    pub fn gated_text_after_turn_start(
+        text: impl Into<String>,
+        start: &MockGateHandle,
+        steer_waiting: &MockGateHandle,
+        gate: &MockGateHandle,
+    ) -> Self {
+        let mut steps = vec![MockStep::TurnStartGate {
+            start: start.gate(),
+            steer_waiting: steer_waiting.gate(),
+        }];
+        steps.extend(text_steps(
+            text.into(),
+            TextShape {
+                gate: Some(gate.gate()),
+                ..TextShape::default()
+            },
+        ));
+        Self::done(steps)
+    }
+
     pub fn gated_held_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         let mut steps = held_steps(text.into());
         steps.push(MockStep::Gate(gate.gate()));
@@ -1475,6 +1497,11 @@ fn held_steps(text: String) -> Vec<MockStep> {
 pub(super) enum MockStep {
     Emit(Box<BackendEvent>),
     Gate(MockGate),
+    /// Parks before the turn starts, refusing every steer as no active turn.
+    TurnStartGate {
+        start: MockGate,
+        steer_waiting: MockGate,
+    },
     SpawnNativeChild(MockNativeChild),
     AgentControlAwait(MockAgentControlAwait),
     TychatSend(String),

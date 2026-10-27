@@ -256,6 +256,7 @@ struct InitialFollowUpContext<'a> {
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
     next_queue_sequence: &'a mut u64,
     pending_inputs: &'a mut VecDeque<AgentInput>,
+    held_controls: &'a mut VecDeque<HeldControlDelivery>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
 }
 
@@ -277,6 +278,7 @@ struct QueueDispatchTerminalContext<'a> {
     start_tx: &'a watch::Sender<AgentStartPayload>,
     latest_output: &'a mut AgentControlLatestOutput,
     pending_inputs: &'a mut VecDeque<AgentInput>,
+    held_controls: &'a mut VecDeque<HeldControlDelivery>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
     open_tool_call_ids: &'a mut HashSet<String>,
     pending_tool_response_ids: &'a mut HashSet<String>,
@@ -386,6 +388,66 @@ enum RunningTurnRedirect {
     SteerElseInterrupt,
     /// Always interrupt the turn and send the message next.
     Interrupt,
+}
+
+/// When an agent-control redirect the actor could not deliver yet re-enters
+/// delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldControlRelease {
+    /// As soon as the actor's dispatch gates open: steer or interrupt again.
+    Redirect,
+    /// After the redirected turn's idle, fenced by required continuations.
+    NextTurn { idle_seen: bool },
+}
+
+/// An agent-control steer or interrupt that is neither steered nor sent yet.
+/// It never enters the editable queue, and its caller is answered only when
+/// the message is dispatched or explicitly refused.
+struct HeldControlDelivery {
+    payload: SendMessagePayload,
+    redirect: RunningTurnRedirect,
+    reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    release: HeldControlRelease,
+}
+
+fn hold_agent_control(
+    held: &mut VecDeque<HeldControlDelivery>,
+    ack: DeliveryAcknowledgement<'_>,
+    payload: SendMessagePayload,
+    redirect: RunningTurnRedirect,
+    release: HeldControlRelease,
+) {
+    held.push_back(HeldControlDelivery {
+        payload,
+        redirect,
+        reply: ack.reply,
+        release,
+    });
+    tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, ?release,
+        held = held.len(), "actor holding agent-control delivery");
+}
+
+/// An agent-control follow-up that must steer or interrupt the running turn
+/// rather than wait in the editable queue.
+fn is_agent_control_redirect(
+    input: &AgentInput,
+    redirect: RunningTurnRedirect,
+    human: &Option<HumanDelivery>,
+) -> bool {
+    human.is_none()
+        && matches!(
+            redirect,
+            RunningTurnRedirect::SteerElseInterrupt | RunningTurnRedirect::Interrupt
+        )
+        && matches!(input, AgentInput::SteerMessage(payload) if payload.tool_response.is_none())
+}
+
+fn reject_held_agent_controls(held: &mut VecDeque<HeldControlDelivery>, reason: &str) {
+    for control in held.drain(..) {
+        let _ = control
+            .reply
+            .send(Err(AgentDeliveryFailure::Rejected(reason.to_owned())));
+    }
 }
 
 struct UsageSnapshotReply {
@@ -3905,6 +3967,7 @@ pub(crate) fn spawn_agent_actor(
             .collect::<VecDeque<_>>();
         let mut next_queue_sequence = queue.len() as u64 + 1;
         let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
+        let mut held_controls: VecDeque<HeldControlDelivery> = VecDeque::new();
         // Checked deliveries this actor has already acknowledged as accepted
         // and parked in `pending_inputs` behind a gate — either the startup
         // loop or the resume-replay barrier. Two later transitions would
@@ -4456,6 +4519,12 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
+                            if is_agent_control_redirect(&input, redirect, &human) {
+                                let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                                    DELIVERY_REJECTED_STARTING.to_owned(),
+                                )));
+                                continue;
+                            }
                             let Some(reply) = prepare_delivery_ack(
                                 reply,
                                 human,
@@ -4620,6 +4689,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
+                    &mut held_controls,
                     &mut rx,
                     &status_handle,
                 )
@@ -4798,6 +4868,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
+                    &mut held_controls,
                     &mut rx,
                     &status_handle,
                 )
@@ -5012,6 +5083,7 @@ pub(crate) fn spawn_agent_actor(
                 &mut latest_output,
                 &mut subscribers,
                 &mut pending_inputs,
+                &mut held_controls,
                 &mut rx,
                 &status_handle,
             )
@@ -5146,6 +5218,7 @@ pub(crate) fn spawn_agent_actor(
                     queue: &mut queue,
                     next_queue_sequence: &mut next_queue_sequence,
                     pending_inputs: &mut pending_inputs,
+                    held_controls: &mut held_controls,
                     rx: &mut rx,
                 },
             )
@@ -5194,11 +5267,15 @@ pub(crate) fn spawn_agent_actor(
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
+                    &mut held_controls,
                     &mut rx,
                     &status_handle,
                 )
                 .await;
                 return;
+            }
+            if matches!(lifecycle, ActorLifecycle::Closing) {
+                reject_held_agent_controls(&mut held_controls, DELIVERY_REJECTED_CLOSING);
             }
             let project_entry_ready = scheduled_project_move.is_some()
                 && !project_move_waiting_for_backend
@@ -5699,6 +5776,7 @@ pub(crate) fn spawn_agent_actor(
                                 start_tx: &start_tx,
                                 latest_output: &mut latest_output,
                                 pending_inputs: &mut pending_inputs,
+                                held_controls: &mut held_controls,
                                 rx: &mut rx,
                                 open_tool_call_ids: &mut open_tool_call_ids,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
@@ -5716,6 +5794,10 @@ pub(crate) fn spawn_agent_actor(
                 }
             }
             let usage_paused = usage_pause.is_some();
+            // A pause holds queued work, never an agent-control caller.
+            if usage_paused {
+                reject_held_agent_controls(&mut held_controls, DELIVERY_REJECTED_USAGE_PAUSED);
+            }
             // The retained restart continuation goes out the first time the
             // agent is idle and unheld; the dispatch barrier keeps the queue
             // behind it until then.
@@ -5832,6 +5914,23 @@ pub(crate) fn spawn_agent_actor(
             );
             tokio::pin!(supervisor_sleep);
             tokio::pin!(stall_sleep);
+            let held_control_releasable = held_controls.front().is_some_and(|held| {
+                matches!(lifecycle, ActorLifecycle::Running)
+                    && tychat_handoff.is_none()
+                    && pending_inputs.is_empty()
+                    && initial_follow_up.is_none()
+                    && scheduled_project_move.is_none()
+                    && project_entry_pending.is_none()
+                    && !resume_replay_gate_pending
+                    && !usage_paused
+                    && context_compaction.is_none()
+                    && active_compaction.is_none()
+                    && !compaction_blocked
+                    && match held.release {
+                        HeldControlRelease::Redirect => true,
+                        HeldControlRelease::NextTurn { idle_seen } => idle_seen,
+                    }
+            });
             tokio::select! {
                 result = async {
                     match project_entry_pending.as_mut() {
@@ -6087,6 +6186,7 @@ pub(crate) fn spawn_agent_actor(
                             queue: &mut queue,
                             next_queue_sequence: &mut next_queue_sequence,
                             pending_inputs: &mut pending_inputs,
+                            held_controls: &mut held_controls,
                             rx: &mut rx,
                         },
                     )
@@ -6294,6 +6394,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_inputs,
+                                &mut held_controls,
                                 &mut rx,
                                 &status_handle,
                             )
@@ -6377,6 +6478,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut latest_output,
                             &mut subscribers,
                             &mut pending_inputs,
+                            &mut held_controls,
                             &mut rx,
                             &status_handle,
                         )
@@ -6711,6 +6813,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
+                                                &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
                                             )
@@ -6750,6 +6853,7 @@ pub(crate) fn spawn_agent_actor(
                                                 next_queue_sequence:
                                                     &mut next_queue_sequence,
                                                 pending_inputs: &mut pending_inputs,
+                                                held_controls: &mut held_controls,
                                                 rx: &mut rx,
                                             },
                                         )
@@ -6859,6 +6963,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_inputs,
+                                        &mut held_controls,
                                         &mut rx,
                                         &status_handle,
                                     )
@@ -7557,6 +7662,20 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                     }
 
+                    // A held agent-control redirect goes out at the backend's
+                    // idle for the turn it redirected, ahead of the queue.
+                    if real_idle_transition
+                        || (matches!(&event, ChatEvent::TypingStatusChanged(false))
+                            && !in_turn
+                            && pending_tool_response_ids.is_empty()
+                            && open_tool_call_ids.is_empty())
+                    {
+                        for held in held_controls.iter_mut() {
+                            if let HeldControlRelease::NextTurn { idle_seen } = &mut held.release {
+                                *idle_seen = true;
+                            }
+                        }
+                    }
                     // Cancelling an interaction after foreground idle owes an
                     // idle marker too, but must not invent a foreground turn.
                     if (real_idle_transition
@@ -7566,6 +7685,7 @@ pub(crate) fn spawn_agent_actor(
                             && initial_follow_up.is_none()
                             && pending_tool_response_ids.is_empty()
                             && open_tool_call_ids.is_empty()))
+                        && held_controls.is_empty()
                         && tychat_handoff.is_none()
                         && !resume_replay_gate_pending
                         && !usage_paused
@@ -7710,6 +7830,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut latest_output,
                                     &mut subscribers,
                                     &mut pending_inputs,
+                                    &mut held_controls,
                                     &mut rx,
                                     &status_handle,
                                 )
@@ -7747,6 +7868,15 @@ pub(crate) fn spawn_agent_actor(
                 maybe_command = async {
                     if !in_turn && let Some((message, reply)) = tychat_handoff.take() {
                         Some(AgentCommand::TychatDeliver { message, after_interrupt: true, reply })
+                    } else if held_control_releasable && let Some(held) = held_controls.pop_front() {
+                        tracing::info!(target: "tyde_project_entry_diagnostic", redirect = ?held.redirect,
+                            release = ?held.release, in_turn, "actor releasing held agent-control delivery");
+                        Some(AgentCommand::DeliverMessage {
+                            input: AgentInput::SteerMessage(held.payload),
+                            redirect: held.redirect,
+                            human: None,
+                            reply: held.reply,
+                        })
                     } else {
                         next_agent_command(&mut pending_inputs, &mut rx,
                             !resume_replay_gate_pending && !usage_paused).await
@@ -7763,6 +7893,9 @@ pub(crate) fn spawn_agent_actor(
                     // which the caller reads as a failed delivery.
                     let mut delivery_ack: Option<DeliveryAcknowledgement<'_>> = None;
                     let mut redirect = RunningTurnRedirect::SteerElseInterrupt;
+                    // An agent-control steer or interrupt: it is steered, sent,
+                    // held for its turn boundary, or refused — never queued.
+                    let mut control_redirect = false;
                     let command = match command {
                         AgentCommand::DeliverMessage {
                             input,
@@ -7780,10 +7913,11 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
+                            control_redirect = is_agent_control_redirect(&input, delivery_redirect, &human);
                             let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
-                            tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn,
+                            tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn, control_redirect,
                                 pending_move = scheduled_project_move.is_some(), "actor received acknowledged delivery");
                             AgentCommand::SendInput(input)
                         }
@@ -8060,6 +8194,10 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::SendInput(input) => {
 
                             if resume_replay_gate_pending {
+                                if control_redirect {
+                                    reject_agent_delivery(delivery_ack.take(), DELIVERY_REJECTED_REPLAY);
+                                    continue;
+                                }
                                 // Accepted, not rejected: the resume barrier is
                                 // transient and the message is dispatched once
                                 // it lifts. Mark the queued work active before
@@ -8172,7 +8310,7 @@ pub(crate) fn spawn_agent_actor(
                                             && !(redirect == RunningTurnRedirect::Interrupt
                                                 && !pending_tool_response_ids.is_empty()))
                                         || usage_paused
-                                        || context_compaction.is_some() =>
+                                        || (context_compaction.is_some() && !control_redirect) =>
                                 {
                                     tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn,
                                         usage_paused, context_compaction = context_compaction.is_some(),
@@ -8190,6 +8328,7 @@ pub(crate) fn spawn_agent_actor(
                                 AgentInput::SendMessage(msg) => {
                                     let admitted_tool_response = msg.tool_response.clone();
                                     let admitted_message = msg.message.clone();
+                                    let required_continuation = matches!(msg.origin, Some(MessageOrigin::System | MessageOrigin::HostRestart));
                                     let admitted_images = msg.images.clone();
                                     let review_origin = match msg.origin.as_ref() {
                                         Some(MessageOrigin::Review { review_id }) => {
@@ -8435,6 +8574,28 @@ pub(crate) fn spawn_agent_actor(
                                             }
                                             continue;
                                         }
+                                        if control_redirect
+                                            && let Some(reply) = delivery_ack.take()
+                                        {
+                                            let release = match admission {
+                                                Some(registry::DispatchAdmission::HostStopping) => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_HOST_STOPPING);
+                                                    continue;
+                                                }
+                                                None if usage_paused => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_USAGE_PAUSED);
+                                                    continue;
+                                                }
+                                                Some(_) => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_RECOVERY_PENDING);
+                                                    continue;
+                                                }
+                                                None if in_turn => HeldControlRelease::Redirect,
+                                                None => HeldControlRelease::NextTurn { idle_seen: true },
+                                            };
+                                            hold_agent_control(&mut held_controls, reply, msg, redirect, release);
+                                            continue;
+                                        }
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
                                         let sequence = next_queue_sequence;
@@ -8539,6 +8700,14 @@ pub(crate) fn spawn_agent_actor(
                                                 AgentInput::SendMessage(payload)
                                                     if payload.tool_response.is_none() =>
                                                 {
+                                                    if control_redirect
+                                                        && let Some(reply) = delivery_ack.take()
+                                                    {
+                                                        // Redirects the turn the
+                                                        // backend started itself.
+                                                        hold_agent_control(&mut held_controls, reply, payload, redirect, HeldControlRelease::Redirect);
+                                                        continue;
+                                                    }
                                                     tracing::info!(
                                                         agent_id = %current_start.agent_id,
                                                         "backend busy with a self-started turn; queued message at front"
@@ -8669,11 +8838,18 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
+                                                &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
                                             )
                                             .await;
                                             return;
+                                        }
+                                        if required_continuation {
+                                            for held in held_controls.iter_mut() {
+                                                held.release = HeldControlRelease::NextTurn { idle_seen: false };
+                                            }
+                                            tracing::info!(target: "tyde_project_entry_diagnostic", held_controls = held_controls.len(), "held controls fenced behind required continuation");
                                         }
                                         if !is_tool_response {
                                             mark_agent_turn_active(&status_handle).await;
@@ -8785,14 +8961,30 @@ pub(crate) fn spawn_agent_actor(
                                                 status.activity_counter.saturating_add(1);
                                         })
                                         .await;
-                                    if status_handle
+                                    let redirect_admission = status_handle
                                         .admit_dispatch(registry::DispatchClass::Redirect)
-                                        .await
-                                        != registry::DispatchAdmission::Admitted
-                                    {
+                                        .await;
+                                    if redirect_admission != registry::DispatchAdmission::Admitted {
                                         if redirect == RunningTurnRedirect::SwarmWake {
                                             if let Some(reply) = delivery_ack.take() {
                                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
+                                            }
+                                            continue;
+                                        }
+                                        if control_redirect
+                                            && let Some(reply) = delivery_ack.take()
+                                        {
+                                            match redirect_admission {
+                                                registry::DispatchAdmission::RecoveryPending => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_RECOVERY_PENDING);
+                                                }
+                                                registry::DispatchAdmission::HostStopping => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_HOST_STOPPING);
+                                                }
+                                                registry::DispatchAdmission::Admitted
+                                                | registry::DispatchAdmission::Unrecorded => {
+                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_UNRECORDED);
+                                                }
                                             }
                                             continue;
                                         }
@@ -8867,6 +9059,51 @@ pub(crate) fn spawn_agent_actor(
                                         },
                                         }
                                     };
+                                    if control_redirect
+                                        && let Some(reply) = delivery_ack.take()
+                                    {
+                                        let blocked_on_user = pending_tool_response_ids.iter().any(|id| {
+                                            open_tool_requests.get(id).is_some_and(|request| {
+                                                user_response_blocks_turn(&request.tool_type)
+                                            })
+                                        });
+                                        let interrupt_turn = interrupt_turn || blocked_on_user;
+                                        let release = HeldControlRelease::NextTurn { idle_seen: false };
+                                        tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, interrupt_turn,
+                                            in_turn, idle_transition_armed, ?release, "actor agent-control redirect decision");
+                                        if interrupt_turn
+                                            && !backend
+                                                .as_ref()
+                                                .expect("backend must exist while actor is running")
+                                                .interrupt()
+                                                .await
+                                        {
+                                            let payload = AgentErrorPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                code: AgentErrorCode::Internal,
+                                                message: "agent backend could not interrupt".to_owned(),
+                                                fatal: false,
+                                            };
+                                            append_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                FrameKind::AgentError,
+                                                &payload,
+                                            )
+                                            .await;
+                                            reject_agent_delivery(Some(reply), DELIVERY_REJECTED_INTERRUPT_FAILED);
+                                            continue;
+                                        }
+                                        hold_agent_control(
+                                            &mut held_controls,
+                                            reply,
+                                            payload,
+                                            redirect,
+                                            release,
+                                        );
+                                        continue;
+                                    }
                                     let (payload, interrupt_turn) = if redirect
                                         == RunningTurnRedirect::SwarmWake
                                     {
@@ -9218,6 +9455,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
+                                                &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
                                             )
@@ -10001,7 +10239,7 @@ pub(crate) fn spawn_agent_actor(
                                 &session_store,
                                 &status_handle,
                                 &review_registry,
-                                usage_paused,
+                                usage_paused || !held_controls.is_empty(),
                             )
                             .await;
                             if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -10024,6 +10262,7 @@ pub(crate) fn spawn_agent_actor(
                                         start_tx: &start_tx,
                                         latest_output: &mut latest_output,
                                         pending_inputs: &mut pending_inputs,
+                                        held_controls: &mut held_controls,
                                         rx: &mut rx,
                                         open_tool_call_ids: &mut open_tool_call_ids,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
@@ -10195,7 +10434,7 @@ pub(crate) fn spawn_agent_actor(
                                     &session_store,
                                     &status_handle,
                                     &review_registry,
-                                    usage_paused,
+                                    usage_paused || !held_controls.is_empty(),
                                 )
                                 .await;
                                 if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -10218,6 +10457,7 @@ pub(crate) fn spawn_agent_actor(
                                             start_tx: &start_tx,
                                             latest_output: &mut latest_output,
                                             pending_inputs: &mut pending_inputs,
+                                            held_controls: &mut held_controls,
                                             rx: &mut rx,
                                             open_tool_call_ids: &mut open_tool_call_ids,
                                             pending_tool_response_ids:
@@ -10855,6 +11095,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_inputs,
+                                &mut held_controls,
                                 &mut rx,
                                 &status_handle,
                             )
@@ -10863,6 +11104,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::StopForRestart { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
+                            reject_held_agent_controls(&mut held_controls, DELIVERY_REJECTED_HOST_STOPPING);
                             status_handle.prepare_restart().await;
                             if let Some(backend) = backend.take() {
                                 backend.interrupt().await;
@@ -10895,6 +11137,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             lifecycle = ActorLifecycle::Closing;
                             close_reply = Some(reply);
+                            reject_held_agent_controls(&mut held_controls, DELIVERY_REJECTED_CLOSING);
                             if let Some(flight) = context_compaction.take() {
                                 let session_id = current_session_id
                                     .as_ref()
@@ -12435,10 +12678,17 @@ fn prepare_delivery_ack<'a>(
 /// transcript error for a message the actor never accepted would put a failure
 /// in the target's history that its user never caused.
 const DELIVERY_REJECTED_RELAY: &str = "backend-native relay agents do not accept direct input";
+const DELIVERY_REJECTED_STARTING: &str = "agent backend is starting; the message was not delivered";
+const DELIVERY_REJECTED_REPLAY: &str =
+    "agent session history is replaying; the message was not delivered";
 const DELIVERY_REJECTED_COMPACTING: &str = "agent compaction is in progress";
 const DELIVERY_REJECTED_CLOSING: &str = "agent is closing";
 const DELIVERY_REJECTED_HOST_STOPPING: &str =
     "Tyde is restarting; answer again after the host restarts";
+const DELIVERY_REJECTED_USAGE_PAUSED: &str =
+    "agent is paused at its usage limit; the message was not delivered";
+const DELIVERY_REJECTED_INTERRUPT_FAILED: &str =
+    "agent backend could not interrupt; the message was not delivered";
 const DELIVERY_REJECTED_RECOVERY_PENDING: &str =
     "agent is continuing the turn a host restart interrupted";
 const DELIVERY_REJECTED_UNRECORDED: &str =
@@ -12970,9 +13220,11 @@ async fn park_terminal_agent(
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     pending_inputs: &mut VecDeque<AgentInput>,
+    held_controls: &mut VecDeque<HeldControlDelivery>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
     status_handle: &registry::AgentStatusHandle,
 ) {
+    reject_held_agent_controls(held_controls, DELIVERY_REJECTED_TERMINAL);
     event_log.timing.interrupt();
     event_log.timing.stop();
     if let Some(session_id) = session_id {
@@ -15187,9 +15439,15 @@ async fn send_initial_follow_up_or_park(
         .await
     {
         SendOutcome::Accepted => {
+            // Controls already held before entry must not preempt its required
+            // continuation when the old turn's idle event is observed.
+            for held in context.held_controls.iter_mut() {
+                held.release = HeldControlRelease::NextTurn { idle_seen: false };
+            }
             *context.idle_transition_armed = false;
             tracing::info!(
                 agent_id = %context.current_start.agent_id,
+                held_controls = context.held_controls.len(),
                 "initial resumed-session follow-up accepted by backend"
             );
             mark_agent_turn_active(context.status_handle).await;
@@ -15293,6 +15551,7 @@ async fn send_initial_follow_up_or_park(
         context.latest_output,
         context.subscribers,
         context.pending_inputs,
+        context.held_controls,
         context.rx,
         context.status_handle,
     )
@@ -15355,6 +15614,7 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
         context.latest_output,
         context.subscribers,
         context.pending_inputs,
+        context.held_controls,
         context.rx,
         context.status_handle,
     )
@@ -16404,9 +16664,9 @@ async fn release_context_compaction_barrier(
     session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
     review_registry: &ReviewRegistryHandle,
-    usage_paused: bool,
+    dispatch_withheld: bool,
 ) -> QueuedMessageDispatchOutcome {
-    if *in_turn || usage_paused {
+    if *in_turn || dispatch_withheld {
         return QueuedMessageDispatchOutcome::Empty;
     }
     dispatch_queued_message(QueuedMessageDispatchContext {

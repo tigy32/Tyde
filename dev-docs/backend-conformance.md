@@ -1946,3 +1946,179 @@ approved small-test API credentials without copying or modifying native OAuth
 or global configuration. The other backends retained their normal profiles.
 Content-safe receipts and complete private diagnostics are retained under
 `/home/tyggs/tyde-evidence/codex-helper-selected-model/`.
+
+## Immediate agent-control delivery
+
+`real_immediate_turn_controls` requires `Interrupt`,
+`BackgroundTasks`, `AgentInitiatedTurns`, `SlashCommands` and `StartupMcpServers`.
+Every eligible backend runs the same foreground FIFO, immediate steering,
+codeword answer, immediate cancellation and next-turn-admission oracles. A
+steered input must join its accepted turn before the harness releases the
+foreground command; success cannot mean waiting until that turn finishes.
+A native phase that cannot take steering must return `Unsupported` with the
+untouched payload; the same oracle then requires actual cancellation followed
+by accepted delivery and the exact fresh answer. `NoActiveTurn` is never valid
+for an admitted, unfinished start. This typed-outcome branch is identical for
+all eligible backends, not a provider-specific substitute scenario. A
+background-completion wake exercises the same control boundary, while a second
+foreground FIFO keeps native wake work observable until its control joins.
+
+`conformance2/pending_control_proxy.py <conformance2 executable>` additionally
+pins the native Codex start boundary for this scenario. It forwards the real
+CLI's bytes, holds genuine `turn/started` notifications and the ordered suffix,
+and leaves RPC replies independent. Unix-socket events arm, observe and release
+the boundary; it fabricates no provider responses and uses no delays. The
+harness waits for the adapter's content-free pending-control receipt before
+release. This transport interleaving is supplementary to, not a replacement
+for, the scenario on every eligible backend.
+
+An accepted Codex send reserves a turn before its native ID arrives. That
+reservation is not `NoActiveTurn`: steering must wait for its start, then
+address that turn. Likewise cancellation must await that same start and its
+correlated terminal state, not publish idle and latch an interrupt onto an
+unspecified future turn. The adapter's state owner handles these boundaries;
+`TypingStatusChanged` remains the server's lifecycle authority. A rejected
+native steering RPC does not prove the turn ended, so it returns `Unsupported`
+for the explicit interrupt/send path rather than manufacturing absence. Hermes
+also returns native refusals as `Unsupported`; an unknown delivery verdict or
+transport outcome closes that session explicitly instead of risking a duplicate
+resend. Its steering RPC waits for completion or a real transport failure.
+Malformed gateway frames fail pending RPCs and close the native process rather
+than leaving a steering receipt unresolved. Hermes natively acknowledges only
+buffering: after injecting that buffer into tool-result history, a native
+controlled halt or persistence failure can still prevent the next provider
+request. Its bridge therefore refuses active steering before enqueueing, and
+does not advertise native MidTurnSteering. The shared actor actually cancels and
+sends instead. Prompt admission rejects native busy delivery instead of handing
+it to Hermes's configurable queue.
+
+`real_control_at_native_halt` uses the same held, genuinely failing MCP call and
+fresh-token oracle on every eligible backend (Claude, Codex and Hermes). An
+isolated native profile enables Hermes's actual controlled halt at the first
+failed call. The broken adapter acknowledged one buffered control, then reached
+one native failed observation and one controlled halt without the exact fresh
+answer. The fixed adapter must either actually steer without cancellation, or
+refuse without enqueueing and actually cancel/send before the exact answer.
+The MCP handler returns an actual JSON-RPC error, not an enveloped isError
+result (the managed bridge intentionally preserves that inside outer success).
+Native profiling records applied guard configuration and actual halt/buffer
+counts without fabricating provider responses or backend events.
+Claude has no addressed-turn native stdin admission acknowledgement, so it
+explicitly refuses steering without writing the correction. The shared actor
+then cancels and sends. Even a projected live tool cannot fence native tool/turn
+completion against the queued write. The genuine transport frontier regression
+held one correction until the old native result, observed a new native result,
+and failed the unchanged fresh-token assertion despite Accepted. No native
+frames were fabricated. Claude no longer advertises MidTurnSteering; the common
+control and initialization cases retain Claude eligibility through Interrupt,
+background work and slash-command capabilities. The same control oracle requires
+Accepted to join its addressed turn without cancellation, or Unsupported to
+reach actual cancellation then accepted send and the exact fresh answer. An advertised read-only command must be returned
+untouched as busy during that held tool, without a delivered user echo, then
+execute normally after idle. Hermes interrupt receipts fence the worker's
+ordered native output before acknowledging cancellation or admitting another
+prompt; delayed old completion events cannot close the replacement turn.
+Hermes also withholds its native `message.complete` until the gateway's settled
+hook runs after reopening native prompt admission; a client-visible idle cannot
+race a still-busy gateway. Slash-command RPC failures propagate to the delivery
+receipt rather than becoming successful admissions.
+
+`conformance2/pending_settlement_proxy.py <conformance2 executable> --python
+<installed Hermes Python>` pins a real Hermes settlement/notification overlap
+in that same case. It profiles actual native callback entry/return, holds the
+settled callback after the old worker released native admission, releases the
+real background FIFO and observes the notifier's admission attempt refused
+until settlement is released. The provider bytes, model, tool and behavioral oracle
+are unchanged. A genuine unhandled native worker exception fails the owned
+native process explicitly. `--baseline-entry <saved native entry>` executes the
+exact preserved broken production bridge for red proof; it fabricates no
+responses. Source hashes and held/claimed/released/error counts are retained.
+
+Hermes retirement and the next reservation share one native boundary; a
+session-wide running flag belonging to the next turn cannot discard the old
+terminal. Cancellation names the observed native generation, waits for that
+generation's worker readiness or settlement, and never arms a later turn.
+Claude cancellation likewise waits for actual control/quiescence completion
+or propagates an error; it no longer times out, kills and force-clears a turn
+to manufacture a successful cancellation.
+
+The server keeps undelivered controls and their unresolved receipts outside
+the editable human queue. Receipts resolve at native steering or backend
+send admission, or fail explicitly on closing, terminal failure, startup,
+resume replay, restart recovery, usage pause or other dispatch refusal.
+Project-entry and restart continuations retain precedence over held controls;
+human queued input retains its order and durability behind them. The server
+protocol flows cover these contracts independently of provider conformance.
+
+The same flow also records a genuine MCP broker call, stops a foreground
+command only after its FIFO start acknowledgement, and requires its completed
+provider response and tool declarations to survive cancellation. Hermes emits
+that response at native `run_tool_round`'s persisted-response boundary before
+execution. Original model tool declarations remain intact; native resolved
+execution metadata types the actual request without renaming the declaration.
+Request usage is recorded at that response boundary, not duplicated at turn end.
+
+Every eligible provider runs an identical isolated native-profile child. Its
+Hermes profile installs a real `pre_tool_call` policy plugin denying only the
+non-writing probe command. Other providers execute that deliberately failing
+command. The common oracle requires exactly one visible attempt and its actual
+failed settlement, never a missing card or invented cancellation. The native
+Hermes commit observer proves one real blocked result was persisted; no fake
+provider or synthetic native event is used. Native policy-blocked settlements
+are projected only after the successful canonical result commit, because native
+execution callbacks intentionally omit them. The real conformance baseline
+observed one blocked commit but zero visible attempts and failed that oracle.
+
+`real_control_initialization_failure` uses the same unavailable model/provider
+fault and recovery oracle for all eligible providers: two accepted failures
+must each settle once, then the same session must answer READY after restoring
+its healthy selection. It does not infer idle from errors above Backend.
+
+Control recovery also preserves explicit native question cancellation. Hermes
+`clear_pending` releases an unanswered clarify with an empty result; the bridge
+projects that native cancellation before releasing the worker, rather than
+misreporting an answered question. A stale typed answer is consumed as an
+explicit error without closing a healthy adapter or ending a later turn.
+Live generation identity is retired on cancellation; a separate cancelled
+receipt fences trailing native debris until the next start. Codex native
+initialization failures retain their actual error before terminal idle, rather
+than an invented incomplete-response diagnostic followed by a late error.
+
+Rejected raw argument preservation follows the native Hermes parser and durable
+invalid-result commit. Real attempts did not produce a non-object provider
+argument: Hermes emitted an object and Codex rejected the request inside its
+custom-code transport before a native command invocation. That discarded probe
+is not raw-invalid red/green coverage. No provider output or events were changed
+to manufacture such coverage; this edge remains unverified by a live emission.
+
+
+### Warm cancellation admission
+
+`pending_claude_cancel_proxy.py --run <conformance2 executable>` runs the same
+`real_immediate_turn_controls` scenario with an explicit debug-only adapter
+admission pin. Release builds contain no socket gate. Normal debug sessions do
+not enable it. The pin sits after prompt preparation and before the owner checks
+turn identity/cancellation and reserves stdin; a content-free cancellation
+receipt releases it. It does not replace the provider or synthesize frames.
+
+The executed broken baseline retains the old pre-write interruption check and
+unchecked FIFO submission, with only that pin and diagnostic added. It selected
+an unwritten warm turn, sent a real idle interrupt, received its native receipt,
+then delivered the cancelled prompt. The real command ran; the fixture released
+its FIFO for cleanup and rejected the stray native interrupt. Held/released were
+both one, with no fabricated frames. This is distinct from the withdrawn
+exploratory proxy that failed to recognize native background-wake frames.
+
+The fixed path cancels an unwritten reservation without a native interrupt and
+checks the selected turn and cancellation atomically with ordinary prompt FIFO
+admission. Compaction reserves its FIFO write and written state in the same owner
+transition too; an interrupted undispatched compaction is explicitly refused.
+Every eligible backend still runs the same common scenario and cancellation,
+next-turn, foreground, native-wake, read-only, tool and usage oracles. The scoped
+Claude pin supplements those oracles rather than substituting another scenario.
+
+A real Hermes cancellation-aborted MCP call also reproduced a native controlled
+halt that reported ordinary completion before checking its stop flag. The bridge
+now orders terminal publication after the actual native interrupt response and
+preserves cancellation only when admitted before that generation's terminal.
+Already-produced terminals are never rewritten to cancel a successor.

@@ -11172,6 +11172,7 @@ pub enum MidTurnSteeringCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSteeringCapability {
     pub backend_kind: BackendKind,
+    /// Tychat redirects running input by steering or actual cancellation/send.
     pub mid_turn: MidTurnSteeringCapability,
 }
 

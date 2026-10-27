@@ -1944,17 +1944,21 @@ async fn unavailable_project_root_keeps_other_roots_live() {
         }
     }
     drop(retired_observation);
+    // The retained hang reached both observation waits, then filled the native
+    // queue and scheduled a catch-up rescan. A per-path queued hook need not
+    // run in that valid path. Fence native dispatch, retaining every protocol
+    // assertion about replacement, queued reads and edit invalidation below.
     let (queued, changed) = watch_completion(
         &fixture,
         &repo_a.path().join("src/lib.rs"),
-        server::ScanPoint::WatcherQueued,
+        server::ScanPoint::WatcherDispatch,
     );
     fs::write(repo_a.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
     changed.await.unwrap();
     drop(queued);
     let drain_path = repo_b.path().join("app/dispatch-drain.rs");
     let (drain, drained) =
-        watch_completion(&fixture, &drain_path, server::ScanPoint::WatcherQueued);
+        watch_completion(&fixture, &drain_path, server::ScanPoint::WatcherDispatch);
     fs::write(&drain_path, "// native dispatch boundary\n").unwrap();
     drained.await.unwrap();
     drop(drain);

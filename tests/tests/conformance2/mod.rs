@@ -23,6 +23,28 @@ pub enum NativeQuestionProfile {
     Plan,
 }
 
+pub async fn real_control_native_policy_child<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_CONTROL_NATIVE_POLICY_PROOF").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("control_native_policy.py");
+    std::fs::write(&script, include_str!("pending_settlement_proxy.py"))
+        .expect("write isolated native policy fixture");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg("--native-policy-profile")
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .status()
+        .await
+        .expect("run isolated real native policy profile");
+    assert!(
+        status.success(),
+        "real native control-policy profile failed"
+    );
+    false
+}
+
 pub async fn real_native_question_profile_child<B: Backend>(
     host: &Harness<B>,
     mode: NativeQuestionProfile,
@@ -453,6 +475,28 @@ impl Profile {
         }
     }
 
+    pub fn claude() -> Self {
+        match std::env::var("TYDE_CLAUDE_TEST_MODEL") {
+            Ok(model) => {
+                assert!(
+                    !model.trim().is_empty(),
+                    "explicit Claude test model is empty"
+                );
+                Self::new(&[&model], &[("model", &model), ("effort", "low")])
+            }
+            Err(std::env::VarError::NotPresent) => Self::new(
+                &[
+                    "haiku",
+                    "claude-haiku-5-5",
+                    "claude-haiku-4-5-20251001",
+                    "anthropic/claude-haiku-4.5",
+                ],
+                &[("model", "haiku"), ("effort", "low")],
+            ),
+            Err(error) => panic!("invalid explicit Claude test model: {error}"),
+        }
+    }
+
     pub fn codex() -> Self {
         let model =
             std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_owned());
@@ -486,6 +530,7 @@ pub struct Agent {
 pub(super) enum NativeReceipt {
     Narrative,
     ToolCompletion,
+    ControlStartPending,
 }
 
 thread_local! {
@@ -500,10 +545,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NarrativeReceiptCa
         struct Receipt(Option<NativeReceipt>);
         impl tracing::field::Visit for Receipt {
             fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                if value {
+                if field.name() == "claude_cancel_prompt_written" && !value {
+                    self.0 = Some(NativeReceipt::ControlStartPending);
+                } else if value {
                     self.0 = match field.name() {
                         "codex_narrative_delta_processed" => Some(NativeReceipt::Narrative),
                         "codex_tool_completion_processed" => Some(NativeReceipt::ToolCompletion),
+                        "codex_control_start_pending" => Some(NativeReceipt::ControlStartPending),
                         _ => self.0,
                     };
                 }
@@ -579,6 +627,10 @@ pub struct Harness<B: Backend> {
 }
 
 impl<B: Backend> Harness<B> {
+    pub fn backend_ref(&self) -> &B {
+        self.backend.as_ref().expect("backend is running")
+    }
+
     pub fn new(profile: Profile, test_name: &str) -> Self {
         {
             use tracing_subscriber::Layer;
@@ -599,7 +651,8 @@ impl<B: Backend> Harness<B> {
                 .with(
                     NarrativeReceiptCapture.with_filter(
                         tracing_subscriber::filter::Targets::new()
-                            .with_target(DISPATCH_RECEIPT_TARGET, tracing::Level::DEBUG),
+                            .with_target(DISPATCH_RECEIPT_TARGET, tracing::Level::DEBUG)
+                            .with_target("tyde_claude_dispatch_receipt", tracing::Level::DEBUG),
                     ),
                 )
                 .try_init();
@@ -3456,6 +3509,39 @@ pub async fn approve_plan<B: Backend>(
     collect_turn(host, agent, "Approved. Implement the plan now.").await
 }
 
+pub async fn collect_control_events_until<B: Backend>(
+    host: &mut Harness<B>,
+    turn: &mut Turn,
+    stop: impl Fn(&ChatEvent) -> bool,
+) {
+    loop {
+        match host.next_backend_event().await {
+            BackendEvent::Chat(event) => {
+                let done = stop(&event);
+                turn.events.push(event);
+                if done {
+                    return;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => {
+                if usage
+                    .current_context_usage
+                    .as_ref()
+                    .and_then(|value| value.known())
+                    .is_some()
+                {
+                    turn.context_usage_event_positions.push(turn.events.len());
+                }
+                turn.model_requests.push(usage);
+            }
+            BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected replay in live control flow")
+            }
+        }
+    }
+}
+
 /// Run process-kill scenarios alone so every direct child belongs to this case.
 pub async fn isolated_process_case<B: Backend>(host: &Harness<B>) -> bool {
     if std::env::var("TYDE_PROCESS_CASE").ok().as_deref() == Some(&host.test_name) {
@@ -3591,4 +3677,145 @@ pub async fn interrupt_backend<B: Backend>(host: &Harness<B>) {
             .await,
         "backend rejected interrupt"
     );
+}
+
+/// Pin the real native terminal callback while a notification claims its successor.
+pub async fn pending_settlement_gate() -> Option<tokio::net::UnixStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = std::env::var_os("TYDE_PENDING_SETTLEMENT_SOCKET")?;
+    let proof = std::env::var_os("TYDE_SETTLEMENT_PROOF")
+        .expect("native settlement fixture must provide its attachment proof");
+    assert!(
+        std::path::Path::new(&proof).is_file(),
+        "native settlement fixture did not attach before model work"
+    );
+    let mut gate = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("connect native settlement gate");
+    gate.write_all(b"T")
+        .await
+        .expect("identify settlement test peer");
+    gate.write_all(b"A")
+        .await
+        .expect("arm native settlement boundary");
+    assert_eq!(
+        gate.read_u8().await.expect("native settlement gate armed"),
+        b'A'
+    );
+    Some(gate)
+}
+
+pub async fn wait_pending_settlement(gate: Option<&mut tokio::net::UnixStream>) {
+    use tokio::io::AsyncReadExt;
+    if let Some(gate) = gate {
+        assert_eq!(
+            gate.read_u8().await.expect("native terminal callback held"),
+            b'S'
+        );
+    }
+}
+
+pub async fn release_pending_settlement(gate: Option<&mut tokio::net::UnixStream>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Some(gate) = gate {
+        assert_eq!(
+            gate.read_u8().await.expect("native next turn claimed"),
+            b'C'
+        );
+        gate.write_all(b"R")
+            .await
+            .expect("release settled native generation");
+    }
+}
+
+pub struct PendingControlGate {
+    stream: tokio::net::UnixStream,
+    held: bool,
+}
+
+pub async fn pending_control_gate() -> Option<PendingControlGate> {
+    pending_control_gate_from_environment("TYDE_PENDING_CONTROL_SOCKET").await
+}
+
+pub async fn pending_cancellation_gate() -> Option<PendingControlGate> {
+    pending_control_gate_from_environment("TYDE_PENDING_CANCELLATION_SOCKET").await
+}
+
+async fn pending_control_gate_from_environment(variable: &str) -> Option<PendingControlGate> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = std::env::var_os(variable)?;
+    let mut gate = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("connect native transport gate");
+    gate.write_all(b"A")
+        .await
+        .expect("arm native transport gate");
+    assert_eq!(gate.read_u8().await.expect("native gate armed"), b'A');
+    Some(PendingControlGate {
+        stream: gate,
+        held: false,
+    })
+}
+
+pub async fn arm_pending_control_gate(gate: Option<&mut PendingControlGate>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Some(gate) = gate {
+        assert!(!gate.held, "previous native start was released");
+        gate.stream
+            .write_all(b"A")
+            .await
+            .expect("arm next native transport gate");
+        assert_eq!(
+            gate.stream.read_u8().await.expect("next native gate armed"),
+            b'A'
+        );
+    }
+}
+
+pub async fn wait_pending_control_start(gate: Option<&mut PendingControlGate>) {
+    use tokio::io::AsyncReadExt;
+    if let Some(gate) = gate
+        && !gate.held
+    {
+        assert_eq!(
+            gate.stream.read_u8().await.expect("native turn start held"),
+            b'H'
+        );
+        gate.held = true;
+    }
+}
+
+pub async fn control_at_start_boundary<F: std::future::Future>(
+    control: F,
+    gate: Option<&mut PendingControlGate>,
+) -> F::Output {
+    use tokio::io::AsyncWriteExt;
+    let Some(gate) = gate else {
+        return control.await;
+    };
+    wait_pending_control_start(Some(gate)).await;
+    let (receipts, mut processed) = tokio::sync::mpsc::unbounded_channel();
+    NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = Some(receipts));
+    tokio::pin!(control);
+    let result = tokio::select! {
+        result = &mut control => Some(result),
+        receipt = processed.recv() => {
+            assert!(receipt == Some(NativeReceipt::ControlStartPending), "control reached its pending native start");
+            None
+        }
+    };
+    gate.stream
+        .write_all(b"R")
+        .await
+        .expect("release genuine native start");
+    gate.held = false;
+    NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = None);
+    assert!(
+        result.is_none(),
+        "control answered before its native start boundary was released"
+    );
+    match result {
+        Some(result) => result,
+        None => control.await,
+    }
 }

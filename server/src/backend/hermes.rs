@@ -30,7 +30,7 @@ use crate::backend::agent_control_progress::{
 use crate::backend::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
-    Backend, BackendAcceptedCompaction, BackendCompactionCapability,
+    AdapterEventSender, Backend, BackendAcceptedCompaction, BackendCompactionCapability,
     BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
@@ -40,7 +40,7 @@ use crate::backend::{
     BackendCompactionUnavailableReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
     BackendSpawnConfig, BackendStartupError, CancelBackgroundTaskOutcome, EventStream,
-    PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport, SteerOutcome,
+    PostCompactionTokenCount, SendOutcome, StartupMcpServer, StartupMcpTransport, SteerOutcome,
     backend_fork_unsupported_message, normalize_mcp_call_tool_result,
     render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
     tyde_owned_no_root_cwd,
@@ -118,10 +118,32 @@ if _tyde_excluded_toolsets:
 _tyde_original_emit = _tyde_gateway_server._emit
 _tyde_original_get_usage = _tyde_gateway_server._get_usage
 _tyde_original_make_agent = _tyde_gateway_server._make_agent
+
+def _tyde_refuse_busy_submit(rid, sid, session, text, transport, queued=False):
+    with session["history_lock"]:
+        if session.get("running"):
+            return _tyde_gateway_server._err(rid, 4091, "Tyde prompt was not delivered: native turn is busy")
+    return None
+
+_tyde_gateway_server._handle_busy_submit = _tyde_refuse_busy_submit
 _tyde_tool_start_args = {}
 _tyde_message_condition = threading.Condition()
 _tyde_open_messages = {}
 _tyde_message_generations = {}
+_tyde_pending_terminals = {}
+_tyde_turn_controls = {}
+
+class _TydeTurnControl:
+    def __init__(self, generation):
+        self.generation = generation
+        self.worker = None
+        self.terminal_pending = False
+        self.settled = False
+        self.failed = False
+        self.cancel_requested = False
+        self.cancel_before_terminal = False
+        self.interrupting = False
+        self.interrupt_issued = False
 from tools import process_registry as _tyde_process_registry_module
 _tyde_original_format_process_notification = _tyde_process_registry_module.format_process_notification
 _tyde_original_kill_process = _tyde_process_registry_module.process_registry.kill_process
@@ -227,8 +249,75 @@ def _tyde_http_send(client, request, *args, **kwargs):
 
 _tyde_httpx.Client.send = _tyde_http_send
 
+from agent import tool_executor as _tyde_tool_executor
+_tyde_original_commit_tool_result = _tyde_tool_executor._commit_tool_result
+
+def _tyde_commit_tool_result(agent, messages, ref, *args, **kwargs):
+    committed = _tyde_original_commit_tool_result(agent, messages, ref, *args, **kwargs)
+    session_id = getattr(agent, "_tyde_control_session_id", None)
+    if committed is not None and kwargs["blocked"] and session_id is not None:
+        # Native policy denials skip execution callbacks. Publish their actual
+        # result only after the canonical append and durable flush succeeded.
+        _tyde_gateway_server._on_tool_complete(
+            session_id, ref.call_id, ref.name, ref.args, committed[1],
+        )
+        print("TYDE HERMES BLOCKED TOOL COMMIT projected", file=sys.stderr, flush=True)
+    return committed
+
+_tyde_tool_executor._commit_tool_result = _tyde_commit_tool_result
+
+_tyde_original_invalid_arguments_result = _tyde_tool_executor._append_invalid_arguments_result
+
+def _tyde_invalid_arguments_result(agent, messages, ref, parse_error):
+    committed = _tyde_original_invalid_arguments_result(agent, messages, ref, parse_error)
+    session_id = getattr(agent, "_tyde_control_session_id", None)
+    if committed and session_id is not None:
+        _tyde_gateway_server._on_tool_complete(
+            session_id, ref.call_id, ref.name, ref.args, parse_error,
+        )
+        print("TYDE HERMES INVALID ARGUMENT COMMIT projected", file=sys.stderr, flush=True)
+    return committed
+
+_tyde_tool_executor._append_invalid_arguments_result = _tyde_invalid_arguments_result
+
+
 def _tyde_make_agent(*args, **kwargs):
     agent = _tyde_original_make_agent(*args, **kwargs)
+    original_execute = agent._execute_tool_calls
+    if not callable(original_execute):
+        raise RuntimeError("Hermes has no compatible native tool execution boundary")
+    def _tyde_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        from agent.message_sanitization import coalesce_tool_call_id
+        calls = []
+        for call in assistant_message.tool_calls:
+            call_id = coalesce_tool_call_id(call)
+            if not call_id:
+                raise RuntimeError("Hermes completed tool response has no native call identity")
+            arguments, parse_error = _tyde_tool_executor._parse_tool_arguments(call.function.arguments)
+            if parse_error is not None:
+                # Preserve rejected provider input; only the native executor
+                # validates it and persists the failed, non-executed attempt.
+                arguments = call.function.arguments
+            calls.append({"tool_id": call_id, "name": call.function.name, "args": arguments})
+        # Native run_tool_round has persisted this complete response before
+        # entering execution. Cancellation must not erase its declarations.
+        text = assistant_message.content
+        if text is not None and not isinstance(text, str):
+            raise RuntimeError("Hermes completed provider response has non-text content")
+        _tyde_original_emit("provider.response.complete", session_id, {
+            "text": text if text is not None else "", "tool_calls": calls,
+            "usage": _tyde_get_usage(agent),
+        })
+        return original_execute(assistant_message, messages, effective_task_id, api_call_count)
+    agent._execute_tool_calls = _tyde_execute
+    original_halt_response = agent._toolguard_controlled_halt_response
+    if not callable(original_halt_response):
+        raise RuntimeError("Hermes has no compatible native controlled-halt boundary")
+    def _tyde_halt_response(decision):
+        text = original_halt_response(decision)
+        _tyde_original_emit("provider.notice", session_id, {"text": text})
+        return text
+    agent._toolguard_controlled_halt_response = _tyde_halt_response
     tyde_prompt = os.environ.get("TYDE_HERMES_SYSTEM_PROMPT", "").strip()
     if tyde_prompt:
         existing = str(getattr(agent, "ephemeral_system_prompt", "") or "").strip()
@@ -236,6 +325,11 @@ def _tyde_make_agent(*args, **kwargs):
             part for part in (existing, tyde_prompt) if part
         )
     session_id = str(args[0] if args else kwargs.get("sid") or "")
+    native_session = _tyde_gateway_server._sessions.get(session_id)
+    if native_session is None:
+        raise RuntimeError("Hermes native agent has no registered session")
+    native_session["_tyde_control_session_id"] = session_id
+    agent._tyde_control_session_id = session_id
     original_step_callback = getattr(agent, "step_callback", None)
     def _tyde_step_callback(iteration, previous_tools):
         try:
@@ -253,6 +347,13 @@ def _tyde_make_agent(*args, **kwargs):
     original_run_conversation = agent.run_conversation
     @wraps(original_run_conversation)
     def _tyde_run_conversation(*run_args, **run_kwargs):
+        with _tyde_message_condition:
+            active = _tyde_open_messages.get(session_id)
+            control = _tyde_turn_controls.get(session_id)
+            if active is None or control is None or active[1] != control.generation:
+                raise RuntimeError("Hermes model work has no native turn boundary")
+            control.worker = threading.current_thread()
+            _tyde_message_condition.notify_all()
         message = run_args[0] if run_args else run_kwargs.get("user_message", "")
         history = run_kwargs.get("conversation_history") or []
         print(
@@ -319,6 +420,27 @@ def _tyde_make_agent(*args, **kwargs):
     return agent
 
 def _tyde_emit(event_type, session_id, payload=None):
+    if event_type == "message.delta":
+        session = _tyde_gateway_server._sessions.get(session_id)
+        agent = session.get("agent") if session is not None else None
+        if agent is not None and agent._tool_guardrail_halt_decision is not None:
+            # The native controlled halt is already emitted as a local notice,
+            # not another fragment of the completed provider response.
+            return
+    session = _tyde_gateway_server._sessions.get(session_id)
+    if (event_type == "message.complete" and isinstance(payload, dict)
+            and (payload.get("error_surface") or {}).get("code") == "agent_init_failed"):
+        admission = getattr(_tyde_deferred_admission, "current", None)
+        if admission is None or admission.session_id != session_id or admission.terminal is not None:
+            raise RuntimeError("Hermes initialization terminal has no matching deferred admission")
+        admission.terminal = dict(payload)
+        return
+    if (event_type == "error" and session is not None and session.get("agent_error")
+            and session.get("running")):
+        # The builder's notice is not terminal: run_after_agent_ready still
+        # owns admission and publishes the correlated native failure next.
+        print("TYDE HERMES TERMINAL native_build_notice_deferred=True", file=sys.stderr, flush=True)
+        return
     if event_type == "subagent.complete" and isinstance(payload, dict):
         payload = dict(payload)
         child_key = str(payload.get("child_session_id") or "")
@@ -348,6 +470,8 @@ def _tyde_emit(event_type, session_id, payload=None):
     if event_type == "message.start":
         owner = threading.get_ident()
         with _tyde_message_condition:
+            while (previous := _tyde_turn_controls.get(session_id)) is not None and previous.interrupting:
+                _tyde_message_condition.wait()
             while session_id in _tyde_open_messages and _tyde_open_messages[session_id][0] != owner:
                 _tyde_message_condition.wait()
             if session_id in _tyde_open_messages and _tyde_open_messages[session_id][0] == owner:
@@ -355,6 +479,8 @@ def _tyde_emit(event_type, session_id, payload=None):
             generation = int(_tyde_message_generations.get(session_id, 0)) + 1
             _tyde_message_generations[session_id] = generation
             _tyde_open_messages[session_id] = (owner, generation)
+            _tyde_turn_controls[session_id] = _TydeTurnControl(generation)
+            _tyde_message_condition.notify_all()
             payload = dict(payload) if isinstance(payload, dict) else {}
             payload["_tyde_turn_generation"] = generation
     if event_type == "message.complete":
@@ -392,6 +518,28 @@ def _tyde_emit(event_type, session_id, payload=None):
                     _tyde_background_completions_delivered.add(process_id)
         if isinstance(completion, dict):
             _tyde_original_emit("background.complete", session_id, completion)
+    # Native terminals precede finally's running=False and settled callback.
+    # Keep their generation open until the callback retires it atomically.
+    session = _tyde_gateway_server._sessions.get(session_id)
+    if event_type in ("message.complete", "error"):
+        with _tyde_message_condition:
+            control = _tyde_turn_controls.get(session_id)
+            if event_type == "error" and control is not None and not control.settled:
+                control.failed = True
+                if session is not None and not session.get("running"):
+                    control.settled = True
+                _tyde_message_condition.notify_all()
+            if (session is not None and session.get("running") and control is not None
+                    and not control.settled):
+                control.terminal_pending = True
+                terminals = _tyde_pending_terminals.setdefault(session_id, [])
+                if terminals and terminals[0][0] is not control:
+                    raise RuntimeError("Hermes overlapped native terminal generations")
+                terminals.append((control, event_type, payload))
+                return
+    _tyde_deliver_event(event_type, session_id, payload)
+
+def _tyde_deliver_event(event_type, session_id, payload):
     try:
         _tyde_original_emit(event_type, session_id, payload)
     finally:
@@ -399,6 +547,152 @@ def _tyde_emit(event_type, session_id, payload=None):
             with _tyde_message_condition:
                 _tyde_open_messages.pop(session_id, None)
                 _tyde_message_condition.notify_all()
+
+_tyde_original_settled_info = _tyde_gateway_server._emit_settled_session_info
+
+def _tyde_retire_terminal(sid):
+    with _tyde_message_condition:
+        terminals = _tyde_pending_terminals.pop(sid, [])
+        control = terminals[0][0] if terminals else _tyde_turn_controls.get(sid)
+        if control is not None:
+            while control.interrupting and not control.interrupt_issued:
+                _tyde_message_condition.wait()
+            control.settled = True
+            if control.interrupt_issued:
+                control.interrupting = False
+        # The next turn may already own running=True. This callback retires
+        # this generation, not that session-wide reservation.
+        for _, event_type, payload in terminals:
+            if (event_type == "message.complete" and control.cancel_before_terminal
+                    and control.interrupt_issued):
+                # The native interrupt cancelled the tool, but its resulting
+                # failure can trip the guardrail before the loop tests its stop
+                # flag. Preserve that acknowledged cancellation at settlement.
+                payload = dict(payload)
+                payload["status"] = "interrupted"
+                print("TYDE HERMES TERMINAL acknowledged_native_cancel=True", file=sys.stderr, flush=True)
+            _tyde_deliver_event(event_type, sid, payload)
+        _tyde_message_condition.notify_all()
+        print(f"TYDE HERMES TERMINAL native_generation_settled={control is not None}", file=sys.stderr, flush=True)
+
+def _tyde_settled_info(sid, session, agent):
+    _tyde_retire_terminal(sid)
+    return _tyde_original_settled_info(sid, session, agent)
+
+_tyde_gateway_server._emit_settled_session_info = _tyde_settled_info
+
+# These native functions are synchronous dispatcher/worker entry points.
+# Admission is serialized per session, never across model work or an await.
+class _TydePromptSubmission:
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.claimed = False
+
+class _TydeDeferredAdmission:
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.terminal = None
+
+_tyde_prompt_submission = threading.local()
+_tyde_deferred_admission = threading.local()
+_tyde_original_prompt_submit = _tyde_gateway_server._methods["prompt.submit"]
+_tyde_original_lock_in_submit_turn = _tyde_gateway_server._lock_in_submit_turn
+_tyde_original_run_after_agent_ready = _tyde_gateway_server._run_after_agent_ready
+_tyde_original_notif_claim_turn = _tyde_gateway_server._notif_claim_turn
+_tyde_original_post_turn_followups = _tyde_gateway_server._run_post_turn_followups
+
+def _tyde_admission_lock(session):
+    return session.setdefault("_tyde_admission_lock", threading.RLock())
+
+def _tyde_lock_in_submit_turn(rid, sid, session, *args):
+    result = _tyde_original_lock_in_submit_turn(rid, sid, session, *args)
+    if result[0] is None:
+        submission = getattr(_tyde_prompt_submission, "current", None)
+        if submission is None or submission.session_id != sid:
+            raise RuntimeError("Hermes prompt claim has no matching submission")
+        submission.claimed = True
+    return result
+
+def _tyde_retire_rejected_prompt(session):
+    with session["history_lock"]:
+        session["running"] = False
+        _tyde_gateway_server._clear_inflight_turn(session)
+    with _tyde_message_condition:
+        _tyde_message_condition.notify_all()
+    print("TYDE HERMES TERMINAL rejected_native_claim_retired=True", file=sys.stderr, flush=True)
+
+def _tyde_prompt_submit(rid, params):
+    sid = params.get("session_id")
+    session = _tyde_gateway_server._sessions.get(sid)
+    if session is None:
+        return _tyde_original_prompt_submit(rid, params)
+    with _tyde_admission_lock(session):
+        session["_tyde_control_session_id"] = sid
+        with _tyde_message_condition:
+            control = _tyde_turn_controls.get(sid)
+            if control is not None and (not control.settled or control.interrupting):
+                return _tyde_gateway_server._err(rid, 4091, "Tyde prompt was not delivered: native worker is busy")
+        submission = _TydePromptSubmission(sid)
+        previous = getattr(_tyde_prompt_submission, "current", None)
+        _tyde_prompt_submission.current = submission
+        try:
+            response = _tyde_original_prompt_submit(rid, params)
+            if "error" in response and submission.claimed:
+                _tyde_retire_rejected_prompt(session)
+            return response
+        except Exception:
+            if submission.claimed:
+                _tyde_retire_rejected_prompt(session)
+            raise
+        finally:
+            _tyde_prompt_submission.current = previous
+
+def _tyde_run_after_agent_ready(rid, sid, session, *args):
+    admission = _TydeDeferredAdmission(sid)
+    previous = getattr(_tyde_deferred_admission, "current", None)
+    _tyde_deferred_admission.current = admission
+    try:
+        return _tyde_original_run_after_agent_ready(rid, sid, session, *args)
+    finally:
+        _tyde_deferred_admission.current = previous
+        if admission.terminal is not None:
+            if session.get("running"):
+                raise RuntimeError("Hermes initialization failed without retiring native admission")
+            error = admission.terminal.get("error")
+            if not isinstance(error, str) or not error:
+                raise RuntimeError("Hermes initialization terminal has no native error")
+            _tyde_original_emit("error", sid, {"message": error})
+            with _tyde_message_condition:
+                _tyde_message_condition.notify_all()
+
+def _tyde_notif_claim_turn(session):
+    sid = session["_tyde_control_session_id"]
+    with _tyde_admission_lock(session):
+        with _tyde_message_condition:
+            control = _tyde_turn_controls.get(sid)
+            if control is not None and (not control.settled or control.interrupting):
+                return False
+        claimed = _tyde_original_notif_claim_turn(session)
+        if claimed:
+            with session["history_lock"]:
+                session["_turn_cancel_requested"] = False
+        return claimed
+
+def _tyde_post_turn_followups(rid, sid, session, *args):
+    with _tyde_admission_lock(session):
+        with _tyde_message_condition:
+            control = _tyde_turn_controls.get(sid)
+            eligible = (control is not None and control.worker is threading.current_thread()
+                        and not control.cancel_requested)
+        if not eligible or session.get("running"):
+            return None
+        return _tyde_original_post_turn_followups(rid, sid, session, *args)
+
+_tyde_gateway_server._methods["prompt.submit"] = _tyde_prompt_submit
+_tyde_gateway_server._lock_in_submit_turn = _tyde_lock_in_submit_turn
+_tyde_gateway_server._run_after_agent_ready = _tyde_run_after_agent_ready
+_tyde_gateway_server._notif_claim_turn = _tyde_notif_claim_turn
+_tyde_gateway_server._run_post_turn_followups = _tyde_post_turn_followups
 
 _tyde_original_tool_start = _tyde_gateway_server._on_tool_start
 
@@ -414,6 +708,49 @@ def _tyde_on_tool_start(session_id, tool_call_id, name, args):
         _tyde_tool_start_args[(session_id, str(tool_call_id))] = args
     _tyde_original_tool_start(session_id, tool_call_id, name, args)
 
+def _tyde_session_steer(rid, params):
+    session, error = _tyde_gateway_server._sess_nowait(params, rid)
+    if error:
+        return error
+    with session["history_lock"]:
+        if not session.get("running"):
+            with _tyde_message_condition:
+                control = _tyde_turn_controls.get(params.get("session_id"))
+                if control is not None and not control.settled:
+                    return _tyde_gateway_server._err(rid, 4010, "Native foreground worker is settling and cannot steer")
+            return _tyde_gateway_server._ok(rid, {"status": "idle"})
+    # Native steer acknowledges only buffering. Even a live tool batch can
+    # halt or fail persistence before the next provider request consumes it.
+    return _tyde_gateway_server._err(rid, 4010, "Native steering has no addressed-turn delivery receipt")
+
+_tyde_gateway_server._methods["session.steer"] = _tyde_session_steer
+
+# Ordinary prompts clear the shared agent's interrupt flag before message.start.
+# Fence that admission as well as native follow-ups' earlier message.start.
+_tyde_original_admit_prompt_turn = _tyde_gateway_server._admit_prompt_turn
+
+def _tyde_admit_prompt_turn(sid, *args, **kwargs):
+    with _tyde_message_condition:
+        while (previous := _tyde_turn_controls.get(sid)) is not None and previous.interrupting:
+            _tyde_message_condition.wait()
+    return _tyde_original_admit_prompt_turn(sid, *args, **kwargs)
+
+_tyde_gateway_server._admit_prompt_turn = _tyde_admit_prompt_turn
+
+# Native clear_pending releases a clarify with an empty successful result.
+# Project that explicit cancellation before releasing its worker, so it cannot
+# become a successful answer or outrun the turn's interrupted terminal.
+def _tyde_clear_pending(sid=None):
+    with _tyde_gateway_server._prompt_lock:
+        for request_id, (owner, event) in list(_tyde_gateway_server._pending.items()):
+            if sid is None or owner == sid:
+                _tyde_gateway_server._answers[request_id] = ""
+                if _tyde_gateway_server._pending_prompt_payloads[request_id][0] == "clarify.request":
+                    _tyde_original_emit("clarify.cancelled", owner, {"request_id": request_id})
+                event.set()
+
+_tyde_gateway_server._clear_pending = _tyde_clear_pending
+
 _tyde_original_interrupt = _tyde_gateway_server._methods["session.interrupt"]
 
 def _tyde_interrupt(rid, params):
@@ -424,27 +761,63 @@ def _tyde_interrupt(rid, params):
             for request_id, (owner, event) in _tyde_gateway_server._pending.items()
         )
     session = _tyde_gateway_server._sessions.get(sid)
-    worker = session.get("_run_thread") if session is not None else None
-    response = _tyde_original_interrupt(rid, params)
-    if "error" in response:
-        return response
-    if pending_clarify:
-        print(
-            f"TYDE HERMES CLARIFY INTERRUPT worker_present={worker is not None}",
-            file=sys.stderr, flush=True,
-        )
-        if worker is None:
-            return _tyde_gateway_server._err(rid, 5000, "Hermes clarify interrupt has no turn worker")
+    if session is None:
+        return _tyde_original_interrupt(rid, params)
+    expected = params.get("_tyde_expected_generation")
+    with _tyde_message_condition:
+        while True:
+            control = _tyde_turn_controls.get(sid)
+            if expected is not None:
+                if control is None or control.generation < expected:
+                    return _tyde_gateway_server._err(rid, 5000, "Hermes interrupt names an unannounced turn")
+                if control.generation > expected:
+                    control = None  # The named generation was already retired.
+                break
+            if control is not None and not control.settled:
+                break
+            if not session.get("running"):
+                control = None
+                break
+            _tyde_message_condition.wait()
+        if control is not None:
+            while not control.settled and control.worker is None:
+                if control.failed:
+                    return _tyde_gateway_server._err(rid, 5000, "Hermes native turn failed before cancellation")
+                _tyde_message_condition.wait()
+            worker = None if control.settled else control.worker
+            if worker is not None:
+                control.interrupting = True
+                control.cancel_requested = True
+                control.cancel_before_terminal = not control.terminal_pending
+        else:
+            worker = None
     if worker is None:
-        return response
-    # Native interrupt only requests cancellation; the worker still owns the
-    # turn, and a prompt submitted before it exits is folded into that dying
-    # turn instead of starting a new one.
-    worker.join(timeout=60)
-    if worker.is_alive():
-        return _tyde_gateway_server._err(rid, 5000, "Hermes interrupt did not settle within 60 seconds")
-    if pending_clarify:
+        response = _tyde_gateway_server._ok(rid, {"status": "already_settled"})
+    else:
+        try:
+            response = _tyde_original_interrupt(rid, params)
+        except Exception:
+            with _tyde_message_condition:
+                control.interrupting = False
+                _tyde_message_condition.notify_all()
+            raise
+        with _tyde_message_condition:
+            control.interrupt_issued = "error" not in response
+            if control.settled or "error" in response:
+                control.interrupting = False
+            _tyde_message_condition.notify_all()
+        if "error" in response:
+            return response
+        worker.join()
+        with _tyde_message_condition:
+            if not control.settled:
+                control.interrupting = False
+                _tyde_message_condition.notify_all()
+                return _tyde_gateway_server._err(rid, 5000, "Hermes cancelled worker exited without settlement")
+    if pending_clarify and worker is not None:
         print("TYDE HERMES CLARIFY INTERRUPT settled", file=sys.stderr, flush=True)
+    _tyde_original_emit("tyde.interrupt.settled", sid, {"request_id": rid})
+    response["result"]["tyde_interrupt_id"] = rid
     return response
 
 _tyde_gateway_server._methods["session.interrupt"] = _tyde_interrupt
@@ -584,6 +957,7 @@ enum HermesBackendCommand {
     ),
     ReadSessionSettings(oneshot::Sender<Result<SessionSettingsValues, String>>),
     Input(AgentInput),
+    Deliver(protocol::SendMessagePayload, oneshot::Sender<SendOutcome>),
     Steer(protocol::SendMessagePayload, oneshot::Sender<SteerOutcome>),
     UpdateSessionSettings(
         protocol::SetSessionSettingsPayload,
@@ -920,7 +1294,7 @@ struct HermesSessionActor {
     /// through the gateway instead of `prompt.submit`.
     slash_commands: Option<protocol::SlashCommandCatalog>,
     mapper: HermesEventMapper,
-    events_tx: mpsc::UnboundedSender<BackendEvent>,
+    events_tx: AdapterEventSender,
     stored_session_id: Arc<std::sync::Mutex<SessionId>>,
     compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
     active_compaction:
@@ -1009,12 +1383,20 @@ impl HermesNativeDelegation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HermesClosedResponse {
+    ProviderComplete,
+    AwaitingUserResponse,
+}
+
 #[derive(Clone)]
 struct HermesTurnTool {
     name: String,
     arguments: Value,
     content_offset: Option<u32>,
     observed_order: u64,
+    execution_registered: bool,
+    request_presented: bool,
 }
 
 #[derive(Clone)]
@@ -1035,14 +1417,9 @@ struct HermesEventMapper {
     /// turn can have been seen reasoning while this stays empty.
     current_reasoning: String,
     typing_active: bool,
-    /// The provider iteration's response was ended early because it asked a
-    /// blocking question. Hermes keeps that iteration running while it waits,
-    /// but a response left open across the wait is live transcript state that
-    /// a reattach discards once the turn stops reporting activity, and the
-    /// question inside it would vanish with it. `current_message_id` stays set:
-    /// the turn is still running, and the iteration's late usage is attached
-    /// to the ended message by id.
-    user_response_closed_stream: bool,
+    // Keep the completed response identity while native tools settle. Only a
+    // response closed before native completion still owes late usage metadata.
+    closed_response: Option<HermesClosedResponse>,
     model: Option<String>,
     provider: Option<String>,
     pending_tools: HashMap<String, String>,
@@ -1066,8 +1443,8 @@ struct HermesEventMapper {
     usage_request_sequence: u32,
     current_turn_generation: Option<u64>,
     last_turn_generation: Option<u64>,
+    retired_cancelled_generation: Option<u64>,
     interrupted_turn_generations: VecDeque<u64>,
-    next_local_turn_generation: u64,
     session_info_emitted: bool,
     approval_counter: u64,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
@@ -1315,7 +1692,6 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
-            tyde_agent_adapter::BackendCapability::MidTurnSteering,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
             tyde_agent_adapter::BackendCapability::TaskListClear,
@@ -1395,7 +1771,7 @@ impl Backend for HermesBackend {
             Vec::new()
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, event_stream) = EventStream::adapter_channel();
         // A Default session that could not bring its skills says so. The channel
         // is unbounded and its receiver is returned below, so this survives
         // until the client attaches.
@@ -1447,7 +1823,7 @@ impl Backend for HermesBackend {
                 compaction_capability,
                 active_compaction,
             },
-            EventStream::new_backend(events_rx),
+            event_stream,
         ))
     }
 
@@ -1533,7 +1909,7 @@ impl Backend for HermesBackend {
         };
         let replay_events = hermes_history_to_chat_events(&replay)?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, event_stream) = EventStream::adapter_channel();
         // A resumed session that came back without its skills says so, exactly
         // as a fresh one does. The channel is unbounded and its receiver is
         // returned below, so this survives until the client attaches.
@@ -1583,7 +1959,7 @@ impl Backend for HermesBackend {
                 compaction_capability,
                 active_compaction,
             },
-            EventStream::new_backend(events_rx),
+            event_stream,
         ))
     }
 
@@ -1672,19 +2048,31 @@ impl Backend for HermesBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        match input {
-            AgentInput::SendMessage(_) | AgentInput::UpdateSessionSettings(_) => self
+        matches!(self.send_with_outcome(input).await, SendOutcome::Accepted)
+    }
+
+    async fn send_with_outcome(&self, input: AgentInput) -> SendOutcome {
+        if let AgentInput::SendMessage(payload) = input {
+            let (reply, outcome) = oneshot::channel();
+            if self
+                .command_tx
+                .send(HermesBackendCommand::Deliver(payload, reply))
+                .is_err()
+            {
+                return SendOutcome::Closed;
+            }
+            return outcome.await.unwrap_or(SendOutcome::Closed);
+        }
+        if matches!(input, AgentInput::UpdateSessionSettings(_))
+            && self
                 .command_tx
                 .send(HermesBackendCommand::Input(input))
-                .is_ok(),
-            AgentInput::GoalControl(_)
-            | AgentInput::EditQueuedMessage(_)
-            | AgentInput::CancelQueuedMessage(_)
-            | AgentInput::SendQueuedMessageNow(_)
-            | AgentInput::SteerMessage(_) => {
-                tracing::error!("queued-message inputs reached Hermes backend");
-                false
-            }
+                .is_ok()
+        {
+            SendOutcome::Accepted
+        } else {
+            tracing::error!("Hermes input was not delivered");
+            SendOutcome::Closed
         }
     }
 
@@ -2797,9 +3185,20 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::Deliver(payload, reply) => {
+                            let outcome = if let Some(response) = payload.tool_response.clone() {
+                                match self.handle_tool_response(response, payload.message).await {
+                                    Ok(()) => SendOutcome::Accepted,
+                                    Err(error) => { self.reject_tool_response(error); SendOutcome::Accepted }
+                                }
+                            } else { self.handle_send_message(payload).await };
+                            let _ = reply.send(outcome);
+                        }
                         HermesBackendCommand::Steer(payload, reply) => {
                             let outcome = self.handle_steer(payload).await;
+                            let closed = matches!(outcome, SteerOutcome::Closed);
                             let _ = reply.send(outcome);
+                            if closed { break; }
                         }
                         HermesBackendCommand::SetWorkspaceRoots(roots, reply) => {
                             let result = self.set_workspace_roots(roots).await;
@@ -3005,8 +3404,11 @@ impl HermesSessionActor {
                     if let Err(error) = self.handle_tool_response(response, payload.message).await {
                         self.reject_tool_response(error);
                     }
-                } else {
-                    self.handle_send_message(payload).await;
+                } else if !matches!(
+                    self.handle_send_message(payload).await,
+                    SendOutcome::Accepted
+                ) {
+                    self.emit_error("Hermes initial prompt was not delivered");
                 }
             }
             AgentInput::UpdateSessionSettings(payload) => {
@@ -3024,11 +3426,14 @@ impl HermesSessionActor {
         }
     }
 
-    async fn handle_send_message(&mut self, payload: protocol::SendMessagePayload) {
-        let images = payload.images.unwrap_or_default();
+    async fn handle_send_message(&mut self, payload: protocol::SendMessagePayload) -> SendOutcome {
+        if self.mapper.typing_active || self.mapper.closed_response.is_some() {
+            return SendOutcome::Busy(AgentInput::SendMessage(payload));
+        }
+        let images = payload.images.clone().unwrap_or_default();
         if payload.message.trim().is_empty() && images.is_empty() {
             self.emit_error("Hermes prompt.submit requires a non-empty message");
-            return;
+            return SendOutcome::Closed;
         }
         if let Some(command) = self
             .slash_commands
@@ -3036,72 +3441,87 @@ impl HermesSessionActor {
             .and_then(|catalog| catalog.invoked_by(&payload.message))
             .cloned()
         {
-            self.run_slash_command(&payload.message, &command, payload.origin)
-                .await;
-            return;
+            return match self.run_slash_command(&payload.message, &command).await {
+                Ok(output) => {
+                    self.emit(ChatEvent::MessageAdded(user_message(
+                        &payload.message,
+                        None,
+                        payload.origin,
+                    )));
+                    self.mapper.typing_active = true;
+                    self.emit(ChatEvent::TypingStatusChanged(true));
+                    if let Some(output) = output {
+                        self.emit_command_reply(output);
+                    }
+                    SendOutcome::Accepted
+                }
+                Err(error) if error.code == Some(4091) => {
+                    SendOutcome::Busy(AgentInput::SendMessage(payload))
+                }
+                Err(error) => {
+                    self.emit_error(format!("Hermes command was not delivered: {error}"));
+                    SendOutcome::Closed
+                }
+            };
         }
-
         let attached_paths = match self.attach_images(&images).await {
             Ok(paths) => paths,
             Err(err) => {
                 self.emit_error(err);
-                return;
+                return SendOutcome::Closed;
             }
         };
-
-        // Scope the stderr tail to this turn so a later failure never reports
-        // stale output from an earlier one.
-        self.recent_stderr.clear();
-        if payload.origin != Some(protocol::MessageOrigin::HostRestart) {
-            self.emit(ChatEvent::MessageAdded(user_message(
-                &payload.message,
-                (!images.is_empty()).then_some(images),
-                payload.origin,
-            )));
+        match self.submit_prompt(&payload.message).await {
+            Ok(()) => {
+                self.recent_stderr.clear();
+                if payload.origin != Some(protocol::MessageOrigin::HostRestart) {
+                    self.emit(ChatEvent::MessageAdded(user_message(
+                        &payload.message,
+                        (!images.is_empty()).then_some(images),
+                        payload.origin,
+                    )));
+                }
+                self.mapper.typing_active = true;
+                self.emit(ChatEvent::TypingStatusChanged(true));
+                SendOutcome::Accepted
+            }
+            Err(error) => {
+                self.detach_images(&attached_paths).await;
+                if error.code == Some(4091) {
+                    SendOutcome::Busy(AgentInput::SendMessage(payload))
+                } else {
+                    self.emit_turn_failure(format!("Hermes prompt.submit failed: {error}"));
+                    SendOutcome::Closed
+                }
+            }
         }
-        self.mapper.typing_active = true;
-        self.emit(ChatEvent::TypingStatusChanged(true));
-        self.submit_prompt(&payload.message, &attached_paths).await;
     }
 
-    async fn submit_prompt(&mut self, message: &str, attached_paths: &[String]) {
-        let message = match super::workspace_prompt(message, self.workspace_roots.as_deref()) {
-            Ok(message) => message,
-            Err(error) => {
-                self.emit_turn_failure(error);
-                return;
-            }
-        };
-        match self
+    async fn submit_prompt(&self, message: &str) -> Result<(), HermesRpcError> {
+        let message = super::workspace_prompt(message, self.workspace_roots.as_deref()).map_err(
+            |message| HermesRpcError {
+                code: None,
+                message,
+            },
+        )?;
+        let result = self
             .gateway
-            .request(
+            .request_to_completion(
                 "prompt.submit",
                 json!({
-                    "session_id": self.live_session_id,
-                    "text": message,
+                    "session_id": self.live_session_id, "text": message,
                 }),
             )
-            .await
-        {
-            Ok(result) => match required_string(&result, &["status"], "prompt.submit") {
-                Ok(status) if status == "streaming" || status == "queued" => {}
-                Ok(status) => self.emit_turn_failure(format!(
-                    "Hermes prompt.submit returned unexpected status '{status}'"
-                )),
-                Err(err) => self.emit_turn_failure(err),
-            },
-            Err(err) => {
-                self.detach_images(attached_paths).await;
-                self.emit_turn_failure(format!("Hermes prompt.submit failed: {err}"));
-            }
+            .await?;
+        match optional_string(&result, &["status"]).as_deref() {
+            Some("streaming") => Ok(()),
+            _ => Err(HermesRpcError {
+                code: None,
+                message: "Hermes did not confirm immediate prompt delivery".to_owned(),
+            }),
         }
     }
 
-    /// `session.steer` answers "queued" for any non-empty text, idle session
-    /// included, and an idle agent's pending steer is wiped by the next turn's
-    /// `clear_interrupt`. So whether a turn is running is decided here, from
-    /// `typing_active`, which an interrupt has already cleared by the time a
-    /// steer behind it is handled.
     async fn handle_steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
         // The steer channel is text only, and a slash command is run by the
         // gateway rather than read by the model.
@@ -3112,12 +3532,9 @@ impl HermesSessionActor {
         {
             return SteerOutcome::Unsupported(payload);
         }
-        if !self.mapper.typing_active && !self.mapper.user_response_closed_stream {
-            return SteerOutcome::NoActiveTurn(payload);
-        }
         let steered = self
             .gateway
-            .request_typed(
+            .request_to_completion(
                 "session.steer",
                 json!({
                     "session_id": self.live_session_id,
@@ -3127,21 +3544,17 @@ impl HermesSessionActor {
             .await;
         match steered {
             Ok(result) => match optional_string(&result, &["status"]).as_deref() {
-                Some("queued") => {
-                    self.emit(ChatEvent::MessageAdded(user_message(
-                        &payload.message,
-                        None,
-                        payload.origin,
-                    )));
-                    SteerOutcome::Accepted
-                }
-                Some("rejected") => SteerOutcome::NoActiveTurn(payload),
+                Some("rejected") => SteerOutcome::Unsupported(payload),
+                Some("idle") => SteerOutcome::NoActiveTurn(payload),
                 status => {
-                    tracing::warn!(
-                        ?status,
-                        "Hermes session.steer returned an unexpected status"
+                    tracing::error!(
+                        status_present = status.is_some(),
+                        "Hermes steering result has no delivery verdict"
                     );
-                    SteerOutcome::NoActiveTurn(payload)
+                    self.emit_error(
+                        "Hermes could not confirm steering delivery; the session is closing",
+                    );
+                    SteerOutcome::Closed
                 }
             },
             // 4010: this session's agent has no steer channel.
@@ -3150,9 +3563,9 @@ impl HermesSessionActor {
                 tracing::warn!(%error, "Hermes gateway closed before answering session.steer");
                 SteerOutcome::Closed
             }
-            Err(error) => {
-                tracing::warn!(%error, "Hermes session.steer failed");
-                SteerOutcome::NoActiveTurn(payload)
+            Err(_) => {
+                self.emit_error("Hermes steering transport failed before delivery was confirmed; the session is closing");
+                SteerOutcome::Closed
             }
         }
     }
@@ -3165,72 +3578,51 @@ impl HermesSessionActor {
         &mut self,
         message: &str,
         command: &protocol::SlashCommand,
-        origin: Option<protocol::MessageOrigin>,
-    ) {
-        self.recent_stderr.clear();
-        self.emit(ChatEvent::MessageAdded(user_message(message, None, origin)));
-        self.mapper.typing_active = true;
-        self.emit(ChatEvent::TypingStatusChanged(true));
+    ) -> Result<Option<String>, HermesRpcError> {
         let args = message.trim_start()[1 + command.name.len()..]
             .trim()
             .to_owned();
         let exec = self
             .gateway
-            .request_typed(
+            .request_to_completion(
                 "slash.exec",
                 json!({ "session_id": self.live_session_id, "command": message.trim() }),
             )
             .await;
         let dispatched = match exec {
             Ok(response) => response,
-            // 4018: not a slash-worker command — skills, bundles, and the
-            // prompt-building built-ins are served by command.dispatch.
+            // Native 4018 routes prompt-building commands to their own handler.
             Err(error) if error.code == Some(4018) => {
-                match self
-                    .gateway
-                    .request_typed(
+                self.gateway
+                    .request_to_completion(
                         "command.dispatch",
-                        json!({
-                            "session_id": self.live_session_id,
-                            "name": command.name,
-                            "arg": args,
-                        }),
+                        json!({ "session_id": self.live_session_id,
+                    "name": command.name, "arg": args }),
                     )
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        self.emit_turn_failure(format!(
-                            "Hermes /{} failed: {}",
-                            command.name, error.message
-                        ));
-                        return;
-                    }
-                }
+                    .await?
             }
-            Err(error) => {
-                self.emit_turn_failure(format!(
-                    "Hermes /{} failed: {}",
-                    command.name, error.message
-                ));
-                return;
-            }
+            Err(error) => return Err(error),
         };
-        let submits_prompt = matches!(
+        if matches!(
             dispatched.get("type").and_then(Value::as_str),
             Some("send" | "skill")
-        );
-        if submits_prompt && let Some(prompt) = dispatched.get("message").and_then(Value::as_str) {
-            let prompt = prompt.to_owned();
-            self.submit_prompt(&prompt, &[]).await;
-            return;
+        ) {
+            let prompt = required_string(&dispatched, &["message"], "command.dispatch").map_err(
+                |message| HermesRpcError {
+                    code: None,
+                    message,
+                },
+            )?;
+            self.submit_prompt(&prompt).await?;
+            return Ok(None);
         }
+        self.recent_stderr.clear();
         let output = dispatched
             .get("output")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| dispatched.to_string());
-        self.emit_command_reply(output);
+        Ok(Some(output))
     }
 
     /// Shows a gateway-answered command's output as the response to the turn
@@ -3583,26 +3975,78 @@ impl HermesSessionActor {
     }
 
     async fn handle_interrupt(&mut self) -> bool {
-        match self
+        let expected_generation = self.mapper.current_turn_generation;
+        let result = self
             .gateway
-            .request(
+            .request_to_completion(
                 "session.interrupt",
-                json!({ "session_id": self.live_session_id }),
+                json!({ "session_id": self.live_session_id, "_tyde_expected_generation": expected_generation }),
             )
-            .await
-        {
-            Ok(_) => {
-                let events = self.mapper.cancel_events("Operation cancelled");
-                for event in events {
-                    self.emit(event);
+            .await;
+        let request_id = match result {
+            Ok(result) => match result.get("tyde_interrupt_id").and_then(Value::as_u64) {
+                Some(id) => id,
+                None => {
+                    self.emit_error("Hermes interrupt has no native settlement receipt");
+                    return false;
                 }
-                true
-            }
+            },
             Err(err) => {
                 self.emit_error(format!("Hermes session.interrupt failed: {err}"));
-                false
+                return false;
+            }
+        };
+        let mut cancelled = false;
+        loop {
+            let Some(event) = self.gateway_events_rx.recv().await else {
+                self.emit_error("Hermes closed before its native interrupt settlement");
+                return false;
+            };
+            if let HermesGatewayEvent::Event {
+                event_type,
+                payload,
+                ..
+            } = &event
+            {
+                if event_type == "tyde.interrupt.settled" {
+                    if payload
+                        .as_ref()
+                        .and_then(|value| value.get("request_id"))
+                        .and_then(Value::as_u64)
+                        != Some(request_id)
+                    {
+                        self.emit_error("Hermes interrupt settlement does not match its request");
+                        return false;
+                    }
+                    break;
+                }
+                cancelled |= event_type == "message.complete"
+                    && payload
+                        .as_ref()
+                        .and_then(|value| optional_string(value, &["status"]))
+                        .as_deref()
+                        == Some("interrupted")
+                    && expected_generation.is_none_or(|generation| {
+                        payload
+                            .as_ref()
+                            .and_then(|value| value.get("_tyde_turn_generation"))
+                            .and_then(Value::as_u64)
+                            == Some(generation)
+                    });
+            }
+            if !self.handle_gateway_event(event).await {
+                return false;
             }
         }
+        if !cancelled
+            && expected_generation
+                .is_some_and(|generation| self.mapper.current_turn_generation == Some(generation))
+        {
+            for event in self.mapper.cancel_events("Operation cancelled") {
+                self.emit(event);
+            }
+        }
+        true
     }
 
     /// Kill one background process and close its card as cancelled.
@@ -3715,10 +4159,14 @@ impl HermesSessionActor {
                         .as_ref()
                         .and_then(|payload| payload.get("usage"))
                         .and_then(current_context_usage_from_hermes);
-                    if !cancelled_settlement {
+                    let completed_response =
+                        self.mapper.closed_response == Some(HermesClosedResponse::ProviderComplete);
+                    if !cancelled_settlement && !completed_response {
                         payload = self.enrich_message_complete_payload(payload).await;
                     }
-                    if let Some(current_context_usage) = context_usage
+                    if !cancelled_settlement
+                        && !completed_response
+                        && let Some(current_context_usage) = context_usage
                         && let Some(usage) = self.mapper.model_request_usage_from_message_complete(
                             payload.as_ref(),
                             current_context_usage,
@@ -3729,12 +4177,26 @@ impl HermesSessionActor {
                             .send(BackendEvent::ModelRequestTokenUsage(usage));
                     }
                 }
-                let provider_request_usage = (event_type == "provider.request.start")
-                    .then(|| {
-                        self.mapper
-                            .model_request_usage_from_provider_request_start(payload.as_ref())
+                let provider_request_usage = (event_type == "provider.response.complete"
+                    || (event_type == "provider.request.start"
+                        && self.mapper.closed_response
+                            != Some(HermesClosedResponse::ProviderComplete)))
+                .then(|| {
+                    self.mapper
+                        .model_request_usage_from_provider_request_start(payload.as_ref())
+                })
+                .flatten();
+                let execution = if matches!(event_type.as_str(), "tool.start" | "tool.complete") {
+                    payload.as_ref().and_then(|payload| {
+                        let native_id = optional_string(payload, &["tool_id", "tool_call_id"])?;
+                        let tool_call_id = self.mapper.tool_call_ids.get(&native_id)?.clone();
+                        let name = optional_string(payload, &["name", "tool_name"])?;
+                        let arguments = payload.get("args")?.clone();
+                        Some((tool_call_id, name, arguments))
                     })
-                    .flatten();
+                } else {
+                    None
+                };
                 let mapped = self.mapper.map_event(&event_type, payload);
                 if let Some(usage) = provider_request_usage {
                     let _ = self
@@ -3742,7 +4204,19 @@ impl HermesSessionActor {
                         .send(BackendEvent::ModelRequestTokenUsage(usage));
                 }
                 for event in mapped {
-                    self.emit(event);
+                    match (event, &execution) {
+                        (
+                            ChatEvent::ToolRequest(request),
+                            Some((tool_call_id, name, arguments)),
+                        ) if &request.tool_call_id == tool_call_id => {
+                            let _ = self.events_tx.resolved_tool_request(
+                                request,
+                                name.clone(),
+                                arguments.clone(),
+                            );
+                        }
+                        (event, _) => self.emit(event),
+                    }
                 }
                 true
             }
@@ -4314,7 +4788,11 @@ impl HermesGatewayHandle {
             .map_err(|error| error.to_string())
     }
 
-    async fn request_typed(&self, method: &str, params: Value) -> Result<Value, HermesRpcError> {
+    fn enqueue_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<oneshot::Receiver<Result<Value, HermesRpcError>>, HermesRpcError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HermesGatewayCommand::Request {
@@ -4327,6 +4805,24 @@ impl HermesGatewayHandle {
                 code: None,
                 message: format!("Hermes gateway is closed; cannot send {method}"),
             })?;
+        Ok(reply_rx)
+    }
+
+    async fn request_to_completion(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HermesRpcError> {
+        self.enqueue_request(method, params)?
+            .await
+            .map_err(|_| HermesRpcError {
+                code: None,
+                message: format!("Hermes gateway closed while waiting for {method}"),
+            })?
+    }
+
+    async fn request_typed(&self, method: &str, params: Value) -> Result<Value, HermesRpcError> {
+        let reply_rx = self.enqueue_request(method, params)?;
         match tokio::time::timeout(self.request_timeout, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(HermesRpcError {
@@ -4646,12 +5142,23 @@ async fn run_gateway_actor(
                 let Some(inbound) = maybe_inbound else { break; };
                 match inbound {
                     HermesGatewayInbound::StdoutLine(line) => {
-                        handle_gateway_stdout_line(
+                        if let Err(error) = handle_gateway_stdout_line(
                             &line,
                             &mut pending,
                             &event_tx,
                             &mut ready_tx,
-                        );
+                        ) {
+                            for (_, reply) in pending.drain() {
+                                let _ = reply.send(Err(HermesRpcError { code: None, message: error.clone() }));
+                            }
+                            if let Some(reply) = ready_tx.take() {
+                                let _ = reply.send(Err(error.clone()));
+                            }
+                            let _ = event_tx.send(HermesGatewayEvent::ProtocolError(error));
+                            drop(stdin.take());
+                            let _ = force_shutdown_tx.send(());
+                            break;
+                        }
                     }
                     HermesGatewayInbound::StderrLine(line) => {
                         if ready_tx.is_some() {
@@ -4710,69 +5217,44 @@ fn handle_gateway_stdout_line(
     pending: &mut HashMap<u64, oneshot::Sender<Result<Value, HermesRpcError>>>,
     event_tx: &mpsc::UnboundedSender<HermesGatewayEvent>,
     ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
-) {
+) -> Result<(), String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return;
+        return Ok(());
     }
-    let value: Value = match serde_json::from_str(trimmed) {
-        Ok(value) => value,
-        Err(err) => {
-            let _ = event_tx.send(HermesGatewayEvent::ProtocolError(format!(
-                "invalid JSON on stdout: {err}: {trimmed}"
-            )));
-            return;
-        }
-    };
-
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|_| "Hermes gateway emitted invalid JSON".to_owned())?;
     if value.get("method").and_then(Value::as_str) == Some("event") {
-        match parse_gateway_event(&value) {
-            Ok(event) => {
-                if matches!(
-                    &event,
-                    HermesGatewayEvent::Event { event_type, .. } if event_type == "gateway.ready"
-                ) && let Some(tx) = ready_tx.take()
-                {
-                    let _ = tx.send(Ok(()));
-                }
-                let _ = event_tx.send(event);
-            }
-            Err(err) => {
-                let _ = event_tx.send(HermesGatewayEvent::ProtocolError(err));
-            }
+        let event = parse_gateway_event(&value)?;
+        if matches!(&event, HermesGatewayEvent::Event { event_type, .. } if event_type == "gateway.ready")
+            && let Some(tx) = ready_tx.take()
+        {
+            let _ = tx.send(Ok(()));
         }
-        return;
+        let _ = event_tx.send(event);
+        return Ok(());
     }
-
-    if let Some(id) = value.get("id").and_then(Value::as_u64) {
-        let Some(reply) = pending.remove(&id) else {
-            let _ = event_tx.send(HermesGatewayEvent::ProtocolError(format!(
-                "Hermes response for unknown request id {id}"
-            )));
-            return;
-        };
-        if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Hermes JSON-RPC error")
-                .to_string();
-            let code = error.get("code").and_then(Value::as_i64);
-            let _ = reply.send(Err(HermesRpcError { code, message }));
-        } else if let Some(result) = value.get("result") {
-            let _ = reply.send(Ok(result.clone()));
-        } else {
-            let _ = reply.send(Err(HermesRpcError {
-                code: None,
-                message: format!("Hermes response {id} missing both result and error"),
-            }));
-        }
-        return;
+    let id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        "Hermes gateway frame has neither an event nor a numeric reply id".to_owned()
+    })?;
+    if value.get("error").is_none() && value.get("result").is_none() {
+        return Err("Hermes gateway reply has neither result nor error".to_owned());
     }
-
-    let _ = event_tx.send(HermesGatewayEvent::ProtocolError(format!(
-        "Hermes stdout frame missing method=event or numeric id: {value}"
-    )));
+    let reply = pending
+        .remove(&id)
+        .ok_or_else(|| "Hermes gateway replied to an unknown request".to_owned())?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Hermes JSON-RPC error")
+            .to_string();
+        let code = error.get("code").and_then(Value::as_i64);
+        let _ = reply.send(Err(HermesRpcError { code, message }));
+    } else if let Some(result) = value.get("result") {
+        let _ = reply.send(Ok(result.clone()));
+    }
+    Ok(())
 }
 
 fn parse_gateway_event(value: &Value) -> Result<HermesGatewayEvent, String> {
@@ -5342,6 +5824,10 @@ impl HermesEventMapper {
             "session.title" => Ok(Vec::new()),
             "status.update" => self.map_status_update(payload),
             "provider.request.start" => self.map_provider_request_start(payload),
+            "provider.response.complete" => self.map_provider_response_complete(payload),
+            "provider.notice" => required_payload(payload, "provider.notice")
+                .and_then(|payload| required_raw_string(&payload, &["text"], "provider.notice"))
+                .map(|text| vec![ChatEvent::MessageAdded(warning_message(text))]),
             "message.start" => self.map_message_start(payload),
             "message.delta" => self.map_message_delta(payload),
             "message.interim" => self.map_message_interim(payload),
@@ -5349,7 +5835,10 @@ impl HermesEventMapper {
             "thinking.delta" | "reasoning.delta" => self.map_reasoning_delta(event_type, payload),
             "reasoning.available" => self.map_reasoning_available(payload),
             "tool.generating" => {
-                eprintln!("TYDE HERMES TOOL GENERATING payload={payload:?}");
+                eprintln!(
+                    "TYDE HERMES TOOL GENERATING payload_present={}",
+                    payload.is_some()
+                );
                 Ok(Vec::new())
             }
             "tool.start" => self.map_tool_start(payload),
@@ -5364,6 +5853,7 @@ impl HermesEventMapper {
             "tool.complete" => self.map_tool_complete(payload),
             "tool.output_risk" => self.map_tool_output_risk(payload),
             "clarify.request" => self.map_clarify_request(payload),
+            "clarify.cancelled" => self.map_clarify_cancelled(payload),
             "clarify.expire" => self.map_clarify_expire(payload),
             "agent.terminal.output" => self.map_agent_terminal_output(payload),
             "background.complete" => self.map_background_complete(payload),
@@ -5410,6 +5900,7 @@ impl HermesEventMapper {
         ));
         events.push(ChatEvent::MessageAdded(error_message(message.into())));
         events.push(ChatEvent::TypingStatusChanged(false));
+        self.retired_cancelled_generation = None;
         self.typing_active = false;
         self.clear_turn_state();
         events
@@ -5538,6 +6029,12 @@ impl HermesEventMapper {
     }
 
     fn map_message_start(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let generation = payload
+            .as_ref()
+            .and_then(|payload| payload.get("_tyde_turn_generation"))
+            .and_then(Value::as_u64)
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| "Hermes message.start requires its native turn generation".to_owned())?;
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
             events.extend(self.finish_stream_events(None, None, None, None, None));
@@ -5554,15 +6051,7 @@ impl HermesEventMapper {
             )));
         }
         self.clear_turn_state();
-        let generation = payload
-            .as_ref()
-            .and_then(|payload| payload.get("_tyde_turn_generation"))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                self.next_local_turn_generation = self.next_local_turn_generation.saturating_add(1);
-                self.next_local_turn_generation
-            });
-        self.next_local_turn_generation = self.next_local_turn_generation.max(generation);
+        self.retired_cancelled_generation = None;
         self.current_turn_generation = Some(generation);
         self.turn_usage_so_far = None;
         let message_id = Uuid::new_v4().to_string();
@@ -5622,13 +6111,18 @@ impl HermesEventMapper {
             ));
         }
 
-        let (request_usage, cumulative_usage) = payload
-            .get("usage")
-            .and_then(token_usage_from_value)
-            .map(|usage| self.record_session_usage(usage))
-            .map_or((None, None), |(request, cumulative)| {
-                (Some(request), cumulative)
-            });
+        let (request_usage, cumulative_usage) =
+            if self.closed_response == Some(HermesClosedResponse::ProviderComplete) {
+                (None, None)
+            } else {
+                payload
+                    .get("usage")
+                    .and_then(token_usage_from_value)
+                    .map(|usage| self.record_session_usage(usage))
+                    .map_or((None, None), |(request, cumulative)| {
+                        (Some(request), cumulative)
+                    })
+            };
         events.extend(self.finish_stream_events(None, None, request_usage, cumulative_usage, None));
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
@@ -5646,23 +6140,10 @@ impl HermesEventMapper {
         Ok(events)
     }
 
-    /// Whether a delta that found no open message is the cancelled turn's
-    /// provider stream still draining.
-    ///
-    /// `cancel_events` closes the message but deliberately leaves
-    /// `current_turn_generation` set, while a turn that ends normally clears it
-    /// through `clear_turn_state` (see the `status != "interrupted"` guard in
-    /// `map_message_complete`). So a generation still in hand with no open
-    /// message can only mean the user cancelled and Hermes has not finished
-    /// unwinding. Measured 5/5 on `real_interruption`: Hermes emits a trailing
-    /// `thinking.delta` after Tyde has already reported the turn interrupted,
-    /// and no `message.start` ever follows it.
-    ///
-    /// `interrupted_turn_generations` cannot answer this — `map_message_complete`
-    /// removes the generation from that list while handling the interrupted
-    /// completion, so it is already empty by the time the straggler lands.
+    // A retired cancellation fences trailing native debris without retaining
+    // that generation as the active identity for the next immediate Stop.
     fn belongs_to_a_cancelled_turn(&self) -> bool {
-        self.current_message_id.is_none() && self.current_turn_generation.is_some()
+        self.current_message_id.is_none() && self.retired_cancelled_generation.is_some()
     }
 
     fn map_message_delta(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -5680,6 +6161,9 @@ impl HermesEventMapper {
         }
         if text.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.closed_response == Some(HermesClosedResponse::ProviderComplete) {
+            return Err("Hermes emitted model text after its response completed".to_owned());
         }
         let mut events = self.reopen_stream_after_user_response();
         self.current_text.push_str(&text);
@@ -5702,6 +6186,9 @@ impl HermesEventMapper {
             .unwrap_or(false)
         {
             return Ok(Vec::new());
+        }
+        if self.closed_response == Some(HermesClosedResponse::ProviderComplete) {
+            return Err("Hermes emitted model text after its response completed".to_owned());
         }
         let mut events = self.reopen_stream_after_user_response();
         self.current_text.push_str(&text);
@@ -5732,8 +6219,11 @@ impl HermesEventMapper {
         }
         // Hermes keeps animating its spinner through a question wait; only
         // real reasoning starts the response that follows the answer.
-        if self.user_response_closed_stream && event_type != "reasoning.delta" {
+        if self.closed_response.is_some() && event_type != "reasoning.delta" {
             return Ok(Vec::new());
+        }
+        if self.closed_response == Some(HermesClosedResponse::ProviderComplete) {
+            return Err("Hermes emitted reasoning after its response completed".to_owned());
         }
         let mut events = self.reopen_stream_after_user_response();
         self.current_reasoning_seen = true;
@@ -5784,15 +6274,15 @@ impl HermesEventMapper {
             Some(raw) => raw.trim().to_string(),
             None => "complete".to_string(),
         };
-        let stamped_generation = payload.get("_tyde_turn_generation").and_then(Value::as_u64);
-        if stamped_generation.is_none() && !self.interrupted_turn_generations.is_empty() {
-            tracing::warn!(
-                active_generation = ?self.current_turn_generation,
-                "ignored uncorrelated Hermes completion while an interrupted generation remained unsettled"
-            );
-            return Ok(Vec::new());
-        }
-        let reported_generation = stamped_generation.or(self.current_turn_generation);
+        let reported_generation = Some(
+            payload
+                .get("_tyde_turn_generation")
+                .and_then(Value::as_u64)
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| {
+                    "Hermes message.complete requires its native turn generation".to_owned()
+                })?,
+        );
         if let Some(generation) = reported_generation
             && let Some(index) = self
                 .interrupted_turn_generations
@@ -5837,7 +6327,9 @@ impl HermesEventMapper {
             .as_ref()
             .filter(|text| !text.trim().is_empty())
             .cloned();
-        let has_visible_text = stream_final_text.is_some() || !self.current_text.trim().is_empty();
+        let has_visible_text = stream_final_text.is_some()
+            || !self.current_text.trim().is_empty()
+            || self.closed_response == Some(HermesClosedResponse::ProviderComplete);
         let has_reasoning = self.current_reasoning_seen
             || final_reasoning
                 .as_ref()
@@ -5854,13 +6346,15 @@ impl HermesEventMapper {
         }
         match status.as_str() {
             "interrupted" => {
-                events.extend(self.finish_stream_events(
-                    stream_final_text,
-                    final_reasoning.clone(),
-                    usage,
-                    cumulative_usage,
-                    context_breakdown,
-                ));
+                if self.closed_response.is_some() {
+                    events.extend(self.finish_stream_events(
+                        stream_final_text,
+                        final_reasoning.clone(),
+                        usage,
+                        cumulative_usage,
+                        context_breakdown,
+                    ));
+                }
                 events.extend(self.cancel_events("Operation cancelled"));
             }
             "error" | "failed" => {
@@ -5928,83 +6422,137 @@ impl HermesEventMapper {
             }
         }
         if status != "interrupted" {
+            self.retired_cancelled_generation = None;
             self.typing_active = false;
             self.clear_turn_state();
         }
         Ok(events)
     }
 
+    fn map_provider_response_complete(
+        &mut self,
+        payload: Option<Value>,
+    ) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "provider.response.complete")?;
+        if self.current_message_id.is_none() || self.closed_response.is_some() {
+            return Err("Hermes completed a provider response without an open stream".to_owned());
+        }
+        let calls = payload
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|calls| !calls.is_empty())
+            .ok_or_else(|| "Hermes completed tool response has no calls".to_owned())?;
+        for call in calls {
+            self.register_response_tool(call.clone())?;
+        }
+        let text = required_raw_string(&payload, &["text"], "provider.response.complete")?;
+        let usage = payload
+            .get("usage")
+            .and_then(token_usage_from_value)
+            .ok_or_else(|| "Hermes completed provider response has no usage".to_owned())?;
+        let (request_usage, cumulative_usage) = self.record_session_usage(usage);
+        let message_id = self.current_message_id.clone();
+        let events = self.finish_stream_events(
+            Some(text),
+            None,
+            Some(request_usage),
+            cumulative_usage,
+            None,
+        );
+        self.current_message_id = message_id;
+        self.closed_response = Some(HermesClosedResponse::ProviderComplete);
+        Ok(events)
+    }
+
     fn map_tool_start(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "tool.start")?;
-        let provider_tool_id =
-            required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.start")?;
-        if self.current_message_id.is_none() {
-            return Err("Hermes tool started without a provider response".to_owned());
-        }
-        let mut events = self.reopen_stream_after_user_response();
+        self.register_tool_execution(&payload)
+    }
+
+    fn register_response_tool(&mut self, payload: Value) -> Result<(), String> {
+        let provider_id = required_string(&payload, &["tool_id"], "provider.response.complete")?;
         let response_id = self
             .current_message_id
             .as_ref()
-            .expect("provider response checked above");
-        let tool_call_id = format!("hermes:{response_id}:{provider_tool_id}");
-        self.tool_call_ids
-            .insert(provider_tool_id.clone(), tool_call_id.clone());
-        eprintln!("TYDE HERMES TOOL ID provider={provider_tool_id} presentation={tool_call_id}");
-        let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.start")?;
-        if self.pending_tools.contains_key(&tool_call_id) {
-            return Err(format!(
-                "Hermes emitted duplicate tool.start for tool_id {tool_call_id}"
-            ));
-        }
+            .ok_or_else(|| "Hermes declaration has no provider response".to_owned())?;
+        let tool_call_id = format!("hermes:{response_id}:{provider_id}");
         if self.turn_tools.contains_key(&tool_call_id) {
-            return Err(format!(
-                "Hermes emitted tool.start for already completed tool_id {tool_call_id}"
-            ));
+            return Err("Hermes completed response repeats a native tool identity".to_owned());
         }
-        self.pending_tools
-            .insert(tool_call_id.clone(), tool_name.clone());
+        let name = required_string(&payload, &["name"], "provider.response.complete")?;
+        let arguments = payload
+            .get("args")
+            .cloned()
+            .ok_or_else(|| "Hermes completed tool response has no arguments".to_owned())?;
+        self.tool_call_ids.insert(provider_id, tool_call_id.clone());
         self.cancelled_tools.remove(&tool_call_id);
-        let content_offset = u32::try_from(self.current_text.chars().count()).ok();
-        let observed_order = self.next_turn_tool_order;
-        self.next_turn_tool_order = self.next_turn_tool_order.saturating_add(1);
-        let arguments = payload.get("args").cloned().unwrap_or(payload);
         self.turn_tools.insert(
-            tool_call_id.clone(),
+            tool_call_id,
             HermesTurnTool {
-                name: tool_name.clone(),
-                arguments: arguments.clone(),
-                content_offset,
-                observed_order,
+                name,
+                arguments,
+                content_offset: u32::try_from(self.current_text.chars().count()).ok(),
+                observed_order: self.next_turn_tool_order,
+                execution_registered: false,
+                request_presented: false,
             },
         );
+        self.next_turn_tool_order = self.next_turn_tool_order.saturating_add(1);
+        tracing::debug!("Hermes registered native provider tool declaration");
+        Ok(())
+    }
+
+    fn register_tool_execution(&mut self, payload: &Value) -> Result<Vec<ChatEvent>, String> {
+        if self.closed_response != Some(HermesClosedResponse::ProviderComplete) {
+            return Err("Hermes tool executed before its provider response completed".to_owned());
+        }
+        let provider_id =
+            required_string_any(payload, &["tool_id", "tool_call_id"], "tool execution")?;
+        let tool_call_id = self
+            .tool_call_ids
+            .get(&provider_id)
+            .cloned()
+            .ok_or_else(|| "Hermes execution has no native response declaration".to_owned())?;
+        let tool = self.turn_tools.get_mut(&tool_call_id).ok_or_else(|| {
+            "Hermes execution belongs to a different provider response".to_owned()
+        })?;
+        if tool.execution_registered {
+            return Err("Hermes repeated native tool execution metadata".to_owned());
+        }
+        let execution_name =
+            required_string_any(payload, &["name", "tool_name"], "tool execution")?;
+        let execution_arguments = payload
+            .get("args")
+            .cloned()
+            .ok_or_else(|| "Hermes execution has no native resolved arguments".to_owned())?;
+        tool.execution_registered = true;
+        let declaration_name = tool.name.clone();
+        self.pending_tools
+            .insert(tool_call_id.clone(), execution_name.clone());
         self.pending_tool_arguments
-            .insert(tool_call_id.clone(), arguments.clone());
-        let tool_type =
-            hermes_native_tool_request_type(&tool_name, &arguments).unwrap_or_else(|| {
-                ToolRequestType::Other {
-                    args: arguments.clone(),
-                }
-            });
-        if is_hermes_delegate_tool(&tool_name) {
+            .insert(tool_call_id.clone(), execution_arguments.clone());
+        if is_hermes_delegate_tool(&execution_name) {
             if self.delegation_tools.len() >= 256 {
                 self.delegation_tools.pop_front();
             }
             self.delegation_tools.push_back(HermesDelegationTool {
                 tool_call_id: tool_call_id.clone(),
-                goals: hermes_delegation_goals(&arguments),
+                goals: hermes_delegation_goals(&execution_arguments),
             });
         }
-        if normalized_hermes_tool_name(&tool_name) == "clarify" {
-            return Ok(events);
+        if normalized_hermes_tool_name(&execution_name) == "clarify" {
+            return Ok(Vec::new());
         }
-        // Agent-control progress is emitted once for every backend in
-        // `EventStream::project_tyde_agent_control`.
-        events.push(ChatEvent::ToolRequest(ToolRequest {
-            tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.clone(),
+        tool.request_presented = true;
+        let tool_type = hermes_native_tool_request_type(&execution_name, &execution_arguments)
+            .unwrap_or(ToolRequestType::Other {
+                args: execution_arguments,
+            });
+        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id,
+            tool_name: declaration_name,
             tool_type,
-        }));
-        Ok(events)
+        })])
     }
 
     fn map_clarify_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -6029,6 +6577,12 @@ impl HermesEventMapper {
             );
         }
         let tool_call_id = tool_call_id.clone();
+        let declaration_name = self
+            .turn_tools
+            .get(&tool_call_id)
+            .ok_or_else(|| "Hermes question has no native model declaration".to_owned())?
+            .name
+            .clone();
         let questions = hermes_clarify_questions(&payload)?;
         self.pending_clarify = Some(HermesPendingClarify {
             tool_call_id: tool_call_id.clone(),
@@ -6042,12 +6596,39 @@ impl HermesEventMapper {
         );
         Ok(self.await_user_response(ToolRequest {
             tool_call_id,
-            tool_name: "clarify".to_string(),
+            tool_name: declaration_name,
             tool_type: ToolRequestType::AskUserQuestion {
                 questions,
                 mode: protocol::UserQuestionMode::Blocking,
             },
         }))
+    }
+
+    fn map_clarify_cancelled(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "clarify.cancelled")?;
+        let request_id = required_string(&payload, &["request_id"], "clarify.cancelled")?;
+        let Some(pending) = self.pending_clarify.as_ref() else {
+            return Err("Hermes cancelled a clarify with no pending request".to_owned());
+        };
+        if pending.request_id != request_id {
+            return Err("Hermes cancelled a different clarify request".to_owned());
+        }
+        let tool_call_id = pending.tool_call_id.clone();
+        self.pending_clarify = None;
+        self.pending_tools.remove(&tool_call_id);
+        self.pending_tool_arguments.remove(&tool_call_id);
+        if self.cancelled_tools.len() >= 256 {
+            self.cancelled_tools.clear();
+        }
+        self.cancelled_tools.insert(tool_call_id.clone());
+        Ok(vec![ChatEvent::ToolExecutionCompleted(
+            ToolExecutionCompletedData {
+                tool_call_id,
+                outcome: ToolExecutionOutcome::Cancelled {
+                    message: "Question cancelled by native interruption".to_owned(),
+                },
+            },
+        )])
     }
 
     fn map_clarify_expire(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -6125,7 +6706,10 @@ impl HermesEventMapper {
 
     fn map_tool_complete(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "tool.complete")?;
-        eprintln!("TYDE HERMES TOOL COMPLETE RAW payload={payload}");
+        eprintln!(
+            "TYDE HERMES TOOL COMPLETE result_present={}",
+            payload.get("result").is_some()
+        );
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.complete")?;
         let tool_call_id = self
@@ -6134,6 +6718,14 @@ impl HermesEventMapper {
             .cloned()
             .unwrap_or(tool_call_id);
         let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.complete")?;
+        let mut events = Vec::new();
+        if self
+            .turn_tools
+            .get(&tool_call_id)
+            .is_some_and(|tool| !tool.execution_registered)
+        {
+            events.extend(self.register_tool_execution(&payload)?);
+        }
         let Some(expected_name) = self.pending_tools.get(&tool_call_id).cloned() else {
             if self.cancelled_tools.remove(&tool_call_id) {
                 return Ok(Vec::new());
@@ -6177,12 +6769,14 @@ impl HermesEventMapper {
             .and_then(|normalized| normalized.error.clone())
             .or(provider_error);
         let completion_tool_call_id = tool_call_id.clone();
-        let mut events = Vec::new();
-        if normalized_hermes_tool_name(&tool_name) == "clarify" && !question_was_presented {
+        if let Some(tool) = self.turn_tools.get_mut(&tool_call_id)
+            && !tool.request_presented
+        {
+            tool.request_presented = true;
             tracing::info!("Hermes question attempt completed without requesting user input");
             events.push(ChatEvent::ToolRequest(ToolRequest {
                 tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
+                tool_name: tool.name.clone(),
                 tool_type: ToolRequestType::Other {
                     args: arguments.clone(),
                 },
@@ -6536,8 +7130,11 @@ impl HermesEventMapper {
     /// live stream, and reports the backend idle for the wait's duration.
     fn await_user_response(&mut self, request: ToolRequest) -> Vec<ChatEvent> {
         let mut events = Vec::new();
+        if let Some(tool) = self.turn_tools.get_mut(&request.tool_call_id) {
+            tool.request_presented = true;
+        }
         if let Some(message_id) = self.current_message_id.clone()
-            && !self.user_response_closed_stream
+            && self.closed_response.is_none()
         {
             let content = std::mem::take(&mut self.current_text);
             let tool_calls = self.tool_uses_for_message(&content, &content);
@@ -6552,7 +7149,7 @@ impl HermesEventMapper {
             self.current_reasoning_seen = false;
             self.turn_tools.clear();
             self.next_turn_tool_order = 0;
-            self.user_response_closed_stream = true;
+            self.closed_response = Some(HermesClosedResponse::AwaitingUserResponse);
             events.push(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
                     origin: None,
@@ -6582,10 +7179,10 @@ impl HermesEventMapper {
     /// Starts the response that continues a provider iteration after its
     /// blocking request was answered.
     fn reopen_stream_after_user_response(&mut self) -> Vec<ChatEvent> {
-        if !self.user_response_closed_stream {
+        if self.closed_response != Some(HermesClosedResponse::AwaitingUserResponse) {
             return Vec::new();
         }
-        self.user_response_closed_stream = false;
+        self.closed_response = None;
         self.current_message_id = Some(Uuid::new_v4().to_string());
         let mut events = Vec::new();
         if !self.typing_active {
@@ -6708,10 +7305,15 @@ impl HermesEventMapper {
         cumulative_usage: Option<TokenUsage>,
         context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
-        if self.user_response_closed_stream {
-            // The iteration's response already ended at its blocking request
-            // and nothing followed the answer, so only its usage is left.
-            self.user_response_closed_stream = false;
+        if let Some(closed) = self.closed_response.take() {
+            if closed == HermesClosedResponse::ProviderComplete {
+                self.current_message_id = None;
+                self.current_text.clear();
+                self.current_reasoning.clear();
+                self.current_reasoning_seen = false;
+                return Vec::new();
+            }
+            // Only a response ended before native completion still owes usage.
             let message_id = self
                 .current_message_id
                 .take()
@@ -6807,6 +7409,8 @@ impl HermesEventMapper {
 
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
+        self.retired_cancelled_generation =
+            self.current_turn_generation.or(self.last_turn_generation);
         if let Some(generation) = self.current_turn_generation.or(self.last_turn_generation)
             && !self.interrupted_turn_generations.contains(&generation)
         {
@@ -6814,9 +7418,6 @@ impl HermesEventMapper {
                 self.interrupted_turn_generations.pop_front();
             }
             self.interrupted_turn_generations.push_back(generation);
-        }
-        if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None, None, None));
         }
         events.extend(
             self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user"),
@@ -6826,18 +7427,51 @@ impl HermesEventMapper {
         }));
         events.push(ChatEvent::TypingStatusChanged(false));
         self.typing_active = false;
-        self.user_response_closed_stream = false;
-        self.current_message_id = None;
-        self.current_text.clear();
-        self.current_reasoning_seen = false;
-        self.clear_turn_tool_state();
+        self.clear_turn_state();
         events
     }
 
     fn complete_pending_tools_as_cancelled(&mut self, detailed_message: &str) -> Vec<ChatEvent> {
         let pending = self.pending_tools.keys().cloned().collect::<Vec<_>>();
         let mut events = Vec::new();
+        for (tool_call_id, tool) in &mut self.turn_tools {
+            if !tool.execution_registered {
+                tool.execution_registered = true;
+                tool.request_presented = true;
+                events.push(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool.name.clone(),
+                    tool_type: ToolRequestType::Other {
+                        args: tool.arguments.clone(),
+                    },
+                }));
+                events.push(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: tool_call_id.clone(),
+                        outcome: ToolExecutionOutcome::Cancelled {
+                            message: detailed_message.to_owned(),
+                        },
+                    },
+                ));
+                if self.cancelled_tools.len() >= 256 {
+                    self.cancelled_tools.clear();
+                }
+                self.cancelled_tools.insert(tool_call_id.clone());
+            }
+        }
         for tool_call_id in pending {
+            if let Some(tool) = self.turn_tools.get_mut(&tool_call_id)
+                && !tool.request_presented
+            {
+                tool.request_presented = true;
+                events.push(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool.name.clone(),
+                    tool_type: ToolRequestType::Other {
+                        args: tool.arguments.clone(),
+                    },
+                }));
+            }
             self.pending_tools.remove(&tool_call_id);
             self.pending_tool_arguments.remove(&tool_call_id);
             if self.cancelled_tools.len() >= 256 {
@@ -6859,6 +7493,10 @@ impl HermesEventMapper {
 
     fn pending_tools_finished(&self) -> bool {
         self.pending_tools.is_empty()
+            && self
+                .turn_tools
+                .values()
+                .all(|tool| tool.execution_registered)
     }
 
     fn pending_tool_ids(&self) -> Vec<String> {
@@ -6888,7 +7526,7 @@ impl HermesEventMapper {
             self.last_turn_generation = Some(generation);
         }
         self.current_message_id = None;
-        self.user_response_closed_stream = false;
+        self.closed_response = None;
         self.current_text.clear();
         self.current_reasoning.clear();
         self.current_reasoning_seen = false;
@@ -7907,39 +8545,11 @@ async fn wait_for_hermes_session_mcp_tools(
     events: &mut mpsc::UnboundedReceiver<HermesGatewayEvent>,
     live_session_id: &str,
 ) -> Result<Vec<HermesGatewayEvent>, String> {
-    let timeout = duration_from_env_ms(HERMES_STARTUP_TIMEOUT_ENV, HERMES_STARTUP_TIMEOUT);
-    let deadline = tokio::time::Instant::now() + timeout;
     let mut buffered = Vec::new();
-    let mut last_session_info = None;
     loop {
-        let event = match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                return Err(
-                    "Hermes gateway event channel closed while waiting for managed MCP tools"
-                        .to_string(),
-                );
-            }
-            Err(_) => {
-                return Err(format!(
-                    "Timed out after {}ms waiting for Hermes to attach the managed Tyde MCP tools{}",
-                    timeout.as_millis(),
-                    last_session_info
-                        .map(|payload: Value| format!("; last session.info payload: {payload}"))
-                        .unwrap_or_default()
-                ));
-            }
-        };
-        if let HermesGatewayEvent::Event {
-            event_type,
-            session_id: Some(session_id),
-            payload: Some(payload),
-        } = &event
-            && event_type == "session.info"
-            && session_id == live_session_id
-        {
-            last_session_info = Some(payload.clone());
-        }
+        let event = events.recv().await.ok_or_else(|| {
+            "Hermes gateway event channel closed while waiting for managed MCP tools".to_owned()
+        })?;
         let ready = matches!(
             &event,
             HermesGatewayEvent::Event {
@@ -7954,6 +8564,18 @@ async fn wait_for_hermes_session_mcp_tools(
                     .is_some_and(session_tools_include_managed_mcp)
         );
         let terminal = match &event {
+            HermesGatewayEvent::Event {
+                event_type,
+                session_id: Some(session_id),
+                payload,
+            } if event_type == "error" && session_id == live_session_id => Some(
+                payload
+                    .as_ref()
+                    .and_then(|payload| optional_string(payload, &["message"]))
+                    .unwrap_or_else(|| {
+                        "Hermes native agent build failed without error details".to_owned()
+                    }),
+            ),
             HermesGatewayEvent::ProtocolError(error) => Some(format!(
                 "Hermes gateway protocol failed while waiting for managed MCP tools: {error}"
             )),

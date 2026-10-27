@@ -121,7 +121,6 @@ const CLAUDE_HELD_BACK_FRAME_LIMIT: usize = 512;
 const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLAUDE_INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(18);
 const CLAUDE_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 /// The one CLI tool that moves a live session's working directory, and with it
 /// the session file Tyde resumes from. See `build_claude_cli_args`.
@@ -645,8 +644,7 @@ struct ActiveTurn {
     id: u64,
     owner: ClaudeTurnOwner,
     outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
-    /// The turn is installed before its prompt reaches the CLI. A steer written
-    /// ahead of that prompt would become the turn, so steering waits for this.
+    /// No correction may be written ahead of its admitted foreground prompt.
     prompt_written: bool,
     interrupt_requested: bool,
     pending_ask_user_question: Option<PendingAskUserQuestionControl>,
@@ -954,7 +952,6 @@ struct ClaudeInner {
     /// then it opens a turn of its own for the message, and adopting that turn
     /// needs a token just as a wake does. Nothing reports which happened, so
     /// the token outlives a steer answered in-turn until the next turn opens.
-    pending_steer_turn: std::sync::atomic::AtomicBool,
     /// True while provider-owned work can continue after the foreground turn
     /// that launched it has ended. Typing is the public activity contract, so
     /// a foreground `result` must not make the agent appear idle while this is
@@ -978,7 +975,6 @@ impl ClaudeInner {
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
-            pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
             background_work_active: std::sync::atomic::AtomicBool::new(false),
             typing_active: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2450,10 +2446,7 @@ impl ClaudeInner {
                     }
                 }
             }
-            SessionCommand::CancelConversation => {
-                this.cancel_active_turn().await;
-                Ok(())
-            }
+            SessionCommand::CancelConversation => this.cancel_active_turn().await,
             SessionCommand::GetSettings => {
                 this.emit_settings().await;
                 Ok(())
@@ -2631,9 +2624,6 @@ impl ClaudeInner {
                 });
                 let model_hint = state.model.clone();
                 let ephemeral = state.ephemeral;
-                // A steer token only covers a turn the CLI opens before the next user
-                // turn; past this point it could only adopt a stray frame.
-                inner.take_pending_steer_turn();
 
                 // The user bubble is emitted only once the turn is admitted, so a
                 // busy hand-back (which redispatches later) can never duplicate it and
@@ -2645,9 +2635,7 @@ impl ClaudeInner {
                         origin,
                     );
                 }
-                let message_id = format!("claude-msg-{turn_id}");
                 inner.emit_typing_status(true);
-                inner.emit_stream_start(&message_id, model_hint.clone());
 
                 let inner = Arc::clone(inner);
                 crate::backend::subprocess::spawn(async move {
@@ -2693,81 +2681,27 @@ impl ClaudeInner {
             .await
     }
 
-    /// Offer a user message to the turn that is already running. The CLI reads
-    /// a user frame written mid-turn at its next model step, answers it inside
-    /// that turn under the same `result`, and emits no frame of its own for it.
     async fn steer(
         self: &Arc<Self>,
         payload: protocol::SendMessagePayload,
     ) -> crate::backend::SteerOutcome {
         use crate::backend::SteerOutcome;
 
-        if payload.tool_response.is_some() {
-            return SteerOutcome::Unsupported(payload);
-        }
-        // The checks, the token, and the frame's place in stdin are fixed in
-        // one transition, so neither an interrupt nor a blocking tool request
-        // can slip in between the checks and the write.
-        let admitted = self
-            .state
-            .with_inner(move |state, inner| {
+        self.state
+            .with(move |state| {
                 if state.closing {
-                    return Err(Box::new(SteerOutcome::Closed));
+                    return SteerOutcome::Closed;
                 }
-                let Some(active) = state.active_turn.as_ref() else {
-                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
-                };
-                let running = matches!(active.owner, ClaudeTurnOwner::User)
-                    && active.prompt_written
-                    && active.outcome_tx.is_some()
-                    && !active.interrupt_requested
-                    && state.resume_bootstrap.is_none();
-                if !running {
-                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
+                if state.active_turn.is_none() {
+                    return SteerOutcome::NoActiveTurn(payload);
                 }
-                // A turn blocked on the user's own answer takes that answer, not a
-                // new message; a slash command is only recognized at the head of a
-                // turn; and a process due to restart after this turn would take a
-                // late steer down with it.
-                if active.pending_ask_user_question.is_some()
-                    || active.pending_exit_plan_mode.is_some()
-                    || state
-                        .stale_process_generation
-                        .is_some_and(|stale| stale >= state.process_generation)
-                    || super::invokes_slash_command(state.slash_commands.as_ref(), &payload.message)
-                {
-                    return Err(Box::new(SteerOutcome::Unsupported(payload)));
-                }
-                let Some(runtime) = state.runtime.as_ref() else {
-                    return Err(Box::new(SteerOutcome::NoActiveTurn(payload)));
-                };
-                // Workspace roots cannot change while a turn runs, so the context
-                // `write_turn_to_persistent_process` prepends is already current.
-                let images =
-                    protocol_images_to_attachments(payload.images.clone()).unwrap_or_default();
-                let input = build_stream_json_user_message(&payload.message, &images);
-                // Armed before the write: a turn the CLI opens for this message
-                // must never reach the reader ahead of its token.
-                inner.arm_steer_turn();
-                Ok((runtime.stdin.submit(&input), images, payload))
+                // Native stdin offers no turn-correlated admission. Even a
+                // live tool can finish before the write reaches the CLI.
+                tracing::debug!(target: "tyde_claude_dispatch_receipt",
+                    "Claude control requires cancellation: native stdin has no addressed-turn admission");
+                SteerOutcome::Unsupported(payload)
             })
-            .await;
-        let (written, images, payload) = match admitted {
-            Ok(admitted) => admitted,
-            Err(outcome) => return *outcome,
-        };
-        if let Err(err) = written.result().await {
-            self.take_pending_steer_turn();
-            tracing::error!("Failed to steer Claude turn: {err}");
-            return SteerOutcome::Closed;
-        }
-
-        self.emit_user_message_added(
-            &payload.message,
-            (!images.is_empty()).then_some(images.as_slice()),
-            payload.origin,
-        );
-        SteerOutcome::Accepted
+            .await
     }
 
     async fn begin_compaction(
@@ -2882,39 +2816,62 @@ impl ClaudeInner {
                 ),
             };
         }
-        let not_dispatched = self
-            .state
-            .with(|state| {
-                if let Some(start) = super::compaction::not_dispatched_for_capability(
-                    &state.compaction_capability.borrow(),
-                ) {
-                    return Some(start);
-                }
-                let process_generation = state.process_generation;
-                // Marked before the line reaches the writer, so the stdout
-                // reader can never see this compaction's frames first.
-                if let Some(pending) = state.pending_compaction.as_mut() {
-                    pending.process_generation = process_generation;
-                    pending.dispatched_at = std::time::Instant::now();
-                    pending.write_submitted = true;
-                }
-                None
-            })
-            .await;
-        if let Some(start) = not_dispatched {
-            reservation.abandon().await;
-            return start;
-        }
-        // From the write on, the pending compaction is settled by its result,
-        // its failure, or its timeout.
-        reservation.disarm();
-
         let prompt = focus
             .as_deref()
             .map(|focus| format!("/compact {focus}"))
             .unwrap_or_else(|| "/compact".to_string());
         let input = build_stream_json_user_message(&prompt, &[]);
-        if let Err(error) = self.write_process_json_line(&input).await {
+        let admission = self
+            .state
+            .with(move |state| {
+                if let Some(start) = super::compaction::not_dispatched_for_capability(
+                    &state.compaction_capability.borrow(),
+                ) {
+                    return Err(start);
+                }
+                let Some(active) = state
+                    .active_turn
+                    .as_ref()
+                    .filter(|active| active.id == turn_id)
+                else {
+                    return Err(BackendCompactionStart::NotDispatched {
+                        reason: BackendCompactionNotDispatchedReason::Interrupted,
+                    });
+                };
+                if active.interrupt_requested {
+                    return Err(BackendCompactionStart::NotDispatched {
+                        reason: BackendCompactionNotDispatchedReason::Interrupted,
+                    });
+                }
+                let Some(runtime) = state.runtime.as_ref() else {
+                    return Err(BackendCompactionStart::NotDispatched {
+                        reason: BackendCompactionNotDispatchedReason::BackendClosed,
+                    });
+                };
+                let written = runtime.stdin.submit(&input);
+                let generation = runtime.generation;
+                state
+                    .active_turn
+                    .as_mut()
+                    .expect("validated compaction turn")
+                    .prompt_written = true;
+                if let Some(pending) = state.pending_compaction.as_mut() {
+                    pending.process_generation = generation;
+                    pending.dispatched_at = std::time::Instant::now();
+                    pending.write_submitted = true;
+                }
+                Ok(written)
+            })
+            .await;
+        let written = match admission {
+            Ok(written) => written,
+            Err(start) => {
+                reservation.abandon().await;
+                return start;
+            }
+        };
+        reservation.disarm();
+        if let Err(error) = written.result().await {
             let result = self
                 .finish_compaction(
                     turn_id,
@@ -3074,21 +3031,6 @@ impl ClaudeInner {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn arm_steer_turn(&self) {
-        self.pending_steer_turn
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn take_pending_steer_turn(&self) -> bool {
-        self.pending_steer_turn
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn has_pending_steer_turn(&self) -> bool {
-        self.pending_steer_turn
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn set_background_work_active(&self, active: bool) -> bool {
         self.background_work_active
             .swap(active, std::sync::atomic::Ordering::Relaxed)
@@ -3181,7 +3123,6 @@ impl ClaudeInner {
                 let message_id = format!("claude-msg-{turn_id}");
                 eprintln!("TYDE CLAUDE WAKE TURN BEGIN turn={turn_id} message={message_id}");
                 inner.emit_typing_status(true);
-                inner.emit_stream_start(&message_id, model_hint.clone());
 
                 let this = Arc::clone(inner);
                 crate::backend::subprocess::spawn(async move {
@@ -3577,10 +3518,6 @@ impl ClaudeInner {
             .await
             .map_err(TurnStartError::Failed)?;
 
-        if self.active_turn_interrupted(turn_id).await {
-            return Err(TurnStartError::Cancelled);
-        }
-
         let prompt = prompt.to_owned();
         let prompt = self
             .state
@@ -3594,6 +3531,10 @@ impl ClaudeInner {
             .await
             .map_err(TurnStartError::Failed)?;
         let input_message = build_stream_json_user_message(&prompt, images);
+        #[cfg(all(debug_assertions, feature = "test-support", unix))]
+        claude_conformance_prompt_boundary()
+            .await
+            .map_err(TurnStartError::Failed)?;
         tracing::info!(turn_id, "writing Claude foreground prompt");
         // Waiter registration and the frame's place in stdin are one
         // transition, so the resume terminal cannot race past the waiter. The
@@ -3602,6 +3543,19 @@ impl ClaudeInner {
         let (resume_bootstrap_generation, resume_bootstrap_rx, written) = self
             .state
             .with(move |state| {
+                let Some(active) = state
+                    .active_turn
+                    .as_ref()
+                    .filter(|active| active.id == turn_id)
+                else {
+                    return Err(TurnStartError::Cancelled);
+                };
+                if active.interrupt_requested {
+                    tracing::debug!(target: "tyde_claude_dispatch_receipt",
+                        claude_cancelled_before_prompt = true,
+                        "Claude cancelled reservation refused native prompt admission");
+                    return Err(TurnStartError::Cancelled);
+                }
                 let runtime = state.runtime.as_ref().ok_or_else(|| {
                     TurnStartError::Failed("Claude CLI process is not running".to_string())
                 })?;
@@ -5869,8 +5823,6 @@ impl ClaudeInner {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.pending_cli_wake
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.pending_steer_turn
-            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn activate_background_task_owner(&self) {
@@ -5914,7 +5866,7 @@ impl ClaudeInner {
         )
     }
 
-    async fn cancel_active_turn(self: &Arc<Self>) {
+    async fn cancel_active_turn(self: &Arc<Self>) -> Result<(), String> {
         // Ordered with interactive responses by the stdout reader, but the
         // quiescence wait happens after the job: the stdout result that
         // signals quiescence is handled by that same reader.
@@ -5961,7 +5913,37 @@ impl ClaudeInner {
                     turn_id = active.id,
                     "Claude interrupt targeted foreground turn"
                 );
-                let target = (active.id, quiesced_rx);
+                let turn_id = active.id;
+                let prompt_written = active.prompt_written;
+                tracing::debug!(target: "tyde_claude_dispatch_receipt",
+                    claude_cancel_prompt_written = prompt_written,
+                    "Claude cancellation selected native prompt boundary");
+                let abandoned_verification = inner.skills_awaiting_verification();
+                if abandoned_verification {
+                    inner.skill_verification_abandoned.store(true, Ordering::Relaxed);
+                    state.skill_verification_generation = state.skill_verification_generation.wrapping_add(1);
+                    if let Some(watchdog) = state.skill_watchdog.take() {
+                        watchdog.abort();
+                    }
+                }
+                // Select the process and reserve its FIFO write in the same
+                // transition as the target turn. No awaited work may move this
+                // unaddressed native interrupt onto a successor turn/process.
+                let generation = state.runtime.as_ref().map(|runtime| runtime.generation);
+                let control = state.runtime.as_ref().filter(|_| prompt_written).map(|runtime| {
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    let (reply, response) = oneshot::channel();
+                    let generation = runtime.generation;
+                    let written = runtime.stdin.submit(&json!({
+                        "type": "control_request", "request_id": request_id,
+                        "request": {"subtype": "interrupt"},
+                    }));
+                    state.control_waiters.insert(request_id.clone(), ClaudeControlWaiter {
+                        generation, reply,
+                    });
+                    (request_id, written, response)
+                });
+                let target = (turn_id, quiesced_rx, abandoned_verification, generation, control);
                 // Terminalize pending interactions in the same
                 // transition that marks the turn interrupted, so no
                 // answer can be written to Claude between those two
@@ -5972,68 +5954,24 @@ impl ClaudeInner {
                 Some(target)
             })
             .await;
-        let Some((turn_id, quiesced_rx)) = target else {
-            return;
+        let Some((turn_id, quiesced_rx, abandoned_verification, generation, control)) = target
+        else {
+            return Ok(());
         };
-
-        // Only now, with the turn confirmed interrupted, may verification be
-        // abandoned — a cancelled turn is the user's doing, not the skills'.
-        let abandoned_verification = self.abandon_skill_verification_for_cancelled_turn().await;
-
-        if self.state.with(|state| state.runtime.is_some()).await
-            && let Err(err) = self.send_control_request("interrupt").await
-        {
-            tracing::warn!("Failed to send Claude interrupt request: {err}");
-        }
-
-        match tokio::time::timeout(CLAUDE_INTERRUPT_QUIESCE_TIMEOUT, quiesced_rx).await {
-            Ok(_) => {}
-            Err(_) => {
-                tracing::warn!(
-                    "Claude did not quiesce after interrupt; killing persistent process"
-                );
-                self.shutdown_process().await;
-                let fallback_rx = self
-                    .state
-                    .with(move |state| {
-                        state.active_turn.as_mut().and_then(|active| {
-                            if active.id == turn_id {
-                                let (tx, rx) = oneshot::channel();
-                                active.quiesced_waiters.push(tx);
-                                Some(rx)
-                            } else {
-                                None
-                            }
-                        })
-                    })
+        if let Some((request_id, written, response)) = control {
+            if let Err(error) = written.result().await {
+                self.state
+                    .with(move |state| state.control_waiters.remove(&request_id))
                     .await;
-                self.complete_active_turn_with_outcome(
-                    turn_id,
-                    TurnOutcome::Cancelled {
-                        summary: ClaudeStdoutSummary::default(),
-                    },
-                )
-                .await;
-                if let Some(rx) = fallback_rx {
-                    // Bounded. This waiter is only ever signalled by
-                    // `clear_active_turn`, which runs from `run_turn` and
-                    // `finalize_turn`. If the owning turn task is gone — the
-                    // process died, the task was aborted — nothing will call
-                    // it, and an unbounded wait here wedges shutdown forever.
-                    if tokio::time::timeout(CLAUDE_INTERRUPT_QUIESCE_TIMEOUT, rx)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            "No owner left to quiesce Claude turn {turn_id}; clearing it here"
-                        );
-                        for waiter in self.clear_active_turn(turn_id).await {
-                            let _ = waiter.send(());
-                        }
-                    }
-                }
+                return Err(error);
             }
+            response.await.map_err(|_| {
+                "Claude interrupt owner closed before its native receipt".to_owned()
+            })??;
         }
+        quiesced_rx
+            .await
+            .map_err(|_| "Claude turn owner closed before confirming cancellation".to_owned())?;
 
         // A process whose pending verification was abandoned can never report
         // its skills: the init frame only follows the first user message, and
@@ -6045,8 +5983,31 @@ impl ClaudeInner {
                 "Retiring the Claude process for cancelled turn {turn_id}; its verification \
                  was abandoned and it can no longer report"
             );
-            self.shutdown_process().await;
+            let runtime = self
+                .state
+                .with_inner(move |state, inner| {
+                    if !state
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| Some(runtime.generation) == generation)
+                    {
+                        return None;
+                    }
+                    state.native_tool_catalog = None;
+                    inner.drain_background_tasks();
+                    state.runtime.take()
+                })
+                .await;
+            if let Some(runtime) = runtime {
+                self.fail_resume_bootstrap(
+                    runtime.generation,
+                    "Cancelled Claude process retired before resume bootstrap completed",
+                )
+                .await;
+                runtime.kill().await;
+            }
         }
+        Ok(())
     }
 
     /// Terminally resolve the active turn without asking the CLI for anything.
@@ -6876,7 +6837,7 @@ impl ClaudeInner {
         // → OperationCancelled). `emitted_phase_count == 0` catches the
         // no-content-yet case; `emitter.is_stream_open()` catches a mid-turn
         // segment that emitted StreamStart without any content before cancel.
-        if summary.emitted_phase_count == 0 || self.emitter.is_stream_open() {
+        if (!cancelled && summary.emitted_phase_count == 0) || self.emitter.is_stream_open() {
             let selected_model = summary.model.clone().or(model_hint);
             if !self.emitter.is_stream_open() {
                 self.emit_stream_start(
@@ -7944,7 +7905,7 @@ async fn read_claude_stdout_persistent(
                         recent_system_subtypes.warn_once_on_dropped_frame(&value);
                         continue;
                     }
-                    if !inner.has_pending_cli_wake() && !inner.has_pending_steer_turn() {
+                    if !inner.has_pending_cli_wake() {
                         recent_system_subtypes.warn_once_on_dropped_turn_start(&value);
                         continue;
                     }
@@ -7952,7 +7913,6 @@ async fn read_claude_stdout_persistent(
                         frame_type = value.get("type").and_then(|field| field.as_str()),
                         frame_subtype = value.get("subtype").and_then(|field| field.as_str()),
                         cli_wake = inner.has_pending_cli_wake(),
-                        steer_turn = inner.has_pending_steer_turn(),
                         "Adopting Claude native continuation"
                     );
                     if inner.begin_cli_initiated_turn().await.is_none() {
@@ -7979,7 +7939,6 @@ async fn read_claude_stdout_persistent(
                         }
                     }
                     inner.take_pending_cli_wake();
-                    inner.take_pending_steer_turn();
                     match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
                         Some(turn) => turn,
                         None => continue,
@@ -11878,7 +11837,7 @@ fn maybe_emit_next_stream_start(
     current_message_id: &mut String,
     model: Option<String>,
 ) {
-    if !segment.awaiting_stream_start {
+    if !segment.awaiting_stream_start && inner.emitter.is_stream_open() {
         return;
     }
 
@@ -12213,25 +12172,6 @@ fn consume_stream_event(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if segment.awaiting_stream_start
-        && matches!(event_type, "content_block_start" | "content_block_delta")
-    {
-        tracing::info!(
-            event_type,
-            provider_message_id = ?segment.current_claude_message_id,
-            "Claude content block started a response phase without message_start"
-        );
-        let model = summary.model.clone();
-        maybe_emit_next_stream_start(
-            summary,
-            segment,
-            inner,
-            base_message_id,
-            current_message_id,
-            model,
-        );
-    }
-
     match event_type {
         "message_start" => {
             flush_pending_tool_uses(summary, segment);
@@ -12267,14 +12207,6 @@ fn consume_stream_event(
             if let Some(message_id) = next_message_id {
                 segment.current_claude_message_id = Some(message_id);
             }
-            maybe_emit_next_stream_start(
-                summary,
-                segment,
-                inner,
-                base_message_id,
-                current_message_id,
-                next_model.or_else(|| summary.model.clone()),
-            );
         }
         "message_delta" => {
             if let Some(usage) = parse_token_usage(event.get("usage")) {
@@ -12297,7 +12229,11 @@ fn consume_stream_event(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if block_type == "text" {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if let Some(text) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
                     maybe_emit_next_stream_start(
                         summary,
                         segment,
@@ -13056,6 +12992,30 @@ fn normalize_claude_permission_mode(value: &Value) -> Option<String> {
         "plan" => Some("plan".to_string()),
         _ => None,
     }
+}
+
+// Conformance pins adapter scheduling, not provider data. Release builds have
+// no gate; debug sessions without the explicit test socket take the normal path.
+#[cfg(all(debug_assertions, feature = "test-support", unix))]
+async fn claude_conformance_prompt_boundary() -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(path) = std::env::var_os("TYDE_CLAUDE_PROMPT_GATE") else {
+        return Ok(());
+    };
+    let mut gate = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(|error| format!("Claude conformance admission gate unavailable: {error}"))?;
+    gate.write_all(b"P")
+        .await
+        .map_err(|error| format!("Claude conformance admission receipt failed: {error}"))?;
+    let released = gate
+        .read_u8()
+        .await
+        .map_err(|error| format!("Claude conformance admission release failed: {error}"))?;
+    if released != b'R' {
+        return Err("Claude conformance admission release is invalid".to_owned());
+    }
+    Ok(())
 }
 
 fn build_stream_json_user_message(prompt: &str, images: &[ImageAttachment]) -> Value {
@@ -16625,7 +16585,6 @@ impl Backend for ClaudeBackend {
             // fills it -- so deliberately no `ContextBreakdownReported`.
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::SlashCommands,
-            tyde_agent_adapter::BackendCapability::MidTurnSteering,
         ]
         .into()
     }
@@ -17000,7 +16959,7 @@ impl Backend for ClaudeBackend {
             .clone();
         match handle {
             Some(handle) => handle.steer(payload).await,
-            None => crate::backend::SteerOutcome::NoActiveTurn(payload),
+            None => crate::backend::SteerOutcome::Closed,
         }
     }
 

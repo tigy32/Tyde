@@ -74,6 +74,9 @@ pub(super) fn start_mock_command_loop(
         violations: Vec::new(),
         requests: Vec::new(),
         parked_at_gate: false,
+        close_requested: false,
+        turn_start_steer_waiting: None,
+        pending_start_steers: Vec::new(),
         terminal_report,
     };
     let control = ControlPlane {
@@ -139,6 +142,10 @@ struct MockActor {
     violations: Vec<MockViolation>,
     requests: Vec<MockRequest>,
     parked_at_gate: bool,
+    close_requested: bool,
+    /// Pending steers are accepted only after the dispatched turn starts.
+    turn_start_steer_waiting: Option<MockGate>,
+    pending_start_steers: Vec<MockControlCommand>,
     terminal_report: MockTerminalReportSlot,
 }
 
@@ -229,6 +236,9 @@ impl MockActor {
         }
 
         loop {
+            if self.close_requested {
+                return;
+            }
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
@@ -287,6 +297,10 @@ impl MockActor {
 
     fn handle_control(&mut self, command: MockControlCommand) {
         match command {
+            MockControlCommand::CloseStream { ack } => {
+                self.close_requested = true;
+                let _ = ack.send(());
+            }
             MockControlCommand::SetWorkspaceRelocationResults { results, ack } => {
                 self.workspace_relocation_results = results.into();
                 let _ = ack.send(());
@@ -326,6 +340,12 @@ impl MockActor {
                     self.events_tx.send_event(emit::typing(false));
                 }
                 let in_turn = self.parked_at_gate || !matches!(self.phase, TurnPhase::Idle);
+                if let Some(waiting) = &self.turn_start_steer_waiting {
+                    waiting.signal();
+                    self.pending_start_steers
+                        .push(MockControlCommand::Steer { payload, reply });
+                    return;
+                }
                 let outcome = if !in_turn {
                     crate::backend::SteerOutcome::NoActiveTurn(payload)
                 } else if self.user_bubbles
@@ -557,6 +577,9 @@ impl MockActor {
         if let Some(gate) = self.native_child_idle_gate.clone() {
             self.park_at_gate(&gate, control).await;
         }
+        if self.close_requested {
+            return false;
+        }
         emit::idle_live_native_children(&self.active_subagents);
         let _ = self.events_tx.send_event(emit::cancelled(
             "mock backend interrupted held turn".to_owned(),
@@ -625,6 +648,23 @@ impl MockActor {
             }
             MockStep::Gate(gate) => {
                 self.park_at_gate(&gate, control).await;
+                !self.close_requested
+            }
+            MockStep::TurnStartGate {
+                start,
+                steer_waiting,
+            } => {
+                self.turn_start_steer_waiting = Some(steer_waiting);
+                self.park_at_gate(&start, control).await;
+                self.turn_start_steer_waiting = None;
+                if self.close_requested {
+                    return false;
+                }
+                self.parked_at_gate = true;
+                for steer in std::mem::take(&mut self.pending_start_steers) {
+                    self.handle_control(steer);
+                }
+                self.parked_at_gate = false;
                 true
             }
             MockStep::SpawnNativeChild(child) => {
@@ -664,7 +704,10 @@ impl MockActor {
             loop {
                 tokio::select! {
                     _ = &mut wait => break,
-                    command = control.recv() => self.handle_control(command),
+                    command = control.recv() => {
+                        self.handle_control(command);
+                        if self.close_requested { break; }
+                    },
                 }
             }
         }

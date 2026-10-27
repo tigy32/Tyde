@@ -576,9 +576,45 @@ impl BackendTranscriptEventMetadata {
 type BackendTranscriptMetadataProjector =
     Arc<dyn Fn(&ChatEvent) -> BackendTranscriptEventMetadata + Send + Sync>;
 
+#[derive(Debug)]
+pub(crate) enum AdapterEvent {
+    Public(Box<BackendEvent>),
+    ResolvedToolRequest {
+        request: Box<protocol::ToolRequest>,
+        execution_name: String,
+        execution_arguments: Value,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct AdapterEventSender(mpsc::UnboundedSender<AdapterEvent>);
+
+impl AdapterEventSender {
+    pub(crate) fn send(
+        &self,
+        event: BackendEvent,
+    ) -> Result<(), mpsc::error::SendError<AdapterEvent>> {
+        self.0.send(AdapterEvent::Public(Box::new(event)))
+    }
+
+    pub(crate) fn resolved_tool_request(
+        &self,
+        request: protocol::ToolRequest,
+        execution_name: String,
+        execution_arguments: Value,
+    ) -> Result<(), mpsc::error::SendError<AdapterEvent>> {
+        self.0.send(AdapterEvent::ResolvedToolRequest {
+            request: Box::new(request),
+            execution_name,
+            execution_arguments,
+        })
+    }
+}
+
 enum EventStreamReceiver {
     Chat(mpsc::UnboundedReceiver<ChatEvent>),
     Backend(mpsc::UnboundedReceiver<BackendEvent>),
+    Adapter(mpsc::UnboundedReceiver<AdapterEvent>),
 }
 
 /// The longest a run of text deltas is held before it goes out as one event.
@@ -667,6 +703,21 @@ impl EventStream {
             open_tool_names: HashMap::new(),
             transcript_metadata_projector: None,
         }
+    }
+
+    pub(crate) fn adapter_channel() -> (AdapterEventSender, Self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            AdapterEventSender(tx),
+            Self {
+                rx: EventStreamReceiver::Adapter(rx),
+                buffered: VecDeque::new(),
+                pending_delta: None,
+                response_started_streaming: false,
+                open_tool_names: HashMap::new(),
+                transcript_metadata_projector: None,
+            },
+        )
     }
 
     pub(crate) fn new_backend_with_transcript_metadata(
@@ -785,10 +836,18 @@ impl EventStream {
         }
     }
 
-    async fn recv_raw(rx: &mut EventStreamReceiver) -> Option<BackendEvent> {
+    async fn recv_raw(rx: &mut EventStreamReceiver) -> Option<AdapterEvent> {
         match rx {
-            EventStreamReceiver::Chat(rx) => rx.recv().await.map(BackendEvent::Chat),
-            EventStreamReceiver::Backend(rx) => rx.recv().await,
+            EventStreamReceiver::Chat(rx) => rx
+                .recv()
+                .await
+                .map(BackendEvent::Chat)
+                .map(|event| AdapterEvent::Public(Box::new(event))),
+            EventStreamReceiver::Backend(rx) => rx
+                .recv()
+                .await
+                .map(|event| AdapterEvent::Public(Box::new(event))),
+            EventStreamReceiver::Adapter(rx) => rx.recv().await,
         }
     }
 
@@ -802,35 +861,58 @@ impl EventStream {
     /// the typed form keeps it, and third-party tools are never touched.
     fn project_tyde_agent_control(
         &mut self,
-        event: BackendEvent,
+        event: AdapterEvent,
     ) -> (BackendEvent, Option<BackendEvent>) {
+        let (event, execution) = match event {
+            AdapterEvent::Public(event) => (*event, None),
+            AdapterEvent::ResolvedToolRequest {
+                request,
+                execution_name,
+                execution_arguments,
+            } => (
+                BackendEvent::Chat(ChatEvent::ToolRequest(*request)),
+                Some(OpenToolCall {
+                    name: execution_name,
+                    arguments: execution_arguments,
+                }),
+            ),
+        };
         match event {
             BackendEvent::Chat(ChatEvent::ToolRequest(mut request)) => {
-                let args = match &request.tool_type {
-                    ToolRequestType::Other { args } => Some(args.clone()),
-                    _ => None,
+                // A native broker's declaration stays intact. Only the adapter
+                // knows the execution that actually resolved from that call.
+                let (execution_name, args) = match execution {
+                    Some(execution) => (execution.name, Some(execution.arguments)),
+                    None => (
+                        request.tool_name.clone(),
+                        match &request.tool_type {
+                            ToolRequestType::Other { args } => Some(args.clone()),
+                            _ => None,
+                        },
+                    ),
                 };
-                if let Some(args) = &args
+                if matches!(request.tool_type, ToolRequestType::Other { .. })
+                    && let Some(args) = &args
                     && let Some(typed) =
-                        agent_control_progress::tyde_tool_request_type(&request.tool_name, args)
+                        agent_control_progress::tyde_tool_request_type(&execution_name, args)
                 {
                     request.tool_type = typed;
                 }
                 let progress = args.as_ref().and_then(|args| {
                     agent_control_progress::await_progress_data_for_tool(
                         &request.tool_call_id,
-                        &request.tool_name,
+                        &execution_name,
                         args,
                     )
                 });
-                if !request.tool_name.is_empty() {
+                if !execution_name.is_empty() {
                     if self.open_tool_names.len() >= OPEN_TOOL_NAME_CAP {
                         self.open_tool_names.clear();
                     }
                     self.open_tool_names.insert(
                         request.tool_call_id.clone(),
                         OpenToolCall {
-                            name: request.tool_name.clone(),
+                            name: execution_name,
                             arguments: args.unwrap_or(Value::Null),
                         },
                     );
@@ -976,8 +1058,14 @@ impl EventStream {
             return Ok(event);
         }
         let event = match &mut self.rx {
-            EventStreamReceiver::Chat(rx) => rx.try_recv().map(BackendEvent::Chat),
-            EventStreamReceiver::Backend(rx) => rx.try_recv(),
+            EventStreamReceiver::Chat(rx) => rx
+                .try_recv()
+                .map(BackendEvent::Chat)
+                .map(|event| AdapterEvent::Public(Box::new(event))),
+            EventStreamReceiver::Backend(rx) => rx
+                .try_recv()
+                .map(|event| AdapterEvent::Public(Box::new(event))),
+            EventStreamReceiver::Adapter(rx) => rx.try_recv(),
         }?;
         let (event, follow_up) = self.project_tyde_agent_control(event);
         if let Some(follow_up) = follow_up {
@@ -1062,8 +1150,9 @@ pub enum SteerOutcome {
     /// The provider took the message into the running turn, and the backend
     /// has emitted the user message for it.
     Accepted,
-    /// No turn is running that the provider would steer (it ended, or never
-    /// started). Nothing was delivered or emitted.
+    /// No turn is running or awaiting its native start. An accepted send
+    /// still awaiting that start must settle before this outcome is returned.
+    /// Nothing was delivered or emitted.
     NoActiveTurn(protocol::SendMessagePayload),
     /// This backend, or this provider session, cannot take input mid-turn, or
     /// cannot carry this payload mid-turn. Nothing was delivered or emitted.
@@ -1748,9 +1837,9 @@ pub trait Backend: Send + Sync + 'static {
     /// Contract: like sends, steers are serialized by a single caller (the
     /// agent actor). On `Accepted` the backend has emitted the user message
     /// exactly once and the running turn carries on; the message is answered
-    /// inside that turn, or in a turn the provider opens for it on its own if
-    /// the running one ended first. A steer never closes, restarts, or
-    /// cancels a turn.
+    /// inside that turn. If it cannot join that turn, return the untouched
+    /// payload explicitly; never acknowledge a natural-end queue. A steer
+    /// never closes, restarts, or cancels a turn.
     fn steer(
         &self,
         payload: protocol::SendMessagePayload,
@@ -1956,6 +2045,12 @@ pub(crate) async fn read_capacity_out_of_band(
 
 pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
     with_backend_type!(kind, |B| B::capabilities(), removed => BackendCapabilities::default())
+}
+
+pub(crate) fn supports_running_redirect(kind: BackendKind) -> bool {
+    let capabilities = capabilities_for_backend_kind(kind);
+    capabilities.contains(BackendCapability::MidTurnSteering)
+        || capabilities.contains(BackendCapability::Interrupt)
 }
 
 #[cfg(feature = "test-support")]

@@ -1918,7 +1918,11 @@ mod wasm_tests {
         {
             let style = document.create_element("style").unwrap();
             style.set_id("test-prod-styles-center-zone");
-            style.set_text_content(Some(PROD_STYLES));
+            style.set_text_content(Some(&format!(
+                "{PROD_STYLES}\n[data-test-fixture=\"center-zone\"] *, \
+                 [data-test-fixture=\"center-zone\"] *::before, \
+                 [data-test-fixture=\"center-zone\"] *::after {{ transition: none !important; }}"
+            )));
             document.head().unwrap().append_child(&style).unwrap();
         }
     }
@@ -2007,29 +2011,10 @@ mod wasm_tests {
         }
     }
 
-    /// Longest transition in `styles.css` on anything asserted here
-    /// (`.tab` animates `color` and `border-color` for 150ms).
-    const LONGEST_TRANSITION_MS: i32 = 150;
-
-    /// Wait for CSS transitions to finish before reading a computed style.
-    ///
-    /// `getComputedStyle` during a transition returns the *interpolated* value —
-    /// an inactive tab mid-fade reports `rgba(0, 122, 204, 0.886)`, the accent on
-    /// its way out. The assertion is about the settled appearance, so the fixture
-    /// waits for it rather than the assertion being loosened to accept a
-    /// half-faded colour.
+    // Assert final styling, not a load-dependent point within a CSS fade.
+    // Transitions are disabled only in this fixture; production values remain.
     async fn settle_styles() {
         settle().await;
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &resolve,
-                    LONGEST_TRANSITION_MS + 50,
-                )
-                .unwrap();
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     fn file_key(name: &str) -> FileResourceKey {

@@ -1008,7 +1008,11 @@ impl Backend for MockBackend {
     }
 
     async fn interrupt(&self) -> bool {
-        self.command_tx.send(MockCommand::Interrupt).is_ok()
+        let accepted = self.command_tx.send(MockCommand::Interrupt).is_ok();
+        if accepted {
+            self.control.record_interrupt_request();
+        }
+        accepted
     }
 
     async fn shutdown(mut self) {
