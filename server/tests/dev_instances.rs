@@ -43,6 +43,8 @@ if marker.with_suffix('.hold').exists():
   host_port=int(os.environ['TYDE_DEV_HOST_BIND_ADDR'].rsplit(':',1)[1])
   ui_port=int(os.environ['TYDE_DEV_UI_DEBUG_BIND_ADDR'].rsplit(':',1)[1])
   control.sendall(host_port.to_bytes(2,'big')+ui_port.to_bytes(2,'big'))
+  host_port=int.from_bytes(control.recv(2,socket.MSG_WAITALL),'big')
+  ui_port=int.from_bytes(control.recv(2,socket.MSG_WAITALL),'big')
  assert control.recv(1)==b'R'
  if mode_path.exists():
   def notify(signal):
@@ -50,8 +52,10 @@ if marker.with_suffix('.hold').exists():
    with socket.create_connection((address,int(port))) as stream:
     stream.sendall(json.dumps({'protocol':json.load(open(pathlib.Path.cwd()/'devtools-protocol/dev-instance-startup.json'))['protocol'],'instance_id':os.environ['TYDE_DEV_INSTANCE_ID'],'signal':signal}).encode())
     stream.shutdown(socket.SHUT_WR)
-  notify({'kind':'host_listening','address':os.environ['TYDE_DEV_HOST_BIND_ADDR']})
-  if mode_path.read_text()=='ready':notify({'kind':'ui_ready'})
+  notify({'kind':'host_listening','address':f'127.0.0.1:{host_port}'})
+  if mode_path.read_text()=='ready':
+   notify({'kind':'ui_listening','address':f'127.0.0.1:{ui_port}'})
+   notify({'kind':'ui_ready'})
   # No deadline: the owner stops this process after actual readiness/error.
   assert control.recv(1)==b'X'
 
@@ -766,6 +770,7 @@ async fn start_dev_instance_expecting_exit(
     let mut desktop_control = None;
     let mut host_probe = None;
     let mut ui_probe = None;
+    let mut competing_ui = None;
     if !scenario.holds_frontend() {
         control
             .write_all(if matches!(scenario, DevScenario::NativeBuildFailure) {
@@ -794,6 +799,7 @@ async fn start_dev_instance_expecting_exit(
                     tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, host_port))
                         .await
                         .expect("bind actual host protocol endpoint");
+                let bound_host_port = host_listener.local_addr().unwrap().port();
                 let mismatch = matches!(scenario, DevScenario::NativeProtocolMismatch);
                 host_probe = Some(tokio::spawn(async move {
                     let (stream, _) = host_listener
@@ -817,11 +823,33 @@ async fn start_dev_instance_expecting_exit(
                         Err(_) => panic!("unexpected host handshake failure"),
                     }
                 }));
+                let mut bound_ui_port = 0;
                 if !mismatch {
-                    let ui_listener =
+                    // Deterministically occupy the requested address before its
+                    // owner binds. A released nonzero reservation fails here;
+                    // port zero lets both owners keep distinct bound sockets.
+                    competing_ui = Some(
                         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, ui_port))
                             .await
-                            .expect("bind real UI-debug transport fixture");
+                            .expect("bind competing real UI-debug endpoint"),
+                    );
+                    let ui_listener = tokio::net::TcpListener::bind((
+                        std::net::Ipv4Addr::LOCALHOST,
+                        ui_port,
+                    ))
+                    .await
+                    .expect("bind real UI-debug transport fixture while competitor remains bound");
+                    let bound_ui_addr = ui_listener.local_addr().unwrap();
+                    assert_ne!(
+                        bound_ui_addr,
+                        competing_ui.as_ref().unwrap().local_addr().unwrap(),
+                        "live owners must receive distinct kernel-owned endpoints"
+                    );
+                    assert_eq!((host_port, ui_port), (0, 0));
+                    bound_ui_port = bound_ui_addr.port();
+                    eprintln!(
+                        "DEV READINESS scenario={scenario:?} phase=bound-endpoint-ownership competitor_held=true distinct=true"
+                    );
                     ui_probe = Some(tokio::spawn(async move {
                         let (mut stream, _) = ui_listener
                             .accept()
@@ -847,6 +875,14 @@ async fn start_dev_instance_expecting_exit(
                         stream.shutdown().await.expect("finish UI readiness result");
                     }));
                 }
+                connected
+                    .write_u16(bound_host_port)
+                    .await
+                    .expect("announce bound host endpoint to desktop fixture");
+                connected
+                    .write_u16(bound_ui_port)
+                    .await
+                    .expect("announce bound UI-debug endpoint to desktop fixture");
                 connected
                     .write_all(b"R")
                     .await
@@ -1124,8 +1160,19 @@ async fn start_dev_instance_expecting_exit(
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
-    // Our unrelated service remains owned and usable after instance cleanup.
+    // Our unrelated services remain owned after instance cleanup.
     assert_eq!(foreign.local_addr().unwrap(), foreign_addr);
+    if let Some(competitor) = competing_ui {
+        let address = competitor
+            .local_addr()
+            .expect("competing socket still owned");
+        let connect = tokio::net::TcpStream::connect(address);
+        let accept = competitor.accept();
+        let (connected, accepted) = tokio::join!(connect, accept);
+        connected.expect("cleanup must not close an unrelated socket");
+        accepted.expect("unrelated socket must still accept after DEV cleanup");
+        eprintln!("DEV READINESS scenario={scenario:?} phase=competing-endpoint-preserved");
+    }
     eprintln!("DEV READINESS scenario={scenario:?} phase=owned-cleanup-joined");
     service.cancel().await.expect("cancel debug MCP client");
     let error = startup_error;

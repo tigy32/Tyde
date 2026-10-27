@@ -17972,3 +17972,117 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
   font: inherit;
   margin: 0;
 }
+/* Settings section rails change layout only; theme typography remains inherited. */
+.settings-overlay .settings-root { padding: 24px 32px; }
+.settings-overlay .settings-layout { gap: 0; }
+.settings-overlay .settings-nav { width: 16rem; padding-right: 20px; border-right: 1px solid var(--border-primary); }
+.settings-overlay .settings-search-wrap { position: sticky; top: 0; z-index: 2; padding-bottom: 12px; background: var(--surface-1); }
+.settings-overlay .settings-nav-group-title { text-transform: none; letter-spacing: normal; color: var(--text-primary); }
+.settings-overlay .settings-nav-group + .settings-nav-group { margin-top: 20px; }
+.settings-overlay .settings-nav-item { white-space: normal; overflow-wrap: anywhere; }
+.settings-overlay .settings-content { padding: 0 16px 24px 32px; }
+.settings-overlay .settings-scope-bar { float: right; max-width: 50%; margin: 0 28px 12px 16px; padding: 0; border: 0; background: none; justify-content: flex-end; }
+.settings-overlay .settings-panel-header { flex-wrap: wrap; align-items: flex-start; }
+.settings-overlay .settings-panel-intro { max-width: 70ch; margin-bottom: 28px; }
+.settings-overlay .settings-section { clear: both; display: grid; grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr); gap: 0 28px; padding: 20px 0; min-width: 0; }
+.settings-overlay .settings-section + .settings-section { border-top: 1px solid var(--border-primary); margin-top: 4px; }
+.settings-overlay .settings-section-rail { margin: 0; padding: 12px 20px 12px 0; border-right: 1px solid var(--border-primary); align-self: stretch; overflow-wrap: anywhere; }
+.settings-overlay .settings-section-body { min-width: 0; }
+.settings-overlay .settings-section-body > :first-child { margin-top: 0; }
+.settings-overlay .settings-field { margin-bottom: 0; padding: 12px 0; min-width: 0; }
+.settings-overlay .settings-toggle-row { align-items: center; min-width: 0; }
+.settings-overlay .settings-toggle-row > div:first-child { min-width: 0; }
+.settings-overlay .settings-description { max-width: 70ch; overflow-wrap: anywhere; }
+.settings-overlay .settings-field > :is(.settings-label, .settings-row-label) ~ .settings-description { margin-bottom: 0; }
+.settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)):has(> :is(.settings-select, .settings-input, .settings-btn, .settings-inline-control, .settings-segmented-control, .settings-schema-number-row)) {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(10rem, 42%); column-gap: 24px; align-items: center;
+}
+.settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)) > :is(.settings-label, .settings-row-label) { grid-column: 1; grid-row: 1; }
+.settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)) > .settings-description { grid-column: 1; grid-row: 2; }
+.settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)) > :is(.settings-select, .settings-input, .settings-btn, .settings-inline-control, .settings-segmented-control, .settings-schema-number-row) { grid-column: 2; grid-row: 1 / span 2; justify-self: end; max-width: 100%; min-width: 0; }
+.settings-overlay :is(.settings-select, .settings-input, .settings-text-input, .settings-native-input, .session-setting-select, .session-setting-number) { max-width: 100%; min-width: 0; box-sizing: border-box; }
+.settings-overlay .settings-schema-number-row > .settings-input.settings-supervisor-number-input { width: 100%; min-width: 0; }
+.settings-overlay .settings-native-field { gap: 0; }
+.settings-overlay .settings-native-field > .settings-btn { grid-row: 3; margin-top: 6px; }
+.settings-overlay .settings-schema-nested { margin-left: 0; padding-left: 0; border-left: 0; background: none; }
+.settings-overlay .settings-schema-nested > .settings-field { padding-bottom: 12px; }
+.settings-overlay .settings-native-fields { gap: 0; }
+.settings-overlay .settings-native-group { margin: 0; border: 0; border-radius: 0; background: none; padding: 0; }
+.settings-overlay .settings-native-group.settings-section { padding: 20px 0; }
+.settings-overlay .settings-native-group-panel[hidden] { display: none; }
+.settings-overlay .settings-native-group-header.settings-section-rail { display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 8px; }
+.settings-overlay .settings-native-group-desc { max-width: 70ch; margin-bottom: 12px; }
+.settings-overlay .settings-native-tab { white-space: normal; }
+.settings-overlay .settings-segmented-control { flex-wrap: wrap; }
+.settings-overlay .settings-segmented-control .segment { white-space: normal; }
+.settings-overlay .settings-checkbox-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+.settings-overlay .settings-checkbox-row > :not(.settings-toggle) { order: -1; }
+.settings-overlay .settings-form { padding: 16px 0; border: 0; border-radius: 0; background: none; min-width: 0; }
+.settings-overlay .settings-form-row { flex-wrap: wrap; min-width: 0; }
+.settings-overlay .settings-form-label { min-width: 0; }
+.settings-overlay .settings-form-footer { flex-wrap: wrap; gap: 12px; }
+.settings-overlay .settings-host-list { gap: 0; }
+.settings-overlay .host-card { padding: 12px 0; border: 0; border-bottom: 1px solid var(--border-primary); border-radius: 0; background: none; flex-wrap: wrap; }
+.settings-overlay .host-card-main { flex-basis: 14rem; }
+.settings-overlay .host-card-actions { flex-wrap: wrap; }
+.settings-overlay .settings-host-list > .panel-empty { padding: 12px 0; border: 0; text-align: left; }
+.settings-overlay .settings-backend-card { border-width: 0 0 1px; border-radius: 0; background: none; padding: 12px 0; }
+.settings-overlay .settings-backend-list { gap: 0; }
+.settings-overlay .delegation-preference-row { border-width: 0 0 1px; border-radius: 0; background: none; flex-wrap: wrap; padding: 12px 0; }
+.settings-overlay .delegation-preference-actions { flex-wrap: wrap; }
+.settings-overlay .settings-tier-row { flex-wrap: wrap; }
+.settings-overlay .settings-tier-select { min-width: 0; flex: 1 1 10rem; }
+.settings-overlay .settings-mobile-direct,
+.settings-overlay .settings-mobile-pairing,
+.settings-overlay .settings-tychat-card { padding: 12px 0; border: 0; border-radius: 0; background: none; max-width: 100%; }
+.settings-overlay .settings-dots,
+.settings-overlay .settings-tychat,
+.settings-overlay .self-improvement-settings { max-width: none; }
+.settings-overlay .settings-hermes-grid { display: flex; flex-direction: column; gap: 0; }
+.settings-overlay .settings-hermes-grid > * { width: 100%; min-width: 0; }
+.settings-overlay .settings-hermes-profilebar,
+.settings-overlay .settings-hermes-profiles,
+.settings-overlay .settings-hermes-profile-actions { flex-wrap: wrap; }
+.settings-overlay .settings-hermes-savebar-wrap { position: static; margin-top: 24px; box-shadow: none; }
+.settings-overlay .settings-hermes-savebar { flex-wrap: wrap; }
+.settings-overlay .settings-hermes-chips { grid-column: 1 / -1; }
+.settings-overlay .settings-hermes-profilebar-label { align-self: center; }
+.settings-overlay .settings-mobile-pairing-qr { max-width: 100%; height: auto; aspect-ratio: 1; flex-shrink: 1; }
+.settings-overlay .workbench-engine-option { justify-content: space-between; flex-wrap: wrap; border-width: 0 0 1px; background: none; padding: 12px 0; }
+.settings-overlay .workbench-engine-option > span { order: -1; flex: 1; flex-direction: column; align-items: flex-start; gap: 4px; }
+.settings-overlay .settings-advanced { margin-top: 12px; }
+.settings-overlay .review-configuration-columns { gap: 24px; }
+.settings-overlay :is(button, input, select, textarea):focus-visible,
+.settings-overlay .settings-toggle:focus-within .settings-toggle-slider { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+@container settings-page (max-width: 840px) {
+    .settings-overlay .settings-section { grid-template-columns: minmax(7rem, 9rem) minmax(0, 1fr); gap: 0 20px; }
+    .settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)):has(> :is(.settings-select, .settings-input, .settings-btn, .settings-inline-control, .settings-segmented-control, .settings-schema-number-row)) { grid-template-columns: minmax(0, 1fr) minmax(8rem, 45%); gap: 4px 16px; }
+}
+@container settings-page (max-width: 560px) {
+    .settings-overlay .settings-section { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 16px 0; }
+    .settings-overlay .settings-section-rail { border-right: 0; padding: 0; }
+    .settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)):has(> :is(.settings-select, .settings-input, .settings-btn, .settings-inline-control, .settings-segmented-control, .settings-schema-number-row)) { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+    .settings-overlay .settings-field:has(> :is(.settings-label, .settings-row-label)) > :is(.settings-select, .settings-input, .settings-btn, .settings-inline-control, .settings-segmented-control, .settings-schema-number-row) { align-self: stretch; }
+    .settings-overlay .settings-toggle-row { flex-wrap: wrap; gap: 12px; }
+    .settings-overlay .settings-scope-bar { float: none; max-width: none; margin: 0 28px 16px 0; justify-content: flex-start; }
+    .settings-overlay .settings-panel-header { flex-direction: row; align-items: center; }
+    .settings-overlay .settings-hermes-provider-line { grid-template-columns: minmax(0, 1fr); }
+}
+@container settings-overlay (max-width: 760px) {
+    .settings-overlay .settings-root { padding: 16px; }
+    .settings-overlay .settings-layout { flex-direction: column; gap: 16px; }
+    .settings-overlay .settings-nav { width: 100%; max-height: 15rem; padding-right: 36px; border-right: 0; border-bottom: 1px solid var(--border-primary); flex-shrink: 1; }
+    .settings-overlay .settings-content { padding: 0 4px 16px; flex: 1 0 45%; }
+    .settings-overlay .settings-nav-group { margin-bottom: 12px; }
+    .settings-overlay .settings-nav-group-items { display: flex; flex-direction: row; flex-wrap: wrap; }
+    .settings-overlay .settings-nav-item { padding: 8px 12px; }
+}
+.settings-overlay .settings-scope-bar :is(.settings-scope-notice, .settings-scope-error) { flex-basis: 100%; }
+
+.settings-overlay .settings-hermes-profilebar { display: flex; }
+.settings-overlay .settings-hermes-profiles { flex: 1 1 16rem; min-width: 0; }
+.settings-overlay .settings-hermes-profile-select { width: 100%; min-width: 0; }
+.settings-overlay .settings-hermes-profile-create > .settings-description { flex-basis: 100%; }
+.settings-overlay label.settings-toggle-row:has(> input[type=radio]) > span { order: -1; }
+.settings-overlay .settings-btn { height: auto; min-height: 30px; padding-top: 6px; padding-bottom: 6px; white-space: normal; }
+.settings-overlay select { overflow: hidden; text-overflow: ellipsis; }

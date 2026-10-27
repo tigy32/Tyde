@@ -451,6 +451,11 @@ enum SettingsTab {
     Hosts,
     Appearance,
     Display,
+    ToolOutput,
+    BackendPreferences,
+    ComplexityTiers,
+    AutoCompaction,
+    AgentRestoration,
     Composer,
     AiSummaries,
     Supervisor,
@@ -466,6 +471,7 @@ enum SettingsTab {
     CodeIntelligence,
     Workbenches,
     Voice,
+    Dictation,
     Tychat,
     ChatgptDots,
     Mobile,
@@ -487,7 +493,12 @@ impl SettingsTab {
             Self::Updates => "Updates",
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
-            Self::Display => "Code & Output Display",
+            Self::Display => "Code display",
+            Self::ToolOutput => "Tool output",
+            Self::BackendPreferences => "Backend preferences",
+            Self::ComplexityTiers => "Complexity tiers",
+            Self::AutoCompaction => "Auto-compaction",
+            Self::AgentRestoration => "Agent restoration",
             Self::Composer => "Composer",
             Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
@@ -503,6 +514,7 @@ impl SettingsTab {
             Self::CodeIntelligence => "Code Intelligence",
             Self::Workbenches => "Workbenches",
             Self::Voice => "Voice",
+            Self::Dictation => "Dictation",
             Self::ChatgptDots => "Remote MCP",
             Self::Tychat => "Tychat",
             Self::Mobile => "Mobile",
@@ -514,10 +526,17 @@ impl SettingsTab {
     /// control separately from device-local updater preferences.
     fn scope(self) -> SettingsScope {
         match self {
-            Self::Updates | Self::Hosts | Self::Appearance | Self::Display | Self::Composer => {
-                SettingsScope::Device
-            }
-            Self::AiSummaries
+            Self::Updates
+            | Self::Hosts
+            | Self::Appearance
+            | Self::Display
+            | Self::ToolOutput
+            | Self::Composer => SettingsScope::Device,
+            Self::BackendPreferences
+            | Self::ComplexityTiers
+            | Self::AutoCompaction
+            | Self::AgentRestoration
+            | Self::AiSummaries
             | Self::Supervisor
             | Self::UsageManagement
             | Self::Subagents
@@ -531,6 +550,7 @@ impl SettingsTab {
             | Self::CodeIntelligence
             | Self::Workbenches
             | Self::Voice
+            | Self::Dictation
             | Self::ChatgptDots
             | Self::Tychat
             | Self::Mobile
@@ -541,6 +561,34 @@ impl SettingsTab {
     /// All searchable text for this tab: labels, descriptions, option names.
     fn search_text(self) -> &'static [&'static str] {
         match self {
+            Self::ToolOutput => &["Tool output", "Summary", "Compact", "Full", "Preview"],
+            Self::BackendPreferences => &[
+                "Backend preferences",
+                "Delegation preference",
+                "Launch profiles",
+                "Order",
+            ],
+            Self::ComplexityTiers => &[
+                "Complexity tiers",
+                "Low",
+                "High",
+                "Model",
+                "Effort",
+                "Speed",
+            ],
+            Self::AutoCompaction => &[
+                "Auto-compaction",
+                "Auto-compact",
+                "Inactivity",
+                "Context",
+                "Tokens",
+            ],
+            Self::AgentRestoration => &[
+                "Agent restoration",
+                "Resume previous agents",
+                "Pause swarms",
+                "Restart",
+            ],
             Self::Updates => &[
                 "Updates",
                 "Release",
@@ -548,8 +596,6 @@ impl SettingsTab {
                 "Update channel",
                 "Check for updates",
                 "Automatic updates",
-                "Resume previous agents",
-                "Agent restoration",
                 "Restart",
             ],
             Self::Hosts => &[
@@ -603,7 +649,7 @@ impl SettingsTab {
                 "Enter",
             ],
             Self::Display => &[
-                "Code & Output Display",
+                "Code display",
                 "Display",
                 "Syntax Theme",
                 "Syntax highlighting",
@@ -615,10 +661,6 @@ impl SettingsTab {
                 "Diff Context",
                 "Hunks",
                 "Full File",
-                "Tool Output",
-                "Summary",
-                "Compact",
-                "Full",
             ],
             Self::AiSummaries => &[
                 "AI Summaries",
@@ -636,11 +678,6 @@ impl SettingsTab {
                 "Spawn",
                 "Orchestrate",
                 "Agent control",
-                "Task complexity tiers",
-                "Low tier",
-                "High tier",
-                "Cheaper faster setup",
-                "Most capable setup",
             ],
             Self::Workbenches => &[
                 "Workbenches",
@@ -659,6 +696,7 @@ impl SettingsTab {
                 "Find references",
                 "custom toolchain",
             ],
+            Self::Dictation => &["Dictation", "Transcribe", "Language", "Speech to text"],
             Self::Voice => &[
                 "Voice",
                 "Native voice",
@@ -689,7 +727,6 @@ impl SettingsTab {
                 "Supervisor",
                 "Agent supervisor",
                 "Enable agent supervisor",
-                "Auto-compact on success",
                 "Verdict model tier",
                 "Low",
                 "High",
@@ -828,64 +865,70 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 23] = [
-    SettingsTab::Updates,
-    SettingsTab::Hosts,
+const APPEARANCE_TABS: &[SettingsTab] = &[
     SettingsTab::Appearance,
     SettingsTab::Display,
+    SettingsTab::ToolOutput,
     SettingsTab::Composer,
-    SettingsTab::AiSummaries,
-    SettingsTab::Supervisor,
-    SettingsTab::UsageManagement,
+];
+const STEERING_TABS: &[SettingsTab] = &[
+    SettingsTab::Steering,
+    SettingsTab::Skills,
+    SettingsTab::McpServers,
+    SettingsTab::SelfImprovement,
+];
+const SUBAGENT_TABS: &[SettingsTab] = &[
     SettingsTab::Subagents,
-    SettingsTab::Backends,
+    SettingsTab::BackendPreferences,
+    SettingsTab::ComplexityTiers,
+    SettingsTab::Supervisor,
+    SettingsTab::AutoCompaction,
     SettingsTab::Review,
     SettingsTab::CustomAgents,
-    SettingsTab::McpServers,
-    SettingsTab::Steering,
-    SettingsTab::SelfImprovement,
-    SettingsTab::Skills,
-    SettingsTab::CodeIntelligence,
+    SettingsTab::AiSummaries,
+];
+const SYSTEM_TABS: &[SettingsTab] = &[
+    SettingsTab::Hosts,
     SettingsTab::Workbenches,
+    SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
+    SettingsTab::Dictation,
+    SettingsTab::Mobile,
     SettingsTab::Tychat,
     SettingsTab::ChatgptDots,
-    SettingsTab::Mobile,
+    SettingsTab::AgentRestoration,
+    SettingsTab::Updates,
     SettingsTab::Debug,
 ];
-
-/// Device-local tabs, listed under the "This Device" sidebar group.
-const DEVICE_GROUP_TABS: [SettingsTab; 5] = [
-    SettingsTab::Updates,
-    SettingsTab::Hosts,
+const ALL_TABS: &[SettingsTab] = &[
     SettingsTab::Appearance,
     SettingsTab::Display,
+    SettingsTab::ToolOutput,
     SettingsTab::Composer,
-];
-
-/// Host-scoped tabs, listed under a sidebar group titled with the selected
-/// host. `SettingsTab::Backends` is deliberately absent: it renders as the
-/// stable "Overview" entry of the dedicated Backends group.
-///
-/// Ordered so neighbouring entries answer neighbouring questions: what Tyde
-/// does on its own (summaries, supervisor, subagents), what an agent is given
-/// (custom agents, steering, skills, MCP), what the host machine can do (code
-/// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 15] = [
-    SettingsTab::AiSummaries,
-    SettingsTab::Supervisor,
+    SettingsTab::Backends,
     SettingsTab::UsageManagement,
-    SettingsTab::Subagents,
-    SettingsTab::Review,
-    SettingsTab::CustomAgents,
     SettingsTab::Steering,
-    SettingsTab::SelfImprovement,
     SettingsTab::Skills,
     SettingsTab::McpServers,
-    SettingsTab::CodeIntelligence,
+    SettingsTab::SelfImprovement,
+    SettingsTab::Subagents,
+    SettingsTab::BackendPreferences,
+    SettingsTab::ComplexityTiers,
+    SettingsTab::Supervisor,
+    SettingsTab::AutoCompaction,
+    SettingsTab::Review,
+    SettingsTab::CustomAgents,
+    SettingsTab::AiSummaries,
+    SettingsTab::Hosts,
     SettingsTab::Workbenches,
+    SettingsTab::CodeIntelligence,
     SettingsTab::Voice,
+    SettingsTab::Dictation,
     SettingsTab::Mobile,
+    SettingsTab::Tychat,
+    SettingsTab::ChatgptDots,
+    SettingsTab::AgentRestoration,
+    SettingsTab::Updates,
     SettingsTab::Debug,
 ];
 
@@ -978,9 +1021,6 @@ fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) 
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let notice_host = state.selected_host_id;
-    let nav_state = state.clone();
-    let host_group_title =
-        Signal::derive(move || format!("Host · {}", selected_host_label(&nav_state)));
     let active_page = RwSignal::new(SettingsPage::Tab(SettingsTab::Appearance));
     let search_query = RwSignal::new(String::new());
     let content_ref = NodeRef::<leptos::html::Div>::new();
@@ -997,7 +1037,7 @@ pub fn SettingsPanel() -> impl IntoView {
         let state = state.clone();
         Effect::new(move |_| {
             if let Some(label) = state.settings_tab_request.get() {
-                if let Some(tab) = ALL_TABS.into_iter().find(|tab| tab.label() == label) {
+                if let Some(tab) = ALL_TABS.iter().copied().find(|tab| tab.label() == label) {
                     active_page.set(SettingsPage::Tab(tab));
                 }
                 state.settings_tab_request.set(None);
@@ -1007,7 +1047,7 @@ pub fn SettingsPanel() -> impl IntoView {
 
     // A backend page only exists while the selected host's schema catalog
     // carries that backend. If the host changes (or schemas haven't loaded),
-    // fall back to the stable Overview page instead of rendering a stale or
+    // fall back to the stable Backends page instead of rendering a stale or
     // blank child page.
     {
         let state = state.clone();
@@ -1036,8 +1076,6 @@ pub fn SettingsPanel() -> impl IntoView {
                 <div class="settings-root">
                     <button class="settings-close-btn" on:click=on_close title="Close settings">"×"</button>
 
-                    <SettingsScopeBar active_page />
-
                     <div class="settings-layout">
                         <nav class="settings-nav">
                             <div class="settings-search-wrap">
@@ -1053,25 +1091,11 @@ pub fn SettingsPanel() -> impl IntoView {
                                     autocomplete="off"
                                 />
                             </div>
-                            <SettingsNavGroup
-                                title=Signal::derive(|| "This Device".to_owned())
-                                tabs=DEVICE_GROUP_TABS.to_vec()
-                                active_page
-                                search_query
-                            />
-                            <SettingsNavGroup
-                                title=host_group_title
-                                tabs=HOST_GROUP_TABS.to_vec()
-                                active_page
-                                search_query
-                            />
-                            <SettingsNavGroup
-                                title=Signal::derive(|| "Integrations".to_owned())
-                                tabs=vec![SettingsTab::Tychat, SettingsTab::ChatgptDots]
-                                active_page
-                                search_query
-                            />
+                            <SettingsNavGroup title=Signal::derive(|| "Appearance".to_owned()) tabs=APPEARANCE_TABS.to_vec() active_page search_query />
                             <BackendsNavGroup active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Steering".to_owned()) tabs=STEERING_TABS.to_vec() active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Subagents".to_owned()) tabs=SUBAGENT_TABS.to_vec() active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "System".to_owned()) tabs=SYSTEM_TABS.to_vec() active_page search_query />
                             <div class="settings-nav-footer">
                                 <button class="settings-feedback-link" on:click=move |_| {
                                     state.settings_open.set(false);
@@ -1081,6 +1105,7 @@ pub fn SettingsPanel() -> impl IntoView {
                         </nav>
 
                         <div class="settings-content" node_ref=content_ref>
+                            <SettingsScopeBar active_page />
                             <crate::notices::InlineNotices scopes=Signal::derive(move || {
                                 let mut scopes = vec![crate::notices::NoticeScope::Settings(None)];
                                 if let Some(host) = notice_host.get() { scopes.push(crate::notices::NoticeScope::Settings(Some(host))); }
@@ -1092,7 +1117,12 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Updates => view! { <crate::components::app_updates::UpdatesSettings /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                     SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
-                                    SettingsTab::Composer => view! { <ComposerSettings /> }.into_any(),
+                                    SettingsTab::ToolOutput => view! { <ToolOutputTab /> }.into_any(),
+                                    SettingsTab::BackendPreferences => view! { <BackendPreferencesTab /> }.into_any(),
+                                    SettingsTab::ComplexityTiers => view! { <ComplexityTiersTab /> }.into_any(),
+                                    SettingsTab::AutoCompaction => view! { <AutoCompactionTab /> }.into_any(),
+                                    SettingsTab::AgentRestoration => view! { <AgentRestorationSettings /> }.into_any(),
+                                    SettingsTab::Composer => view! { <ComposerTab /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
                                     SettingsTab::UsageManagement => view! { <UsageManagementTab /> }.into_any(),
@@ -1107,6 +1137,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Workbenches => view! { <WorkbenchesTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
                                     SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
+                                    SettingsTab::Dictation => view! { <DictationTab /> }.into_any(),
                                     SettingsTab::ChatgptDots => view! { <super::dots_settings::DotsTab /> }.into_any(),
                                     SettingsTab::Tychat => view! { <super::tychat_settings::TychatTab /> }.into_any(),
                                     SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
@@ -1204,94 +1235,100 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
     // Type-erased branches: the wasm test module runs every frontend test in
     // one browser instance, and each distinct nested view type it monomorphizes
     // costs module size against that ceiling.
-    let body = move || {
-        match active_page.get().scope() {
+    let body = move || match active_page.get().scope() {
         SettingsScope::Host => view! { <SettingsHostScope /> }.into_any(),
-        SettingsScope::Device if active_page.get() == SettingsPage::Tab(SettingsTab::Updates) => view! {
-            <span class="settings-scope-text">"Update preferences apply to this device. Agent restoration applies to the host selected below."</span>
-        }.into_any(),
         SettingsScope::Device => view! {
-            <span class="settings-scope-text">"These settings apply to this device only."</span>
+            <span class="settings-scope-text">"This device"</span>
         }
         .into_any(),
-    }
     };
     view! { <div class="settings-scope-bar">{body}</div> }
+}
+
+#[component]
+pub(super) fn SettingsSection(title: &'static str, children: Children) -> impl IntoView {
+    view! {
+        <section class="settings-section">
+            <h3 class="settings-section-rail settings-section-title">{title}</h3>
+            <div class="settings-section-body">{children()}</div>
+        </section>
+    }
 }
 
 #[component]
 fn WorkbenchesTab() -> impl IntoView {
     let display_state = expect_context::<AppState>();
     view! {
-        <div class="workbenches-settings">
-            <h2 class="settings-panel-title">"Workbenches"</h2>
-            <p class="settings-description">"Engine for new workbenches. Existing workbenches are unchanged."</p>
-            <p class="settings-description">"Bubblewrap: Linux only. Native backend authentication, tools and policies are preserved. No live transfers between engines."</p>
-            {move || {
-                let Some(host_id) = display_state.selected_host_id.get() else {
-                    return view! { <p class="settings-description">"Select a host to configure workbenches."</p> }.into_any();
-                };
-                let Some(settings) = display_state.host_settings(&host_id) else {
-                    return view! { <p class="settings-description">"Workbenches settings are unavailable from this host."</p> }.into_any();
-                };
-                let support = display_state.workbench_support_by_host.get().get(&host_id).cloned();
-                let Some(support) = support else {
-                    return view! { <p class="settings-description">"Workbenches support has not been reported by this host."</p> }.into_any();
-                };
-                let bubblewrap_available = matches!(support.bubblewrap, protocol::WorkbenchAvailability::Available);
-                let bubblewrap_status = match support.bubblewrap {
-                    protocol::WorkbenchAvailability::Available => "Bubblewrap is available on this host.".to_owned(),
-                    protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Bubblewrap unavailable: {message}"),
-                };
-                let nested_status = match support.nested_namespaces {
-                    protocol::WorkbenchAvailability::Available => "Nested namespaces are available.".to_owned(),
-                    protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Nested namespace limit: {message}"),
-                };
-                let disconnected = display_state.selected_host_connection_status() != ConnectionStatus::Connected;
-                let native_state = display_state.clone();
-                let bubblewrap_state = display_state.clone();
-                view! {
-                    <fieldset class="workbench-engine-options" disabled=disconnected>
-                        <legend>"Engine for new workbenches"</legend>
-                        <label class="workbench-engine-option">
-                            <input type="radio" name="workbench-engine" value="native"
-                                prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Native
-                                on:click=move |event| {
-                                    event.prevent_default();
-                                    send_host_replace(&native_state, "/workbenches/engine", protocol::WorkbenchEngine::Native);
-                                }
-                            />
-                            <span>"Native"<small>"Default"</small></span>
-                        </label>
-                        <label class="workbench-engine-option">
-                            <input type="radio" name="workbench-engine" value="bubblewrap"
-                                disabled=!bubblewrap_available
-                                prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Bubblewrap
-                                on:click=move |event| {
-                                    event.prevent_default();
-                                    send_host_replace(&bubblewrap_state, "/workbenches/engine", protocol::WorkbenchEngine::Bubblewrap);
-                                }
-                            />
-                            <span>"Bubblewrap"<small>"Linux · automatic warm builds"</small></span>
-                        </label>
-                    </fieldset>
-                    <p class="settings-description" role="status">{bubblewrap_status}</p>
-                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"Creation never runs builds or installs. Compatible existing Rust and JS/TS artifacts are reused privately; otherwise the checkout is ready cold. Agents build according to repository instructions. Runtime configuration remains optional; environment errors never fall back to Native."</p></details>
-                }.into_any()
-            }}
-        </div>
-    }
+            <div class="workbenches-settings">
+                <h2 class="settings-panel-title">"Workbenches"</h2>
+                <p class="settings-description">"Engine for new workbenches. Existing workbenches are unchanged."</p>
+                <p class="settings-description">"Bubblewrap: Linux only. Native backend authentication, tools and policies are preserved. No live transfers between engines."</p>
+    <SettingsSection title="New workbenches">
+                {move || {
+                    let Some(host_id) = display_state.selected_host_id.get() else {
+                        return view! { <p class="settings-description">"Select a host to configure workbenches."</p> }.into_any();
+                    };
+                    let Some(settings) = display_state.host_settings(&host_id) else {
+                        return view! { <p class="settings-description">"Workbenches settings are unavailable from this host."</p> }.into_any();
+                    };
+                    let support = display_state.workbench_support_by_host.get().get(&host_id).cloned();
+                    let Some(support) = support else {
+                        return view! { <p class="settings-description">"Workbenches support has not been reported by this host."</p> }.into_any();
+                    };
+                    let bubblewrap_available = matches!(support.bubblewrap, protocol::WorkbenchAvailability::Available);
+                    let bubblewrap_status = match support.bubblewrap {
+                        protocol::WorkbenchAvailability::Available => "Bubblewrap is available on this host.".to_owned(),
+                        protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Bubblewrap unavailable: {message}"),
+                    };
+                    let nested_status = match support.nested_namespaces {
+                        protocol::WorkbenchAvailability::Available => "Nested namespaces are available.".to_owned(),
+                        protocol::WorkbenchAvailability::Unsupported { message, .. } => format!("Nested namespace limit: {message}"),
+                    };
+                    let disconnected = display_state.selected_host_connection_status() != ConnectionStatus::Connected;
+                    let native_state = display_state.clone();
+                    let bubblewrap_state = display_state.clone();
+                    view! {
+                        <fieldset class="workbench-engine-options" disabled=disconnected>
+                            <legend>"Engine for new workbenches"</legend>
+                            <label class="workbench-engine-option">
+                                <input type="radio" name="workbench-engine" value="native"
+                                    prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Native
+                                    on:click=move |event| {
+                                        event.prevent_default();
+                                        send_host_replace(&native_state, "/workbenches/engine", protocol::WorkbenchEngine::Native);
+                                    }
+                                />
+                                <span>"Native"<small>"Default"</small></span>
+                            </label>
+                            <label class="workbench-engine-option">
+                                <input type="radio" name="workbench-engine" value="bubblewrap"
+                                    disabled=!bubblewrap_available
+                                    prop:checked=settings.workbenches.engine == protocol::WorkbenchEngine::Bubblewrap
+                                    on:click=move |event| {
+                                        event.prevent_default();
+                                        send_host_replace(&bubblewrap_state, "/workbenches/engine", protocol::WorkbenchEngine::Bubblewrap);
+                                    }
+                                />
+                                <span>"Bubblewrap"</span>
+                            </label>
+                        </fieldset>
+                        <p class="settings-description" role="status">{bubblewrap_status}</p>
+                        <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"Creation never runs builds or installs. Compatible existing Rust and JS/TS artifacts are reused privately; otherwise the checkout is ready cold. Agents build according to repository instructions. Runtime configuration remains optional; environment errors never fall back to Native."</p></details>
+                    }.into_any()
+                }}
+            </SettingsSection>
+
+            </div>
+        }
 }
 
 #[component]
 pub(crate) fn AgentRestorationSettings() -> impl IntoView {
     let state = expect_context::<AppState>();
     view! {
-        <section class="settings-subsection">
-            <h3 class="settings-section-title">"Agent restoration"</h3>
-            <div class="settings-scope-bar"><SettingsHostScope /></div>
-            {move || host_schema_section(&state, "updates")}
-        </section>
+        <h2 class="settings-panel-title">"Agent restoration"</h2>
+        <p class="settings-description settings-panel-intro">"Choose what resumes when this host restarts or updates."</p>
+        <SettingsSection title="On restart">{move || host_schema_section(&state, "updates")}</SettingsSection>
     }
 }
 
@@ -1363,7 +1400,7 @@ fn SettingsHostScope() -> impl IntoView {
 
     view! {
         <span class=status_class></span>
-        <span class="settings-scope-text">"Editing settings on"</span>
+        <span class="settings-scope-text">"Host:"</span>
         {picker}
         <SettingsScopeNotices chat_state error_sig />
     }
@@ -1471,7 +1508,7 @@ fn SettingsScopeNotices(
     view! { {notices} }
 }
 
-/// The "Backends" sidebar group: a stable Overview entry plus one page per
+/// The "Backends" sidebar group: a stable Backends entry plus one page per
 /// backend in the selected host's server-owned schema catalog.
 #[component]
 fn BackendsNavGroup(
@@ -1479,11 +1516,10 @@ fn BackendsNavGroup(
     search_query: RwSignal<String>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let title_state = state.clone();
-    let title = Signal::derive(move || format!("Backends · {}", selected_host_label(&title_state)));
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
+            || SettingsTab::UsageManagement.matches_query(&query)
             || usage_page_matches_query(&query)
             || launch_profiles_page_matches_query(&query)
             || schema_backends(&state)
@@ -1493,7 +1529,7 @@ fn BackendsNavGroup(
     view! {
         <Show when=visible>
             <div class="settings-nav-group">
-                <div class="settings-nav-group-title">{move || title.get()}</div>
+                <div class="settings-nav-group-title">"Backends"</div>
                 <div class="settings-nav-group-items">
                     <Show when=move || SettingsTab::Backends.matches_query(&search_query.get())>
                         <button
@@ -1505,7 +1541,7 @@ fn BackendsNavGroup(
                                 active_page.set(SettingsPage::Tab(SettingsTab::Backends))
                             }
                         >
-                            "Overview"
+                            "Backends"
                         </button>
                     </Show>
                     <Show when=move || usage_page_matches_query(&search_query.get())>
@@ -1516,6 +1552,10 @@ fn BackendsNavGroup(
                         >
                             "Usage"
                         </button>
+                    </Show>
+                    <Show when=move || SettingsTab::UsageManagement.matches_query(&search_query.get())>
+                        <button class="settings-nav-item" class:active=move || active_page.get() == SettingsPage::Tab(SettingsTab::UsageManagement)
+                            on:click=move |_| active_page.set(SettingsPage::Tab(SettingsTab::UsageManagement))>"Usage Limits"</button>
                     </Show>
                     <Show when=move || launch_profiles_page_matches_query(&search_query.get())>
                         <button
@@ -1629,280 +1669,282 @@ fn HostsTab() -> impl IntoView {
     };
 
     view! {
-        <h2 class="settings-panel-title">"Hosts"</h2>
-        <p class="settings-description settings-panel-intro">
-            "Machines Tyde runs agents on. The local host is always available; remote hosts connect over SSH."
-        </p>
+            <h2 class="settings-panel-title">"Hosts"</h2>
+            <p class="settings-description settings-panel-intro">
+                "Machines Tyde runs agents on. The local host is always available; remote hosts connect over SSH."
+            </p>
 
-        <div class="settings-field">
-            <label class="settings-label">"Selected host"</label>
-            <p class="settings-description">"The host whose settings the other pages edit."</p>
-            <select
-                class="settings-select settings-select-full"
-                aria-label="Selected host"
-                prop:value=move || state.selected_host_id.get().unwrap_or_default()
-                on:change=move |ev: web_sys::Event| {
-                    let target = ev.target().unwrap();
-                    let select: web_sys::HtmlSelectElement = target.unchecked_into();
-                    let state = state_for_selected_host.clone();
-                    let host_id = select.value();
-                    spawn_local(async move {
-                        match select_settings_host(state, host_id).await {
-                            Ok(()) => error_sig.set(None),
-                            Err(e) => error_sig.set(Some(e)),
-                        }
-                    });
-                }
-            >
-                {move || state.configured_hosts.get().into_iter().map(|host| {
-                    view! { <option value=host.id>{host.label}</option> }
-                }).collect_view()}
-            </select>
-        </div>
-
-        <div class="settings-field">
-            <label class="settings-label">"Configured hosts"</label>
-            <div class="settings-host-list">
-                {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
-                    let host_id = host.id.clone();
-                    let is_local = matches!(host.transport, BridgeHostTransportConfig::LocalEmbedded);
-                    let is_managed_remote = is_managed_remote_host(&host.transport);
-                    let host_id_for_connect = host_id.clone();
-                    let host_id_for_disconnect = host_id.clone();
-                    let host_id_for_remove = host_id.clone();
-                    let status = state_for_configured_hosts
-                        .connection_statuses
-                        .get()
-                        .get(&host_id)
-                        .cloned()
-                        .unwrap_or(crate::state::ConnectionStatus::Disconnected);
-                    let (status_class, status_text) = match &status {
-                        crate::state::ConnectionStatus::Connected => ("connected", "Connected".to_string()),
-                        crate::state::ConnectionStatus::Reconnecting { attempt, retry_in_seconds, message } => ("connecting", if *attempt == 0 { message.clone() } else { format!("Disconnected — reconnecting… Attempt {attempt} · retry in {retry_in_seconds}s · {message}") }),
-                        crate::state::ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
-                        crate::state::ConnectionStatus::Disconnected => ("disconnected", "Disconnected".to_string()),
-                        crate::state::ConnectionStatus::Error(message) => ("error", format!("Error: {message}")),
-                    };
-                    let is_disconnecting = disconnecting_hosts.with(|hosts| hosts.contains(&host_id));
-                    let is_connected = is_disconnecting || !matches!(status, crate::state::ConnectionStatus::Disconnected);
-                    let is_reconnecting = matches!(status, crate::state::ConnectionStatus::Reconnecting { .. });
-                    let retry_host_id = host_id.clone();
-                    let retry_state = state.clone();
-                    let is_connecting = matches!(status, crate::state::ConnectionStatus::Connecting);
-                    let lifecycle_status = state_for_configured_hosts
-                        .host_lifecycle_statuses
-                        .get()
-                        .get(&host_id)
-                        .cloned()
-                        .unwrap_or(bridge::RemoteHostLifecycleStatus::Idle);
-                    let connect_state = state.clone();
-                    let disconnect_state = state.clone();
-                    let remove_state = state.clone();
-                    let (badge_class, badge_text, transport_text) = match &host.transport {
-                        BridgeHostTransportConfig::LocalEmbedded => (
-                            "host-badge host-badge-local",
-                            "Local",
-                            "Embedded local host".to_string(),
-                        ),
-                        BridgeHostTransportConfig::SshStdio { ssh_destination, .. } => (
-                            "host-badge host-badge-ssh",
-                            "SSH",
-                            format!("ssh {ssh_destination}"),
-                        ),
-                    };
-
-                    view! {
-                        <div class="host-card">
-                            <div class="host-card-main">
-                                <div class="host-card-title-row">
-                                    <span class=badge_class>{badge_text}</span>
-                                    <span class="host-card-label">{host.label.clone()}</span>
-                                </div>
-                                <p class="host-card-transport">{transport_text}</p>
-                                <div class="host-card-status">
-                                    <span class=format!("status-dot {status_class}")></span>
-                                    <span class="status-text">{status_text}</span>
-                                </div>
-                                {is_managed_remote.then(|| {
-                                    let lifecycle_text = lifecycle_status_text(&lifecycle_status);
-                                    view! {
-                                        <p class="host-card-lifecycle">{format!("Tyde server: {lifecycle_text}")}</p>
-                                    }
-                                })}
-                            </div>
-                            <div class="host-card-actions">
-                                {is_reconnecting.then(|| view! {
-                                    <button class="settings-btn" on:click=move |_| {
-                                        let host_id = retry_host_id.clone();
-                                        let state = retry_state.clone();
-                                        spawn_local(async move {
-                                            let epoch = state.host_connection_epochs.get_untracked().get(&host_id).copied();
-                                            let result = bridge::retry_host(host_id.clone()).await;
-                                            if state.host_connection_epochs.get_untracked().get(&host_id).copied() != epoch {
-                                                return;
-                                            }
-                                            if result.is_err() {
-                                                connect_one_host(state, host_id).await;
-                                            }
-                                        });
-                                    }>"Retry now"</button>
-                                })}
-                                {(!is_local).then(|| {
-                                    let host_id_for_connect = host_id_for_connect.clone();
-                                    let host_id_for_disconnect = host_id_for_disconnect.clone();
-                                    let connect_state = connect_state.clone();
-                                    let disconnect_state = disconnect_state.clone();
-                                    if is_connected {
-                                        view! {
-                                            <button
-                                                class="settings-btn"
-                                                disabled=is_disconnecting
-                                                title="Clear this host’s projects, agents, and tabs. Connect again to load a fresh snapshot."
-                                                on:click=move |_| {
-                                                    let host_id = host_id_for_disconnect.clone();
-                                                    let state = disconnect_state.clone();
-                                                    disconnecting_hosts.update(|hosts| { hosts.insert(host_id.clone()); });
-                                                    spawn_local(async move {
-                                                        if let Err(e) = crate::app::disconnect_one_host(state, host_id.clone()).await {
-                                                            error_sig.set(Some(format!("Failed to disconnect host: {e}")));
-                                                        }
-                                                        disconnecting_hosts.update(|hosts| { hosts.remove(&host_id); });
-                                                    });
-                                                }
-                                            >
-                                                {if is_disconnecting { "Disconnecting…" } else { "Disconnect" }}
-                                            </button>
-                                        }.into_any()
-                                    } else if is_managed_remote {
-                                        let lifecycle_status = lifecycle_status.clone();
-                                        let label = if matches!(status, crate::state::ConnectionStatus::Disconnected) {
-                                            "Connect".to_string()
-                                        } else {
-                                            managed_lifecycle_button_label(&lifecycle_status)
-                                        };
-                                        let disabled = is_connecting || managed_lifecycle_button_disabled(&lifecycle_status);
-                                        view! {
-                                            <button
-                                                class="settings-btn settings-btn-primary"
-                                                disabled=disabled
-                                                on:click=move |_| {
-                                                    let state = connect_state.clone();
-                                                    let host_id = host_id_for_connect.clone();
-                                                    spawn_local(async move {
-                                                        connect_one_host(state, host_id).await;
-                                                    });
-                                                }
-                                            >
-                                                {label}
-                                            </button>
-                                        }.into_any()
-                                    } else {
-                                        view! {
-                                            <button
-                                                class="settings-btn settings-btn-primary"
-                                                disabled=is_connecting
-                                                on:click=move |_| {
-                                                    let state = connect_state.clone();
-                                                    let host_id = host_id_for_connect.clone();
-                                                    spawn_local(async move {
-                                                        connect_one_host(state, host_id).await;
-                                                    });
-                                                }
-                                            >
-                                                {if is_connecting { "Connecting…" } else { "Connect" }}
-                                            </button>
-                                        }.into_any()
-                                    }
-                                })}
-                                {(!is_local).then(|| {
-                                    let host_id = host_id_for_remove.clone();
-                                    view! {
-                                        <button
-                                            class="settings-btn settings-btn-danger"
-                                            on:click=move |_| {
-                                                let state = remove_state.clone();
-                                                let host_id = host_id.clone();
-                                                spawn_local(async move {
-                                                    state.cancel_host_connect(&host_id);
-                                                    match bridge::remove_configured_host(host_id.clone()).await {
-                                                        Ok(_) => {
-                                                            state.clear_host_runtime(&host_id);
-                                                            refresh_configured_hosts(&state).await;
-                                                        },
-                                                        Err(e) => error_sig.set(Some(format!("Failed to remove host: {e}"))),
-                                                    }
-                                                });
-                                            }
-                                        >
-                                            "Remove"
-                                        </button>
-                                    }
-                                })}
-                            </div>
-                        </div>
+    <SettingsSection title="Connections">
+            <div class="settings-field">
+                <label class="settings-label">"Selected host"</label>
+                <p class="settings-description">"The host whose settings the other pages edit."</p>
+                <select
+                    class="settings-select settings-select-full"
+                    aria-label="Selected host"
+                    prop:value=move || state.selected_host_id.get().unwrap_or_default()
+                    on:change=move |ev: web_sys::Event| {
+                        let target = ev.target().unwrap();
+                        let select: web_sys::HtmlSelectElement = target.unchecked_into();
+                        let state = state_for_selected_host.clone();
+                        let host_id = select.value();
+                        spawn_local(async move {
+                            match select_settings_host(state, host_id).await {
+                                Ok(()) => error_sig.set(None),
+                                Err(e) => error_sig.set(Some(e)),
+                            }
+                        });
                     }
-                }).collect_view()}
+                >
+                    {move || state.configured_hosts.get().into_iter().map(|host| {
+                        view! { <option value=host.id>{host.label}</option> }
+                    }).collect_view()}
+                </select>
             </div>
-        </div>
 
-        <div class="settings-field">
-            <label class="settings-label">"Add remote host"</label>
-            <p class="settings-description">"Tyde installs and runs a matching server release on the host over SSH."</p>
-            <div class="settings-form">
-                <div class="settings-form-row">
-                    <label class="settings-form-label">
-                        <span>"Label"</span>
-                        <input
-                            class="settings-text-input"
-                            type="text"
-                            placeholder="e.g. Workstation"
-                            prop:value=move || label_sig.get()
-                            on:input=move |ev| label_sig.set(event_target_value(&ev))
-                            spellcheck="false"
-                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
-                            autocapitalize="none"
-                            autocomplete="off"
-                        />
-                    </label>
-                    <label class="settings-form-label">
-                        <span>"SSH destination"</span>
-                        <input
-                            class="settings-text-input"
-                            type="text"
-                            placeholder="user@host"
-                            prop:value=move || ssh_destination_sig.get()
-                            on:input=move |ev| ssh_destination_sig.set(event_target_value(&ev))
-                            spellcheck="false"
-                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
-                            autocapitalize="none"
-                            autocomplete="off"
-                        />
-                    </label>
+            <div class="settings-field">
+                <label class="settings-label">"Configured hosts"</label>
+                <div class="settings-host-list">
+                    {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
+                        let host_id = host.id.clone();
+                        let is_local = matches!(host.transport, BridgeHostTransportConfig::LocalEmbedded);
+                        let is_managed_remote = is_managed_remote_host(&host.transport);
+                        let host_id_for_connect = host_id.clone();
+                        let host_id_for_disconnect = host_id.clone();
+                        let host_id_for_remove = host_id.clone();
+                        let status = state_for_configured_hosts
+                            .connection_statuses
+                            .get()
+                            .get(&host_id)
+                            .cloned()
+                            .unwrap_or(crate::state::ConnectionStatus::Disconnected);
+                        let (status_class, status_text) = match &status {
+                            crate::state::ConnectionStatus::Connected => ("connected", "Connected".to_string()),
+                            crate::state::ConnectionStatus::Reconnecting { attempt, retry_in_seconds, message } => ("connecting", if *attempt == 0 { message.clone() } else { format!("Disconnected — reconnecting… Attempt {attempt} · retry in {retry_in_seconds}s · {message}") }),
+                            crate::state::ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
+                            crate::state::ConnectionStatus::Disconnected => ("disconnected", "Disconnected".to_string()),
+                            crate::state::ConnectionStatus::Error(message) => ("error", format!("Error: {message}")),
+                        };
+                        let is_disconnecting = disconnecting_hosts.with(|hosts| hosts.contains(&host_id));
+                        let is_connected = is_disconnecting || !matches!(status, crate::state::ConnectionStatus::Disconnected);
+                        let is_reconnecting = matches!(status, crate::state::ConnectionStatus::Reconnecting { .. });
+                        let retry_host_id = host_id.clone();
+                        let retry_state = state.clone();
+                        let is_connecting = matches!(status, crate::state::ConnectionStatus::Connecting);
+                        let lifecycle_status = state_for_configured_hosts
+                            .host_lifecycle_statuses
+                            .get()
+                            .get(&host_id)
+                            .cloned()
+                            .unwrap_or(bridge::RemoteHostLifecycleStatus::Idle);
+                        let connect_state = state.clone();
+                        let disconnect_state = state.clone();
+                        let remove_state = state.clone();
+                        let (badge_class, badge_text, transport_text) = match &host.transport {
+                            BridgeHostTransportConfig::LocalEmbedded => (
+                                "host-badge host-badge-local",
+                                "Local",
+                                "Embedded local host".to_string(),
+                            ),
+                            BridgeHostTransportConfig::SshStdio { ssh_destination, .. } => (
+                                "host-badge host-badge-ssh",
+                                "SSH",
+                                format!("ssh {ssh_destination}"),
+                            ),
+                        };
+
+                        view! {
+                            <div class="host-card">
+                                <div class="host-card-main">
+                                    <div class="host-card-title-row">
+                                        <span class=badge_class>{badge_text}</span>
+                                        <span class="host-card-label">{host.label.clone()}</span>
+                                    </div>
+                                    <p class="host-card-transport">{transport_text}</p>
+                                    <div class="host-card-status">
+                                        <span class=format!("status-dot {status_class}")></span>
+                                        <span class="status-text">{status_text}</span>
+                                    </div>
+                                    {is_managed_remote.then(|| {
+                                        let lifecycle_text = lifecycle_status_text(&lifecycle_status);
+                                        view! {
+                                            <p class="host-card-lifecycle">{format!("Tyde server: {lifecycle_text}")}</p>
+                                        }
+                                    })}
+                                </div>
+                                <div class="host-card-actions">
+                                    {is_reconnecting.then(|| view! {
+                                        <button class="settings-btn" on:click=move |_| {
+                                            let host_id = retry_host_id.clone();
+                                            let state = retry_state.clone();
+                                            spawn_local(async move {
+                                                let epoch = state.host_connection_epochs.get_untracked().get(&host_id).copied();
+                                                let result = bridge::retry_host(host_id.clone()).await;
+                                                if state.host_connection_epochs.get_untracked().get(&host_id).copied() != epoch {
+                                                    return;
+                                                }
+                                                if result.is_err() {
+                                                    connect_one_host(state, host_id).await;
+                                                }
+                                            });
+                                        }>"Retry now"</button>
+                                    })}
+                                    {(!is_local).then(|| {
+                                        let host_id_for_connect = host_id_for_connect.clone();
+                                        let host_id_for_disconnect = host_id_for_disconnect.clone();
+                                        let connect_state = connect_state.clone();
+                                        let disconnect_state = disconnect_state.clone();
+                                        if is_connected {
+                                            view! {
+                                                <button
+                                                    class="settings-btn"
+                                                    disabled=is_disconnecting
+                                                    title="Clear this host’s projects, agents, and tabs. Connect again to load a fresh snapshot."
+                                                    on:click=move |_| {
+                                                        let host_id = host_id_for_disconnect.clone();
+                                                        let state = disconnect_state.clone();
+                                                        disconnecting_hosts.update(|hosts| { hosts.insert(host_id.clone()); });
+                                                        spawn_local(async move {
+                                                            if let Err(e) = crate::app::disconnect_one_host(state, host_id.clone()).await {
+                                                                error_sig.set(Some(format!("Failed to disconnect host: {e}")));
+                                                            }
+                                                            disconnecting_hosts.update(|hosts| { hosts.remove(&host_id); });
+                                                        });
+                                                    }
+                                                >
+                                                    {if is_disconnecting { "Disconnecting…" } else { "Disconnect" }}
+                                                </button>
+                                            }.into_any()
+                                        } else if is_managed_remote {
+                                            let lifecycle_status = lifecycle_status.clone();
+                                            let label = if matches!(status, crate::state::ConnectionStatus::Disconnected) {
+                                                "Connect".to_string()
+                                            } else {
+                                                managed_lifecycle_button_label(&lifecycle_status)
+                                            };
+                                            let disabled = is_connecting || managed_lifecycle_button_disabled(&lifecycle_status);
+                                            view! {
+                                                <button
+                                                    class="settings-btn settings-btn-primary"
+                                                    disabled=disabled
+                                                    on:click=move |_| {
+                                                        let state = connect_state.clone();
+                                                        let host_id = host_id_for_connect.clone();
+                                                        spawn_local(async move {
+                                                            connect_one_host(state, host_id).await;
+                                                        });
+                                                    }
+                                                >
+                                                    {label}
+                                                </button>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <button
+                                                    class="settings-btn settings-btn-primary"
+                                                    disabled=is_connecting
+                                                    on:click=move |_| {
+                                                        let state = connect_state.clone();
+                                                        let host_id = host_id_for_connect.clone();
+                                                        spawn_local(async move {
+                                                            connect_one_host(state, host_id).await;
+                                                        });
+                                                    }
+                                                >
+                                                    {if is_connecting { "Connecting…" } else { "Connect" }}
+                                                </button>
+                                            }.into_any()
+                                        }
+                                    })}
+                                    {(!is_local).then(|| {
+                                        let host_id = host_id_for_remove.clone();
+                                        view! {
+                                            <button
+                                                class="settings-btn settings-btn-danger"
+                                                on:click=move |_| {
+                                                    let state = remove_state.clone();
+                                                    let host_id = host_id.clone();
+                                                    spawn_local(async move {
+                                                        state.cancel_host_connect(&host_id);
+                                                        match bridge::remove_configured_host(host_id.clone()).await {
+                                                            Ok(_) => {
+                                                                state.clear_host_runtime(&host_id);
+                                                                refresh_configured_hosts(&state).await;
+                                                            },
+                                                            Err(e) => error_sig.set(Some(format!("Failed to remove host: {e}"))),
+                                                        }
+                                                    });
+                                                }
+                                            >
+                                                "Remove"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </div>
+                        }
+                    }).collect_view()}
                 </div>
-                <div class="settings-form-footer">
-                    <div class="settings-checkbox-row">
-                        <label class="settings-toggle">
-                            <input
-                                type="checkbox"
-                                prop:checked=move || auto_connect_sig.get()
-                                on:change=move |ev: web_sys::Event| {
-                                    let target = ev.target().unwrap();
-                                    let input: web_sys::HtmlInputElement = target.unchecked_into();
-                                    auto_connect_sig.set(input.checked());
-                                }
-                            />
-                            <span class="settings-toggle-slider"></span>
-                        </label>
-                        <span>"Auto-connect on launch"</span>
-                    </div>
-                    <button class="settings-btn settings-btn-primary" on:click=on_add>"Add Host"</button>
-                </div>
-                <Show when=move || error_sig.get().is_some()>
-                    <p class="settings-error">{move || error_sig.get().unwrap_or_default()}</p>
-                </Show>
             </div>
-        </div>
-    }
+
+            <div class="settings-field">
+                <label class="settings-label">"Add remote host"</label>
+                <p class="settings-description">"Tyde installs and runs a matching server release on the host over SSH."</p>
+                <div class="settings-form">
+                    <div class="settings-form-row">
+                        <label class="settings-form-label">
+                            <span>"Label"</span>
+                            <input
+                                class="settings-text-input"
+                                type="text"
+                                placeholder="e.g. Workstation"
+                                prop:value=move || label_sig.get()
+                                on:input=move |ev| label_sig.set(event_target_value(&ev))
+                                spellcheck="false"
+                                {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                                autocapitalize="none"
+                                autocomplete="off"
+                            />
+                        </label>
+                        <label class="settings-form-label">
+                            <span>"SSH destination"</span>
+                            <input
+                                class="settings-text-input"
+                                type="text"
+                                placeholder="user@host"
+                                prop:value=move || ssh_destination_sig.get()
+                                on:input=move |ev| ssh_destination_sig.set(event_target_value(&ev))
+                                spellcheck="false"
+                                {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                                autocapitalize="none"
+                                autocomplete="off"
+                            />
+                        </label>
+                    </div>
+                    <div class="settings-form-footer">
+                        <div class="settings-checkbox-row">
+                            <span>"Auto-connect on launch"</span>
+                            <label class="settings-toggle">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || auto_connect_sig.get()
+                                    on:change=move |ev: web_sys::Event| {
+                                        let target = ev.target().unwrap();
+                                        let input: web_sys::HtmlInputElement = target.unchecked_into();
+                                        auto_connect_sig.set(input.checked());
+                                    }
+                                />
+                                <span class="settings-toggle-slider"></span>
+                            </label>
+                        </div>
+                        <button class="settings-btn settings-btn-primary" on:click=on_add>"Add Host"</button>
+                    </div>
+                    <Show when=move || error_sig.get().is_some()>
+                        <p class="settings-error">{move || error_sig.get().unwrap_or_default()}</p>
+                    </Show>
+                </div>
+            </div>
+            </SettingsSection>
+        }
 }
 
 fn is_managed_remote_host(transport: &BridgeHostTransportConfig) -> bool {
@@ -2060,200 +2102,223 @@ fn AppearanceTab() -> impl IntoView {
     };
 
     view! {
-        <h2 class="settings-panel-title">"Appearance"</h2>
-        <div class="settings-field">
-            <label class="settings-label">"Sidebar layout"</label>
-            <p class="settings-description">"Vibe keeps agents and history in focus. Dinosaur includes developer tools. Each mode remembers its own sidebar layout on this client."</p>
-            <button class="settings-btn" on:click=move |_| {
-                layout_state.sidebar_layout.update(|layouts| *layouts.current_mut() = crate::sidebar_layout::SidebarLayout::new(layouts.mode));
-                layout_state.sidebar_storage_blocked.set(false);
-            }>"Reset sidebar layout"</button>
-        </div>
-
-        <p class="settings-description settings-panel-intro">
-            "How the Tyde window looks on this device, whichever host you connect to."
-        </p>
-
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
-                    <p class="settings-description">"Show backend names on history cards. Agent glyphs always identify the backend."</p>
-                </div>
-                <label class="settings-toggle">
-                    <input id="sidebar-backend-labels" type="checkbox"
-                        prop:checked=move || state.sidebar_backend_labels.get()
-                        on:change=move |ev: web_sys::Event| {
-                            let input: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                            let enabled = input.checked();
-                            state.sidebar_backend_labels.set(enabled);
-                            if let Some(storage) = local_storage() {
-                                let _ = storage.set_item(STORAGE_SIDEBAR_BACKEND_LABELS, if enabled { "true" } else { "false" });
-                            }
-                        }
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
+            <h2 class="settings-panel-title">"Appearance"</h2>
+            <p class="settings-description settings-panel-intro">"Customize this device’s colors, text and workspace layout."</p>
+    <SettingsSection title="Workspace">
+            <div class="settings-field">
+                <label class="settings-label">"Sidebar layout"</label>
+                <p class="settings-description">"Reset the current mode’s saved sidebar layout."</p>
+                <button class="settings-btn" on:click=move |_| {
+                    layout_state.sidebar_layout.update(|layouts| *layouts.current_mut() = crate::sidebar_layout::SidebarLayout::new(layouts.mode));
+                    layout_state.sidebar_storage_blocked.set(false);
+                }>"Reset sidebar layout"</button>
             </div>
-        </div>
 
-        <div class="settings-field">
-            <label class="settings-label" for="appearance-theme">"Appearance theme"</label>
-            <p class="settings-description">"Interface colors. Code colors are set in Code & Output Display."</p>
-            <select
-                id="appearance-theme"
-                aria-label="Appearance theme"
-                class="settings-select"
-                prop:value=move || state.theme.get()
-                on:change=on_theme
-            >
-                {crate::appearance::THEMES.iter().map(|theme| {
-                    view! { <option value=theme.id>{theme.label}</option> }
-                }).collect::<Vec<_>>()}
-            </select>
-        </div>
 
-        <div class="settings-field">
-            <label class="settings-label" for="chat-appearance">"Chat presentation"</label>
-            <select
-                id="chat-appearance"
-                aria-label="Chat presentation"
-                class="settings-select"
-                prop:value=move || state.chat_appearance.get().id()
-                on:change=move |ev: web_sys::Event| {
-                    let select: web_sys::HtmlSelectElement = event_target(&ev);
-                    let selected = select.value();
-                    select.set_value(state.chat_appearance.get_untracked().id());
-                    let appearance = match crate::appearance::ChatAppearance::from_id(&selected) {
-                        Ok(appearance) => appearance,
-                        Err(error) => {
-                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), error);
+
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
+                        <p class="settings-description">"Agent glyphs remain visible when names are hidden."</p>
+                    </div>
+                    <label class="settings-toggle">
+                        <input id="sidebar-backend-labels" type="checkbox"
+                            prop:checked=move || state.sidebar_backend_labels.get()
+                            on:change=move |ev: web_sys::Event| {
+                                let input: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                                let enabled = input.checked();
+                                state.sidebar_backend_labels.set(enabled);
+                                if let Some(storage) = local_storage() {
+                                    let _ = storage.set_item(STORAGE_SIDEBAR_BACKEND_LABELS, if enabled { "true" } else { "false" });
+                                }
+                            }
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+
+
+            </SettingsSection>
+    <SettingsSection title="Interface">
+            <div class="settings-field">
+                <label class="settings-label" for="appearance-theme">"Appearance theme"</label>
+                <p class="settings-description">"Code colors are set in Code display."</p>
+                <select
+                    id="appearance-theme"
+                    aria-label="Appearance theme"
+                    class="settings-select"
+                    prop:value=move || state.theme.get()
+                    on:change=on_theme
+                >
+                    {crate::appearance::THEMES.iter().map(|theme| {
+                        view! { <option value=theme.id>{theme.label}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
+            </div>
+
+            <div class="settings-field">
+                <label class="settings-label" for="chat-appearance">"Chat presentation"</label>
+                <select
+                    id="chat-appearance"
+                    aria-label="Chat presentation"
+                    class="settings-select"
+                    prop:value=move || state.chat_appearance.get().id()
+                    on:change=move |ev: web_sys::Event| {
+                        let select: web_sys::HtmlSelectElement = event_target(&ev);
+                        let selected = select.value();
+                        select.set_value(state.chat_appearance.get_untracked().id());
+                        let appearance = match crate::appearance::ChatAppearance::from_id(&selected) {
+                            Ok(appearance) => appearance,
+                            Err(error) => {
+                                crate::notices::report_error(crate::notices::NoticeScope::Settings(None), error);
+                                return;
+                            }
+                        };
+                        let Some(storage) = local_storage() else {
+                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation: local storage unavailable.");
+                            return;
+                        };
+                        if let Err(error) = storage.set_item(STORAGE_CHAT_APPEARANCE, appearance.id()) {
+                            log::error!("Could not save chat presentation: {error:?}");
+                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation.");
                             return;
                         }
-                    };
-                    let Some(storage) = local_storage() else {
-                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation: local storage unavailable.");
-                        return;
-                    };
-                    if let Err(error) = storage.set_item(STORAGE_CHAT_APPEARANCE, appearance.id()) {
-                        log::error!("Could not save chat presentation: {error:?}");
-                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save chat presentation.");
-                        return;
+                        state.chat_appearance.set(appearance);
+                        select.set_value(appearance.id());
                     }
-                    state.chat_appearance.set(appearance);
-                    select.set_value(appearance.id());
-                }
-            >
-                {crate::appearance::ChatAppearance::ALL.into_iter().map(|appearance| {
-                    view! { <option value=appearance.id()>{appearance.label()}</option> }
-                }).collect::<Vec<_>>()}
-            </select>
-        </div>
-
-        <div class="settings-field">
-            <label class="settings-label">"Font size"</label>
-            <p class="settings-description">"Base size for all interface, chat, and code text."</p>
-            <div class="settings-inline-control">
-                <input
-                    type="range"
-                    class="settings-slider"
-                    min="11"
-                    max="20"
-                    prop:value=move || state.font_size.get().to_string()
-                    on:input=on_font_size
-                />
-                <span class="settings-slider-value">{move || format!("{}px", state.font_size.get())}</span>
+                >
+                    {crate::appearance::ChatAppearance::ALL.into_iter().map(|appearance| {
+                        view! { <option value=appearance.id()>{appearance.label()}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
             </div>
-        </div>
 
-        <div class="settings-field">
-            <label class="settings-label">"Font family"</label>
-            <p class="settings-description">"Typeface for interface text and chat. Code always uses a monospace font."</p>
-            <select
-                class="settings-select"
-                prop:value=move || state.font_family.get()
-                on:change=on_font_family
-            >
-                {FONT_FAMILIES.iter().map(|(key, label, _)| {
-                    view! { <option value=*key>{*label}</option> }
-                }).collect::<Vec<_>>()}
-            </select>
-        </div>
+            <div class="settings-field">
+                <label class="settings-label">{move || format!("Font size ({}px)", state.font_size.get())}</label>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Tab bar"</label>
-                    <p class="settings-description">"Keep several chats, files, and diffs open in tabs. When off, opening something replaces the current view."</p>
-                </div>
-                <label class="settings-toggle">
+                <div class="settings-inline-control">
                     <input
-                        type="checkbox"
-                        prop:checked=move || state.tabs_enabled.get()
-                        on:change=move |ev: web_sys::Event| {
-                            let target = ev.target().unwrap();
-                            let input: web_sys::HtmlInputElement = target.unchecked_into();
-                            let enabled = input.checked();
-                            state.tabs_enabled.set(enabled);
-                            if let Some(storage) = local_storage() {
-                                let _ = storage.set_item(STORAGE_TABS_ENABLED, if enabled { "true" } else { "false" });
-                            }
-                        }
+                        type="range"
+                        class="settings-slider"
+                        min="11"
+                        max="20"
+                        prop:value=move || state.font_size.get().to_string()
+                        on:input=on_font_size
                     />
-                    <span class="settings-toggle-slider"></span>
-                </label>
+                </div>
             </div>
-        </div>
-    }
+
+            <div class="settings-field">
+                <label class="settings-label">"Font family"</label>
+                <p class="settings-description">"Code keeps its monospace font."</p>
+                <select
+                    class="settings-select"
+                    prop:value=move || state.font_family.get()
+                    on:change=on_font_family
+                >
+                    {FONT_FAMILIES.iter().map(|(key, label, _)| {
+                        view! { <option value=*key>{*label}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
+            </div>
+
+
+            </SettingsSection>
+    <SettingsSection title="Open views">
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Tab bar"</label>
+                        <p class="settings-description">"When off, opening a view replaces the current one."</p>
+                    </div>
+                    <label class="settings-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || state.tabs_enabled.get()
+                            on:change=move |ev: web_sys::Event| {
+                                let target = ev.target().unwrap();
+                                let input: web_sys::HtmlInputElement = target.unchecked_into();
+                                let enabled = input.checked();
+                                state.tabs_enabled.set(enabled);
+                                if let Some(storage) = local_storage() {
+                                    let _ = storage.set_item(STORAGE_TABS_ENABLED, if enabled { "true" } else { "false" });
+                                }
+                            }
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+            </SettingsSection>
+
+        }
 }
 
 #[component]
 pub(crate) fn ComposerSettings() -> impl IntoView {
-    let state = expect_context::<AppState>();
     view! {
         <h2 class="settings-panel-title">"Composer"</h2>
-        <div class="settings-field">
-            <label class="settings-label" for="default-send-action">"Default send action"</label>
-            <p class="settings-description">"Enter and the send button use this action while an agent is working. Idle agents receive a normal message. The More send actions menu overrides it for one message. Shift+Enter inserts a newline. Saved on this device."</p>
-            <Show when=move || state.default_send_action.get().is_none()>
-                <p role="alert">"Your saved default send action could not be loaded. Enable local storage and choose an action to enable default sending. Explicit send actions remain available."</p>
-            </Show>
-            <select id="default-send-action" class="settings-select"
-                prop:value=move || match state.default_send_action.get() {
-                    Some(action) => action.value(),
-                    None => "",
-                }
-                on:change=move |ev: web_sys::Event| {
-                    let select: web_sys::HtmlSelectElement = event_target(&ev);
-                    let selected = select.value();
-                    select.set_value(state.default_send_action.get_untracked().map_or("", DefaultSendAction::value));
-                    let Some(action) = DefaultSendAction::from_value(&selected) else {
-                        log::error!("invalid default send action selection");
-                        return;
-                    };
-                    let Some(storage) = local_storage() else {
-                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action: local storage is unavailable.");
-                        return;
-                    };
-                    if let Err(error) = storage.set_item(STORAGE_DEFAULT_SEND_ACTION, action.value()) {
-                        log::error!("failed to save default send action: {error:?}");
-                        crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action.");
-                        return;
-                    }
-                    select.set_value(action.value());
-                    state.default_send_action.set(Some(action));
-                }
-            >
-                <option value="" disabled>"Choose a default send action"</option>
-                <option value="cancel_and_send">"Cancel + send"</option>
-                <option value="queue">"Queue"</option>
-                <option value="steer">"Steer"</option>
-            </select>
-        </div>
+        <ComposerSendActionField />
     }
 }
 
-/// How code, diffs, and tool output are rendered. Split out of
+#[component]
+fn ComposerTab() -> impl IntoView {
+    view! {
+        <h2 class="settings-panel-title">"Composer"</h2>
+        <p class="settings-description settings-panel-intro">"Choose what sending a message does while an agent is working."</p>
+        <SettingsSection title="Sending"><ComposerSendActionField concise=true /></SettingsSection>
+    }
+}
+
+#[component]
+fn ComposerSendActionField(#[prop(optional)] concise: bool) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+            <div class="settings-field">
+                <label class="settings-label" for="default-send-action">"Default send action"</label>
+                <p class="settings-description">{if concise { "Idle agents receive a normal message. More send actions overrides this choice once; Shift+Enter inserts a newline." } else { "Enter and the send button use this action while an agent is working. Idle agents receive a normal message. The More send actions menu overrides it for one message. Shift+Enter inserts a newline. Saved on this device." }}</p>
+                <Show when=move || state.default_send_action.get().is_none()>
+                    <p role="alert">"Your saved default send action could not be loaded. Enable local storage and choose an action to enable default sending. Explicit send actions remain available."</p>
+                </Show>
+                <select id="default-send-action" class="settings-select"
+                    prop:value=move || match state.default_send_action.get() {
+                        Some(action) => action.value(),
+                        None => "",
+                    }
+                    on:change=move |ev: web_sys::Event| {
+                        let select: web_sys::HtmlSelectElement = event_target(&ev);
+                        let selected = select.value();
+                        select.set_value(state.default_send_action.get_untracked().map_or("", DefaultSendAction::value));
+                        let Some(action) = DefaultSendAction::from_value(&selected) else {
+                            log::error!("invalid default send action selection");
+                            return;
+                        };
+                        let Some(storage) = local_storage() else {
+                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action: local storage is unavailable.");
+                            return;
+                        };
+                        if let Err(error) = storage.set_item(STORAGE_DEFAULT_SEND_ACTION, action.value()) {
+                            log::error!("failed to save default send action: {error:?}");
+                            crate::notices::report_error(crate::notices::NoticeScope::Settings(None), "Could not save default send action.");
+                            return;
+                        }
+                        select.set_value(action.value());
+                        state.default_send_action.set(Some(action));
+                    }
+                >
+                    <option value="" disabled>"Choose a default send action"</option>
+                    <option value="cancel_and_send">"Cancel + send"</option>
+                    <option value="queue">"Queue"</option>
+                    <option value="steer">"Steer"</option>
+                </select>
+            </div>
+    }
+}
+
+/// How code and diffs are rendered. Split out of
 /// [`AppearanceTab`] because these are reading-defaults for content an agent
 /// produced, not chrome: the questions they answer ("how much of this diff do I
 /// want to see?") are asked at a different time than "what font do I like?".
@@ -2275,69 +2340,82 @@ fn DisplayTab() -> impl IntoView {
     let syntax_themes: Vec<String> = crate::syntax_highlight::available_themes();
 
     view! {
-        <h2 class="settings-panel-title">"Code & Output Display"</h2>
+            <h2 class="settings-panel-title">"Code display"</h2>
 
-        <p class="settings-description settings-panel-intro">
-            "Defaults for how files, diffs, and tool results are shown on this device. Individual diffs and tool cards can still be expanded in place."
-        </p>
+            <p class="settings-description settings-panel-intro">
+                "Set code colors and the default view for files and diffs."
+            </p>
 
-        <div class="settings-field">
-            <label class="settings-label">"Syntax theme"</label>
-            <p class="settings-description">"Code colors in files, diffs, and chat. Open files update when reopened."</p>
-            <select
-                class="settings-select"
-                prop:value=move || state.syntax_theme.get()
-                on:change=on_syntax_theme
-            >
-                {syntax_themes.into_iter().map(|name| {
-                    let label = name.clone();
-                    view! { <option value=name>{label}</option> }
-                }).collect::<Vec<_>>()}
-            </select>
-        </div>
-
-        <div class="settings-field">
-            <label class="settings-label">"Diff layout"</label>
-            <p class="settings-description">"Unified fits narrow panels. Side by Side makes rewritten lines easier to compare."</p>
-            <div class="settings-segmented-control">
-                <button
-                    class=move || if state.diff_view_mode.get() == DiffViewMode::Unified { "segment active" } else { "segment" }
-                    on:click=move |_| {
-                        state.diff_view_mode.set(DiffViewMode::Unified);
-                        persist_diff_view_mode(DiffViewMode::Unified);
-                    }
-                >"Unified"</button>
-                <button
-                    class=move || if state.diff_view_mode.get() == DiffViewMode::SideBySide { "segment active" } else { "segment" }
-                    on:click=move |_| {
-                        state.diff_view_mode.set(DiffViewMode::SideBySide);
-                        persist_diff_view_mode(DiffViewMode::SideBySide);
-                    }
-                >"Side by Side"</button>
+    <SettingsSection title="Files and diffs">
+            <div class="settings-field">
+                <label class="settings-label">"Syntax theme"</label>
+                <p class="settings-description">"Code colors in files, diffs, and chat. Open files update when reopened."</p>
+                <select
+                    class="settings-select"
+                    prop:value=move || state.syntax_theme.get()
+                    on:change=on_syntax_theme
+                >
+                    {syntax_themes.into_iter().map(|name| {
+                        let label = name.clone();
+                        view! { <option value=name>{label}</option> }
+                    }).collect::<Vec<_>>()}
+                </select>
             </div>
-        </div>
 
-        <div class="settings-field">
-            <label class="settings-label">"Diff context"</label>
-            <p class="settings-description">"Show only the changed regions, or the whole file with changes highlighted."</p>
-            <div class="settings-segmented-control">
-                <button
-                    class=move || if state.diff_context_mode.get() == DiffContextMode::Hunks { "segment active" } else { "segment" }
-                    on:click=move |_| {
-                        state.diff_context_mode.set(DiffContextMode::Hunks);
-                        persist_diff_context_mode(DiffContextMode::Hunks);
-                    }
-                >"Hunks"</button>
-                <button
-                    class=move || if state.diff_context_mode.get() == DiffContextMode::FullFile { "segment active" } else { "segment" }
-                    on:click=move |_| {
-                        state.diff_context_mode.set(DiffContextMode::FullFile);
-                        persist_diff_context_mode(DiffContextMode::FullFile);
-                    }
-                >"Full File"</button>
+            <div class="settings-field">
+                <label class="settings-label">"Diff layout"</label>
+
+                <div class="settings-segmented-control">
+                    <button
+                        class=move || if state.diff_view_mode.get() == DiffViewMode::Unified { "segment active" } else { "segment" }
+                        on:click=move |_| {
+                            state.diff_view_mode.set(DiffViewMode::Unified);
+                            persist_diff_view_mode(DiffViewMode::Unified);
+                        }
+                    >"Unified"</button>
+                    <button
+                        class=move || if state.diff_view_mode.get() == DiffViewMode::SideBySide { "segment active" } else { "segment" }
+                        on:click=move |_| {
+                            state.diff_view_mode.set(DiffViewMode::SideBySide);
+                            persist_diff_view_mode(DiffViewMode::SideBySide);
+                        }
+                    >"Side by Side"</button>
+                </div>
             </div>
-        </div>
 
+            <div class="settings-field">
+                <label class="settings-label">"Diff context"</label>
+
+                <div class="settings-segmented-control">
+                    <button
+                        class=move || if state.diff_context_mode.get() == DiffContextMode::Hunks { "segment active" } else { "segment" }
+                        on:click=move |_| {
+                            state.diff_context_mode.set(DiffContextMode::Hunks);
+                            persist_diff_context_mode(DiffContextMode::Hunks);
+                        }
+                    >"Hunks"</button>
+                    <button
+                        class=move || if state.diff_context_mode.get() == DiffContextMode::FullFile { "segment active" } else { "segment" }
+                        on:click=move |_| {
+                            state.diff_context_mode.set(DiffContextMode::FullFile);
+                            persist_diff_context_mode(DiffContextMode::FullFile);
+                        }
+                    >"Full File"</button>
+                </div>
+            </div>
+
+            </SettingsSection>
+
+        }
+}
+
+#[component]
+fn ToolOutputTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        <h2 class="settings-panel-title">"Tool output"</h2>
+        <p class="settings-description settings-panel-intro">"Choose how much output tool cards show by default."</p>
+        <SettingsSection title="Tool cards">
         <div class="settings-field">
             <label class="settings-label">"Tool output"</label>
             <p class="settings-description">"Summary and Compact collapse tool cards to one line; an expanded Compact card shows a short preview. Full shows all output."</p>
@@ -2364,7 +2442,7 @@ fn DisplayTab() -> impl IntoView {
                     }
                 >"Full"</button>
             </div>
-        </div>
+        </div>        </SettingsSection>
     }
 }
 
@@ -2374,14 +2452,17 @@ fn DisplayTab() -> impl IntoView {
 #[component]
 fn CodeIntelligenceTab() -> impl IntoView {
     view! {
-        <h2 class="settings-panel-title">"Code Intelligence"</h2>
+            <h2 class="settings-panel-title">"Code Intelligence"</h2>
 
-        <p class="settings-description settings-panel-intro">
-            "Navigation, references, hover types, and diagnostics, powered by language servers on this host."
-        </p>
+            <p class="settings-description settings-panel-intro">
+                "Navigation, references, hover types, and diagnostics, powered by language servers on this host."
+            </p>
 
-        <CodeIntelSettingsSection />
-    }
+    <SettingsSection title="Language servers">
+            <CodeIntelSettingsSection />
+            </SettingsSection>
+
+        }
 }
 
 /// One labelled free-text host setting, committed on change.
@@ -2587,52 +2668,55 @@ fn AiSummariesTab() -> impl IntoView {
     };
 
     view! {
-        <h2 class="settings-panel-title">"AI Summaries"</h2>
+            <h2 class="settings-panel-title">"AI Summaries"</h2>
 
-        <p class="settings-description settings-panel-intro">
-            "Short labels Tyde writes about your agents. Each is a background model call, so both settings cost money."
-        </p>
+            <p class="settings-description settings-panel-intro">
+                "Name agents and summarize their activity with paid background model calls."
+            </p>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Auto-generate agent names"</label>
-                    <p class="settings-description">
-                        "Title unnamed agents from their first prompt, such as \"Fix pairing timeout\". One small model call per agent. When off, the name is taken from the prompt text."
-                    </p>
+    <SettingsSection title="Background labels">
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Auto-generate agent names"</label>
+                        <p class="settings-description">
+                            "One paid call per unnamed agent. When off, use the prompt text."
+                        </p>
+                    </div>
+                    <label class="settings-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=names_checked
+                            disabled=names_disabled
+                            on:change=names_on_toggle
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
                 </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=names_checked
-                        disabled=names_disabled
-                        on:change=names_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
             </div>
-        </div>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Agent activity summaries"</label>
-                    <p class="settings-description">
-                        "Show a live line describing what each running agent is doing. Repeats while agents are active, so cost grows with how many you run."
-                    </p>
+            <div class="settings-field">
+                <div class="settings-toggle-row">
+                    <div>
+                        <label class="settings-label">"Agent activity summaries"</label>
+                        <p class="settings-description">
+                            "Repeated paid calls while agents are active."
+                        </p>
+                    </div>
+                    <label class="settings-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=summaries_checked
+                            disabled=summaries_disabled
+                            on:change=summaries_on_toggle
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
                 </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=summaries_checked
-                        disabled=summaries_disabled
-                        on:change=summaries_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
             </div>
-        </div>
-    }
+            </SettingsSection>
+
+        }
 }
 
 #[component]
@@ -2641,15 +2725,19 @@ fn ReviewSettingsTab() -> impl IntoView {
     let toggle_state = state.clone();
     let settings = Memo::new(move |_| state.selected_host_settings());
     view! {
-        <section class="review-settings">
-            <h2 class="settings-panel-title">"Review"</h2>
-            <div class="settings-toggle-row"><span class="settings-label">"Enable reviews"</span><label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Enable reviews"
-                prop:checked=move || settings.get().is_some_and(|s| s.review.enabled)
-                disabled=move || settings.get().is_none()
-                on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) /><span class="settings-toggle-slider"></span></label></div>
-            <ReviewConfigurationFields />
-        </section>
-    }
+            <section class="review-settings">
+                <h2 class="settings-panel-title">"Review"</h2>
+                <p class="settings-description settings-panel-intro">"Choose how agents review changes and which aspects they check."</p>
+    <SettingsSection title="Review defaults">
+                <div class="settings-toggle-row"><span class="settings-label">"Enable reviews"</span><label class="settings-toggle"><input type="checkbox" role="switch" aria-label="Enable reviews"
+                    prop:checked=move || settings.get().is_some_and(|s| s.review.enabled)
+                    disabled=move || settings.get().is_none()
+                    on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) /><span class="settings-toggle-slider"></span></label></div>
+                <ReviewConfigurationFields />
+            </SettingsSection>
+
+            </section>
+        }
 }
 
 #[component]
@@ -2677,6 +2765,13 @@ pub(super) fn ReviewConfigurationFields(
     let add_state = StoredValue::new(state.clone());
     let delete_state = StoredValue::new(state.clone());
     let restore_state = StoredValue::new(state.clone());
+    let mode_help = view! {
+        <dl class="review-mode-help" aria-label="Review mode descriptions">
+            <div><dt>"Inline"</dt><dd>"The authoring agent reviews its own work. No separate reviewers or Review-panel findings."</dd></div>
+            <div><dt>"Single reviewer"</dt><dd>"One reviewer inherits the authoring agent’s context, backend and model to check all selected aspects. Requires native forks and enforced read-only support."</dd></div>
+            <div><dt>"Review team"</dt><dd>"Reviewers use your configured sources and team layout to cover the selected aspects."</dd></div>
+        </dl>
+    }.into_any();
     view! {
         <div class="settings-segmented-control review-segments" role="group" aria-label="Review mode">
             {[protocol::ReviewMode::Inline, protocol::ReviewMode::SingleReviewer, protocol::ReviewMode::ReviewTeam].into_iter().map(|mode| {
@@ -2686,11 +2781,11 @@ pub(super) fn ReviewConfigurationFields(
                     on:click=move |_| send_host_replace(&state, "/review/default_mode", mode)>{mode.label()}</button> }
             }).collect_view()}
         </div>
-        <dl class="review-mode-help" aria-label="Review mode descriptions">
-            <div><dt>"Inline"</dt><dd>"The authoring agent reviews its own work. No separate reviewers or Review-panel findings."</dd></div>
-            <div><dt>"Single reviewer"</dt><dd>"One reviewer inherits the authoring agent’s context, backend and model to check all selected aspects. Requires native forks and enforced read-only support."</dd></div>
-            <div><dt>"Review team"</dt><dd>"Reviewers use your configured sources and team layout to cover the selected aspects."</dd></div>
-        </dl>
+        {if compact {
+            mode_help
+        } else {
+            view! { <details class="settings-advanced"><summary>"Review modes"</summary>{mode_help}</details> }.into_any()
+        }}
         <Show when=move || settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::ReviewTeam)>
             <h3 class="settings-section-title">"Team layout"</h3>
             <div class="settings-segmented-control review-segments" role="group" aria-label="Team layout">
@@ -3074,19 +3169,23 @@ fn ReviewAspectEditor(
 /// per idle transition, so it defaults off.
 #[component]
 fn SupervisorTab() -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let fields_state = state.clone();
-
+    let state = StoredValue::new(expect_context::<AppState>());
     view! {
         <h2 class="settings-panel-title">"Supervisor"</h2>
+        <p class="settings-description settings-panel-intro">"Check stopped agents and nudge unfinished work to continue. Each check and retry is a paid model call."</p>
+        <SettingsSection title="Monitoring">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/enabled", "/supervisor/supervise_restored_agents"])}</SettingsSection>
+        <SettingsSection title="Stalled turns">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/stall_timeout_enabled", "/supervisor/stall_timeout_seconds"])}</SettingsSection>
+        <SettingsSection title="Follow-ups">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/max_kicks_per_task", "/supervisor/retry_attempts", "/supervisor/cost_tier"])}</SettingsSection>
+    }
+}
 
-        <p class="settings-description settings-panel-intro">
-            "When an agent stops, the supervisor checks whether the work is done and nudges it to continue if not. Each check is a paid model call."
-        </p>
-
-        <div class="settings-schema-fields">
-            {move || host_schema_section(&fields_state, "supervisor")}
-        </div>
+#[component]
+fn AutoCompactionTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        <h2 class="settings-panel-title">"Auto-compaction"</h2>
+        <p class="settings-description settings-panel-intro">"Compact completed agents after they become idle. Requires Supervisor to be enabled."</p>
+        <SettingsSection title="Finished agents">{move || host_schema_fields(&state, "supervisor", &["/supervisor/auto_compact_on_success", "/supervisor/auto_compact_inactivity_delay_seconds", "/supervisor/auto_compact_min_context_tokens"])}</SettingsSection>
     }
 }
 
@@ -3095,14 +3194,17 @@ fn UsageManagementTab() -> impl IntoView {
     let usage_state = expect_context::<AppState>();
 
     view! {
-        <h2 class="settings-panel-title">"Usage Limits"</h2>
-        <p class="settings-description settings-panel-intro">
-            "Pause agents before they exhaust a shared subscription quota, and resume them when it resets."
-        </p>
-        <div class="settings-schema-fields">
-            {move || host_schema_section(&usage_state, "usage_limits")}
-        </div>
-    }
+            <h2 class="settings-panel-title">"Usage Limits"</h2>
+            <p class="settings-description settings-panel-intro">
+                "Pause agents before they exhaust a shared subscription quota, and resume them when it resets."
+            </p>
+    <SettingsSection title="Quota management">
+            <div class="settings-schema-fields">
+                {move || host_schema_section(&usage_state, "usage_limits")}
+            </div>
+            </SettingsSection>
+
+        }
 }
 
 #[component]
@@ -3110,128 +3212,134 @@ fn BackendsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     view! {
-        <h2 class="settings-panel-title">"Backends"</h2>
-        <p class="settings-description settings-panel-intro">
-            "The coding agents Tyde can run on this host. Each backend has its own page in the sidebar for configuration."
-        </p>
+            <h2 class="settings-panel-title">"Backends"</h2>
+            <p class="settings-description settings-panel-intro">
+                "Choose which coding agents are available and the default for new chats."
+            </p>
 
-        <div class="settings-field">
-            <label class="settings-label">"Default backend"</label>
-            <p class="settings-description">"Used for new chats when you don't pick a backend or launch profile."</p>
-            {move || match state.selected_host_settings() {
-                Some(settings) => {
-                    let state_for_change = state.clone();
-                    let has_enabled = !settings.enabled_backends.is_empty();
-                    let selected_profile = settings.default_launch_profile_id.clone();
-                    let default_backend_value = match &selected_profile {
-                        Some(id) => format!("profile:{}", id.0),
-                        None => settings.default_backend.map(backend_value).unwrap_or("").to_owned(),
-                    };
-                    let catalog = state.selected_host_id.get().and_then(|host_id| {
-                        state.launch_profile_catalog.get().get(&host_id).cloned()
-                    });
-                    let entries = catalog.map(|catalog| catalog.entries).unwrap_or_default();
-                    let missing_selection = selected_profile.as_ref().filter(|id| {
-                        !entries.iter().any(|entry| entry.id() == *id)
-                    }).map(|id| view! {
-                        <option value=format!("profile:{}", id.0) disabled=true>
-                            {format!("{} — unavailable launch profile", id.0)}
-                        </option>
-                    });
-                    let profile_options = entries.into_iter().filter(|entry| {
-                        entry.kind() == protocol::LaunchProfileKind::Custom
-                            || selected_profile.as_ref() == Some(entry.id())
-                    }).map(|entry| {
-                        let value = format!("profile:{}", entry.id().0);
-                        match entry {
-                            LaunchProfileEntry::Ready { profile } => view! {
-                                <option value=value>
-                                    {format!("{} ({})", profile.label, backend_label(profile.backend_kind))}
-                                </option>
-                            }.into_any(),
-                            LaunchProfileEntry::Unavailable { label, backend_kind, message, .. } => view! {
-                                <option value=value disabled=true>
-                                    {format!("{} ({}) — unavailable: {}", label, backend_label(backend_kind), message)}
-                                </option>
-                            }.into_any(),
-                        }
-                    }).collect::<Vec<_>>();
-                    let options = settings
-                        .enabled_backends
-                        .into_iter()
-                        .map(|backend| {
-                            view! {
-                                <option value=backend_value(backend)>{backend_label(backend)}</option>
+    <SettingsSection title="New chats">
+            <div class="settings-field">
+                <label class="settings-label">"Default backend"</label>
+                <p class="settings-description">"Used for new chats when you don't pick a backend or launch profile."</p>
+                {move || match state.selected_host_settings() {
+                    Some(settings) => {
+                        let state_for_change = state.clone();
+                        let has_enabled = !settings.enabled_backends.is_empty();
+                        let selected_profile = settings.default_launch_profile_id.clone();
+                        let default_backend_value = match &selected_profile {
+                            Some(id) => format!("profile:{}", id.0),
+                            None => settings.default_backend.map(backend_value).unwrap_or("").to_owned(),
+                        };
+                        let catalog = state.selected_host_id.get().and_then(|host_id| {
+                            state.launch_profile_catalog.get().get(&host_id).cloned()
+                        });
+                        let entries = catalog.map(|catalog| catalog.entries).unwrap_or_default();
+                        let missing_selection = selected_profile.as_ref().filter(|id| {
+                            !entries.iter().any(|entry| entry.id() == *id)
+                        }).map(|id| view! {
+                            <option value=format!("profile:{}", id.0) disabled=true>
+                                {format!("{} — unavailable launch profile", id.0)}
+                            </option>
+                        });
+                        let profile_options = entries.into_iter().filter(|entry| {
+                            entry.kind() == protocol::LaunchProfileKind::Custom
+                                || selected_profile.as_ref() == Some(entry.id())
+                        }).map(|entry| {
+                            let value = format!("profile:{}", entry.id().0);
+                            match entry {
+                                LaunchProfileEntry::Ready { profile } => view! {
+                                    <option value=value>
+                                        {format!("{} ({})", profile.label, backend_label(profile.backend_kind))}
+                                    </option>
+                                }.into_any(),
+                                LaunchProfileEntry::Unavailable { label, backend_kind, message, .. } => view! {
+                                    <option value=value disabled=true>
+                                        {format!("{} ({}) — unavailable: {}", label, backend_label(backend_kind), message)}
+                                    </option>
+                                }.into_any(),
                             }
-                        })
-                        .collect::<Vec<_>>();
+                        }).collect::<Vec<_>>();
+                        let options = settings
+                            .enabled_backends
+                            .into_iter()
+                            .map(|backend| {
+                                view! {
+                                    <option value=backend_value(backend)>{backend_label(backend)}</option>
+                                }
+                            })
+                            .collect::<Vec<_>>();
 
-                    view! {
-                        <select
-                            class="settings-select"
-                            aria-label="Default backend"
-                            prop:value=default_backend_value
-                            disabled=!has_enabled && selected_profile.is_none()
-                            on:change=move |ev: web_sys::Event| {
-                                let target = ev.target().unwrap();
-                                let el: web_sys::HtmlSelectElement = target.unchecked_into();
-                                let value = el.value();
-                                let (default_backend, default_profile) = if value.is_empty() {
-                                    (None, None)
-                                } else if let Some(profile_id) = value.strip_prefix("profile:") {
-                                    let profile = state_for_change.selected_host_id.get_untracked().and_then(|host_id| {
-                                        state_for_change.launch_profile_catalog.with_untracked(|catalogs| {
-                                            catalogs.get(&host_id)?.entries.iter().find_map(|entry| match entry {
-                                                LaunchProfileEntry::Ready { profile } if profile.id.0 == profile_id => Some(profile.clone()),
-                                                _ => None,
+                        view! {
+                            <select
+                                class="settings-select"
+                                aria-label="Default backend"
+                                prop:value=default_backend_value
+                                disabled=!has_enabled && selected_profile.is_none()
+                                on:change=move |ev: web_sys::Event| {
+                                    let target = ev.target().unwrap();
+                                    let el: web_sys::HtmlSelectElement = target.unchecked_into();
+                                    let value = el.value();
+                                    let (default_backend, default_profile) = if value.is_empty() {
+                                        (None, None)
+                                    } else if let Some(profile_id) = value.strip_prefix("profile:") {
+                                        let profile = state_for_change.selected_host_id.get_untracked().and_then(|host_id| {
+                                            state_for_change.launch_profile_catalog.with_untracked(|catalogs| {
+                                                catalogs.get(&host_id)?.entries.iter().find_map(|entry| match entry {
+                                                    LaunchProfileEntry::Ready { profile } if profile.id.0 == profile_id => Some(profile.clone()),
+                                                    _ => None,
+                                                })
                                             })
-                                        })
+                                        });
+                                        let Some(profile) = profile else {
+                                            crate::notices::report_settings_error(&state_for_change, "This launch profile is no longer available.");
+                                            return;
+                                        };
+                                        (Some(profile.backend_kind), Some(profile.id))
+                                    } else {
+                                        let Some(kind) = parse_backend_kind(&value) else {
+                                            log::error!("unknown backend value in default select");
+                                            crate::notices::report_settings_error(&state_for_change, "This backend selection is invalid.");
+                                            return;
+                                        };
+                                        (Some(kind), None)
+                                    };
+                                    send_host_change(&state_for_change, move |doc| {
+                                        Ok(vec![
+                                            replace_setting_op(doc, "/default_backend".to_owned(), serde_json::json!(default_backend))?,
+                                            replace_setting_op(doc, "/default_launch_profile_id".to_owned(), serde_json::json!(default_profile))?,
+                                        ])
                                     });
-                                    let Some(profile) = profile else {
-                                        crate::notices::report_settings_error(&state_for_change, "This launch profile is no longer available.");
-                                        return;
-                                    };
-                                    (Some(profile.backend_kind), Some(profile.id))
-                                } else {
-                                    let Some(kind) = parse_backend_kind(&value) else {
-                                        log::error!("unknown backend value in default select");
-                                        crate::notices::report_settings_error(&state_for_change, "This backend selection is invalid.");
-                                        return;
-                                    };
-                                    (Some(kind), None)
-                                };
-                                send_host_change(&state_for_change, move |doc| {
-                                    Ok(vec![
-                                        replace_setting_op(doc, "/default_backend".to_owned(), serde_json::json!(default_backend))?,
-                                        replace_setting_op(doc, "/default_launch_profile_id".to_owned(), serde_json::json!(default_profile))?,
-                                    ])
-                                });
-                            }
-                        >
-                            <option value="">"No default backend"</option>
-                            {options}
-                            <optgroup label="Launch profiles">
-                                {missing_selection}
-                                {profile_options}
-                            </optgroup>
-                        </select>
+                                }
+                            >
+                                <option value="">"No default backend"</option>
+                                {options}
+                                <optgroup label="Launch profiles">
+                                    {missing_selection}
+                                    {profile_options}
+                                </optgroup>
+                            </select>
+                        }
+                        .into_any()
                     }
-                    .into_any()
-                }
-                None => view! { <p class="settings-description">"Host settings not loaded for the selected host."</p> }.into_any(),
-            }}
-        </div>
-
-        <div class="settings-field">
-            <label class="settings-label">"Enabled backends"</label>
-            <div class="settings-backend-list">
-                {all_backends()
-                    .into_iter()
-                    .map(|kind| view! { <BackendCard kind /> })
-                    .collect::<Vec<_>>()}
+                    None => view! { <p class="settings-description">"Host settings not loaded for the selected host."</p> }.into_any(),
+                }}
             </div>
-        </div>
-    }
+
+
+            </SettingsSection>
+    <SettingsSection title="Availability">
+            <div class="settings-field">
+                <label class="settings-label">"Enabled backends"</label>
+                <div class="settings-backend-list">
+                    {all_backends()
+                        .into_iter()
+                        .map(|kind| view! { <BackendCard kind /> })
+                        .collect::<Vec<_>>()}
+                </div>
+            </div>
+            </SettingsSection>
+
+        }
 }
 
 fn usage_page_matches_query(query: &str) -> bool {
@@ -3259,12 +3367,15 @@ fn usage_page_matches_query(query: &str) -> bool {
 #[component]
 fn UsagePage() -> impl IntoView {
     view! {
-        <h2 class="settings-panel-title">"Usage"</h2>
-        <p class="settings-description settings-panel-intro">
-            "Subscription capacity each backend reports for its signed-in account on this host. Advisory only: Tyde never switches backends because of it, and never estimates a figure from its own token counts."
-        </p>
-        <SubscriptionCapacitySection />
-    }
+            <h2 class="settings-panel-title">"Usage"</h2>
+            <p class="settings-description settings-panel-intro">
+                "Subscription capacity each backend reports for its signed-in account on this host. Advisory only: Tyde never switches backends because of it, and never estimates a figure from its own token counts."
+            </p>
+    <SettingsSection title="Account capacity">
+            <SubscriptionCapacitySection />
+            </SettingsSection>
+
+        }
 }
 
 fn launch_profiles_page_matches_query(query: &str) -> bool {
@@ -3292,6 +3403,7 @@ fn launch_profiles_page_matches_query(query: &str) -> bool {
 fn LaunchProfilesPage() -> impl IntoView {
     view! {
         <LaunchProfilesSection />
+
     }
 }
 
@@ -3465,6 +3577,7 @@ fn LaunchProfilesSection() -> impl IntoView {
         <p class="settings-description settings-panel-intro">
             "Named presets of a backend and its settings, such as \"Deep review\" or \"Quick fix\". They appear in the new-agent menu and agents can use them for children."
         </p>
+        <SettingsSection title="Profiles">
         <div class="settings-field">
 
             {move || form.get().map(|f| view! { <LaunchProfileEditor form=f editor_signal=form /> })}
@@ -3503,6 +3616,7 @@ fn LaunchProfilesSection() -> impl IntoView {
                 })
             }}
         </div>
+        </SettingsSection>
     }
 }
 
@@ -3847,27 +3961,32 @@ fn LaunchProfileEditor(
 #[component]
 fn SubagentsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let fields_state = state.clone();
-    let rows_state = state.clone();
-
     view! {
         <h2 class="settings-panel-title">"Subagents"</h2>
+        <p class="settings-description settings-panel-intro">"Let agents delegate work to child agents. Each child adds model usage."</p>
+        <SettingsSection title="Delegation">{move || host_schema_fields(&state, "subagents", &["/tyde_agent_control_mcp_enabled", "/tyde_agent_control_max_depth"])}</SettingsSection>
+    }
+}
 
-        <p class="settings-description settings-panel-intro">
-            "Agents can split work across child agents running in parallel. Each child adds model usage."
-        </p>
+#[component]
+fn BackendPreferencesTab() -> impl IntoView {
+    view! {
+        <h2 class="settings-panel-title">"Backend preferences"</h2>
+        <p class="settings-description settings-panel-intro">"Order the launch profiles agents should prefer for children. Explicit backend or profile requests take precedence."</p>
+        <SettingsSection title="Preferred profiles"><DelegationPreference /></SettingsSection>
+    }
+}
 
-        <div class="settings-schema-fields">
-            {move || host_schema_section(&fields_state, "subagents")}
-        </div>
-
-        {move || complexity_tier_rows(&rows_state).map(|rows| view! {
-            <div class="settings-schema-nested">
-                <div class="settings-field">{rows}</div>
-            </div>
+#[component]
+fn ComplexityTiersTab() -> impl IntoView {
+    let state = StoredValue::new(expect_context::<AppState>());
+    view! {
+        <h2 class="settings-panel-title">"Complexity tiers"</h2>
+        <p class="settings-description settings-panel-intro">"Choose low and high cost configurations for delegated tasks."</p>
+        <SettingsSection title="Task routing">{move || host_schema_fields(&state.get_value(), "subagents", &["/complexity_tiers_enabled"])}</SettingsSection>
+        {move || complexity_tier_rows(&state.get_value()).map(|rows| view! {
+            <SettingsSection title="Backend tiers">{rows}</SettingsSection>
         })}
-
-        <DelegationPreference />
     }
 }
 
@@ -3879,12 +3998,7 @@ fn DelegationPreference() -> impl IntoView {
 
     view! {
         <section class="settings-field delegation-preference" aria-labelledby="delegation-preference-title">
-            <h3 id="delegation-preference-title" class="settings-section-title">
-                "Delegation preference"
-            </h3>
-            <p class="settings-description">
-                "Launch profiles agents should prefer for children, in order. An explicitly requested backend or profile always wins."
-            </p>
+            <span id="delegation-preference-title" class="settings-label">"Delegation preference"</span>
             <ol class="delegation-preference-list">
                 {move || delegation_preference_rows(&rows_state)}
             </ol>
@@ -4323,7 +4437,7 @@ fn backend_page_body(
         // Other backends may instead publish a backend-native settings
         // snapshot (e.g. Tycode's grouped settings) — render that when
         // present. Otherwise this is the transient window the nav fallback
-        // effect handles by returning to Overview.
+        // effect handles by returning to Backends.
         if let Some(snapshot) = state
             .backend_native_settings
             .get()
@@ -4944,7 +5058,7 @@ fn host_schema_field_depth(pointer: &str) -> u8 {
     }
 }
 
-fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&str>) -> AnyView {
+fn host_schema_fields(state: &AppState, section: &str, pointers: &[&str]) -> AnyView {
     let Some(schema) = state.selected_host_settings_schema() else {
         return view! {
             <p class="settings-description settings-schema-unavailable">
@@ -4966,8 +5080,8 @@ fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&s
     };
     let mut fields = Vec::new();
     collect_host_schema_fields(&schema, &schema, "", section, 0, &mut fields);
-    if let Some(prefix) = pointer_prefix {
-        fields.retain(|(_, pointer, _)| pointer.starts_with(prefix));
+    if !pointers.is_empty() {
+        fields.retain(|(_, pointer, _)| pointers.contains(&pointer.as_str()));
     }
     fields.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     if fields.is_empty() {
@@ -5008,7 +5122,7 @@ fn host_schema_fields(state: &AppState, section: &str, pointer_prefix: Option<&s
 }
 
 fn host_schema_section(state: &AppState, section: &str) -> AnyView {
-    host_schema_fields(state, section, None)
+    host_schema_fields(state, section, &[])
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -5599,7 +5713,10 @@ fn native_settings_groups_form(
                     role="tabpanel"
                     hidden=hidden
                 >
-                    {content}
+                    <section class="settings-section">
+                        <h3 class="settings-section-rail settings-section-title">{group.title.clone()}</h3>
+                        <div class="settings-section-body">{content}</div>
+                    </section>
                 </div>
             }
         })
@@ -5962,14 +6079,14 @@ fn native_settings_group(
 ) -> AnyView {
     let content = native_settings_group_content(state, scope, group, settings, disabled);
     view! {
-        <section class="settings-native-group">
-            <div class="settings-native-group-header">
+        <section class="settings-native-group settings-section">
+            <div class="settings-native-group-header settings-section-rail">
                 <span class="settings-native-group-title">{group.title.clone()}</span>
                 <span class="settings-native-group-badge">
                     {native_group_badge(group.kind)}
                 </span>
             </div>
-            {content}
+            <div class="settings-section-body">{content}</div>
         </section>
     }
     .into_any()
@@ -6079,6 +6196,11 @@ fn schema_settings_field(
         .and_then(Value::as_str)
         .unwrap_or(key)
         .to_owned();
+    let aria_label = schema_field_aria_label(&target, &label);
+    let label = match schema_field_unit(&target) {
+        Some(unit) => format!("{label} ({unit})"),
+        None => label,
+    };
     let description = prop_schema
         .get("description")
         .and_then(Value::as_str)
@@ -6178,7 +6300,7 @@ fn schema_settings_field(
             })
             .collect::<Vec<_>>();
         let target = target.clone();
-        let aria_label = schema_field_aria_label(&target, &label);
+        let aria_label = aria_label.clone();
         let on_change = move |ev: web_sys::Event| {
             if disabled && !target.is_host() {
                 return;
@@ -6257,7 +6379,7 @@ fn schema_settings_field(
                     <div
                         class="settings-segmented-control"
                         role="group"
-                        aria-label=schema_field_aria_label(&target, &label)
+                        aria-label=aria_label.clone()
                     >
                         {segments}
                     </div>
@@ -6302,8 +6424,7 @@ fn schema_settings_field(
                     .get("multipleOf")
                     .and_then(Value::as_f64)
                     .unwrap_or(1.0);
-                let aria_label = schema_field_aria_label(&target, &label);
-                let unit = schema_field_unit(&target);
+                let aria_label = aria_label.clone();
                 let on_change = move |ev: web_sys::Event| {
                     if disabled && !target.is_host() {
                         return;
@@ -6334,9 +6455,6 @@ fn schema_settings_field(
                             aria-label=aria_label
                             on:change=on_change
                         />
-                        {unit.map(|unit| view! {
-                            <span class="settings-supervisor-number-unit">{unit}</span>
-                        })}
                     </div>
                 }
                 .into_any()
@@ -6350,7 +6468,7 @@ fn schema_settings_field(
                     .get("multipleOf")
                     .and_then(Value::as_f64)
                     .unwrap_or(1.0);
-                let aria_label = schema_field_aria_label(&target, &label);
+                let aria_label = aria_label.clone();
                 let on_change = move |ev: web_sys::Event| {
                     if disabled && !target.is_host() {
                         return;
@@ -6565,16 +6683,19 @@ fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     view! {
-        <h2 class="settings-panel-title">"Debug"</h2>
+            <h2 class="settings-panel-title">"Debug"</h2>
 
-        <p class="settings-description settings-panel-intro">
-            "Diagnostics for developing Tyde itself. Everything here is off by default."
-        </p>
+            <p class="settings-description settings-panel-intro">
+                "Diagnostics for developing Tyde itself. Everything here is off by default."
+            </p>
 
-        <div class="settings-schema-fields">
-            {move || host_schema_section(&state, "general")}
-        </div>
-    }
+    <SettingsSection title="Frontend tools">
+            <div class="settings-schema-fields">
+                {move || host_schema_section(&state, "general")}
+            </div>
+            </SettingsSection>
+
+        }
 }
 
 /// Server-side speech settings. Lifted out of the Mobile tab, where it was the
@@ -6590,7 +6711,7 @@ fn VoiceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Voice"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Talk to agents with Amazon Nova Sonic, or dictate into the composer with Amazon Transcribe. Both use this host's AWS credentials, which never leave the host."
+            "Talk to agents with Amazon Nova Sonic using this host’s AWS credentials. The AWS profile is also used by Dictation."
         </p>
 
         <Show
@@ -6613,126 +6734,155 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
     let state_for_voice_region = state.clone();
     let state_for_voice_model = state.clone();
     let state_for_voice_endpointing = state.clone();
-    let state_for_dictation_enabled = state.clone();
-    let state_for_dictation_region = state.clone();
-    let state_for_dictation_language = state.clone();
     let state_for_voice_enabled_commit = state.clone();
     let state_for_voice_profile_commit = state.clone();
     let state_for_voice_region_commit = state.clone();
     let state_for_voice_model_commit = state.clone();
     let state_for_voice_endpointing_commit = state.clone();
-    let state_for_dictation_enabled_commit = state.clone();
-    let state_for_dictation_region_commit = state.clone();
-    let state_for_dictation_language_commit = state.clone();
-    let state_for_dictation_disabled = state.clone();
     let state_for_voice_disabled = state;
 
     view! {
-        <div data-testid="native-voice-settings">
-            <div class="settings-field">
-                <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
-                <p class="settings-description">"Named profile from the host's AWS credentials file. Leave empty to use the default credential chain."</p>
-                <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
-                    prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
-                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
-                />
-            </div>
-            <div class="settings-field">
-                <div class="settings-toggle-row">
-                    <div>
-                        <label class="settings-label">"Conversation with Amazon Nova Sonic"</label>
-                        <p class="settings-description">"Talk with the focused agent on desktop and mobile. Nova passes your request to the agent and speaks its reply."</p>
-                    </div>
-                    <label class="settings-toggle"><input type="checkbox"
-                        prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
-                        disabled=move || state_for_dictation_disabled.selected_host_settings().is_none()
-                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
-                    /><span class="settings-toggle-slider"></span></label>
-                </div>
-            </div>
-            <div class="settings-schema-nested">
+            <div data-testid="native-voice-settings">
+    <SettingsSection title="AWS identity">
                 <div class="settings-field">
-                    <label class="settings-label" for="voice-aws-region">"AWS region"</label>
-                    <p class="settings-description">"Bedrock region for Nova Sonic. Required; Tyde does not pick a default."</p>
-                    <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
-                        prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
-                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
+                    <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
+                    <p class="settings-description">"Named profile from the host's AWS credentials file. Leave empty to use the default credential chain."</p>
+                    <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
+                        prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
+                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
                     />
                 </div>
+
+            </SettingsSection>
+    <SettingsSection title="Conversation">
                 <div class="settings-field">
-                    <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
-                    <p class="settings-description">"Use Nova Sonic v1 only if your account or region lacks Nova 2 Sonic."</p>
-                    <select id="voice-nova-model" class="settings-select"
-                        prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
-                        on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_voice_model_commit,"/voice/nova_model",input.value()); }
-                    ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
-                </div>
-                <div class="settings-field">
-                    <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
-                    <p class="settings-description">"How long Nova waits through a pause before replying. Patient interrupts you least."</p>
-                    <select id="voice-endpointing-sensitivity" class="settings-select"
-                        prop:value=move || state_for_voice_endpointing.selected_host_settings().map(|settings|settings.voice.endpointing_sensitivity.nova_value()).unwrap_or("LOW")
-                        on:change=move |ev| {
-                            let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
-                            let sensitivity=match input.value().as_str() {
-                                "HIGH" => settings_model::VoiceEndpointingSensitivity::High,
-                                "MEDIUM" => settings_model::VoiceEndpointingSensitivity::Medium,
-                                _ => settings_model::VoiceEndpointingSensitivity::Low,
-                            };
-                            send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
-                        }
-                    ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
-                </div>
-            </div>
-            <div class="settings-field">
-                <div class="settings-toggle-row">
-                    <div>
-                        <label class="settings-label">"Dictation with Amazon Transcribe Streaming"</label>
-                        <p class="settings-description">"Transcribe speech into the composer draft. Nothing is sent automatically and no model rewrites the text."</p>
+                    <div class="settings-toggle-row">
+                        <div>
+                            <label class="settings-label">"Conversation with Amazon Nova Sonic"</label>
+                            <p class="settings-description">"Talk with the focused agent on desktop and mobile. Nova passes your request to the agent and speaks its reply."</p>
+                        </div>
+                        <label class="settings-toggle"><input type="checkbox"
+                            prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
+                            disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                            on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
+                        /><span class="settings-toggle-slider"></span></label>
                     </div>
-                    <label class="settings-toggle"><input type="checkbox"
-                        prop:checked=move || state_for_dictation_enabled.selected_host_settings().is_some_and(|settings| settings.voice.dictation_enabled)
-                        disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
-                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_dictation_enabled_commit,"/voice/dictation_enabled",input.checked()); }
-                    /><span class="settings-toggle-slider"></span></label>
                 </div>
+                <div class="settings-schema-nested">
+                    <div class="settings-field">
+                        <label class="settings-label" for="voice-aws-region">"AWS region"</label>
+                        <p class="settings-description">"Bedrock region for Nova Sonic. Required; Tyde does not pick a default."</p>
+                        <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
+                            prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
+                            on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
+                        />
+                    </div>
+                    <div class="settings-field">
+                        <label class="settings-label" for="voice-nova-model">"Nova Sonic model"</label>
+                        <p class="settings-description">"Use Nova Sonic v1 only if your account or region lacks Nova 2 Sonic."</p>
+                        <select id="voice-nova-model" class="settings-select"
+                            prop:value=move || state_for_voice_model.selected_host_settings().map(|settings|settings.voice.nova_model).unwrap_or_else(||"amazon.nova-2-sonic-v1:0".into())
+                            on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_voice_model_commit,"/voice/nova_model",input.value()); }
+                        ><option value="amazon.nova-2-sonic-v1:0">"Amazon Nova 2 Sonic"</option><option value="amazon.nova-sonic-v1:0">"Amazon Nova Sonic v1"</option></select>
+                    </div>
+                    <div class="settings-field">
+                        <label class="settings-label" for="voice-endpointing-sensitivity">"Turn-ending patience"</label>
+                        <p class="settings-description">"How long Nova waits through a pause before replying. Patient interrupts you least."</p>
+                        <select id="voice-endpointing-sensitivity" class="settings-select"
+                            prop:value=move || state_for_voice_endpointing.selected_host_settings().map(|settings|settings.voice.endpointing_sensitivity.nova_value()).unwrap_or("LOW")
+                            on:change=move |ev| {
+                                let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();
+                                let sensitivity=match input.value().as_str() {
+                                    "HIGH" => settings_model::VoiceEndpointingSensitivity::High,
+                                    "MEDIUM" => settings_model::VoiceEndpointingSensitivity::Medium,
+                                    _ => settings_model::VoiceEndpointingSensitivity::Low,
+                                };
+                                send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
+                            }
+                        ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
+                    </div>
+                </div>
+
+            </SettingsSection>
+
             </div>
-            <div class="settings-schema-nested">
-                <div class="settings-field">
-                    <label class="settings-label" for="voice-dictation-region">"Transcribe region"</label>
-                    <p class="settings-description">"AWS region for Transcribe Streaming. Required; it does not inherit the Nova region."</p>
-                    <input id="voice-dictation-region" class="settings-input" type="text" placeholder="us-east-1"
-                        prop:value=move || state_for_dictation_region.selected_host_settings().and_then(|settings|settings.voice.dictation_region).unwrap_or_default()
-                        on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_dictation_region_commit,"/voice/dictation_region",(!value.is_empty()).then_some(value)); }
-                    />
-                </div>
-                <div class="settings-field">
-                    <label class="settings-label" for="voice-dictation-language">"Dictation language"</label>
-                    <p class="settings-description">"The language you dictate in."</p>
-                    <select id="voice-dictation-language" class="settings-select"
-                        prop:value=move || state_for_dictation_language.selected_host_settings().map(|settings|settings.voice.dictation_language_code).unwrap_or_else(||"en-US".into())
-                        on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_dictation_language_commit,"/voice/dictation_language_code",input.value()); }
-                    >
-                        <option value="en-US">"English (United States)"</option>
-                        <option value="en-GB">"English (United Kingdom)"</option>
-                        <option value="en-AU">"English (Australia)"</option>
-                        <option value="es-US">"Spanish (United States)"</option>
-                        <option value="es-ES">"Spanish (Spain)"</option>
-                        <option value="fr-FR">"French (France)"</option>
-                        <option value="fr-CA">"French (Canada)"</option>
-                        <option value="de-DE">"German"</option>
-                        <option value="it-IT">"Italian"</option>
-                        <option value="pt-BR">"Portuguese (Brazil)"</option>
-                        <option value="ja-JP">"Japanese"</option>
-                        <option value="ko-KR">"Korean"</option>
-                        <option value="zh-CN">"Chinese (Mainland)"</option>
-                        <option value="hi-IN">"Hindi"</option>
-                    </select>
-                </div>
-            </div>
-            <p class="settings-description settings-voice-footnote">"Dictation needs transcribe:StartStreamTranscription on the host's AWS identity. Audio is processed under AWS Transcribe service terms; configure any AWS Organizations AI-services opt-out before enabling it."</p>
-        </div>
+        }
+}
+
+#[component]
+fn DictationTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let support = state.native_voice_supported;
+    view! {
+        <h2 class="settings-panel-title">"Dictation"</h2>
+        <p class="settings-description settings-panel-intro">"Transcribe speech into the composer without sending or rewriting it. Uses the host’s AWS profile configured in Voice."</p>
+        <Show when=move || support.get() fallback=|| view! { <p class="settings-description">"This host was built without native audio support, so dictation is unavailable."</p> }>
+            <NativeDictationSettings state=state.clone() />
+        </Show>
     }
+}
+
+#[component]
+fn NativeDictationSettings(state: AppState) -> impl IntoView {
+    let state_for_dictation_enabled = state.clone();
+    let state_for_dictation_region = state.clone();
+    let state_for_dictation_language = state.clone();
+    let state_for_dictation_enabled_commit = state.clone();
+    let state_for_dictation_region_commit = state.clone();
+    let state_for_dictation_language_commit = state.clone();
+    let state_for_voice_disabled = state;
+    view! {
+    <SettingsSection title="Dictation">
+                <div class="settings-field">
+                    <div class="settings-toggle-row">
+                        <div>
+                            <label class="settings-label">"Dictation with Amazon Transcribe Streaming"</label>
+                            <p class="settings-description">"Transcribe speech into the composer draft. Nothing is sent automatically and no model rewrites the text."</p>
+                        </div>
+                        <label class="settings-toggle"><input type="checkbox"
+                            prop:checked=move || state_for_dictation_enabled.selected_host_settings().is_some_and(|settings| settings.voice.dictation_enabled)
+                            disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                            on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_dictation_enabled_commit,"/voice/dictation_enabled",input.checked()); }
+                        /><span class="settings-toggle-slider"></span></label>
+                    </div>
+                </div>
+                <div class="settings-schema-nested">
+                    <div class="settings-field">
+                        <label class="settings-label" for="voice-dictation-region">"Transcribe region"</label>
+                        <p class="settings-description">"AWS region for Transcribe Streaming. Required; it does not inherit the Nova region."</p>
+                        <input id="voice-dictation-region" class="settings-input" type="text" placeholder="us-east-1"
+                            prop:value=move || state_for_dictation_region.selected_host_settings().and_then(|settings|settings.voice.dictation_region).unwrap_or_default()
+                            on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_dictation_region_commit,"/voice/dictation_region",(!value.is_empty()).then_some(value)); }
+                        />
+                    </div>
+                    <div class="settings-field">
+                        <label class="settings-label" for="voice-dictation-language">"Dictation language"</label>
+                        <p class="settings-description">"The language you dictate in."</p>
+                        <select id="voice-dictation-language" class="settings-select"
+                            prop:value=move || state_for_dictation_language.selected_host_settings().map(|settings|settings.voice.dictation_language_code).unwrap_or_else(||"en-US".into())
+                            on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_dictation_language_commit,"/voice/dictation_language_code",input.value()); }
+                        >
+                            <option value="en-US">"English (United States)"</option>
+                            <option value="en-GB">"English (United Kingdom)"</option>
+                            <option value="en-AU">"English (Australia)"</option>
+                            <option value="es-US">"Spanish (United States)"</option>
+                            <option value="es-ES">"Spanish (Spain)"</option>
+                            <option value="fr-FR">"French (France)"</option>
+                            <option value="fr-CA">"French (Canada)"</option>
+                            <option value="de-DE">"German"</option>
+                            <option value="it-IT">"Italian"</option>
+                            <option value="pt-BR">"Portuguese (Brazil)"</option>
+                            <option value="ja-JP">"Japanese"</option>
+                            <option value="ko-KR">"Korean"</option>
+                            <option value="zh-CN">"Chinese (Mainland)"</option>
+                            <option value="hi-IN">"Hindi"</option>
+                        </select>
+                    </div>
+                </div>
+                <p class="settings-description settings-voice-footnote">"Dictation needs transcribe:StartStreamTranscription on the host's AWS identity. Audio is processed under AWS Transcribe service terms; configure any AWS Organizations AI-services opt-out before enabling it."</p>
+            </SettingsSection>
+
+        }
 }
 
 /// Mobile pairing settings for `tycode.dev`-managed WebRTC access.
@@ -6884,6 +7034,7 @@ fn MobileTab() -> impl IntoView {
             "Follow and reply to your agents from the Tyde mobile app. Pair through the managed relay, or host the mobile app on your own network."
         </p>
 
+        <SettingsSection title="Mobile access">
         <div class="settings-field">
             <div class="settings-toggle-row">
                 <div>
@@ -7108,6 +7259,7 @@ fn MobileTab() -> impl IntoView {
                 "Managed access is an end-to-end encrypted WebRTC connection relayed through Cloudflare TURN. Cloudflare sees only connection metadata such as IP addresses, timing and traffic volume. tycode.dev authorizes pairing but cannot read your chats, files or commands."
             </p>
         </div>
+        </SettingsSection>
     }
 }
 
@@ -8381,58 +8533,61 @@ fn CustomAgentsTab() -> impl IntoView {
     });
 
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Custom Agents"</h2>
-            <button
-                class="settings-btn settings-btn-primary"
-                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                on:click=move |_| form.set(Some(CustomAgentForm::blank()))
-            >
-                "+ New custom agent"
-            </button>
-        </div>
-        <p class="settings-description settings-panel-intro">
-            "Reusable agents with their own instructions, skills, MCP servers, and tool policy."
-        </p>
-
-        {move || form.get().map(|f| view! { <CustomAgentEditor form=f editor_signal=form /> })}
-
-        <div class="settings-field">
-            <div class="settings-host-list">
-                {move || {
-                    let list = rows.get();
-                    if list.is_empty() {
-                        view! { <div class="panel-empty">"No custom agents on this host."</div> }.into_any()
-                    } else {
-                        view! {
-                            <>
-                            {list.into_iter().map(|agent| view! {
-                                <CustomAgentRow agent=agent editor_signal=form delete_signal=pending_delete />
-                            }).collect_view()}
-                            </>
-                        }.into_any()
-                    }
-                }}
+            <div class="settings-panel-header">
+                <h2 class="settings-panel-title">"Custom Agents"</h2>
+                <button
+                    class="settings-btn settings-btn-primary"
+                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                    on:click=move |_| form.set(Some(CustomAgentForm::blank()))
+                >
+                    "+ New custom agent"
+                </button>
             </div>
-        </div>
+            <p class="settings-description settings-panel-intro">
+                "Reusable agents with their own instructions, skills, MCP servers, and tool policy."
+            </p>
 
-        {move || {
-            pending_delete.get().map(|(_, name)| {
-                let on_cancel = on_cancel_delete;
-                let on_confirm = on_confirm_delete;
-                let body = format!("Delete custom agent \"{name}\"? This cannot be undone.");
-                view! {
-                    <SettingsConfirmDialog
-                        title="Delete custom agent".to_string()
-                        body=body
-                        confirm_label="Delete".to_string()
-                        on_cancel=on_cancel
-                        on_confirm=on_confirm
-                    />
-                }
-            })
-        }}
-    }
+    <SettingsSection title="Agent definitions">
+            {move || form.get().map(|f| view! { <CustomAgentEditor form=f editor_signal=form /> })}
+
+            <div class="settings-field">
+                <div class="settings-host-list">
+                    {move || {
+                        let list = rows.get();
+                        if list.is_empty() {
+                            view! { <div class="panel-empty">"No custom agents on this host."</div> }.into_any()
+                        } else {
+                            view! {
+                                <>
+                                {list.into_iter().map(|agent| view! {
+                                    <CustomAgentRow agent=agent editor_signal=form delete_signal=pending_delete />
+                                }).collect_view()}
+                                </>
+                            }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+
+            {move || {
+                pending_delete.get().map(|(_, name)| {
+                    let on_cancel = on_cancel_delete;
+                    let on_confirm = on_confirm_delete;
+                    let body = format!("Delete custom agent \"{name}\"? This cannot be undone.");
+                    view! {
+                        <SettingsConfirmDialog
+                            title="Delete custom agent".to_string()
+                            body=body
+                            confirm_label="Delete".to_string()
+                            on_cancel=on_cancel
+                            on_confirm=on_confirm
+                        />
+                    }
+                })
+            }}
+            </SettingsSection>
+
+        }
 }
 
 #[component]
@@ -8943,58 +9098,61 @@ fn McpServersTab() -> impl IntoView {
     });
 
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"MCP Servers"</h2>
-            <button
-                class="settings-btn settings-btn-primary"
-                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                on:click=move |_| form.set(Some(McpForm::blank()))
-            >
-                "+ New MCP server"
-            </button>
-        </div>
-        <p class="settings-description settings-panel-intro">
-            "Tool servers available to agents on this host, over HTTP or stdio."
-        </p>
-
-        {move || form.get().map(|f| view! { <McpEditor form=f editor_signal=form /> })}
-
-        <div class="settings-field">
-            <div class="settings-host-list">
-                {move || {
-                    let list = rows.get();
-                    if list.is_empty() {
-                        view! { <div class="panel-empty">"No MCP servers on this host."</div> }.into_any()
-                    } else {
-                        view! {
-                            <>
-                            {list.into_iter().map(|server| view! {
-                                <McpRow server=server editor_signal=form delete_signal=pending_delete />
-                            }).collect_view()}
-                            </>
-                        }.into_any()
-                    }
-                }}
+            <div class="settings-panel-header">
+                <h2 class="settings-panel-title">"MCP Servers"</h2>
+                <button
+                    class="settings-btn settings-btn-primary"
+                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                    on:click=move |_| form.set(Some(McpForm::blank()))
+                >
+                    "+ New MCP server"
+                </button>
             </div>
-        </div>
+            <p class="settings-description settings-panel-intro">
+                "Tool servers available to agents on this host, over HTTP or stdio."
+            </p>
 
-        {move || {
-            pending_delete.get().map(|(_, name)| {
-                let on_cancel = on_cancel_delete;
-                let on_confirm = on_confirm_delete;
-                let body = format!("Delete MCP server \"{name}\"? This cannot be undone.");
-                view! {
-                    <SettingsConfirmDialog
-                        title="Delete MCP server".to_string()
-                        body=body
-                        confirm_label="Delete".to_string()
-                        on_cancel=on_cancel
-                        on_confirm=on_confirm
-                    />
-                }
-            })
-        }}
-    }
+    <SettingsSection title="Server definitions">
+            {move || form.get().map(|f| view! { <McpEditor form=f editor_signal=form /> })}
+
+            <div class="settings-field">
+                <div class="settings-host-list">
+                    {move || {
+                        let list = rows.get();
+                        if list.is_empty() {
+                            view! { <div class="panel-empty">"No MCP servers on this host."</div> }.into_any()
+                        } else {
+                            view! {
+                                <>
+                                {list.into_iter().map(|server| view! {
+                                    <McpRow server=server editor_signal=form delete_signal=pending_delete />
+                                }).collect_view()}
+                                </>
+                            }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+
+            {move || {
+                pending_delete.get().map(|(_, name)| {
+                    let on_cancel = on_cancel_delete;
+                    let on_confirm = on_confirm_delete;
+                    let body = format!("Delete MCP server \"{name}\"? This cannot be undone.");
+                    view! {
+                        <SettingsConfirmDialog
+                            title="Delete MCP server".to_string()
+                            body=body
+                            confirm_label="Delete".to_string()
+                            on_cancel=on_cancel
+                            on_confirm=on_confirm
+                        />
+                    }
+                })
+            }}
+            </SettingsSection>
+
+        }
 }
 
 #[component]
@@ -9422,161 +9580,165 @@ fn SelfImprovementTab() -> impl IntoView {
         }
     };
     view! {
-        <section class="self-improvement-settings">
-            <h2 class="settings-panel-title">"Self-improvement"</h2>
-            <div class="settings-field">
-                <label class="settings-label" for="learning-scope">"Scope"</label>
-                <select id="learning-scope" class="settings-select settings-select-full" aria-label="Self-improvement scope"
-                    prop:value=move || match scope.get() {
-                        Some(SteeringScope::Host) => "host".into(),
-                        Some(SteeringScope::Project(id)) => id.0,
-                        None => String::new(),
-                    }
-                    on:change=move |ev| {
-                        let value = event_target_value(&ev);
-                        scope.set(match value.as_str() {
-                            "" => None,
-                            "host" => Some(SteeringScope::Host),
-                            _ => Some(SteeringScope::Project(ProjectId(value))),
-                        });
-                    }>
-                    <option value="" disabled>"Choose a scope"</option>
-                    {move || {
-                        let state = store.get_value();
-                        let host = state.selected_host_id.get();
-                        state.projects.get().into_iter()
-                            .filter(|project| Some(&project.host_id) == host.as_ref())
-                            .map(|project| view! { <option value=project.project.id.0>{format!("Project · {}", project.project.name)}</option> })
-                            .collect_view()
-                    }}
-                    <option value="host">"All projects (host-wide)"</option>
-                </select>
-            </div>
-            <div class="settings-field">
-                <div class="settings-toggle-row">
-                    <div>
-                        <span class="settings-label">"Learn from feedback"</span>
-                        <p class="settings-description learning-status" role="status">{status_text}</p>
-                    </div>
-                    <label class="settings-toggle">
-                        <input type="checkbox" role="switch" aria-label="Enable self-improvement" disabled=disabled
-                            prop:checked=move || config.get().is_some_and(|config| config.enabled)
-                            on:change=move |ev| {
-                                let enabled = event_target_checked(&ev);
-                                edit(&|config| config.enabled = enabled);
-                            } />
-                        <span class="settings-toggle-slider"></span>
-                    </label>
-                </div>
-            </div>
-            <div class="settings-field">
-                <span class="settings-label">"Mode"</span>
-                <div class="settings-segmented-control review-segments" role="group" aria-label="Self-improvement mode">
-                    {[LearningMode::Suggest, LearningMode::Automatic].into_iter().map(move |mode| {
-                        let active = move || config.get().is_some_and(|config| config.mode == mode);
-                        view! {
-                            <button type="button" disabled=disabled
-                                class=move || if active() { "segment active" } else { "segment" }
-                                aria-pressed=move || if active() { "true" } else { "false" }
-                                on:click=move |_| edit(&|config| config.mode = mode)>
-                                {if mode == LearningMode::Suggest { "Suggest" } else { "Automatic" }}
-                            </button>
+            <section class="self-improvement-settings">
+                <h2 class="settings-panel-title">"Self-improvement"</h2>
+                <p class="settings-description settings-panel-intro">"Turn feedback into scoped steering and review improvements."</p>
+    <SettingsSection title="Learning">
+                <div class="settings-field">
+                    <label class="settings-label" for="learning-scope">"Scope"</label>
+                    <select id="learning-scope" class="settings-select settings-select-full" aria-label="Self-improvement scope"
+                        prop:value=move || match scope.get() {
+                            Some(SteeringScope::Host) => "host".into(),
+                            Some(SteeringScope::Project(id)) => id.0,
+                            None => String::new(),
                         }
-                    }).collect_view()}
-                </div>
-            </div>
-            <div class="settings-field">
-                <label class="settings-label" for="learning-backend">"Analyzer"</label>
-                <div class="learning-analyzer">
-                    <select id="learning-backend" class="settings-select" aria-label="Analyzer backend" disabled=disabled
-                        prop:value=move || analyzer.get().map(|analyzer| format!("{:?}", analyzer.backend_kind)).unwrap_or_default()
                         on:change=move |ev| {
                             let value = event_target_value(&ev);
-                            let backend_kind = snapshot.get_untracked().analyzers.into_iter()
-                                .find(|option| format!("{:?}", option.backend_kind) == value)
-                                .map(|option| option.backend_kind);
-                            edit(&|config| config.analyzer = backend_kind.map(|backend_kind| LearningAnalyzer { backend_kind, model: String::new() }));
+                            scope.set(match value.as_str() {
+                                "" => None,
+                                "host" => Some(SteeringScope::Host),
+                                _ => Some(SteeringScope::Project(ProjectId(value))),
+                            });
                         }>
-                        <option value="" disabled>"Choose a backend"</option>
-                        {move || snapshot.get().analyzers.into_iter().map(|option| {
-                            let name = crate::components::teams_panel::backend_kind_label(option.backend_kind);
-                            let (label, reason) = match option.capability {
-                                LearningAnalyzerCapability::TextAnalysis => (name.to_owned(), None),
-                                LearningAnalyzerCapability::Unsupported { reason } => (format!("{name} · unavailable"), Some(reason)),
-                            };
-                            view! { <option value=format!("{:?}", option.backend_kind) disabled=reason.is_some() title=reason>{label}</option> }
-                        }).collect_view()}
-                    </select>
-                    <select class="settings-select" aria-label="Analyzer model"
-                        disabled=move || disabled() || model_field.get().is_err()
-                        prop:value=move || analyzer.get().map(|analyzer| analyzer.model).unwrap_or_default()
-                        on:change=move |ev| {
-                            let model = event_target_value(&ev);
-                            edit(&|config| if let Some(analyzer) = &mut config.analyzer { analyzer.model = model.clone(); });
-                        }>
-                        {move || match model_field.get() {
-                            Ok(options) => {
-                                let current = analyzer.get().map(|analyzer| analyzer.model).unwrap_or_default();
-                                view! {
-                                    <option value="" disabled>"Choose a model"</option>
-                                    {protocol::options_including_current(&options, &current).into_iter()
-                                        .map(|option| view! { <option value=option.value disabled=option.unavailable>{option.label}</option> })
-                                        .collect_view()}
-                                }.into_any()
-                            }
-                            Err(reason) => view! { <option value="">{reason}</option> }.into_any(),
+                        <option value="" disabled>"Choose a scope"</option>
+                        {move || {
+                            let state = store.get_value();
+                            let host = state.selected_host_id.get();
+                            state.projects.get().into_iter()
+                                .filter(|project| Some(&project.host_id) == host.as_ref())
+                                .map(|project| view! { <option value=project.project.id.0>{format!("Project · {}", project.project.name)}</option> })
+                                .collect_view()
                         }}
+                        <option value="host">"All projects (host-wide)"</option>
                     </select>
                 </div>
-            </div>
-            {toggle(
-                "Learn steering",
-                |config| config.steering,
-                |config, enabled| config.steering = enabled,
-            )}
-            {toggle(
-                "Learn review aspects",
-                |config| config.review_aspects,
-                |config, enabled| config.review_aspects = enabled,
-            )}
-            <Show when=move || snapshot.get().error.is_some()>
-                <p class="learning-error" role="alert">{move || snapshot.get().error}</p>
-            </Show>
-            <button class="settings-btn" disabled=move || store.get_value().selected_host_id.get().is_none() || scope.get().is_none() on:click=move |_| {
-                let state = store.get_value();
-                match (state.selected_host_id.get_untracked(), scope.get_untracked()) {
-                    (Some(host), Some(scope)) => {
-                        state.self_improvement_scope_request.set(Some((host, scope)));
-                        state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
-                        state.settings_open.set(false);
-                    }
-                    _ => crate::notices::report_settings_error(&state, "Choose a host and scope"),
-                }
-            }>"Open suggestions"</button>
-            {move || {
-                let usage = snapshot.get().usage.into_iter()
-                    .filter(|usage| Some(&usage.scope) == scope.get().as_ref())
-                    .collect::<Vec<_>>();
-                (!usage.is_empty()).then(|| view! {
-                    <details class="learning-usage" aria-label="Analyzer usage">
-                        <summary>{match usage.len() {
-                            1 => "Analyzer usage · 1 run".to_owned(),
-                            runs => format!("Analyzer usage · {runs} runs"),
-                        }}</summary>
-                        {usage.into_iter().map(|usage| view! {
-                            <p>{format!(
-                                "{} · {} · {} messages · {}",
-                                crate::components::teams_panel::backend_kind_label(usage.analyzer.backend_kind),
-                                usage.analyzer.model,
-                                usage.input_ids.len(),
-                                learning_usage_label(&usage.usage)
-                            )}</p>
+                <div class="settings-field">
+                    <div class="settings-toggle-row">
+                        <div>
+                            <span class="settings-label">"Learn from feedback"</span>
+                            <p class="settings-description learning-status" role="status">{status_text}</p>
+                        </div>
+                        <label class="settings-toggle">
+                            <input type="checkbox" role="switch" aria-label="Enable self-improvement" disabled=disabled
+                                prop:checked=move || config.get().is_some_and(|config| config.enabled)
+                                on:change=move |ev| {
+                                    let enabled = event_target_checked(&ev);
+                                    edit(&|config| config.enabled = enabled);
+                                } />
+                            <span class="settings-toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+                <div class="settings-field">
+                    <span class="settings-label">"Mode"</span>
+                    <div class="settings-segmented-control review-segments" role="group" aria-label="Self-improvement mode">
+                        {[LearningMode::Suggest, LearningMode::Automatic].into_iter().map(move |mode| {
+                            let active = move || config.get().is_some_and(|config| config.mode == mode);
+                            view! {
+                                <button type="button" disabled=disabled
+                                    class=move || if active() { "segment active" } else { "segment" }
+                                    aria-pressed=move || if active() { "true" } else { "false" }
+                                    on:click=move |_| edit(&|config| config.mode = mode)>
+                                    {if mode == LearningMode::Suggest { "Suggest" } else { "Automatic" }}
+                                </button>
+                            }
                         }).collect_view()}
-                    </details>
-                })
-            }}
-        </section>
-    }
+                    </div>
+                </div>
+                <div class="settings-field">
+                    <label class="settings-label" for="learning-backend">"Analyzer"</label>
+                    <div class="learning-analyzer">
+                        <select id="learning-backend" class="settings-select" aria-label="Analyzer backend" disabled=disabled
+                            prop:value=move || analyzer.get().map(|analyzer| format!("{:?}", analyzer.backend_kind)).unwrap_or_default()
+                            on:change=move |ev| {
+                                let value = event_target_value(&ev);
+                                let backend_kind = snapshot.get_untracked().analyzers.into_iter()
+                                    .find(|option| format!("{:?}", option.backend_kind) == value)
+                                    .map(|option| option.backend_kind);
+                                edit(&|config| config.analyzer = backend_kind.map(|backend_kind| LearningAnalyzer { backend_kind, model: String::new() }));
+                            }>
+                            <option value="" disabled>"Choose a backend"</option>
+                            {move || snapshot.get().analyzers.into_iter().map(|option| {
+                                let name = crate::components::teams_panel::backend_kind_label(option.backend_kind);
+                                let (label, reason) = match option.capability {
+                                    LearningAnalyzerCapability::TextAnalysis => (name.to_owned(), None),
+                                    LearningAnalyzerCapability::Unsupported { reason } => (format!("{name} · unavailable"), Some(reason)),
+                                };
+                                view! { <option value=format!("{:?}", option.backend_kind) disabled=reason.is_some() title=reason>{label}</option> }
+                            }).collect_view()}
+                        </select>
+                        <select class="settings-select" aria-label="Analyzer model"
+                            disabled=move || disabled() || model_field.get().is_err()
+                            prop:value=move || analyzer.get().map(|analyzer| analyzer.model).unwrap_or_default()
+                            on:change=move |ev| {
+                                let model = event_target_value(&ev);
+                                edit(&|config| if let Some(analyzer) = &mut config.analyzer { analyzer.model = model.clone(); });
+                            }>
+                            {move || match model_field.get() {
+                                Ok(options) => {
+                                    let current = analyzer.get().map(|analyzer| analyzer.model).unwrap_or_default();
+                                    view! {
+                                        <option value="" disabled>"Choose a model"</option>
+                                        {protocol::options_including_current(&options, &current).into_iter()
+                                            .map(|option| view! { <option value=option.value disabled=option.unavailable>{option.label}</option> })
+                                            .collect_view()}
+                                    }.into_any()
+                                }
+                                Err(reason) => view! { <option value="">{reason}</option> }.into_any(),
+                            }}
+                        </select>
+                    </div>
+                </div>
+                {toggle(
+                    "Learn steering",
+                    |config| config.steering,
+                    |config, enabled| config.steering = enabled,
+                )}
+                {toggle(
+                    "Learn review aspects",
+                    |config| config.review_aspects,
+                    |config, enabled| config.review_aspects = enabled,
+                )}
+                <Show when=move || snapshot.get().error.is_some()>
+                    <p class="learning-error" role="alert">{move || snapshot.get().error}</p>
+                </Show>
+                <button class="settings-btn" disabled=move || store.get_value().selected_host_id.get().is_none() || scope.get().is_none() on:click=move |_| {
+                    let state = store.get_value();
+                    match (state.selected_host_id.get_untracked(), scope.get_untracked()) {
+                        (Some(host), Some(scope)) => {
+                            state.self_improvement_scope_request.set(Some((host, scope)));
+                            state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+                            state.settings_open.set(false);
+                        }
+                        _ => crate::notices::report_settings_error(&state, "Choose a host and scope"),
+                    }
+                }>"Open suggestions"</button>
+                {move || {
+                    let usage = snapshot.get().usage.into_iter()
+                        .filter(|usage| Some(&usage.scope) == scope.get().as_ref())
+                        .collect::<Vec<_>>();
+                    (!usage.is_empty()).then(|| view! {
+                        <details class="learning-usage" aria-label="Analyzer usage">
+                            <summary>{match usage.len() {
+                                1 => "Analyzer usage · 1 run".to_owned(),
+                                runs => format!("Analyzer usage · {runs} runs"),
+                            }}</summary>
+                            {usage.into_iter().map(|usage| view! {
+                                <p>{format!(
+                                    "{} · {} · {} messages · {}",
+                                    crate::components::teams_panel::backend_kind_label(usage.analyzer.backend_kind),
+                                    usage.analyzer.model,
+                                    usage.input_ids.len(),
+                                    learning_usage_label(&usage.usage)
+                                )}</p>
+                            }).collect_view()}
+                        </details>
+                    })
+                }}
+            </SettingsSection>
+
+            </section>
+        }
 }
 
 fn learning_usage_label(usage: &protocol::TaskTokenUsageScope) -> String {
@@ -9689,58 +9851,61 @@ fn SteeringTab() -> impl IntoView {
     });
 
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Steering"</h2>
-            <button
-                class="settings-btn settings-btn-primary"
-                disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
-                on:click=move |_| form.set(Some(SteeringForm::blank()))
-            >
-                "+ New steering"
-            </button>
-        </div>
-        <p class="settings-description settings-panel-intro">
-            "Standing guidance added to every agent's context, for the whole host or one project."
-        </p>
-
-        {move || form.get().map(|f| view! { <SteeringEditor form=f editor_signal=form /> })}
-
-        <div class="settings-field">
-            <div class="settings-host-list">
-                {move || {
-                    let list = rows.get();
-                    if list.is_empty() {
-                        view! { <div class="panel-empty">"No steering on this host."</div> }.into_any()
-                    } else {
-                        view! {
-                            <>
-                            {list.into_iter().map(|item| view! {
-                                <SteeringRow item=item editor_signal=form delete_signal=pending_delete />
-                            }).collect_view()}
-                            </>
-                        }.into_any()
-                    }
-                }}
+            <div class="settings-panel-header">
+                <h2 class="settings-panel-title">"Steering"</h2>
+                <button
+                    class="settings-btn settings-btn-primary"
+                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                    on:click=move |_| form.set(Some(SteeringForm::blank()))
+                >
+                    "+ New steering"
+                </button>
             </div>
-        </div>
+            <p class="settings-description settings-panel-intro">
+                "Standing guidance added to every agent's context, for the whole host or one project."
+            </p>
 
-        {move || {
-            pending_delete.get().map(|(_, title)| {
-                let on_cancel = on_cancel_delete;
-                let on_confirm = on_confirm_delete;
-                let body = format!("Delete steering \"{title}\"? This cannot be undone.");
-                view! {
-                    <SettingsConfirmDialog
-                        title="Delete steering".to_string()
-                        body=body
-                        confirm_label="Delete".to_string()
-                        on_cancel=on_cancel
-                        on_confirm=on_confirm
-                    />
-                }
-            })
-        }}
-    }
+    <SettingsSection title="Instructions">
+            {move || form.get().map(|f| view! { <SteeringEditor form=f editor_signal=form /> })}
+
+            <div class="settings-field">
+                <div class="settings-host-list">
+                    {move || {
+                        let list = rows.get();
+                        if list.is_empty() {
+                            view! { <div class="panel-empty">"No steering on this host."</div> }.into_any()
+                        } else {
+                            view! {
+                                <>
+                                {list.into_iter().map(|item| view! {
+                                    <SteeringRow item=item editor_signal=form delete_signal=pending_delete />
+                                }).collect_view()}
+                                </>
+                            }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+
+            {move || {
+                pending_delete.get().map(|(_, title)| {
+                    let on_cancel = on_cancel_delete;
+                    let on_confirm = on_confirm_delete;
+                    let body = format!("Delete steering \"{title}\"? This cannot be undone.");
+                    view! {
+                        <SettingsConfirmDialog
+                            title="Delete steering".to_string()
+                            body=body
+                            confirm_label="Delete".to_string()
+                            on_cancel=on_cancel
+                            on_confirm=on_confirm
+                        />
+                    }
+                })
+            }}
+            </SettingsSection>
+
+        }
 }
 
 #[component]
@@ -9958,48 +10123,51 @@ fn SkillsTab() -> impl IntoView {
     };
 
     view! {
-        <div class="settings-panel-header">
-            <h2 class="settings-panel-title">"Skills"</h2>
-            <button
-                class="settings-btn settings-btn-primary"
-                disabled=move || state_for_refresh_disabled.selected_host_stream_untracked().is_none()
-                on:click=on_refresh
-            >"Refresh"</button>
-        </div>
-        <p class="settings-description settings-panel-intro">
-            "Skills are read from "<code>"~/.tyde/skills/<name>/SKILL.md"</code>" on the host. Refresh after editing them."
-        </p>
-
-        <div class="settings-field">
-            <div class="settings-host-list">
-                {move || {
-                    let list = rows.get();
-                    if list.is_empty() {
-                        view! { <div class="panel-empty">"No skills on this host."</div> }.into_any()
-                    } else {
-                        view! {
-                            <>
-                            {list.into_iter().map(|skill| {
-                                let title = skill.title.clone().unwrap_or_else(|| skill.name.clone());
-                                let description = skill.description.clone().unwrap_or_else(|| "No description".to_string());
-                                view! {
-                                    <div class="host-card">
-                                        <div class="host-card-main">
-                                            <div class="host-card-title-row">
-                                                <span class="host-card-label">{title}</span>
-                                            </div>
-                                            <p class="host-card-description">{description}</p>
-                                        </div>
-                                    </div>
-                                }
-                            }).collect_view()}
-                            </>
-                        }.into_any()
-                    }
-                }}
+            <div class="settings-panel-header">
+                <h2 class="settings-panel-title">"Skills"</h2>
+                <button
+                    class="settings-btn settings-btn-primary"
+                    disabled=move || state_for_refresh_disabled.selected_host_stream_untracked().is_none()
+                    on:click=on_refresh
+                >"Refresh"</button>
             </div>
-        </div>
-    }
+            <p class="settings-description settings-panel-intro">
+                "Skills are read from "<code>"~/.tyde/skills/<name>/SKILL.md"</code>" on the host. Refresh after editing them."
+            </p>
+
+    <SettingsSection title="Filesystem skills">
+            <div class="settings-field">
+                <div class="settings-host-list">
+                    {move || {
+                        let list = rows.get();
+                        if list.is_empty() {
+                            view! { <div class="panel-empty">"No skills on this host."</div> }.into_any()
+                        } else {
+                            view! {
+                                <>
+                                {list.into_iter().map(|skill| {
+                                    let title = skill.title.clone().unwrap_or_else(|| skill.name.clone());
+                                    let description = skill.description.clone().unwrap_or_else(|| "No description".to_string());
+                                    view! {
+                                        <div class="host-card">
+                                            <div class="host-card-main">
+                                                <div class="host-card-title-row">
+                                                    <span class="host-card-label">{title}</span>
+                                                </div>
+                                                <p class="host-card-description">{description}</p>
+                                            </div>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                                </>
+                            }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+            </SettingsSection>
+
+        }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -10107,13 +10275,25 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
+        assert_eq!(
+            bubblewrap
+                .closest("label")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .trim(),
+            "Bubblewrap",
+            "The engine choice must not advertise automatic builds or a replacement tagline"
+        );
         let label = native.closest("label").unwrap().unwrap();
         let text = label.query_selector("span").unwrap().unwrap();
         let input_rect = native.get_bounding_client_rect();
         let text_rect = text.get_bounding_client_rect();
         assert!(
-            text_rect.left() - input_rect.right() < 20.0,
-            "Engine text must sit beside its radio, not across the page"
+            input_rect.left() >= text_rect.right()
+                && input_rect.right() <= label.get_bounding_client_rect().right(),
+            "Engine labels must precede their radio without clipping"
         );
         assert!(
             (text_rect.y() + text_rect.height() / 2.0 - input_rect.y() - input_rect.height() / 2.0)
@@ -10337,7 +10517,31 @@ mod wasm_tests {
         );
     }
 
-    fn make_container() -> HtmlElement {
+    fn make_container() -> crate::wasm_test_support::ScopedRoot {
+        static PANIC_CLEANUP: std::sync::Once = std::sync::Once::new();
+        PANIC_CLEANUP.call_once(|| {
+            let report_panic = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                report_panic(info);
+                // wasm-bindgen-test retains failed futures until the suite ends;
+                // their Drop guards cannot clear overlays before later hit-tests.
+                let document = web_sys::window().unwrap().document().unwrap();
+                let roots = document
+                    .query_selector_all("[data-test-fixture='settings-panel']")
+                    .unwrap();
+                for index in 0..roots.length() {
+                    roots
+                        .item(index)
+                        .unwrap()
+                        .unchecked_into::<web_sys::Element>()
+                        .remove();
+                }
+                eprintln!(
+                    "Settings panic cleanup removed {} owned roots",
+                    roots.length()
+                );
+            }));
+        });
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
@@ -10347,7 +10551,10 @@ mod wasm_tests {
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
+        crate::wasm_test_support::ScopedRoot::new(
+            container.dyn_into::<HtmlElement>().unwrap(),
+            "settings-panel",
+        )
     }
 
     async fn next_tick() {
@@ -10406,7 +10613,7 @@ mod wasm_tests {
         next_tick().await;
         // Syntax highlighting is a code-rendering default, so it lives on the
         // Display tab rather than with the interface chrome on Appearance.
-        click_tab(&container, "Code & Output Display");
+        click_tab(&container, "Code display");
         next_tick().await;
 
         let select =
@@ -11910,7 +12117,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn integrations_render_dots_host_truth_and_keep_tychat_grouped() {
+    async fn system_pages_render_dots_host_truth_and_keep_tychat_grouped() {
         let window = web_sys::window().unwrap();
         let document = window.document().unwrap();
         let style = document.create_element("style").unwrap();
@@ -11935,15 +12142,17 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
+        // The approved flat navigation moves both integrations to System;
+        // their shared group and searchable one-click pages remain required.
         let labels = container.query_selector_all(".settings-nav-group").unwrap();
         let groups = (0..labels.length())
             .map(|i| labels.item(i).unwrap().text_content().unwrap())
             .collect::<Vec<_>>();
         assert!(
-            groups.iter().any(|text| text.contains("Integrations")
+            groups.iter().any(|text| text.starts_with("System")
                 && text.contains("Tychat")
                 && text.contains("Remote MCP")),
-            "Tychat and Remote MCP must remain together under Integrations"
+            "Tychat and Remote MCP must remain together under System"
         );
         let search: web_sys::HtmlInputElement = container
             .query_selector(".settings-search-input")
@@ -11961,8 +12170,8 @@ mod wasm_tests {
         assert!(
             filtered_group_text
                 .iter()
-                .any(|text| text.contains("Integrations") && text.contains("Remote MCP")),
-            "Searching MCP must keep Remote MCP visible under Integrations"
+                .any(|text| text.contains("System") && text.contains("Remote MCP")),
+            "Searching MCP must keep Remote MCP visible under System"
         );
         assert!(
             find_button_by_text(&container, "Remote MCP").is_some(),
@@ -12628,7 +12837,12 @@ mod wasm_tests {
                 .contains("Awaiting pairing")
         );
         drop(handle);
-        container.remove();
+        let root = container.clone();
+        drop(container);
+        assert!(
+            !root.is_connected() && !root.has_child_nodes(),
+            "The Settings fixture must remove its parent and unmount the view"
+        );
         style.remove();
     }
 
@@ -14350,7 +14564,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn updates_tab_controls_server_owned_agent_restoration() {
+    async fn restoration_page_preserves_server_owned_preferences() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let state = AppState::new();
@@ -14364,9 +14578,28 @@ mod wasm_tests {
         next_tick().await;
         click_tab(&container, "Updates");
         next_tick().await;
-        let text = container.text_content().expect("settings text");
-        assert!(text.contains("Agent restoration applies to the host selected below"));
-        assert!(text.contains("Editing settings on"));
+        assert!(scope_bar_text(&container).contains("This device"));
+        assert!(
+            container
+                .query_selector(".settings-content")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Update channel")
+        );
+        assert!(
+            !container
+                .query_selector(".settings-content")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Resume previous agents")
+        );
+        click_tab(&container, "Agent restoration");
+        next_tick().await;
+        assert!(scope_bar_text(&container).contains("Host:"));
         let toggle = toggle_for_label(&container, "Resume previous agents");
         assert!(
             toggle.checked(),
@@ -14398,12 +14631,12 @@ mod wasm_tests {
         );
         click_tab(&container, "Appearance");
         next_tick().await;
-        click_tab(&container, "Updates");
+        click_tab(&container, "Agent restoration");
         next_tick().await;
         let toggle = toggle_for_label(&container, "Resume previous agents");
         assert!(
             !toggle.checked(),
-            "reopening Updates retains the server preference"
+            "reopening Agent restoration retains the server preference"
         );
         toggle.set_checked(true);
         dispatch_change(&toggle);
@@ -14428,11 +14661,13 @@ mod wasm_tests {
     async fn supervisor_tab_enable_toggle_commits_setting() {
         let calls = install_settings_send_stub();
         let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, None);
+        crate::dispatch::reset_inbound_state_for_host("host-general");
+        state.settings_open.set(true);
+        let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_general_host_settings(&state, true, false, None);
-            state.settings_open.set(true);
-            provide_context(state);
+            provide_context(mounted_state);
             view! { <SettingsPanel /> }
         });
         next_tick().await;
@@ -14461,9 +14696,45 @@ mod wasm_tests {
             "the committed frame must carry enabled=true: {frame:?}"
         );
 
+        // Auto-compaction is now a separate page, but Supervisor still owns
+        // its enable dependency and the exact same typed setting paths.
+        assert!(
+            !container
+                .query_selector(".settings-content")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Auto-compact on success")
+        );
+        click_tab(&container, "Auto-compaction");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Auto-compaction");
+        assert!(scope_bar_text(&container).contains("host-general"));
         let compact = toggle_for_label(&container, "Auto-compact on success");
-        compact.set_checked(true);
-        dispatch_change(&compact);
+        assert!(compact.disabled(), "intent alone cannot enable compaction");
+        assert!(!compact.checked(), "auto-compaction defaults off");
+        let mut saved = state.host_settings_untracked("host-general").unwrap();
+        saved.supervisor.enabled = true;
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-general",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-general".to_owned()),
+                FrameKind::HostSettings,
+                0,
+                &settings_model::HostSettingsPayload {
+                    settings: saved,
+                    etag: "supervisor-enabled".to_owned(),
+                    configured_secrets: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let compact = toggle_for_label(&container, "Auto-compact on success");
+        assert!(!compact.disabled(), "the host snapshot unlocks compaction");
+        compact.click();
         for _ in 0..4 {
             next_tick().await;
         }
@@ -14476,6 +14747,11 @@ mod wasm_tests {
             ),
             "toggling auto-compact must emit a SupervisorAutoCompactOnSuccess SettingsWrite: {settings:?}"
         );
+
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Supervisor");
+        assert!(toggle_for_label(&container, "Enable agent supervisor").checked());
 
         // The restore opt-in and stall interrupts each authorize something the
         // user would not want by accident — a paid verdict on reopened history
@@ -14491,10 +14767,10 @@ mod wasm_tests {
             !stall.checked(),
             "stalled turns are left running by default"
         );
-        restored.set_checked(true);
-        dispatch_change(&restored);
-        stall.set_checked(true);
-        dispatch_change(&stall);
+        assert!(!restored.disabled());
+        assert!(!stall.disabled());
+        restored.click();
+        stall.click();
         for _ in 0..4 {
             next_tick().await;
         }
@@ -14581,15 +14857,8 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Supervisor");
+        click_tab(&container, "Auto-compaction");
         next_tick().await;
-
-        let kicks: web_sys::HtmlInputElement = container
-            .query_selector("input[aria-label='Supervisor kick limit']")
-            .unwrap()
-            .expect("kick limit input renders")
-            .dyn_into()
-            .expect("kick limit is an input");
 
         let compact_min: web_sys::HtmlInputElement = container
             .query_selector("input[aria-label='Supervisor auto-compact minimum context tokens']")
@@ -14608,15 +14877,21 @@ mod wasm_tests {
             "300",
             "auto-compact inactivity delay shows the server default"
         );
-        let compact_delay_unit = compact_delay
-            .parent_element()
-            .expect("delay input has a form row")
-            .query_selector(".settings-supervisor-number-unit")
-            .unwrap()
-            .expect("auto-compact inactivity delay renders a visible unit");
-        assert_eq!(
-            compact_delay_unit.text_content().as_deref(),
-            Some("seconds")
+        let field = compact_delay.closest(".settings-field").unwrap().unwrap();
+        assert!(
+            field
+                .query_selector(".settings-label")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .ends_with("(seconds)")
+        );
+        assert!(
+            field
+                .query_selector(".settings-supervisor-number-unit")
+                .unwrap()
+                .is_none()
         );
         compact_delay.set_value("15");
         dispatch_change(&compact_delay);
@@ -14631,17 +14906,35 @@ mod wasm_tests {
             "200000",
             "auto-compact minimum context shows the host default before edits"
         );
-        let compact_min_unit = compact_min
-            .parent_element()
-            .expect("minimum input has a form row")
-            .query_selector(".settings-supervisor-number-unit")
-            .unwrap()
-            .expect("auto-compact minimum context renders a visible unit");
-        assert_eq!(compact_min_unit.text_content().as_deref(), Some("tokens"));
+        let field = compact_min.closest(".settings-field").unwrap().unwrap();
+        assert!(
+            field
+                .query_selector(".settings-label")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .ends_with("(tokens)")
+        );
+        assert!(
+            field
+                .query_selector(".settings-supervisor-number-unit")
+                .unwrap()
+                .is_none()
+        );
         compact_min.set_value("240000");
         dispatch_change(&compact_min);
         compact_min.set_value("0");
         dispatch_change(&compact_min);
+
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+        let kicks: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Supervisor kick limit']")
+            .unwrap()
+            .expect("kick limit input renders")
+            .dyn_into()
+            .expect("kick limit is an input");
 
         assert_eq!(
             kicks.value(),
@@ -14662,13 +14955,22 @@ mod wasm_tests {
             "1800",
             "the stall timeout shows the 30-minute server default"
         );
-        let stall_unit = stall_seconds
-            .parent_element()
-            .expect("stall timeout input has a form row")
-            .query_selector(".settings-supervisor-number-unit")
-            .unwrap()
-            .expect("stall timeout renders a visible unit");
-        assert_eq!(stall_unit.text_content().as_deref(), Some("seconds"));
+        let field = stall_seconds.closest(".settings-field").unwrap().unwrap();
+        assert!(
+            field
+                .query_selector(".settings-label")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .ends_with("(seconds)")
+        );
+        assert!(
+            field
+                .query_selector(".settings-supervisor-number-unit")
+                .unwrap()
+                .is_none()
+        );
         stall_seconds.set_value("600");
         dispatch_change(&stall_seconds);
         stall_seconds.set_value("0");
@@ -14815,10 +15117,8 @@ mod wasm_tests {
         let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(mounted_state);
-            view! { <SettingsPanel /> }
+            view! { <SupervisorTab /> <AutoCompactionTab /> }
         });
-        next_tick().await;
-        click_tab(&container, "Supervisor");
         next_tick().await;
 
         let auto_compact = toggle_for_label(&container, "Auto-compact on success");
@@ -15011,11 +15311,20 @@ mod wasm_tests {
             "agent_activity_summaries=true must render as a checked toggle"
         );
 
-        let body = container.text_content().unwrap_or_default().to_lowercase();
-        assert!(
-            body.contains("costs money") || body.contains("cost money"),
-            "the section must warn the user that summaries cost money: {body}"
-        );
+        // The actual redesigned page says paid calls, not "costs money".
+        // Require cost disclosure on each opt-in, not arbitrary page wording.
+        for (input, warning) in [
+            (names, "One paid call per unnamed agent."),
+            (summaries, "Repeated paid calls while agents are active."),
+        ] {
+            let row = input.closest(".settings-toggle-row").unwrap().unwrap();
+            let copy = row.text_content().unwrap();
+            assert!(
+                copy.contains(warning),
+                "Each background feature must disclose its paid-call behavior: {copy}"
+            );
+            assert!(!input.disabled(), "the host's opt-ins remain editable");
+        }
     }
 
     fn rust_analyzer_path_input(container: &HtmlElement) -> web_sys::HtmlInputElement {
@@ -15711,14 +16020,13 @@ mod wasm_tests {
             .unwrap_or_default()
     }
 
-    /// The Subagents tab owns both halves of the delegation story: whether an
-    /// agent may spawn children at all, and what those children run as. The
+    /// Delegation, backend preferences and tiers have separate pages. The
     /// master toggle is `tyde_agent_control_mcp_enabled` under a name that says
     /// what it does, so this pins the label to the wire setting — a rename that
     /// silently pointed the switch at a different setting would leave the UI
     /// looking correct while agent-control stayed on.
     #[wasm_bindgen_test]
-    async fn subagents_tab_master_toggle_commits_agent_control_and_carries_tiers() {
+    async fn subagent_pages_keep_controls_and_typed_writes_separate() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -15732,11 +16040,14 @@ mod wasm_tests {
         click_tab(&container, "Subagents");
         next_tick().await;
 
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("Task complexity tiers"),
-            "complexity tiers must live with the subagent switch they configure: {text:?}"
-        );
+        let text = container
+            .query_selector(".settings-content")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(!text.contains("Task complexity tiers"));
+        assert!(!text.contains("Delegation preference"));
 
         let toggle = toggle_for_label(&container, "Tyde sub-agents");
         assert!(
@@ -15773,6 +16084,33 @@ mod wasm_tests {
             .find(|op| replacement_value(op, "/tyde_agent_control_max_depth").is_some())
             .expect("the depth input must commit its settings path");
         assert_eq!(depth_frame.get("value").and_then(Value::as_u64), Some(4));
+        click_tab(&container, "Complexity tiers");
+        next_tick().await;
+        let tiers = toggle_for_label(&container, "Task complexity tiers");
+        tiers.set_checked(true);
+        dispatch_change(&tiers);
+        next_tick().await;
+        assert!(recorded_settings_write_ops(&calls).iter().any(|op| {
+            replacement_value(op, "/complexity_tiers_enabled").and_then(Value::as_bool)
+                == Some(true)
+        }));
+        click_tab(&container, "Backend preferences");
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".settings-content")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Delegation preference")
+        );
+        assert!(
+            container
+                .query_selector("input[type=number]")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A tier value the model catalog has since dropped must stay visible as
@@ -15878,7 +16216,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Subagents");
+        click_tab(&container, "Complexity tiers");
         next_tick().await;
 
         let selects = container.query_selector_all("select").unwrap();
@@ -16139,7 +16477,7 @@ mod wasm_tests {
         );
     }
 
-    /// The sidebar has a dedicated Backends group: a stable Overview entry, a
+    /// The sidebar has a dedicated Backends group: a stable Backends entry, a
     /// Usage page, a Launch Profiles page, plus one schema-derived item per
     /// configurable backend. The overview page renders no backend config
     /// fields and no launch-profile editor; navigation to a backend's own page
@@ -16160,7 +16498,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let overview = find_button_by_text(&container, "Overview")
+        let overview = find_button_by_text(&container, "Backends")
             .expect("the Backends group must have a stable Overview item");
         assert!(
             find_button_by_text(&container, "Hermes").is_some(),
@@ -16339,7 +16677,7 @@ mod wasm_tests {
             }
         });
         next_tick().await;
-        click_tab(&container, "Overview");
+        click_tab(&container, "Backends");
         next_tick().await;
 
         let default_select = || {
@@ -16561,7 +16899,7 @@ mod wasm_tests {
         }
         state.settings_open.set(true);
         next_tick().await;
-        click_tab(&container, "Overview");
+        click_tab(&container, "Backends");
         next_tick().await;
         let select = default_select();
         select.set_value("claude");
@@ -16692,7 +17030,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        find_button_by_text(&container, "Overview")
+        find_button_by_text(&container, "Backends")
             .expect("the Backends group must have an Overview item")
             .click();
         next_tick().await;
@@ -17096,7 +17434,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        find_button_by_text(&container, "Overview")
+        find_button_by_text(&container, "Backends")
             .expect("the Backends group must have an Overview item")
             .click();
         next_tick().await;
@@ -17787,11 +18125,11 @@ mod wasm_tests {
         assert_eq!(panel_title(&container), "Appearance");
         let bar = scope_bar_text(&container);
         assert!(
-            bar.contains("this device"),
+            bar.contains("This device"),
             "a device-local page must say so: {bar:?}"
         );
         assert!(
-            !bar.contains("Editing settings on"),
+            !bar.contains("Host:"),
             "a device-local page must not claim to edit a host: {bar:?}"
         );
 
@@ -17800,7 +18138,7 @@ mod wasm_tests {
 
         let bar = scope_bar_text(&container);
         assert!(
-            bar.contains("Editing settings on"),
+            bar.contains("Host:"),
             "a host-scoped page must name the host it writes to: {bar:?}"
         );
         let select: HtmlSelectElement = container
@@ -17827,11 +18165,34 @@ mod wasm_tests {
             "the picker must show the host's label, not its id"
         );
 
-        let nav = container.text_content().unwrap_or_default();
-        assert!(
-            nav.contains("Host · dev2"),
-            "the sidebar group holding host-scoped tabs must name the host: {nav:?}"
+        let groups = container
+            .query_selector_all(".settings-nav-group-title")
+            .unwrap();
+        let labels = (0..groups.length())
+            .map(|i| groups.item(i).unwrap().text_content().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            ["Appearance", "Backends", "Steering", "Subagents", "System"]
         );
+        for label in [
+            "Appearance",
+            "Backends",
+            "Steering",
+            "Subagents",
+            "Backend preferences",
+            "Complexity tiers",
+            "Supervisor",
+            "Auto-compaction",
+            "Agent restoration",
+            "Code display",
+            "Tool output",
+        ] {
+            assert!(
+                find_button_by_text(&container, label).is_some(),
+                "Every page is one click away: {label}"
+            );
+        }
 
         click_tab(&container, "Review");
         next_tick().await;
@@ -17907,6 +18268,106 @@ mod wasm_tests {
         click_tab(&container, "Appearance");
         next_tick().await;
         assert_eq!(panel_title(&container), "Appearance");
+        let root = document
+            .document_element()
+            .unwrap()
+            .unchecked_into::<HtmlElement>();
+        let original_style = root.get_attribute("style");
+        let storage = local_storage().unwrap();
+        let original_family = storage.get_item(STORAGE_FONT_FAMILY).unwrap();
+        let original_size = storage.get_item(STORAGE_FONT_SIZE).unwrap();
+        let family = container
+            .query_selector_all(".settings-content select")
+            .unwrap();
+        let family = (0..family.length())
+            .filter_map(|i| family.item(i)?.dyn_into::<HtmlSelectElement>().ok())
+            .find(|select| {
+                (0..select.length()).any(|i| {
+                    select
+                        .item(i)
+                        .unwrap()
+                        .unchecked_into::<HtmlOptionElement>()
+                        .value()
+                        == "mono"
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            (0..family.length())
+                .map(|i| family.item(i).unwrap().text_content().unwrap())
+                .collect::<Vec<_>>(),
+            ["System Default", "Monospace", "Inter", "SF Pro"]
+        );
+        let size = container
+            .query_selector(".settings-slider")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<HtmlInputElement>();
+        container.style().set_property("width", "1280px").unwrap();
+        for font in ["system", "mono"] {
+            family.set_value(font);
+            dispatch_event_from_js(&family.clone().unchecked_into(), "change", None);
+            for scale in [11, 20] {
+                size.set_value(&scale.to_string());
+                dispatch_event_from_js(&size, "input", None);
+                next_tick().await;
+                let label = container
+                    .query_selector(".settings-label")
+                    .unwrap()
+                    .unwrap();
+                let computed = web_sys::window()
+                    .unwrap()
+                    .get_computed_style(&label)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    computed.get_property_value("font-size").unwrap(),
+                    format!("{scale}px")
+                );
+                assert_eq!(
+                    computed.get_property_value("font-family").unwrap(),
+                    web_sys::window()
+                        .unwrap()
+                        .get_computed_style(&document.body().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("font-family")
+                        .unwrap()
+                );
+                let buttons = container
+                    .query_selector_all(".settings-content button")
+                    .unwrap();
+                for index in 0..buttons.length() {
+                    let button = buttons.item(index).unwrap().unchecked_into::<HtmlElement>();
+                    assert!(
+                        button.scroll_height() <= button.client_height(),
+                        "Configured typography must fit inside its button: {}",
+                        button.text_content().unwrap()
+                    );
+                }
+                let content = container
+                    .query_selector(".settings-content")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    content.scroll_width() <= content.client_width(),
+                    "Configured typography must not clip settings controls"
+                );
+            }
+        }
+        match original_style {
+            Some(style) => root.set_attribute("style", &style).unwrap(),
+            None => root.remove_attribute("style").unwrap(),
+        }
+        for (key, original) in [
+            (STORAGE_FONT_FAMILY, original_family),
+            (STORAGE_FONT_SIZE, original_size),
+        ] {
+            match original {
+                Some(value) => storage.set_item(key, &value).unwrap(),
+                None => storage.remove_item(key).unwrap(),
+            }
+        }
         let close = container
             .query_selector(".settings-close-btn")
             .unwrap()
@@ -18034,7 +18495,7 @@ mod wasm_tests {
             "non-matching settings tabs must be filtered out"
         );
         assert!(
-            find_button_by_text(&container, "Overview").is_none(),
+            find_button_by_text(&container, "Backends").is_none(),
             "Overview must be filtered when the query only matches a backend page"
         );
     }
@@ -22104,6 +22565,14 @@ mod wasm_tests {
         );
         assert!(help_text.contains("Requires native forks and enforced read-only support"));
         assert!(help_text.contains("Reviewers use your configured sources and team layout"));
+        let mode_disclosure: HtmlElement = container
+            .query_selector("details summary")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(mode_disclosure.text_content().unwrap(), "Review modes");
+        mode_disclosure.click();
         container.set_attribute("style", "width: 320px").unwrap();
         next_tick().await;
         let help_rect = mode_help.get_bounding_client_rect();

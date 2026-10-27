@@ -1282,13 +1282,15 @@ fn delete_profile_dialog(
 /// language so this page sits naturally next to the other backend pages.
 fn card(title: &str, description: Option<&str>, body: AnyView) -> AnyView {
     view! {
-        <section class="settings-native-group settings-hermes-card">
-            <div class="settings-native-group-header">
+        <section class="settings-native-group settings-hermes-card settings-section">
+            <div class="settings-native-group-header settings-section-rail">
                 <span class="settings-native-group-title">{title.to_owned()}</span>
             </div>
+            <div class="settings-section-body">
             {description
                 .map(|d| view! { <p class="settings-native-group-desc">{d.to_owned()}</p> })}
             {body}
+            </div>
         </section>
     }
     .into_any()
@@ -2122,7 +2124,7 @@ fn model_card(
                 config_committer(doc.clone(), drafts, name.clone(), |c, v| c.model.base_url = v),
             )}
             {number_field(
-                "Context length",
+                "Context length (tokens)",
                 Some("Context window override in tokens."),
                 "The model's own limit",
                 config_value(doc.clone(), drafts, name.clone(), |c| c.model.context_length),
@@ -2660,8 +2662,8 @@ fn save_bar(
 
 fn labeled_field(label: &str, hint: Option<&str>, control: AnyView) -> AnyView {
     view! {
-        <div class="settings-native-field">
-            <span class="settings-form-label">{label.to_owned()}</span>
+        <div class="settings-native-field settings-field">
+            <span class="settings-form-label settings-row-label">{label.to_owned()}</span>
             {control}
             {hint.map(|h| view! { <p class="settings-description">{h.to_owned()}</p> })}
         </div>

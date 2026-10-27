@@ -1205,6 +1205,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn project_roots_collapse_and_expand_their_files() {
+        let _bridge = FileViewBridge::install();
         let container = make_container();
         let _state = mount_explorer_with_files(container.clone(), &["main.rs"]);
         next_tick().await;

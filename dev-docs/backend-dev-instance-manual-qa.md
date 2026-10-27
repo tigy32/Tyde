@@ -40,6 +40,14 @@ canonical `frontendUrl`; do not export the private HTTP identity header. Keep
 cold compilation/setup and warm launch durations separate from UI-action
 measurements. A build or readiness failure leaves UI actions unmeasured.
 
+The `notifications_v2` desktop startup contract requires the host and UI-debug
+owners to bind port-zero loopback listeners and announce their actual bound
+addresses. The launcher never picks and releases a port for a child to rebind.
+A host announcement must pass the normal protocol handshake; UI listening must
+precede UI-ready and a typed Ping/Pong. Duplicate, non-loopback, zero-port or
+shared host/UI endpoints fail explicitly. Launcher and source must declare the
+same contract; old notifications are rejected rather than used as a fallback.
+
 ## Certification contract
 
 A run certifies one exact combination of Tyde commit, backend CLI version,

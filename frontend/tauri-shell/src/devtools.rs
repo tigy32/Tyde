@@ -148,6 +148,11 @@ pub fn start_ui_debug_http_server(
     let local_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to resolve UI debug listener addr: {err}"))?;
+    devtools_protocol::notify_dev_instance_startup(
+        devtools_protocol::DevInstanceStartupSignal::UiListening {
+            address: local_addr,
+        },
+    )?;
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

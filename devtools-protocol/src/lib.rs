@@ -251,7 +251,7 @@ pub const DEV_INSTANCE_STARTUP_CONTRACT_PATH: &str = "devtools-protocol/dev-inst
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevInstanceStartupProtocol {
-    NotificationsV1,
+    NotificationsV2,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,7 +275,7 @@ pub struct DevFrontendAttestation {
 }
 
 pub const DEV_INSTANCE_STARTUP_CONTRACT: DevInstanceStartupContract = DevInstanceStartupContract {
-    protocol: DevInstanceStartupProtocol::NotificationsV1,
+    protocol: DevInstanceStartupProtocol::NotificationsV2,
     frontend: DevFrontendProtocol::OwnedBuildServeV1,
 };
 
@@ -283,6 +283,7 @@ pub const DEV_INSTANCE_STARTUP_CONTRACT: DevInstanceStartupContract = DevInstanc
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DevInstanceStartupSignal {
     HostListening { address: std::net::SocketAddr },
+    UiListening { address: std::net::SocketAddr },
     UiReady,
 }
 

@@ -1073,10 +1073,9 @@ async fn build_instance(
         | None => project_dir.clone(),
     };
     let instance_id = reporter.instance_id.clone();
-    let host_port = reserve_loopback_port()?;
-    let ui_debug_port = reserve_loopback_port()?;
-    let host_addr = loopback_addr(host_port);
-    let ui_debug_addr = loopback_addr(ui_debug_port);
+    // The child keeps each port-zero listener bound and announces its actual
+    // address. Picking then releasing a port here creates a rebind race.
+    let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let resolved_hermes_runtime = input
         .hermes
         .as_ref()
@@ -1175,8 +1174,8 @@ async fn build_instance(
             .env("TYDE_DEV_INSTANCE", "1")
             .env(DEV_INSTANCE_STARTUP_ADDR_ENV, startup_addr.to_string())
             .env(DEV_INSTANCE_ID_ENV, &instance_id.0)
-            .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
-            .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
+            .env("TYDE_DEV_HOST_BIND_ADDR", bind_addr.to_string())
+            .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", bind_addr.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
@@ -1206,8 +1205,8 @@ async fn build_instance(
         let mut record = DevInstanceRecord {
             frontend_port,
             frontend_build: frontend_ready.attestation,
-            host_addr,
-            ui_debug_addr,
+            host_addr: bind_addr,
+            ui_debug_addr: bind_addr,
             frontend_url: frontend_url.clone(),
             config_path,
             store_dir,
@@ -1601,12 +1600,11 @@ async fn wait_for_instance_ready(
     listener: TcpListener,
     reporter: &StartupReporter,
 ) -> Result<(), DevStartFailure> {
-    let host_addr = record.host_addr;
-    let ui_debug_addr = record.ui_debug_addr;
     let readiness = async {
-        let mut host_ready = false;
+        let mut host_addr = None;
+        let mut ui_debug_addr = None;
         let mut ui_ready = false;
-        while !host_ready || !ui_ready {
+        while host_addr.is_none() || !ui_ready {
             let (stream, remote) = listener
                 .accept()
                 .await
@@ -1641,21 +1639,42 @@ async fn wait_for_instance_ready(
             }
             match notification.signal {
                 DevInstanceStartupSignal::HostListening { address } => {
-                    if host_ready || address != host_addr {
+                    if host_addr.is_some()
+                        || !address.ip().is_loopback()
+                        || address.port() == 0
+                        || ui_debug_addr == Some(address)
+                    {
                         return Err("Invalid or duplicate DEV host readiness notification"
                             .to_owned()
                             .into());
                     }
                     reporter.phase(DevInstanceStartupPhase::HostHandshake)?;
-                    connect_host_endpoint(host_addr).await?;
-                    host_ready = true;
+                    connect_host_endpoint(address).await?;
+                    host_addr = Some(address);
+                }
+                DevInstanceStartupSignal::UiListening { address } => {
+                    if ui_debug_addr.is_some()
+                        || !address.ip().is_loopback()
+                        || address.port() == 0
+                        || host_addr == Some(address)
+                    {
+                        return Err("Invalid or duplicate DEV UI listening notification"
+                            .to_owned()
+                            .into());
+                    }
+                    ui_debug_addr = Some(address);
                 }
                 DevInstanceStartupSignal::UiReady => {
                     if ui_ready {
                         return Err("Duplicate DEV UI readiness notification".to_owned().into());
                     }
+                    let address = ui_debug_addr.ok_or_else(|| {
+                        DevStartFailure::from(
+                            "DEV UI ready before its listening notification".to_owned(),
+                        )
+                    })?;
                     reporter.phase(DevInstanceStartupPhase::UiHandshake)?;
-                    match send_ui_debug_request(ui_debug_addr, UiDebugRequest::Ping)
+                    match send_ui_debug_request(address, UiDebugRequest::Ping)
                         .await
                         .map_err(|error| {
                             DevStartFailure::new(DevInstanceFailureKind::UiHandshake, error)
@@ -1677,9 +1696,12 @@ async fn wait_for_instance_ready(
                 }
             }
         }
-        Ok::<(), DevStartFailure>(())
+        Ok::<_, DevStartFailure>((
+            host_addr.ok_or_else(|| "DEV host endpoint was not announced".to_owned())?,
+            ui_debug_addr.ok_or_else(|| "DEV UI endpoint was not announced".to_owned())?,
+        ))
     };
-    tokio::select! {
+    let (host_addr, ui_debug_addr) = tokio::select! {
         biased;
         status = record.frontend_child.wait() => match status {
             Ok(status) => Err(DevStartFailure::new(DevInstanceFailureKind::ChildExit, format!("dev frontend exited before desktop ready: {status}"))),
@@ -1690,7 +1712,10 @@ async fn wait_for_instance_ready(
             Err(error) => Err(format!("failed to wait for dev desktop: {error}").into()),
         },
         result = readiness => result,
-    }
+    }?;
+    record.host_addr = host_addr;
+    record.ui_debug_addr = ui_debug_addr;
+    Ok(())
 }
 
 fn dev_instance_summary(
@@ -1825,22 +1850,6 @@ fn resolve_project_dir(repo_root: Option<&Path>, raw: &str) -> Result<PathBuf, S
             joined.display()
         )
     })
-}
-
-fn reserve_loopback_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|err| format!("failed to reserve loopback port: {err}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|err| format!("failed to read reserved loopback port: {err}"))?
-        .port();
-    Ok(port)
-}
-
-fn loopback_addr(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{port}")
-        .parse()
-        .expect("loopback socket addr must parse")
 }
 
 fn dev_instance_store_dir(instance_id: &str) -> PathBuf {
