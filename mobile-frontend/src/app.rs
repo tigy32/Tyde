@@ -2341,6 +2341,43 @@ mod wasm_tests {
                     .is_same_node(Some(&input))
             );
         }
+        // Background ends owned editing; return keeps the draft and selection
+        // and waits for a tap instead of refocusing.
+        assert!(!frame_document.hidden());
+        let set_hidden = js_sys::Function::new_with_args(
+            "w,hidden",
+            r#"
+            for (const key of ['hidden', 'visibilityState']) delete w.document[key];
+            if (hidden) {
+                Object.defineProperty(w.document, 'hidden', {configurable:true, value:true});
+                Object.defineProperty(w.document, 'visibilityState', {configurable:true, value:'hidden'});
+            }
+            w.document.dispatchEvent(new w.Event('visibilitychange'));
+        "#,
+        );
+        let frame_window = frame.content_window().unwrap();
+        for hidden in [true, false] {
+            set_hidden
+                .call2(&wasm_bindgen::JsValue::NULL, &frame_window, &hidden.into())
+                .unwrap();
+            render_shell(&frame).await;
+            assert_eq!(frame_document.hidden(), hidden);
+            assert!(
+                !frame_document
+                    .active_element()
+                    .is_some_and(|active| active.is_same_node(Some(&input))),
+                "hidden={hidden}: background must end composer editing without refocus"
+            );
+            assert_eq!(input.value(), "preserved draft");
+            assert_eq!(state.chat_input.get_untracked(), "preserved draft");
+            assert_eq!(input.selection_start().unwrap(), Some(2));
+            assert_eq!(input.selection_end().unwrap(), Some(8));
+        }
+        assert_bottom_gap(&dock, 8.0);
+        assert!(reachable(), "returned composer remains reachable");
+        input.focus().unwrap();
+        assert_eq!(input.selection_start().unwrap(), Some(2));
+        assert_eq!(input.selection_end().unwrap(), Some(8));
         // The old gate rejected a 307.19 ms sample despite correct Send hit
         // geometry. Assert before and after the reactive flush, not host speed.
         let set_input = js_sys::Function::new_with_args(

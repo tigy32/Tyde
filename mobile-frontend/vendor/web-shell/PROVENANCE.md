@@ -16,9 +16,8 @@ not at an unversioned origin-root URL. CSS is loaded before app styles.
 No npm install, registry access, or independent viewport implementation.
 
 This main-based revision includes the optional `endEditingOnHidden` API,
-default OFF. Tyde has not enabled it: the background/hardware-keyboard editing
-UX decision is pending. Visible focus/blur/pageshow and viewport measurement
-remain unchanged. The newer `keyboardHint()` API from upstream main is also
+default OFF. Tyde enables it in `src/shell.rs`. Visible focus/blur/pageshow and
+viewport measurement remain unchanged. The newer `keyboardHint()` API from upstream main is also
 included but INACTIVE: Tyde web/PWA has no binding or caller. It is not used as
 a guessed software-keyboard metric or a second layout authority.
 

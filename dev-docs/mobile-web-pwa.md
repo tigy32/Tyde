@@ -110,8 +110,8 @@ versioned bundle and the existing executable-integrity manifest covers it.
 The shared CSS loads before Tyde's appearance styles. The main-based archive
 also includes upstream's native `keyboardHint()` API; Tyde web/PWA has no
 binding/caller, so it remains inactive and measured browser geometry stays the
-sole viewport path. The optional hidden-editing policy is not enabled pending
-the consumer UX decision described below.
+sole viewport path. Tyde enables the optional hidden-editing policy described
+below.
 
 `mobile-frontend/src/shell.rs` attaches one document owner after mounting and
 rebinds only when navigation replaces its header, scroller, or bottom region.
@@ -149,14 +149,24 @@ from the earlier investigation that established no fix and from the separately
 landed double-tap zoom work.
 
 The shared shell offers an optional `endEditingOnHidden` policy, default OFF.
-Tyde has not enabled it: ending editing on background changes hardware-keyboard
-focus and requires tapping to edit again on return. That consumer UX decision is
-pending. The supported library candidate ends root-owned editing while hidden,
-not after return, with no replacement height or second viewport controller.
-Visible window blur, focus changes and pageshow do not end editing; there is no
-foreground autofocus. Draft, selection and history were retained in the bounded
-comparison. Uncommitted IME and assistive cursor behavior remain unverified.
-The existing foreground transport recovery is untouched.
+Tyde enables it: the owner approved ending editing on background, so returning
+users (including hardware-keyboard users) tap the composer to resume typing.
+The shell ends root-owned editing while hidden, not after return, with no
+replacement height or second viewport controller. Visible window blur, focus
+changes and pageshow do not end editing; there is no foreground autofocus.
+Draft and selection are retained. The existing foreground transport recovery
+is untouched. The app-surface browser test covers the hidden/visible cycle.
+
+The decisive matched-source reproduction ran in an actual iOS 27 Simulator
+Home Screen web clip with real touches: composer -> Emoji -> Search Emoji ->
+app switcher -> Messages -> switcher back with the composer still focused
+(accessory-only, no keys, 725px viewport) -> landscape -> portrait. WebKit then
+reported a 90.9px visual viewport with no keyboard on screen and the shell
+collapsed to the top of the screen. The same flow with the policy enabled
+returns unfocused at full height. The shell still applies visual viewport
+contraction while nothing is focused; an unfocused stale contraction (the
+user-reported floating tab bar) was not reproduced in the Simulator, so no
+shell measurement change was made for it.
 
 One bounded physical iPhone 14 Pro/iOS 27.0 reduced-DOM comparison observed
 hidden focusout, then native-first full-height/no-keyboard return (793px), same

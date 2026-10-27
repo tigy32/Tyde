@@ -81,8 +81,13 @@ fn bind_regions(
     }
     js_sys::Reflect::set(&options, &"regions".into(), &bindings)?;
     js_sys::Reflect::set(&options, &"followEnd".into(), &false.into())?;
+    // A focus retained across background lets iOS standalone WebKit return
+    // with keyboard geometry for a keyboard that is no longer shown.
+    js_sys::Reflect::set(&options, &"endEditingOnHidden".into(), &true.into())?;
     let handle = attach_shell(root, &options)?;
-    log::debug!("Shared mobile shell attached to mounted regions; followEnd=false");
+    log::debug!(
+        "Shared mobile shell attached to mounted regions; followEnd=false endEditingOnHidden=true"
+    );
     *mounted.borrow_mut() = Some(MountedShell { handle, regions });
     Ok(())
 }
