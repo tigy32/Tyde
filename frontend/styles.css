@@ -7143,10 +7143,13 @@ math merror {
 }
 
 .agent-sidebar-swarm-row .agent-card-name {
-    flex: 1;
+    flex: 1 1 80px;
 }
 
+.agents-panel .agent-sidebar-swarm-row .agent-card-top { flex-wrap: wrap; }
+.agents-panel .agent-sidebar-swarm-row .agent-card-status { height: auto; min-height: 20px; max-width: 100%; overflow-wrap: anywhere; }
 .agent-sidebar-swarm-counts {
+    overflow-wrap: anywhere;
     font-size: 0.846rem;
     color: var(--text-tertiary);
 }
@@ -17598,7 +17601,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agent-card-top > .agent-card-pin.pinned { display: inline-flex; visibility: visible; }
 .agent-backend-glyph { width: 18px; height: 18px; flex-shrink: 0; display: inline-flex; color: var(--text-primary); }
 .agent-backend-glyph .launch-backend-icon { width: 18px; height: 18px; object-fit: contain; }
-.agent-card-collapse-toggle { flex-shrink: 0; font-size: 11px; line-height: 1.4; color: var(--accent-primary); gap: 3px; }
+.agent-card-collapse-toggle { flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; font-size: 20px; line-height: 1; color: var(--text-tertiary); margin-block: -2px; }
+.agent-card-child-count { font-size: 11px; line-height: 18px; color: var(--text-tertiary); }
 .agent-show-inactive { align-self: flex-start; margin-left: 32px; border: none; background: transparent; color: var(--text-tertiary); font-size: 11px; padding: 6px; cursor: pointer; }
 .agent-show-inactive[aria-expanded="true"] { color: var(--accent-primary); }
 /* One 20px line box for every item on a row's first line, so revealing the pin
@@ -17611,8 +17615,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-panel .agent-sidebar-project-section,
 .agents-panel .agent-sidebar-default-tree { gap: 0; }
 .agent-sidebar-project-section { border: 0; border-radius: 0; padding: 0; margin-top: 3px; }
-.agent-sidebar-project-section > .agent-card-group,
-.agent-sidebar-project-section > .agent-sidebar-swarm-row { margin-left: 22px; }
+.agent-sidebar-project-section > .agent-card-group { margin-left: 22px; }
+.agent-sidebar-project-section > .agent-sidebar-swarm-row { margin-left: 22px; width: calc(100% - 22px); }
 .agent-sidebar-host-header { display: flex; align-items: center; justify-content: space-between; min-height: 30px; border-bottom: 1px solid var(--border-primary); margin-block: 8px 5px; }
 .agent-sidebar-host-header > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-sidebar-project-header { text-transform: none; letter-spacing: normal; font-size: 13px; color: var(--text-primary); min-height: 32px; }
@@ -17622,7 +17626,6 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-panel .agent-card-top { align-items: flex-start; min-width: 0; width: 100%; gap: 6px; }
 .agents-panel .agent-card-top > .agent-backend-glyph { margin-block: 1px; }
 .agents-panel .agent-card-top-main { flex-direction: column; align-items: flex-start; gap: 2px; }
-.agents-panel .agent-card-collapse-toggle { min-height: 18px; color: var(--text-tertiary); }
 .agents-panel .agent-card-status,
 .agent-row-drag-preview .agent-card-status { animation: none; display: inline-flex; align-items: center; height: 20px; min-width: 0; }
 .agents-panel .agent-card-status > [aria-hidden="true"] { flex-shrink: 0; }
@@ -17669,6 +17672,27 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
         text-overflow: ellipsis;
         white-space: nowrap;
     }
+}
+@container (max-width: 219px) {
+    .agents-panel .agent-card-top-main { min-width: 0; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) {
+        display: grid;
+        grid-template-columns: 24px minmax(0, auto) minmax(32px, 1fr) 18px;
+        grid-template-rows: minmax(20px, auto) minmax(18px, auto);
+        gap: 2px 4px;
+    }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-top-main { display: contents; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-collapse-toggle { grid-column: 1; grid-row: 1; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-status { grid-column: 2; grid-row: 1; max-width: 100%; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) .agent-card-name,
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) .agent-card-name-input { grid-column: 3; grid-row: 1; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) .agent-card-child-count { grid-column: 1 / 4; grid-row: 2; margin-right: 24px; overflow-wrap: anywhere; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-pin { grid-column: 3; grid-row: 2; justify-self: end; display: inline-flex; visibility: hidden; margin-block: -1px; }
+    .agents-panel .agent-card:is(:hover, :focus-within) > .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-pin,
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-pin.pinned { visibility: visible; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-backend-glyph { grid-column: 4; grid-row: 2; margin-block: 0; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-card-actions { grid-column: 4; grid-row: 1; }
+    .agents-panel .agent-card-top:has(> .agent-card-collapse-toggle) > .agent-pin-host { grid-column: 1 / -1; grid-row: 3; max-width: 100%; }
 }
 .agents-filter-menu { position: absolute; top: 8px; right: 8px; z-index: 3; }
 .agents-filter-menu summary { list-style: none; width: 28px; height: 28px; border: 1px solid var(--border-primary); border-radius: 4px; display: grid; place-items: center; color: var(--text-secondary); cursor: pointer; }

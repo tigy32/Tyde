@@ -2950,6 +2950,23 @@ fn agent_card(
             on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
         >
             <div class="agent-card-top">
+                {(child_count > 0).then(|| {
+                    let parent_ref = agent_ref(&agent);
+                    let expanded_ref = parent_ref.clone();
+                    view! {
+                        <button type="button" class="agent-card-collapse-toggle"
+                            title="Toggle sub-agents" aria-label="Toggle sub-agents"
+                            aria-expanded=move || expanded_parents.with(|set| set.contains(&expanded_ref)).to_string()
+                            on:click=move |ev: web_sys::MouseEvent| {
+                                ev.stop_propagation();
+                                expanded_parents.update(|set| { if !set.remove(&parent_ref) { set.insert(parent_ref.clone()); } });
+                            }
+                            on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                        >
+                            <span aria-hidden="true">{move || if expanded_parents.with(|set| set.contains(&agent_ref_for_disclosure)) { "▾" } else { "▸" }}</span>
+                        </button>
+                    }
+                })}
                 <span
                     class=move || {
                         if status_label_visible_sig() {
@@ -3054,23 +3071,8 @@ fn agent_card(
                         }.into_any()
                     }
                 }}
-                {(child_count > 0).then(|| {
-                    let parent_ref = agent_ref(&agent);
-                    let expanded_ref = parent_ref.clone();
-                    view! {
-                        <button type="button" class="agent-card-collapse-toggle"
-                            title="Toggle sub-agents" aria-label="Toggle sub-agents"
-                            aria-expanded=move || expanded_parents.with(|set| set.contains(&expanded_ref)).to_string()
-                            on:click=move |ev: web_sys::MouseEvent| {
-                                ev.stop_propagation();
-                                expanded_parents.update(|set| { if !set.remove(&parent_ref) { set.insert(parent_ref.clone()); } });
-                            }
-                            on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                        >
-                            {move || format!("{} running", running.get())}
-                            <span aria-hidden="true">{move || if expanded_parents.with(|set| set.contains(&agent_ref_for_disclosure)) { " ▾" } else { " ▸" }}</span>
-                        </button>
-                    }
+                {(child_count > 0).then(|| view! {
+                    <span class="agent-card-child-count">{move || format!("{} running", running.get())}</span>
                 })}
                 </div>
                 <Show when=move || is_pinned.get()>
@@ -4989,9 +4991,26 @@ mod wasm_tests {
             .unwrap()
             .unwrap()
             .get_bounding_client_rect();
+        let activity = selected
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let count = selected
+            .query_selector(".agent-card-child-count")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        // The requested leading disclosure shares the name line; only the
+        // running count retains the second line of the previous layout.
         assert!(
-            disclosure.top() >= name.bottom(),
-            "The child disclosure is below the full conversation name, not competing with it for width"
+            disclosure.right() <= activity.left()
+                && disclosure.width() >= 24.0
+                && disclosure.height() >= 24.0
+                && disclosure.top() <= name.top()
+                && disclosure.bottom() >= name.bottom()
+                && count.top() >= name.bottom(),
+            "The disclosure leads activity with a 24px target while the count stays below the name"
         );
         assert!(
             selected.get_bounding_client_rect().height() <= 60.0,
@@ -6081,6 +6100,37 @@ mod wasm_tests {
             disclosure.get_attribute("aria-expanded").as_deref(),
             Some("false")
         );
+        let target = disclosure.get_bounding_client_rect();
+        assert!(
+            target.width() >= 24.0 && target.height() >= 24.0,
+            "Disclosure has a comfortable target"
+        );
+        let status = parent
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        assert!(
+            target.right() <= status.left(),
+            "Disclosure precedes activity"
+        );
+        let before = parent.get_bounding_client_rect();
+        let hit = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .element_from_point((target.left() + 2.0) as f32, (target.top() + 2.0) as f32)
+            .unwrap();
+        assert!(
+            disclosure.contains(Some(&hit)),
+            "The enlarged edge is clickable"
+        );
+        hit.dyn_into::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        disclosure.click();
+        next_tick().await;
+        assert_eq!(child.get_bounding_client_rect().height(), 0.0);
+        assert_eq!(parent.get_bounding_client_rect().height(), before.height());
         disclosure.click();
         next_tick().await;
         assert!(
@@ -6102,6 +6152,130 @@ mod wasm_tests {
         inactive.click();
         next_tick().await;
         assert!(quiet.get_bounding_client_rect().height() > 0.0);
+        let layout_document = web_sys::window().unwrap().document().unwrap();
+        let root = layout_document
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let original_font = root.style().get_property_value("font-size").unwrap();
+        for font in [13, 20] {
+            root.style()
+                .set_property("font-size", &format!("{font}px"))
+                .unwrap();
+            for width in [160, 220, 360] {
+                state.agent_awaiting_user.update(|pending| {
+                    if width == 160 {
+                        pending.insert(AgentId("parent-alpha".into()));
+                    } else {
+                        pending.remove(&AgentId("parent-alpha".into()));
+                    }
+                });
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                let actions: HtmlElement = parent
+                    .query_selector("[aria-label='Agent actions']")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into()
+                    .unwrap();
+                actions.blur().unwrap();
+                disclosure.blur().unwrap();
+                next_tick().await;
+                let at_rest = parent.get_bounding_client_rect();
+                let name_at_rest = parent
+                    .query_selector(".agent-card-name")
+                    .unwrap()
+                    .unwrap()
+                    .get_bounding_client_rect();
+                disclosure.focus().unwrap();
+                next_tick().await;
+                let panel = container
+                    .query_selector(".agents-panel .panel-content")
+                    .unwrap()
+                    .unwrap();
+                let panel_rect = panel.get_bounding_client_rect();
+                assert!(
+                    panel.scroll_width() <= panel.client_width() + 1,
+                    "No sidebar overflow at {width}px/{font}px, including focused parent and nested controls"
+                );
+                for part in [
+                    "[aria-label='Toggle sub-agents']",
+                    ".agent-card-status",
+                    ".agent-card-name",
+                    ".agent-card-child-count",
+                    ".agent-card-pin",
+                    ".agent-backend-glyph",
+                    "[aria-label='Agent actions']",
+                ] {
+                    let rect = parent
+                        .query_selector(part)
+                        .unwrap()
+                        .unwrap()
+                        .get_bounding_client_rect();
+                    assert!(
+                        rect.width() > 0.0
+                            && rect.left() >= panel_rect.left()
+                            && rect.right() <= panel_rect.right(),
+                        "Parent {part} stays accessible at {width}px/{font}px"
+                    );
+                }
+                assert_eq!(
+                    parent.get_bounding_client_rect().height(),
+                    at_rest.height(),
+                    "Focus cannot resize the parent row"
+                );
+                let focused_name = parent
+                    .query_selector(".agent-card-name")
+                    .unwrap()
+                    .unwrap()
+                    .get_bounding_client_rect();
+                assert_eq!(
+                    (focused_name.left(), focused_name.top()),
+                    (name_at_rest.left(), name_at_rest.top()),
+                    "Revealing the pin cannot move the name"
+                );
+                assert!(at_rest.height() <= 49.0, "Parent remains two compact lines");
+                let rect = actions.get_bounding_client_rect();
+                let hit = layout_document
+                    .element_from_point(
+                        (rect.left() + rect.width() / 2.0) as f32,
+                        (rect.top() + rect.height() / 2.0) as f32,
+                    )
+                    .unwrap();
+                assert!(
+                    actions.contains(Some(&hit)),
+                    "The menu target is not clipped or covered"
+                );
+                hit.dyn_into::<HtmlElement>().unwrap().click();
+                next_tick().await;
+                let menu: HtmlElement = parent
+                    .query_selector("[role='menu']")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into()
+                    .unwrap();
+                assert!(menu.text_content().unwrap().contains("Rename agent"));
+                dispatch_key(&menu, "Escape");
+                next_tick().await;
+                assert_eq!(
+                    actions.get_attribute("aria-expanded").as_deref(),
+                    Some("false")
+                );
+                assert_eq!(
+                    layout_document.active_element().unwrap(),
+                    parent.clone().unchecked_into::<web_sys::Element>()
+                );
+            }
+        }
+        root.style()
+            .set_property("font-size", &original_font)
+            .unwrap();
+        container.style().remove_property("width").unwrap();
+        next_tick().await;
+
         state.agent_turn_active.update(|turns| {
             turns.insert(AgentId("child-alpha".into()), false);
         });
@@ -6119,6 +6293,35 @@ mod wasm_tests {
                 .as_deref(),
             Some("Idle")
         );
+        assert!(
+            child
+                .query_selector("button[aria-label='Toggle sub-agents']")
+                .unwrap()
+                .is_none(),
+            "Childless rows have no disclosure"
+        );
+        state
+            .agents_view_preferences
+            .update(|preferences| preferences.sidebar.hide_sub_agents = true);
+        next_tick().await;
+        assert!(
+            agent_card_el(&container, "parent-alpha")
+                .query_selector("button[aria-label='Toggle sub-agents']")
+                .unwrap()
+                .is_none(),
+            "Hiding sub-agents removes the disclosure"
+        );
+        assert!(
+            container
+                .query_selector("[data-agent-drop-id='child-alpha']")
+                .unwrap()
+                .is_none()
+        );
+        state
+            .agents_view_preferences
+            .update(|preferences| preferences.sidebar.hide_sub_agents = false);
+        next_tick().await;
+
         // Project editing uses the same domain commands as the project rail,
         // and renders only the roots in the server's project snapshot.
         let pencil = container
@@ -7742,6 +7945,78 @@ mod wasm_tests {
             row_text()
         );
 
+        let document = web_sys::window().unwrap().document().unwrap();
+        let root = document
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let before_layout =
+            state.swarms.get_untracked()["local"][&SwarmId("bamboo-swarm".into())].clone();
+        let original_font = root.style().get_property_value("font-size").unwrap();
+        set_swarm(&|swarm| {
+            swarm.name =
+                "Bamboo with a very long unbrokenlabelthatmustnotpushthestatusoutside".into();
+            let member = swarm.members[0].clone();
+            swarm.members.resize(123, member);
+        });
+        for font in [13, 20] {
+            root.style()
+                .set_property("font-size", &format!("{font}px"))
+                .unwrap();
+            for width in [160, 220, 360] {
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                for (lifecycle, expected) in [
+                    (SwarmLifecycle::Running, "Idle"),
+                    (SwarmLifecycle::AttentionRequired, "Needs attention"),
+                    (SwarmLifecycle::Paused, "Paused"),
+                ] {
+                    set_swarm(&|swarm| {
+                        swarm.lifecycle = lifecycle;
+                        for member in &mut swarm.members {
+                            member.runtime_status = Some(AgentControlStatus::Idle);
+                        }
+                    });
+                    next_tick().await;
+                    let status = row.query_selector(".agent-card-status").unwrap().unwrap();
+                    assert_eq!(status.text_content().unwrap(), expected);
+                    let bounds = row.get_bounding_client_rect();
+                    let parent = row.parent_element().unwrap().get_bounding_client_rect();
+                    let text = document.create_range().unwrap();
+                    text.select_node_contents(&status).unwrap();
+                    let visible = text.get_bounding_client_rect();
+                    assert!(
+                        bounds.right() <= parent.right() + 1.0,
+                        "Indented swarm stays inside project at {width}px/{font}px"
+                    );
+                    assert!(
+                        visible.width() > 0.0
+                            && visible.left() >= bounds.left()
+                            && visible.right() <= bounds.right(),
+                        "Full {expected} text remains inside swarm at {width}px/{font}px"
+                    );
+                    assert!(
+                        visible.top() >= bounds.top() && visible.bottom() <= bounds.bottom(),
+                        "Status lines are not vertically clipped"
+                    );
+                    assert!(
+                        row.scroll_width() <= row.client_width() + 1,
+                        "Long name/counts cannot overflow the swarm"
+                    );
+                    assert!(row_text().contains("123 agents · 0 working"));
+                }
+            }
+        }
+        root.style()
+            .set_property("font-size", &original_font)
+            .unwrap();
+
+        set_swarm(&|swarm| *swarm = before_layout.clone());
+        next_tick().await;
+
         row.click();
         next_tick().await;
         assert_eq!(
@@ -8796,14 +9071,14 @@ mod wasm_tests {
             "the fork must never render inside another agent's child list; got {nested:?}"
         );
         let counted = container
-            .query_selector(".agent-card-collapse-toggle")
+            .query_selector(".agent-card-child-count")
             .unwrap()
             .expect("the owning agent still shows its child count")
             .text_content()
             .unwrap_or_default();
         assert_eq!(
             counted.trim(),
-            "1 running ▸",
+            "1 running",
             "the fork must not be counted as a child of the agent it forked from"
         );
     }

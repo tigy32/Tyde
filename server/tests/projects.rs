@@ -6335,6 +6335,67 @@ async fn project_watcher_prunes_ignored_build_trees() {
         drop((removed, restored));
     }
 
+    // A real listing can see a file before its queued native create is classified.
+    // Hold the watcher, not the client or actor, across that visible file's deletion.
+    expect_watched_write(
+        &mut fixture.client,
+        &project,
+        "src/main.rs",
+        "before queued create race\n",
+    )
+    .await;
+    let (scan_tx, scan_rx) = tokio::sync::oneshot::channel();
+    let (scan_release_tx, scan_release_rx) = std::sync::mpsc::channel();
+    let scan = fixture.on_project_scan(
+        pruned.clone(),
+        server::ScanPoint::ReadDirectory,
+        move || {
+            scan_tx.send(()).unwrap();
+            scan_release_rx.recv().unwrap();
+        },
+    );
+    fs::write(
+        repo.path().join("src/main.rs"),
+        "start independent listing\n",
+    )
+    .unwrap();
+    scan_rx.await.unwrap();
+    let race_file = pruned.join("created-before-dispatch.rs");
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held = fixture.on_project_scan(
+        race_file.clone(),
+        server::ScanPoint::WatcherProcess,
+        move || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        },
+    );
+    fs::write(&race_file, "visible before watcher classification\n").unwrap();
+    held_rx.await.unwrap();
+    let (settled, settled_rx) =
+        watch_completion(&fixture, repo.path(), server::ScanPoint::FileRefreshSettled);
+    scan_release_tx.send(()).unwrap();
+    expect_watched_listing(
+        &mut fixture.client,
+        "pruned/deep/created-before-dispatch.rs",
+        true,
+    )
+    .await;
+    settled_rx.await.unwrap();
+    fs::remove_file(&race_file).unwrap();
+    eprintln!(
+        "PROJECT WATCH RACE EVIDENCE file_listed=true prior_refreshes_settled=true removed_before_create_classified=true"
+    );
+    release_tx.send(()).unwrap();
+    expect_watched_listing(
+        &mut fixture.client,
+        "pruned/deep/created-before-dispatch.rs",
+        false,
+    )
+    .await;
+    drop((scan, held, settled));
+
     fixture
         .client
         .project_read_file(

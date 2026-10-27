@@ -968,6 +968,19 @@ async fn run_project_subscription(
                 tracing::warn!(%project_id, %error, "failed to emit project review summaries");
             }
         }
+        #[cfg(feature = "test-support")]
+        if !debounce_active
+            && !pending_files.requested
+            && file_tasks.is_empty()
+            && watch_rx.is_empty()
+        {
+            for root in project.root_paths() {
+                scan_test_support::run(
+                    Path::new(&root.0),
+                    scan_test_support::ScanPoint::FileRefreshSettled,
+                );
+            }
+        }
         tokio::select! {
             biased;
             changed = catalog.changed() => { if changed.is_err() { break; } }
@@ -4259,6 +4272,7 @@ pub mod scan_test_support {
         ActorStarting,
         Metadata,
         ReadDirectory,
+        FileRefreshSettled,
         WatcherInitialize,
         WatcherInitialized,
         WatcherReady,

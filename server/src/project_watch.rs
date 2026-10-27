@@ -494,9 +494,9 @@ impl ProjectWatcher {
                         }
                     };
                     #[cfg(feature = "test-support")]
-                    for root in &state.roots {
+                    for path in state.roots.iter().chain(&event.paths) {
                         crate::project_stream::scan_test_support::run(
-                            root,
+                            path,
                             crate::project_stream::scan_test_support::ScanPoint::WatcherProcess,
                         );
                     }
@@ -1048,6 +1048,12 @@ impl WatchState {
                 && self.inventory.directories.contains(parent)
                 && (directory || !self.inventory.visible.contains(path))
             {
+                // A listing can see a child before its queued create reaches the inventory.
+                // Its native removal is authoritative even when that child is already gone.
+                if matches!(event.kind, EventKind::Remove(_)) {
+                    relevant.push(path.clone());
+                    continue;
+                }
                 // Only inspect siblings for a newly encountered entry, not on ordinary writes.
                 for entry in walk(parent, Some(1)) {
                     let entry = match entry {
@@ -1145,6 +1151,19 @@ impl WatchState {
                 registered_directories = self.registered.len(),
                 relevant_paths = relevant.len(),
                 "project watcher catch-up rescan reconciled inventory and invalidated observed files"
+            );
+        }
+        #[cfg(feature = "test-support")]
+        if event.paths.iter().any(|path| {
+            path.parent()
+                .is_some_and(|parent| self.inventory.directories.contains(parent))
+                && !self.inventory.visible.contains(path)
+                && !path.exists()
+        }) {
+            eprintln!(
+                "PROJECT WATCH INVENTORY EVIDENCE kind={:?} missing_uninventoried_child=true relevant_paths={} reconcile={reconcile}",
+                event.kind,
+                relevant.len()
             );
         }
         relevant.sort();
