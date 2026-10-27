@@ -1276,7 +1276,7 @@ fn WorkbenchesTab() -> impl IntoView {
                         </label>
                     </fieldset>
                     <p class="settings-description" role="status">{bubblewrap_status}</p>
-                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"Normal Rust and JS/TS projects prepare a compatible baseline automatically when needed, across every registered root. Initial preparation runs the normal build; later compatible workbenches reuse private snapshots. Preparation, reuse and blockers are reported. Custom recipes and services remain configurable; setup errors never fall back to Native."</p></details>
+                    <details class="settings-advanced"><summary>"Implementation details"</summary><p class="settings-description">{nested_status}</p><p class="settings-description">"Native is the default. Bubblewrap is a Linux-only opt-in performance environment, not a hostile-code security sandbox. It uses normal backend authentication without copying credentials into the environment."</p><p class="settings-description">"Creation never runs builds or installs. Compatible existing Rust and JS/TS artifacts are reused privately; otherwise the checkout is ready cold. Agents build according to repository instructions. Runtime configuration remains optional; environment errors never fall back to Native."</p></details>
                 }.into_any()
             }}
         </div>

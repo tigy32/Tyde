@@ -85,9 +85,15 @@ record('validating-frontend-arguments')
 assert sys.argv[1].endswith('/tools/trunk-command.mjs'), 'frontend-script-argument'
 assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv, 'frontend-serve-arguments'
 record('validating-workbench-namespace')
-if sys.argv[1].startswith('/mnt/tyde-workspace/'):
+engine=json.loads(pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.execution').read_text())
+if engine=='bubblewrap':
  assert os.getcwd()=='/mnt/tyde-workspace', 'frontend-logical-cwd'
  assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-private-namespace'
+elif engine=='native':
+ if pathlib.Path('/proc/self/ns/mnt').exists():
+  assert os.readlink('/proc/self/ns/mnt')==os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-native-namespace'
+else:
+ raise AssertionError('frontend-execution-kind')
 record('parsing-port')
 port=int(sys.argv[sys.argv.index('--port')+1])
 record('launched')
@@ -345,6 +351,18 @@ async fn start_dev_instance_expecting_exit(
     scenario: DevScenario,
 ) -> String {
     eprintln!("DEV READINESS scenario={scenario:?} phase=starting");
+    // A native scenario can itself run from /mnt/tyde-workspace. Its source
+    // path does not establish whether the child needs a private namespace.
+    let engine = if scenario.is_native() {
+        protocol::WorkbenchEngine::Native
+    } else {
+        protocol::WorkbenchEngine::Bubblewrap
+    };
+    std::fs::write(
+        desktop_marker.with_extension("execution"),
+        serde_json::to_vec(&engine).expect("typed expected execution kind"),
+    )
+    .expect("declare scenario namespace contract");
     let producer_proof = desktop_marker.with_extension("frontend");
     if producer_proof.exists() {
         std::fs::remove_file(&producer_proof).expect("remove completed producer proof");

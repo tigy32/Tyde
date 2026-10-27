@@ -640,7 +640,7 @@ fn ProjectRow(
                 } => {
                     let title = match &initialization {
                         protocol::WorkbenchInitialization::Cold => {
-                            "Bubblewrap · Cold initialization".to_owned()
+                            "Bubblewrap · Ready (cold)".to_owned()
                         }
                         protocol::WorkbenchInitialization::Prepared { .. } => {
                             "Bubblewrap · Baseline prepared (initial build)".to_owned()
@@ -1747,7 +1747,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(
             container
-                .query_selector("[title='Bubblewrap · Cold initialization']")
+                .query_selector("[title='Bubblewrap · Ready (cold)']")
                 .unwrap()
                 .is_some()
         );
@@ -1783,7 +1783,7 @@ mod wasm_tests {
         );
         assert!(
             container
-                .query_selector("[title='Bubblewrap · Cold initialization']")
+                .query_selector("[title='Bubblewrap · Ready (cold)']")
                 .unwrap()
                 .is_none()
         );

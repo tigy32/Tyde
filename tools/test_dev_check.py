@@ -1464,6 +1464,9 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
         self._git("commit", "-qm", "Initial")
 
         self.env = os.environ.copy()
+        # This fixture represents a native host, even when the suite itself is
+        # run in a Bubblewrap workbench with an owned compiler cache.
+        self.env.pop("TYDE_WORKBENCH_RUNTIME", None)
         self.env.pop("CI", None)
         self.env.update(
             {
@@ -2955,7 +2958,31 @@ fi
             self.assertEqual(shared[field], original[field])
 
         configuration = pathlib.Path(self.env["SCCACHE_BUILD_ENV"])
-        configuration.write_text(configuration.read_text().replace("100G", "200G"))
+        original_environment = configuration.read_text()
+        configuration.write_text("exit 71\n")
+        runtime = pathlib.Path(self.temp.name) / "namespace-runtime"
+        runtime.mkdir()
+        (runtime / "compiler-cache.toml").write_text("")
+        namespace = dict(self.env,
+            TYDE_WORKBENCH_RUNTIME=str(runtime),
+            RUSTC_WRAPPER=str(self.bin / "sccache"),
+            SCCACHE_CONF=str(runtime / "compiler-cache.toml"),
+            SCCACHE_SERVER_UDS=str(runtime / "compiler-cache.sock"),
+            SCCACHE_DIR=str(runtime / "compiler-cache"),
+            SCCACHE_CACHE_SIZE="100G",
+        )
+        (self.root / "tracked.txt").write_text("namespace cache contract\n")
+        self._run(env=namespace)
+        namespace_runs = [path for path in (self.root / "target/dev-check-logs").glob("run-*")
+                          if (path / "sccache-metrics.txt").exists()
+                          and "scope=namespace-local\n" in (path / "sccache-metrics.txt").read_text()]
+        self.assertEqual(len(namespace_runs), 1)
+        self.assertIn(f"sccache.directory={runtime / 'compiler-cache'}\n",
+                      (namespace_runs[0] / "metadata.txt").read_text())
+        rejected = self._run(env=dict(namespace, SCCACHE_SERVER_UDS="/host-cache.sock"), check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("owned namespace compiler cache", rejected.stderr)
+        configuration.write_text(original_environment.replace("100G", "200G"))
         wrong_daemon = dict(self.env, DEV_CHECK_FAKE_CACHE_SIZE_BYTES=str(100 * 1024**3))
         rejected = self._run(env=wrong_daemon, check=False)
         self.assertEqual(rejected.returncode, 1)

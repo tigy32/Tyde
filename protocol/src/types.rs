@@ -6230,14 +6230,24 @@ pub struct WorkbenchConfiguration {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkbenchSnapshotConfiguration {
-    pub producer: Vec<String>,
     pub include: Vec<String>,
     pub provenance_paths: Vec<String>,
     pub provenance_environment: Vec<String>,
     #[serde(default)]
-    pub provenance_commands: Vec<Vec<String>>,
+    pub provenance_tools: Vec<WorkbenchProvenanceTool>,
     #[serde(default)]
     pub optional_include: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchProvenanceTool {
+    Cargo,
+    Rustc,
+    Node,
+    Npm,
+    Pnpm,
+    Yarn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -353,7 +353,12 @@ prepare_rust_toolchain() {
 set_sccache_environment() {
     local environment="${SCCACHE_BUILD_ENV:-${CARGO_HOME:-$HOME/.cargo}/sccache-env}"
 
-    if [[ -n "${SCCACHE_BUILD_ENV:-}" || -e "$environment" ]]; then
+    if [[ -n "${TYDE_WORKBENCH_RUNTIME:-}" ]]; then
+        [[ "${SCCACHE_CONF:-}" == "$TYDE_WORKBENCH_RUNTIME/compiler-cache.toml" &&
+           "${SCCACHE_SERVER_UDS:-}" == "$TYDE_WORKBENCH_RUNTIME/compiler-cache.sock" &&
+           "${SCCACHE_DIR:-}" == "$TYDE_WORKBENCH_RUNTIME/compiler-cache" ]] ||
+            die "Bubblewrap checks require the owned namespace compiler cache"
+    elif [[ -n "${SCCACHE_BUILD_ENV:-}" || -e "$environment" ]]; then
         [[ -f "$environment" ]] || die "sccache build environment is missing: $environment"
         source "$environment"
     fi
@@ -545,6 +550,7 @@ record_sccache_finish() {
     if ! python3 - "$SCCACHE_STATS_BEFORE" "$after" >"$metrics_file" \
         2>"$error_log" <<'PY'
 import json
+import os
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -582,7 +588,7 @@ print(f"cache_size={new_size if new_size is not None else 'unknown'}")
 print(f"max_cache_size={after['max_cache_size']}")
 print(f"cache_size_before={old_size if old_size is not None else 'unknown'}")
 print(f"cache_growth_bytes={growth}")
-print("scope=shared-daemon")
+print("scope=namespace-local" if os.environ.get("TYDE_WORKBENCH_RUNTIME") else "scope=shared-daemon")
 for language, label in (("Rust", "rust"), ("C/C++", "c_cpp"), ("Assembler", "assembler")):
     for counter, suffix in (("cache_hits", "hits"), ("cache_misses", "misses")):
         delta = (

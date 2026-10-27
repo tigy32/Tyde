@@ -7,9 +7,9 @@ on the normal workbench project. Worktrunk is neither used nor required.
 
 Bubblewrap requires Linux, working unprivileged namespaces, Python 3.9+ with
 pidfd support, Git, and GNU cp with strict reflinks on the source filesystem.
-Basic namespace execution requires no compiler or package manager. Automatic
-conventional setup additionally requires the project's normal build tools
-(and Python 3.11+ for Rust manifest/configuration inspection). Unsupported
+Basic namespace execution requires no compiler or package manager. Artifact discovery uses Python 3.11+ for Rust manifest/configuration inspection.
+Missing project build tools leave the checkout cold; agents install/build only
+when directed by normal repository instructions or steering. Unsupported
 configuration fails explicitly: there is no Native or full-copy fallback.
 The settings capability report is probed during host initialization, not on each
 connection. Workbench creation validates the current prerequisites again; changing
@@ -42,84 +42,89 @@ of projecting them onto unrelated host files.
 Live cross-engine conversation moves remain unsupported.
 Modes requiring nested namespaces fail explicitly if host policy denies them.
 
-## Automatic warm setup
+## Cold readiness and opportunistic artifact reuse
 
-Selecting Bubblewrap is sufficient for normal supported projects. There is no
-second enable switch, recipe approval or baseline-production approval. During
-creation the server emits `ProjectOperationStage::PrepareBuilds`. The app does
-not show an app-wide notice for any workbench operation state. Failures and
-warnings remain available in the affected project or workbench dialog.
+Creation does not choose or execute build/install commands, project scripts or
+background builds. There is no recipe or approval step. An entirely unbuilt
+checkout and a new empty artifact store are supported ready states. Agents use
+normal repository instructions and steering to decide what to build.
+`WorkbenchInitialization::Cold` means usable without restored artifacts;
+`Snapshot` means verified private restoration, not tests or application readiness.
+Older persisted `Prepared`/`Blocked` states describe the previous contract only.
+The existing internal `PrepareBuilds` operation stage prepares the environment
+and checks for existing artifacts; it does not authorize a build.
 
-Language-aware discovery (`setup.py`) selects normal commands and artifact
-boundaries; the generic engine (`runner.py`) executes opaque producers and
-verifies cohorts. Discovery never imports arbitrary host output as a baseline.
+`setup.py` discovers artifact **boundaries**, not build commands. Supported
+layouts are project-relative Cargo targets and npm/pnpm/Yarn dependency/output
+paths, including declared TypeScript output directories. Every registered root
+participates in the composite source/configuration/toolchain/environment identity.
+A different revision of any root starts cold. Relative sibling inputs keep their
+registered logical layout. Duplicate/nested roots, external local dependencies,
+external output paths, conflicting lockfiles and invalid explicit configuration
+remain explicit errors. This is not universal build-system support: an unknown
+layout remains usable cold, with no automatic artifact reuse.
 
-- Rust: `Cargo.toml`, the effective Cargo configuration and environment select
-  a private project-relative target directory. Project and representable ancestor
-  Cargo configurations retain their discovery order through read-only native
-  references in the logical hierarchy; contents/credentials are not copied.
-  Local dependency, patch, replacement and path-override inputs must remain
-  in the registered logical roots. Run `cargo build --locked` with
-  an existing lockfile, otherwise build and retain the generated lockfile.
-  Compiler/Cargo identities, configuration and build environment participate
-  in provenance. An effective sccache wrapper selects the same installed
-  sccache version with an owned foreground namespace-local service and private
-  endpoint/storage. Caching is not disabled and the host daemon is untouched.
-  Tyde's pinned Meson/Ninja provisioner uses the private execution runtime,
-  not Cargo's target tree, inside Bubblewrap. Its interpreter-referencing venv
-  is never sealed as a portable artifact. Normal native builds keep their
-  existing tool location; explicit tool-root overrides remain authoritative.
-  Runtime tools are provisioned on demand per launch, not claimed as restored
-  compiler artifacts.
-- JS/TS: one npm, pnpm or Yarn lockfile selects its package manager. Enforce
-  a declared `packageManager` version; perform the locked install and run the
-  declared `build` script when present. Retain dependencies and conventional
-  `dist`/`build` outputs, plus an explicit TypeScript `outDir` from `tsconfig.json`
-  (JSONC supported). Modern Yarn also retains private PnP/install/cache outputs.
-  Node/package-manager identities and build environment join provenance.
-- Every registered root is mounted before any producer executes. Relative
-  cross-root source dependencies and relative artifact links remain local to
-  the registered logical layout. A change to any root invalidates the combined
-  cohort. Independent roots need no separate setup actions.
+Discovery may inspect installed host tools with fixed version queries. It never
+runs arbitrary project commands; Rust toolchain auto-install/update checks are
+disabled for these identity queries. Missing build tools mean no reusable
+artifacts for that root, not a namespace failure. Namespace, storage, runtime,
+provenance and integrity errors still fail explicitly without a Native substitute.
+Yarn identity queries support configuration-free installed tooling only: Yarn rc
+files in the checkout, ancestors or HOME, custom rc filenames and tool-dispatch
+environment overrides are rejected before invocation, including explicit
+`provenance_tools` queries. Delegated managers/plugins are not supported by this
+artifact contract. JavaScript identity queries also reject `NODE_OPTIONS` and
+`NODE_PATH` loader overrides. These are explicit unsupported configurations,
+not permission to run project tooling during discovery.
+Toolchain/compiler identities and effective Cargo configuration join provenance.
+Representable ancestor Cargo configurations remain read-only references at the
+same logical hierarchy. A version-matched sccache wrapper uses an owned foreground
+namespace-local service with private storage/endpoints; the host daemon is never
+reused or reconfigured. Runtime tools are provisioned only by explicit builds,
+not during creation or claimed as portable artifacts.
 
-An absent compatible cohort triggers a real producer build at those same
-stable paths. After successful command/descendant settlement the engine verifies
-unchanged source and inventories artifacts, then publishes the sealed cohort. Failed preparation retains private,
-environment-secret-redacted build diagnostics outside the cohort and reports
-the producer root/exit or underlying typed service failure.
-`WorkbenchInitialization::Prepared` means **initial build**, not warm reuse or
-validated tests. `Snapshot` means verified private snapshot restoration; the
-normal build tool remains the incremental-rebuild authority. Neither state
-means the application is running. Per-root `build_blockers` expose unrecognized
-build layouts; a project with no supported build manifest reports `Blocked`,
-not a warm success. Artifact-link errors identify the selected artifact and the offending link in
-its chain; absolute/external links remain rejected, including indirect links.
-Tool/configuration, producer, namespace and storage errors
-fail explicitly and roll back creation without a Native substitute.
+On normal removal Tyde first joins its agents, terminals and DEV processes.
+Existing outputs are eligible for sealing only if committed inputs, provenance
+and exact tracked-source metadata still match the environment's creation or
+restoration authority. No command interception, producer helper or successful-build
+receipt is needed: these are existing artifacts, not certified build results.
+The normal build tool remains responsible for deciding freshness and correctness.
+Artifacts are inventoried, strictly reflinked and reverified before publication.
+Recipients verify the immutable cohort and restore source timestamps only after
+content/mode identity checks, preserving real incremental-build behavior.
 
-Automatic setup does not guess conflicting package managers, external output
-directories, undeclared external workspace links or custom service contracts.
-These are explicit blockers. Cargo ancestor configurations deeper than the
-available private logical hierarchy also report an explicit blocker. Declared local source dependencies must resolve
-inside the registered logical layout; native absolute aliases are rejected
-rather than reading a parent checkout. Native projects/workbenches are never
-converted. Older manifests without authoritative root mappings fail with a
-recreation instruction; execution does not synthesize legacy mappings.
+Changed source metadata or provenance declines publication with an explicit
+reason; it does **not** prevent ordinary source-preserving Git removal. Restoring
+source bytes after a scratch edit/rebuild must not publish its modified executable.
+No timestamps or receipts are rewritten to make such output eligible. Old
+producer-only environments lack recipe-free input authority and discard their
+artifacts on removal. No build is run just to enable cleanup. `force` still
+controls Git source deletion and discards artifacts; ordinary removal never
+implicitly enables it. Dirty-source Git guards remain unchanged.
+
+No output is a normal cold result. Malformed/unsafe artifacts, absolute/external
+symlink chains, special files, traversal, overlapping includes and corrupt stored
+cohorts remain explicit errors, never hidden as cold success. Compatible outputs
+use independent private inodes, preserved metadata and relative links within the
+registered roots. Credentials, live service/cache state and validation receipts
+must not be selected as artifacts.
+
+Cohorts live in the Git common directory's `tyde-workbench-snapshots-v2`.
+Owned runtime resources live beside the host project store in
+`workbench-environments`. Persistent removal phases permit retry without
+reopening partly removed environments; there is no parallel project registry.
 
 ## Optional project configuration
 
-A tracked `.tyde/workbench.json` remains an explicit generic recipe/runtime
-contract for custom projects; it takes precedence over conventional discovery
-for that root. Its existing explicit producer lifecycle is unchanged. It is
-not required for ordinary Rust or JS/TS setup.
-
-For example, a Python project can explicitly configure:
+A tracked `.tyde/workbench.json` can declare custom artifact boundaries,
+provenance and runtime resources. It is not a build recipe and never supplies a
+command to execute. It overrides conventional discovery for that root.
+For example, an opaque Python project's existing output can be selected with:
 
 ```json
 {
   "snapshot": {
-    "producer": ["python3", "assemble.py"],
-    "include": ["outputs", "generated.data"],
+    "include": ["outputs"],
     "provenance_paths": ["/usr/bin/python3", "/etc/os-release"],
     "provenance_environment": ["PROJECT_PROFILE"]
   },
@@ -127,46 +132,19 @@ For example, a Python project can explicitly configure:
 }
 ```
 
-The producer runs **only** when requested explicitly inside the environment:
-
-```
-/mnt/tyde-runtime/bin/tyde-workbench-produce
-```
-
-That helper runs the configured command unchanged, joins its descendants, and
-records successful completion only with clean, unchanged committed inputs. It
-is not a test/validation receipt. Normal commands are not intercepted. The
-project must declare all external toolchain, ABI, profile and other inputs on
-which its opaque artifacts depend; incomplete declarations cannot establish
-compatibility. Provenance paths hash actual referenced files/directories without
-copying them. Selected environment values are hashed, not logged or stored raw
-in snapshot receipts. Configuration, source commit/tree, host platform and
-OS identity are also part of the cohort. No generic mechanism can certify
-undeclared external inputs or an incorrectly specified producer.
-
-On non-forced removal, Tyde joins owned agents, terminals and DEV processes,
-then seals only when the producer receipt, current provenance, source metadata
-and opaque artifact inventory still match. No live compiler outputs or shared
-live caches are cloned. An explicit custom recipe without a completed producer reports cold
-initialization, not a warm build or DEV-ready claim. Automatically discovered
-recipes instead prepare and seal a compatible baseline during creation. Forced removal discards artifacts. Compatible
-recipients get strict reflinks with independent inodes and preserved metadata;
-relative links within the registered logical root layout and empty directories
-are preserved. Traversal,
-external/absolute artifact symlinks, special files and overlapping includes fail.
-Never include credentials, live service/cache directories, validation receipts
-or served output that the project's next normal launch must regenerate.
-
-Cohorts live under the Git common directory's `tyde-workbench-snapshots-v2`.
-Owned runtime resources live beside the host project store in
-`workbench-environments`. Persistent removal phases allow retry without reopening
-partly removed environments. No second project/workbench registry exists.
+The agent runs its ordinary build explicitly. Custom projects must declare all
+external toolchain, ABI, profile and other inputs on which their opaque artifacts
+depend. Paths are hashed, never copied; environment values are hashed, never
+stored raw in receipts. No generic mechanism can certify undeclared inputs.
+The obsolete `snapshot.producer` and arbitrary `provenance_commands` fields are
+rejected; remove them from old tracked configuration. Fixed `provenance_tools`
+identities are `cargo`, `rustc`, `node`, `npm`, `pnpm` and `yarn`.
 
 ## Explicit runtime and external services
 
 Optional configuration fields are typed by `protocol::WorkbenchConfiguration`:
 
-- `snapshot.provenance_commands`: generic command-output identity hashes.
+- `snapshot.provenance_tools`: fixed installed-tool identity queries.
 - `snapshot.optional_include`: declared artifact paths allowed to be absent.
 - `readonly_bindings`: native file/directory references at private logical
   ancestor mountpoints (`host_path`, `execution_path`), never source overlays.
@@ -194,8 +172,8 @@ Tyde never controls host/peer services.
 
 **External host services are not automatically namespace-compatible.** A daemon
 that opens logical project paths must run inside this workbench namespace and
-use private endpoints/storage. Automatic Rust setup handles a version-matched sccache wrapper using a private
-foreground service. Custom recipes and other compiler daemons must declare
+use private endpoints/storage. Rust artifact discovery handles a version-matched sccache wrapper using a private
+foreground service. Custom runtime configurations and other compiler daemons must declare
 their service, endpoint/storage and native configuration overlays explicitly.
 Tyde never silently reuses a host daemon for namespace-local paths. Other external
 services require equivalent explicit configuration; unconfigured compatibility

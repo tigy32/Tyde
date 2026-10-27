@@ -1,9 +1,8 @@
-"""Conventional project discovery; emits generic producer/runtime configuration."""
+"""Conventional artifact boundaries and runtime configuration."""
 import json
 import os
 import re
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 
@@ -12,17 +11,25 @@ class SetupFailure(Exception):
     pass
 
 
-def tool(name):
+class ToolsUnavailable(Exception):
+    pass
+
+
+def tool(name, workspace=()):
     executable = shutil.which(name)
     if executable is None:
-        raise SetupFailure("Automatic warm setup requires the project tool: " + name)
+        raise ToolsUnavailable("Artifact reuse needs the project tool: " + name)
+    if not Path(executable).is_absolute() or any(Path(executable).resolve().is_relative_to(record[key]) for record in workspace for key in ("root", "parent_root")):
+        raise SetupFailure("Artifact discovery requires native host tools, not project scripts")
     return executable
 
 
 def output(command, root):
-    result = subprocess.run(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if Path(command[0]).resolve().is_relative_to(root):
+        raise SetupFailure("Artifact discovery cannot execute project scripts")
+    result = subprocess.run(command, cwd=root, env=dict(os.environ, RUSTUP_AUTO_INSTALL="0", RUSTUP_NO_UPDATE_CHECK="1", COREPACK_ENABLE_NETWORK="0", COREPACK_ENABLE_AUTO_PIN="0"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
-        raise SetupFailure("Automatic setup could not inspect a declared build tool (exit %d)" % result.returncode)
+        raise SetupFailure("Artifact discovery could not inspect a declared build tool (exit %d)" % result.returncode)
     return result.stdout
 
 
@@ -30,7 +37,7 @@ def toml(path):
     try:
         import tomllib
     except ImportError as error:
-        raise SetupFailure("Automatic Rust setup requires Python 3.11+ TOML support") from error
+        raise SetupFailure("Rust artifact reuse requires Python 3.11+ TOML support") from error
     with path.open("rb") as source:
         return tomllib.load(source)
 
@@ -97,11 +104,14 @@ def cargo_configuration(root, logical_root, config, workspace):
     return configuration, origins, provenance
 
 
-def sccache_runtime(config, wrapper, root):
+def sccache_runtime(config, wrapper, root, workspace):
     version = output([wrapper, "--version"], root)
     if not version.startswith(b"sccache "):
         return
-    executable = tool("sccache")
+    try:
+        executable = tool("sccache", workspace)
+    except ToolsUnavailable as error:
+        raise SetupFailure("Configured compiler caching requires installed sccache") from error
     if output([executable, "--version"], root) != version:
         raise SetupFailure("Configured compiler cache and the installed sccache have different versions")
     # Select the same compiler-cache implementation with an owned local service,
@@ -145,7 +155,7 @@ def private_source(logical, workspace):
 
 
 def check_local_inputs(root, logical_root, workspace, rust, javascript):
-    tracked = output([tool("git"), "ls-files", "-z"], root).split(b"\0")
+    tracked = output([tool("git", workspace), "ls-files", "-z"], root).split(b"\0")
     for raw in tracked:
         if not raw:
             continue
@@ -171,16 +181,16 @@ def check_local_inputs(root, logical_root, workspace, rust, javascript):
                         private_source(logical / dependency.split(":", 1)[1], workspace)
 
 
-def configure(root, logical_root, config, workspace):
+def configure(root, logical_root, config, workspace, guard_tool_query):
     rust = (root / "Cargo.toml").exists()
     javascript = (root / "package.json").exists()
     if not rust and not javascript:
         return False
     check_local_inputs(root, logical_root, workspace, rust, javascript)
-    producers, required, optional, paths, commands, environment = [], [], [], [], [], ["PATH"]
+    required, optional, paths, tools, environment = [], [], [], [], ["PATH"]
     if rust:
-        cargo = tool("cargo")
-        tool("rustc")
+        tool("cargo", workspace)
+        tool("rustc", workspace)
         toml(root / "Cargo.toml")
         build, origins, inputs = cargo_configuration(root, logical_root, config, workspace)
         paths += inputs
@@ -195,47 +205,42 @@ def configure(root, logical_root, config, workspace):
         else:
             target = Path("target")
         if target.is_absolute() or ".." in target.parts or target == Path("."):
-            raise SetupFailure("Automatic Rust setup requires a project-relative private Cargo target directory")
+            raise SetupFailure("Rust artifact reuse requires a project-relative private Cargo target directory")
         required.append(str(target))
-        command = [cargo, "build"]
-        if (root / "Cargo.lock").exists():
-            command.append("--locked")
-        else:
+        if not (root / "Cargo.lock").exists():
             optional.append("Cargo.lock")
-        producers.append(shlex.join(command))
-        commands += [[cargo, "--version"], [tool("rustc"), "-vV"]]
+        tools += ["cargo", "rustc"]
         environment += ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS"]
         wrapper = os.environ.get("RUSTC_WRAPPER", build.get("rustc-wrapper"))
         if wrapper:
             if "RUSTC_WRAPPER" not in os.environ and not Path(wrapper).is_absolute() and "/" in wrapper:
                 wrapper = str((origins["rustc-wrapper"] / wrapper).resolve())
-            executable = tool(wrapper)
+            executable = tool(wrapper, workspace)
             paths.append(str(Path(executable).relative_to(root)) if Path(executable).is_relative_to(root) else executable)
-            sccache_runtime(config, executable, root)
+            sccache_runtime(config, executable, root, workspace)
     if javascript:
         package = json.loads((root / "package.json").read_text())
         locks = [(name, manager) for name, manager in [("package-lock.json", "npm"), ("npm-shrinkwrap.json", "npm"), ("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn")] if (root / name).exists()]
+        if not locks:
+            return False
         if len(locks) != 1:
-            raise SetupFailure("Automatic JS/TS setup requires exactly one package-manager lockfile")
+            raise SetupFailure("JS/TS artifact reuse requires exactly one package-manager lockfile")
         manager = locks[0][1]
         declared = package.get("packageManager")
         if declared and declared.split("@")[0] != manager:
             raise SetupFailure("Declared package manager conflicts with the project lockfile")
-        executable, node = tool(manager), tool("node")
+        guard_tool_query(manager, root, os.environ)
+        executable = tool(manager, workspace)
+        tool("node", workspace)
         version = output([executable, "--version"], root).decode().strip()
         if declared and declared.split("@", 1)[1].split("+", 1)[0] != version:
             raise SetupFailure("Installed package manager does not match the version declared by the project")
-        commands += [[executable, "--version"], [node, "--version"]]
-        install = {"npm": ["ci"], "pnpm": ["install", "--frozen-lockfile"], "yarn": ["install", "--frozen-lockfile"] if version.startswith("1.") else ["install", "--immutable"]}[manager]
+        tools += [manager, "node"]
         if manager == "yarn" and not version.startswith("1."):
             config["environment"]["YARN_ENABLE_GLOBAL_CACHE"] = "false"
             optional += [".pnp.cjs", ".pnp.loader.mjs", ".yarn/cache", ".yarn/install-state.gz"]
-        producers.append(shlex.join([executable, *install]))
-        # Empty dependency graphs need not create node_modules themselves.
-        producers.append("mkdir -p node_modules")
         required.append("node_modules")
         if "build" in package.get("scripts", {}):
-            producers.append(shlex.join([executable, "run", "build"]))
             optional += ["dist", "build"]
             tsconfig = root / "tsconfig.json"
             if tsconfig.exists():
@@ -243,17 +248,16 @@ def configure(root, logical_root, config, workspace):
                 for destination in [options.get("outDir"), options.get("tsBuildInfoFile"), "tsconfig.tsbuildinfo"]:
                     if destination:
                         if Path(destination).is_absolute() or ".." in Path(destination).parts:
-                            raise SetupFailure("Automatic JS/TS setup requires private project-relative build outputs")
+                            raise SetupFailure("JS/TS artifact reuse requires private project-relative build outputs")
                         optional.append(destination.removeprefix("./"))
         environment += ["NODE_OPTIONS", "NODE_ENV", "npm_config_arch", "npm_config_platform"]
     optional = sorted(set(optional) - set(required))
     optional = [value for value in optional if not any(Path(parent) in Path(value).parents for parent in required + optional)]
     environment += [key for key in os.environ if key.startswith(("CARGO_", "RUST_", "npm_config_", "YARN_", "PNPM_"))]
     config["snapshot"] = {
-        "producer": ["/bin/sh", "-eu", "-c", " && ".join(producers)],
-        "include": required, "optional_include": optional,
+        "include": [], "optional_include": sorted(set(required + optional)),
         "provenance_paths": sorted(set(paths)),
-        "provenance_commands": commands,
+        "provenance_tools": tools,
         "provenance_environment": sorted(set(environment)),
     }
     return True
