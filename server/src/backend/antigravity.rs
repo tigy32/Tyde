@@ -532,6 +532,8 @@ struct TurnMapper {
     deferred_tools: BTreeMap<u64, AgyStep>,
     completed_steps: BTreeSet<u64>,
     turn_usage: AgyUsage,
+    // None preserves a missing request measurement across deferred answers.
+    message_generation_usage: Option<AgyUsage>,
     cumulative_usage: AgyUsage,
     /// Question cards this turn opened and deliberately did not close.
     pending_questions: Vec<String>,
@@ -566,6 +568,7 @@ impl TurnMapper {
         model: String,
         transcript: TranscriptReader,
         cumulative: AgyUsage,
+        message_generation_usage: Option<AgyUsage>,
     ) -> Self {
         Self {
             turn_id: ModelTurnId(turn_id),
@@ -575,6 +578,7 @@ impl TurnMapper {
             deferred_tools: BTreeMap::new(),
             completed_steps: BTreeSet::new(),
             turn_usage: AgyUsage::default(),
+            message_generation_usage,
             cumulative_usage: cumulative,
             pending_questions: Vec::new(),
             request_sequence: 0,
@@ -618,6 +622,18 @@ impl TurnMapper {
             open.text.push_str(delta);
         }
 
+        if step.state == STATE_DONE {
+            if step.usage.is_none() && self.message_generation_usage.is_some() {
+                tracing::warn!(
+                    target: "tyde_antigravity_usage_diagnostic",
+                    "Antigravity completed a request without usage; generation usage is unavailable"
+                );
+            }
+            self.message_generation_usage = self
+                .message_generation_usage
+                .zip(step.usage)
+                .map(|(total, usage)| total.saturating_add(usage));
+        }
         if step.state == STATE_DONE
             && let Some(usage) = step.usage
         {
@@ -937,6 +953,13 @@ impl TurnMapper {
         let Some(open) = self.response.take() else {
             return;
         };
+        if open.usage.is_none() && self.message_generation_usage.is_some() {
+            tracing::warn!(
+                target: "tyde_antigravity_usage_diagnostic",
+                "Antigravity closed a response without usage; generation usage is unavailable"
+            );
+            self.message_generation_usage = None;
+        }
         // A response with no text and no tool calls would render as an empty
         // bubble. `agy` produces one whenever a model request is pure
         // bookkeeping, so it is dropped rather than published.
@@ -957,11 +980,12 @@ impl TurnMapper {
                 model_info: Some(ModelInfo {
                     model: self.model.clone(),
                 }),
-                token_usage: open.usage.map(|usage| {
-                    MessageTokenUsage::request_and_turn_known(
+                token_usage: open.usage.map(|usage| match self.message_generation_usage {
+                    Some(total) => MessageTokenUsage::request_and_turn_known(
                         usage.to_protocol(),
-                        self.turn_usage.to_protocol(),
-                    )
+                        total.to_protocol(),
+                    ),
+                    None => MessageTokenUsage::request_known(usage.to_protocol()),
                 }),
                 tool_calls: open.declarations,
                 ..Default::default()
@@ -1021,6 +1045,8 @@ struct Supervisor {
     tool_policy_projection: Option<tempfile::TempDir>,
     mapper: Option<TurnMapper>,
     cumulative: AgyUsage,
+    // Deferred answers keep working across native turns, without an idle edge.
+    pending_generation_usage: Option<AgyUsage>,
     turn_counter: u64,
     /// Question cards waiting on a human. They survive the turn that asked, and
     /// are cleared either by an answer or by a cancel.
@@ -1184,6 +1210,7 @@ impl Supervisor {
             mapper.abandon_open_work();
         }
         self.mapper = None;
+        self.pending_generation_usage = Some(AgyUsage::default());
         // `operation_cancelled` completes every pending tool as cancelled,
         // including any question still waiting on the user.
         self.pending_questions.clear();
@@ -1426,6 +1453,7 @@ impl Supervisor {
             model,
             TranscriptReader::new(&self.brain_dir, &process.conversation_id),
             self.cumulative,
+            self.pending_generation_usage.replace(AgyUsage::default()),
         ));
         if let Some((user_message, origin)) = echoed_user_message {
             self.inner.emitter.user_message(user_message, None, origin);
@@ -1614,6 +1642,10 @@ impl Supervisor {
             );
             self.pending_questions
                 .extend(mapper.take_pending_questions());
+            if !self.deferred_answers.is_empty() {
+                tracing::debug!("Antigravity retained message accounting across a deferred answer");
+                self.pending_generation_usage = mapper.message_generation_usage;
+            }
         }
         // A deferred answer starts its turn as soon as this one is over, so
         // the session never reports an idle it is about to leave.
@@ -3128,6 +3160,7 @@ impl AntigravityBackend {
             tool_policy_projection,
             mapper: None,
             cumulative: AgyUsage::default(),
+            pending_generation_usage: Some(AgyUsage::default()),
             turn_counter: 0,
             pending_questions: Vec::new(),
             deferred_answers: VecDeque::new(),

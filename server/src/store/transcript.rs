@@ -15,6 +15,8 @@ pub(crate) enum TranscriptVisibility {
     TimelineMarker,
     InternalCompactionSeed,
     ProviderMetadata,
+    /// Ends a prior actor's accounting generation without publishing UI idle.
+    MessageAccountingBoundary,
     /// A tool request, or its completion, issued inside a response that has
     /// not ended. Replay materializes the response only at its end, so this
     /// record is what keeps the call durable if the host dies first.

@@ -1168,7 +1168,7 @@ enum TokenUsageSource {
     Message(ChatMessageId),
     EventSeq(u64),
     ModelRequest(ModelRequestId),
-    PromotedRequests,
+    Generation(u64),
 }
 
 use crate::backend::TokenUsageTrackingMode;
@@ -1191,10 +1191,13 @@ struct AgentActivityStatsTracker {
     stats: AgentActivityStats,
     seen_tool_calls: HashSet<String>,
     token_usage_by_source: HashMap<TokenUsageSource, TaskTokenUsageScope>,
-    authoritative_token_usage_baseline: TokenUsage,
     authoritative_token_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
     authoritative_turn_sources: HashSet<TokenUsageSource>,
     provisional_request_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
+    message_generations: HashMap<TokenUsageSource, (u64, u64)>,
+    latest_turn_source: HashMap<u64, u64>,
+    generation: u64,
+    typing: bool,
     active_reasoning: String,
     latest_model: Option<String>,
     token_usage_tracking_mode: TokenUsageTrackingMode,
@@ -1384,10 +1387,13 @@ impl AgentActivityStatsTracker {
                     self.stats.source_through_seq = Some(source_seq);
                 }
             }
-            ChatEvent::TypingStatusChanged(_)
+            ChatEvent::TypingStatusChanged(typing)
                 if self.token_usage_tracking_mode == TokenUsageTrackingMode::Messages =>
             {
-                self.commit_provisional_request_usage();
+                if *typing && !self.typing {
+                    self.generation = self.generation.saturating_add(1);
+                }
+                self.typing = *typing;
             }
             ChatEvent::TypingStatusChanged(_)
             | ChatEvent::ToolProgress(_)
@@ -1553,20 +1559,18 @@ impl AgentActivityStatsTracker {
         if self.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
             return token_usage;
         }
+        let (generation, position) = *self
+            .message_generations
+            .entry(source.clone())
+            .or_insert((self.generation, source_seq));
+        let turn_source = TokenUsageSource::Generation(generation);
         let Some(turn_usage) = token_usage.turn.known_usage().cloned() else {
+            if self.authoritative_turn_sources.contains(&source) {
+                return token_usage;
+            }
             if let Some(request_usage) = token_usage.request.known_usage().cloned() {
-                if !self.authoritative_turn_sources.contains(&source) {
-                    if self
-                        .authoritative_token_usage_by_source
-                        .contains_key(&source)
-                    {
-                        self.authoritative_token_usage_by_source
-                            .insert(source.clone(), request_usage.clone());
-                    } else {
-                        self.provisional_request_usage_by_source
-                            .insert(source.clone(), request_usage.clone());
-                    }
-                }
+                self.provisional_request_usage_by_source
+                    .insert(source.clone(), request_usage.clone());
                 self.token_usage_by_source.insert(
                     source,
                     TaskTokenUsageScope::Known {
@@ -1590,87 +1594,71 @@ impl AgentActivityStatsTracker {
             return token_usage;
         };
 
-        let existing_authoritative_turn = self.authoritative_turn_sources.contains(&source);
-        if !existing_authoritative_turn {
-            self.clear_provisional_request_usage();
-        }
-        self.token_usage_by_source.insert(
-            source.clone(),
-            TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&turn_usage)),
-            },
-        );
-        if let Some(cumulative) = token_usage.cumulative.known_usage().cloned() {
-            self.authoritative_token_usage_baseline = cumulative;
-            self.authoritative_token_usage_by_source.clear();
-            self.token_usage_by_source
-                .retain(|_, usage| matches!(usage, TaskTokenUsageScope::Known { .. }));
-        } else {
-            if !existing_authoritative_turn
-                || self
-                    .authoritative_token_usage_by_source
-                    .contains_key(&source)
-            {
-                self.authoritative_token_usage_by_source
-                    .insert(source.clone(), turn_usage);
+        // A turn snapshot covers the generation, not just the response carrying
+        // it. Late metadata keeps its original generation and cannot replace a
+        // newer response's running snapshot.
+        let newer_turn_observed = self
+            .latest_turn_source
+            .get(&generation)
+            .is_some_and(|latest| *latest > position);
+        if !newer_turn_observed {
+            self.latest_turn_source.insert(generation, position);
+            let covered = self
+                .message_generations
+                .iter()
+                .filter(|(_, (candidate, first_seq))| {
+                    *candidate == generation && *first_seq <= position
+                })
+                .map(|(source, _)| source.clone())
+                .collect::<Vec<_>>();
+            for source in covered {
+                self.provisional_request_usage_by_source.remove(&source);
+                self.token_usage_by_source.remove(&source);
+                self.authoritative_turn_sources.insert(source);
             }
-            self.refresh_token_usage();
-            if !matches!(
-                token_usage.cumulative,
-                TokenUsageScope::Unavailable {
-                    reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
-                }
-            ) {
-                token_usage.cumulative = match synthesized_cumulative_unavailable_reason(
-                    self.token_usage_by_source.values(),
-                ) {
-                    Some(reason) => TokenUsageScope::Unavailable { reason },
-                    None => TokenUsageScope::Known {
-                        usage: Box::new(self.stats.token_usage.clone()),
-                    },
-                };
-            }
+            self.token_usage_by_source.insert(
+                turn_source.clone(),
+                TaskTokenUsageScope::Known {
+                    usage: Box::new(TaskTokenUsageAmount::from_token_usage(&turn_usage)),
+                },
+            );
+            self.authoritative_token_usage_by_source
+                .insert(turn_source, turn_usage);
         }
-        self.authoritative_turn_sources.insert(source);
         self.refresh_token_usage();
+        // Messages-mode task totals come from own generation measurements.
+        // Preserve provider cumulative metadata without making it a second
+        // accounting source (native absolute ownership is ModelRequests mode).
+        if matches!(
+            token_usage.cumulative,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ) {
+            token_usage.cumulative = match synthesized_cumulative_unavailable_reason(
+                self.token_usage_by_source.values(),
+            ) {
+                Some(reason) => TokenUsageScope::Unavailable { reason },
+                None => TokenUsageScope::Known {
+                    usage: Box::new(self.stats.token_usage.clone()),
+                },
+            };
+        }
+        tracing::debug!(
+            generation,
+            late_snapshot = newer_turn_observed,
+            turn_sources = self.authoritative_token_usage_by_source.len(),
+            request_sources = self.provisional_request_usage_by_source.len(),
+            "Reconciled generation token accounting"
+        );
         self.stats.source_through_seq = Some(source_seq);
         token_usage
     }
 
-    fn commit_provisional_request_usage(&mut self) {
-        if self.token_usage_tracking_mode != TokenUsageTrackingMode::Messages
-            || self.provisional_request_usage_by_source.is_empty()
-        {
-            return;
-        }
-        // A typing boundary ends the Messages-mode generation. If no turn
-        // reconciled it, fold its request sources into the baseline and keep
-        // one classification marker rather than retaining every request key.
-        let promoted = total_token_usage(self.provisional_request_usage_by_source.values());
-        self.authoritative_token_usage_baseline =
-            total_token_usage([&self.authoritative_token_usage_baseline, &promoted].into_iter());
-        for (source, _) in self.provisional_request_usage_by_source.drain() {
-            self.token_usage_by_source.remove(&source);
-        }
-        self.token_usage_by_source.insert(
-            TokenUsageSource::PromotedRequests,
-            TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&promoted)),
-            },
-        );
-        self.refresh_token_usage();
-    }
-
-    fn clear_provisional_request_usage(&mut self) {
-        for (source, _) in self.provisional_request_usage_by_source.drain() {
-            self.token_usage_by_source.remove(&source);
-        }
-    }
-
     fn refresh_token_usage(&mut self) {
         self.stats.token_usage = total_token_usage(
-            std::iter::once(&self.authoritative_token_usage_baseline)
-                .chain(self.authoritative_token_usage_by_source.values())
+            self.authoritative_token_usage_by_source
+                .values()
                 .chain(self.provisional_request_usage_by_source.values()),
         );
     }
@@ -4959,6 +4947,36 @@ pub(crate) fn spawn_agent_actor(
             None
         };
         let _ = session_binding_tx.send(Ok(actor_session_id.clone()));
+        if resume_message_accounting_seeded && activity_stats.typing {
+            match journal_message_accounting_boundary(&transcript_store, &actor_session_id).await {
+                Ok(outcome) => {
+                    report_transcript_persistence(
+                        &canonical_stream,
+                        &mut event_log,
+                        &mut subscribers,
+                        &mut replay_state,
+                        Ok(Some(outcome)),
+                    )
+                    .await;
+                    activity_stats.accounting_restore_incomplete |=
+                        event_log.accounting_history_incomplete;
+                    if event_log.accounting_storage_failed {
+                        early_accounting_error =
+                            Some("Cannot preserve incomplete task-accounting coverage".to_owned());
+                    }
+                    let mut idle = ChatEvent::TypingStatusChanged(false);
+                    let source_seq = activity_event_seq;
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                    observe_actor_accounting(&mut activity_stats, &mut event_log, |stats| {
+                        stats.observe_chat_event(&mut idle, source_seq, "")
+                    });
+                }
+                Err(error) => {
+                    activity_stats.accounting_restore_incomplete = true;
+                    early_accounting_error = Some(error);
+                }
+            }
+        }
         accepting_input_task.store(
             !resume_replay_gate_pending && !status_handle.restarting(),
             Ordering::SeqCst,
@@ -14874,8 +14892,15 @@ async fn seed_existing_transcript_history(
             && matches!(
                 record.visibility,
                 crate::store::transcript::TranscriptVisibility::Visible
+                    | crate::store::transcript::TranscriptVisibility::MessageAccountingBoundary
             )
         {
+            if record.visibility
+                == crate::store::transcript::TranscriptVisibility::MessageAccountingBoundary
+                && !matches!(record.event, ChatEvent::TypingStatusChanged(false))
+            {
+                return Err("Saved message accounting boundary is invalid".to_owned());
+            }
             let mut event = record.event.clone();
             strip_replayed_cumulative_token_usage(&mut event);
             match &event {
@@ -14912,11 +14937,9 @@ async fn seed_existing_transcript_history(
                 open_stream_events.push(record.event);
             }
             crate::store::transcript::TranscriptVisibility::InternalCompactionSeed
-            | crate::store::transcript::TranscriptVisibility::ProviderMetadata => {}
+            | crate::store::transcript::TranscriptVisibility::ProviderMetadata
+            | crate::store::transcript::TranscriptVisibility::MessageAccountingBoundary => {}
         }
-    }
-    if let Some((tracker, _)) = accounting.as_mut() {
-        tracker.commit_provisional_request_usage();
     }
     if accounting.is_some() && damage != crate::store::transcript::JournalDamage::None {
         return Err(
@@ -14996,6 +15019,30 @@ async fn load_authoritative_completed_tool_call_ids(
         }
     }
     completed_tool_call_ids
+}
+
+async fn journal_message_accounting_boundary(
+    store: &TranscriptStore,
+    session_id: &SessionId,
+) -> Result<crate::store::transcript::TranscriptAppend, String> {
+    let journal = store.open_session(session_id);
+    let record = crate::store::transcript::TranscriptRecord {
+        logical_session_id: session_id.clone(),
+        sequence: 0,
+        event_id: uuid::Uuid::new_v4().to_string(),
+        visibility: crate::store::transcript::TranscriptVisibility::MessageAccountingBoundary,
+        accounting_scope: crate::store::transcript::TranscriptAccountingScope::SessionOwn,
+        provider_identity: None,
+        event: ChatEvent::TypingStatusChanged(false),
+        timestamp_ms: now_ms(),
+    };
+    let outcome = tokio::task::spawn_blocking(move || journal.append_live_records(vec![record]))
+        .await
+        .map_err(|error| format!("message accounting boundary write task failed: {error}"))??;
+    if outcome.appended != 1 || outcome.unreadable_record {
+        return Err("Cannot preserve a message accounting boundary in intact history".to_owned());
+    }
+    Ok(outcome)
 }
 
 /// Persist a tool event that replay is still holding inside an open response.

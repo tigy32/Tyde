@@ -1438,10 +1438,12 @@ struct HermesEventMapper {
     pending_clarify: Option<HermesPendingClarify>,
     last_session_usage: Option<TokenUsage>,
     cumulative_usage_incomplete: bool,
-    /// Running total of the current turn's provider requests. Hermes splits a
-    /// turn into one message per request, so each message's own figure is a
-    /// single request and the turn only exists as their sum.
+    /// Native turn total, retained for `ModelRequestTokenUsage` independently of
+    /// the public working generations split by blocking questions.
     turn_usage_so_far: Option<TokenUsage>,
+    // A blocking question splits public working generations, not native turns.
+    message_generation_usage_so_far: Option<TokenUsage>,
+    message_generation_usage_incomplete: bool,
     usage_turn_generation: Option<u64>,
     usage_request_sequence: u32,
     current_turn_generation: Option<u64>,
@@ -3451,8 +3453,8 @@ impl HermesSessionActor {
                         None,
                         payload.origin,
                     )));
-                    self.mapper.typing_active = true;
-                    self.emit(ChatEvent::TypingStatusChanged(true));
+                    let working = self.mapper.start_typing();
+                    self.emit(working);
                     if let Some(output) = output {
                         self.emit_command_reply(output);
                     }
@@ -3484,8 +3486,8 @@ impl HermesSessionActor {
                         payload.origin,
                     )));
                 }
-                self.mapper.typing_active = true;
-                self.emit(ChatEvent::TypingStatusChanged(true));
+                let working = self.mapper.start_typing();
+                self.emit(working);
                 SendOutcome::Accepted
             }
             Err(error) => {
@@ -3765,8 +3767,8 @@ impl HermesSessionActor {
                         .map_err(|err| format!("Hermes clarify.respond failed: {err}"))?;
                 }
                 self.mapper.pending_clarify = None;
-                self.mapper.typing_active = true;
-                self.emit(ChatEvent::TypingStatusChanged(true));
+                let working = self.mapper.start_typing();
+                self.emit(working);
             }
             SendMessageToolResponse::ExitPlanMode {
                 tool_call_id,
@@ -3822,8 +3824,8 @@ impl HermesSessionActor {
                                 outcome,
                             },
                         ));
-                        self.mapper.typing_active = true;
-                        self.emit(ChatEvent::TypingStatusChanged(true));
+                        let working = self.mapper.start_typing();
+                        self.emit(working);
                     }
                     Err(err) => return Err(format!("Hermes approval.respond failed: {err}")),
                 }
@@ -5799,6 +5801,19 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
 }
 
 impl HermesEventMapper {
+    fn start_typing(&mut self) -> ChatEvent {
+        if !self.typing_active {
+            tracing::debug!(
+                prior_generation_measured = self.message_generation_usage_so_far.is_some(),
+                "Hermes started a message accounting generation"
+            );
+            self.message_generation_usage_so_far = None;
+            self.message_generation_usage_incomplete = false;
+        }
+        self.typing_active = true;
+        ChatEvent::TypingStatusChanged(true)
+    }
+
     fn drain_background_tasks(&mut self) -> Vec<ChatEvent> {
         let mut tasks = self.background_tasks.drain().collect::<Vec<_>>();
         tasks.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -6063,8 +6078,7 @@ impl HermesEventMapper {
         self.current_reasoning.clear();
         self.current_reasoning_seen = false;
         if !self.typing_active {
-            events.push(ChatEvent::TypingStatusChanged(true));
-            self.typing_active = true;
+            events.push(self.start_typing());
         }
         events.push(ChatEvent::StreamStart(StreamStartData {
             agent: HERMES_AGENT_NAME.to_string(),
@@ -6133,8 +6147,7 @@ impl HermesEventMapper {
         let message_id = Uuid::new_v4().to_string();
         self.current_message_id = Some(message_id.clone());
         if !self.typing_active {
-            events.push(ChatEvent::TypingStatusChanged(true));
-            self.typing_active = true;
+            events.push(self.start_typing());
         }
         events.push(ChatEvent::StreamStart(StreamStartData {
             agent: HERMES_AGENT_NAME.to_string(),
@@ -6645,8 +6658,7 @@ impl HermesEventMapper {
         {
             self.pending_clarify = None;
             if !self.typing_active {
-                events.push(ChatEvent::TypingStatusChanged(true));
-                self.typing_active = true;
+                events.push(self.start_typing());
             }
         }
         Ok(events)
@@ -7189,8 +7201,7 @@ impl HermesEventMapper {
         self.current_message_id = Some(Uuid::new_v4().to_string());
         let mut events = Vec::new();
         if !self.typing_active {
-            events.push(ChatEvent::TypingStatusChanged(true));
-            self.typing_active = true;
+            events.push(self.start_typing());
         }
         events.push(ChatEvent::StreamStart(StreamStartData {
             agent: HERMES_AGENT_NAME.to_string(),
@@ -7385,14 +7396,22 @@ impl HermesEventMapper {
         // `Unavailable`, which is the slot the chat row actually renders.
         match (request_usage, cumulative_usage) {
             (Some(request), cumulative) => {
-                let turn = add_token_usage(self.turn_usage_so_far.as_ref(), &request);
-                self.turn_usage_so_far = Some(turn.clone());
+                self.turn_usage_so_far =
+                    Some(add_token_usage(self.turn_usage_so_far.as_ref(), &request));
+                let turn = add_token_usage(self.message_generation_usage_so_far.as_ref(), &request);
+                self.message_generation_usage_so_far = Some(turn.clone());
                 Some(MessageTokenUsage {
                     request: TokenUsageScope::Known {
                         usage: Box::new(request),
                     },
-                    turn: TokenUsageScope::Known {
-                        usage: Box::new(turn),
+                    turn: if self.message_generation_usage_incomplete {
+                        TokenUsageScope::Unavailable {
+                            reason: TokenUsageUnavailableReason::BackendDidNotReport,
+                        }
+                    } else {
+                        TokenUsageScope::Known {
+                            usage: Box::new(turn),
+                        }
                     },
                     cumulative: cumulative.map_or(
                         TokenUsageScope::Unavailable {
@@ -7404,9 +7423,18 @@ impl HermesEventMapper {
                     ),
                 })
             }
-            (None, _) => Some(MessageTokenUsage::unavailable(
-                TokenUsageUnavailableReason::BackendDidNotReport,
-            )),
+            (None, _) => {
+                if !self.message_generation_usage_incomplete {
+                    tracing::warn!(
+                        target: "tyde_hermes_usage_diagnostic",
+                        "Hermes closed a response without usage; generation usage is unavailable"
+                    );
+                }
+                self.message_generation_usage_incomplete = true;
+                Some(MessageTokenUsage::unavailable(
+                    TokenUsageUnavailableReason::BackendDidNotReport,
+                ))
+            }
         }
     }
 

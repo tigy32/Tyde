@@ -4,7 +4,7 @@
 #[path = "conformance2/mod.rs"]
 pub mod fixture;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use protocol::{
     ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
 };
 use serde_json::Value;
-use server::backend::{Backend, SendOutcome, SteerOutcome};
+use server::backend::{Backend, SendOutcome, SteerOutcome, TokenUsageTrackingMode};
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
 
@@ -63,7 +63,7 @@ const PLAN_TASKS: [&str; 3] = [
 ];
 
 macro_rules! conformance2_scenario {
-    ($scenario:ident, [$($requirement:path),* $(,)?]) => {
+    ($scenario:ident, [$($requirement:path),* $(,)?] $(, $tracking_mode:path)?) => {
         mod $scenario {
             use super::*;
             fn eligible<B: Backend>() -> bool {
@@ -71,9 +71,11 @@ macro_rules! conformance2_scenario {
                 B::capabilities().validate().expect("backend capability declaration must be consistent");
                 let native_skills = !matches!(stringify!($scenario), "real_skills" | "real_duplicate_skill_content")
                     || B::skill_delivery() == server::backend::SkillDelivery::NativeDiscovery;
-                let eligible = native_skills && required.iter().all(|capability| B::capabilities().contains(*capability));
+                let usage_modes: &[TokenUsageTrackingMode] = &[$($tracking_mode)?];
+                let usage_mode_matches = usage_modes.iter().all(|mode| B::token_usage_tracking_mode() == *mode);
+                let eligible = native_skills && usage_mode_matches && required.iter().all(|capability| B::capabilities().contains(*capability));
                 if !eligible {
-                    eprintln!("COVERAGE: {:?} does not declare {required:?}", B::session_settings_schema().backend_kind);
+                    eprintln!("COVERAGE: {:?} requires {required:?}; usage_mode_matches={usage_mode_matches}", B::session_settings_schema().backend_kind);
                 }
                 eligible
             }
@@ -166,7 +168,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_feedback_analysis"
+                    "real_async_user_question" | "real_user_question" | "real_question_usage_accounting" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_feedback_analysis"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -10276,6 +10278,212 @@ conformance2_scenario!(
         BackendCapability::UserQuestionRequests,
         BackendCapability::ResumeSession
     ]
+);
+
+async fn real_question_usage_accounting<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let mut flow = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&flow);
+    let prompt = question_prompt::<B>();
+    send_prompt(host, &agent, &prompt).await;
+    collect_turn_until(host, &mut flow, |event| {
+        matches!(event, ChatEvent::ToolRequest(request)
+            if matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. }))
+    })
+    .await;
+    let request = flow
+        .tool_requests()
+        .find(|request| matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. }))
+        .expect("native question request")
+        .clone();
+    let ToolRequestType::AskUserQuestion { questions, .. } = &request.tool_type else {
+        unreachable!("selected question request")
+    };
+    let choice = questions
+        .first()
+        .and_then(|question| question.options.first())
+        .expect("native question must offer a choice")
+        .label
+        .clone();
+    eprintln!("Question usage diagnostic: phase=question_received");
+    send_question_response(host, &request.tool_call_id, &choice).await;
+    eprintln!("Question usage diagnostic: phase=answer_submitted");
+    let mut completed = false;
+    let mut answered = false;
+    loop {
+        match host.next_backend_event().await {
+            server::backend::BackendEvent::Chat(event) => {
+                assert!(
+                    !matches!(&event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Error)),
+                    "question usage flow emitted a backend error"
+                );
+                if let ChatEvent::ToolExecutionCompleted(completion) = &event
+                    && completion.tool_call_id == request.tool_call_id
+                {
+                    assert!(!completed, "question must complete exactly once");
+                    assert!(matches!(
+                        completion.outcome,
+                        ToolExecutionOutcome::Succeeded { .. }
+                    ));
+                    completed = true;
+                }
+                if let ChatEvent::StreamEnd(end) = &event
+                    && completed
+                    && end.message.content.contains(&choice)
+                {
+                    answered = true;
+                }
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                flow.events.push(event);
+                if idle && completed {
+                    assert!(answered, "question answer must reach the model before idle");
+                    break;
+                }
+            }
+            server::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
+                flow.model_requests.push(usage);
+            }
+            server::backend::BackendEvent::Compaction(_) => {}
+            server::backend::BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected replay boundary in question usage flow")
+            }
+        }
+    }
+    eprintln!("Question usage diagnostic: phase=answer_settled");
+    let mut generations = Vec::new();
+    let mut response_generations = HashMap::new();
+    let mut typing = false;
+    let mut diagnostic_responses = HashMap::new();
+    let mut diagnostic_events = 0;
+    for (event_ordinal, event) in flow.events().iter().enumerate() {
+        match event {
+            ChatEvent::TypingStatusChanged(active) => {
+                if *active && !typing {
+                    generations.push(host.turn("question usage generation"));
+                }
+                typing = *active;
+            }
+            ChatEvent::StreamEnd(end) => {
+                let generation = generations
+                    .len()
+                    .checked_sub(1)
+                    .expect("response must follow a working edge");
+                let id = end.message.message_id.clone().expect("response identity");
+                let response_ordinal = diagnostic_responses.len();
+                diagnostic_responses.insert(id.clone(), response_ordinal);
+                assert!(
+                    response_generations.insert(id, generation).is_none(),
+                    "provider response must end exactly once"
+                );
+            }
+            _ => {}
+        }
+        let usage_event = match event {
+            ChatEvent::StreamEnd(end) => Some((
+                "stream_end",
+                end.message.message_id.as_ref(),
+                end.message.token_usage.as_ref(),
+            )),
+            ChatEvent::MessageMetadataUpdated(update) => Some((
+                "metadata",
+                Some(&update.message_id),
+                update.token_usage.as_ref(),
+            )),
+            _ => None,
+        };
+        if matches!(event, ChatEvent::TypingStatusChanged(_)) || usage_event.is_some() {
+            diagnostic_events += 1;
+            if diagnostic_events <= 64 {
+                if let ChatEvent::TypingStatusChanged(active) = event {
+                    eprintln!(
+                        "Question usage event: ordinal={event_ordinal} kind=working_edge active={active}"
+                    );
+                }
+                if let Some((kind, id, usage)) = usage_event {
+                    eprintln!(
+                        "Question usage event: ordinal={event_ordinal} kind={kind} response_ordinal={:?} generation={:?} usage_present={} request={:?} turn={:?} cumulative={:?}",
+                        id.and_then(|id| diagnostic_responses.get(id)),
+                        id.and_then(|id| response_generations.get(id)),
+                        usage.is_some(),
+                        usage.and_then(|usage| usage.request.known_usage()),
+                        usage.and_then(|usage| usage.turn.known_usage()),
+                        usage.and_then(|usage| usage.cumulative.known_usage()),
+                    );
+                }
+            } else if diagnostic_events == 65 {
+                eprintln!("Question usage event: diagnostic_limit_reached=true");
+            }
+        }
+    }
+    for event in flow.events() {
+        let id = match event {
+            ChatEvent::StreamEnd(end) => {
+                end.message.message_id.as_ref().expect("response identity")
+            }
+            ChatEvent::MessageMetadataUpdated(update) => &update.message_id,
+            _ => continue,
+        };
+        let generation = response_generations
+            .get(id)
+            .expect("usage metadata must belong to a provider response");
+        generations[*generation].events.push(event.clone());
+    }
+    let mut requests = 0;
+    for (index, generation) in generations.iter().enumerate() {
+        let usages = generation.reported_usage();
+        assert!(!usages.is_empty(), "working generation must report usage");
+        if index < 8 {
+            eprintln!(
+                "Question usage diagnostic: generation={index} responses={} measured_requests={} measured_snapshots={}",
+                usages.len(),
+                usages
+                    .iter()
+                    .filter(|usage| usage.request.known_usage().is_some())
+                    .count(),
+                usages
+                    .iter()
+                    .filter(|usage| usage.turn.known_usage().is_some())
+                    .count()
+            );
+        }
+        assert!(
+            usages
+                .iter()
+                .all(|usage| usage.request.known_usage().is_some()),
+            "every provider request must be measured"
+        );
+        // Intermediate Claude phases report requests before the final native
+        // result supplies the turn total. Compare that final snapshot to all
+        // requests, rather than demanding a snapshot on each intermediate row.
+        assert!(
+            usages
+                .last()
+                .and_then(|usage| usage.turn.known_usage())
+                .is_some(),
+            "the final generation snapshot must be measured"
+        );
+        requests += usages.len();
+        assert_requests_sum_to_their_turn(generation, true);
+    }
+    assert!(
+        requests >= 3,
+        "launch, question and answer must be measured"
+    );
+    eprintln!(
+        "Question usage diagnostic: generations={} measured_requests={requests}",
+        generations.len()
+    );
+    assert_clean_close(host, &agent).await;
+}
+conformance2_scenario!(
+    real_question_usage_accounting,
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::TurnUsageReported,
+        BackendCapability::ModelRequestUsageReported
+    ],
+    TokenUsageTrackingMode::Messages
 );
 
 const USAGE_MARKER: &str = "TYDE_USAGE";

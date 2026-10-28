@@ -1217,6 +1217,8 @@ pub struct BackendDiscovery {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TokenUsageTrackingMode {
     #[default]
+    /// Message `turn` snapshots cover only the false-to-true typing generation
+    /// that emitted the response, even across waits inside one native turn.
     Messages,
     ModelRequests,
 }

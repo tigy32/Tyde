@@ -1446,7 +1446,7 @@ async fn expect_stream_end_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
     expected_text: &str,
-) {
+) -> StreamEndData {
     loop {
         let env = expect_chat_event_on_stream(client, stream, "StreamEnd").await;
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
@@ -1457,7 +1457,7 @@ async fn expect_stream_end_on_stream(
                 stream,
                 end.message.content
             );
-            return;
+            return end;
         }
     }
 }
@@ -1977,83 +1977,517 @@ async fn spawn_parent_with_native_child(
 
 #[tokio::test]
 async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
+    // AGY-shaped overlap uses the resumable Messages-mode fixture for durability.
     let mut fixture = Fixture::new().await;
-    let agent = fixture.spawn("token-usage-agent", "first usage").await;
-
-    let first = expect_strict_mock_turn(
+    let start = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "token-usage-agent",
+            MockScript::one(MockTurn::overlapping_usage(&start)).with_unbounded_echo(),
+        )
+        .await;
+    let agent = spawn_token_usage_agent_with_backend(
         &mut fixture.client,
-        &agent.stream,
-        "mock backend response to: first usage",
+        "token-usage-agent",
+        "first usage",
+        BackendKind::Claude,
     )
     .await;
+    drop(reservation);
+    start.release_one();
+    let generation = fixture::finish_turn_on(&mut fixture.client, &agent.instance_stream).await;
+    let events = generation.chat_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+            .count(),
+        1
+    );
+    let ends = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ends.len(), 2, "two responses in one generation");
+    let first = ends[0];
+    let second = ends[1];
+    assert_known_turn_usage(&first.message.token_usage, 16_984, 16_984);
     assert_eq!(
         first
             .message
             .token_usage
             .as_ref()
-            .expect("first turn usage")
+            .expect("first usage")
             .request
             .known_usage()
-            .expect("first request usage")
+            .expect("first request")
             .total_tokens,
-        MOCK_TURN_TOKEN_TOTAL
+        16_984
     );
-    assert_known_turn_usage(
-        &first.message.token_usage,
-        MOCK_TURN_TOKEN_TOTAL,
-        MOCK_TURN_TOKEN_TOTAL,
+    assert_known_turn_usage(&second.message.token_usage, 32_168, 32_168);
+    let usage = second.message.token_usage.as_ref().expect("response usage");
+    assert_eq!(
+        usage.request.known_usage().expect("request").total_tokens,
+        15_184
     );
+    let total = usage.cumulative.known_usage().expect("cumulative");
+    assert_eq!(total.input_tokens, 24_045);
+    assert_eq!(total.prompt_tokens(), 40_173);
+    assert_eq!(total.output_tokens, 8_123);
+    assert_eq!(total.cached_prompt_tokens, Some(16_128));
+    assert_eq!(total.reasoning_tokens, Some(4_521));
+    assert_eq!(total.cache_creation_input_tokens, None);
 
+    eprintln!("Usage accounting diagnostic: overlapping generation reconciled");
     fixture
         .client
-        .send_message(&agent.stream, "second usage".to_owned())
+        .send_message(&agent.instance_stream, "second usage".to_owned())
         .await
-        .expect("send second usage message");
-    let second = expect_strict_mock_turn(
-        &mut fixture.client,
-        &agent.stream,
-        "mock backend response to: second usage",
-    )
-    .await;
-    assert_known_turn_usage(
-        &second.message.token_usage,
-        MOCK_TURN_TOKEN_TOTAL,
-        MOCK_TURN_TOKEN_TOTAL * 2,
-    );
-
-    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    let late_agent = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
-    let env =
-        fixture::next_frame_matching_on(&mut late_client, "late client AgentBootstrap", |env| {
-            env.kind == FrameKind::AgentBootstrap && env.stream == late_agent.instance_stream
+        .expect("send second generation");
+    let generation = fixture::finish_turn_on(&mut fixture.client, &agent.instance_stream).await;
+    let ends = generation
+        .chat_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end),
+            _ => None,
         })
-        .await;
-    let agent_bootstrap: AgentBootstrapPayload = env
-        .parse_payload()
-        .expect("parse late client AgentBootstrap");
-    let stats = agent_bootstrap
+        .collect::<Vec<_>>();
+    assert_eq!(ends.len(), 1, "one response in the next generation");
+    let next = &ends[0];
+    assert_known_turn_usage(
+        &next.message.token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        32_168 + MOCK_TURN_TOKEN_TOTAL,
+    );
+    let expected = next
+        .message
+        .token_usage
+        .as_ref()
+        .expect("next usage")
+        .cumulative
+        .known_usage()
+        .expect("next cumulative")
+        .clone();
+    eprintln!("Usage accounting diagnostic: next generation reconciled");
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_agent = bootstrapped_agent(&bootstrap, &agent.agent_id);
+    eprintln!(
+        "Usage reconnect diagnostic: subscriber_stream_changed={}",
+        late_agent.instance_stream != agent.instance_stream
+    );
+    let task = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == agent.agent_id)
+        .expect("task usage");
+    assert_known_task_status(&task.total.status);
+    assert_known_task_scope(&task.self_usage, expected.total_tokens);
+    assert_eq!(
+        task.total.usage.prompt_tokens,
+        Some(expected.prompt_tokens())
+    );
+    assert_eq!(task.backends.len(), 1);
+    assert_eq!(task.backends[0].backend_kind, BackendKind::Claude);
+    assert_eq!(task.backends[0].total, task.total);
+    assert_eq!(task.breakdown[0].model.as_deref(), Some("mock"));
+    let session = task.root_session_id.clone().expect("usage session");
+    let env = fixture::next_frame_matching_on(&mut late_client, "usage replay", |env| {
+        env.kind == FrameKind::AgentBootstrap && env.stream == late_agent.instance_stream
+    })
+    .await;
+    let replay: AgentBootstrapPayload = env.parse_payload().expect("usage replay");
+    let stats = replay
         .events
         .iter()
         .find_map(|event| match event {
-            AgentBootstrapEvent::AgentActivityStats(payload) => Some(payload),
+            AgentBootstrapEvent::AgentActivityStats(payload) => Some(&payload.stats),
             _ => None,
         })
-        .expect("AgentBootstrap should carry AgentActivityStats");
+        .expect("replayed stats");
+    assert_eq!(stats.token_usage, expected);
+    // Bootstrap folds metadata onto its response rather than replaying raw updates.
+    let replayed_first = replay
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end))
+                if end.message.message_id == first.message.message_id =>
+            {
+                Some(&end.message)
+            }
+            _ => None,
+        })
+        .expect("first response with folded late metadata");
+    assert_known_turn_usage(&replayed_first.token_usage, 16_984, 32_168);
     assert_eq!(
-        stats.stats.token_usage.total_tokens,
-        MOCK_TURN_TOKEN_TOTAL * 2
+        replayed_first
+            .token_usage
+            .as_ref()
+            .expect("replayed usage")
+            .request
+            .known_usage()
+            .expect("replayed request")
+            .total_tokens,
+        16_984
+    );
+
+    eprintln!("Usage accounting diagnostic: reconnect replay verified");
+    fixture
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close usage agent");
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "usage agent closed",
+    )
+    .await;
+    eprintln!("Usage accounting diagnostic: actor closed");
+    let (_, closed) = fixture.connect_with_bootstrap().await;
+    // Only live roots are advertised; retained usage becomes observable on resume.
+    assert!(
+        closed
+            .task_token_usages
+            .iter()
+            .all(|usage| usage.root_session_id.as_ref() != Some(&session)),
+        "closed task roots must not stay advertised"
+    );
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("usage-reopened".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("reopen saved usage");
+    let reopened = expect_new_agent(&mut fixture.client, "reopened usage agent").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &reopened.instance_stream,
+        "reopened usage ready",
+    )
+    .await;
+    eprintln!("Usage accounting diagnostic: saved session reopened");
+    let (_, reopened_usage) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        reopened_usage
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == reopened.agent_id)
+            .expect("retained usage on reopen")
+            .total,
+        task.total
+    );
+    let restart = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&session))
+        .await;
+    let mut active = restored[&session].clone();
+    eprintln!("Usage resume diagnostic: phase=restored_bootstrap_begin");
+    let (_, ready) = fixture.connect_with_bootstrap().await;
+    eprintln!("Usage resume diagnostic: phase=restored_bootstrap_received");
+    let restored = ready
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&session].agent_id)
+        .expect("restored usage");
+    assert_eq!(restored.total, task.total);
+    assert_eq!(restored.backends.len(), 1);
+    assert_eq!(restored.backends[0].backend_kind, BackendKind::Claude);
+    assert_eq!(restored.backends[0].total, task.backends[0].total);
+    assert_eq!(restored.breakdown[0].model, task.breakdown[0].model);
+
+    eprintln!("Usage resume diagnostic: phase=restored_usage_verified");
+    let write_id = protocol::SettingsWriteId("accounting-manual-resume".to_owned());
+    fixture
+        .client
+        .settings_write(protocol::SettingsWritePayload {
+            write_id: write_id.clone(),
+            ops: vec![protocol::SettingOp::Replace {
+                path: "/resume_previous_agents".to_owned(),
+                value: json!(false),
+                expected: protocol::SettingExpectation::Value { value: json!(true) },
+            }],
+        })
+        .await
+        .expect("disable automatic restoration for manual resume");
+    eprintln!("Usage resume diagnostic: phase=manual_restoration_write_sent");
+    expect_settings_write_applied(&mut fixture.client, &write_id, "manual restoration saved").await;
+    eprintln!("Usage resume diagnostic: phase=manual_restoration_write_applied");
+    let mut expected_total = expected.total_tokens;
+    let resume_cases = [(false, false), (true, false), (true, true)];
+    for (index, (prompt_on_resume, torn_tail)) in resume_cases.into_iter().enumerate() {
+        let gate = MockGateHandle::new();
+        let held_text = format!("measured interrupted usage {index}");
+        eprintln!("Usage resume diagnostic: case={index} phase=mock_control_begin");
+        let control = fixture.mock_by_id(&active.agent_id).await;
+        eprintln!("Usage resume diagnostic: case={index} phase=mock_control_received");
+        control
+            .enqueue(MockTurn::gated_text(held_text.clone(), &gate))
+            .await;
+        eprintln!("Usage resume diagnostic: case={index} phase=measured_turn_enqueued");
+        fixture
+            .client
+            .send_message(&active.instance_stream, "measured before kill".to_owned())
+            .await
+            .expect("start measured generation before kill");
+        eprintln!("Usage resume diagnostic: case={index} phase=measured_prompt_sent");
+        let mut measured_events = 0;
+        let measured = fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            &active.instance_stream,
+            "measured response before idle",
+            |event| {
+                if measured_events < 16 {
+                    eprintln!(
+                        "Usage resume diagnostic: case={index} phase=measured_event ordinal={measured_events} event={} scripted_response={}",
+                        match event {
+                            ChatEvent::TypingStatusChanged(true) => "working",
+                            ChatEvent::TypingStatusChanged(false) => "idle",
+                            ChatEvent::StreamStart(_) => "response_start",
+                            ChatEvent::StreamDelta(_) => "response_delta",
+                            ChatEvent::StreamEnd(_) => "response_end",
+                            _ => "other",
+                        },
+                        matches!(event, ChatEvent::StreamEnd(end) if end.message.content == held_text),
+                    );
+                }
+                measured_events += 1;
+                matches!(event, ChatEvent::StreamEnd(end) if end.message.content == held_text)
+            },
+        )
+        .await;
+        let ChatEvent::StreamEnd(measured) = measured else {
+            unreachable!("matched measured response")
+        };
+        assert_known_turn_usage(
+            &measured.message.token_usage,
+            MOCK_TURN_TOKEN_TOTAL,
+            expected_total + MOCK_TURN_TOKEN_TOTAL,
+        );
+        eprintln!("Usage resume diagnostic: case={index} phase=measured_usage_verified");
+        gate.wait_until_entered().await;
+        eprintln!("Usage resume diagnostic: case={index} phase=measured_gate_entered");
+        let killed = fixture.relaunch_host_after_kill().await;
+        eprintln!("Usage resume diagnostic: case={index} phase=killed_host_relaunched");
+        assert!(
+            killed.agents.is_empty(),
+            "manual restoration remains disabled"
+        );
+        if torn_tail {
+            use std::io::Write;
+            let journal_path = fixture
+                .store_dir()
+                .join("transcripts")
+                .join(format!("{}.jsonl", session.0));
+            let mut journal = std::fs::OpenOptions::new()
+                .append(true)
+                .open(journal_path)
+                .expect("open inactive fixture journal");
+            journal
+                .write_all(b"{\"interrupted_record\":")
+                .expect("inject an uncommitted fixture tail");
+            journal.sync_data().expect("persist fixture tail");
+            eprintln!("Usage resume diagnostic: case={index} phase=torn_tail_injected");
+        }
+        let prompt = format!("accounting after interrupted resume {index}");
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("usage-after-interruption".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session.clone(),
+                    prompt: prompt_on_resume.then(|| prompt.clone()),
+                },
+            })
+            .await
+            .expect("resume interrupted accounting");
+        eprintln!("Usage resume diagnostic: case={index} phase=resume_requested");
+        let resumed = expect_new_agent(&mut fixture.client, "interrupted usage resumed").await;
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_agent_announced");
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &resumed.instance_stream,
+            "interrupted usage start",
+        )
+        .await;
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_agent_started");
+        if !prompt_on_resume {
+            fixture
+                .client
+                .send_message(&resumed.instance_stream, prompt.clone())
+                .await
+                .expect("prompt after interrupted resume");
+        }
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_prompt_submitted");
+        let reply = format!("mock backend response to: {prompt}");
+        let mut resumed_events = 0;
+        let after = fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "new generation after interrupted resume",
+            |env| {
+                if env.stream != resumed.instance_stream {
+                    return false;
+                }
+                if env.kind == FrameKind::AgentError {
+                    let error: AgentErrorPayload = env.parse_payload().expect("resume error");
+                    assert!(
+                        !error.fatal,
+                        "resume must remain usable, error code {:?}",
+                        error.code
+                    );
+                }
+                if env.kind != FrameKind::ChatEvent {
+                    return false;
+                }
+                let event: ChatEvent = env.parse_payload().expect("resumed chat event");
+                assert!(
+                    !prompt_on_resume || !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                    "queued resume must not publish idle before its reply"
+                );
+                let matched = matches!(
+                    &event,
+                    ChatEvent::StreamEnd(end) if end.message.content.ends_with(&reply)
+                );
+                if resumed_events < 16 {
+                    eprintln!(
+                        "Usage resume diagnostic: case={index} phase=resumed_event ordinal={resumed_events} response_end={} echo_suffix_matches={matched}",
+                        matches!(event, ChatEvent::StreamEnd(_)),
+                    );
+                }
+                resumed_events += 1;
+                matched
+            },
+        )
+        .await;
+        let ChatEvent::StreamEnd(after) = after.parse_payload().expect("resumed response") else {
+            unreachable!("matched resumed response")
+        };
+        expected_total += MOCK_TURN_TOKEN_TOTAL * 2;
+        assert_known_turn_usage(
+            &after.message.token_usage,
+            MOCK_TURN_TOKEN_TOTAL,
+            expected_total,
+        );
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_usage_verified");
+        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_bootstrap_received");
+        let task = bootstrap
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == resumed.agent_id)
+            .expect("interrupted generation retained");
+        if torn_tail {
+            match &task.self_usage {
+                TaskTokenUsageScope::Partial {
+                    usage,
+                    unavailable_count: 1,
+                    reasons,
+                } => {
+                    assert_eq!(usage.total_tokens, expected_total);
+                    assert_eq!(
+                        reasons,
+                        &vec![TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete]
+                    );
+                }
+                _ => panic!("torn history must retain usage without certifying completeness"),
+            }
+            assert_eq!(
+                task.total.status,
+                TaskTokenUsageStatus::Partial {
+                    unavailable_count: 1,
+                    reasons: vec![TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete],
+                }
+            );
+        } else {
+            assert_known_task_scope(&task.self_usage, expected_total);
+            assert_known_task_status(&task.total.status);
+        }
+        assert_eq!(task.backends[0].total, task.total);
+        let resumed_self = task.self_usage.clone();
+        let resumed_total = task.total.clone();
+        fixture
+            .client
+            .close_agent(&resumed.instance_stream)
+            .await
+            .expect("close resumed usage for durable replay");
+        expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentClosed,
+            "resumed usage closed",
+        )
+        .await;
+        eprintln!("Usage resume diagnostic: case={index} phase=resumed_actor_closed");
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("usage-durable-reopen".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .expect("reopen resumed accounting journal");
+        let reopened = expect_new_agent(&mut fixture.client, "durable usage reopened").await;
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &reopened.instance_stream,
+            "durable usage ready",
+        )
+        .await;
+        let (_, durable) = fixture.connect_with_bootstrap().await;
+        let task = durable
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == reopened.agent_id)
+            .expect("durable resumed usage");
+        assert_eq!(task.self_usage, resumed_self);
+        assert_eq!(task.total, resumed_total);
+        assert_eq!(task.backends.len(), 1);
+        assert_eq!(task.backends[0].backend_kind, BackendKind::Claude);
+        assert_eq!(task.backends[0].total, task.total);
+        assert_eq!(task.breakdown[0].model.as_deref(), Some("mock"));
+        eprintln!("Usage resume diagnostic: case={index} phase=durable_usage_verified");
+        active = reopened;
+    }
+    eprintln!(
+        "Usage accounting diagnostic: interrupted generations retained across both resume prompt paths"
     );
 }
 
 #[tokio::test]
 async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     let mut fixture = Fixture::new().await;
+    let checkpoint = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "late-token-usage-agent",
             MockScript::one(MockTurn::text_with_late_usage(
                 "mock backend response to: first late",
             ))
+            .then(MockTurn::text("mock backend response to: after late usage"))
+            .then(MockTurn::generation_usage_coverage(&checkpoint))
             .with_unbounded_echo(),
         )
         .await;
@@ -2113,6 +2547,134 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL * 2,
     );
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "coverage revisions".to_owned())
+        .await
+        .expect("start generation coverage");
+    let unavailable = expect_stream_end_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "coverage response 1",
+    )
+    .await;
+    assert_unavailable_turn_usage(&unavailable.message.token_usage);
+    let covering = expect_stream_end_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "coverage response 2",
+    )
+    .await;
+    assert_known_turn_usage(
+        &covering.message.token_usage,
+        MOCK_TURN_TOKEN_TOTAL * 2,
+        MOCK_TURN_TOKEN_TOTAL * 4,
+    );
+    checkpoint.wait_until_entered().await;
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let task = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == new_agent.agent_id)
+        .expect("covered unavailable response");
+    assert_known_task_status(&task.total.status);
+    let optional_fields = vec![
+        protocol::TaskTokenUsageField::CachedPrompt,
+        protocol::TaskTokenUsageField::CacheCreationInput,
+        protocol::TaskTokenUsageField::Reasoning,
+    ];
+    assert_eq!(task.total.usage.partial_fields, optional_fields);
+
+    let unavailable_id = unavailable
+        .message
+        .message_id
+        .as_ref()
+        .expect("response identity");
+    checkpoint.release_one();
+    fixture::next_logical_frame_matching_on(&mut fixture.client, "covered stale metadata", |env| {
+        env.stream == new_agent.instance_stream
+            && env.kind == FrameKind::ChatEvent
+            && env.parse_payload::<ChatEvent>().is_ok_and(|event| {
+                matches!(event, ChatEvent::MessageMetadataUpdated(update)
+                    if &update.message_id == unavailable_id
+                        && update.token_usage.as_ref().is_some_and(|usage| usage.turn.known_usage().is_none()))
+            })
+    })
+    .await;
+    checkpoint.wait_until_entered().await;
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let task = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == new_agent.agent_id)
+        .expect("generation optional coverage upgraded");
+    assert_known_task_status(&task.total.status);
+    assert_known_task_scope(&task.self_usage, MOCK_TURN_TOKEN_TOTAL * 4);
+    assert!(task.total.usage.partial_fields.is_empty());
+
+    checkpoint.release_one();
+    let unreported = expect_stream_end_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "coverage response 3",
+    )
+    .await;
+    assert_unavailable_turn_usage(&unreported.message.token_usage);
+    let request_only = expect_stream_end_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "coverage response 4",
+    )
+    .await;
+    let request_only = request_only
+        .message
+        .token_usage
+        .expect("request-only usage");
+    assert!(request_only.turn.known_usage().is_none());
+    assert_eq!(
+        request_only
+            .request
+            .known_usage()
+            .expect("request")
+            .total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    checkpoint.wait_until_entered().await;
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    let task = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == new_agent.agent_id)
+        .expect("uncovered responses retained");
+    assert_partial_task_scope(&task.self_usage, MOCK_TURN_TOKEN_TOTAL * 5, 1);
+    assert_partial_task_scope(&task.breakdown[0].usage, MOCK_TURN_TOKEN_TOTAL * 5, 1);
+    assert!(matches!(
+        &task.total.status,
+        TaskTokenUsageStatus::Partial { unavailable_count: 1, reasons }
+            if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+    ));
+    assert_eq!(task.backends[0].total, task.total);
+    assert_eq!(task.total.usage.partial_fields, optional_fields);
+
+    checkpoint.release_one();
+    let (update, task) = expect_metadata_update_and_task_token_usage_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        &new_agent.agent_id,
+        MOCK_TURN_TOKEN_TOTAL * 6,
+        "complete generation coverage",
+    )
+    .await;
+    assert_known_turn_usage(
+        &update.token_usage,
+        MOCK_TURN_TOKEN_TOTAL * 4,
+        MOCK_TURN_TOKEN_TOTAL * 6,
+    );
+    assert_known_task_scope(&task.self_usage, MOCK_TURN_TOKEN_TOTAL * 6);
+    assert!(task.total.usage.partial_fields.is_empty());
+    assert_eq!(task.backends[0].total, task.total);
+    eprintln!("Usage accounting diagnostic: generation coverage and uncovered sources reconciled");
 }
 
 #[tokio::test]

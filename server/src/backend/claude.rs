@@ -555,6 +555,7 @@ impl ClaudeSession {
                 skill_watchdog: None,
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
+                message_generation_usage: None,
                 active_turn: None,
                 compaction_capability: watch::channel(BackendCompactionCapability::unknown(
                     BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -793,6 +794,7 @@ struct ClaudeState {
     skill_watchdog: Option<JoinHandle<()>>,
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
+    message_generation_usage: Option<(u64, TokenUsageScope)>,
     active_turn: Option<ActiveTurn>,
     compaction_capability: watch::Sender<BackendCompactionCapability>,
     compact_command_advertised: Option<bool>,
@@ -875,6 +877,7 @@ impl Default for ClaudeState {
             skill_watchdog: None,
             cumulative_usage: None,
             cumulative_usage_complete: true,
+            message_generation_usage: None,
             active_turn: None,
             compaction_capability: watch::channel(BackendCompactionCapability::unknown(
                 BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -958,6 +961,9 @@ struct ClaudeInner {
     /// set.
     background_work_active: std::sync::atomic::AtomicBool,
     typing_active: std::sync::atomic::AtomicBool,
+    message_usage_generation: std::sync::atomic::AtomicU64,
+    usage_diagnostic_sequence: std::sync::atomic::AtomicU64,
+    usage_diagnostic_reader_step: std::sync::atomic::AtomicU64,
 }
 
 impl ClaudeInner {
@@ -977,6 +983,9 @@ impl ClaudeInner {
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
             background_work_active: std::sync::atomic::AtomicBool::new(false),
             typing_active: std::sync::atomic::AtomicBool::new(false),
+            message_usage_generation: std::sync::atomic::AtomicU64::new(0),
+            usage_diagnostic_sequence: std::sync::atomic::AtomicU64::new(0),
+            usage_diagnostic_reader_step: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -1543,9 +1552,18 @@ struct ClaudeStdoutSummary {
     /// Aggregate usage for this CLI invocation from the `result` event.
     /// Kept separate from `usage` so we don't confuse a turn with one API call.
     result_turn_usage: Option<Value>,
-    /// Sum of distinct API-call usages observed while relaying a native child.
-    /// Claude does not consistently correlate a `result` frame to native children.
+    /// Distinct closed requests in this invocation, independent of the public
+    /// working generations that blocking native controls can split it into.
     accumulated_request_usage: Option<Value>,
+    unmeasured_request_count: usize,
+    closed_request_usage: Vec<ClaudeClosedRequestUsage>,
+    message_usage_generation: Option<u64>,
+    message_usage_prefix: Option<Value>,
+    message_usage_prefix_unmeasured_request_count: usize,
+    message_usage_carry: Option<TokenUsageScope>,
+    usage_diagnostic_requests: HashMap<String, usize>,
+    usage_diagnostic_current_request: Option<usize>,
+    usage_diagnostic_closed_requests: HashSet<usize>,
     /// The most recent per-request usage seen this invocation. Distinct from
     /// `usage`, which a closing phase clears: the context window only arrives
     /// with the `result` frame, by which point `usage` is already gone, so
@@ -2148,6 +2166,14 @@ struct ClaudeMessageUsage {
     request: Option<Value>,
     turn: Option<Value>,
     cumulative: Option<Value>,
+}
+
+struct ClaudeClosedRequestUsage {
+    native_message_id: String,
+    message_id: protocol::ChatMessageId,
+    generation: u64,
+    usage: ClaudeMessageUsage,
+    turn_is_native_aggregate: bool,
 }
 
 fn claude_message_token_usage(usage: ClaudeMessageUsage) -> Option<MessageTokenUsage> {
@@ -6168,6 +6194,7 @@ impl ClaudeInner {
                 state.fork_from_session_id = None;
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
+                state.message_generation_usage = None;
                 (state.workspace_root.clone(), state.ssh_host.clone())
             })
             .await;
@@ -6467,12 +6494,49 @@ impl ClaudeInner {
         tracing::info!("Claude shutdown completed");
     }
 
+    fn trace_usage_diagnostic(&self, phase: &'static str, fields: impl FnOnce() -> Value) {
+        if !tracing::enabled!(target: "tyde_claude_usage_diagnostic", tracing::Level::INFO) {
+            return;
+        }
+        let sequence = self
+            .usage_diagnostic_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if sequence > 255 {
+            return;
+        }
+        let reader_step = self
+            .usage_diagnostic_reader_step
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .message_usage_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let fields = if sequence == 255 {
+            json!({"diagnostic_limit_reached": true})
+        } else {
+            fields()
+        };
+        tracing::info!(
+            target: "tyde_claude_usage_diagnostic",
+            sequence,
+            reader_step,
+            generation,
+            phase,
+            fields = %fields,
+            "Claude usage diagnostic"
+        );
+    }
+
     fn emit_typing_status(&self, typing: bool) {
         if self
             .typing_active
             .swap(typing, std::sync::atomic::Ordering::Relaxed)
             != typing
         {
+            if typing {
+                self.message_usage_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.trace_usage_diagnostic("working_edge", || json!({"active": typing}));
             self.emitter.typing_status_changed(typing);
         }
     }
@@ -6533,7 +6597,7 @@ impl ClaudeInner {
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
         context_breakdown: Option<Value>,
-    ) {
+    ) -> Option<protocol::ChatMessageId> {
         let content_offset = u32::try_from(content.chars().count()).unwrap_or(u32::MAX);
         let Some(response) = self
             .active_response
@@ -6544,8 +6608,16 @@ impl ClaudeInner {
         else {
             tracing::error!("Claude ended a response that was not open");
             debug_assert!(false, "Claude ended a response that was not open");
-            return;
+            return None;
         };
+        let message_id = response.message_id();
+        self.trace_usage_diagnostic("public_stream_end", || {
+            json!({
+                "request": claude_usage_diagnostic_fields(usage.request.as_ref()),
+                "turn": claude_usage_diagnostic_fields(usage.turn.as_ref()),
+                "cumulative": claude_usage_diagnostic_fields(usage.cumulative.as_ref()),
+            })
+        });
         self.emitter.stream_end(response, StreamEndPayload {
             content,
             model_info: model.map(|model| ModelInfo { model }),
@@ -6567,6 +6639,7 @@ impl ClaudeInner {
             }),
             images: Vec::new(),
         });
+        Some(message_id)
     }
 
     /// Declare tool calls on the response that is still streaming them, so their
@@ -6611,7 +6684,7 @@ impl ClaudeInner {
         turn_usage: Option<ClaudeTurnUsage>,
         context_breakdown: Option<Value>,
     ) {
-        self.emit_stream_end(
+        let _ = self.emit_stream_end(
             String::new(),
             model,
             ClaudeMessageUsage {
@@ -6739,6 +6812,37 @@ impl ClaudeInner {
             turn_usage,
             cancelled,
         } = options;
+        self.trace_usage_diagnostic("terminal_before_scope", || {
+            claude_usage_diagnostic_state(summary)
+        });
+        align_claude_message_usage_generation(summary, self);
+        let message_turn = scope_claude_message_turn_usage(
+            summary,
+            turn_usage.as_ref().map(|usage| usage.turn.clone()),
+            self,
+        );
+        let message_turn_usage = message_turn.as_ref().map(|turn| ClaudeTurnUsage {
+            turn: turn.clone(),
+            cumulative: turn_usage
+                .as_ref()
+                .and_then(|usage| usage.cumulative.clone()),
+        });
+        let generation = self
+            .message_usage_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let measured = match message_turn.clone().and_then(claude_token_usage) {
+            Some(usage) => TokenUsageScope::Known {
+                usage: Box::new(usage),
+            },
+            None => TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+        };
+        self.state
+            .with(move |state| {
+                state.message_generation_usage = Some((generation, measured));
+            })
+            .await;
         let known_context_window = summary.result_context_window;
         // Occupancy for the turn, published once the `result` frame has named
         // the window. Claude reports no attribution, so no breakdown rides
@@ -6805,12 +6909,12 @@ impl ClaudeInner {
                     selected_model.clone(),
                 );
             }
-            self.emit_stream_end(
+            let _ = self.emit_stream_end(
                 text,
                 selected_model,
                 ClaudeMessageUsage {
                     request: phase.usage,
-                    turn: turn_usage.as_ref().map(|usage| usage.turn.clone()),
+                    turn: message_turn,
                     cumulative: turn_usage
                         .as_ref()
                         .and_then(|usage| usage.cumulative.clone()),
@@ -6838,7 +6942,7 @@ impl ClaudeInner {
                         selected_model.clone(),
                     );
                 }
-                self.emit_placeholder_stream_end(selected_model, turn_usage.clone(), None);
+                self.emit_placeholder_stream_end(selected_model, message_turn_usage.clone(), None);
             }
             close_terminal_tool_requests(summary, self, cancelled);
             return true;
@@ -6857,7 +6961,7 @@ impl ClaudeInner {
                     selected_model.clone(),
                 );
             }
-            self.emit_placeholder_stream_end(selected_model, turn_usage, None);
+            self.emit_placeholder_stream_end(selected_model, message_turn_usage, None);
         }
 
         if !summary.unresolved_tool_requests.is_empty() {
@@ -7580,6 +7684,13 @@ async fn read_claude_stdout_persistent(
             }
         };
 
+        if tracing::enabled!(target: "tyde_claude_usage_diagnostic", tracing::Level::INFO) {
+            inner
+                .usage_diagnostic_reader_step
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            trace_claude_usage_reader_frame(&inner, &value);
+        }
+
         if inner
             .state
             .with(|state| state.workspace_relocation_in_flight)
@@ -8222,7 +8333,7 @@ async fn prepare_persistent_stdout_turn(
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
 ) -> Option<(u64, Option<String>, ClaudeTurnOwner)> {
-    let (turn_id, model_hint, owner) = inner
+    let (turn_id, model_hint, owner, message_generation_usage) = inner
         .state
         .with(|state| {
             let active = state.active_turn.as_ref()?;
@@ -8237,16 +8348,28 @@ async fn prepare_persistent_stdout_turn(
             if matches!(owner, ClaudeTurnOwner::User) {
                 active.outcome_tx.as_ref()?;
             }
-            Some((active.id, state.model.clone(), owner))
+            Some((
+                active.id,
+                state.model.clone(),
+                owner,
+                state.message_generation_usage.clone(),
+            ))
         })
         .await?;
     if turn_state.active_turn_id != Some(turn_id) {
+        let generation = inner
+            .message_usage_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         let base_message_id = format!("claude-msg-{turn_id}");
         turn_state.active_turn_id = Some(turn_id);
         turn_state.base_message_id = base_message_id.clone();
         turn_state.current_message_id = base_message_id;
         turn_state.summary = ClaudeStdoutSummary {
             turn_id: Some(turn_id),
+            message_usage_generation: Some(generation),
+            message_usage_carry: message_generation_usage
+                .filter(|(previous, _)| *previous == generation)
+                .map(|(_, usage)| usage),
             model: turn_state.context_window_model.clone(),
             result_context_window: turn_state.context_window,
             context_window_model: turn_state.context_window_model.clone(),
@@ -8447,12 +8570,18 @@ async fn bridge_ask_user_question_control_request(
         .await
         .ok_or_else(|| "Claude asked a question with no active turn".to_string())?;
 
+    inner.trace_usage_diagnostic("question_before_close", || {
+        claude_usage_diagnostic_state(&turn_state.summary)
+    });
     let tool_call = ensure_ask_user_question_tool_request_emitted(
         &mut turn_state.summary,
         &mut turn_state.segment,
         inner,
         request.clone(),
     );
+    inner.trace_usage_diagnostic("question_after_close", || {
+        claude_usage_diagnostic_state(&turn_state.summary)
+    });
     inner
         .begin_ask_user_question_control_request(AskUserQuestionControlRequest {
             tool_call_id: tool_call.id,
@@ -8613,7 +8742,7 @@ fn ensure_exit_plan_mode_tool_request_emitted(
     }
 
     if !emitted {
-        inner.emit_stream_end(
+        let _ = inner.emit_stream_end(
             String::new(),
             None,
             ClaudeMessageUsage::default(),
@@ -11005,7 +11134,7 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
         );
         stream.message_id = terminal_message_id;
         close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
-    } else if let Some(turn_usage) = subagent_terminal_usage(&stream.summary) {
+    } else if let Some(turn_usage) = subagent_terminal_usage(&stream.summary, &stream.segment) {
         let base_message_id = stream.message_id.clone();
         let mut terminal_message_id = base_message_id.clone();
         let model = stream.summary.model.clone();
@@ -11027,7 +11156,7 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
     if stream.inner.emitter.is_stream_open() {
         stream.inner.emit_placeholder_stream_end(
             stream.summary.model.clone(),
-            subagent_terminal_usage(&stream.summary),
+            subagent_terminal_usage(&stream.summary, &stream.segment),
             None,
         );
     }
@@ -11047,25 +11176,31 @@ fn close_current_subagent_phase(
     segment: &mut SegmentState,
     inner: &ClaudeInner,
 ) {
-    let turn_usage = subagent_terminal_usage(summary);
+    let turn_usage = subagent_terminal_usage(summary, segment);
     close_current_phase_with_turn_usage(summary, segment, inner, turn_usage);
 }
 
-fn subagent_terminal_usage(summary: &ClaudeStdoutSummary) -> Option<ClaudeTurnUsage> {
-    summary
-        .result_turn_usage
-        .clone()
-        .or_else(|| {
-            summary
-                .usage
-                .as_ref()
-                .map(|usage| add_token_usage(summary.accumulated_request_usage.as_ref(), usage))
-        })
-        .or_else(|| summary.accumulated_request_usage.clone())
-        .map(|usage| ClaudeTurnUsage {
-            turn: usage.clone(),
-            cumulative: Some(usage),
-        })
+fn subagent_terminal_usage(
+    summary: &ClaudeStdoutSummary,
+    segment: &SegmentState,
+) -> Option<ClaudeTurnUsage> {
+    let usage = match summary.result_turn_usage.as_ref() {
+        Some(usage) => usage.clone(),
+        None => {
+            if summary.unmeasured_request_count != 0 {
+                return None;
+            }
+            match summary.usage.as_ref() {
+                Some(usage) => add_token_usage(summary.accumulated_request_usage.as_ref(), usage),
+                None if phase_has_pending_output(summary, segment) => return None,
+                None => summary.accumulated_request_usage.clone()?,
+            }
+        }
+    };
+    Some(ClaudeTurnUsage {
+        turn: usage.clone(),
+        cumulative: Some(usage),
+    })
 }
 
 /// Finalize a background sub-agent when its `task_notification` completion
@@ -11400,6 +11535,14 @@ fn consume_claude_stream_value_with_interrupt(
             if let Some(usage) = parse_token_usage(value.get("usage")) {
                 summary.result_turn_usage = Some(usage);
             }
+            let _ = observe_claude_usage_diagnostic(
+                summary,
+                segment,
+                inner,
+                "native_result_usage",
+                None,
+                value.get("usage"),
+            );
             // Extract contextWindow from result.modelUsage[model].contextWindow.
             // This is the only place Claude Code reports the actual context window.
             if let Some(model_usage) = value.get("modelUsage").and_then(Value::as_object) {
@@ -11602,6 +11745,15 @@ fn consume_assistant_message(
         clear_stale_claude_context_window(summary, &model);
         summary.model = Some(model);
     }
+    let diagnostic_request = observe_claude_usage_diagnostic(
+        summary,
+        segment,
+        inner,
+        "native_assistant_usage",
+        next_message_id.as_deref(),
+        message.get("usage"),
+    );
+    summary.usage_diagnostic_current_request = diagnostic_request;
     if let Some(message_id) = next_message_id {
         segment.current_claude_message_id = Some(message_id);
     }
@@ -11620,7 +11772,12 @@ fn consume_assistant_message(
         trace_claude_usage_observed("assistant_message", &usage, summary.result_context_window);
         emit_live_claude_context_usage(inner, summary, &usage);
         summary.last_request_usage = Some(usage.clone());
-        summary.usage = Some(usage);
+        apply_claude_request_usage(
+            summary,
+            segment.current_claude_message_id.as_deref(),
+            inner,
+            usage,
+        );
     }
 
     for tool_call in next_tool_calls {
@@ -11925,6 +12082,10 @@ fn close_current_phase_with_turn_usage(
     inner: &ClaudeInner,
     turn_usage: Option<ClaudeTurnUsage>,
 ) {
+    inner.trace_usage_diagnostic("phase_before_close", || {
+        claude_usage_diagnostic_state(summary)
+    });
+    align_claude_message_usage_generation(summary, inner);
     flush_pending_tool_uses(summary, segment);
     enrich_exit_plan_mode_tool_calls(summary);
 
@@ -11934,8 +12095,30 @@ fn close_current_phase_with_turn_usage(
                 summary.accumulated_request_usage.as_ref(),
                 request_usage,
             ));
+        } else {
+            summary.unmeasured_request_count += 1;
         }
-        let turn = turn_usage.as_ref().map(|usage| usage.turn.clone());
+        if let Some(ordinal) = summary.usage_diagnostic_current_request {
+            summary.usage_diagnostic_closed_requests.insert(ordinal);
+        }
+        inner.trace_usage_diagnostic("phase_after_accumulation", || {
+            json!({
+                "state": claude_usage_diagnostic_state(summary),
+                "closed_request": claude_usage_diagnostic_fields(phase.usage.as_ref()),
+                "supplied_native_total": turn_usage.as_ref().map(|usage| {
+                    claude_usage_diagnostic_fields(Some(&usage.turn))
+                }),
+            })
+        });
+        let measured_turn = match turn_usage.as_ref() {
+            Some(usage) => Some(usage.turn.clone()),
+            None if summary.unmeasured_request_count == 0 => {
+                summary.accumulated_request_usage.clone()
+            }
+            None => None,
+        };
+        let turn = scope_claude_message_turn_usage(summary, measured_turn, inner);
+        let turn_is_native_aggregate = turn_usage.is_some() && summary.result_turn_usage.is_some();
         let cumulative = turn_usage.and_then(|usage| usage.cumulative);
         let tool_calls = phase
             .tool_calls
@@ -11949,18 +12132,32 @@ fn close_current_phase_with_turn_usage(
                 })
             })
             .collect::<Vec<_>>();
-        inner.emit_stream_end(
+        let usage = ClaudeMessageUsage {
+            request: phase.usage,
+            turn,
+            cumulative,
+        };
+        let message_id = inner.emit_stream_end(
             phase.text,
             phase.model,
-            ClaudeMessageUsage {
-                request: phase.usage,
-                turn,
-                cumulative,
-            },
+            usage.clone(),
             phase.reasoning,
             tool_calls,
             None,
         );
+        if let (Some(native_message_id), Some(message_id), Some(generation)) = (
+            segment.current_claude_message_id.as_ref(),
+            message_id,
+            summary.message_usage_generation,
+        ) {
+            summary.closed_request_usage.push(ClaudeClosedRequestUsage {
+                native_message_id: native_message_id.clone(),
+                message_id,
+                generation,
+                usage,
+                turn_is_native_aggregate,
+            });
+        }
         for tool_call in &phase.tool_calls {
             // Requested already, while the response was still open. A second
             // request would be rebuilt from state the tool has since changed —
@@ -12214,13 +12411,29 @@ fn consume_stream_event(
                 );
                 emit_live_claude_context_usage(inner, summary, &usage);
                 summary.last_request_usage = Some(usage.clone());
-                summary.usage = Some(usage);
+                apply_claude_request_usage(summary, next_message_id.as_deref(), inner, usage);
             }
+            summary.usage_diagnostic_current_request = observe_claude_usage_diagnostic(
+                summary,
+                segment,
+                inner,
+                "native_message_start_usage",
+                next_message_id.as_deref(),
+                event.pointer("/message/usage"),
+            );
             if let Some(message_id) = next_message_id {
                 segment.current_claude_message_id = Some(message_id);
             }
         }
         "message_delta" => {
+            let _ = observe_claude_usage_diagnostic(
+                summary,
+                segment,
+                inner,
+                "native_message_delta_usage",
+                segment.current_claude_message_id.as_deref(),
+                event.get("usage"),
+            );
             if let Some(usage) = parse_token_usage(event.get("usage")) {
                 trace_claude_usage_observed(
                     "stream_message_delta",
@@ -12229,7 +12442,12 @@ fn consume_stream_event(
                 );
                 emit_live_claude_context_usage(inner, summary, &usage);
                 summary.last_request_usage = Some(usage.clone());
-                summary.usage = Some(usage);
+                apply_claude_request_usage(
+                    summary,
+                    segment.current_claude_message_id.as_deref(),
+                    inner,
+                    usage,
+                );
             }
         }
         "content_block_start" => {
@@ -12897,6 +13115,342 @@ fn claude_current_context_usage(
 
 fn usage_value_u64(usage: &Value, key: &str) -> u64 {
     usage.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn replace_claude_request_usage(
+    total: Option<&Value>,
+    previous: Option<&Value>,
+    updated: &Value,
+) -> Option<Value> {
+    let Some(previous) = previous else {
+        return Some(add_token_usage(total, updated));
+    };
+    let mut remaining = total?.clone();
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_prompt_tokens",
+        "cache_creation_input_tokens",
+        "reasoning_tokens",
+    ] {
+        let value = remaining
+            .get(key)
+            .and_then(Value::as_u64)?
+            .checked_sub(previous.get(key).and_then(Value::as_u64)?)?;
+        remaining[key] = json!(value);
+    }
+    Some(add_token_usage(Some(&remaining), updated))
+}
+
+fn apply_claude_request_usage(
+    summary: &mut ClaudeStdoutSummary,
+    native_message_id: Option<&str>,
+    inner: &ClaudeInner,
+    updated: Value,
+) {
+    let closed = native_message_id.and_then(|id| {
+        summary
+            .closed_request_usage
+            .iter()
+            .position(|closed| closed.native_message_id == id)
+    });
+    let Some(index) = closed else {
+        summary.usage = Some(updated);
+        return;
+    };
+    let previous = summary.closed_request_usage[index].usage.request.clone();
+    if previous.as_ref() == Some(&updated) {
+        return;
+    }
+    let generation = summary.closed_request_usage[index].generation;
+    let reconcile = || -> Option<_> {
+        let recovered_request = usize::from(previous.is_none());
+        let unmeasured_request_count = summary
+            .unmeasured_request_count
+            .checked_sub(recovered_request)?;
+        let accumulated = replace_claude_request_usage(
+            summary.accumulated_request_usage.as_ref(),
+            previous.as_ref(),
+            &updated,
+        )?;
+        let before_generation = summary
+            .message_usage_generation
+            .is_some_and(|current| generation < current);
+        let (prefix, prefix_unmeasured_request_count) = if before_generation {
+            (
+                Some(replace_claude_request_usage(
+                    summary.message_usage_prefix.as_ref(),
+                    previous.as_ref(),
+                    &updated,
+                )?),
+                summary
+                    .message_usage_prefix_unmeasured_request_count
+                    .checked_sub(recovered_request)?,
+            )
+        } else {
+            (
+                summary.message_usage_prefix.clone(),
+                summary.message_usage_prefix_unmeasured_request_count,
+            )
+        };
+        let mut revisions = Vec::new();
+        for (position, closed) in summary.closed_request_usage.iter().enumerate().skip(index) {
+            if closed.generation != generation {
+                continue;
+            }
+            let mut usage = closed.usage.clone();
+            if position == index {
+                usage.request = Some(updated.clone());
+            }
+            // A native aggregate already includes late request measurements.
+            if usage.turn.is_some() && !closed.turn_is_native_aggregate {
+                usage.turn = Some(replace_claude_request_usage(
+                    usage.turn.as_ref(),
+                    previous.as_ref(),
+                    &updated,
+                )?);
+            }
+            revisions.push((position, usage));
+        }
+        Some((
+            accumulated,
+            unmeasured_request_count,
+            prefix,
+            prefix_unmeasured_request_count,
+            revisions,
+        ))
+    };
+    let Some((
+        accumulated,
+        unmeasured_request_count,
+        prefix,
+        prefix_unmeasured_request_count,
+        revisions,
+    )) = reconcile()
+    else {
+        tracing::error!("Claude late request usage cannot replace its closed measurement");
+        inner.emit_error("Claude reported inconsistent usage for a closed provider request.");
+        return;
+    };
+    summary.accumulated_request_usage = Some(accumulated);
+    summary.unmeasured_request_count = unmeasured_request_count;
+    summary.message_usage_prefix = prefix;
+    summary.message_usage_prefix_unmeasured_request_count = prefix_unmeasured_request_count;
+    inner.trace_usage_diagnostic("late_request_usage_reconciled", || {
+        json!({
+            "previous": claude_usage_diagnostic_fields(previous.as_ref()),
+            "updated": claude_usage_diagnostic_fields(Some(&updated)),
+            "original_generation": generation,
+            "revised_responses": revisions.len(),
+            "state": claude_usage_diagnostic_state(summary),
+        })
+    });
+    for (position, usage) in revisions {
+        let closed = &mut summary.closed_request_usage[position];
+        closed.usage = usage.clone();
+        inner
+            .emitter
+            .message_metadata_updated(protocol::MessageMetadataUpdateData {
+                message_id: closed.message_id.clone(),
+                model_info: None,
+                token_usage: claude_message_token_usage(usage),
+                context_breakdown: None,
+            });
+    }
+}
+
+fn claude_usage_diagnostic_fields(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return Value::Null;
+    };
+    let mut fields = serde_json::Map::new();
+    for path in [
+        "/input_tokens",
+        "/output_tokens",
+        "/total_tokens",
+        "/cached_prompt_tokens",
+        "/cache_read_input_tokens",
+        "/cache_creation_input_tokens",
+        "/reasoning_tokens",
+        "/context_window",
+        "/output_tokens_details/thinking_tokens",
+        "/cache_creation/ephemeral_1h_input_tokens",
+        "/cache_creation/ephemeral_5m_input_tokens",
+    ] {
+        if let Some(value) = usage.pointer(path) {
+            fields.insert(path[1..].to_owned(), json!(value.as_u64()));
+        }
+    }
+    Value::Object(fields)
+}
+
+fn claude_usage_diagnostic_state(summary: &ClaudeStdoutSummary) -> Value {
+    let carry = match summary.message_usage_carry.as_ref() {
+        Some(TokenUsageScope::Known { usage }) => json!({"known": usage}),
+        Some(TokenUsageScope::Unavailable { .. }) => json!({"unavailable": true}),
+        None => Value::Null,
+    };
+    json!({
+        "invocation_ordinal": summary.turn_id,
+        "request_ordinal": summary.usage_diagnostic_current_request,
+        "phase_ordinal": summary.emitted_phase_count,
+        "captured_generation": summary.message_usage_generation,
+        "request": claude_usage_diagnostic_fields(summary.usage.as_ref()),
+        "accumulated_requests": claude_usage_diagnostic_fields(summary.accumulated_request_usage.as_ref()),
+        "unmeasured_requests": summary.unmeasured_request_count,
+        "prefix": claude_usage_diagnostic_fields(summary.message_usage_prefix.as_ref()),
+        "prefix_unmeasured_requests": summary.message_usage_prefix_unmeasured_request_count,
+        "carry": carry,
+        "native_result": claude_usage_diagnostic_fields(summary.result_turn_usage.as_ref()),
+    })
+}
+
+fn observe_claude_usage_diagnostic(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &SegmentState,
+    inner: &ClaudeInner,
+    phase: &'static str,
+    native_message_id: Option<&str>,
+    raw: Option<&Value>,
+) -> Option<usize> {
+    if !tracing::enabled!(target: "tyde_claude_usage_diagnostic", tracing::Level::INFO) {
+        return None;
+    }
+    let ordinal = native_message_id.and_then(|id| {
+        if let Some(ordinal) = summary.usage_diagnostic_requests.get(id) {
+            Some(*ordinal)
+        } else if summary.usage_diagnostic_requests.len() < 32 {
+            let ordinal = summary.usage_diagnostic_requests.len();
+            summary
+                .usage_diagnostic_requests
+                .insert(id.to_owned(), ordinal);
+            Some(ordinal)
+        } else {
+            None
+        }
+    });
+    inner.trace_usage_diagnostic(phase, || {
+        json!({
+            "state": claude_usage_diagnostic_state(summary),
+            "observed_request_ordinal": ordinal,
+            "request_ordinal_limit_reached": summary.usage_diagnostic_requests.len() == 32,
+            "matches_current_request": native_message_id.is_some()
+                && native_message_id == segment.current_claude_message_id.as_deref(),
+            "already_closed_request": ordinal.is_some_and(|ordinal| {
+                summary.usage_diagnostic_closed_requests.contains(&ordinal)
+            }),
+            "raw": claude_usage_diagnostic_fields(raw),
+            "parsed": claude_usage_diagnostic_fields(parse_token_usage(raw).as_ref()),
+        })
+    });
+    ordinal
+}
+
+fn trace_claude_usage_reader_frame(inner: &ClaudeInner, value: &Value) {
+    let frame = match value.get("type").and_then(Value::as_str) {
+        Some("assistant") => Some(("assistant", value.pointer("/message/usage"))),
+        Some("result") => Some(("result", value.get("usage"))),
+        Some("control_request") => Some(("control_request", None)),
+        Some("stream_event") => match value.pointer("/event/type").and_then(Value::as_str) {
+            Some("message_start") => Some(("message_start", value.pointer("/event/message/usage"))),
+            Some("message_delta") => Some(("message_delta", value.pointer("/event/usage"))),
+            Some("message_stop") => Some(("message_stop", None)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((kind, raw)) = frame {
+        inner.trace_usage_diagnostic("reader_frame", || {
+            json!({
+                "kind": kind,
+                "child": extract_parent_tool_use_id(value).is_some(),
+                "raw": claude_usage_diagnostic_fields(raw),
+            })
+        });
+    }
+}
+
+fn align_claude_message_usage_generation(summary: &mut ClaudeStdoutSummary, inner: &ClaudeInner) {
+    let generation = inner
+        .message_usage_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if summary.message_usage_generation == Some(generation) {
+        return;
+    }
+    let previous_generation = summary.message_usage_generation;
+    if summary.message_usage_generation.is_some() {
+        summary.message_usage_prefix = summary.accumulated_request_usage.clone();
+        summary.message_usage_prefix_unmeasured_request_count = summary.unmeasured_request_count;
+        summary.message_usage_carry = None;
+        if summary.emitted_phase_count <= 8 {
+            eprintln!(
+                "Claude usage diagnostic: phase=working_generation_changed prior_requests_measured={}",
+                summary.message_usage_prefix.is_some()
+            );
+        }
+    }
+    summary.message_usage_generation = Some(generation);
+    inner.trace_usage_diagnostic("generation_prefix_captured", || {
+        json!({
+            "previous_generation": previous_generation,
+            "state": claude_usage_diagnostic_state(summary),
+        })
+    });
+}
+
+fn scope_claude_message_turn_usage(
+    summary: &ClaudeStdoutSummary,
+    total: Option<Value>,
+    inner: &ClaudeInner,
+) -> Option<Value> {
+    inner.trace_usage_diagnostic("scope_operands", || {
+        json!({
+            "state": claude_usage_diagnostic_state(summary),
+            "total_argument": claude_usage_diagnostic_fields(total.as_ref()),
+        })
+    });
+    if summary.message_usage_prefix_unmeasured_request_count != 0 {
+        return None;
+    }
+    let mut total = total?;
+    // The native result covers the whole invocation. Only its own measured
+    // requests before this emitted working generation have already been paid
+    // to earlier generations; preserve the full native result everywhere else.
+    if let Some(prefix) = summary.message_usage_prefix.as_ref() {
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_prompt_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_tokens",
+        ] {
+            let remaining = total
+                .get(key)
+                .and_then(Value::as_u64)
+                .zip(prefix.get(key).and_then(Value::as_u64))
+                .and_then(|(total, prefix)| total.checked_sub(prefix));
+            let Some(remaining) = remaining else {
+                tracing::error!(key, "Claude message usage cannot partition its native turn");
+                inner.emit_error("Claude reported inconsistent usage across working generations.");
+                return None;
+            };
+            total[key] = json!(remaining);
+        }
+    }
+    let scoped = match summary.message_usage_carry.as_ref() {
+        Some(TokenUsageScope::Known { usage }) => {
+            Some(add_token_usage(Some(&json!(usage)), &total))
+        }
+        Some(TokenUsageScope::Unavailable { .. }) => None,
+        None => Some(total),
+    };
+    inner.trace_usage_diagnostic(
+        "scope_output",
+        || json!({"scoped": claude_usage_diagnostic_fields(scoped.as_ref())}),
+    );
+    scoped
 }
 
 fn add_token_usage(accumulated: Option<&Value>, usage: &Value) -> Value {

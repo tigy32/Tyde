@@ -2229,6 +2229,7 @@ mod wasm_tests {
                 ("wrap", "a wrapped composing draft ".repeat(10)),
                 ("shrink", "short".to_owned()),
                 ("newline", "one\ntwo\nthree\nfour\nfive\nsix".to_owned()),
+                ("shrink", "short".to_owned()),
                 ("maxheight", "line\n".repeat(40)),
                 ("shrink", "short".to_owned()),
             ] {

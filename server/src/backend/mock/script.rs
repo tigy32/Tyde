@@ -318,6 +318,173 @@ impl MockTurn {
         Self::done(text_steps(text.into(), TextShape::default()))
     }
 
+    pub fn overlapping_usage(start: &MockGateHandle) -> Self {
+        let requests = [
+            protocol::TokenUsage {
+                input_tokens: 16_127,
+                output_tokens: 857,
+                total_tokens: 16_984,
+                cached_prompt_tokens: Some(0),
+                cache_creation_input_tokens: None,
+                reasoning_tokens: Some(321),
+            },
+            protocol::TokenUsage {
+                input_tokens: 7_918,
+                output_tokens: 7_266,
+                total_tokens: 15_184,
+                cached_prompt_tokens: Some(16_128),
+                cache_creation_input_tokens: None,
+                reasoning_tokens: Some(4_200),
+            },
+        ];
+        let turn_id = protocol::ModelTurnId(Uuid::new_v4().to_string());
+        let mut total = protocol::TokenUsage::default();
+        let mut steps = vec![
+            MockStep::Gate(start.gate()),
+            MockStep::emit(emit::typing(true)),
+        ];
+        let mut updates = Vec::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            total.input_tokens += request.input_tokens;
+            total.output_tokens += request.output_tokens;
+            total.total_tokens += request.total_tokens;
+            total.cached_prompt_tokens = Some(
+                total.cached_prompt_tokens.unwrap_or(0) + request.cached_prompt_tokens.unwrap_or(0),
+            );
+            total.reasoning_tokens =
+                Some(total.reasoning_tokens.unwrap_or(0) + request.reasoning_tokens.unwrap_or(0));
+            let message_id = ChatMessageId(Uuid::new_v4().to_string());
+            let usage = MessageTokenUsage::request_and_turn_known(request.clone(), total.clone());
+            steps.extend([
+                MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
+                MockStep::emit(emit::stream_delta(format!("usage response {}", index + 1))),
+                MockStep::emit(BackendEvent::ModelRequestTokenUsage(
+                    protocol::ModelRequestTokenUsage {
+                        request_id: protocol::ModelRequestId {
+                            turn_id: turn_id.clone(),
+                            sequence: index as u32 + 1,
+                        },
+                        request,
+                        turn: total.clone(),
+                        cumulative: total.clone(),
+                        model_context_window: None,
+                        current_context_usage: None,
+                        estimated_context_breakdown: None,
+                    },
+                )),
+                MockStep::emit(emit::stream_end(protocol::ChatMessage {
+                    token_usage: Some(usage.clone()),
+                    ..emit::mock_assistant_message(
+                        Some(message_id.clone()),
+                        format!("usage response {}", index + 1),
+                    )
+                })),
+            ]);
+            updates.push(MessageMetadataUpdateData {
+                message_id,
+                model_info: None,
+                token_usage: Some(usage),
+                context_breakdown: None,
+            });
+        }
+        // Repeat the latest snapshot, then deliver an older response's metadata
+        // after idle. Neither changes the generation's measured total.
+        steps.push(MockStep::emit(emit::metadata_update(updates[1].clone())));
+        steps.push(MockStep::emit(emit::typing(false)));
+        steps.push(MockStep::emit(emit::metadata_update(updates[0].clone())));
+        Self::done(steps)
+    }
+
+    pub fn generation_usage_coverage(checkpoint: &MockGateHandle) -> Self {
+        let measured = |count| {
+            let usage = emit::mock_turn_token_usage();
+            protocol::TokenUsage {
+                input_tokens: usage.input_tokens * count,
+                output_tokens: usage.output_tokens * count,
+                total_tokens: usage.total_tokens * count,
+                cached_prompt_tokens: usage.cached_prompt_tokens.map(|value| value * count),
+                cache_creation_input_tokens: usage
+                    .cache_creation_input_tokens
+                    .map(|value| value * count),
+                reasoning_tokens: usage.reasoning_tokens.map(|value| value * count),
+            }
+        };
+        let missing_optionals = |mut usage: protocol::TokenUsage| {
+            usage.cached_prompt_tokens = None;
+            usage.cache_creation_input_tokens = None;
+            usage.reasoning_tokens = None;
+            usage
+        };
+        let unavailable = || {
+            MessageTokenUsage::unavailable(
+                protocol::TokenUsageUnavailableReason::BackendDidNotReport,
+            )
+        };
+        let ids = (0..4)
+            .map(|_| ChatMessageId(Uuid::new_v4().to_string()))
+            .collect::<Vec<_>>();
+        let metadata = |index: usize, usage| {
+            MockStep::emit(emit::metadata_update(MessageMetadataUpdateData {
+                message_id: ids[index].clone(),
+                model_info: None,
+                token_usage: Some(usage),
+                context_breakdown: None,
+            }))
+        };
+        let mut steps = vec![MockStep::emit(emit::typing(true))];
+        for (index, usage) in [
+            unavailable(),
+            MessageTokenUsage::request_and_turn_known(measured(1), missing_optionals(measured(2))),
+            unavailable(),
+            MessageTokenUsage::request_known(missing_optionals(measured(1))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            steps.extend([
+                MockStep::emit(emit::stream_start("mock", Some(MOCK_MODEL.to_owned()))),
+                MockStep::emit(emit::stream_delta(format!(
+                    "coverage response {}",
+                    index + 1
+                ))),
+                MockStep::emit(emit::stream_end(protocol::ChatMessage {
+                    token_usage: Some(usage),
+                    ..emit::mock_assistant_message(
+                        Some(ids[index].clone()),
+                        format!("coverage response {}", index + 1),
+                    )
+                })),
+            ]);
+            if index == 1 {
+                steps.extend([
+                    MockStep::Gate(checkpoint.gate()),
+                    metadata(
+                        1,
+                        MessageTokenUsage::request_and_turn_known(measured(1), measured(2)),
+                    ),
+                    metadata(
+                        0,
+                        MessageTokenUsage::request_and_turn_known(
+                            measured(1),
+                            missing_optionals(measured(1)),
+                        ),
+                    ),
+                    metadata(0, unavailable()),
+                    MockStep::Gate(checkpoint.gate()),
+                ]);
+            }
+        }
+        steps.extend([
+            MockStep::Gate(checkpoint.gate()),
+            metadata(
+                3,
+                MessageTokenUsage::request_and_turn_known(measured(1), measured(4)),
+            ),
+            MockStep::emit(emit::typing(false)),
+        ]);
+        Self::done(steps)
+    }
+
     pub fn gated_text_for_input(
         text: impl Into<String>,
         required: impl Into<String>,
