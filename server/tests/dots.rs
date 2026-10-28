@@ -8,14 +8,24 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 async fn snapshot(
     fixture: &mut Fixture,
+    context: &str,
     status: impl Fn(&DotsConnectionStatus) -> bool,
 ) -> DotsStatePayload {
+    eprintln!("Dots check: waiting for {context}");
     fixture
-        .next_frame_matching("Dots connection state", |event| {
+        .next_frame_matching(context, |event| {
             event.kind == FrameKind::DotsState
                 && event
                     .parse_payload::<DotsStatePayload>()
-                    .is_ok_and(|state| status(&state.status))
+                    .is_ok_and(|state| {
+                        eprintln!("Dots check: context={context} status={:?}", state.status);
+                        let matched = status(&state.status);
+                        assert!(
+                            matched || !matches!(state.status, DotsConnectionStatus::Failed { .. }),
+                            "Dots check received a terminal connection failure waiting for {context}"
+                        );
+                        matched
+                    })
         })
         .await
         .parse_payload()
@@ -104,7 +114,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .replace_setting("/chatgpt_dots_enabled", true, false)
         .await
         .expect("enable through real protocol");
-    let original_pairing = snapshot(&mut fixture, |status| {
+    let original_pairing = snapshot(&mut fixture, "initial pairing", |status| {
         matches!(status, DotsConnectionStatus::AwaitingPairing)
     })
     .await;
@@ -117,7 +127,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .dots_command(DotsCommandPayload::Retry)
         .await
         .unwrap();
-    let pairing = snapshot(&mut fixture, |status| {
+    let pairing = snapshot(&mut fixture, "replacement pairing", |status| {
         matches!(status, DotsConnectionStatus::AwaitingPairing)
     })
     .await;
@@ -240,7 +250,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     let token = tokens["access_token"]
         .as_str()
         .expect("OAuth access token present");
-    let connected = snapshot(&mut fixture, |status| {
+    let connected = snapshot(&mut fixture, "paired connection", |status| {
         matches!(status, DotsConnectionStatus::Connected)
     })
     .await;
@@ -267,7 +277,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     let (mut replacement_socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("Host owner can replace the real service connection");
-    snapshot(&mut fixture, |status| {
+    snapshot(&mut fixture, "replaced host connection failure", |status| {
         matches!(status, DotsConnectionStatus::Failed { .. })
     })
     .await;
@@ -277,7 +287,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .dots_command(DotsCommandPayload::Retry)
         .await
         .unwrap();
-    snapshot(&mut fixture, |status| {
+    snapshot(&mut fixture, "retried connection", |status| {
         matches!(status, DotsConnectionStatus::Connected)
     })
     .await;
@@ -756,6 +766,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         "The remote wait is pending before disabling the integration"
     );
     configuration_gate.send_replace(false);
+    eprintln!("Dots check: phase=commit-disable-with-transport-held");
     let disabled_write = fixture
         .client
         .replace_setting("/chatgpt_dots_enabled", false, true)
@@ -793,10 +804,11 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     )
     .await;
     configuration_gate.send_replace(true);
-    snapshot(&mut fixture, |status| {
+    snapshot(&mut fixture, "disabled connection", |status| {
         matches!(status, DotsConnectionStatus::Disabled)
     })
     .await;
+    eprintln!("Dots check: phase=await-disconnected-request");
     let disconnected_wait = disconnected_wait.await.expect("Disconnected wait response");
     assert!(
         disconnected_wait.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -820,7 +832,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .replace_setting("/chatgpt_dots_enabled", true, false)
         .await
         .unwrap();
-    snapshot(&mut fixture, |status| {
+    snapshot(&mut fixture, "reenabled connection", |status| {
         matches!(status, DotsConnectionStatus::Connected)
     })
     .await;
@@ -829,7 +841,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .dots_command(DotsCommandPayload::Disconnect)
         .await
         .unwrap();
-    snapshot(&mut fixture, |status| {
+    snapshot(&mut fixture, "revoked pairing", |status| {
         matches!(status, DotsConnectionStatus::AwaitingPairing)
     })
     .await;

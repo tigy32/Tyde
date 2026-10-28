@@ -2078,6 +2078,50 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    #[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+        export async function settle_reply_cards(root, phase, expectedText) {
+            console.log('Reply layout awaiting DOM', phase);
+            await new Promise(resolve => {
+                const ready = () => root.textContent.includes(expectedText)
+                    && root.querySelectorAll('.chat-card-assistant').length === 2
+                    && (phase !== 'completed' || !root.querySelector('.chat-card-streaming'));
+                const observer = new MutationObserver(() => {
+                    if (ready()) {
+                        observer.disconnect();
+                        resolve();
+                    }
+                });
+                observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
+                if (ready()) {
+                    observer.disconnect();
+                    resolve();
+                }
+            });
+            const cards = [...root.querySelectorAll('.chat-card-assistant')];
+            const animations = cards.flatMap(card => {
+                const style = getComputedStyle(card);
+                const rect = card.getBoundingClientRect();
+                const row = card.parentElement.getBoundingClientRect();
+                const entering = card.getAnimations().filter(animation => animation.animationName === 'card-enter');
+                console.log('Reply layout', phase, JSON.stringify({
+                    top: rect.top, bottom: rect.bottom, rowTop: row.top, rowBottom: row.bottom,
+                    transform: style.transform,
+                    animations: entering.map(animation => ({ state: animation.playState, time: animation.currentTime }))
+                }));
+                return entering;
+            });
+            await Promise.all(animations.map(animation => animation.finished));
+        }
+    ")]
+    extern "C" {
+        #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+        async fn settle_reply_cards(
+            root: &web_sys::HtmlElement,
+            phase: &str,
+            expected_text: &str,
+        ) -> Result<JsValue, JsValue>;
+    }
+
     const PROD_STYLES: &str = include_str!("../../styles.css");
 
     /// Inject the production CSS into the test document so flex/scroll
@@ -2537,14 +2581,11 @@ mod wasm_tests {
             model: Some("claude-test".to_owned()),
         }));
 
-        async fn settle_layout() {
-            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-                web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 200)
-                    .unwrap();
-            });
-            wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        async fn settle_layout(container: &HtmlElement, phase: &str, expected_text: &str) {
+            leptos::task::tick().await;
+            settle_reply_cards(container, phase, expected_text)
+                .await
+                .expect("reply entrance animations complete");
         }
 
         let measure_gap = |phase: &str| {
@@ -2564,7 +2605,7 @@ mod wasm_tests {
             gap
         };
 
-        settle_layout().await;
+        settle_layout(&container, "thinking", "Thinking\u{2026}").await;
         assert!(
             container
                 .text_content()
@@ -2575,7 +2616,7 @@ mod wasm_tests {
         dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
             text: "The reply is arriving".to_owned(),
         }));
-        settle_layout().await;
+        settle_layout(&container, "streaming", "The reply is arriving").await;
         assert!(
             container
                 .text_content()
@@ -2586,7 +2627,12 @@ mod wasm_tests {
         dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
             text: " and is now complete.".to_owned(),
         }));
-        settle_layout().await;
+        settle_layout(
+            &container,
+            "last delta",
+            "The reply is arriving and is now complete.",
+        )
+        .await;
         measure_gap("last delta");
         let mut completed = mk_user_msg("The reply is arriving and is now complete.").message;
         completed.sender = MessageSender::Assistant {
@@ -2595,7 +2641,12 @@ mod wasm_tests {
         dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
             message: completed,
         }));
-        settle_layout().await;
+        settle_layout(
+            &container,
+            "completed",
+            "The reply is arriving and is now complete.",
+        )
+        .await;
         assert!(query(&container, ".chat-card-streaming").is_none());
         let completed_gap = measure_gap("completed");
         assert!((thinking_gap - completed_gap).abs() < 0.5);

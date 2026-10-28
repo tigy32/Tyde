@@ -474,7 +474,11 @@ pub async fn report_frontend_lifecycle(event: &'static str) -> Result<(), String
 }
 
 pub async fn submit_ui_debug_response(request: SubmitUiDebugResponseRequest) -> Result<(), String> {
-    let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
+    // Keep nulls defined for IPC without changing map transport: object-map
+    // serialization assigns __proto__ instead of preserving it as a JSON key.
+    let args = request
+        .serialize(&serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true))
+        .map_err(|error| error.to_string())?;
     tauri_invoke("submit_ui_debug_response", args)
         .await
         .map_err(|e| format!("{e:?}"))?;

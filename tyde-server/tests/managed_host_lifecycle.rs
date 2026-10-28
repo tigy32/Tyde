@@ -349,6 +349,7 @@ fn managed_stop_refuses_a_reused_foreign_pid() {
 async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
     for signal in ["-TERM", "-INT"] {
         let home = ManagedHome::install();
+        eprintln!("Stdio signal check: signal={signal} phase=spawn");
         let log_path = home.path().join("stdio.log");
         let log = std::fs::File::create(&log_path).expect("stdio diagnostics");
         let mut child = tokio::process::Command::new(home.managed_bin())
@@ -378,6 +379,7 @@ async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
         write_envelope(&mut writer, &hello)
             .await
             .expect("send stdio hello");
+        eprintln!("Stdio signal check: signal={signal} phase=await-welcome");
         // The gate hit the client's ten-second startup timeout. This signal test
         // waits for protocol readiness and exit; the per-test watchdog bounds hangs.
         let response = read_envelope(&mut reader)
@@ -392,12 +394,14 @@ async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
         let welcome: WelcomePayload = response.parse_payload().expect("valid stdio welcome");
         assert_eq!(welcome.protocol_version, PROTOCOL_VERSION);
         assert_eq!(welcome.tyde_version, TYDE_VERSION);
+        eprintln!("Stdio signal check: signal={signal} phase=send-signal");
         let sent = tokio::process::Command::new("kill")
             .args([signal, &child.id().expect("owned host pid").to_string()])
             .status()
             .await
             .expect("signal owned stdio host");
         assert!(sent.success());
+        eprintln!("Stdio signal check: signal={signal} phase=await-exit-with-stdin-open");
         let exited = child.wait().await.expect("reap stdio host");
         let graceful_finished = std::fs::read_to_string(&log_path)
             .expect("read stdio diagnostics")
@@ -411,5 +415,6 @@ async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
             exited.success(),
             "signal must finish production shutdown, not terminate the host abruptly"
         );
+        eprintln!("Stdio signal check: signal={signal} phase=complete");
     }
 }
