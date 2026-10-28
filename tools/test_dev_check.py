@@ -4043,6 +4043,7 @@ class WasmToolScriptTests(unittest.TestCase):
             # The installed launcher uses the canonical TCP endpoint; the real
             # boundary fixture explicitly uses its own UDS instead.
             settings["SCCACHE_SERVER_PORT"] = "4226"
+            settings["SCCACHE_SERVER_TMPDIR"] = str(directory / "daemon-tmp")
             settings["SCCACHE_EXECUTABLE"] = sccache
             settings["RUSTC_WRAPPER"] = str(wrapper)
             (cargo_home / "sccache-env").write_text("".join(
@@ -4146,10 +4147,14 @@ class WasmToolScriptTests(unittest.TestCase):
                 self.assertEqual(data["cache_location"], f'Local disk: "{directory / "cache"}"')
                 return data["stats"]
 
-            private_env = fixtures[0][2]
-            subprocess.run([sccache, "--start-server"], env=private_env,
+            caller_tmp = directory / "disposable-caller-tmp"
+            caller_tmp.mkdir()
+            private_env = dict(fixtures[0][2], TMPDIR=str(caller_tmp))
+            subprocess.run([str(wrapper), "--start-server"], env=private_env,
                            text=True, capture_output=True, check=True)
             try:
+                # A daemon must keep compiling after its caller is cleaned up.
+                shutil.rmtree(caller_tmp)
                 legacy_first = run_checkout(fixtures[0], 1, legacy=True)
                 legacy_second = run_checkout(fixtures[1], 1, legacy=True)
                 legacy_hits = (legacy_second["cache_hits"]["counts"].get("Rust", 0)
@@ -4179,7 +4184,7 @@ class WasmToolScriptTests(unittest.TestCase):
                 print(f"WASM_CARGO_CACHE second-checkout legacy hits={legacy_hits} misses={legacy_misses}; "
                       f"CLI hits={hits} misses={misses}; source-change misses=4", flush=True)
             finally:
-                subprocess.run([sccache, "--stop-server"], env=private_env,
+                subprocess.run([str(wrapper), "--stop-server"], env=private_env,
                                text=True, capture_output=True, check=True)
 
     def test_canonical_run_adds_no_filter_skip_or_shard_arguments(self) -> None:

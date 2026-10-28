@@ -19,6 +19,7 @@ export SCCACHE_CONF="/absolute/config/sccache/config.toml"
 export SCCACHE_DIR="/absolute/shared/compiler-cache"
 export SCCACHE_CACHE_SIZE="1000G"
 export SCCACHE_SERVER_PORT="36897"
+export SCCACHE_SERVER_TMPDIR="/absolute/host-owned/sccache-tmp"
 export SCCACHE_IDLE_TIMEOUT="600"
 ```
 
@@ -29,6 +30,15 @@ settings take precedence over its disk settings. The installed launcher
 clears inherited `SCCACHE_*` settings before loading this file, so an old
 shell or caller cannot silently select a different cache. It never retries
 with a different cache or without the wrapper.
+
+`SCCACHE_SERVER_TMPDIR` is an absolute, durable host-owned directory. Keep
+its path short enough for sccache's startup Unix socket. The launcher creates
+it and pins `TMPDIR` before every sccache invocation: a shared daemon keeps
+its startup environment even after its caller exits. Never put this directory
+under a disposable dev-instance, workbench, or QA runtime, and never remove
+it while the daemon is alive. An environment-only reference to `TMPDIR` is a
+live resource dependency even when no file descriptor, mapping, or cwd points
+there. Missing or invalid configuration fails; caller scratch is not used.
 
 Ordinary Cargo, Trunk, and dev-instance builds use Cargo's global wrapper.
 The launcher finds its configuration relative to its installed location,
@@ -57,6 +67,14 @@ New builds immediately join its existing writer. Already-running compiler
 clients may finish on their original endpoint. Retain old cache contents
 and leave old daemons alone while any existing clients may still use them.
 Changing capacity later requires all host builds to finish first.
+
+The same rule applies when repairing a daemon started with disposable
+`TMPDIR`: first install the corrected launcher and durable temp setting,
+then let every host build finish before stopping the exact configured daemon.
+Restart through that launcher with the existing directory, endpoint and cap;
+verify the new daemon's startup `TMPDIR` before resuming the canonical gate.
+Do not recreate deleted caller scratch, switch caches, or stop a daemon
+underneath healthy builds. Checks never perform this operational recovery.
 
 On the development host, migration reused the populated 1000 GiB writer on
 port 36897 in place. Its historical repository-hashed directory is now an

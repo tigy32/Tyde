@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use leptos::leptos_dom::helpers::{
     AnimationFrameRequestHandle, request_animation_frame_with_handle,
@@ -155,12 +156,16 @@ fn render_swarm_row(state: AppState, swarm_ref: SidebarSwarmRef) -> AnyView {
             on:click=open
         >
             <div class="agent-card-top">
-                <span class="agent-card-name">
-                    {move || swarm.with(|s| s.as_ref().map(|s| format!("Swarm: {}", s.name)))}
-                </span>
-                <span class=move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).1).unwrap_or("agent-card-status"))>
-                    {move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).0))}
-                </span>
+                <span class="agent-card-disclosure-spacer" aria-hidden="true"></span>
+                <span class="agent-card-activity-spacer" aria-hidden="true"></span>
+                <div class="agent-card-top-main">
+                    <span class="agent-card-name">
+                        {move || swarm.with(|s| s.as_ref().map(|s| format!("Swarm: {}", s.name)))}
+                    </span>
+                    <span class=move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).1).unwrap_or("agent-card-status"))>
+                        {move || swarm.with(|s| s.as_ref().map(|s| swarm_row_status(s).0))}
+                    </span>
+                </div>
             </div>
             <div class="agent-card-bottom">
                 <span class="agent-sidebar-swarm-counts">
@@ -536,12 +541,6 @@ struct AgentTreeGroup {
     children: Vec<AgentTreeGroup>,
 }
 
-impl AgentTreeGroup {
-    fn member_count(&self) -> usize {
-        1 + self.children.iter().map(Self::member_count).sum::<usize>()
-    }
-}
-
 /// A swarm shown as one summary row in the project its members run in, in
 /// place of the member rows the Agents list hides.
 #[derive(Clone, Debug, PartialEq)]
@@ -562,13 +561,42 @@ struct AgentProjectSection {
 }
 
 impl AgentProjectSection {
+    /// Top-level rows only; nested agents count on their parent's row.
     fn row_count(&self) -> usize {
-        self.swarms.len()
-            + self
-                .groups
-                .iter()
-                .map(AgentTreeGroup::member_count)
-                .sum::<usize>()
+        self.folder_count().rows()
+    }
+
+    fn folder_count(&self) -> FolderCount {
+        FolderCount {
+            agents: self.groups.len(),
+            swarms: self.swarms.len(),
+        }
+    }
+}
+
+/// A folder's top-level rows by kind: the visible "(N)" is their sum and
+/// assistive tech hears the same rows named, e.g. "1 agent, 1 swarm".
+#[derive(Clone, Copy)]
+struct FolderCount {
+    agents: usize,
+    swarms: usize,
+}
+
+impl FolderCount {
+    fn rows(self) -> usize {
+        self.agents + self.swarms
+    }
+
+    fn spoken(self) -> String {
+        [(self.agents, "agent"), (self.swarms, "swarm")]
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, noun)| match count {
+                1 => format!("1 {noun}"),
+                count => format!("{count} {noun}s"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1327,20 +1355,31 @@ fn load_collapsed_folders() -> HashSet<String> {
     HashSet::new()
 }
 
+static NEXT_FOLDER_COUNT_ID: AtomicUsize = AtomicUsize::new(1);
+
 fn folder_toggle(
     collapsed: RwSignal<HashSet<String>>,
     key: String,
     label: String,
     display_label: String,
-    count: usize,
+    folder_count: FolderCount,
 ) -> impl IntoView {
+    let count = folder_count.rows();
     let toggle_key = key.clone();
     let expanded = Memo::new(move |_| !collapsed.with(|folders| folders.contains(&key)));
+    let count_id = (count > 0).then(|| {
+        format!(
+            "agent-folder-count-{}",
+            NEXT_FOLDER_COUNT_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+    let described_by = count_id.clone();
     view! {
         <button
             type="button"
             class="agent-folder-toggle"
             aria-label=label.clone()
+            aria-describedby=described_by
             title=label.clone()
             aria-expanded=move || expanded.get().to_string()
             on:keydown=move |ev: web_sys::KeyboardEvent| ev.stop_propagation()
@@ -1359,16 +1398,22 @@ fn folder_toggle(
                 }
             }
         >
-            <svg class="agent-folder-chevron" class:expanded=move || expanded.get()
-                width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <path d="m6 3 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <svg class="agent-folder-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7h18" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
-            </svg>
+            {disclosure_chevron(move || expanded.get())}
             <span class="agent-folder-label">{display_label}</span>
-            {(count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{count}</span> })}
+            {(count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{format!("({count})")}</span> })}
+            {count_id.map(|id| view! {
+                <span id=id hidden>{folder_count.spoken()}</span>
+            })}
         </button>
+    }
+}
+
+fn disclosure_chevron(expanded: impl Fn() -> bool + Send + Sync + 'static) -> impl IntoView {
+    view! {
+        <svg class="agent-folder-chevron" class:expanded=expanded
+            width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="m6 3 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
     }
 }
 
@@ -1946,17 +1991,23 @@ pub fn AgentsPanel() -> impl IntoView {
                 }
             }>
             <div class="panel-search">
-                <input
-                    type="text"
-                    class="panel-search-input"
-                    placeholder="Filter agents..."
-                    prop:value=search
-                    on:input=on_search
-                    spellcheck="false"
-                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
-                    autocapitalize="none"
-                    autocomplete="off"
-                />
+                <div class="agents-search-field">
+                    <svg class="agents-search-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5" />
+                        <path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    </svg>
+                    <input
+                        type="text"
+                        class="panel-search-input"
+                        placeholder="Filter agents..."
+                        prop:value=search
+                        on:input=on_search
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
+                    />
+                </div>
                 <button type="button" class="agents-new-button" title="New agent" aria-label="New agent"
                     on:click=move |_| {
                         launch_target.set(
@@ -1965,7 +2016,11 @@ pub fn AgentsPanel() -> impl IntoView {
                                 .map(LaunchDestination::Project),
                         );
                         launch_open.set(true);
-                    }><span aria-hidden="true">"+"</span><span class="agents-new-label">"New agent"</span></button>
+                    }>
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M8 2.5v11M2.5 8h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    </svg>
+                </button>
             </div>
             <details class="agents-filter-menu" on:keydown=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
@@ -1979,7 +2034,11 @@ pub fn AgentsPanel() -> impl IntoView {
                     }
                 }
             }>
-                <summary aria-label="Filter agents" title="Filter agents">"▽"</summary>
+                <summary aria-label="Filter agents" title="Filter agents">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M2.5 3h11l-4.25 5v4.5l-2.5 1.25V8z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                    </svg>
+                </summary>
                 <div class="panel-filters">
                     <label class="agents-filter-option settings-toggle">
                         <span>"Hide inactive"</span>
@@ -2046,7 +2105,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                             let group_id = custom_group.group.id.clone();
                                             let group_id_attr = group_id.0.clone();
                                             let folder_key = format!("group:{}", group_id.0);
-                                            let member_count = custom_group.groups.iter().map(|group| group.member_count()).sum();
+                                            let member_count = FolderCount { agents: custom_group.groups.len(), swarms: 0 };
                                             let group_name = custom_group.group.name.clone();
                                             let header_group_id = group_id.clone();
                                             let hover_class_group_id = group_id.clone();
@@ -2241,7 +2300,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 let no_project_host = host_id_for_projects.clone();
                                                 let no_project_host_label = host_label_for_projects.clone();
                                                 let folder_key = format!("project:{}", project.key);
-                                                let member_count = project.row_count();
+                                                let member_count = project.folder_count();
                                                 let editor = state.project_editor;
                                                 let target = project.project.clone();
                                                 let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
@@ -2250,16 +2309,15 @@ pub fn AgentsPanel() -> impl IntoView {
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key.clone()>
                                                         <div class="agent-sidebar-project-header">
                                                             {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
-                                                            {(member_count > 0).then(|| view! { <span class="project-heading-count" aria-label=format!("{member_count} agents")>{member_count}</span> })}
                                                             {match target {
                                                                 Some(target) => view! {
+                                                                    <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
+                                                                        on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
                                                                     <ProjectNewAgent
-                                                                        destination=LaunchDestination::Project(target.clone())
+                                                                        destination=LaunchDestination::Project(target)
                                                                         name=format!("New agent in {}", project.label)
                                                                         launch=launch
                                                                     />
-                                                                    <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
-                                                                        on:click=move |_| editor.set(Some(target.clone()))>"⋯"</button>
                                                                 }.into_any(),
                                                                 None => view! {
                                                                     <ProjectNewAgent
@@ -2367,7 +2425,7 @@ fn project_members(
             groups = remaining;
             let (member_swarms, remaining): (Vec<_>, Vec<_>) = swarms.drain(..).partition(|swarm| swarm.project_id == target.project_id);
             swarms = remaining;
-            let count = members.iter().map(AgentTreeGroup::member_count).sum::<usize>() + member_swarms.len();
+            let count = FolderCount { agents: members.len(), swarms: member_swarms.len() };
             let folder_key = format!("workbench:{}:{}", target.host_id, target.project_id.0);
             let label = workbench.project.name.clone();
             let edit_label = format!("Edit project {label}");
@@ -2376,10 +2434,9 @@ fn project_members(
                 <section class="agent-sidebar-workbench-section" data-project-id=target.project_id.0.clone()>
                     <div class="agent-sidebar-project-header agent-sidebar-workbench">
                         {folder_toggle(collapsed, folder_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
-                        {(count > 0).then(|| view! { <span class="project-heading-count">{count}</span> })}
-                        <ProjectNewAgent destination=LaunchDestination::Project(target.clone()) name=format!("New agent in {label}") launch=launch />
                         <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
                             on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
+                        <ProjectNewAgent destination=LaunchDestination::Project(target.clone()) name=format!("New agent in {label}") launch=launch />
                     </div>
                     {folder_members(state.clone(), member_swarms, members, interactions.clone(), collapsed, folder_key)}
                 </section>
@@ -2432,33 +2489,7 @@ fn render_agent_tree_group(
     };
     let child_count = children.len();
     let parent_ref_host = parent.host_id.clone();
-    let parent_view = agent_card(
-        state.clone(),
-        parent,
-        child_count,
-        running,
-        interactions.clone(),
-    );
-    let related = {
-        fn refs(tree: &AgentTreeGroup, items: &mut Vec<SidebarAgentRef>) {
-            items.push(agent_ref(&tree.parent));
-            for child in &tree.children {
-                refs(child, items);
-            }
-        }
-        let mut items = vec![parent_ref.clone()];
-        for child in &children {
-            refs(child, &mut items);
-        }
-        let active = state.active_agent;
-        Memo::new(move |_| {
-            active.get().is_some_and(|selected| {
-                items.iter().any(|item| {
-                    item.host_id == selected.host_id && item.agent_id == selected.agent_id
-                })
-            })
-        })
-    };
+    let parent_view = agent_card(state.clone(), parent, child_count, interactions.clone());
     let children_view = children
         .into_iter()
         .map(|child| {
@@ -2488,16 +2519,18 @@ fn render_agent_tree_group(
     let inactive_button = (child_count > 0).then(|| view! {
         <button class="agent-show-inactive" style=move || if has_inactive.get() { "" } else { "display:none" } aria-expanded=move || inactive_expanded.get().to_string()
             on:click=move |_| inactive_parents.update(|set| { if !set.remove(&toggle_parent) { set.insert(toggle_parent.clone()); } })>
-            {move || format!("{} {} inactive", if inactive_expanded.get() { "Hide" } else { "Show" }, child_count - running.get())}
+            <span class="agent-card-disclosure-slot">{disclosure_chevron(move || inactive_expanded.get())}</span>
+            <span class="agent-show-inactive-label">{move || format!("{} inactive", child_count - running.get())}</span>
         </button>
     });
     view! {
-        <div class="agent-card-group" data-host-id=parent_ref_host data-agent-id=group_id data-related=move || related.get().to_string()>
+        <div class="agent-card-group" data-host-id=parent_ref_host data-agent-id=group_id>
             {parent_view}
             {children_view}
             {inactive_button}
         </div>
-    }.into_any()
+    }
+    .into_any()
 }
 
 /// Switch the active project (and host) to the project the clicked agent
@@ -2575,7 +2608,6 @@ fn agent_card(
     state: AppState,
     agent: AgentInfo,
     child_count: usize,
-    running: Memo<usize>,
     interactions: AgentsPanelInteractions,
 ) -> AnyView {
     #[cfg(all(test, target_arch = "wasm32"))]
@@ -2881,8 +2913,7 @@ fn agent_card(
 
     let edit_ref_for_block = agent_ref(&agent);
     let card_anchor = NodeRef::<leptos::html::Div>::new();
-    // The row is one line. Its actions live in one menu, reached by right-click
-    // or by the row's `⋯` button; nothing opens on hover or inside the row.
+    // Right-click and the row's `⋯` button open the same actions menu.
     let card_menu: CardMenuPosition = RwSignal::new(None);
     let menu_rename = on_rename;
     let menu_close = on_close;
@@ -2950,7 +2981,7 @@ fn agent_card(
             on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
         >
             <div class="agent-card-top">
-                {(child_count > 0).then(|| {
+                {if child_count > 0 {
                     let parent_ref = agent_ref(&agent);
                     let expanded_ref = parent_ref.clone();
                     view! {
@@ -2963,28 +2994,15 @@ fn agent_card(
                             }
                             on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
                         >
-                            <span aria-hidden="true">{move || if expanded_parents.with(|set| set.contains(&agent_ref_for_disclosure)) { "▾" } else { "▸" }}</span>
+                            {disclosure_chevron(move || expanded_parents.with(|set| set.contains(&agent_ref_for_disclosure)))}
                         </button>
-                    }
-                })}
-                <span
-                    class=move || {
-                        if status_label_visible_sig() {
-                            format!("{} agent-card-status-labelled", status_class_sig())
-                        } else {
-                            status_class_sig().to_string()
-                        }
-                    }
-                    title=status_title_sig
-                >
+                    }.into_any()
+                } else {
+                    view! { <span class="agent-card-disclosure-spacer" aria-hidden="true"></span> }.into_any()
+                }}
+                <span class=status_class_sig title=status_title_sig>
                     <span aria-hidden="true">{status_icon_sig}</span>
-                    <span class=move || {
-                        if status_label_visible_sig() {
-                            "agent-card-status-text"
-                        } else {
-                            "visually-hidden"
-                        }
-                    }>{status_label_sig}</span>
+                    <span class="visually-hidden">{status_label_sig}</span>
                 </span>
                 <div class="agent-card-top-main">
                 {move || {
@@ -3072,9 +3090,46 @@ fn agent_card(
                     }
                 }}
                 {(child_count > 0).then(|| view! {
-                    <span class="agent-card-child-count">{move || format!("{} running", running.get())}</span>
+                    <span class="agent-card-child-count">{format!("({child_count})")}</span>
+                })}
+                {move || status_label_visible_sig().then(|| view! {
+                    <span class="agent-card-status-text" aria-hidden="true">{status_label_sig}</span>
                 })}
                 </div>
+                <span class="agent-card-tools-anchor">
+                    <span class="agent-card-tools">
+                    <button
+                        type="button"
+                        class="agent-card-pin"
+                        class:pinned=move || is_pinned.get()
+                        aria-pressed=move || is_pinned.get().to_string()
+                        aria-label=move || if is_pinned.get() { "Unpin chat" } else { "Pin chat" }
+                        title=move || if is_pinned.get() { "Unpin chat" } else { "Pin chat" }
+                        on:click=toggle_pin
+                        on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                        on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
+                    >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="m16 3 5 5-4 1-3 5v3l-3-3-6 6-1-1 6-6-3-3h3l5-3z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                    </button>
+                    <span class="agent-backend-glyph" role="img" aria-label=backend_label(backend) title=backend_label(backend)>
+                        {crate::components::launch_menu::backend_icon(backend)}
+                    </span>
+                    <button
+                        type="button"
+                        class="agent-card-actions"
+                        aria-haspopup="menu"
+                        aria-expanded=move || card_menu.get().is_some().to_string()
+                        title="Agent actions"
+                        aria-label="Agent actions"
+                        on:click=move |ev: web_sys::MouseEvent| open_card_menu_below(card_menu, &ev)
+                        on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                    >
+                        "⋯"
+                    </button>
+                    </span>
+                </span>
                 <Show when=move || is_pinned.get()>
                     {move || match pin_host_label.get() {
                         Some(label) => {
@@ -3097,37 +3152,6 @@ fn agent_card(
                         }
                     }}
                 </Show>
-                <button
-                    type="button"
-                    class="agent-card-pin"
-                    class:pinned=move || is_pinned.get()
-                    aria-pressed=move || is_pinned.get().to_string()
-                    aria-label=move || if is_pinned.get() { "Unpin chat" } else { "Pin chat" }
-                    title=move || if is_pinned.get() { "Unpin chat" } else { "Pin chat" }
-                    on:click=toggle_pin
-                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                    on:dragstart=|ev: web_sys::DragEvent| { ev.prevent_default(); ev.stop_propagation(); }
-                >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="m16 3 5 5-4 1-3 5v3l-3-3-6 6-1-1 6-6-3-3h3l5-3z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                </button>
-                <span class="agent-backend-glyph" role="img" aria-label=backend_label(backend) title=backend_label(backend)>
-                    {crate::components::launch_menu::backend_icon(backend)}
-                </span>
-                <button
-                    type="button"
-                    class="agent-card-actions"
-                    aria-haspopup="menu"
-                    aria-expanded=move || card_menu.get().is_some().to_string()
-                    title="Agent actions"
-                    aria-label="Agent actions"
-                    on:click=move |ev: web_sys::MouseEvent| open_card_menu_below(card_menu, &ev)
-                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
-                >
-                    "⋯"
-                </button>
-
             </div>
             {error_msg.map(|msg| view! {
                 <div class="agent-card-error">{msg}</div>
@@ -3511,6 +3535,90 @@ mod wasm_tests {
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    fn painted_opacity(element: &web_sys::Element) -> f64 {
+        let window = web_sys::window().unwrap();
+        let mut opacity = 1.0;
+        let mut node = Some(element.clone());
+        while let Some(current) = node {
+            let style = window.get_computed_style(&current).unwrap().unwrap();
+            if style.get_property_value("visibility").unwrap() == "hidden" {
+                return 0.0;
+            }
+            opacity *= style
+                .get_property_value("opacity")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            node = current.parent_element();
+        }
+        opacity
+    }
+
+    fn assert_row_contents_accessible(card: &HtmlElement) {
+        let bounds = card.get_bounding_client_rect();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let mut parts = Vec::new();
+        for selector in [
+            ".agent-card-collapse-toggle",
+            ".agent-card-status",
+            ".agent-card-name",
+            ".agent-card-child-count",
+            ".agent-card-status-text",
+            ".agent-card-pin",
+            ".agent-backend-glyph",
+            ".agent-card-actions",
+            ".agent-pin-host",
+        ] {
+            let Some(element) = card.query_selector(selector).unwrap() else {
+                continue;
+            };
+            let rect = element.get_bounding_client_rect();
+            assert!(
+                rect.width() > 0.0
+                    && rect.height() > 0.0
+                    && rect.left() >= bounds.left() - 0.5
+                    && rect.right() <= bounds.right() + 0.5
+                    && rect.top() >= bounds.top() - 0.5
+                    && rect.bottom() <= bounds.bottom() + 0.5,
+                "Row content must be visible inside its row: {selector}"
+            );
+            if selector == ".agent-card-name" {
+                assert!(
+                    rect.width() >= 40.0 || element.scroll_width() <= element.client_width(),
+                    "Keep a readable name fragment or the complete short name"
+                );
+            }
+            if element.tag_name() == "BUTTON" {
+                assert!(
+                    rect.width() >= 24.0 && rect.height() >= 24.0,
+                    "Keep the full action target: {selector}"
+                );
+            }
+            let hit = document
+                .element_from_point(
+                    (rect.left() + rect.width() / 2.0) as f32,
+                    (rect.top() + rect.height() / 2.0) as f32,
+                )
+                .expect("Visible row content must be hit-testable");
+            assert!(
+                element.contains(Some(&hit)),
+                "Row content is occluded: {selector}"
+            );
+            parts.push((selector, rect));
+        }
+        for (index, (left_name, left)) in parts.iter().enumerate() {
+            for (right_name, right) in &parts[index + 1..] {
+                assert!(
+                    left.right() <= right.left() + 0.5
+                        || right.right() <= left.left() + 0.5
+                        || left.bottom() <= right.top() + 0.5
+                        || right.bottom() <= left.top() + 0.5,
+                    "Row content must not overlap: {left_name} and {right_name}"
+                );
+            }
+        }
     }
 
     async fn next_tick() {
@@ -4950,6 +5058,51 @@ mod wasm_tests {
             "Selection uses the existing theme token, not a filled blue mix"
         );
         sample.remove();
+        let parent_group = container
+            .query_selector("[data-agent-id='parent-alpha']")
+            .unwrap()
+            .unwrap();
+        let reveal_children: HtmlElement = selected
+            .query_selector("[aria-label='Toggle sub-agents']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let reveal_inactive: HtmlElement = parent_group
+            .query_selector(".agent-show-inactive")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        reveal_children.click();
+        next_tick().await;
+        reveal_inactive.click();
+        next_tick().await;
+        let selected_child = agent_card_el(&container, "child-alpha");
+        assert!(selected_child.get_bounding_client_rect().height() > 0.0);
+        settle_sidebar_styles(&selected_child).await.unwrap();
+        let background = |element: &web_sys::Element| {
+            theme
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap()
+        };
+        assert_eq!(
+            background(selected_child.as_ref()),
+            "rgba(0, 0, 0, 0)",
+            "Only the selected row is highlighted; its child row stays unshaded"
+        );
+        assert_eq!(
+            background(&parent_group),
+            "rgba(0, 0, 0, 0)",
+            "Selection does not shade the descendant block"
+        );
+        reveal_inactive.click();
+        next_tick().await;
+        reveal_children.click();
+        next_tick().await;
         let row_style = theme.get_computed_style(&selected).unwrap().unwrap();
         assert_eq!(
             row_style.get_property_value("border-left-width").unwrap(),
@@ -5008,20 +5161,23 @@ mod wasm_tests {
             .unwrap()
             .unwrap()
             .get_bounding_client_rect();
-        // The requested leading disclosure shares the name line; only the
-        // running count retains the second line of the previous layout.
+        // The approved tree reference renders a parent as "Tyde (3)": the
+        // direct-child count trails the name on the one row line instead of
+        // the former second "N running" line.
         assert!(
             disclosure.right() <= activity.left()
                 && disclosure.width() >= 24.0
                 && disclosure.height() >= 24.0
                 && disclosure.top() <= name.top()
                 && disclosure.bottom() >= name.bottom()
-                && count.top() >= name.bottom(),
-            "The disclosure leads activity with a 24px target while the count stays below the name"
+                && count.left() >= name.right()
+                && count.top() < name.bottom()
+                && count.bottom() > name.top(),
+            "The disclosure leads activity with a 24px target while the count trails the name"
         );
         assert!(
-            selected.get_bounding_client_rect().height() <= 60.0,
-            "A parent keeps its name and child disclosure within two compact lines"
+            selected.get_bounding_client_rect().height() <= 29.0,
+            "A parent is one compact 28px line"
         );
         assert!(
             selected
@@ -5105,22 +5261,43 @@ mod wasm_tests {
             5,
             "Every boolean filter exposes the same native keyboard control"
         );
-        for name in [
-            "Hide inactive",
-            "Hide sub-agents",
-            "Show other projects",
-            "Show workbenches",
-            "Hide empty projects",
-        ] {
-            let control = filter_control(&container, name);
-            control.focus().unwrap();
-            let slider = control.next_element_sibling().unwrap();
-            let bounds = slider.get_bounding_client_rect();
-            assert_eq!(bounds.width(), 36.0, "The standard Tyde toggle is visible");
-            assert_eq!(bounds.height(), 20.0);
-            let style = theme.get_computed_style(&slider).unwrap().unwrap();
-            assert_eq!(style.get_property_value("outline-style").unwrap(), "solid");
+        let root = theme
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let original_font = root.style().get_property_value("font-size").unwrap();
+        for font in [13, 20] {
+            root.style()
+                .set_property("font-size", &format!("{font}px"))
+                .unwrap();
+            next_tick().await;
+            for name in [
+                "Hide inactive",
+                "Hide sub-agents",
+                "Show other projects",
+                "Show workbenches",
+                "Hide empty projects",
+            ] {
+                let control = filter_control(&container, name);
+                control.focus().unwrap();
+                let slider = control.next_element_sibling().unwrap();
+                let bounds = slider.get_bounding_client_rect();
+                assert_eq!(
+                    bounds.width(),
+                    36.0,
+                    "The standard Tyde toggle is visible at {font}px"
+                );
+                assert_eq!(bounds.height(), 20.0);
+                let style = theme.get_computed_style(&slider).unwrap().unwrap();
+                assert_eq!(style.get_property_value("outline-style").unwrap(), "solid");
+            }
         }
+        root.style()
+            .set_property("font-size", &original_font)
+            .unwrap();
         let key = web_sys::KeyboardEventInit::new();
         key.set_key("Escape");
         key.set_bubbles(true);
@@ -6086,8 +6263,8 @@ mod wasm_tests {
         assert!(
             group_text.contains("Parent Alpha Agent")
                 && group_text.contains("Child Alpha Agent")
-                && group_text.contains("1 running"),
-            "parent group should show parent, child, and visible child count; got {group_text:?}"
+                && group_text.contains("(2)"),
+            "parent group should show parent, child, and direct child count; got {group_text:?}"
         );
         let parent = agent_card_el(&container, "parent-alpha");
         let child = agent_card_el(&container, "child-alpha");
@@ -6155,10 +6332,41 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap();
-        assert_eq!(inactive.text_content().unwrap().trim(), "Show 1 inactive");
+        // The approved reference labels the quiet-children disclosure
+        // "1 inactive"; its expansion is announced through aria-expanded.
+        assert_eq!(inactive.text_content().unwrap().trim(), "1 inactive");
+        assert_eq!(
+            inactive.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        let child_status = child
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let child_disclosure_column = child
+            .query_selector(".agent-card-disclosure-spacer")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let centre = |rect: &web_sys::DomRect| rect.left() + rect.width() / 2.0;
+        assert_eq!(
+            centre(&child_disclosure_column),
+            centre(&status),
+            "A child's disclosure column sits under its parent's activity mark"
+        );
+        assert_eq!(
+            child_status.width(),
+            status.width(),
+            "Activity marks share one column width at every depth"
+        );
         inactive.click();
         next_tick().await;
         assert!(quiet.get_bounding_client_rect().height() > 0.0);
+        assert_eq!(
+            inactive.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
         let layout_document = web_sys::window().unwrap().document().unwrap();
         let root = layout_document
             .document_element()
@@ -6190,7 +6398,13 @@ mod wasm_tests {
                     .unwrap();
                 actions.blur().unwrap();
                 disclosure.blur().unwrap();
+                parent.blur().unwrap();
                 next_tick().await;
+                assert_eq!(
+                    painted_opacity(&actions),
+                    0.0,
+                    "Row tools stay unpainted at rest at {width}px/{font}px"
+                );
                 let at_rest = parent.get_bounding_client_rect();
                 let name_at_rest = parent
                     .query_selector(".agent-card-name")
@@ -6199,6 +6413,11 @@ mod wasm_tests {
                     .get_bounding_client_rect();
                 disclosure.focus().unwrap();
                 next_tick().await;
+                assert_eq!(
+                    painted_opacity(&actions),
+                    1.0,
+                    "Keyboard focus reveals the row tools at {width}px/{font}px"
+                );
                 let panel = container
                     .query_selector(".agents-panel .panel-content")
                     .unwrap()
@@ -6244,7 +6463,9 @@ mod wasm_tests {
                     (name_at_rest.left(), name_at_rest.top()),
                     "Revealing the pin cannot move the name"
                 );
-                assert!(at_rest.height() <= 49.0, "Parent remains two compact lines");
+                // The old overlay kept a short row by painting tools over its
+                // name/status. Narrow rows now reserve a separate tool line.
+                assert_row_contents_accessible(&parent);
                 let rect = actions.get_bounding_client_rect();
                 let hit = layout_document
                     .element_from_point(
@@ -6287,9 +6508,10 @@ mod wasm_tests {
             turns.insert(AgentId("child-alpha".into()), false);
         });
         next_tick().await;
-        assert!(
-            parent.text_content().unwrap().contains("0 running"),
-            "Count reacts to authoritative activity"
+        assert_eq!(
+            inactive.text_content().unwrap().trim(),
+            "2 inactive",
+            "The inactive count reacts to authoritative activity"
         );
         assert_eq!(
             child
@@ -7419,6 +7641,55 @@ mod wasm_tests {
             missing_label.text_content().as_deref(),
             Some("Host label missing")
         );
+        container.style().set_property("width", "160px").unwrap();
+        missing_label.blur().unwrap();
+        next_tick().await;
+        let label_at_rest = missing_label.get_bounding_client_rect();
+        missing_label.focus().unwrap();
+        next_tick().await;
+        let label_rect = missing_label.get_bounding_client_rect();
+        let row_actions = missing_label
+            .closest(".agent-card")
+            .unwrap()
+            .unwrap()
+            .query_selector("[aria-label='Agent actions']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            painted_opacity(&row_actions),
+            1.0,
+            "Focusing the host settings action reveals its row tools"
+        );
+        assert!(
+            (label_rect.left() - label_at_rest.left()).abs() < 0.5
+                && (label_rect.width() - label_at_rest.width()).abs() < 0.5
+                && label_rect.width() >= 24.0,
+            "Revealed row tools leave the host settings action where it rested, at least 24px wide, in a 160px sidebar (rest {:.1}+{:.1}, revealed {:.1}+{:.1})",
+            label_at_rest.left(),
+            label_at_rest.width(),
+            label_rect.left(),
+            label_rect.width()
+        );
+        // The narrow layout puts the host action below the tools, rather
+        // than beside an overlay. Check that separation on the painted axis.
+        assert!(
+            row_actions.get_bounding_client_rect().bottom() <= label_rect.top() + 0.5,
+            "Revealed row tools end above the host settings action"
+        );
+        let hit = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .element_from_point(
+                (label_rect.left() + label_rect.width() / 2.0) as f32,
+                (label_rect.top() + label_rect.height() / 2.0) as f32,
+            )
+            .unwrap();
+        assert!(
+            missing_label.contains(Some(&hit)),
+            "Revealed row tools never cover the host settings action"
+        );
+        container.style().set_property("width", "600px").unwrap();
         missing_label.click();
         next_tick().await;
         assert!(state.settings_open.get_untracked());
@@ -7919,8 +8190,37 @@ mod wasm_tests {
         };
         assert_eq!(
             counts,
-            vec!["1".to_owned(), "1".to_owned()],
+            vec!["(1)".to_owned(), "(1)".to_owned()],
             "Alpha counts its one agent and Bamboo its one swarm row, not the hidden members"
+        );
+        let spoken_counts: Vec<String> = {
+            let nodes = container.query_selector_all(".agent-folder-count").unwrap();
+            (0..nodes.length())
+                .map(|index| {
+                    let toggle = nodes
+                        .item(index)
+                        .unwrap()
+                        .dyn_into::<web_sys::Element>()
+                        .unwrap()
+                        .closest("button")
+                        .unwrap()
+                        .unwrap();
+                    let id = toggle
+                        .get_attribute("aria-describedby")
+                        .expect("a counted folder describes its count to assistive tech");
+                    container
+                        .query_selector(&format!("[id='{id}']"))
+                        .unwrap()
+                        .expect("the described count exists")
+                        .text_content()
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        assert_eq!(
+            spoken_counts,
+            vec!["1 agent".to_owned(), "1 swarm".to_owned()],
+            "Screen readers hear each folder's counted rows named by kind, matching the visible count"
         );
 
         set_swarm(&|swarm| swarm.members[0].runtime_status = Some(AgentControlStatus::Idle));
@@ -8008,6 +8308,48 @@ mod wasm_tests {
                     assert!(
                         visible.top() >= bounds.top() && visible.bottom() <= bounds.bottom(),
                         "Status lines are not vertically clipped"
+                    );
+                    let name = row.query_selector(".agent-card-name").unwrap().unwrap();
+                    let swarm_name = name.get_bounding_client_rect();
+                    text.select_node_contents(&name).unwrap();
+                    let name_text = text.get_bounding_client_rect();
+                    let main = row
+                        .query_selector(".agent-card-top-main")
+                        .unwrap()
+                        .unwrap()
+                        .get_bounding_client_rect();
+                    assert!(
+                        name_text.top() >= swarm_name.top()
+                            && name_text.bottom() <= swarm_name.bottom()
+                            && name_text.top() >= main.top()
+                            && name_text.bottom() <= main.bottom()
+                            && visible.top() >= main.top()
+                            && visible.bottom() <= main.bottom(),
+                        "Name and status glyphs stay inside their clipping bounds at {width}px/{font}px/{expected}: name {}..{}, name box {}..{}, status {}..{}, main {}..{}",
+                        name_text.top(),
+                        name_text.bottom(),
+                        swarm_name.top(),
+                        swarm_name.bottom(),
+                        visible.top(),
+                        visible.bottom(),
+                        main.top(),
+                        main.bottom(),
+                    );
+                    let agent_name = agent_card_el(&container, "normal")
+                        .query_selector(".agent-card-name")
+                        .unwrap()
+                        .unwrap()
+                        .get_bounding_client_rect();
+                    assert!(
+                        swarm_name.width() > 0.0
+                            && (swarm_name.left() - agent_name.left()).abs() < 0.5
+                            && swarm_name.top() < visible.top() + 0.5,
+                        "The swarm name stays visible in the agent name column, at or above its status, at {width}px/{font}px/{expected}: name left={}, width={}, top={}; agent left={}; status top={}",
+                        swarm_name.left(),
+                        swarm_name.width(),
+                        swarm_name.top(),
+                        agent_name.left(),
+                        visible.top(),
                     );
                     assert!(
                         row.scroll_width() <= row.client_width() + 1,
@@ -9088,7 +9430,7 @@ mod wasm_tests {
             .unwrap_or_default();
         assert_eq!(
             counted.trim(),
-            "1 running",
+            "(1)",
             "the fork must not be counted as a child of the agent it forked from"
         );
     }
@@ -12117,6 +12459,23 @@ mod wasm_tests {
             Some(parent_project_id),
             Some("parent-agent"),
         );
+        let mut deep_parent = "child-agent".to_owned();
+        for depth in 0..6 {
+            let id = format!("deep-{depth}");
+            push_agent_with_scope(
+                &state,
+                "local",
+                &id,
+                "A deeply nested agent whose name must remain identifiable",
+                true,
+                Some(parent_project_id),
+                Some(&deep_parent),
+            );
+            state.agent_turn_active.update(|turns| {
+                turns.insert(AgentId(id.clone()), true);
+            });
+            deep_parent = id;
+        }
         // Workbench agent
         push_agent_with_scope(
             &state,
@@ -12127,6 +12486,23 @@ mod wasm_tests {
             Some(workbench_id),
             None,
         );
+        for (id, parent) in [
+            ("bench-parent", None),
+            ("bench-child", Some("bench-parent")),
+        ] {
+            push_agent_with_scope(
+                &state,
+                "local",
+                id,
+                "A long workbench agent name with its own child",
+                true,
+                Some(workbench_id),
+                parent,
+            );
+            state.agent_turn_active.update(|turns| {
+                turns.insert(AgentId(id.to_owned()), true);
+            });
+        }
         // Grouped agent
         push_agent_with_scope(
             &state,
@@ -12150,7 +12526,7 @@ mod wasm_tests {
             turns.insert(AgentId("child-agent".to_owned()), true);
         });
 
-        for width in [220, 320] {
+        for width in [160, 220, 360] {
             let container = make_container();
             container
                 .set_attribute(
@@ -12179,6 +12555,27 @@ mod wasm_tests {
                 .unwrap();
             toggle.click();
             for _ in 0..4 {
+                next_tick().await;
+            }
+
+            // Descendants stay mounted but hidden until each disclosure opens.
+            // Expand the fixture before measuring every row's action target.
+            for id in [
+                "child-agent",
+                "deep-0",
+                "deep-1",
+                "deep-2",
+                "deep-3",
+                "deep-4",
+                "bench-parent",
+            ] {
+                let card = agent_card_el(&container, id);
+                card.query_selector(".agent-card-collapse-toggle")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
                 next_tick().await;
             }
 
@@ -12340,29 +12737,33 @@ mod wasm_tests {
                 }
                 geometry
             };
-            let child_pin_width = || {
-                child_card
-                    .query_selector(".agent-card-pin")
-                    .unwrap()
-                    .expect("child-agent pin button must exist")
-                    .get_bounding_client_rect()
-                    .width()
+            // Tool space is reserved; only painting changes on focus.
+            let child_pin_painted = || {
+                painted_opacity(
+                    &child_card
+                        .query_selector(".agent-card-pin")
+                        .unwrap()
+                        .expect("child-agent pin button must exist"),
+                )
             };
             assert_eq!(
-                child_pin_width(),
+                child_pin_painted(),
                 0.0,
                 "the pin of an unpinned row waits for hover or focus"
             );
+            child_card.scroll_into_view();
+            next_tick().await;
             let at_rest = row_geometry(&child_card);
-            assert!(
-                (27.0..=29.0).contains(&at_rest[0]),
-                "a row with a glyph-only status is one 28px line at {width}px, got {}px",
-                at_rest[0]
+            let narrow = child_card.client_width() <= 244;
+            assert_eq!(
+                at_rest[0],
+                if narrow { 52.0 } else { 28.0 },
+                "A narrow row reserves a second 24px line for tools at {width}px"
             );
             // height, glyph.left, glyph.top, name.left, name.top, status.left, status.top, actions.left, actions.top
             assert!(
-                at_rest[5] < at_rest[3] && at_rest[3] < at_rest[1] && at_rest[1] < at_rest[7],
-                "activity leads the name and the backend glyph trails it at {width}px: {at_rest:?}"
+                at_rest[5] < at_rest[3] && at_rest[1] < at_rest[7],
+                "Activity leads the name; backend identity precedes actions at {width}px: {at_rest:?}"
             );
 
             // Focus child-agent card to reveal its pin control via :focus-within and verify visible geometry
@@ -12370,7 +12771,8 @@ mod wasm_tests {
             for _ in 0..2 {
                 next_tick().await;
             }
-            assert!(child_pin_width() > 0.0);
+            assert_eq!(child_pin_painted(), 1.0);
+            assert_row_contents_accessible(&child_card);
             assert_eq!(
                 row_geometry(&child_card),
                 at_rest,
@@ -12396,32 +12798,44 @@ mod wasm_tests {
                 panel_rect.right(),
             );
 
-            for id in ["grouped-agent", "workbench-agent"] {
+            for id in ["grouped-agent", "workbench-agent", "bench-parent"] {
                 let card = agent_card_el(&container, id);
+                let before_scroll = panel_content.scroll_top();
+                let before_top = card.get_bounding_client_rect().top();
+                // Focus may scroll offscreen rows; settle that before measuring reflow.
+                card.scroll_into_view();
+                next_tick().await;
+                let at_rest_scroll = panel_content.scroll_top();
                 let at_rest = row_geometry(&card);
-                assert_eq!(
-                    at_rest[0], 28.0,
-                    "a labelled leaf row stays one line at {width}px"
-                );
-                assert!(at_rest[5] < at_rest[3] && at_rest[3] < at_rest[1]);
+                assert!(at_rest[5] < at_rest[3]);
                 card.focus().unwrap();
                 next_tick().await;
+                assert_row_contents_accessible(&card);
+                wasm_bindgen_test::console_log!(
+                    "Sidebar focus geometry {id}/{width}px: before scroll={before_scroll}, top={before_top}; baseline scroll={at_rest_scroll}, geometry={at_rest:?}; focused scroll={}, geometry={:?}",
+                    panel_content.scroll_top(),
+                    row_geometry(&card),
+                );
                 assert_eq!(
                     row_geometry(&card),
                     at_rest,
-                    "revealing a labelled row's pin cannot wrap or move its content at {width}px"
+                    "revealing a labelled row's pin cannot wrap or move its content at {width}px: {id}, scroll {at_rest_scroll} -> {}",
+                    panel_content.scroll_top(),
                 );
             }
 
             // Verify awaiting-user status text has visible nonzero geometry and stays within panel
             let awaiting_text: HtmlElement = container
-                .query_selector(
-                    "[data-agent-drop-id='parent-agent'] .agent-card-status.awaiting .agent-card-status-text",
-                )
+                .query_selector("[data-agent-drop-id='parent-agent'] .agent-card-status-text")
                 .unwrap()
                 .expect("parent-agent must display awaiting status text")
                 .dyn_into()
                 .unwrap();
+            assert_eq!(
+                awaiting_text.text_content().as_deref(),
+                Some("Needs your answer"),
+                "parent-agent's visible label reports its awaiting state at {width}px"
+            );
             let awaiting_rect = awaiting_text.get_bounding_client_rect();
             assert!(
                 awaiting_rect.width() > 0.0 && awaiting_rect.height() > 0.0,
@@ -12436,13 +12850,16 @@ mod wasm_tests {
 
             // Verify compacting status text has visible nonzero geometry and stays within panel
             let compacting_text: HtmlElement = container
-                .query_selector(
-                    "[data-agent-drop-id='workbench-agent'] .agent-card-status .agent-card-status-text",
-                )
+                .query_selector("[data-agent-drop-id='workbench-agent'] .agent-card-status-text")
                 .unwrap()
                 .expect("workbench-agent must display compaction status text")
                 .dyn_into()
                 .unwrap();
+            assert_eq!(
+                compacting_text.text_content().as_deref(),
+                Some("Compacting context"),
+                "workbench-agent's visible label reports its compaction state at {width}px"
+            );
             let compacting_rect = compacting_text.get_bounding_client_rect();
             assert!(
                 compacting_rect.width() > 0.0 && compacting_rect.height() > 0.0,
@@ -12453,6 +12870,32 @@ mod wasm_tests {
                 "compaction status text must remain within panel at {width}px (right: {}, panel_right: {})",
                 compacting_rect.right(),
                 panel_rect.right(),
+            );
+
+            let deepest = agent_card_el(&container, "deep-5");
+            deepest.scroll_into_view();
+            deepest.focus().unwrap();
+            next_tick().await;
+            assert_row_contents_accessible(&deepest);
+            open_row_menu(&deepest).await;
+            let menu = deepest
+                .query_selector("[role='menu']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            assert!(menu.text_content().unwrap().contains("Pin chat"));
+            dispatch_key(&menu, "Escape");
+            next_tick().await;
+            assert_eq!(
+                web_sys::window()
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .active_element()
+                    .unwrap(),
+                deepest.clone().unchecked_into::<web_sys::Element>(),
+                "The deepest row regains focus after closing its menu"
             );
 
             container.remove();

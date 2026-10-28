@@ -12,4 +12,12 @@ source "$environment"
 : "${SCCACHE_DIR:?Set SCCACHE_DIR in sccache-env}"
 : "${SCCACHE_CACHE_SIZE:?Set SCCACHE_CACHE_SIZE in sccache-env}"
 : "${SCCACHE_SERVER_PORT:?Set SCCACHE_SERVER_PORT in sccache-env}"
+: "${SCCACHE_SERVER_TMPDIR:?Set SCCACHE_SERVER_TMPDIR in sccache-env}"
+[[ "$SCCACHE_SERVER_TMPDIR" == /* ]] || {
+    printf 'SCCACHE_SERVER_TMPDIR must be an absolute host-owned path\n' >&2
+    exit 1
+}
+# The shared daemon outlives disposable callers and retains its startup TMPDIR.
+mkdir -p "$SCCACHE_SERVER_TMPDIR"
+export TMPDIR="$SCCACHE_SERVER_TMPDIR"
 exec "$SCCACHE_EXECUTABLE" "$@"
