@@ -20553,25 +20553,22 @@ async fn codex_restricted_thread_config(
     }
     let mut restricted_mcp_servers = serde_json::Map::new();
     for (name, server) in mcp_servers {
-        let mut server = if allowed_servers.contains(&name.as_str()) {
-            // This overrides the entire native MCP table, including CLI-added
-            // transport/auth fields, so allowed entries must be retained intact.
-            let mut config = server
-                .as_object()
-                .cloned()
-                .ok_or("Codex config/read allowed MCP configuration must be an object")?;
-            // Native config/read emits null for an unset tool timeout, but its
-            // JSON-to-TOML conversion turns null into an invalid empty string.
-            let native_field_count = config.len();
-            config.retain(|_, value| !value.is_null());
-            tracing::debug!(
-                omitted_optional_field_count = native_field_count - config.len(),
-                "Omitting unset native MCP fields from TOML lifecycle overrides"
-            );
-            Value::Object(config)
-        } else {
-            json!({ "enabled": false })
-        };
+        // Lifecycle overrides replace the entire table. Disabled entries still
+        // require a transport; native null optionals are not TOML values.
+        let mut config = server
+            .as_object()
+            .cloned()
+            .ok_or("Codex config/read MCP configuration must be an object")?;
+        let native_field_count = config.len();
+        config.retain(|_, value| !value.is_null());
+        tracing::debug!(
+            omitted_optional_field_count = native_field_count - config.len(),
+            "Omitting unset native MCP fields from TOML lifecycle overrides"
+        );
+        if !allowed_servers.contains(&name.as_str()) {
+            config.insert("enabled".to_owned(), json!(false));
+        }
+        let mut server = Value::Object(config);
         if rpc.read_only_builtins_direct_tools
             && matches!(
                 name.as_str(),

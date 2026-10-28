@@ -2712,6 +2712,19 @@ async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
     let directory = tempfile::tempdir().expect("review metadata outside the read-only workspace");
     let script = directory.path().join("probe.py");
     let journal = directory.path().join("calls.jsonl");
+    let excluded_script = directory.path().join("excluded.py");
+    let excluded_journal = directory.path().join("excluded-calls.jsonl");
+    std::fs::write(&excluded_script, mcp_probe_script()).expect("write excluded MCP probe");
+    install_mcp_server(
+        host,
+        "tyde-agent-await",
+        "python3",
+        vec![
+            excluded_script.to_string_lossy().into_owned(),
+            excluded_journal.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
     let mut source = mcp_probe_script().replace(MCP_TOOL_NAME, "propose_review_comment");
     let boundary = "    elif method == \"tools/call\":";
     source = source.replace(boundary, &format!("        result[\"tools\"].append(dict(result[\"tools\"][0], name=\"read_review_git\"))\n{boundary}"));
@@ -2825,6 +2838,10 @@ async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
         }
         _ => panic!("A closed MCP transport must be an explicit failed tool execution"),
     }
+    assert!(
+        !excluded_journal.exists(),
+        "Excluded MCP tools must not execute during the feedback-only flow"
+    );
     assert_universal_contract(&[first, second, disconnected]);
     assert_clean_close(host, &agent).await;
 }

@@ -4442,8 +4442,20 @@ impl ClaudeInner {
 
     async fn configure_restricted_mcp(
         &self,
-        servers: serde_json::Map<String, Value>,
+        mut servers: serde_json::Map<String, Value>,
     ) -> Result<(), String> {
+        let configured_server_count = servers.len();
+        servers.retain(|name, _| {
+            matches!(
+                name.as_str(),
+                crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME
+                    | crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME
+            )
+        });
+        tracing::info!(
+            excluded_server_count = configured_server_count - servers.len(),
+            "Excluding MCP servers outside Claude's enforced read-only allowance"
+        );
         let expected = servers.keys().cloned().collect::<HashSet<_>>();
         let request_id = uuid::Uuid::new_v4().to_string();
         let response = self

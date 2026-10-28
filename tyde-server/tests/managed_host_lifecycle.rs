@@ -12,6 +12,10 @@ use host_config::{
     RemoteArchitecture, RemoteHostLifecycleSnapshot, RemoteOperatingSystem, RemotePlatform,
     RemoteTydeRunningState, TydeReleaseVersion,
 };
+use protocol::{
+    Envelope, FrameKind, HelloPayload, PROTOCOL_VERSION, SeqValidator, StreamPath, TYDE_VERSION,
+    WelcomePayload, read_envelope, write_envelope,
+};
 
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -356,33 +360,53 @@ async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn stdio host");
-        let io = tokio::io::join(
-            child.stdout.take().expect("host stdout"),
-            child.stdin.take().expect("host stdin"),
-        );
-        let connection = tokio::time::timeout(
-            Duration::from_secs(15),
-            client::connect(&client::ClientConfig::current(), io),
+        let mut reader = tokio::io::BufReader::new(child.stdout.take().expect("host stdout"));
+        let mut writer = child.stdin.take().expect("host stdin");
+        let stream = StreamPath("/host/00000000-0000-4000-8000-000000000001".to_owned());
+        let hello = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::Hello,
+            0,
+            &HelloPayload {
+                protocol_version: PROTOCOL_VERSION,
+                tyde_version: TYDE_VERSION,
+                client_name: "stdio-signal-test".to_owned(),
+                platform: std::env::consts::OS.to_owned(),
+            },
         )
-        .await
-        .expect("stdio handshake deadline")
-        .expect("real stdio handshake");
+        .expect("encode stdio hello");
+        write_envelope(&mut writer, &hello)
+            .await
+            .expect("send stdio hello");
+        // The gate hit the client's ten-second startup timeout. This signal test
+        // waits for protocol readiness and exit; the per-test watchdog bounds hangs.
+        let response = read_envelope(&mut reader)
+            .await
+            .expect("read stdio handshake")
+            .expect("host must respond before closing stdout");
+        SeqValidator::new()
+            .validate(&response.stream, response.seq, response.kind)
+            .expect("valid stdio handshake sequence");
+        assert!(response.stream == stream, "stdio handshake stream mismatch");
+        assert_eq!(response.kind, FrameKind::Welcome);
+        let welcome: WelcomePayload = response.parse_payload().expect("valid stdio welcome");
+        assert_eq!(welcome.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(welcome.tyde_version, TYDE_VERSION);
         let sent = tokio::process::Command::new("kill")
             .args([signal, &child.id().expect("owned host pid").to_string()])
             .status()
             .await
             .expect("signal owned stdio host");
         assert!(sent.success());
-        let exited = tokio::time::timeout(Duration::from_secs(28), child.wait()).await;
+        let exited = child.wait().await.expect("reap stdio host");
         let graceful_finished = std::fs::read_to_string(&log_path)
             .expect("read stdio diagnostics")
             .contains("stdio host graceful shutdown completed; leaving runtime");
         assert!(
-            exited.is_ok(),
-            "signal shutdown waited for stdin EOF; graceful shutdown completed={graceful_finished}"
+            graceful_finished,
+            "signal must complete graceful shutdown while client stdin remains open"
         );
-        let exited = exited.expect("checked timeout").expect("reap stdio host");
-        drop(connection);
+        drop((reader, writer));
         assert!(
             exited.success(),
             "signal must finish production shutdown, not terminate the host abruptly"

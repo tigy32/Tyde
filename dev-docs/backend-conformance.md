@@ -48,6 +48,32 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Restricted MCP transport configuration
+
+`real_enforced_review_feedback` includes an excluded `tyde-agent-await` MCP
+server alongside the permitted feedback server. Both eligible providers,
+Codex and Claude, must complete the existing two-turn feedback and explicit
+closed-transport failure flow without executing any excluded tool. The fixture
+and assertions are identical for both providers.
+
+The same flow exposed Claude registering the excluded server before its native
+catalog guard correctly rejected the advertised probe tool. This is a startup
+producer violation, not permission to loosen catalog verification: normal Tyde
+startup MCP sets include await, and enforced-read-only launches must exclude it.
+Claude now registers only its permitted control/feedback servers in that mode.
+Its native catalog guard, tool permissions and unrestricted registration stay
+unchanged.
+
+Codex CLI 0.162.1 validates disabled MCP transports at `thread/start`. The
+restricted lifecycle override replaces whole native tables, so replacing an
+excluded entry with only `enabled:false` loses its transport and fails startup
+with `invalid transport`. The Codex adapter retains native transport/auth
+fields, omits unset null optionals that cannot be represented in TOML, and
+sets `enabled:false` on excluded entries. The same helper supplies start,
+fork, resume and inference configurations; their permission policies remain
+unchanged. The extended real Backend flow reproduces the startup rejection
+without the repair, rather than injecting malformed transport configuration.
+
 ## Workspace relocation readiness
 
 Workspace relocation distinguishes `Busy`, `Rejected`, and `OutcomeUnknown`.
