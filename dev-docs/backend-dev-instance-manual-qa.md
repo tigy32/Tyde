@@ -16,6 +16,17 @@ private `frontend-dist`, then serves that snapshot on a producer-owned ephemeral
 loopback listener. Restart the disposable instance to pick up source changes.
 Ordinary development `trunk serve` is unchanged.
 
+The explicit Rust asset in `frontend/index.html` uses Trunk's supported
+`data-no-demangle` to keep Rust function names mangled: wasm-bindgen's default
+demangling can greatly expand the Wasm `name` custom section independently of
+DWARF. This retains names, not strips them, and leaves the Cargo debug profile
+and target flags unchanged. Keep the asset in the body to preserve the implicit
+pipeline's module-script placement. `data-wasm-opt="0"` preserves that pipeline's
+disabled wasm-opt behavior in release builds too; explicit assets otherwise
+enable it by default in release mode. Do not postprocess the served snapshot.
+Artifact reduction alone does not establish WebProcess allocation causality or
+a fix for a UI stall. See [Trunk Rust assets](https://trunk-rs.github.io/trunk/guide/assets/index.html#rust).
+
 Readiness requires ordered, typed build/serving receipts on the owned child's
 stdout pipe, followed by one HTTP index request whose private serving identity
 and SHA-256 match the receipt. Compiler output is captured from stderr, never
