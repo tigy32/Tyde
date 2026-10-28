@@ -891,6 +891,9 @@ impl ProtocolValidator {
             FrameKind::WorkbenchCreate => {
                 parse_host_payload::<WorkbenchCreatePayload>(self, envelope, "WorkbenchCreate")
             }
+            FrameKind::WorkbenchRecover => {
+                parse_host_payload::<crate::WorkbenchRecoverPayload>(self, envelope, "WorkbenchRecover")
+            }
             FrameKind::WorkbenchRemove => {
                 parse_host_payload::<WorkbenchRemovePayload>(self, envelope, "WorkbenchRemove")
             }

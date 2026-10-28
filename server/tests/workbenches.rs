@@ -1940,6 +1940,22 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
     );
     let (_, bootstrap) = fixture.connect_with_bootstrap().await;
     let committed = bootstrap.projects.into_iter().find(|project| matches!(&project.source, ProjectSource::GitWorkbench { branch, .. } if branch.0 == "workflow-publication-error")).expect("durably committed workbench must remain authoritative");
+    fixture.relaunch_host_after_kill().await;
+    let replay = next_frame_matching_on(&mut fixture.client, "durable creation warning replay", |env| {
+        env.kind == FrameKind::ProjectOperation && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
+            matches!(operation.mutation, protocol::ProjectMutation::CreateWorkbench(ref payload) if payload.branch.0 == "workflow-publication-error")
+                && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
+        })
+    }).await.parse_payload::<protocol::ProjectOperationPayload>().unwrap();
+    assert!(
+        matches!(replay.state, protocol::ProjectOperationState::Committed { warnings } if warnings.iter().any(|warning| warning.stage == protocol::ProjectOperationStage::Workflow)),
+        "restart must retain the actual settled creation warning, not replay clean success"
+    );
+    fixture
+        .host_for_test()
+        .stop_workflow_watcher_for_test()
+        .await
+        .unwrap();
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -2553,6 +2569,58 @@ async fn agent_control_multi_root_preflight_and_removed_spawn_are_atomic() {
     assert!(is_error, "spawn into removed workbench succeeded: {body}");
     assert!(body.contains("missing project"));
     assert_no_new_agent(&mut fixture.client, "rejecting removed-workbench spawn").await;
+
+    let shared = init_git_repo("shared-common-directory");
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    git(
+        shared.path(),
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    let linked_registration = git_stdout(shared.path(), &["worktree", "list", "--porcelain"]);
+    let linked_project = create_project(&mut fixture.client, vec![shared.path(), &linked]).await;
+    for attempt in 0..2 {
+        fixture
+            .client
+            .workbench_create(WorkbenchCreatePayload {
+                parent_project_id: linked_project.id.clone(),
+                branch: GitBranchName("shared-claim".into()),
+                name: "Shared claim".into(),
+            })
+            .await
+            .unwrap();
+        let error = expect_command_error(
+            &mut fixture.client,
+            "linked roots rejected before ownership writes",
+        )
+        .await;
+        assert_eq!(
+            git_stdout(shared.path(), &["worktree", "list", "--porcelain"]),
+            linked_registration,
+            "preflight must preserve existing linked registrations and permit the same explicit request again"
+        );
+        assert!(
+            git_stdout(
+                shared.path(),
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/tyde/workbench-creation/",
+                    "refs/heads/shared-claim"
+                ]
+            )
+            .is_empty(),
+            "unsupported shared branch ownership must never acquire refs"
+        );
+        assert!(!expected_worktree_path(shared.path(), "shared-claim").exists());
+        assert!(!expected_worktree_path(&linked, "shared-claim").exists());
+        assert_eq!(
+            error.code,
+            CommandErrorCode::InvalidInput,
+            "linked-root attempt {attempt}"
+        );
+        assert!(error.message.contains("distinct Git common directories"));
+    }
 }
 
 #[tokio::test]
@@ -5849,6 +5917,609 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         assert!(
             !root.join("target").exists() && !root.join("node_modules").exists(),
             "native parent must stay unbuilt"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interrupted_creation_rolls_back_before_identical_retry() {
+    for prepared in [false, true] {
+        let repo = init_git_repo("creation-crash");
+        let aliases = tempfile::tempdir().unwrap();
+        let ancestor = aliases.path().join("source-parent");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(repo.path().parent().unwrap(), &ancestor).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(repo.path().parent().unwrap(), &ancestor).unwrap();
+        let aliased_repo = ancestor.join(repo.path().file_name().unwrap());
+        let mut fixture = Fixture::new_with_settings_file(&json!({"settings": {"workbenches": {"engine": if prepared { "bubblewrap" } else { "native" }}}}).to_string()).await;
+        let second = init_git_repo("creation-crash-second");
+        let parent = create_project(&mut fixture.client, vec![&aliased_repo, second.path()]).await;
+        let caller = spawn_project_caller(
+            &mut fixture.client,
+            &parent,
+            "creation witness",
+            BackendAccessMode::Unrestricted,
+        )
+        .await;
+        let (reached, release) = if prepared {
+            fixture
+                .host_for_test()
+                .hold_prepared_workbench_creation_for_test()
+                .await
+        } else {
+            fixture
+                .host_for_test()
+                .hold_next_workbench_creation_for_test()
+                .await
+        };
+        fixture
+            .client
+            .workbench_create(WorkbenchCreatePayload {
+                parent_project_id: parent.id.clone(),
+                branch: GitBranchName("crash-owned".into()),
+                name: "Interrupted".into(),
+            })
+            .await
+            .expect("send creation");
+        reached.await.expect("Git completed before crash");
+        let root = expected_worktree_path(repo.path(), "crash-owned");
+        assert!(root.exists(), "real Git side effect reached");
+        let other_root = expected_worktree_path(second.path(), "crash-owned");
+        let (failed, listed) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_list_workbenches",
+            json!({}),
+        )
+        .await;
+        assert!(!failed, "typed creation witness must be available");
+        let listed: Value = serde_json::from_str(&listed).expect("typed workbench list");
+        let intent: protocol::WorkbenchCreationIntent =
+            serde_json::from_value(listed["interrupted_creations"][0].clone())
+                .expect("durable ownership intent exposed over MCP");
+        let environment = intent
+            .environment_directory
+            .map(|path| PathBuf::from(path.0));
+        let mut staging = None;
+        if prepared {
+            assert!(
+                environment
+                    .as_ref()
+                    .is_some_and(|path| path.join("manifest.json").exists()),
+                "real environment preparation completed before crash"
+            );
+            let directory = environment.as_ref().unwrap();
+            fs::remove_file(directory.join("manifest.json"))
+                .expect("interrupt the disposable environment before manifest completion");
+            let claim = intent
+                .operation
+                .0
+                .strip_prefix("/project-operation/")
+                .unwrap();
+            let path = directory.parent().unwrap().join(format!(".claim-{claim}"));
+            fs::rename(directory, &path)
+                .expect("preserve the actual acquired directory at the pre-rename boundary");
+            staging = Some(path);
+        } else {
+            fs::remove_dir_all(&root).expect("remove only the disposable owned source");
+            assert!(
+                git_stdout(repo.path(), &["worktree", "list", "--porcelain"])
+                    .contains(root.to_str().unwrap()),
+                "real Git registration survives the missing directory"
+            );
+        }
+        fixture
+            .host_for_test()
+            .crash_project_catalog_for_test()
+            .await;
+        drop(release);
+        fixture.relaunch_host_after_kill().await;
+        let recovered =
+            next_frame_matching_on(&mut fixture.client, "durable recovery settlement", |env| {
+                env.kind == FrameKind::ProjectOperation
+                    && env
+                        .parse_payload::<protocol::ProjectOperationPayload>()
+                        .is_ok_and(|operation| {
+                            operation.stream == intent.operation
+                                && match operation.state {
+                                    protocol::ProjectOperationState::Failed {
+                                        cleanup_may_be_partial: false,
+                                        ..
+                                    } => true,
+                                    protocol::ProjectOperationState::Failed {
+                                        ref message, ..
+                                    } => message.contains("Source is not the claimed Git worktree"),
+                                    _ => false,
+                                }
+                        })
+            })
+            .await
+            .parse_payload::<protocol::ProjectOperationPayload>()
+            .unwrap();
+        assert!(
+            matches!(
+                recovered.state,
+                protocol::ProjectOperationState::Failed {
+                    cleanup_may_be_partial: false,
+                    ..
+                }
+            ),
+            "canonical identity must recover an untouched source reached through a symlinked parent ancestor"
+        );
+        assert!(
+            !root.exists() && !other_root.exists(),
+            "all owned roots rolled back before retry"
+        );
+        assert!(
+            environment.as_ref().is_none_or(|path| !path.exists()),
+            "owned environment rolled back without publishing snapshots"
+        );
+        assert!(
+            staging.as_ref().is_none_or(|path| !path.exists()),
+            "owned pre-rename staging directory is recovered without a complete manifest"
+        );
+        assert!(
+            !git_stdout(repo.path(), &["worktree", "list", "--porcelain"])
+                .contains(root.to_str().unwrap()),
+            "rollback settles the exact Git registration even without its source directory"
+        );
+        let replacement = create_workbench(&mut fixture.client, &parent, "crash-owned").await;
+        assert!(
+            replacement.is_workbench(),
+            "identical create succeeds after owned recovery"
+        );
+        let bootstrap = fixture.relaunch_host_after_kill().await;
+        assert!(
+            bootstrap
+                .projects
+                .iter()
+                .any(|project| project.id == replacement.id),
+            "catalog commit survives restart without rollback"
+        );
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: replacement.id,
+                force: false,
+            })
+            .await
+            .unwrap();
+        // Bubblewrap publishes intermediate Removing upserts before final Delete.
+        next_frame_matching_on(&mut fixture.client, "disposable replacement deleted", |env| {
+            env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project } if project.root_paths().iter().any(|path| Path::new(&path.0) == root))
+        }).await;
+        assert!(!root.exists(), "disposable worktree removed");
+        eprintln!(
+            "CREATION CRASH EVIDENCE: real Git add, actor loss, fresh protocol host, identical create and removal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interrupted_creation_preserves_unowned_paths_and_supports_explicit_recovery() {
+    for (environment_replacement, relocated) in [(false, false), (false, true), (true, false)] {
+        let repo = init_git_repo("creation-ownership");
+        git(repo.path(), &["branch", "protected"]);
+        let protected = git_stdout(repo.path(), &["rev-parse", "protected"]);
+        let mut fixture = Fixture::new_with_settings_file(&json!({"settings": {"workbenches": {"engine": if environment_replacement { "bubblewrap" } else { "native" }}}}).to_string()).await;
+        let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+        let caller = spawn_project_caller(
+            &mut fixture.client,
+            &parent,
+            "ownership witness",
+            BackendAccessMode::Unrestricted,
+        )
+        .await;
+        if environment_replacement {
+            let (reached, release) = fixture
+                .host_for_test()
+                .hold_next_workbench_creation_for_test()
+                .await;
+            fixture
+                .client
+                .workbench_create(WorkbenchCreatePayload {
+                    parent_project_id: parent.id.clone(),
+                    branch: GitBranchName("occupied-environment".into()),
+                    name: "Occupied environment".into(),
+                })
+                .await
+                .unwrap();
+            reached.await.expect("hold before environment acquisition");
+            let (failed, listed) = call_agent_control(
+                &fixture,
+                &caller.agent_id,
+                "tyde_list_workbenches",
+                json!({}),
+            )
+            .await;
+            assert!(!failed);
+            let listed: Value = serde_json::from_str(&listed).unwrap();
+            let intent: protocol::WorkbenchCreationIntent =
+                serde_json::from_value(listed["interrupted_creations"][0].clone()).unwrap();
+            let directory = PathBuf::from(intent.environment_directory.unwrap().0);
+            fs::create_dir_all(directory.parent().unwrap()).unwrap();
+            fs::create_dir(&directory).unwrap();
+            let sentinel = b"foreign occupant\x00\xff\n";
+            let foreign_claim = br#"{"claim":"different-owner"}"#;
+            fs::write(directory.join("unknown"), sentinel).unwrap();
+            fs::write(directory.join("claim.json"), foreign_claim).unwrap();
+            release
+                .send(())
+                .expect("resume real prepare with occupied path");
+            let rejected = next_frame_matching_on(
+                &mut fixture.client,
+                "occupied environment creation rejected",
+                |env| {
+                    env.kind == FrameKind::ProjectOperation
+                        && env
+                            .parse_payload::<protocol::ProjectOperationPayload>()
+                            .is_ok_and(|progress| {
+                                progress.stream == intent.operation
+                                    && matches!(
+                                        progress.state,
+                                        protocol::ProjectOperationState::Failed { .. }
+                                            | protocol::ProjectOperationState::Committed { .. }
+                                    )
+                            })
+                },
+            )
+            .await;
+            assert!(matches!(
+                rejected
+                    .parse_payload::<protocol::ProjectOperationPayload>()
+                    .unwrap()
+                    .state,
+                protocol::ProjectOperationState::Failed {
+                    cleanup_may_be_partial: true,
+                    ..
+                }
+            ));
+            assert_eq!(fs::read(directory.join("unknown")).unwrap(), sentinel);
+            assert_eq!(
+                fs::read(directory.join("claim.json")).unwrap(),
+                foreign_claim
+            );
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+            let claim = intent
+                .operation
+                .0
+                .strip_prefix("/project-operation/")
+                .unwrap();
+            assert!(
+                !directory
+                    .parent()
+                    .unwrap()
+                    .join(format!(".claim-{claim}"))
+                    .exists(),
+                "failed acquisition removes only its own staging directory"
+            );
+            fs::remove_file(directory.join("unknown")).unwrap();
+            fs::remove_file(directory.join("claim.json")).unwrap();
+            fs::remove_dir(&directory).unwrap();
+            fixture
+                .client
+                .workbench_recover(protocol::WorkbenchRecoverPayload {
+                    operation: intent.operation.clone(),
+                    parent_project_id: parent.id.clone(),
+                })
+                .await
+                .unwrap();
+            let recovered = next_frame_matching_on(
+                &mut fixture.client,
+                "recover after disposable occupant removal",
+                |env| {
+                    env.kind == FrameKind::ProjectOperation
+                        && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(
+                            |progress| {
+                                matches!(progress.mutation, protocol::ProjectMutation::RecoverWorkbench(ref payload) if payload.operation == intent.operation)
+                                    && matches!(progress.state, protocol::ProjectOperationState::Failed { .. } | protocol::ProjectOperationState::Committed { .. })
+                            },
+                        )
+                },
+            )
+            .await;
+            assert!(matches!(
+                recovered
+                    .parse_payload::<protocol::ProjectOperationPayload>()
+                    .unwrap()
+                    .state,
+                protocol::ProjectOperationState::Committed { .. }
+            ));
+        }
+        let (reached, release) = if environment_replacement {
+            fixture
+                .host_for_test()
+                .hold_prepared_workbench_creation_for_test()
+                .await
+        } else {
+            fixture
+                .host_for_test()
+                .hold_next_workbench_creation_for_test()
+                .await
+        };
+        fixture
+            .client
+            .workbench_create(WorkbenchCreatePayload {
+                parent_project_id: parent.id.clone(),
+                branch: GitBranchName("owned-recovery".into()),
+                name: "Ownership".into(),
+            })
+            .await
+            .unwrap();
+        reached.await.expect("real worktree creation");
+        let admitted = next_frame_matching_on(&mut fixture.client, "creation operation identity", |env| {
+        env.kind == FrameKind::ProjectOperation && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| matches!(operation.mutation, protocol::ProjectMutation::CreateWorkbench(ref payload) if payload.branch.0 == "owned-recovery"))
+    }).await;
+        let operation: protocol::ProjectOperationPayload = admitted.parse_payload().unwrap();
+        let source = expected_worktree_path(repo.path(), "owned-recovery");
+        let (failed, listed) = call_agent_control(
+            &fixture,
+            &caller.agent_id,
+            "tyde_list_workbenches",
+            json!({}),
+        )
+        .await;
+        assert!(!failed, "typed ownership witness must be available");
+        let listed: Value = serde_json::from_str(&listed).expect("typed workbench list");
+        let intent: protocol::WorkbenchCreationIntent =
+            serde_json::from_value(listed["interrupted_creations"][0].clone())
+                .expect("durable creation intent exposed over MCP");
+        let mut root = if environment_replacement {
+            PathBuf::from(
+                intent
+                    .environment_directory
+                    .expect("prepared environment path")
+                    .0,
+            )
+        } else {
+            source.clone()
+        };
+        let preserved_environment = root.with_extension("preserved-owned-environment");
+        let owned_branch = git_stdout(
+            repo.path(),
+            &["show-ref", "--verify", "refs/heads/owned-recovery"],
+        );
+        let owner_ref = format!(
+            "refs/tyde/workbench-creation/{}",
+            operation
+                .stream
+                .0
+                .strip_prefix("/project-operation/")
+                .unwrap()
+        );
+        let owned_claim = git_stdout(repo.path(), &["show-ref", "--verify", &owner_ref]);
+        if relocated {
+            let moved = source.with_extension("relocated-owned-source");
+            git(
+                repo.path(),
+                &[
+                    "worktree",
+                    "move",
+                    source.to_str().unwrap(),
+                    moved.to_str().unwrap(),
+                ],
+            );
+            root = moved;
+        } else if environment_replacement {
+            fs::rename(&root, &preserved_environment)
+                .expect("preserve disposable owned environment including its internal claim");
+        } else {
+            git(repo.path(), &["worktree", "remove", root.to_str().unwrap()]);
+        }
+        if !relocated {
+            fs::create_dir(&root).unwrap();
+        }
+        fs::write(root.join("unknown"), "preserve").unwrap();
+        fixture
+            .host_for_test()
+            .crash_project_catalog_for_test()
+            .await;
+        drop(release);
+        let bootstrap = fixture.relaunch_host_after_kill().await;
+        assert_eq!(
+            bootstrap.projects.len(),
+            1,
+            "unknown source must never become a registered project"
+        );
+        let settled =
+            next_frame_matching_on(&mut fixture.client, "replacement recovery settled", |env| {
+                env.kind == FrameKind::ProjectOperation
+                    && env
+                        .parse_payload::<protocol::ProjectOperationPayload>()
+                        .is_ok_and(|progress| {
+                            progress.stream == operation.stream
+                                && match progress.state {
+                                    protocol::ProjectOperationState::Failed {
+                                        cleanup_may_be_partial: false,
+                                        ..
+                                    } => true,
+                                    protocol::ProjectOperationState::Failed {
+                                        ref message, ..
+                                    } => message.to_lowercase().contains(
+                                        if environment_replacement {
+                                            "environment"
+                                        } else if relocated {
+                                            "relocated"
+                                        } else {
+                                            "source is not the claimed git worktree"
+                                        },
+                                    ),
+                                    _ => false,
+                                }
+                        })
+            })
+            .await;
+        let settled: protocol::ProjectOperationPayload = settled.parse_payload().unwrap();
+        if relocated {
+            assert_eq!(
+                git_stdout(
+                    repo.path(),
+                    &["show-ref", "--verify", "refs/heads/owned-recovery"]
+                ),
+                owned_branch,
+                "recovery must preserve the branch still registered in a relocated worktree"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), &["show-ref", "--verify", &owner_ref]),
+                owned_claim,
+                "relocated worktree ownership proof must remain available for explicit recovery"
+            );
+            assert!(
+                git_stdout(repo.path(), &["worktree", "list", "--porcelain"])
+                    .contains(root.to_str().unwrap()),
+                "relocated registration must remain untouched"
+            );
+        }
+        assert!(
+            matches!(
+                settled.state,
+                protocol::ProjectOperationState::Failed {
+                    cleanup_may_be_partial: true,
+                    ..
+                }
+            ),
+            "replacement ownership conflict must retain the creation intent"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("unknown")).unwrap(),
+            "preserve"
+        );
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", "protected"]),
+            protected,
+            "unrelated protected ref untouched"
+        );
+        fixture
+            .client
+            .workbench_recover(protocol::WorkbenchRecoverPayload {
+                operation: operation.stream.clone(),
+                parent_project_id: ProjectId("not-owner".into()),
+            })
+            .await
+            .unwrap();
+        expect_command_error(&mut fixture.client, "wrong recovery parent").await;
+        fixture
+            .client
+            .workbench_create(WorkbenchCreatePayload {
+                parent_project_id: parent.id.clone(),
+                branch: GitBranchName("owned-recovery".into()),
+                name: "Must remain reserved".into(),
+            })
+            .await
+            .unwrap();
+        expect_command_error(
+            &mut fixture.client,
+            "retained intent protects owned resources",
+        )
+        .await;
+        if environment_replacement {
+            for contents in [r#"{"claim":"different-owner"}"#, "malformed claim document"] {
+                fs::write(root.join("claim.json"), contents).unwrap();
+                fixture
+                    .client
+                    .workbench_recover(protocol::WorkbenchRecoverPayload {
+                        operation: operation.stream.clone(),
+                        parent_project_id: parent.id.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let rejected = next_frame_matching_on(
+                    &mut fixture.client,
+                    "unowned internal environment claim rejected",
+                    |env| {
+                        env.kind == FrameKind::ProjectOperation
+                            && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(
+                                |progress| {
+                                    progress.stream != operation.stream
+                                        && matches!(progress.mutation, protocol::ProjectMutation::RecoverWorkbench(ref payload) if payload.operation == operation.stream)
+                                        && matches!(progress.state, protocol::ProjectOperationState::Failed { .. } | protocol::ProjectOperationState::Committed { .. })
+                                },
+                            )
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    rejected
+                        .parse_payload::<protocol::ProjectOperationPayload>()
+                        .unwrap()
+                        .state,
+                    protocol::ProjectOperationState::Failed {
+                        cleanup_may_be_partial: true,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    fs::read_to_string(root.join("unknown")).unwrap(),
+                    "preserve"
+                );
+                assert_eq!(
+                    fs::read_to_string(root.join("claim.json")).unwrap(),
+                    contents
+                );
+            }
+            fs::remove_file(root.join("claim.json")).unwrap();
+        }
+        fs::remove_file(root.join("unknown")).unwrap();
+        if relocated {
+            git(
+                repo.path(),
+                &[
+                    "worktree",
+                    "move",
+                    root.to_str().unwrap(),
+                    source.to_str().unwrap(),
+                ],
+            );
+        } else {
+            fs::remove_dir(&root).unwrap();
+        }
+        if environment_replacement {
+            fs::rename(&preserved_environment, &root)
+                .expect("restore only the preserved owned environment");
+            fs::remove_file(root.join("manifest.json"))
+                .expect("owned incomplete environment still supports explicit recovery");
+        }
+        fixture
+            .client
+            .workbench_recover(protocol::WorkbenchRecoverPayload {
+                operation: operation.stream.clone(),
+                parent_project_id: parent.id.clone(),
+            })
+            .await
+            .unwrap();
+        let mut original_settled = false;
+        next_frame_matching_on(&mut fixture.client, "explicit recovery and original operation completed", |env| {
+            if env.kind != FrameKind::ProjectOperation { return false; }
+            let progress: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+            if progress.stream == operation.stream {
+                original_settled |= matches!(progress.state, protocol::ProjectOperationState::Failed { cleanup_may_be_partial: false, .. });
+            }
+            matches!(progress.mutation, protocol::ProjectMutation::RecoverWorkbench(ref payload) if payload.operation == operation.stream)
+                && matches!(progress.state, protocol::ProjectOperationState::Committed { .. })
+        }).await;
+        assert!(
+            original_settled,
+            "explicit recovery must publish settlement on the original operation before its own completion, without reconnecting"
+        );
+        let replacement = create_workbench(&mut fixture.client, &parent, "owned-recovery").await;
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: replacement.id.clone(),
+                force: false,
+            })
+            .await
+            .unwrap();
+        next_frame_matching_on(&mut fixture.client, "recovered replacement deleted", |env| {
+            env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project } if project.id == replacement.id)
+        }).await;
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", "protected"]),
+            protected
+        );
+        eprintln!(
+            "CREATION OWNERSHIP EVIDENCE: unknown source/environment replacement preserved, wrong-parent recovery refused, retained intent blocks conflicting CREATE, explicit owned recovery permits retry"
         );
     }
 }

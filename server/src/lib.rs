@@ -194,6 +194,7 @@ pub async fn prepare_workbench_environment(
             worktree_root: protocol::ProjectRootPath(root.to_owned()),
         }],
         environment_root,
+        &uuid::Uuid::new_v4().to_string(),
     )
     .await
     .map_err(|error| error.to_string())

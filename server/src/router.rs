@@ -327,6 +327,17 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await?;
             }
+            FrameKind::WorkbenchRecover => {
+                let payload = parse_payload::<protocol::WorkbenchRecoverPayload>(
+                    &envelope,
+                    "workbench_recover",
+                )?;
+                host.admit_project_mutation(
+                    protocol::ProjectMutation::RecoverWorkbench(payload),
+                    host_output_stream.clone(),
+                )
+                .await?;
+            }
             FrameKind::WorkbenchRemove => {
                 let payload: WorkbenchRemovePayload = parse_payload(&envelope, "workbench_remove")?;
                 ensure_non_empty("workbench_remove", "id", payload.id.0.as_str())?;

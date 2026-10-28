@@ -1059,6 +1059,7 @@ pub enum FrameKind {
     ProjectDelete,
     WorkbenchCreate,
     WorkbenchRemove,
+    WorkbenchRecover,
     ProjectOperation,
     CustomAgentUpsert,
     CustomAgentDelete,
@@ -1288,6 +1289,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectDelete => f.write_str("project_delete"),
             Self::WorkbenchCreate => f.write_str("workbench_create"),
             Self::WorkbenchRemove => f.write_str("workbench_remove"),
+            Self::WorkbenchRecover => f.write_str("workbench_recover"),
             Self::ProjectOperation => f.write_str("project_operation"),
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
@@ -6438,6 +6440,7 @@ pub enum ProjectMutation {
     DeleteRoot(ProjectDeleteRootPayload),
     CreateWorkbench(WorkbenchCreatePayload),
     RemoveWorkbench(WorkbenchRemovePayload),
+    RecoverWorkbench(WorkbenchRecoverPayload),
     Rename(ProjectRenamePayload),
     Reorder(ProjectReorderPayload),
 }
@@ -6499,6 +6502,27 @@ pub struct WorkbenchCreatePayload {
     pub parent_project_id: ProjectId,
     pub branch: GitBranchName,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkbenchRecoverPayload {
+    pub operation: StreamPath,
+    pub parent_project_id: ProjectId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkbenchCreationRoot {
+    pub root: WorkbenchRoot,
+    pub base_commit: String,
+    pub parent_root_dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkbenchCreationIntent {
+    pub operation: StreamPath,
+    pub payload: WorkbenchCreatePayload,
+    pub roots: Vec<WorkbenchCreationRoot>,
+    pub environment_directory: Option<HostAbsPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -126,8 +126,10 @@ must not be selected as artifacts.
 
 Cohorts live in the Git common directory's `tyde-workbench-snapshots-v2`.
 Owned runtime resources live beside the host project store in
-`workbench-environments`. Persistent removal phases permit retry without
-reopening partly removed environments; there is no parallel project registry.
+`workbench-environments`. Creation acquires its environment directory
+atomically together with a private creation claim. Persistent removal phases
+permit retry without reopening partly removed environments; there is no
+parallel project registry.
 
 ## Optional project configuration
 

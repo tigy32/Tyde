@@ -236,6 +236,7 @@ pub fn request_scope(host: &str, stream: &StreamPath, kind: FrameKind) -> Option
         | FrameKind::ProjectDelete
         | FrameKind::WorkbenchCreate
         | FrameKind::WorkbenchRemove
+        | FrameKind::WorkbenchRecover
         | FrameKind::ProjectRename
         | FrameKind::ProjectReorder => Some(NoticeScope::ProjectOperations(host.to_owned())),
         FrameKind::TerminalCreate => Some(NoticeScope::Terminals),
@@ -448,6 +449,7 @@ fn mutation_project(mutation: &protocol::ProjectMutation) -> Option<&ProjectId> 
         ProjectMutation::AddRoot(payload) => Some(&payload.id),
         ProjectMutation::DeleteRoot(payload) => Some(&payload.id),
         ProjectMutation::CreateWorkbench(payload) => Some(&payload.parent_project_id),
+        ProjectMutation::RecoverWorkbench(payload) => Some(&payload.parent_project_id),
         ProjectMutation::RemoveWorkbench(payload) => Some(&payload.id),
         ProjectMutation::Rename(payload) => Some(&payload.id),
     }
@@ -491,6 +493,7 @@ pub(crate) fn mutation_label(
             payload.branch,
             project_label(state, host, &payload.parent_project_id)
         ),
+        ProjectMutation::RecoverWorkbench(_) => "Recover interrupted workbench creation".to_owned(),
         ProjectMutation::RemoveWorkbench(payload) => format!(
             "Remove workbench {}",
             project_label(state, host, &payload.id)

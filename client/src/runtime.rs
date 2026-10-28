@@ -346,6 +346,13 @@ impl HostCommands {
         self.send(FrameKind::WorkbenchCreate, &payload).await
     }
 
+    pub async fn workbench_recover(
+        &self,
+        payload: protocol::WorkbenchRecoverPayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::WorkbenchRecover, &payload).await
+    }
+
     pub async fn workbench_remove(
         &self,
         payload: WorkbenchRemovePayload,

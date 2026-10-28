@@ -1716,6 +1716,15 @@ pub fn submit_project_mutation(
                 )
                 .await
             }
+            protocol::ProjectMutation::RecoverWorkbench(payload) => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    stream,
+                    FrameKind::WorkbenchRecover,
+                    payload,
+                )
+                .await
+            }
             protocol::ProjectMutation::RemoveWorkbench(payload) => {
                 crate::send::send_frame_unreported(
                     &host_id,

@@ -817,6 +817,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::ProjectDelete
         | FrameKind::WorkbenchCreate
         | FrameKind::WorkbenchRemove
+        | FrameKind::WorkbenchRecover
         | FrameKind::CustomAgentUpsert
         | FrameKind::CustomAgentDelete
         | FrameKind::SteeringUpsert

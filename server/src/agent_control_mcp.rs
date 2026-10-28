@@ -547,6 +547,12 @@ struct RemoveWorkbenchToolInput {
     force: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RecoverWorkbenchToolInput {
+    operation: String,
+    parent_project_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateWorkbenchResult {
     project_id: String,
@@ -570,6 +576,7 @@ struct CreatedWorkbenchRootResult {
 struct ListWorkbenchesResult {
     caller_project_id: Option<String>,
     projects: Vec<ProjectOverview>,
+    interrupted_creations: Vec<protocol::WorkbenchCreationIntent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -881,7 +888,10 @@ async fn swarm_tool_allowed(
 ) -> Result<bool, String> {
     if !matches!(
         tool_name,
-        "tyde_list_workbenches" | "tyde_create_workbench" | "tyde_remove_workbench"
+        "tyde_list_workbenches"
+            | "tyde_create_workbench"
+            | "tyde_remove_workbench"
+            | "tyde_recover_workbench_creation"
     ) {
         return Ok(swarm_tool_allowed_for_policy(
             protocol::SwarmWorkspacePolicy::ReadOnly,
@@ -919,7 +929,10 @@ fn swarm_tool_allowed_for_policy(policy: protocol::SwarmWorkspacePolicy, tool_na
         }
     ) && matches!(
         tool_name,
-        "tyde_list_workbenches" | "tyde_create_workbench" | "tyde_remove_workbench"
+        "tyde_list_workbenches"
+            | "tyde_create_workbench"
+            | "tyde_remove_workbench"
+            | "tyde_recover_workbench_creation"
     ))
 }
 
@@ -1634,6 +1647,39 @@ impl TydeAgentControlMcpServer {
         let project_id = input.project_id.clone();
         match do_remove_workbench(&self.host, &caller, input).await {
             Ok(()) => ok_json(json!({ "project_id": project_id, "removed": true })),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Retry owned rollback of an interrupted workbench creation listed by tyde_list_workbenches. Never adopts directories or discards changed/unowned resources. Requires the exact operation and its canonical parent project."
+    )]
+    async fn tyde_recover_workbench_creation(
+        &self,
+        Parameters(input): Parameters<RecoverWorkbenchToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let caller =
+                require_authenticated_caller(self, &parts, "tyde_recover_workbench_creation")
+                    .await?;
+            let (canonical, _) = caller_project_scope(&self.host, &caller).await?;
+            let parent = parse_project_id(&input.parent_project_id)?;
+            if parent != canonical {
+                return Err("Creation is outside the caller's canonical project".to_owned());
+            }
+            self.host
+                .recover_workbench_creation(protocol::WorkbenchRecoverPayload {
+                    operation: protocol::StreamPath(input.operation.clone()),
+                    parent_project_id: parent,
+                })
+                .await
+                .map_err(|error| error.message)?;
+            Ok::<_, String>(json!({"operation": input.operation, "rolled_back": true}))
+        }
+        .await;
+        match result {
+            Ok(value) => ok_json(value),
             Err(error) => Ok(err_text(error)),
         }
     }
@@ -2984,6 +3030,16 @@ async fn do_list_workbenches(
         let (caller_project_id, projects) = caller_project_scope(host, caller).await?;
         (Some(caller_project_id), projects)
     };
+    let interrupted_creations = host
+        .project_catalog
+        .snapshot_creations()
+        .into_iter()
+        .filter(|intent| {
+            projects
+                .iter()
+                .any(|project| project.id == intent.payload.parent_project_id)
+        })
+        .collect();
     let projects = projects
         .into_iter()
         .map(|project| {
@@ -3022,6 +3078,7 @@ async fn do_list_workbenches(
     Ok(ListWorkbenchesResult {
         caller_project_id: caller_project_id.map(|id| id.0),
         projects,
+        interrupted_creations,
     })
 }
 

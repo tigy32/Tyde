@@ -347,11 +347,51 @@ must not be repeated. Its `ProjectMutationCommitted` context and resource
 `Committed { warnings }` event preserve that distinction; the durable record
 is not rolled back.
 
-Bootstrap replays only CURRENT in-flight operations using the same events.
-Disconnect does not cancel owned work. There is no terminal-operation history,
-automatic resend, deduplication, exactly-once promise, or crash journal. After
-restart the persisted catalog is authoritative; partially completed external
-work may require explicit repair.
+Bootstrap replays current operations using the same events. Disconnect does not
+cancel owned work. There is no automatic resend, deduplication, or exactly-once
+promise. Workbench creation additionally persists typed ownership intents and
+the latest 128 creation outcomes in the project store so crash recovery has a
+durable completion event, even if it finishes before a client reconnects.
+
+Before creating a branch, source worktree, or environment, the catalog persists
+`WorkbenchCreationIntent`. Its operation UUID claims the branch through a Git
+ref transaction and the environment through an internal `claim.json` acquired
+atomically with its directory. The intent records the canonical absolute source
+path before creation by resolving its existing parent directory, so ownership
+comparison does not depend on a symlink spelling or the source still existing.
+The final catalog write registers the project and settles its intent together.
+A committed project is never rolled back on
+restart or because subsequent derived work fails.
+
+The registration commit records follow-up as unconfirmed until the catalog
+actor persists the actual settled warnings before terminal publication. A
+restart during follow-up therefore reports unconfirmed derived state, not
+invented clean success; later warning replay preserves required repair.
+
+Startup rolls back only resources proven to belong to an unsettled intent. Git
+registration is checked independently of directory existence and must be gone
+before its branch/claim are released. A registration of the claimed branch at
+another path is an ownership conflict: preserve the relocated worktree, branch,
+claim and intent rather than adopting or deleting them. Environment cleanup
+requires the exact internal claim, including incomplete environments and pre-rename staging
+directories. It does not inspect or publish build artifacts. Missing, malformed,
+symlinked, or different claims preserve the resource and intent; source/ref
+ownership conflicts do likewise. Retained intents keep their resource-scoped
+reservations and expose failed recovery through `ProjectOperationPayload`.
+
+`WorkbenchRecover` retries owned rollback for an exact operation and canonical
+parent, also exposed as `tyde_recover_workbench_creation`. Authorized workbench
+listing includes the typed unsettled intents. Recovery never discovers or
+adopts projects from directory names, and cannot claim legacy resources that
+predate the journal. After successful rollback, the original CREATE can be
+retried. Explicit recovery publishes the original operation's settlement before
+its own completion, so connected clients do not need to reconnect. Unknown
+occupants must be safely removed or the original owned
+resource restored before recovery can complete.
+
+Git preflight requires distinct common directories across parent roots: linked
+roots of one repository cannot check out the same new branch twice. Both
+engines reject this layout before acquiring any branch or creation claims.
 
 The catalog sends generation-stamped full records one-way to project actors.
 Root authorization and root-scoped metadata are adopted before watcher/scanning

@@ -738,6 +738,14 @@ impl Connection {
             .await
     }
 
+    pub async fn workbench_recover(
+        &mut self,
+        payload: protocol::WorkbenchRecoverPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::WorkbenchRecover, &payload)
+            .await
+    }
+
     pub async fn workbench_remove(
         &mut self,
         payload: WorkbenchRemovePayload,

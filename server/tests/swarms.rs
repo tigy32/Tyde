@@ -2246,6 +2246,7 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             expected.extend([
                 "tyde_list_workbenches",
                 "tyde_create_workbench",
+                "tyde_recover_workbench_creation",
                 "tyde_remove_workbench",
             ]);
         }
@@ -2266,9 +2267,12 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
         );
 
         let create_args = json!({ "parent_project_id": parent.id.0, "branch": "new-workbench" });
+        let operation = format!("/project-operation/{}", uuid::Uuid::new_v4());
+        let recover_args = json!({"operation": operation, "parent_project_id": parent.id.0});
         if !broad {
             tool_error(&call_tool(&caller, "tyde_create_workbench", create_args).await);
             tool_error(&call_tool(&caller, "tyde_list_workbenches", json!({})).await);
+            tool_error(&call_tool(&caller, "tyde_recover_workbench_creation", recover_args).await);
             let mut outside = publication(
                 SwarmBoard::Coordination,
                 "outside-scope",
@@ -2291,6 +2295,18 @@ async fn workspace_scopes_authorize_current_projects_workbenches_and_resume_root
             );
             continue;
         }
+        let outside_recovery = call_tool(
+            &caller,
+            "tyde_recover_workbench_creation",
+            json!({"operation": operation, "parent_project_id": other.id.0}),
+        )
+        .await;
+        tool_error(&outside_recovery);
+        assert!(outside_recovery.content.iter().any(|content| matches!(&content.raw, RawContent::Text(text) if text.text.contains("outside the caller's canonical project"))));
+        let missing_recovery =
+            call_tool(&caller, "tyde_recover_workbench_creation", recover_args).await;
+        tool_error(&missing_recovery);
+        assert!(missing_recovery.content.iter().any(|content| matches!(&content.raw, RawContent::Text(text) if text.text.contains("No interrupted creation exists"))));
         let created: Value =
             tool_value(&call_tool(&caller, "tyde_create_workbench", create_args).await);
         let fresh_id = protocol::ProjectId(

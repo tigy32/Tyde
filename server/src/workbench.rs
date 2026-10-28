@@ -219,9 +219,14 @@ pub(crate) fn support() -> WorkbenchSupport {
     support
 }
 
+/// Acquires `environment_root` atomically with `claim.json` holding `claim`,
+/// staged at its sibling `.claim-<claim>`. The runner fails on an occupied
+/// path without touching it; creation recovery must likewise remove only a
+/// directory whose `claim.json` holds its own claim.
 pub(crate) async fn prepare(
     roots: &[protocol::WorkbenchRoot],
     environment_root: &Path,
+    claim: &str,
 ) -> AppResult<WorkbenchEnvironment> {
     if !cfg!(target_os = "linux") {
         return Err(AppError::invalid(
@@ -265,7 +270,16 @@ pub(crate) async fn prepare(
         .map_err(|error| AppError::internal("workbench_create", error))?;
     std::io::Write::write_all(&mut setup, include_str!("workbench/setup.py").as_bytes())
         .map_err(|error| AppError::internal("workbench_create", error))?;
-    invoke("prepare", &[request.path(), environment_root, setup.path()]).await
+    invoke(
+        "prepare",
+        &[
+            request.path(),
+            environment_root,
+            setup.path(),
+            Path::new(claim),
+        ],
+    )
+    .await
 }
 
 #[derive(Deserialize)]

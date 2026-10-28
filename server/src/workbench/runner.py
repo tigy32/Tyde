@@ -2,6 +2,7 @@
 import array
 import contextlib
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -28,6 +29,8 @@ ARTIFACT_CONTRACT = "existing_artifacts_v1"
 LOGICAL_ROOT = "/mnt/tyde-workspace"
 RUNTIME = "/mnt/tyde-runtime"
 RECEIPTS = "/mnt/tyde-producer-receipts"
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 
 
 class Failure(Exception):
@@ -396,7 +399,33 @@ def workspace_clean(manifest):
         assert_clean(Path(record["root"]), record["configuration"])
 
 
-def prepare(request_path, directory, setup_path):
+def acquire_environment(directory, claim):
+    # The directory appears atomically with its creation claim, so creation
+    # recovery removes only what this attempt acquired, never an occupant.
+    if not claim or len(claim) > 64 or any(not (character.isascii() and (character.isalnum() or character in "-_")) for character in claim):
+        fail("incompatible_environment", "Workbench environment claim is malformed")
+    directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    staging = directory.parent / (".claim-" + claim)
+    staging.mkdir(mode=0o700)
+    try:
+        save(staging / "claim.json", {"claim": claim})
+        descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.renameat2(AT_FDCWD, os.fsencode(staging), AT_FDCWD, os.fsencode(directory), RENAME_NOREPLACE):
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                fail("incompatible_environment", "The workbench environment path is already occupied")
+            raise OSError(error, os.strerror(error), str(directory))
+    except BaseException:
+        shutil.rmtree(staging)
+        raise
+
+
+def prepare(request_path, directory, setup_path, claim):
     import runpy
     request = load(request_path)
     roots = request["roots"]
@@ -443,7 +472,7 @@ def prepare(request_path, directory, setup_path):
                     config[key].append(value)
     validate_configuration(config)
     directory = Path(directory).resolve()
-    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    acquire_environment(directory, claim)
     try:
         root = Path(records[0]["root"])
         common = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).strip())

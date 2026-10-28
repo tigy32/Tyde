@@ -126,12 +126,7 @@ use crate::backend::{
 #[derive(Clone, Debug)]
 pub(crate) struct BaseRevision(pub(crate) String);
 
-#[derive(Clone, Debug)]
-pub(crate) struct CreatedWorkbenchRoot {
-    pub(crate) root: WorkbenchRoot,
-    pub(crate) base_commit: String,
-    pub(crate) parent_root_dirty: bool,
-}
+pub(crate) type CreatedWorkbenchRoot = protocol::WorkbenchCreationRoot;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CreatedWorkbench {
@@ -8399,6 +8394,15 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
 
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
         self.complete_project_mutation(protocol::ProjectMutation::Delete(payload), None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn recover_workbench_creation(
+        &self,
+        payload: protocol::WorkbenchRecoverPayload,
+    ) -> AppResult<()> {
+        self.complete_project_mutation(protocol::ProjectMutation::RecoverWorkbench(payload), None)
             .await
             .map(|_| ())
     }
@@ -18675,8 +18679,35 @@ async fn preflight_workbench_create(
         ));
     }
 
+    let mut common_directories = HashSet::new();
     for root in roots {
         ensure_git_top_level(&root.parent_root).await?;
+        let output = run_git(
+            &root.parent_root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await
+        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        if !output.status.success() {
+            return Err(AppError::internal(
+                OPERATION,
+                anyhow!(
+                    "Cannot read Git common directory: {}",
+                    git_output_message(&output)
+                ),
+            ));
+        }
+        let common = String::from_utf8(output.stdout)
+            .map_err(|error| AppError::internal(OPERATION, error))?;
+        let common = tokio::fs::canonicalize(common.trim())
+            .await
+            .map_err(|error| AppError::internal(OPERATION, error))?;
+        if !common_directories.insert(common) {
+            return Err(AppError::invalid(
+                OPERATION,
+                "Workbench roots must have distinct Git common directories; one branch cannot be checked out twice in the same repository",
+            ));
+        }
     }
     for root in roots {
         let output = run_git(
@@ -18808,36 +18839,6 @@ async fn git_branch_exists(
     Ok(output.status.success())
 }
 
-async fn git_worktree_add(
-    parent_root: &ProjectRootPath,
-    worktree_root: &ProjectRootPath,
-    branch: &GitBranchName,
-    base_commit: &str,
-) -> Result<(), String> {
-    let output = run_git(
-        parent_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch.0,
-            &worktree_root.0,
-            base_commit,
-        ],
-    )
-    .await?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "git worktree add failed for parent root {} branch {} worktree {}: {}",
-        parent_root,
-        branch,
-        worktree_root,
-        git_output_message(&output)
-    ))
-}
-
 async fn git_resolve_base_commit(
     parent_root: &ProjectRootPath,
     base: Option<&BaseRevision>,
@@ -18922,65 +18923,6 @@ async fn git_status_porcelain(worktree_root: &ProjectRootPath) -> Result<String,
         .map_err(|error| format!("git status output was not valid UTF-8: {error}"))
 }
 
-async fn rollback_workbench_environment(directory: &Path) -> Option<String> {
-    match tokio::fs::try_exists(directory).await {
-        Ok(false) => None,
-        Ok(true) => tokio::fs::remove_dir_all(directory)
-            .await
-            .err()
-            .map(|error| format!("Environment rollback failed: {error}")),
-        Err(error) => Some(format!("Environment rollback inspection failed: {error}")),
-    }
-}
-
-async fn rollback_created_worktrees(
-    created: &[WorkbenchRoot],
-    branch: &GitBranchName,
-) -> Option<String> {
-    let mut failures = Vec::new();
-    for root in created.iter().rev() {
-        match run_git(
-            &root.parent_root,
-            &["worktree", "remove", "--force", &root.worktree_root.0],
-        )
-        .await
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => failures.push(format!(
-                "rollback git worktree remove --force failed for {}: {}",
-                root.worktree_root,
-                git_output_message(&output)
-            )),
-            Err(error) => failures.push(format!(
-                "rollback git worktree remove --force failed for {}: {}",
-                root.worktree_root, error
-            )),
-        }
-        // `git worktree add -b` created this branch in the parent repo;
-        // delete it so retrying the identical create passes the
-        // branch-exists preflight. The branch still points at the parent
-        // HEAD (no work happened), so `-D` cannot lose anything.
-        match run_git(&root.parent_root, &["branch", "-D", &branch.0]).await {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => failures.push(format!(
-                "rollback git branch -D {} failed for {}: {}",
-                branch,
-                root.parent_root,
-                git_output_message(&output)
-            )),
-            Err(error) => failures.push(format!(
-                "rollback git branch -D {} failed for {}: {}",
-                branch, root.parent_root, error
-            )),
-        }
-    }
-    if failures.is_empty() {
-        None
-    } else {
-        Some(failures.join("; "))
-    }
-}
-
 async fn git_worktree_prune(parent_root: &ProjectRootPath) -> Result<(), String> {
     let output = run_git(parent_root, &["worktree", "prune"]).await?;
     if output.status.success() {
@@ -18991,13 +18933,6 @@ async fn git_worktree_prune(parent_root: &ProjectRootPath) -> Result<(), String>
         parent_root,
         git_output_message(&output)
     ))
-}
-
-fn append_rollback_message(error: String, rollback_message: Option<String>) -> String {
-    match rollback_message {
-        Some(rollback_message) => format!("{error}; rollback failures: {rollback_message}"),
-        None => error,
-    }
 }
 
 async fn run_git(root: &ProjectRootPath, args: &[&str]) -> Result<std::process::Output, String> {

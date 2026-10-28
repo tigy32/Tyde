@@ -3,21 +3,24 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    GitBranchName, Project, ProjectId, ProjectReorderScope, ProjectRootPath, ProjectSource,
-    WorkbenchRoot,
+    Project, ProjectId, ProjectReorderScope, ProjectRootPath, ProjectSource, WorkbenchRoot,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::write_seq::peek_write_seq;
 
-const STORE_VERSION: u32 = 3;
+const STORE_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
 struct StoreFile {
     #[serde(default)]
     write_seq: u64,
     records: HashMap<String, Project>,
+    #[serde(default)]
+    creations: HashMap<protocol::StreamPath, protocol::WorkbenchCreationIntent>,
+    #[serde(default)]
+    creation_outcomes: Vec<protocol::ProjectOperationPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +28,8 @@ struct StoreFileRef<'a> {
     write_seq: u64,
     version: u32,
     records: &'a HashMap<String, Project>,
+    creations: &'a HashMap<protocol::StreamPath, protocol::WorkbenchCreationIntent>,
+    creation_outcomes: &'a [protocol::ProjectOperationPayload],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,11 +113,19 @@ pub struct ProjectStore {
     path: PathBuf,
     records: HashMap<String, Project>,
     write_seq: u64,
+    creations: HashMap<protocol::StreamPath, protocol::WorkbenchCreationIntent>,
+    creation_outcomes: Vec<protocol::ProjectOperationPayload>,
 }
 
 impl ProjectStore {
     pub fn load(path: PathBuf) -> Result<Self, ProjectStoreError> {
-        let (write_seq, mut records, migrated) = Self::read_from_disk(&path)?;
+        let (file, migrated) = Self::read_from_disk(&path)?;
+        let StoreFile {
+            write_seq,
+            mut records,
+            creations,
+            creation_outcomes,
+        } = file;
         let heal_actions = heal_duplicate_standalone_roots(&mut records);
         for action in &heal_actions {
             tracing::warn!("project store heal: {action}");
@@ -133,11 +146,108 @@ impl ProjectStore {
             path,
             records,
             write_seq,
+            creations,
+            creation_outcomes,
         };
         if migrated || !heal_actions.is_empty() || quarantined_records {
             store.save_current()?;
         }
         Ok(store)
+    }
+
+    pub(crate) fn creations(&self) -> Vec<protocol::WorkbenchCreationIntent> {
+        self.creations.values().cloned().collect()
+    }
+
+    pub(crate) fn creation(
+        &self,
+        operation: &protocol::StreamPath,
+    ) -> Option<protocol::WorkbenchCreationIntent> {
+        self.creations.get(operation).cloned()
+    }
+
+    pub(crate) fn creation_outcomes(&self) -> &[protocol::ProjectOperationPayload] {
+        &self.creation_outcomes
+    }
+
+    pub(crate) fn begin_creation(
+        &mut self,
+        intent: protocol::WorkbenchCreationIntent,
+    ) -> Result<(), ProjectStoreError> {
+        if self.creations.contains_key(&intent.operation) {
+            return Err(ProjectStoreError::conflict(
+                "Creation intent already exists",
+            ));
+        }
+        self.creations.insert(intent.operation.clone(), intent);
+        self.persist_candidate(self.records.clone())
+    }
+
+    fn finish_creation(
+        &mut self,
+        operation: &protocol::StreamPath,
+        committed: bool,
+    ) -> Result<protocol::ProjectOperationPayload, ProjectStoreError> {
+        let intent = self
+            .creations
+            .remove(operation)
+            .ok_or_else(|| ProjectStoreError::not_found("Creation intent is missing"))?;
+        self.creation_outcomes
+            .retain(|outcome| &outcome.stream != operation);
+        let outcome = protocol::ProjectOperationPayload {
+            host_id: protocol::HostFilterId(protocol::LOCAL_HOST_ID.into()),
+            stream: operation.clone(),
+            mutation: protocol::ProjectMutation::CreateWorkbench(intent.payload),
+            state: if committed {
+                // A crash before follow-up settles must not replay clean success.
+                protocol::ProjectOperationState::Committed { warnings: vec![protocol::ProjectOperationWarning {
+                    stage: protocol::ProjectOperationStage::Fanout,
+                    message: "Catalog committed; post-commit work is unconfirmed. Inspect derived state; do not repeat CREATE".into(),
+                }] }
+            } else {
+                protocol::ProjectOperationState::Failed {
+                    code: protocol::CommandErrorCode::Internal,
+                    message:
+                        "Interrupted creation rolled back; the original CREATE may now be retried"
+                            .into(),
+                    cleanup_may_be_partial: false,
+                }
+            },
+        };
+        self.creation_outcomes.push(outcome.clone());
+        if self.creation_outcomes.len() > 128 {
+            self.creation_outcomes.remove(0);
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn rollback_creation(
+        &mut self,
+        operation: &protocol::StreamPath,
+    ) -> Result<protocol::ProjectOperationPayload, ProjectStoreError> {
+        let outcome = self.finish_creation(operation, false)?;
+        self.persist_candidate(self.records.clone())?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn settle_creation(
+        &mut self,
+        operation: &protocol::StreamPath,
+        warnings: Vec<protocol::ProjectOperationWarning>,
+    ) -> Result<(), ProjectStoreError> {
+        let outcome = self
+            .creation_outcomes
+            .iter_mut()
+            .find(|outcome| &outcome.stream == operation)
+            .ok_or_else(|| ProjectStoreError::not_found("Committed creation outcome is missing"))?;
+        if !matches!(
+            outcome.state,
+            protocol::ProjectOperationState::Committed { .. }
+        ) {
+            return Err(ProjectStoreError::conflict("Creation has not committed"));
+        }
+        outcome.state = protocol::ProjectOperationState::Committed { warnings };
+        self.persist_candidate(self.records.clone())
     }
 
     pub fn default_path() -> Result<PathBuf, ProjectStoreError> {
@@ -404,13 +514,23 @@ impl ProjectStore {
 
     pub fn create_workbench(
         &mut self,
-        parent_project_id: ProjectId,
-        name: String,
-        branch: GitBranchName,
-        roots: Vec<WorkbenchRoot>,
+        operation: &protocol::StreamPath,
         environment: protocol::WorkbenchEnvironment,
     ) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
+        let intent = self
+            .creation(operation)
+            .ok_or_else(|| ProjectStoreError::not_found("Creation intent is missing"))?;
+        let protocol::WorkbenchCreatePayload {
+            parent_project_id,
+            name,
+            branch,
+        } = intent.payload;
+        let roots = intent
+            .roots
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>();
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
         if branch.0.trim().is_empty() {
             return Err(ProjectStoreError::invalid_input(
@@ -457,6 +577,7 @@ impl ProjectStore {
         };
         let mut records = self.records.clone();
         records.insert(id.0.clone(), project.clone());
+        self.finish_creation(operation, true)?;
         self.persist_candidate(records)?;
         Ok(project)
     }
@@ -526,14 +647,18 @@ impl ProjectStore {
         children.into_iter().map(|project| project.id).collect()
     }
 
-    fn read_from_disk(
-        path: &Path,
-    ) -> Result<(u64, HashMap<String, Project>, bool), ProjectStoreError> {
+    fn read_from_disk(path: &Path) -> Result<(StoreFile, bool), ProjectStoreError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => Self::parse_store_file(path, &contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok((0, HashMap::new(), false))
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((
+                StoreFile {
+                    write_seq: 0,
+                    records: HashMap::new(),
+                    creations: HashMap::new(),
+                    creation_outcomes: Vec::new(),
+                },
+                false,
+            )),
             Err(err) => Err(ProjectStoreError::internal(format!(
                 "Failed to read project store {}: {err}",
                 path.display()
@@ -544,7 +669,7 @@ impl ProjectStore {
     fn parse_store_file(
         path: &Path,
         contents: &str,
-    ) -> Result<(u64, HashMap<String, Project>, bool), ProjectStoreError> {
+    ) -> Result<(StoreFile, bool), ProjectStoreError> {
         let value = serde_json::from_str::<serde_json::Value>(contents).map_err(|err| {
             ProjectStoreError::internal(format!(
                 "Failed to parse project store {}: {err}",
@@ -553,18 +678,14 @@ impl ProjectStore {
         })?;
         let version = value.get("version").and_then(serde_json::Value::as_u64);
         match version {
-            Some(version) if version == STORE_VERSION as u64 || version == 2 => {
+            Some(version) if version == STORE_VERSION as u64 || version == 2 || version == 3 => {
                 let store = serde_json::from_value::<StoreFile>(value).map_err(|err| {
                     ProjectStoreError::internal(format!(
                         "Failed to parse project store {}: {err}",
                         path.display()
                     ))
                 })?;
-                Ok((
-                    store.write_seq,
-                    store.records,
-                    version != STORE_VERSION as u64,
-                ))
+                Ok((store, version != STORE_VERSION as u64))
             }
             Some(version) => Err(ProjectStoreError::internal(format!(
                 "Unsupported project store version {} in {}",
@@ -595,7 +716,15 @@ impl ProjectStore {
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                Ok((0, records, true))
+                Ok((
+                    StoreFile {
+                        write_seq: 0,
+                        records,
+                        creations: HashMap::new(),
+                        creation_outcomes: Vec::new(),
+                    },
+                    true,
+                ))
             }
         }
     }
@@ -609,9 +738,11 @@ impl ProjectStore {
     }
 
     fn reload(&mut self) -> Result<(), ProjectStoreError> {
-        let (write_seq, records, _) = Self::read_from_disk(&self.path)?;
-        self.records = records;
-        self.write_seq = write_seq;
+        let (file, _) = Self::read_from_disk(&self.path)?;
+        self.records = file.records;
+        self.write_seq = file.write_seq;
+        self.creations = file.creations;
+        self.creation_outcomes = file.creation_outcomes;
         Ok(())
     }
 
@@ -628,7 +759,13 @@ impl ProjectStore {
             ));
         }
         let new_seq = self.write_seq.saturating_add(1);
-        Self::save_to_path(&self.path, new_seq, &records)?;
+        Self::save_to_path(
+            &self.path,
+            new_seq,
+            &records,
+            &self.creations,
+            &self.creation_outcomes,
+        )?;
         self.records = records;
         self.write_seq = new_seq;
         Ok(())
@@ -636,7 +773,13 @@ impl ProjectStore {
 
     fn save_current(&mut self) -> Result<(), ProjectStoreError> {
         let new_seq = self.write_seq.saturating_add(1);
-        Self::save_to_path(&self.path, new_seq, &self.records)?;
+        Self::save_to_path(
+            &self.path,
+            new_seq,
+            &self.records,
+            &self.creations,
+            &self.creation_outcomes,
+        )?;
         self.write_seq = new_seq;
         Ok(())
     }
@@ -645,11 +788,15 @@ impl ProjectStore {
         path: &Path,
         write_seq: u64,
         records: &HashMap<String, Project>,
+        creations: &HashMap<protocol::StreamPath, protocol::WorkbenchCreationIntent>,
+        creation_outcomes: &[protocol::ProjectOperationPayload],
     ) -> Result<(), ProjectStoreError> {
         let json = serde_json::to_string_pretty(&StoreFileRef {
             write_seq,
             version: STORE_VERSION,
             records,
+            creations,
+            creation_outcomes,
         })
         .map_err(|err| {
             ProjectStoreError::internal(format!("Failed to serialize project store: {err}"))
