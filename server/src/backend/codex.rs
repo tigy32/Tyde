@@ -855,6 +855,7 @@ struct CodexSkillTreeManifestBuilder {
     hasher: Sha256,
     entries: usize,
     bytes: u64,
+    ancestors: HashSet<PathBuf>,
 }
 
 impl CodexSkillTreeManifestBuilder {
@@ -865,6 +866,7 @@ impl CodexSkillTreeManifestBuilder {
             hasher: Sha256::new(),
             entries: 1,
             bytes: 0,
+            ancestors: HashSet::new(),
         };
         builder.visit(&root, Path::new(""))?;
         let digest: [u8; 32] = builder.hasher.finalize().into();
@@ -879,24 +881,27 @@ impl CodexSkillTreeManifestBuilder {
     }
 
     fn visit(&mut self, path: &Path, relative: &Path) -> Result<(), String> {
-        let metadata = std::fs::symlink_metadata(path)
+        // Compare what the loader can read, not installation modes or link
+        // spellings. Resolve links before inspection so broken links, cycles,
+        // unreadable targets and unsupported entries remain explicit errors.
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|err| format!("Failed to resolve skill entry {}: {err}", path.display()))?;
+        let metadata = std::fs::metadata(&resolved)
             .map_err(|err| format!("Failed to inspect skill entry {}: {err}", path.display()))?;
         codex_hash_relative_path(&mut self.hasher, relative);
-        self.hasher
-            .update(codex_skill_permission_bits(&metadata).to_le_bytes());
         let file_type = metadata.file_type();
         if file_type.is_dir() {
-            self.hasher.update(b"d");
-            for name in self.sorted_entry_names(path)? {
-                self.visit(&path.join(&name), &relative.join(name))?;
+            if !self.ancestors.insert(resolved.clone()) {
+                return Err(format!(
+                    "Skill tree contains a directory cycle at {}",
+                    path.display()
+                ));
             }
-            return Ok(());
-        }
-        if file_type.is_symlink() {
-            self.hasher.update(b"l");
-            let target = std::fs::read_link(path)
-                .map_err(|err| format!("Failed to read skill link {}: {err}", path.display()))?;
-            codex_hash_os_string(&mut self.hasher, target.as_os_str());
+            self.hasher.update(b"d");
+            for name in self.sorted_entry_names(&resolved)? {
+                self.visit(&resolved.join(&name), &relative.join(name))?;
+            }
+            self.ancestors.remove(&resolved);
             return Ok(());
         }
         if !file_type.is_file() {
@@ -922,7 +927,7 @@ impl CodexSkillTreeManifestBuilder {
             ));
         }
         self.hasher.update(size.to_le_bytes());
-        let mut file = std::fs::File::open(path)
+        let mut file = std::fs::File::open(&resolved)
             .map_err(|err| format!("Failed to read skill file {}: {err}", path.display()))?;
         let mut buffer = [0u8; 64 * 1024];
         let mut read = 0u64;
@@ -979,17 +984,6 @@ fn codex_sorted_entry_names(path: &Path, limit: usize) -> Result<Vec<OsString>, 
     }
     names.sort();
     Ok(names)
-}
-
-#[cfg(unix)]
-fn codex_skill_permission_bits(metadata: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o777
-}
-
-#[cfg(not(unix))]
-fn codex_skill_permission_bits(metadata: &std::fs::Metadata) -> u32 {
-    u32::from(metadata.permissions().readonly())
 }
 
 fn codex_hash_relative_path(hasher: &mut Sha256, path: &Path) {
@@ -1130,13 +1124,24 @@ struct CodexSkillPreparation {
     diagnostics: Vec<String>,
 }
 
+enum CodexSelectedSkillError {
+    Conflict(String),
+    Inspection(String),
+}
+
+impl From<String> for CodexSelectedSkillError {
+    fn from(error: String) -> Self {
+        Self::Inspection(error)
+    }
+}
+
 fn prepare_codex_selected_skill(
     selected: &ResolvedSkill,
     ordinal: usize,
     baseline: &CodexSkillCatalog,
     projection_root: &Path,
     manifests: &mut HashMap<PathBuf, CodexSkillTreeManifest>,
-) -> Result<CodexExpectedSkillVisibility, String> {
+) -> Result<CodexExpectedSkillVisibility, CodexSelectedSkillError> {
     let related_errors = baseline
         .errors
         .iter()
@@ -1144,11 +1149,11 @@ fn prepare_codex_selected_skill(
         .map(CodexSkillCatalogError::display)
         .collect::<Vec<_>>();
     if !related_errors.is_empty() {
-        return Err(format!(
+        return Err(CodexSelectedSkillError::Inspection(format!(
             "Selected Tyde skill '{}' is ambiguous because Codex reported related discovery errors: {}",
             selected.name,
             related_errors.join("; ")
-        ));
+        )));
     }
     let unknown = baseline
         .skills
@@ -1156,25 +1161,27 @@ fn prepare_codex_selected_skill(
         .filter(|skill| skill.name == selected.name && skill.enabled.is_none())
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
-        return Err(format!(
+        return Err(CodexSelectedSkillError::Inspection(format!(
             "Selected Tyde skill '{}' conflicts with {} same-name Codex catalog entry or entries whose enabled state is unknown",
             selected.name,
             unknown.len()
-        ));
+        )));
     }
-    let same_name = baseline
+    let mut same_name = baseline
         .skills
         .iter()
         .filter(|skill| skill.enabled == Some(true) && skill.name == selected.name)
         .collect::<Vec<_>>();
+    same_name.sort_by(|left, right| left.locator.cmp(&right.locator));
+    let (_, selected_manifest) = codex_cached_skill_manifest(manifests, &selected.source_dir)?;
     let mut equivalent_visible = None;
     for native in same_name {
         let Some(native_skill_md) = codex_listed_filesystem_skill_md(native)? else {
-            return Err(format!(
+            return Err(CodexSelectedSkillError::Inspection(format!(
                 "Selected Tyde skill '{}' conflicts with enabled non-filesystem Codex skill locator {}; native invocation would be ambiguous",
                 selected.name,
                 native.locator.as_deref().unwrap_or("<opaque>")
-            ));
+            )));
         };
         let native_dir = native_skill_md.parent().ok_or_else(|| {
             format!(
@@ -1183,24 +1190,32 @@ fn prepare_codex_selected_skill(
                 native_skill_md.display()
             )
         })?;
-        let (_, selected_manifest) = codex_cached_skill_manifest(manifests, &selected.source_dir)?;
         let (_, native_manifest) = codex_cached_skill_manifest(manifests, native_dir)?;
+        tracing::debug!(
+            selected_entries = selected_manifest.entries,
+            native_entries = native_manifest.entries,
+            selected_bytes = selected_manifest.bytes,
+            native_bytes = native_manifest.bytes,
+            equivalent = selected_manifest == native_manifest,
+            "Compared complete Codex skill content"
+        );
         if selected_manifest == native_manifest {
-            equivalent_visible = Some(native_skill_md);
+            equivalent_visible.get_or_insert(native_skill_md);
         } else {
-            return Err(format!(
+            return Err(CodexSelectedSkillError::Conflict(format!(
                 "Selected Tyde skill '{}' at {} conflicts with a different enabled Codex skill at {}; rename or reconcile one of the complete skill trees",
                 selected.name,
                 selected.source_dir.display(),
                 native_dir.display()
-            ));
+            )));
         }
     }
 
     match equivalent_visible {
         Some(native_skill_md) => Ok(CodexExpectedSkillVisibility::Native(native_skill_md)),
         None => materialize_codex_skill(projection_root, selected, ordinal)
-            .map(CodexExpectedSkillVisibility::Projected),
+            .map(CodexExpectedSkillVisibility::Projected)
+            .map_err(Into::into),
     }
 }
 
@@ -1226,12 +1241,19 @@ fn prepare_codex_skills_blocking(
                 skill: selected,
                 visibility,
             }),
-            // The selection type does not decide this. An explicitly selected
-            // skill Tyde cannot project is one capability the session does not
-            // get; refusing to start would cost it all the others too. It does
-            // decide how loudly to say it: a skill a custom agent named by hand
-            // going missing is worth more than one of everything-installed.
-            Err(err) => {
+            Err(error) => {
+                let err = match error {
+                    CodexSelectedSkillError::Conflict(reason) => reason,
+                    CodexSelectedSkillError::Inspection(reason) => {
+                        if selection == SkillSelection::Explicit {
+                            return Err(format!(
+                                "Explicitly selected Tyde skill '{}' could not be inspected: {reason}",
+                                selected.name
+                            ));
+                        }
+                        reason
+                    }
+                };
                 discard_codex_skill_wrapper(&projection_root, ordinal)?;
                 tracing::warn!("Codex skill selection degraded: {err}");
                 diagnostics.push(format!(
@@ -1339,6 +1361,10 @@ fn verify_codex_prepared_skill(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    tracing::debug!(
+        enabled_count = enabled.len(),
+        "Verifying final Codex skill catalog content"
+    );
     if enabled.is_empty() {
         return CodexSkillVerdict::Unresolved(format!(
             "Selected Codex skill '{}' must resolve to exactly one enabled entry after \
@@ -1347,40 +1373,48 @@ fn verify_codex_prepared_skill(
             describe_matches()
         ));
     }
-    if enabled.len() > 1 {
-        // More than one enabled entry under the name: the skill resolves, but
-        // not necessarily to Tyde's copy. Reachable, so it stays; ambiguous, so
-        // it is reported.
-        return CodexSkillVerdict::Superseded(format!(
-            "Selected Codex skill '{}' must resolve to exactly one enabled entry after \
-             skills/extraRoots/set; found {} [{}], so Codex — not Tyde — decides which body runs. \
-             Rename the Tyde skill to give this session its own copy.",
-            selected.name,
-            enabled.len(),
-            describe_matches()
-        ));
-    }
-    let visible_skill_md = match codex_listed_filesystem_skill_md(enabled[0]) {
-        Ok(Some(path)) => path,
-        Ok(None) => {
-            return CodexSkillVerdict::Superseded(format!(
-                "Selected Codex skill '{}' resolved to non-filesystem locator {}, which is not the \
-                 copy Tyde projected",
-                selected.name,
-                enabled[0].locator.as_deref().unwrap_or("<opaque>")
-            ));
+    let expected_dir = match expected_skill_md.parent() {
+        Some(directory) => directory,
+        None => {
+            return CodexSkillVerdict::Unresolved("Expected skill path has no parent".to_owned());
         }
+    };
+    let mut manifests = HashMap::new();
+    let expected_manifest = match codex_cached_skill_manifest(&mut manifests, expected_dir) {
+        Ok((_, manifest)) => manifest,
         Err(err) => return CodexSkillVerdict::Unresolved(err),
     };
-    if visible_skill_md != expected_skill_md {
-        return CodexSkillVerdict::Superseded(format!(
-            "Selected Codex skill '{}' resolved to {} instead of the copy Tyde projected at {}, so \
-             a skill of the same name that was already installed won the name. The skill is \
-             available; rename the Tyde skill to use Tyde's copy instead.",
-            selected.name,
-            visible_skill_md.display(),
-            expected_skill_md.display()
-        ));
+    for native in enabled {
+        let visible_skill_md = match codex_listed_filesystem_skill_md(native) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                return CodexSkillVerdict::Superseded(format!(
+                    "Selected Codex skill '{}' resolved to non-filesystem locator {}, which is not the copy Tyde projected",
+                    selected.name,
+                    native.locator.as_deref().unwrap_or("<opaque>")
+                ));
+            }
+            Err(err) => return CodexSkillVerdict::Unresolved(err),
+        };
+        let visible_dir = match visible_skill_md.parent() {
+            Some(directory) => directory,
+            None => {
+                return CodexSkillVerdict::Unresolved(
+                    "Visible skill path has no parent".to_owned(),
+                );
+            }
+        };
+        let visible_manifest = match codex_cached_skill_manifest(&mut manifests, visible_dir) {
+            Ok((_, manifest)) => manifest,
+            Err(err) => return CodexSkillVerdict::Unresolved(err),
+        };
+        if visible_manifest != expected_manifest {
+            return CodexSkillVerdict::Superseded(format!(
+                "Selected Codex skill '{}' conflicts with a different enabled Codex skill at {}; reconcile the complete skill trees",
+                selected.name,
+                visible_dir.display()
+            ));
+        }
     }
     CodexSkillVerdict::Verified
 }
@@ -1475,16 +1509,21 @@ async fn configure_codex_native_skills(
                         diagnostics.push(note);
                     }
                 }
-                CodexSkillVerdict::Unresolved(reason) => failures.push((index, reason)),
+                CodexSkillVerdict::Unresolved(reason) => {
+                    if selection == SkillSelection::Explicit {
+                        return Err(format!(
+                            "Explicitly selected Tyde skill '{}' could not be verified: {reason}",
+                            prepared[index].skill.name
+                        ));
+                    }
+                    failures.push((index, reason));
+                }
             }
         }
         if failures.is_empty() {
             break;
         }
 
-        // The selection type does not change the outcome. A custom agent that
-        // named its skills is still that agent with one fewer, and refusing to
-        // start would cost it every skill that *did* resolve.
         let last_pass = verification + 1 == maximum_verifications;
         let failed_indices = failures
             .iter()
@@ -1551,10 +1590,8 @@ async fn configure_codex_native_skills(
 
 /// Turn a failure to configure skills into a session that starts without them.
 ///
-/// Every way skill configuration can fail — an app-server that rejects
-/// `skills/extraRoots/set`, a catalog Tyde cannot read, a projection it cannot
-/// write — costs the session its Tyde skills and nothing else. The session
-/// starts, and this is the notice that says what it is missing.
+/// Only the all-installed selection may omit unavailable skills with a notice.
+/// Explicit selection errors propagate to the startup boundary instead.
 fn codex_skills_unavailable(selected_skills: &[ResolvedSkill], reason: &str) -> CodexSkillSetup {
     let names = selected_skills
         .iter()
@@ -1808,14 +1845,14 @@ impl CodexSession {
             selected_skills,
             skill_selection,
         } = options;
-        // A session that cannot reach Tyde's skills runs without them. Dropping
-        // the selection here — rather than refusing the spawn — is what keeps a
-        // remote workspace usable to a skill-bearing agent.
         let mut skill_notices: Vec<String> = Vec::new();
         let mut selected_skills = selected_skills;
         if let Some(notice) =
             codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
         {
+            if skill_selection == SkillSelection::Explicit {
+                return Err(notice);
+            }
             tracing::warn!("{notice}");
             skill_notices.push(notice);
             selected_skills = &[];
@@ -1823,6 +1860,9 @@ impl CodexSession {
         let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
             Ok(projection) => projection,
             Err(err) => {
+                if skill_selection == SkillSelection::Explicit {
+                    return Err(err);
+                }
                 let unavailable = codex_skills_unavailable(selected_skills, &err);
                 skill_notices.extend(unavailable.diagnostics);
                 selected_skills = &[];
@@ -1924,11 +1964,16 @@ impl CodexSession {
             .await
             {
                 Ok(setup) => setup,
-                // Configuring skills never fails the spawn. Whatever went wrong
-                // — a rejected `skills/extraRoots/set`, an unreadable catalog —
-                // costs this session its Tyde skills and nothing else, and the
-                // notice says which ones and why.
                 Err(err) => {
+                    if skill_selection == SkillSelection::Explicit {
+                        cleanup_codex_startup_failure(
+                            rpc,
+                            &mut skill_projection,
+                            &steering_tempfile,
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     remove_codex_skill_projection(&mut skill_projection);
                     codex_skills_unavailable(selected_skills, &err)
                 }
@@ -2089,14 +2134,14 @@ impl CodexSession {
             installed_provider_version,
             excluded_tool_categories,
         } = selected_skill_context;
-        // A session that cannot reach Tyde's skills runs without them. Dropping
-        // the selection here — rather than refusing the spawn — is what keeps a
-        // remote workspace usable to a skill-bearing agent.
         let mut skill_notices: Vec<String> = Vec::new();
         let mut selected_skills = selected_skills;
         if let Some(notice) =
             codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
         {
+            if skill_selection == SkillSelection::Explicit {
+                return Err(notice);
+            }
             tracing::warn!("{notice}");
             skill_notices.push(notice);
             selected_skills = &[];
@@ -2104,6 +2149,9 @@ impl CodexSession {
         let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
             Ok(projection) => projection,
             Err(err) => {
+                if skill_selection == SkillSelection::Explicit {
+                    return Err(err);
+                }
                 let unavailable = codex_skills_unavailable(selected_skills, &err);
                 skill_notices.extend(unavailable.diagnostics);
                 selected_skills = &[];
@@ -2179,11 +2227,16 @@ impl CodexSession {
             .await
             {
                 Ok(setup) => setup,
-                // Configuring skills never fails the spawn. Whatever went wrong
-                // — a rejected `skills/extraRoots/set`, an unreadable catalog —
-                // costs this session its Tyde skills and nothing else, and the
-                // notice says which ones and why.
                 Err(err) => {
+                    if skill_selection == SkillSelection::Explicit {
+                        cleanup_codex_startup_failure(
+                            rpc,
+                            &mut skill_projection,
+                            &steering_tempfile,
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     remove_codex_skill_projection(&mut skill_projection);
                     codex_skills_unavailable(selected_skills, &err)
                 }
@@ -23668,6 +23721,7 @@ impl Backend for CodexBackend {
 
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
+            tyde_agent_adapter::BackendCapability::NativeSkillContentCollisions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,

@@ -69,7 +69,7 @@ macro_rules! conformance2_scenario {
             fn eligible<B: Backend>() -> bool {
                 let required: &[BackendCapability] = &[$($requirement),*];
                 B::capabilities().validate().expect("backend capability declaration must be consistent");
-                let native_skills = stringify!($scenario) != "real_skills"
+                let native_skills = !matches!(stringify!($scenario), "real_skills" | "real_duplicate_skill_content")
                     || B::skill_delivery() == server::backend::SkillDelivery::NativeDiscovery;
                 let eligible = native_skills && required.iter().all(|capability| B::capabilities().contains(*capability));
                 if !eligible {
@@ -10325,6 +10325,172 @@ async fn real_usage_accounting<B: Backend>(host: &mut Harness<B>) {
     assert_universal_contract(&turns);
     assert_clean_close(host, &agent).await;
 }
+
+async fn real_duplicate_skill_content<B: Backend>(host: &mut Harness<B>) {
+    let marker = format!("SKILL_{}", Uuid::new_v4().simple());
+    let identical = "tyde-identical-copy";
+    let different_resource = "tyde-different-resource";
+    let different_body = "tyde-different-body";
+    let unsafe_skill = "tyde-broken-resource";
+    for name in [identical, different_resource, different_body] {
+        let body = format!(
+            "---\nname: {name}\ndescription: Activate only when explicitly requested.\n---\nRead resources/answer.txt relative to this skill directory, then reply with its exact contents and nothing else."
+        );
+        install_skill(
+            host,
+            name,
+            "Activate only when explicitly requested.",
+            &body,
+        )
+        .await;
+        let selected = host
+            .config
+            .resolved_spawn_config
+            .skills
+            .last()
+            .expect("installed skill")
+            .source_dir
+            .clone();
+        let native = host.workspace().join(".agents/skills").join(name);
+        for directory in [&selected, &native] {
+            std::fs::create_dir_all(directory.join("resources")).expect("create skill resources");
+            std::fs::write(directory.join("SKILL.md"), &body).expect("write skill copy");
+            std::fs::write(directory.join("resources/answer.txt"), &marker)
+                .expect("write skill answer");
+            // Different absolute link spellings expose identical effective bytes.
+            std::os::unix::fs::symlink(
+                directory.join("resources/answer.txt"),
+                directory.join("answer-link.txt"),
+            )
+            .expect("link skill answer");
+        }
+        std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict selected directory");
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755))
+            .expect("set native directory mode");
+        std::fs::set_permissions(
+            selected.join("SKILL.md"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("restrict selected body");
+        std::fs::set_permissions(
+            native.join("SKILL.md"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("set native body mode");
+        if name == different_resource {
+            std::fs::write(
+                native.join("resources/answer.txt"),
+                "different supporting content",
+            )
+            .expect("change supporting file only");
+        }
+        if name == different_body {
+            std::fs::write(
+                native.join("SKILL.md"),
+                format!("{body}\nDifferent instructions."),
+            )
+            .expect("change native instructions");
+        }
+    }
+    // Two distinct catalog-visible directories declare the same native name.
+    // The old final verifier warned on enabled entry count even after the
+    // preparation manifest correctly accepted equivalent complete content.
+    let nested_workspace = host.workspace().join("nested-project");
+    let second_native = nested_workspace.join(".agents/skills").join(identical);
+    let first_native = host.workspace().join(".agents/skills").join(identical);
+    std::fs::create_dir_all(second_native.join("resources")).expect("create second native skill");
+    for relative in ["SKILL.md", "resources/answer.txt"] {
+        std::fs::copy(first_native.join(relative), second_native.join(relative))
+            .expect("copy complete native skill content");
+    }
+    std::os::unix::fs::symlink(
+        second_native.join("resources/answer.txt"),
+        second_native.join("answer-link.txt"),
+    )
+    .expect("link second native answer");
+
+    let roots = vec![nested_workspace.display().to_string()];
+    host.config.resolved_spawn_config.skill_selection = server::backend::SkillSelection::Explicit;
+    let mut unavailable_config = host.config.clone();
+    unavailable_config.resolved_spawn_config.skills.clear();
+    install_skill(
+        host,
+        unsafe_skill,
+        "Explicit unreadable skill",
+        "---\nname: tyde-broken-resource\ndescription: Explicit unreadable skill\n---\nDo not run.",
+    )
+    .await;
+    let unreadable = host
+        .config
+        .resolved_spawn_config
+        .skills
+        .pop()
+        .expect("unreadable skill fixture");
+    std::os::unix::fs::symlink(
+        unreadable.source_dir.join("missing"),
+        unreadable.source_dir.join("broken-link"),
+    )
+    .expect("seed unreadable selected resource");
+    unavailable_config
+        .resolved_spawn_config
+        .skills
+        .push(unreadable);
+    let rejected = B::spawn(
+        roots.clone(),
+        unavailable_config,
+        user_message("Do not use tools. Reply with READY."),
+    )
+    .await;
+    match rejected {
+        Err(error) => {
+            assert!(
+                error.contains(unsafe_skill) && error.contains("Failed to resolve skill entry"),
+                "explicit unreadable skill did not return its actionable inspection failure"
+            );
+        }
+        Ok((backend, _events)) => {
+            backend.shutdown().await;
+            panic!("explicit unreadable skill incorrectly allowed startup");
+        }
+    }
+    let prompt = format!(
+        "Activate and follow the {identical} skill. Read its instructions and resource; do not invent the answer."
+    );
+    let agent = spawn_agent_at_roots(host, roots, &prompt).await;
+    let turn = collect_turn(host, &agent, &prompt).await;
+    let warnings = turn
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Warning) =>
+            {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !warnings.iter().any(|warning| warning.contains(identical)),
+        "identical complete skill copies produced a warning"
+    );
+    for name in [different_resource, different_body] {
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(name) && warning.contains("conflicts")),
+            "different complete skill content did not produce a conflict warning"
+        );
+    }
+    assert_final_text_contains(&turn, &marker);
+    assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_duplicate_skill_content,
+    [BackendCapability::NativeSkillContentCollisions]
+);
 
 async fn real_skills<B: Backend>(host: &mut Harness<B>) {
     let skill_name = "tyde-conformance-skill";

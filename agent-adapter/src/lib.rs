@@ -195,6 +195,10 @@ exhaustive_capabilities! {
     PlanApprovalRequests,
     WorkspaceInstructions,
     Customization,
+    // Selected native skills share a name namespace with filesystem-discovered
+    // skills: equivalent complete content is usable without a warning; differing
+    // content and unreadable trees are diagnosed rather than silently substituted.
+    NativeSkillContentCollisions,
     GenericModifyFile,
     GenericReadFiles,
     GenericSearchTypes,
