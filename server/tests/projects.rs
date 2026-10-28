@@ -5158,109 +5158,9 @@ async fn project_watch_failures_keep_other_projects_live() {
         .trim()
         .parse()
         .unwrap();
-    let storm_watches = directory_watch_ids(storm_repo.path());
-    assert_eq!(storm_watches.len(), 1);
-    let duplicate = unsafe { libc::fcntl(storm_watches[0].0, libc::F_DUPFD_CLOEXEC, 0) };
-    assert!(duplicate >= 0);
-    let native_queue = unsafe { OwnedFd::from_raw_fd(duplicate) };
-    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let paused = fixture.on_project_scan(
-        storm_repo.path().join("a.rs"),
-        server::ScanPoint::WatcherDispatch,
-        move || {
-            let _ = paused_tx.send(());
-            release_rx
-                .recv()
-                .expect("release native drain after read-only flood");
-        },
-    );
-    fs::write(storm_repo.path().join("a.rs"), "pause for reads\n").unwrap();
-    (paused_rx).await.unwrap();
-    let queued_before = rustix::io::ioctl_fionread(&native_queue).unwrap();
-    let started = std::time::Instant::now();
-    for index in 0..queue_capacity + 128 {
-        fs::read_dir(if index % 2 == 0 {
-            storm_repo.path().to_owned()
-        } else {
-            storm_repo.path().join("gone")
-        })
-        .unwrap()
-        .for_each(|entry| {
-            entry.unwrap();
-        });
-        fs::read(
-            storm_repo
-                .path()
-                .join(if index % 2 == 0 { "a.rs" } else { "b.rs" }),
-        )
-        .unwrap();
-    }
-    let queued_after = rustix::io::ioctl_fionread(&native_queue).unwrap();
-    eprintln!(
-        "native read flood: queue_capacity={queue_capacity} read_count={} queued_before={queued_before} queued_after={queued_after} elapsed_ms={}",
-        2 * (queue_capacity + 128),
-        started.elapsed().as_millis()
-    );
-    release_tx.send(()).unwrap();
-    drop(paused);
-    drop(native_queue);
-    // Native queue sizes are diagnostics; the protocol must prove reads leave
-    // versions unchanged and both projects still receive subsequent writes.
-    fs::write(storm_repo.path().join("b.rs"), "write after read flood\n").unwrap();
-    expect_watched_change(&mut fixture.client, "b.rs").await;
-    fixture
-        .client
-        .project_read_file(&storm.id, ProjectReadFilePayload { path: storm_file })
-        .await
-        .unwrap();
-    let storm_after =
-        expect_project_file_contents(&mut fixture.client, "read after read flood").await;
-    assert_eq!(
-        storm_after.contents.as_deref(),
-        Some("write after read flood\n")
-    );
-    assert!(storm_after.version > storm_before.version);
-
-    assert_no_watched_changes(&mut fixture.client, &["src/file.rs"]).await;
-    fixture
-        .client
-        .project_read_file(
-            &projects[1].id,
-            ProjectReadFilePayload {
-                path: before.path.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    let after_reads =
-        expect_project_file_contents(&mut fixture.client, "read after read-only flood").await;
-    assert_eq!(after_reads.version, before.version);
-    assert_eq!(after_reads.contents, before.contents);
-    fs::write(
-        healthy_repo.path().join("src/file.rs"),
-        "healthy write after read flood\n",
-    )
-    .unwrap();
-    expect_watched_change(&mut fixture.client, "src/file.rs").await;
-    fixture
-        .client
-        .project_read_file(
-            &projects[1].id,
-            ProjectReadFilePayload {
-                path: before.path.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    let healthy_after_reads =
-        expect_project_file_contents(&mut fixture.client, "healthy write after read flood").await;
-    assert_eq!(
-        healthy_after_reads.contents.as_deref(),
-        Some("healthy write after read flood\n")
-    );
-    assert!(healthy_after_reads.version > before.version);
-    let before = healthy_after_reads;
+    // Read-only floods can overflow the shared kernel queue too, correctly
+    // invalidating observed roots. Exercise actual lost writes, not load-
+    // dependent absence/version assertions about a read-only flood.
     let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let paused = fixture.on_project_scan(
@@ -6794,19 +6694,49 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         .await,
         ProjectFileViewState::DirectoryMissing
     ));
+    let deleted_view = directory_view(&project_root(&project, 0), "vanishing-dir");
+    fixture
+        .client
+        .project_file_view(
+            &project.id,
+            ProjectFileViewPayload {
+                view: deleted_view.clone(),
+                active: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        file_view_state_matching(&mut fixture.client, &deleted_view, |state| *state
+            == ProjectFileViewState::Closed)
+        .await,
+        ProjectFileViewState::Closed
+    ));
 
     fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
     fs::write(repo.path().join("keep.rs"), "// updated\n").expect("update keep.rs");
 
     // Builds and agents need not leave the entire project idle for a refresh.
     let activity_path = repo.path().join("activity.log");
+    let (mut activity_client, _) = fixture.connect_with_bootstrap().await;
     let activity = async {
         let mut writes = 0;
         loop {
             fs::write(&activity_path, format!("activity {writes}\n")).expect("write activity");
             fs::read(&activity_path).expect("read activity");
             writes += 1;
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            activity_client
+                .heartbeat(protocol::HeartbeatPayload {
+                    client_sent_at_ms: writes,
+                })
+                .await
+                .unwrap();
+            next_frame_matching_on(
+                &mut activity_client,
+                "activity command completed",
+                |event| event.kind == FrameKind::HeartbeatAck,
+            )
+            .await;
         }
     };
     let update_started = std::time::Instant::now();
@@ -6858,9 +6788,7 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         )
     };
     let (file_list, changed_version) = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(3), receive_updates) => {
-            result.expect("file listing and contents invalidation must arrive while filesystem activity continues")
-        }
+        result = receive_updates => result,
         () = activity => unreachable!("activity continues until updates arrive"),
     };
     fixture

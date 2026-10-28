@@ -49,11 +49,18 @@ pub fn require_nested_namespaces() -> Result<(), String> {
     let Some(project) = current_project() else {
         return Ok(());
     };
-    if let protocol::ProjectSource::GitWorkbench {
-        environment: protocol::WorkbenchEnvironment::Bubblewrap { support, .. },
-        ..
-    } = project.source
-    {
+    if matches!(
+        project.source,
+        protocol::ProjectSource::GitWorkbench {
+            environment: protocol::WorkbenchEnvironment::Bubblewrap { .. },
+            ..
+        }
+    ) {
+        let support = EXECUTION_ENVIRONMENT
+            .try_with(|environment| environment.get().map(|value| value.support.clone()))
+            .ok()
+            .flatten()
+            .ok_or("Namespace requirements need a prepared execution environment")?;
         match support.nested_namespaces {
             protocol::WorkbenchAvailability::Available => {}
             protocol::WorkbenchAvailability::Unsupported { message, .. } => return Err(message),
@@ -112,6 +119,7 @@ impl WorkspacePath {
 
 #[derive(serde::Deserialize, PartialEq, Eq)]
 pub struct ExecutionEnvironment {
+    pub support: protocol::WorkbenchSupport,
     pub values: std::collections::BTreeMap<String, String>,
     pub configuration_identity: String,
     pub runner_identity: String,

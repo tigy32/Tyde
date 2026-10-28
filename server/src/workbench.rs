@@ -124,6 +124,14 @@ fn operation_result<T: serde::de::DeserializeOwned>(
         "Workbench engine diagnostic: action={action} phase=completed success={}",
         result.status.success()
     );
+    if action == "probe" && !result.stderr.is_empty() {
+        tracing::debug!(diagnostic = %String::from_utf8_lossy(&result.stderr), "Workbench namespace probe output");
+        #[cfg(feature = "test-support")]
+        eprintln!(
+            "Workbench namespace probe output: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     if !result.status.success() {
         let failure = result
             .stderr

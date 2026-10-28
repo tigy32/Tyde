@@ -97,7 +97,12 @@ def cargo_configuration(root, logical_root, config, workspace):
         configuration.update(values)
         origins.update(locations)
     projected = {binding["execution_path"] for binding in config["readonly_bindings"]}
+    anchor = Path(os.path.commonpath([record["logical_root"] for record in workspace]))
     for parent in logical_parents:
+        # Source mounts replace this hierarchy; inherited engine paths do not
+        # survive the private mount table and cannot supply Cargo config.
+        if parent.is_relative_to(anchor):
+            continue
         directory = parent / ".cargo"
         if str(directory) not in projected and directory.parent != Path("/") and any((directory / name).exists() for name in ("config", "config.toml")):
             raise SetupFailure("A host Cargo configuration conflicts with the private logical layout")

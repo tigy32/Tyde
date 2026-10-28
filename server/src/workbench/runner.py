@@ -20,6 +20,9 @@ import tempfile
 import termios
 import uuid
 
+# Nested environments replace the parent's runtime mount, including its venv.
+# The runner uses only stdlib, so retain the real interpreter, not that alias.
+PYTHON = str(Path(sys.executable).resolve(strict=True))
 SCHEMA = 3
 ARTIFACT_CONTRACT = "existing_artifacts_v1"
 LOGICAL_ROOT = "/mnt/tyde-workspace"
@@ -89,13 +92,19 @@ def probe():
         reason = "bubblewrap_missing" if missing == "bwrap" else "runtime_tool_missing"
         result = unsupported(reason, "Required host tool is missing: " + missing)
         return {"bubblewrap": result, "nested_namespaces": result}
-    args = [shutil.which("bwrap"), "--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"]
-    result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if result.returncode:
-        result = unsupported("namespace_denied", "Host policy prevents an unprivileged Bubblewrap namespace")
+    runtime_diagnostic("probe_started", python=PYTHON, user_namespace=os.readlink("/proc/self/ns/user"))
+    # Probe the actual command topology, not bwrap's restricted child profile.
+    with tempfile.TemporaryDirectory(prefix="tyde-namespace-probe-") as run:
+        run = Path(run)
+        shutil.copyfile(__file__, run / "runner.py")
+        save(run / "manifest.json", {"configuration": {"services": []}})
+        args = [shutil.which("bwrap"), "--unshare-user", "--dev-bind", "/", "/", *private_mountpoints(), "--bind", str(run), RUNTIME, "--", PYTHON, RUNTIME + "/runner.py", "namespace", RUNTIME + "/control.sock"]
+        command = [PYTHON, "-c", "import subprocess,sys; sys.exit(42 if subprocess.run(sys.argv[1:]).returncode else 0)", shutil.which("bwrap"), "--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"]
+        result = guarded_launch(args, dict(os.environ), run, command, "/")
+    if result not in (0, 42):
+        result = unsupported("namespace_denied", "Host policy prevents the Bubblewrap mount environment")
         return {"bubblewrap": result, "nested_namespaces": result}
-    nested = subprocess.run(args[:-1] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"bubblewrap": {"kind": "available"}, "nested_namespaces": {"kind": "available"} if nested.returncode == 0 else unsupported("nested_namespaces_denied", "Host policy denies nested namespaces. Provider modes that require their own namespace are unsupported; their security policies are never weakened.")}
+    return {"bubblewrap": {"kind": "available"}, "nested_namespaces": {"kind": "available"} if result == 0 else unsupported("nested_namespaces_denied", "Host policy denies nested namespaces; explicit backend namespace requirements cannot be satisfied.")}
 
 
 def strict_clone(source, destination):
@@ -440,7 +449,7 @@ def prepare(request_path, directory, setup_path):
         common = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).strip())
         snapshots = common / "tyde-workbench-snapshots-v2"
         snapshots.mkdir(mode=0o700, exist_ok=True)
-        manifest = {"schema": SCHEMA, "artifact_contract": ARTIFACT_CONTRACT, "root": str(root), "roots": records, "common": str(common), "snapshot_root": str(snapshots), "configuration": config, "support": support, "python": sys.executable, "bwrap": shutil.which("bwrap")}
+        manifest = {"schema": SCHEMA, "artifact_contract": ARTIFACT_CONTRACT, "root": str(root), "roots": records, "common": str(common), "snapshot_root": str(snapshots), "configuration": config, "support": support, "python": PYTHON, "bwrap": shutil.which("bwrap")}
         workspace_clean(manifest)
         (directory / "receipts").mkdir()
         (directory / "runs").mkdir()
@@ -543,7 +552,7 @@ def private_mountpoints():
     reserved = {LOGICAL_ROOT, RUNTIME, RECEIPTS}
     for path in sorted(Path("/mnt").iterdir()):
         if str(path) in reserved:
-            fail("incompatible_environment", "An engine mountpoint conflicts with an existing host /mnt entry")
+            continue
         if path.is_symlink():
             args += ["--symlink", os.readlink(path), str(path)]
         else:
@@ -556,7 +565,33 @@ def own_descendants():
         fail("incompatible_environment", "Could not establish runtime descendant ownership")
 
 
-def guarded_launch(args, env, run, descriptor_path=None):
+def namespace(endpoint):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        connection.connect(endpoint)
+        descriptors = array.array("i", [os.open("/proc/self/ns/user", os.O_RDONLY), os.open("/proc/self/ns/mnt", os.O_RDONLY)])
+        try:
+            connection.sendmsg([b"namespace"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+            connection.recv(1)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+
+def enter_namespace(descriptors, cwd):
+    libc = ctypes.CDLL(None, use_errno=True)
+    for descriptor in descriptors:
+        if libc.setns(descriptor, 0):
+            raise OSError(ctypes.get_errno(), "Could not enter workbench namespace")
+    # Joining the user namespace grants setup capabilities. Commands do not
+    # need them; their own backend remains responsible for its permission mode.
+    header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+    data = (ctypes.c_uint32 * 6)()
+    if libc.capset(header, data):
+        raise OSError(ctypes.get_errno(), "Could not release namespace setup capabilities")
+    os.chdir(cwd)
+
+
+def guarded_launch(args, env, run, command, cwd, descriptor_path=None):
     # The guardian survives the caller's process-group kill, retaining its lease
     # until even orphaned/setsid native descendants have been killed and joined.
     # The runtime takes controlling-terminal ownership after entering its own
@@ -575,6 +610,11 @@ def guarded_launch(args, env, run, descriptor_path=None):
         result = None
         listener = None
         runtimefd = None
+        namespace_connection = None
+        builder = None
+        child = None
+        childfd = None
+        descriptors = array.array("i")
         try:
             os.setsid()
             own_descendants()
@@ -584,20 +624,28 @@ def guarded_launch(args, env, run, descriptor_path=None):
                 listener.bind("/proc/self/fd/%d/control.sock" % directoryfd)
             finally:
                 os.close(directoryfd)
-            listener.listen(1)
+            listener.listen(2)
             pending_signals = []
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(signum, signal.SIG_IGN)
-            child = subprocess.Popen(args, env=env, start_new_session=True)
-            childfd = os.pidfd_open(child.pid)
+            # Bubblewrap builds mounts only. Exec from its host parent so the
+            # build environment does not inherit bwrap's AppArmor child profile.
+            builder = subprocess.Popen(args, env=env, start_new_session=True)
+            builderfd = os.pidfd_open(builder.pid)
             try:
                 with selectors.DefaultSelector() as events:
                     events.register(parentfd, selectors.EVENT_READ, "parent")
                     events.register(guardian_control, selectors.EVENT_READ, "control")
-                    events.register(childfd, selectors.EVENT_READ, "child")
+                    events.register(builderfd, selectors.EVENT_READ, "builder")
                     events.register(listener, selectors.EVENT_READ, "runtime")
                     while result is None:
                         for key, _ in events.select():
+                            if key.data == "builder":
+                                code = builder.wait()
+                                if code == 0:
+                                    fail("incompatible_environment", "Namespace builder closed before its command settled")
+                                result = code
+                                break
                             if key.data == "child":
                                 result = child.wait()
                                 break
@@ -606,10 +654,27 @@ def guarded_launch(args, env, run, descriptor_path=None):
                                 break
                             if key.data == "runtime":
                                 connection, _ = listener.accept()
+                                message, ancillary, flags, _ = connection.recvmsg(16, socket.CMSG_SPACE(2 * descriptors.itemsize))
+                                if message == b"namespace" and namespace_connection is None:
+                                    namespace_connection = connection
+                                    for level, kind, data in ancillary:
+                                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                                            descriptors.frombytes(data[:len(data) - len(data) % descriptors.itemsize])
+                                    if flags & socket.MSG_CTRUNC or len(descriptors) != 2:
+                                        fail("incompatible_environment", "Namespace builder omitted its user/mount descriptors")
+                                    runtime_command = [PYTHON, RUNTIME + "/runner.py", "inside", *command]
+                                    child = subprocess.Popen(runtime_command, env=env, start_new_session=True, preexec_fn=lambda: enter_namespace(descriptors, cwd))
+                                    for descriptor in descriptors:
+                                        os.close(descriptor)
+                                    descriptors = array.array("i")
+                                    childfd = os.pidfd_open(child.pid)
+                                    events.register(childfd, selectors.EVENT_READ, "child")
+                                    runtime_diagnostic("namespace_entered", builder_pid=builder.pid, command_pid=child.pid)
+                                    continue
                                 with connection:
-                                    peer = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-                                    pid, _, _ = struct.unpack("3i", peer)
-                                    runtimefd = os.pidfd_open(pid)
+                                    if message != b"runtime" or child is None:
+                                        fail("incompatible_environment", "Unexpected namespace readiness notification")
+                                    runtimefd = os.pidfd_open(child.pid)
                                     connection.send(b"start")
                                 if descriptor_path is not None:
                                     with socket.socket(socket.AF_UNIX) as descriptor:
@@ -636,13 +701,23 @@ def guarded_launch(args, env, run, descriptor_path=None):
                                 except ProcessLookupError:
                                     pass
             finally:
-                # Kill the wrapper group even if its leader exited first.
+                if child is not None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                    if childfd is not None:
+                        os.close(childfd)
+                if namespace_connection is not None:
+                    namespace_connection.close()
+                    namespace_connection = None
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    os.killpg(builder.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                child.wait()
-                os.close(childfd)
+                builder.wait()
+                os.close(builderfd)
         except Failure as error:
             result = {"error": {"reason": error.reason, "message": error.message}}
         except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -658,6 +733,10 @@ def guarded_launch(args, env, run, descriptor_path=None):
             except BrokenPipeError:
                 pass
             guardian_control.close()
+            for descriptor in descriptors:
+                os.close(descriptor)
+            if namespace_connection is not None:
+                namespace_connection.close()
             if listener is not None:
                 listener.close()
             if runtimefd is not None:
@@ -727,12 +806,11 @@ def launch(manifest_path, expected_root, cwd, command, configuration_identity=No
             args += ["--ro-bind", manifest["snapshot_root"], manifest["snapshot_root"]]
             for record in root_records(manifest):
                 args += ["--bind", record["root"], record["logical_root"]]
-            args += ["--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", manifest["python"], RUNTIME + "/runner.py", "inside", *command]
-            return guarded_launch(args, env, run, descriptor_path)
+            args += ["--bind", str(run), RUNTIME, "--bind", str(directory / "receipts"), RECEIPTS, "--chdir", cwd, "--", str(Path(manifest["python"]).resolve(strict=True)), RUNTIME + "/runner.py", "namespace", RUNTIME + "/control.sock"]
+            return guarded_launch(args, env, run, command, cwd, descriptor_path)
 
 
 def join_children(excluded=(), services=(), terminate=False):
-    codes = []
     pending = {}
     with selectors.DefaultSelector() as events:
         for pidfd in services:
@@ -753,7 +831,7 @@ def join_children(excluded=(), services=(), terminate=False):
                 if any(key.data == "service" for key, _ in ready):
                     fail("runtime_service_failed", "An owned runtime service exited before command descendants settled")
                 if not pending:
-                    return codes
+                    return
                 if not ready:
                     ready = events.select()
                 if any(key.data == "service" for key, _ in ready):
@@ -761,7 +839,8 @@ def join_children(excluded=(), services=(), terminate=False):
                 for key, _ in ready:
                     pid = key.data
                     _, status = os.waitpid(pid, 0)
-                    codes.append(os.waitstatus_to_exitcode(status))
+                    code = os.waitstatus_to_exitcode(status)
+                    runtime_diagnostic("descendant_joined", pid=pid, exit_code=code, terminate=terminate)
                     events.unregister(pending[pid])
                     os.close(pending.pop(pid))
         finally:
@@ -952,6 +1031,7 @@ def inside(command):
         signal.signal(signum, forward)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
         control.connect(RUNTIME + "/control.sock")
+        control.send(b"runtime")
         if control.recv(16) != b"start":
             fail("incompatible_environment", "Execution guardian did not admit the native command")
     try:
@@ -1017,12 +1097,12 @@ def inside(command):
             finish_execution(requests)
             result = child.wait()
             runtime_diagnostic("command_exited", exit_code=result)
-            descendants = join_children(
+            join_children(
                 {process.pid for process, _, _, _ in services},
                 [pidfd for _, pidfd, _, _ in services],
                 terminate=not services,
             )
-            return result if result or not services else next((code for code in descendants if code), 0)
+            return result
         finally:
             os.close(childfd)
     finally:
@@ -1136,7 +1216,7 @@ def main():
             # Launch owns its private bin prefix; a command's explicit PATH
             # remains an override of this same prepared environment.
             values["PATH"] = values["PATH"].removeprefix(RUNTIME + "/bin:")
-            return {"values": values, "configuration_identity": digest(json.dumps(manifest["configuration"], sort_keys=True).encode()), "runner_identity": digest(Path(__file__).read_bytes())}
+            return {"support": probe(), "values": values, "configuration_identity": digest(json.dumps(manifest["configuration"], sort_keys=True).encode()), "runner_identity": digest(Path(__file__).read_bytes())}
     if action == "execute":
         sys.exit(execute(*arguments))
     if action == "launch_prepared_context":
@@ -1151,6 +1231,8 @@ def main():
     if action == "launch":
         manifest, expected_root, cwd, *command = arguments
         sys.exit(launch(manifest, expected_root, cwd, command))
+    if action == "namespace":
+        return namespace(*arguments)
     if action == "inside":
         sys.exit(inside(arguments))
     if action == "snapshot":

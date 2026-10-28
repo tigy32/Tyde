@@ -4691,7 +4691,7 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn bubblewrap_service_failure_after_foreground_exit_is_not_success() {
+async fn bubblewrap_service_lifecycle_preserves_command_outcomes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut fixture = Fixture::new().await;
     assert!(
@@ -4726,11 +4726,11 @@ with socket.socket(socket.AF_UNIX) as control:
 "#,
     )
     .expect("real foreground service");
-    fs::write(repo.path().join("command.py"), r#"import os,pathlib,select,socket
+    fs::write(repo.path().join("command.py"), r#"import os,pathlib,select,socket,sys
 assert os.tcgetpgrp(0)==os.getpgrp(), 'native command must own the terminal before input'
 read,write=os.pipe()
 if os.fork():
- os.close(write);assert os.read(read,1)==b'R';os._exit(0)
+ os.close(write);assert os.read(read,1)==b'R';os._exit(int(sys.argv[1]))
 os.close(read)
 parent=os.pidfd_open(os.getppid())
 service=os.pidfd_open(int(pathlib.Path(os.environ['TYDE_WORKBENCH_RUNTIME']+'/service.pid').read_text()))
@@ -4738,6 +4738,9 @@ os.write(write,b'R');os.close(write)
 select.select([parent],[],[])
 with socket.socket(socket.AF_UNIX) as control:
  control.connect(os.environ['CONTROL_DIR']+'/descendant');control.sendall(b'P')
+ if sys.argv[2]=='0':
+  assert control.recv(1)==b'R'
+  os._exit(42)
  select.select([service],[],[])
 os._exit(0)
 "#).expect("command with real owned descendant");
@@ -4796,97 +4799,139 @@ os._exit(0)
         panic!("workbench upsert required")
     };
     let root = project.root_paths()[0].clone();
-    fixture
-        .client
-        .terminal_create(TerminalCreatePayload {
-            target: TerminalLaunchTarget::Project {
-                project_id: project.id.clone(),
-                root: root.clone(),
-                relative_cwd: None,
-            },
-            cols: 100,
-            rows: 25,
-        })
-        .await
-        .expect("real engine terminal");
-    let terminal = expect_kind(
-        &mut fixture.client,
-        FrameKind::NewTerminal,
-        "service terminal",
-    )
-    .await
-    .parse_payload::<NewTerminalPayload>()
-    .unwrap();
-    expect_kind(
-        &mut fixture.client,
-        FrameKind::TerminalBootstrap,
-        "service terminal bootstrap",
-    )
-    .await;
-    fixture
-        .client
-        .terminal_send(
-            &terminal.terminal_id,
-            protocol::TerminalSendPayload {
-                data: "exec python3 command.py\n".into(),
-            },
+    for (foreground, fail_service) in [(0, false), (23, false), (0, true)] {
+        fixture
+            .client
+            .terminal_create(TerminalCreatePayload {
+                target: TerminalLaunchTarget::Project {
+                    project_id: project.id.clone(),
+                    root: root.clone(),
+                    relative_cwd: None,
+                },
+                cols: 100,
+                rows: 25,
+            })
+            .await
+            .expect("real engine terminal");
+        let terminal = expect_kind(
+            &mut fixture.client,
+            FrameKind::NewTerminal,
+            "service terminal",
         )
         .await
-        .expect("execute real command");
-    let (mut service, _) = tokio::select! {
-        accepted = service_listener.accept() => accepted.expect("owned service control connection"),
-        event = next_frame_matching_on(&mut fixture.client, "service startup outcome", |event| {
-            event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
-        }) => panic!("runtime exited before its required service connected: {:?}", event.kind),
-    };
-    let (mut descendant, _) = tokio::select! {
-        accepted = descendant_listener.accept() => accepted.expect("owned descendant control connection"),
-        event = next_frame_matching_on(&mut fixture.client, "descendant startup outcome", |event| {
-            event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
-        }) => panic!("runtime exited before its owned descendant connected: {:?}", event.kind),
-    };
-    assert_eq!(
-        descendant
-            .read_u8()
-            .await
-            .expect("foreground completed event"),
-        b'P'
-    );
-    service
-        .write_all(b"X")
-        .await
-        .expect("request actual required-service exit after foreground settled");
-    let mut output = String::new();
-    let exit = loop {
-        let event = next_frame_matching_on(
+        .parse_payload::<NewTerminalPayload>()
+        .unwrap();
+        expect_kind(
             &mut fixture.client,
-            "service failure terminal outcome",
-            |e| {
-                e.stream == terminal.stream
-                    && matches!(
-                        e.kind,
-                        FrameKind::TerminalOutput
-                            | FrameKind::TerminalExit
-                            | FrameKind::TerminalError
-                    )
-            },
+            FrameKind::TerminalBootstrap,
+            "service terminal bootstrap",
         )
         .await;
-        match event.kind {
-            FrameKind::TerminalOutput => output.push_str(
-                &event
-                    .parse_payload::<protocol::TerminalOutputPayload>()
-                    .unwrap()
-                    .data,
-            ),
-            FrameKind::TerminalExit => {
-                break event
-                    .parse_payload::<protocol::TerminalExitPayload>()
-                    .unwrap();
-            }
-            _ => panic!("terminal transport failed instead of completing the runtime"),
+        fixture
+            .client
+            .terminal_send(
+                &terminal.terminal_id,
+                protocol::TerminalSendPayload {
+                    data: format!(
+                        "exec python3 command.py {foreground} {}\n",
+                        u8::from(fail_service)
+                    ),
+                },
+            )
+            .await
+            .expect("execute real command");
+        let (mut service, _) = tokio::select! {
+            accepted = service_listener.accept() => accepted.expect("owned service control connection"),
+            event = next_frame_matching_on(&mut fixture.client, "service startup outcome", |event| {
+                event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
+            }) => panic!("runtime exited before its required service connected: {:?}", event.kind),
+        };
+        let (mut descendant, _) = tokio::select! {
+            accepted = descendant_listener.accept() => accepted.expect("owned descendant control connection"),
+            event = next_frame_matching_on(&mut fixture.client, "descendant startup outcome", |event| {
+                event.stream == terminal.stream && matches!(event.kind, FrameKind::TerminalExit | FrameKind::TerminalError)
+            }) => panic!("runtime exited before its owned descendant connected: {:?}", event.kind),
+        };
+        assert_eq!(
+            descendant
+                .read_u8()
+                .await
+                .expect("foreground completed event"),
+            b'P'
+        );
+        if fail_service {
+            service
+                .write_all(b"X")
+                .await
+                .expect("request actual required-service exit after foreground settled");
+        } else {
+            descendant
+                .write_all(b"R")
+                .await
+                .expect("release adopted descendant with its own nonzero status");
         }
-    };
+        let mut output = String::new();
+        let exit = loop {
+            let event = next_frame_matching_on(
+                &mut fixture.client,
+                "service failure terminal outcome",
+                |e| {
+                    e.stream == terminal.stream
+                        && matches!(
+                            e.kind,
+                            FrameKind::TerminalOutput
+                                | FrameKind::TerminalExit
+                                | FrameKind::TerminalError
+                        )
+                },
+            )
+            .await;
+            match event.kind {
+                FrameKind::TerminalOutput => output.push_str(
+                    &event
+                        .parse_payload::<protocol::TerminalOutputPayload>()
+                        .unwrap()
+                        .data,
+                ),
+                FrameKind::TerminalExit => {
+                    break event
+                        .parse_payload::<protocol::TerminalExitPayload>()
+                        .unwrap();
+                }
+                _ => panic!("terminal transport failed instead of completing the runtime"),
+            }
+        };
+        assert_eq!(
+            descendant
+                .read_u8()
+                .await
+                .expect_err("owned descendant must close")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        eprintln!(
+            "SERVICE FAILURE boundary: exit_code={:?} typed_failure={} output_bytes={}",
+            exit.exit_code,
+            output.contains("\"reason\": \"runtime_service_failed\""),
+            output.len()
+        );
+        if fail_service {
+            assert_ne!(
+                exit.exit_code,
+                Some(0),
+                "required service exit after foreground completion must fail the environment"
+            );
+            assert!(
+                output.contains("\"reason\": \"runtime_service_failed\""),
+                "actual terminal output must surface the typed runtime service failure"
+            );
+        } else {
+            // A shell owns its outcome; unrelated adopted exit statuses must not
+            // turn an otherwise successful check into a failure when sccache runs.
+            assert_eq!(exit.exit_code, Some(foreground));
+            assert!(!output.contains("\"reason\": \"runtime_service_failed\""));
+        }
+    }
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -4897,29 +4942,6 @@ os._exit(0)
         .expect("cleanup failed-runtime workbench");
     next_frame_matching_on(&mut fixture.client,"service workbench removed",|e|e.kind==FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>().unwrap(),ProjectNotifyPayload::Delete {project:p} if p.id==project.id)).await;
     assert!(!Path::new(&root.0).exists());
-    assert_eq!(
-        descendant
-            .read_u8()
-            .await
-            .expect_err("owned descendant must close")
-            .kind(),
-        std::io::ErrorKind::UnexpectedEof
-    );
-    eprintln!(
-        "SERVICE FAILURE boundary: exit_code={:?} typed_failure={} output_bytes={}",
-        exit.exit_code,
-        output.contains("\"reason\": \"runtime_service_failed\""),
-        output.len()
-    );
-    assert_ne!(
-        exit.exit_code,
-        Some(0),
-        "required service exit after foreground completion must fail the environment"
-    );
-    assert!(
-        output.contains("\"reason\": \"runtime_service_failed\""),
-        "actual terminal output must surface the typed runtime service failure"
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -5059,7 +5081,19 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
     // content and mtimes that reuse restores.
     fs::write(
         rust.join("build.rs"),
-        "fn main() { println!(\"cargo::rerun-if-changed=build.rs\"); std::fs::write(\"build-hook-ran\", \"explicit\").unwrap(); }\n",
+        r#"fn main() {
+    println!("cargo::rerun-if-changed=build.rs");
+    if let Ok(path) = std::env::var("TYDE_TEST_BUILD_BARRIER") {
+        use std::io::{Read, Write};
+        let mut barrier = std::os::unix::net::UnixStream::connect(path).unwrap();
+        barrier.write_all(b"B").unwrap();
+        let mut release = [0];
+        barrier.read_exact(&mut release).unwrap();
+        assert_eq!(release, [b'R']);
+    }
+    std::fs::write("build-hook-ran", "explicit").unwrap();
+}
+"#,
     )
     .unwrap();
     fs::write(
@@ -5116,23 +5150,11 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         matches!(env.kind, FrameKind::ProjectNotify | FrameKind::CommandError)
     })
     .await;
-    if event.kind == FrameKind::CommandError {
-        let error = event.parse_payload::<CommandErrorPayload>().unwrap();
-        match &fixture.bootstrap.workbench_support.bubblewrap {
-            protocol::WorkbenchAvailability::Unsupported { reason, .. } => {
-                assert_eq!(error.workbench_reason, Some(*reason))
-            }
-            protocol::WorkbenchAvailability::Available => assert_eq!(
-                error.workbench_reason,
-                Some(protocol::WorkbenchUnsupportedReason::ReflinkUnsupported)
-            ),
-        }
-        eprintln!(
-            "Recipe-free real namespace flow unavailable: {:?}; no cold/reuse proof claimed",
-            error.workbench_reason
-        );
-        return;
-    }
+    assert_eq!(
+        event.kind,
+        FrameKind::ProjectNotify,
+        "real Bubblewrap build/reuse flow requires working namespaces and reflinks"
+    );
     let ProjectNotifyPayload::Upsert { project: first } = event.parse_payload().unwrap() else {
         panic!("created workbench")
     };
@@ -5161,10 +5183,16 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         0,
         "new cache must be genuinely empty"
     );
-    let cold_terminal = terminal(&mut fixture.client, &first).await;
+    let (mut cold_client, _) = fixture.connect_with_bootstrap().await;
+    let cold_terminal = terminal(&mut cold_client, &first).await;
     let host_namespace = fs::read_link("/proc/self/ns/user").unwrap();
-    let namespace = command(&mut fixture.client, &cold_terminal, &format!("python3 -c 'import os; assert os.readlink(\"/proc/self/ns/user\") != {}; assert os.path.isdir(\"/mnt/tyde-runtime\"); print(\"namespace_verified\")'", serde_json::to_string(&host_namespace).unwrap())).await;
+    let namespace = command(&mut cold_client, &cold_terminal, &format!("python3 -c 'import os,subprocess; assert os.readlink(\"/proc/self/ns/user\") != {}; assert os.path.isdir(\"/mnt/tyde-runtime\"); subprocess.run([\"bwrap\",\"--unshare-user\",\"--ro-bind\",\"/\",\"/\",\"--\",\"/bin/true\"],check=True); print(\"namespace_verified\")'", serde_json::to_string(&host_namespace).unwrap())).await;
     assert!(namespace.contains("namespace_verified"));
+    command(
+        &mut cold_client,
+        &cold_terminal,
+        r#"python3 -c 'import json,subprocess; from pathlib import Path; runtime=Path("/mnt/tyde-runtime"); venv=runtime/"probe-venv"; subprocess.run(["python3","-m","venv","--without-pip",str(venv)],check=True); p=subprocess.run([str(venv/"bin/python3"),str(runtime/"runner.py"),"probe"],stdin=subprocess.DEVNULL,check=True,capture_output=True,text=True); support=json.loads(p.stdout); assert support["bubblewrap"]["kind"] == "available"; assert support["nested_namespaces"]["kind"] == "available"'"#,
+    ).await;
     let delegated = workspace.path().join("delegated-yarn");
     fs::create_dir(&delegated).unwrap();
     git(&delegated, &["init", "-q"]);
@@ -5230,7 +5258,44 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
             "creation must never dispatch a project package-manager script on the host"
         );
     }
-    command(&mut fixture.client, &cold_terminal, "cargo build --offline --message-format=json && (cd ../shared && cargo build --offline) && (cd ../web && npm ci --offline && npm run build) && (cd ../library && npm ci --offline)").await;
+    let concurrent = create_workbench(&mut fixture.client, &parent, "independent-feature").await;
+    let concurrent_root = PathBuf::from(&concurrent.root_paths()[0].0);
+    let independent_source = concurrent_root.join("src/main.rs");
+    let original_source = fs::read(&independent_source).unwrap();
+    fs::write(&independent_source, "fn main() { println!(\"99\"); }\n").unwrap();
+    let concurrent_terminal = terminal(&mut fixture.client, &concurrent).await;
+    let barrier_path = workspace.path().join("build.sock");
+    let barrier = tokio::net::UnixListener::bind(&barrier_path).unwrap();
+    let mut cold_build = tokio::spawn(async move {
+        command(&mut cold_client, &cold_terminal, &format!(
+            "TYDE_TEST_BUILD_BARRIER='{}' cargo build --offline --message-format=json && (cd ../shared && cargo build --offline) && (cd ../web && npm ci --offline && npm run build) && (cd ../library && npm ci --offline)",
+            barrier_path.to_string_lossy().replace('\'', "'\"'\"'")
+        )).await;
+    });
+    let (mut building, _) = tokio::select! {
+        connection = barrier.accept() => connection.unwrap(),
+        result = &mut cold_build => {
+            result.unwrap();
+            panic!("the held build completed before reaching its barrier");
+        }
+    };
+    let mut started = [0];
+    tokio::io::AsyncReadExt::read_exact(&mut building, &mut started)
+        .await
+        .unwrap();
+    assert_eq!(started, [b'B']);
+    command(&mut fixture.client, &concurrent_terminal, "cargo build --offline && python3 -c 'import subprocess; assert subprocess.check_output([\"target/debug/reuse_app\"]) == b\"99\\n\"'").await;
+    assert!(
+        !cold_build.is_finished(),
+        "an independent feature must complete while its peer build is held"
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut building, b"R")
+        .await
+        .unwrap();
+    cold_build.await.unwrap();
+    fs::write(independent_source, original_source).unwrap();
+    remove(&mut fixture.client, &concurrent, "independent-feature").await;
+
     assert!(Path::new(&paths[0].0).join("build-hook-ran").exists());
     assert!(Path::new(&paths[2].0).join("install-hook-ran").exists());
     let donor_binary = Path::new(&paths[0].0).join("target/debug/reuse_app");

@@ -25,7 +25,13 @@ being flattened. Every root participates in the composite revision identity. Hos
 HOME and credentials are never copied into snapshots. Native filesystem
 permissions are preserved, including config/session paths outside HOME; the
 engine-owned cohort store is mounted read-only. Backend security/tool policies
-and host namespace policy are unchanged. All enabled backends use the same
+and host namespace policy are unchanged. Bubblewrap prepares the mounts; its
+host parent enters those user/mount namespaces before starting the command.
+Commands therefore retain the caller's AppArmor profile instead of inheriting
+Bubblewrap's child profile, which can prohibit nested builds and backend
+sandboxes. Namespace setup capabilities are released before command execution.
+Nested workbenches replace inherited engine mountpoints inside their own private
+mount table; they do not modify the host or parent workbench mounts. All enabled backends use the same
 host/execution workspace boundary; no backend declares Bubblewrap compatibility.
 Native session IDs remain unchanged, while native workspace inputs use the
 stable execution path and Tyde keeps host-root project ownership. Native catalog
@@ -40,7 +46,12 @@ files initialize afresh on each native driver launch, including resume.
 Host-only controls reject parent traversal and engine-private paths instead
 of projecting them onto unrelated host files.
 Live cross-engine conversation moves remain unsupported.
-Modes requiring nested namespaces fail explicitly if host policy denies them.
+Modes requiring nested namespaces use freshly prepared runtime support, not a
+workbench's persisted creation-time report. They fail explicitly if host policy
+denies them; explicit backend permission settings remain unchanged.
+The foreground command owns its exit status, independently of compiler-cache
+services. Adopted descendants are joined and their statuses logged; required
+service failures still fail the execution explicitly.
 
 ## Cold readiness and opportunistic artifact reuse
 
