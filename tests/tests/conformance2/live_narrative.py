@@ -17,7 +17,23 @@ run = Path(tempfile.mkdtemp(prefix="tyde-real-live-narrative-"))
 print("Real live narrative evidence:", run, flush=True)
 used = set()
 lock = threading.Lock()
-state = {"held": 0, "released": 0, "transport_errors": 0, "upstream_errors": 0}
+state = {"held": 0, "released": 0, "transport_errors": 0, "upstream_errors": 0,
+         "requests": 0, "unexpected_requests": 0, "transport_failures": []}
+child_exited = threading.Event()
+
+
+def transport_failure(error, request, stage, inference, phase, status,
+                      terminal_received, terminal_forwarded):
+    with lock:
+        state["transport_errors"] += 1
+        state["transport_failures"].append({
+            "request": request, "exception": type(error).__name__,
+            "errno": getattr(error, "errno", None), "stage": stage,
+            "inference": inference, "phase": phase, "status": status,
+            "terminal_received": terminal_received,
+            "terminal_forwarded": terminal_forwarded,
+            "child_exited": child_exited.is_set(),
+        })
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -62,6 +78,21 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         return True
 
     def forward(self):
+        with lock:
+            state["requests"] += 1
+            request_number = state["requests"]
+            request_phase = "after_held_request" if any(item.startswith("request:") for item in used) else "before_held_request"
+        inference = self.path.split("?")[0].endswith("/responses")
+        terminal_received = False
+        terminal_forwarded = False
+        status = None
+        stage = "read_request"
+        if not inference:
+            with lock:
+                state["unexpected_requests"] += 1
+            self.close_connection = True
+            self.send_error(502, "Only inference requests belong to the stream gate")
+            return
         payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.request_held():
             self.close_connection = True
@@ -83,6 +114,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 state["upstream_errors"] += 1
         try:
             with response:
+                status = response.status
+                stage = "write_headers"
                 self.send_response(response.status)
                 for key, value in response.headers.items():
                     if key.lower() not in {"connection", "transfer-encoding", "content-length", "content-encoding"}:
@@ -90,17 +123,24 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                if not self.path.split("?")[0].endswith("/responses") or response.status != 200:
+                if response.status != 200:
+                    stage = "copy_error_response"
                     shutil.copyfileobj(response, self.wfile)
                     return
                 frame = bytearray()
                 text_seen = False
+                stage = "read_frame"
                 for line in response:
+                    stage = "collect_frame"
                     frame.extend(line)
                     if line.strip():
+                        stage = "read_frame"
                         continue
+                    stage = "decode_frame"
                     events = [json.loads(field[5:]) for field in bytes(frame).splitlines()
                               if field.startswith(b"data:") and field[5:].strip() != b"[DONE]"]
+                    completed = any(event.get("type") == "response.completed" for event in events)
+                    terminal_received |= completed
                     text_seen |= any(event.get("type") == "response.output_text.delta" for event in events)
                     terminal = any(event.get("type") == "response.output_text.done" for event in events)
                     if terminal and text_seen and (run / "armed").is_file():
@@ -111,6 +151,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                                 used.add(phase)
                                 state["held"] += 1
                         if hold:
+                            stage = "response_gate"
                             with socket.socket(socket.AF_UNIX) as gate:
                                 gate.connect(str(run / "gate.sock"))
                                 gate.sendall(b"\x01")
@@ -118,25 +159,33 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                                     raise RuntimeError("stream gate closed without release")
                             with lock:
                                 state["released"] += 1
+                    stage = "write_frame"
                     self.wfile.write(frame)
+                    stage = "flush_frame"
                     self.wfile.flush()
+                    terminal_forwarded |= completed
                     frame.clear()
+                    stage = "read_frame"
                 if frame:
+                    stage = "write_tail"
                     self.wfile.write(frame)
+                    stage = "flush_tail"
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+                stage = "close_upstream"
+        except (BrokenPipeError, ConnectionResetError) as error:
             if not (run / "armed").is_file() or (run / "armed").read_text() != "interrupted":
-                with lock:
-                    state["transport_errors"] += 1
+                transport_failure(error, request_number, stage, inference, request_phase, status,
+                                  terminal_received, terminal_forwarded)
             self.close_connection = True
-        except Exception:
-            with lock:
-                state["transport_errors"] += 1
+        except Exception as error:
+            transport_failure(error, request_number, stage, inference, request_phase, status,
+                              terminal_received, terminal_forwarded)
             self.close_connection = True
 
 
 class Server(http.server.ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
+    block_on_close = True
 
 
 if shutil.which("codex") is None:
@@ -160,6 +209,7 @@ try:
 [model_providers.tyde_live_narrative]
 name = "Real inference stream gate"
 base_url = "http://127.0.0.1:{server.server_port}"
+model_catalog_url = "https://chatgpt.com/backend-api/codex/models"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false
@@ -168,6 +218,7 @@ supports_websockets = false
         with (run / "run.log").open("w") as output:
             result = subprocess.run([sys.argv[1], "--exact", sys.argv[2], "--ignored", "--nocapture"],
                                     env=env, stdout=output, stderr=subprocess.STDOUT)
+            child_exited.set()
 finally:
     server.shutdown()
     thread.join()
@@ -182,4 +233,5 @@ for line in (run / "run.log").read_text().splitlines():
     panic = "panicked at" in line
 assert state["held"] > 0 and state["held"] == state["released"], "no completed real stream gate"
 assert not state["transport_errors"] and not state["upstream_errors"], "real stream fixture failed"
+assert not state["unexpected_requests"], "non-inference request reached the stream gate"
 sys.exit(result.returncode)

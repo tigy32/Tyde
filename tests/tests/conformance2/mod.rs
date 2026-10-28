@@ -524,6 +524,7 @@ impl Profile {
 pub struct Agent {
     pub session_id: SessionId,
     pub replayed_history: Vec<ChatEvent>,
+    pub replayed_model_requests: Vec<ModelRequestTokenUsage>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1020,6 +1021,7 @@ pub async fn spawn_agent_with_payload<B: Backend>(
     Agent {
         session_id,
         replayed_history: Vec::new(),
+        replayed_model_requests: Vec::new(),
     }
 }
 
@@ -1047,6 +1049,7 @@ pub async fn fork_agent<B: Backend>(
     Agent {
         session_id,
         replayed_history: Vec::new(),
+        replayed_model_requests: Vec::new(),
     }
 }
 
@@ -2189,6 +2192,7 @@ pub async fn resume_agent_at_roots<B: Backend>(
         "resume silently changed the provider session identity"
     );
     let mut replayed_history = Vec::new();
+    let mut replayed_model_requests = Vec::new();
     loop {
         let event = events
             .recv_backend()
@@ -2213,7 +2217,8 @@ pub async fn resume_agent_at_roots<B: Backend>(
                 );
                 replayed_history.push(event);
             }
-            BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
+            BackendEvent::ModelRequestTokenUsage(usage) => replayed_model_requests.push(usage),
+            BackendEvent::Compaction(_) => {}
         }
     }
     host.backend = Some(backend);
@@ -2222,6 +2227,7 @@ pub async fn resume_agent_at_roots<B: Backend>(
     Agent {
         session_id: id.clone(),
         replayed_history,
+        replayed_model_requests,
     }
 }
 
@@ -3064,6 +3070,7 @@ pub async fn install_host_steering<B: Backend>(host: &mut Harness<B>, body: &str
 pub struct Compaction {
     backend: BackendKind,
     events: Vec<ChatEvent>,
+    pub model_requests: Vec<ModelRequestTokenUsage>,
     pub observations: Vec<server::backend::compaction::BackendObservedCompaction>,
     pub terminal: server::backend::compaction::BackendCompactionResult,
 }
@@ -3144,6 +3151,7 @@ pub async fn finish_compaction<B: Backend>(
     use server::backend::compaction::BackendCompactionEvent;
     let operation_id = accepted.operation_id.clone();
     let mut observations = Vec::new();
+    let mut model_requests = Vec::new();
     let terminal = loop {
         tokio::select! {
             terminal = &mut accepted.terminal => break terminal.expect("compaction terminal channel closed"),
@@ -3152,7 +3160,7 @@ pub async fn finish_compaction<B: Backend>(
                     BackendEvent::Chat(event) => events.push(event),
                     BackendEvent::Compaction(BackendCompactionEvent::Observed(observation)) => observations.push(*observation),
                     BackendEvent::Compaction(BackendCompactionEvent::Progress(progress)) => assert_eq!(progress.operation_id, operation_id),
-                    BackendEvent::ModelRequestTokenUsage(_) => {},
+                    BackendEvent::ModelRequestTokenUsage(usage) => model_requests.push(usage),
                     BackendEvent::ResumeReplayComplete(_) => panic!("unexpected resume boundary during compaction"),
                 }
             }
@@ -3178,7 +3186,7 @@ pub async fn finish_compaction<B: Backend>(
             BackendEvent::Compaction(BackendCompactionEvent::Progress(progress)) => {
                 assert_eq!(progress.operation_id, operation_id)
             }
-            BackendEvent::ModelRequestTokenUsage(_) => {}
+            BackendEvent::ModelRequestTokenUsage(usage) => model_requests.push(usage),
             BackendEvent::ResumeReplayComplete(_) => {
                 panic!("unexpected resume boundary after compaction")
             }
@@ -3188,6 +3196,7 @@ pub async fn finish_compaction<B: Backend>(
         backend: host.backend(),
         events,
         observations,
+        model_requests,
         terminal,
     }
 }

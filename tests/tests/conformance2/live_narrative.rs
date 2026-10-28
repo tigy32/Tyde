@@ -263,6 +263,77 @@ pub async fn interrupted_held_request<B: Backend>(
     follow_up
 }
 
+/// Holds the fork's first real inference before forwarding it upstream, so
+/// cancellation cannot race a completed response on a fast provider.
+pub async fn fork_before_first_request<B: Backend>(
+    host: &mut Harness<B>,
+    source: &SessionId,
+    prompt: &str,
+) -> (Agent, Turn) {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("TYDE_NARRATIVE_GATE_DIR").expect("stream gate directory"),
+    );
+    let listener = tokio::net::UnixListener::bind(directory.join("gate.sock"))
+        .expect("bind first fork request gate");
+    std::fs::write(directory.join("armed"), "request:fork-before-first-request")
+        .expect("arm first fork inference");
+    let child = fork_agent(host, source, prompt).await;
+    let (mut gate, _) = listener.accept().await.expect("first fork inference held");
+    assert_eq!(gate.read_u8().await.expect("fork request held receipt"), 1);
+    let mut interrupted = host.turn(prompt);
+    loop {
+        match host.next_backend_event().await {
+            BackendEvent::Chat(event) => {
+                let working = matches!(event, ChatEvent::TypingStatusChanged(true));
+                interrupted.events.push(event);
+                if working {
+                    break;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(_) => {
+                panic!("held fork reported usage before its first completed request")
+            }
+            _ => panic!("unexpected backend boundary before first fork inference"),
+        }
+    }
+    interrupt_backend(host).await;
+    loop {
+        match host.next_backend_event().await {
+            BackendEvent::Chat(event) => {
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                interrupted.events.push(event);
+                if idle {
+                    break;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => interrupted.model_requests.push(usage),
+            _ => panic!("unexpected backend boundary during first fork cancellation"),
+        }
+    }
+    gate.write_u8(1)
+        .await
+        .expect("release cancelled fork request");
+    drop(listener);
+    std::fs::remove_file(directory.join("gate.sock")).expect("remove first fork request gate");
+    assert!(
+        interrupted.model_requests.is_empty(),
+        "a fork interrupted before upstream inference has no completed own request"
+    );
+    assert_eq!(
+        interrupted
+            .events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+            .count(),
+        1,
+        "the first fork request is cancelled exactly once"
+    );
+    eprintln!(
+        "REQUEST INTERRUPT EVIDENCE phase=first-fork request_held=true own_request_count=0 cancellation_count=1"
+    );
+    (child, interrupted)
+}
+
 fn assert_exact_streamed_content(turn: &Turn) {
     let mut stream = None;
     for event in &turn.events {

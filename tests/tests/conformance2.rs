@@ -10343,6 +10343,249 @@ async fn real_usage_accounting<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+conformance2_scenario!(
+    real_fork_own_request_usage,
+    [
+        BackendCapability::ModelRequestUsageReported,
+        BackendCapability::DurableOwnRequestUsage,
+        BackendCapability::CumulativeUsageReported,
+        BackendCapability::ForkSession,
+        BackendCapability::ResumeSession,
+    ]
+);
+
+async fn real_fork_own_request_usage<B: Backend>(host: &mut Harness<B>) {
+    let prompt = usage_probe_prompt();
+    let parent = spawn_agent(host, &prompt).await;
+    let first = collect_turn(host, &parent, &prompt).await;
+    assert_final_text_contains(&first, USAGE_MARKER);
+    let warm = ask(host, &parent, &prompt).await;
+    assert_final_text_contains(&warm, USAGE_MARKER);
+    close_agent(host, &parent).await;
+
+    let child = fork_agent(host, &parent.session_id, &prompt).await;
+    let forked = collect_turn(host, &child, &prompt).await;
+    assert_final_text_contains(&forked, USAGE_MARKER);
+    let mut own = BTreeMap::new();
+    assert!(
+        !forked.model_requests().is_empty(),
+        "fork omitted own request usage"
+    );
+    assert_own_request_totals(&mut own, forked.model_requests());
+    let followup = ask(host, &child, &prompt).await;
+    assert_final_text_contains(&followup, USAGE_MARKER);
+    assert_own_request_totals(&mut own, followup.model_requests());
+    close_agent(host, &child).await;
+
+    for _ in 0..2 {
+        let resumed = resume_agent(host, &child.session_id).await;
+        assert_own_request_totals(&mut own, &resumed.replayed_model_requests);
+        let followed = ask(host, &resumed, &prompt).await;
+        assert_final_text_contains(&followed, USAGE_MARKER);
+        assert_own_request_totals(&mut own, followed.model_requests());
+        close_agent(host, &resumed).await;
+    }
+}
+
+conformance2_scenario!(
+    real_interrupted_fork_own_request_usage,
+    [
+        BackendCapability::ModelRequestUsageReported,
+        BackendCapability::DurableOwnRequestUsage,
+        BackendCapability::CumulativeUsageReported,
+        BackendCapability::ForkSession,
+        BackendCapability::ResumeSession,
+        BackendCapability::Interrupt,
+    ]
+);
+
+async fn real_interrupted_fork_own_request_usage<B: Backend>(host: &mut Harness<B>) {
+    if !real_live_narrative_child(host).await {
+        return;
+    }
+    let prompt = usage_baseline_prompt();
+    let parent = spawn_agent(host, &prompt).await;
+    let warmed = collect_turn(host, &parent, &prompt).await;
+    assert_final_text_contains(&warmed, USAGE_MARKER);
+    assert!(
+        !warmed.model_requests().is_empty(),
+        "parent must have paid request usage"
+    );
+    assert_clean_close(host, &parent).await;
+
+    let (child, interrupted) = fork_before_first_request(host, &parent.session_id, &prompt).await;
+    assert_no_error_message(&interrupted.label(), interrupted.events());
+    assert!(
+        interrupted.events().iter().all(|event| !matches!(
+            event,
+            ChatEvent::StreamStart(_)
+                | ChatEvent::StreamDelta(_)
+                | ChatEvent::StreamReasoningDelta(_)
+                | ChatEvent::StreamEnd(_)
+        )),
+        "a fork cancelled before upstream inference must not emit an assistant response"
+    );
+    let working = event_positions(&interrupted, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(true))
+    });
+    let cancellations = event_positions(&interrupted, |event| {
+        matches!(event, ChatEvent::OperationCancelled(_))
+    });
+    let idle = event_positions(&interrupted, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    });
+    assert_eq!(
+        (working.len(), cancellations.len(), idle.len()),
+        (1, 1, 1),
+        "the held fork must report working, cancellation and idle exactly once"
+    );
+    assert!(
+        working[0] < cancellations[0] && cancellations[0] < idle[0],
+        "the held fork must acknowledge cancellation after working and before idle"
+    );
+    assert_reached_idle(&interrupted);
+    assert_clean_close(host, &child).await;
+    let resumed = resume_agent(host, &child.session_id).await;
+    assert!(
+        resumed.replayed_model_requests.is_empty(),
+        "an unused fork cannot replay inherited usage or invented zero requests"
+    );
+    assert!(resumed.replayed_history.iter().any(|event| matches!(event,
+        ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Assistant { .. }) && message.content.contains(USAGE_MARKER)
+    )), "the unused fork retains its parent's completed history");
+    assert_clean_close(host, &resumed).await;
+
+    let restarted = resume_agent(host, &child.session_id).await;
+    assert!(
+        restarted.replayed_model_requests.is_empty(),
+        "restarting an unused fork cannot invent own requests"
+    );
+    let followed = ask(host, &restarted, &prompt).await;
+    assert_final_text_contains(&followed, USAGE_MARKER);
+    assert!(
+        !followed.model_requests().is_empty(),
+        "the resumed fork must account its first completed own request"
+    );
+    assert_own_request_totals(&mut BTreeMap::new(), followed.model_requests());
+    assert_universal_contract(&[followed]);
+    assert_clean_close(host, &restarted).await;
+}
+
+conformance2_scenario!(
+    real_compaction_own_request_usage,
+    [
+        BackendCapability::ModelRequestUsageReported,
+        BackendCapability::DurableOwnRequestUsage,
+        BackendCapability::CumulativeUsageReported,
+        BackendCapability::CompactionReported,
+        BackendCapability::CompactionRequestUsageReported,
+        BackendCapability::ResumeSession,
+    ]
+);
+
+async fn real_compaction_own_request_usage<B: Backend>(host: &mut Harness<B>) {
+    let prompt = format!(
+        "Context to preserve during compaction: {}\n{}",
+        "The project maintains exact request ownership across context changes. ".repeat(1024),
+        usage_baseline_prompt()
+    );
+    let agent = spawn_agent(host, &prompt).await;
+    let launched = collect_turn(host, &agent, &prompt).await;
+    assert_final_text_contains(&launched, USAGE_MARKER);
+    let mut own = BTreeMap::new();
+    assert!(
+        !launched.model_requests().is_empty(),
+        "initial turn omitted own request usage"
+    );
+    assert_own_request_totals(&mut own, launched.model_requests());
+    let compacted = compact(host, &agent).await;
+    assert_compaction_completed_once(&compacted);
+    assert!(
+        !compacted.model_requests.is_empty(),
+        "native compaction omitted the actual model requests it consumed"
+    );
+    assert_own_request_totals(&mut own, &compacted.model_requests);
+    let followed = ask(host, &agent, usage_baseline_prompt()).await;
+    assert_final_text_contains(&followed, USAGE_MARKER);
+    assert_own_request_totals(&mut own, followed.model_requests());
+    close_agent(host, &agent).await;
+    let resumed = resume_agent(host, &agent.session_id).await;
+    assert_own_request_totals(&mut own, &resumed.replayed_model_requests);
+    let followed = ask(host, &resumed, usage_baseline_prompt()).await;
+    assert_final_text_contains(&followed, USAGE_MARKER);
+    assert_own_request_totals(&mut own, followed.model_requests());
+    assert_clean_close(host, &resumed).await;
+}
+
+fn assert_own_request_totals(
+    own: &mut BTreeMap<(String, u32), TokenUsage>,
+    updates: &[protocol::ModelRequestTokenUsage],
+) {
+    for update in updates {
+        let key = (
+            update.request_id.turn_id.0.clone(),
+            update.request_id.sequence,
+        );
+        if let Some(previous) = own.insert(key, update.request.clone()) {
+            assert!(
+                previous == update.request,
+                "replayed request identity changed its measured usage"
+            );
+        }
+        let summed = sum_own_request_usage(own.values());
+        assert!(
+            update.cumulative == summed,
+            "own cumulative usage must equal unique own requests in every token field"
+        );
+        let turn = &update.request_id.turn_id.0;
+        let summed_turn = sum_own_request_usage(
+            own.iter()
+                .filter(|((id, _), _)| id == turn)
+                .map(|(_, usage)| usage),
+        );
+        assert!(
+            update.turn == summed_turn,
+            "own turn usage must equal its unique requests in every token field"
+        );
+        assert!(
+            update.request.total_tokens > 0,
+            "an accounted model request cannot be an invented zero measurement"
+        );
+    }
+}
+
+fn sum_own_request_usage<'a>(requests: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
+    let mut summed = TokenUsage::default();
+    for (index, request) in requests.enumerate() {
+        if index == 0 {
+            summed = request.clone();
+        } else {
+            summed.input_tokens += request.input_tokens;
+            summed.output_tokens += request.output_tokens;
+            summed.total_tokens += request.total_tokens;
+            summed.cached_prompt_tokens = summed
+                .cached_prompt_tokens
+                .zip(request.cached_prompt_tokens)
+                .map(|(a, b)| a + b);
+            summed.cache_creation_input_tokens = summed
+                .cache_creation_input_tokens
+                .zip(request.cache_creation_input_tokens)
+                .map(|(a, b)| a + b);
+            summed.reasoning_tokens = summed
+                .reasoning_tokens
+                .zip(request.reasoning_tokens)
+                .map(|(a, b)| a + b);
+        }
+        assert!(
+            request
+                .reasoning_tokens
+                .is_none_or(|reasoning| reasoning <= request.output_tokens),
+            "reasoning is an output subset, not additional output"
+        );
+    }
+    summed
+}
+
 async fn real_duplicate_skill_content<B: Backend>(host: &mut Harness<B>) {
     let marker = format!("SKILL_{}", Uuid::new_v4().simple());
     let identical = "tyde-identical-copy";

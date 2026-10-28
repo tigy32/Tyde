@@ -1,4 +1,5 @@
 mod settings;
+mod usage;
 
 pub(crate) use settings::{native_settings_snapshot, persist_native_settings};
 
@@ -27,11 +28,10 @@ use protocol::{
     CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure, CapacityPlanLabel,
     CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
     CapacityWindow, ChatMessageId, CodexLimitSlot, CurrentContextUsage, ImageData,
-    MessageMetadataUpdateData, MessageTokenUsage, ModelInfo, ModelRequestId,
-    ModelRequestTokenUsage, ModelTurnId, ReasoningData, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionMode, ToolExecutionNormalizationFailure,
-    ToolExecutionOutcome, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
-    ToolRequestType, ToolUseData, ValueProvenance,
+    MessageMetadataUpdateData, MessageTokenUsage, ModelInfo, ModelRequestTokenUsage, ReasoningData,
+    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionMode,
+    ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolProgressData,
+    ToolProgressUpdate, ToolRequestType, ToolUseData, ValueProvenance,
 };
 
 use crate::agent_control_mcp::{
@@ -4352,7 +4352,6 @@ struct PendingCodexMessageMetadata {
 #[derive(Clone, Default)]
 struct CodexTurnTokenUsage {
     request_count: u32,
-    latest_request: Option<TokenUsage>,
     turn: TokenUsage,
     cumulative: Option<TokenUsage>,
     model_context_window: Option<u64>,
@@ -4394,7 +4393,6 @@ struct CodexSubAgentStream {
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
-    provider_usage_baseline: Option<TokenUsage>,
 }
 
 impl CodexSubAgentStream {
@@ -4439,7 +4437,6 @@ struct CompletedCodexSubAgentStream {
     sender_thread_id: String,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
-    provider_usage_baseline: Option<TokenUsage>,
     provider_item_tombstones: VecDeque<CodexProviderItemTombstone>,
     owner_terminated: bool,
 }
@@ -4473,7 +4470,6 @@ fn completed_codex_subagent_stream(
         sender_thread_id: stream.sender_thread_id,
         pending_message_metadata: stream.pending_message_metadata,
         model_token_usage_by_turn: stream.model_token_usage_by_turn,
-        provider_usage_baseline: stream.provider_usage_baseline,
         provider_item_tombstones: stream.provider_item_tombstones,
         owner_terminated,
     }
@@ -4610,6 +4606,7 @@ enum CodexNotificationOwner {
 
 struct CodexState {
     thread_id: String,
+    own_request_usage: HashMap<String, usage::OwnRequestUsage>,
     workspace_roots_override: Option<Vec<String>>,
     workspace_relocation_in_flight: bool,
     response_projections: HashMap<String, CodexResponseProjection>,
@@ -4781,6 +4778,7 @@ fn initial_codex_state(
         Some(CodexResponseProjection::Responses(_))
     );
     CodexState {
+        own_request_usage: HashMap::new(),
         thread_id,
         workspace_roots_override: None,
         workspace_relocation_in_flight: false,
@@ -9425,6 +9423,7 @@ impl CodexInner {
                         state.pending_message_metadata = None;
                         state.token_usage_by_turn.clear();
                         state.model_token_usage_by_turn.clear();
+                        state.own_request_usage.clear();
                         state.file_change_call_ids.clear();
                         state.background_command_owner_active = true;
                         state.pending_background_wakes.clear();
@@ -9453,6 +9452,7 @@ impl CodexInner {
         if execution_mode == BackendExecutionMode::Agent {
             self.emit_native_goal_snapshot(&thread_id).await?;
         }
+        self.reconcile_own_request_usage(&thread_id, None).await?;
         self.emitter.resume_replay_complete();
         tracing::debug!(
             history_turns = turns.len(),
@@ -11661,6 +11661,21 @@ impl CodexInner {
                 codex_param_keys(params)
             );
         }
+        if matches!(method, "thread/tokenUsage/updated" | "turn/completed")
+            && let Some(thread_id) = extract_notification_thread_id(params)
+            && self
+                .state
+                .with({
+                    let thread_id = thread_id.clone();
+                    move |state| state.thread_id == thread_id
+                })
+                .await
+            && let Err(error) = self
+                .reconcile_own_request_usage(&thread_id, Some(params))
+                .await
+        {
+            self.emitter.backend_error(&error);
+        }
         if self.intercept_compaction_notification(method, params).await {
             return;
         }
@@ -12390,8 +12405,124 @@ impl CodexInner {
         );
     }
 
+    async fn reconcile_own_request_usage(
+        &self,
+        thread_id: &str,
+        params: Option<&Value>,
+    ) -> Result<(), String> {
+        let owner = thread_id.to_owned();
+        let root_emitter = Arc::clone(&self.emitter);
+        let target = self
+            .state
+            .with(move |state| {
+                let emitter = if owner == state.thread_id {
+                    root_emitter
+                } else if let Some(stream) = state.subagent_streams.get(&owner) {
+                    Arc::clone(&stream.emitter)
+                } else {
+                    let stream = state.completed_subagent_streams.get(&owner)?;
+                    Arc::clone(&stream.emitter)
+                };
+                let usage = state.own_request_usage.get(&owner);
+                let path = usage.and_then(|usage| usage.path.clone());
+                let offset = usage.map_or(0, usage::OwnRequestUsage::offset);
+                Some((emitter, path, offset))
+            })
+            .await;
+        let Some((emitter, path, offset)) = target else {
+            return Ok(());
+        };
+        let path = match path {
+            Some(path) => path,
+            None => {
+                let response = self
+                    .rpc
+                    .request(
+                        "thread/read",
+                        json!({
+                            "threadId": thread_id,
+                            "includeTurns": false,
+                        }),
+                    )
+                    .await
+                    .map_err(|_| "Codex native accounting thread/read failed")?;
+                response
+                    .pointer("/thread/path")
+                    .and_then(Value::as_str)
+                    .ok_or("Codex native accounting requires a materialized thread path")?
+                    .to_owned()
+            }
+        };
+        let bytes = self.rpc.read_native_usage(&path, offset).await?;
+        let context = params.and_then(|params| {
+            let raw = extract_turn_token_usage_value(params)?;
+            let normalized = normalize_token_usage_with_envelope(raw, Some(params), None)?;
+            let request: TokenUsage = serde_json::from_value(normalized).ok()?;
+            let window = context_window_from_token_usage(raw, raw, Some(params))?;
+            (window > 0).then_some((request, window))
+        });
+        let terminal_turn = params.and_then(|params| {
+            (params.pointer("/turn/status").and_then(Value::as_str) == Some("completed"))
+                .then(|| extract_turn_id(params))
+                .flatten()
+        });
+        let owner = thread_id.to_owned();
+        let events = self
+            .state
+            .with(move |state| {
+                let ledger = state.own_request_usage.entry(owner.clone()).or_default();
+                ledger.path = Some(path);
+                let mut events = ledger.reconcile(
+                    &owner,
+                    offset,
+                    &bytes,
+                    context.as_ref().map(|(_, window)| *window),
+                    terminal_turn.as_deref(),
+                )?;
+                let projections = events
+                    .iter()
+                    .map(|event| {
+                        let turn_id = event.request_id.turn_id.0.clone();
+                        let turn = ledger.turns[&turn_id].clone();
+                        (turn_id, turn)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some((request, window)) = context
+                    && let Some(update) = ledger.context_update(&request, window)
+                {
+                    events.push(update);
+                }
+                let turns = if owner == state.thread_id {
+                    &mut state.model_token_usage_by_turn
+                } else if let Some(stream) = state.subagent_streams.get_mut(&owner) {
+                    &mut stream.model_token_usage_by_turn
+                } else if let Some(stream) = state.completed_subagent_streams.get_mut(&owner) {
+                    &mut stream.model_token_usage_by_turn
+                } else {
+                    return Err("Codex native accounting lost its registered owner".to_owned());
+                };
+                turns.extend(projections);
+                Ok::<_, String>(events)
+            })
+            .await?;
+        tracing::debug!(
+            request_updates = events.len(),
+            "Codex own-request accounting reconciled"
+        );
+        if params.is_none() {
+            if let Some(event) = events.last() {
+                emitter.model_request_token_usage(event);
+            }
+        } else {
+            for event in events {
+                emitter.model_request_token_usage(&event);
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_root_token_usage_updated(&self, params: &Value) {
-        let (metadata_update, model_usage) = {
+        let metadata_update = {
             {
                 let flow = {
                     let params = params.clone();
@@ -12400,27 +12531,13 @@ impl CodexInner {
                             let params = &params;
                             ControlFlow::Continue({
                                 let model = state.effective_model.clone();
-                                let model_usage =
-                                    extract_model_request_token_usage(params, model.as_deref())
-                                        .and_then(
-                                            |(turn_id, request, cumulative, context_window)| {
-                                                let usage = record_model_request_token_usage(
-                                                    &mut state.model_token_usage_by_turn,
-                                                    turn_id,
-                                                    request,
-                                                    cumulative,
-                                                    context_window,
-                                                )?;
-                                                Some(usage)
-                                            },
-                                        );
                                 let Some((turn_id, token_usage)) =
                                     extract_turn_token_usage(params, model.as_deref())
                                 else {
                                     return ControlFlow::Break(());
                                 };
 
-                                let metadata_update = if let Some(pending) =
+                                if let Some(pending) =
                                     state.completed_message_metadata_by_turn.remove(&turn_id)
                                 {
                                     let model_token_usage =
@@ -12440,8 +12557,7 @@ impl CodexInner {
                                     None
                                 } else {
                                     None
-                                };
-                                (metadata_update, model_usage)
+                                }
                             })
                         })
                         .await
@@ -12453,9 +12569,6 @@ impl CodexInner {
             }
         };
 
-        if let Some(usage) = model_usage {
-            self.emitter.model_request_token_usage(&usage);
-        }
         if let Some((pending, token_usage, model_token_usage, context_breakdown)) = metadata_update
         {
             emit_codex_message_metadata_update(
@@ -12616,6 +12729,14 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        if matches!(method, "thread/tokenUsage/updated" | "turn/completed")
+            && let Err(error) = self
+                .reconcile_own_request_usage(stream_key, Some(params))
+                .await
+        {
+            self.emitter.backend_error(&error);
+        }
+
         eprintln!(
             "TYDE CODEX CHILD EVENT method={method} turn={} turn_status={:?} will_retry={:?} message_bytes={:?}",
             extract_turn_id(params).is_some(),
@@ -13479,6 +13600,14 @@ let stream_key = stream_key.as_str();
         stream_key: &str,
         model: &str,
     ) {
+        if matches!(method, "thread/tokenUsage/updated" | "turn/completed")
+            && let Err(error) = self
+                .reconcile_own_request_usage(stream_key, Some(params))
+                .await
+        {
+            self.emitter.backend_error(&error);
+        }
+
         if matches!(method, "item/started" | "item/completed")
             && params
                 .pointer("/item/type")
@@ -14789,8 +14918,6 @@ let stream_key = stream_key.as_str();
         stream_key: &str,
         model: &str,
     ) {
-        self.emit_subagent_model_request_usage(params, stream_key, model, false)
-            .await;
         let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
             return;
         };
@@ -14849,8 +14976,6 @@ let stream_key = stream_key.as_str();
         stream_key: &str,
         model: &str,
     ) {
-        self.emit_subagent_model_request_usage(params, stream_key, model, true)
-            .await;
         let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
             return;
         };
@@ -14941,8 +15066,6 @@ let stream_key = stream_key.as_str();
             tracing::debug!("Consumed completion for terminated Codex child turn");
             return;
         }
-        self.emit_subagent_model_request_usage(params, stream_key, model, false)
-            .await;
         self.close_subagent_tool_container_if_open(stream_key).await;
         let turn_status = params
             .get("turn")
@@ -15351,72 +15474,6 @@ let stream_key = stream_key.as_str();
                 )
                 .await;
             }
-        }
-    }
-
-    async fn emit_subagent_model_request_usage(
-        &self,
-        params: &Value,
-        stream_key: &str,
-        model: &str,
-        completed: bool,
-    ) {
-        let Some((turn_id, request, cumulative, context_window)) =
-            extract_model_request_token_usage(params, Some(model))
-        else {
-            return;
-        };
-        let recorded = {
-            {
-                let stream_key = stream_key.to_owned();
-                self.state
-                    .with(move |state| {
-                        let stream_key = stream_key.as_str();
-                        if completed {
-                            state
-                                .completed_subagent_streams
-                                .get_mut(stream_key)
-                                .and_then(|stream| {
-                                    let cumulative = normalize_subagent_cumulative_usage(
-                                        &mut stream.provider_usage_baseline,
-                                        &request,
-                                        cumulative,
-                                    );
-                                    let usage = record_model_request_token_usage(
-                                        &mut stream.model_token_usage_by_turn,
-                                        turn_id,
-                                        request,
-                                        cumulative,
-                                        context_window,
-                                    )?;
-                                    Some((Arc::clone(&stream.emitter), usage))
-                                })
-                        } else {
-                            state
-                                .subagent_streams
-                                .get_mut(stream_key)
-                                .and_then(|stream| {
-                                    let cumulative = normalize_subagent_cumulative_usage(
-                                        &mut stream.provider_usage_baseline,
-                                        &request,
-                                        cumulative,
-                                    );
-                                    let usage = record_model_request_token_usage(
-                                        &mut stream.model_token_usage_by_turn,
-                                        turn_id,
-                                        request,
-                                        cumulative,
-                                        context_window,
-                                    )?;
-                                    Some((Arc::clone(&stream.emitter), usage))
-                                })
-                        }
-                    })
-                    .await
-            }
-        };
-        if let Some((emitter, usage)) = recorded {
-            emitter.model_request_token_usage(&usage);
         }
     }
 
@@ -17405,7 +17462,6 @@ let stream_key = stream_key.as_str();
                                             pending_message_metadata: None,
                                             token_usage_by_turn: HashMap::new(),
                                             model_token_usage_by_turn: HashMap::new(),
-                                            provider_usage_baseline: None,
                                             current_images: Vec::new(),
                                         },
                                     );
@@ -17680,7 +17736,6 @@ let stream_key = stream_key.as_str();
                 .await
         };
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
-        let model_usage = extract_model_request_token_usage(params, model_hint.as_deref());
         let open_foreground_tool_ids = self
             .emitter
             .open_foreground_tool_ids()
@@ -17701,7 +17756,6 @@ let stream_key = stream_key.as_str();
             interrupted_published_stream,
             partial_idless_reasoning,
             metadata_update,
-            model_usage,
             terminated_background_commands,
             defer_idle_until_foreground_tools_complete,
             completed_after_interrupt,
@@ -17712,18 +17766,6 @@ let stream_key = stream_key.as_str();
                 if let Some((turn_id, token_usage)) = turn_usage {
                     state.token_usage_by_turn.insert(turn_id, token_usage);
                 }
-                let model_usage =
-                    model_usage.and_then(|(turn_id, request, cumulative, context_window)| {
-                        let usage = record_model_request_token_usage(
-                            &mut state.model_token_usage_by_turn,
-                            turn_id,
-                            request,
-                            cumulative,
-                            context_window,
-                        )?;
-                        Some(usage)
-                    });
-
                 let completed_turn_id =
                     notification_turn_id.or_else(|| state.active_turn_id.clone());
                 let requested_interrupt = completed_turn_id.is_some()
@@ -17868,7 +17910,6 @@ let stream_key = stream_key.as_str();
                     interrupted_published_stream,
                     partial_idless_reasoning,
                     metadata_update,
-                    model_usage,
                     terminated_background_commands,
                     defer_idle_until_foreground_tools_complete,
                     completed_after_interrupt,
@@ -17882,9 +17923,7 @@ let stream_key = stream_key.as_str();
                 "Codex background command was cancelled with its interrupted turn",
             );
         }
-        if let Some(usage) = model_usage {
-            self.emitter.model_request_token_usage(&usage);
-        }
+
         if let Some(stream) = interrupted_published_stream {
             self.trace_terminal_emission("stream_end", None).await;
             self.emitter.stream_end(
@@ -19076,9 +19115,11 @@ fn codex_message_usage(
     };
     if let Some(usage) = model_token_usage {
         return Some(MessageTokenUsage {
-            request: usage
-                .latest_request
-                .clone()
+            // The ledger may already contain later completed requests when
+            // this notification is dequeued. Its latest row is not this footer.
+            request: token_usage
+                .as_ref()
+                .and_then(codex_token_usage)
                 .map(known)
                 .unwrap_or_else(unavailable),
             turn: known(usage.turn.clone()),
@@ -19728,80 +19769,6 @@ fn extract_turn_token_usage(params: &Value, model_hint: Option<&str>) -> Option<
     Some((turn_id, normalized))
 }
 
-fn extract_model_request_token_usage(
-    params: &Value,
-    model_hint: Option<&str>,
-) -> Option<(String, TokenUsage, TokenUsage, Option<u64>)> {
-    let turn_id = extract_turn_id(params)?;
-    let raw = extract_turn_token_usage_value(params)?;
-    let request_value = normalize_token_usage_with_envelope(raw, Some(params), model_hint)?;
-    let cumulative_raw = raw
-        .get("total")
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| {
-            raw.get("last")
-                .filter(|value| value.is_object())
-                .unwrap_or(raw)
-        });
-    let cumulative_value =
-        normalize_token_usage_with_envelope(cumulative_raw, Some(params), model_hint)?;
-    let model_context_window = context_window_from_token_usage(raw, raw, Some(params));
-    let request = serde_json::from_value(request_value).ok()?;
-    let cumulative = serde_json::from_value(cumulative_value).ok()?;
-    Some((turn_id, request, cumulative, model_context_window))
-}
-
-fn record_model_request_token_usage(
-    usage_by_turn: &mut HashMap<String, CodexTurnTokenUsage>,
-    turn_id: String,
-    request: TokenUsage,
-    cumulative: TokenUsage,
-    model_context_window: Option<u64>,
-) -> Option<ModelRequestTokenUsage> {
-    let state = usage_by_turn.entry(turn_id.clone()).or_default();
-    if state.cumulative.as_ref() == Some(&cumulative) {
-        let context_window = model_context_window
-            .filter(|context_window| Some(*context_window) != state.model_context_window)?;
-        state.model_context_window = Some(context_window);
-        return Some(ModelRequestTokenUsage {
-            request_id: ModelRequestId {
-                turn_id: ModelTurnId(turn_id),
-                sequence: state.request_count,
-            },
-            current_context_usage: Some(current_context_usage(&request, context_window)),
-            request,
-            turn: state.turn.clone(),
-            cumulative,
-            model_context_window: state.model_context_window,
-            estimated_context_breakdown: None,
-        });
-    }
-
-    let sequence = state.request_count.saturating_add(1);
-    state.request_count = state.request_count.saturating_add(1);
-    add_token_usage(&mut state.turn, &request);
-    state.latest_request = Some(request.clone());
-    state.cumulative = Some(cumulative.clone());
-    state.model_context_window = model_context_window.or(state.model_context_window);
-    let current_context_usage = state
-        .model_context_window
-        .map(|context_window| current_context_usage(&request, context_window))
-        .unwrap_or(CurrentContextUsage::Unknown);
-
-    Some(ModelRequestTokenUsage {
-        request_id: ModelRequestId {
-            turn_id: ModelTurnId(turn_id),
-            sequence,
-        },
-        request,
-        turn: state.turn.clone(),
-        cumulative,
-        model_context_window: state.model_context_window,
-        current_context_usage: Some(current_context_usage),
-        estimated_context_breakdown: None,
-    })
-}
-
 fn current_context_usage(request: &TokenUsage, context_window: u64) -> CurrentContextUsage {
     CurrentContextUsage::Known {
         input_tokens: request
@@ -19809,63 +19776,6 @@ fn current_context_usage(request: &TokenUsage, context_window: u64) -> CurrentCo
             .saturating_add(request.cached_prompt_tokens.unwrap_or_default())
             .saturating_add(request.cache_creation_input_tokens.unwrap_or_default()),
         context_window,
-    }
-}
-
-fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
-    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-    total.cached_prompt_tokens =
-        add_optional_token_usage(total.cached_prompt_tokens, usage.cached_prompt_tokens);
-    total.cache_creation_input_tokens = add_optional_token_usage(
-        total.cache_creation_input_tokens,
-        usage.cache_creation_input_tokens,
-    );
-    total.reasoning_tokens =
-        add_optional_token_usage(total.reasoning_tokens, usage.reasoning_tokens);
-}
-
-fn normalize_subagent_cumulative_usage(
-    baseline: &mut Option<TokenUsage>,
-    request: &TokenUsage,
-    provider_cumulative: TokenUsage,
-) -> TokenUsage {
-    let Some(baseline) = baseline.as_ref() else {
-        *baseline = Some(subtract_token_usage(&provider_cumulative, request));
-        return request.clone();
-    };
-    subtract_token_usage(&provider_cumulative, baseline)
-}
-
-fn subtract_token_usage(total: &TokenUsage, baseline: &TokenUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: total.input_tokens.saturating_sub(baseline.input_tokens),
-        output_tokens: total.output_tokens.saturating_sub(baseline.output_tokens),
-        total_tokens: total.total_tokens.saturating_sub(baseline.total_tokens),
-        cached_prompt_tokens: subtract_optional_token_usage(
-            total.cached_prompt_tokens,
-            baseline.cached_prompt_tokens,
-        ),
-        cache_creation_input_tokens: subtract_optional_token_usage(
-            total.cache_creation_input_tokens,
-            baseline.cache_creation_input_tokens,
-        ),
-        reasoning_tokens: subtract_optional_token_usage(
-            total.reasoning_tokens,
-            baseline.reasoning_tokens,
-        ),
-    }
-}
-
-fn subtract_optional_token_usage(total: Option<u64>, baseline: Option<u64>) -> Option<u64> {
-    total.map(|total| total.saturating_sub(baseline.unwrap_or(0)))
-}
-
-fn add_optional_token_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
-    match (total, usage) {
-        (None, None) => None,
-        (total, usage) => Some(total.unwrap_or(0).saturating_add(usage.unwrap_or(0))),
     }
 }
 
@@ -19886,20 +19796,21 @@ fn normalize_token_usage_with_envelope(
     // and `cachedInputTokens` is a subset.  Our internal contract (matching
     // Anthropic) expects `input_tokens` to be the non-cached portion only,
     // with cache fields as separate additive values.
-    let cached_prompt_tokens =
-        usage_u64(source, &["cachedInputTokens", "cached_prompt_tokens"]).unwrap_or(0);
+    let cached_prompt_tokens = usage_u64(source, &["cachedInputTokens", "cached_prompt_tokens"]);
     let cache_creation_input_tokens = usage_u64(
         source,
-        &["cacheCreationInputTokens", "cache_creation_input_tokens"],
-    )
-    .unwrap_or(0);
-    let raw_input_tokens = usage_u64(source, &["inputTokens"]).unwrap_or(0);
+        &[
+            "cacheWriteInputTokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ],
+    );
     let input_tokens = if source.get("inputTokens").is_some() {
-        raw_input_tokens
-            .saturating_sub(cached_prompt_tokens)
-            .saturating_sub(cache_creation_input_tokens)
+        usage_u64(source, &["inputTokens"])?
+            .checked_sub(cached_prompt_tokens?)?
+            .checked_sub(cache_creation_input_tokens?)?
     } else {
-        usage_u64(source, &["input_tokens", "inputTokens", "prompt_tokens"]).unwrap_or(0)
+        usage_u64(source, &["input_tokens", "prompt_tokens"])?
     };
 
     // OpenAI convention: `outputTokens` includes reasoning.  Our contract
@@ -19908,14 +19819,11 @@ fn normalize_token_usage_with_envelope(
     let output_tokens = usage_u64(
         source,
         &["outputTokens", "output_tokens", "completion_tokens"],
-    )
-    .unwrap_or(0);
-    let reasoning_tokens =
-        usage_u64(source, &["reasoningOutputTokens", "reasoning_tokens"]).unwrap_or(0);
+    )?;
+    let reasoning_tokens = usage_u64(source, &["reasoningOutputTokens", "reasoning_tokens"]);
 
     // total_tokens = input_tokens + output_tokens (no double-counting).
-    let total_tokens =
-        usage_u64(source, &["totalTokens", "total_tokens"]).unwrap_or(input_tokens + output_tokens);
+    let total_tokens = usage_u64(source, &["totalTokens", "total_tokens"])?;
     let context_window =
         context_window_from_token_usage(raw, source, envelope).filter(|window| *window > 0);
     tracing::debug!(
@@ -21575,6 +21483,7 @@ struct CodexRpc {
     inbound: mpsc::UnboundedSender<CodexInbound>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    usage_is_remote: bool,
     rollout_trace_task: Option<JoinHandle<()>>,
     rollout_trace_root: Option<tempfile::TempDir>,
     tool_catalog: Option<tempfile::NamedTempFile>,
@@ -21735,6 +21644,7 @@ impl CodexRpc {
         } else {
             None
         };
+        let usage_is_remote = ssh_host.is_some();
         let mut child = if let Some(host) = ssh_host {
             let remote_args = codex_app_server_args(access_mode, execution_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
@@ -21851,6 +21761,7 @@ impl CodexRpc {
                 inbound: inbound_tx,
                 stdout_task,
                 stderr_task,
+                usage_is_remote,
                 rollout_trace_task,
                 rollout_trace_root,
                 tool_catalog,
@@ -21867,6 +21778,51 @@ impl CodexRpc {
             },
             inbound_rx,
         ))
+    }
+
+    async fn read_native_usage(&self, path: &str, offset: usize) -> Result<Vec<u8>, String> {
+        if self.usage_is_remote {
+            let file = self
+                .request("fs/readFile", json!({"path": path}))
+                .await
+                .map_err(|_| "Codex remote native accounting fs/readFile failed")?;
+            let encoded = file
+                .get("dataBase64")
+                .and_then(Value::as_str)
+                .ok_or("Codex native accounting fs/readFile omitted its contents")?;
+            let bytes = BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|_| "Codex native accounting fs/readFile returned invalid encoding")?;
+            return bytes
+                .get(offset..)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "Codex native accounting source was truncated".to_owned());
+        }
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| "Codex native accounting source could not be opened")?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|_| "Codex native accounting source could not be inspected")?
+            .len();
+        let remaining = length
+            .checked_sub(offset as u64)
+            .ok_or("Codex native accounting source was truncated")?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .await
+            .map_err(|_| "Codex native accounting source could not be positioned")?;
+        let mut bytes = Vec::new();
+        file.take(remaining)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "Codex native accounting source could not be read")?;
+        if bytes.len() as u64 != remaining {
+            return Err(
+                "Codex native accounting source changed during its bounded read".to_owned(),
+            );
+        }
+        Ok(bytes)
     }
 
     async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
@@ -23736,6 +23692,8 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
             tyde_agent_adapter::BackendCapability::CumulativeUsageReported,
             tyde_agent_adapter::BackendCapability::ModelRequestUsageReported,
+            tyde_agent_adapter::BackendCapability::DurableOwnRequestUsage,
+            tyde_agent_adapter::BackendCapability::CompactionRequestUsageReported,
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,

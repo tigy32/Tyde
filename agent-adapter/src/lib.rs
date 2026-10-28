@@ -124,6 +124,12 @@ exhaustive_capabilities! {
     // state, not a retraction of the capability.
     CumulativeUsageReported,
     ModelRequestUsageReported,
+    // Identity-bearing own-request totals survive resume/restart and exclude
+    // inherited fork work. Session-cumulative/message usage alone is weaker.
+    DurableOwnRequestUsage,
+    // Native compaction performs metered requests and exposes their exact
+    // request usage. CompactionReported alone promises no billing evidence.
+    CompactionRequestUsageReported,
     ContextUsageReported,
     ContextBreakdownReported,
     CompactionReported,
@@ -258,6 +264,26 @@ impl BackendCapabilities {
         self.require(
             BackendCapability::CumulativeUsageReported,
             BackendCapability::TurnUsageReported,
+        )?;
+        self.require(
+            BackendCapability::DurableOwnRequestUsage,
+            BackendCapability::ModelRequestUsageReported,
+        )?;
+        self.require(
+            BackendCapability::DurableOwnRequestUsage,
+            BackendCapability::CumulativeUsageReported,
+        )?;
+        self.require(
+            BackendCapability::DurableOwnRequestUsage,
+            BackendCapability::ResumeSession,
+        )?;
+        self.require(
+            BackendCapability::CompactionRequestUsageReported,
+            BackendCapability::ModelRequestUsageReported,
+        )?;
+        self.require(
+            BackendCapability::CompactionRequestUsageReported,
+            BackendCapability::CompactionReported,
         )?;
         self.require(
             BackendCapability::AgentControlTools,
