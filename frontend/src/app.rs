@@ -1721,6 +1721,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn ui_stall_log_names_the_slow_host_frame_apart_from_pending_waits() {
         let host_id = "stall-attribution-host";
+        let capture = crate::perf::diagnostic_tests::Capture::new();
+        capture.start();
         let clock = crate::perf::diagnostic_tests::LocalMonitorClock::install();
         let recorded = js_sys::eval(
             r#"
@@ -1943,6 +1945,21 @@ mod wasm_tests {
         assert_eq!(work["bytes"].as_u64(), Some(line.len() as u64));
         assert_eq!(work["items"], 1);
         assert!(work["duration_ms"].as_u64().unwrap() >= 100);
+        let detailed = capture.export();
+        assert_eq!(detailed["capabilities"]["longtask"], "unsupported");
+        let receive = detailed["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == "host_receive")
+            .unwrap();
+        assert_eq!(receive["detail"], "project_file_view_state");
+        assert_eq!(receive["bytes"].as_u64(), Some(line.len() as u64));
+        assert_eq!(receive["items"], 1);
+        assert!(
+            !detailed.to_string().contains("/repo"),
+            "frame attribution must not retain payload paths"
+        );
 
         js_sys::eval("window.__stallRelease(null)").unwrap();
         wasm_bindgen_futures::JsFuture::from(waiting).await.unwrap();

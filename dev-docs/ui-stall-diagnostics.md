@@ -51,6 +51,11 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
   Reactive rendering, layout and paint after a frame is dispatched are not
   instrumented: they appear only as interval beyond `longest_work`.
+  `focused` is `document.hasFocus()` at callback time, not a focus history.
+  `longest_work:null` means no qualifying completed span was retained for that
+  sampling window, not that the UI did no work. Pending calls are counted at
+  callback time, not throughout the interval. Every tick consumes the longest
+  span, including ticks that do not emit a gap; visibility changes clear it.
 - `layer=native event=dispatch_pending/dispatch_completed`: a background task
   queued a main-thread callback, observed it still pending at the next tick,
   and later measured its queue interval. At most one callback is pending.
@@ -72,6 +77,15 @@ The existing nonblocking tracing writer is bounded and lossy under saturation;
 these limits bound diagnostic contribution, not all pre-existing log traffic
 or total file bytes. Existing general logs can contain paths/IDs: do not assume
 an entire log file is sanitized just because these new lines are.
+
+These records locate delayed callbacks; they cannot reconstruct a stack or
+name work that was never instrumented. A 20,062ms interval on a 1,000ms timer
+is not proof of 20,062ms of continuous UI blocking. Correlate retained native
+dispatch and lifecycle records without treating their absence in a selected
+excerpt as evidence of an absent transition. Bind interpretation to the
+client's own `event=enabled version=...` line and matching source; a connected
+host's version does not identify the client build. An explicit capture must
+already have been running to provide its richer evidence retrospectively.
 
 **Limits:** scheduling gaps can also mean OS suspension, debugger pauses,
 unfocused-window WebKit throttling, or uninstrumented browser work. Visibility
@@ -124,7 +138,9 @@ bridge wait initiated by that work.
   Covered paths: global keyboard handling, composer input/autosize, host JSON
   receive/typed dispatch, file explorer tree build, markdown/synchronous
   highlighting, highlight worker submission/callback. Nested durations must not
-  be added together.
+  be added together. Host receive spans acquire their typed frame kind after
+  parsing; dispatch spans identify the frame from the start. Neither identifies
+  subsequent deferred reactive rendering or browser layout/paint.
 - `async_wait`: bridge invocation-to-settlement interval. It includes transport,
   native/server/remote work **and** delayed delivery back to the client. It is
   not UI-thread blocking time or proof of a slow server. Pending intervals are
@@ -148,6 +164,13 @@ interval, **not unmeasured CPU consumption**. It can include idle time, browser
 layout/paint/GC, uninstrumented application work or scheduling. Overlap is not
 causation. `scope_end` means a scope returned, not successful backend work.
 `incomplete` marks work still active when stopped/exported.
+
+Browser observer delivery can follow a gap's timer/frame callback. Late numeric
+browser intervals are attached to overlapping retained incidents, still capped
+at 12 per incident. Stop drains queued observer entries before disconnecting;
+no later callback changes the stopped export. Browser intervals are not added
+to the synchronous client union and do not establish which application call
+caused them. Unsupported browser observers remain explicitly unsupported.
 
 Portable timers, animation frames, DOM events and explicit call-site timings
 work in Tauri/WebKit as well as Chromium. Optional Long Tasks/Long Animation

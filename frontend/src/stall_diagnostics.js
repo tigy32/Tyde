@@ -61,6 +61,10 @@ export function createRecorder(env) {
         const endMs = now();
         c.records.push({...row, endMs, durationMs: endMs - row.startMs, outcome});
     }
+    function setFrame(id, frame) {
+        const row = capture?.running && capture.active.get(id);
+        if (row) row.detail = frame;
+    }
     function stop() {
         const c = capture;
         if (!c?.running) return;
@@ -69,7 +73,10 @@ export function createRecorder(env) {
         env.clearTimeout(c.timer);
         env.cancelAnimationFrame(c.frame);
         for (const [name, fn] of c.listeners) env.document.removeEventListener(name, fn, true);
-        for (const observer of c.observers) observer.disconnect();
+        for (const {observer, record} of c.observers) {
+            record(observer.takeRecords());
+            observer.disconnect();
+        }
     }
     function snapshot() {
         const c = capture;
@@ -152,16 +159,28 @@ export function createRecorder(env) {
         for (const [type, key] of [['longtask', 'longtask'], ['long-animation-frame', 'longAnimationFrame']]) {
             if (!supported.includes(type)) continue;
             try {
+                const record = entries => {
+                    for (const entry of entries) {
+                        const row = {kind: 'browser_work', operation: type,
+                            startMs: entry.startTime, endMs: entry.startTime + entry.duration,
+                            durationMs: entry.duration};
+                        c.records.push(row);
+                        // Observer delivery can follow the timer/frame callback that
+                        // retained the incident. Preserve that late evidence there too.
+                        for (const incident of c.gaps.read()) {
+                            if (row.endMs > incident.startMs && row.startMs < incident.endMs) {
+                                incident.browserWork.push(row);
+                                incident.browserWork = incident.browserWork.slice(-12);
+                            }
+                        }
+                    }
+                };
                 const observer = new env.PerformanceObserver(list => {
                     if (!c.running) return;
-                    for (const entry of list.getEntries()) {
-                        c.records.push({kind: 'browser_work', operation: type,
-                            startMs: entry.startTime, endMs: entry.startTime + entry.duration,
-                            durationMs: entry.duration});
-                    }
+                    record(list.getEntries());
                 });
                 observer.observe({type});
-                c.observers.push(observer);
+                c.observers.push({observer, record});
                 c.capabilities[key] = 'observing';
             } catch {
                 c.capabilities[key] = 'registration_failed';
@@ -171,7 +190,7 @@ export function createRecorder(env) {
         c.frame = env.requestAnimationFrame(frame);
         return {schema: 1, running: true};
     }
-    return {begin, end, start, stop, snapshot, enabled: () => capture?.running === true,
+    return {begin, end, setFrame, start, stop, snapshot, enabled: () => capture?.running === true,
         export: () => JSON.stringify(snapshot()),
         clear() { stop(); capture = null; }};
 }
@@ -187,6 +206,7 @@ export function diagnosticBegin(operation, detail, bytes, items, waiting) {
     return recorder ? recorder.begin(operation, detail, bytes, items, waiting) : 0;
 }
 export function diagnosticEnd(id, outcome) { if (id) recorder.end(id, outcome); }
+export function diagnosticSetFrame(id, frame) { if (id) recorder.setFrame(id, frame); }
 
 // The DOM tests inject a clock and explicit scheduler events, not real delays.
 export function installTestDiagnostics(env) {

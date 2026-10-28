@@ -80,6 +80,8 @@ extern "C" {
     ) -> f64;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = diagnosticEnd)]
     fn diagnostic_end(id: f64, outcome: &str);
+    #[wasm_bindgen(js_name = diagnosticSetFrame)]
+    fn diagnostic_set_frame(id: f64, frame: &str);
     #[wasm_bindgen(js_name = createLocalMonitor)]
     fn create_local_monitor(env: &JsValue, tick: &JsValue, reset: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = localMonitorNow)]
@@ -326,6 +328,9 @@ impl UiSpan {
 
     /// Attributes a receive span to the frame it parsed.
     pub(crate) fn set_frame(&mut self, kind: protocol::FrameKind) {
+        if self.capture != 0.0 {
+            diagnostic_set_frame(self.capture, &kind.to_string());
+        }
         if let Some(local) = &mut self.local {
             local.frame = Some(kind);
         }
@@ -392,8 +397,9 @@ pub(crate) mod diagnostic_tests {
     }
 
     #[wasm_bindgen(inline_js = r#"
-export function diagnosticTestEnvironment() {
+export function diagnosticTestEnvironment(browserObserver) {
     let time = 1000, timer = null, frame = null, foreground = true;
+    let delivered;
     const eventDocument = {
         get visibilityState() { return foreground ? 'visible' : 'hidden'; },
         addEventListener(...args) { document.addEventListener(...args); },
@@ -401,6 +407,28 @@ export function diagnosticTestEnvironment() {
     };
     return {
         document: eventDocument, Date: {now: () => 1800000000000}, performance: {now: () => time},
+        // Use real asynchronous browser observer delivery with explicitly timed
+        // measures; generating long tasks would make this test CPU-dependent.
+        PerformanceObserver: browserObserver ? class {
+            static supportedEntryTypes = ['longtask'];
+            constructor(callback) {
+                this.observer = new PerformanceObserver(list => {
+                    callback(list);
+                    delivered();
+                });
+            }
+            observe() { this.observer.observe({type: 'measure'}); }
+            takeRecords() { return this.observer.takeRecords(); }
+            disconnect() { this.observer.disconnect(); }
+        } : undefined,
+        browserWork(start, end) {
+            const delivery = new Promise(resolve => { delivered = resolve; });
+            performance.measure('private source credential argv bearer', {
+                start, end, detail: {path: '/private/source', nativeId: 'private-native-id'},
+            });
+            performance.clearMeasures('private source credential argv bearer');
+            return delivery;
+        },
         setTimeout(fn) { timer = fn; return 1; }, clearTimeout() { timer = null; },
         requestAnimationFrame(fn) { frame = fn; return 2; }, cancelAnimationFrame() { frame = null; },
         visibility(value) {
@@ -419,12 +447,15 @@ export function diagnosticTestCall(object, method, source, amount) {
     if (method === 'visibility') return object.visibility(source);
     return object[method]();
 }
+export function diagnosticTestBrowserWork(env, start, end) { return env.browserWork(start, end); }
 "#)]
     extern "C" {
         #[wasm_bindgen(js_name = diagnosticTestEnvironment)]
-        fn test_environment() -> JsValue;
+        fn test_environment(browser_observer: bool) -> JsValue;
         #[wasm_bindgen(js_name = diagnosticTestCall)]
         fn call(object: &JsValue, method: &str, source: &str, amount: f64) -> JsValue;
+        #[wasm_bindgen(js_name = diagnosticTestBrowserWork)]
+        fn browser_work(env: &JsValue, start: f64, end: f64) -> js_sys::Promise;
     }
 
     #[wasm_bindgen(inline_js = r#"
@@ -487,9 +518,17 @@ export function localMonitorTestCall(env, method, amount) { return env[method](a
 
     impl Capture {
         pub(crate) fn new() -> Self {
-            let env = test_environment();
+            Self::with_observer(false)
+        }
+
+        pub(crate) fn with_observer(browser_observer: bool) -> Self {
+            let env = test_environment(browser_observer);
             let recorder = install_test_diagnostics(&env);
             Self { env, recorder }
+        }
+
+        pub(crate) fn browser_work(&self, start: f64, end: f64) -> js_sys::Promise {
+            browser_work(&self.env, start, end)
         }
 
         pub(crate) fn start(&self) {

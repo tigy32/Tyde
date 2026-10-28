@@ -2529,7 +2529,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn typing_capture_exports_bounded_private_context_without_blocking_on_host() {
-        let capture = crate::perf::diagnostic_tests::Capture::new();
+        let capture = crate::perf::diagnostic_tests::Capture::with_observer(true);
         let container = make_container();
         let state = AppState::new();
         configure(&state, true, false, "");
@@ -2611,11 +2611,26 @@ mod wasm_tests {
             "send_host_line"
         );
         assert_eq!(incident["gaps"][0]["intervalMs"], 1200.0);
-        assert_eq!(incident["capabilities"]["longtask"], "unsupported");
+        assert_eq!(incident["capabilities"]["longtask"], "observing");
         assert_eq!(
             incident["capabilities"]["longAnimationFrame"],
             "unsupported"
         );
+        assert!(
+            incident["gaps"][0]["browserWork"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        wasm_bindgen_futures::JsFuture::from(capture.browser_work(1100.0, 1300.0))
+            .await
+            .unwrap();
+        let attributed = capture.export();
+        let browser = &attributed["gaps"][0]["browserWork"][0];
+        assert_eq!(browser["operation"], "longtask");
+        assert_eq!(browser["startMs"], 1100.0);
+        assert_eq!(browser["endMs"], 1300.0);
+        assert_eq!(browser["durationMs"], 200.0);
         js_sys::eval("window.__diagnosticHostRelease(null); delete window.__diagnosticHostRelease; delete window.__diagnosticHostEntered;").unwrap();
         wasm_bindgen_futures::JsFuture::from(sent).await.unwrap();
         // Exercise typed host dispatch and synchronous rendering with private payloads.
@@ -2686,8 +2701,18 @@ mod wasm_tests {
                 .dispatch_event(&web_sys::Event::new("input").unwrap())
                 .unwrap();
         }
+        assert_eq!(capture.export()["gaps"][0]["browserWork"][0], *browser);
+        // Stop in the same task as enqueueing: delivery has not run, so the
+        // recorder must drain the real observer queue before disconnecting it.
+        for duration in 1..=14 {
+            drop(capture.browser_work(1100.0, 1100.0 + f64::from(duration)));
+        }
         capture.stop();
         let exported = capture.export();
+        let browser_work = exported["gaps"][0]["browserWork"].as_array().unwrap();
+        assert_eq!(browser_work.len(), 12, "incident attribution stays bounded");
+        assert_eq!(browser_work[0]["durationMs"], 3.0);
+        assert_eq!(browser_work[11]["durationMs"], 14.0);
         assert_eq!(exported["records"].as_array().unwrap().len(), 1024);
         assert!(exported["loss"]["recordsOverwritten"].as_u64().unwrap() > 0);
         assert_eq!(
