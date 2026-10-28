@@ -49,9 +49,15 @@ struct Pending {
     destructive: bool,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy)]
+enum FamilyUse {
+    Mutation,
+    Creation,
+    Binding,
+}
+
 enum Resource {
-    Family(ProjectId),
+    Family(ProjectId, FamilyUse),
     Root(ProjectRootPath),
     TopLevelOrder,
 }
@@ -72,6 +78,12 @@ struct Commit {
 }
 
 enum Command {
+    #[cfg(feature = "test-support")]
+    HoldNextCreation {
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        installed: oneshot::Sender<()>,
+    },
     Admit {
         mutation: ProjectMutation,
         base: Option<BaseRevision>,
@@ -96,6 +108,27 @@ enum Command {
         result: AppResult<(CatalogResult, Vec<ProjectOperationWarning>)>,
     },
     Stop,
+}
+
+#[cfg(feature = "test-support")]
+impl HostHandle {
+    pub async fn hold_next_workbench_creation_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, entered) = oneshot::channel();
+        let (resume, release) = oneshot::channel();
+        let (installed, ready) = oneshot::channel();
+        self.project_catalog
+            .tx
+            .send(Command::HoldNextCreation {
+                reached,
+                release,
+                installed,
+            })
+            .expect("catalog must be running while installing creation hook");
+        ready.await.expect("catalog must install creation hook");
+        (entered, resume)
+    }
 }
 
 enum Publication {
@@ -354,6 +387,8 @@ impl ProjectCatalogActor {
         let mut publications = JoinSet::new();
         let mut stopping = false;
         let mut draining = false;
+        #[cfg(feature = "test-support")]
+        let mut next_creation = None;
         loop {
             if persistence.is_empty()
                 && publications.is_empty()
@@ -444,6 +479,12 @@ impl ProjectCatalogActor {
                             let Some(handle) = self.handle.upgrade() else { let _ = request.reply.send(Err("Project catalog stopped before project entry".into())); continue; };
                             entries.spawn(lifecycle::run_entry(worker_host, handle, request));
                         }
+                        #[cfg(feature = "test-support")]
+                        Command::HoldNextCreation { reached, release, installed } => {
+                            assert!(next_creation.is_none(), "creation hook already installed");
+                            next_creation = Some((reached, release));
+                            let _ = installed.send(());
+                        }
                         Command::Admit { mutation, base, output, reply } => {
                             let operation = mutation_name(&mutation);
                             if stopping { let _ = reply.send(Err(AppError::conflict(operation, "project catalog is stopping"))); continue; }
@@ -463,7 +504,9 @@ impl ProjectCatalogActor {
                             let _ = publish_tx.send(Publication::Progress(stream.clone()));
                             let task_stream = stream.clone();
                             let span = tracing::info_span!(target: "tyde::project_operation", "project_mutation", operation, operation_stream = %stream);
-                            let abort = workers.spawn(async move { run_mutation(&worker_host, &handle, &task_stream, mutation, base).await }.instrument(span));
+                            #[cfg(feature = "test-support")]
+                            let creation_hook = matches!(mutation, ProjectMutation::CreateWorkbench(_)).then(|| next_creation.take()).flatten();
+                            let abort = workers.spawn(async move { run_mutation(&worker_host, &handle, &task_stream, mutation, base, #[cfg(feature = "test-support")] creation_hook).await }.instrument(span));
                             worker_streams.insert(abort.id(), stream);
                             let _ = reply.send(Ok(response));
                         }
@@ -472,7 +515,7 @@ impl ProjectCatalogActor {
                             let result = if stopping { Err("project catalog is stopping".into()) }
                             else if projects.iter().any(|id| handle.get(id).is_some_and(|project| project.is_removing_workbench())) { Err("Workbench removal is in progress".into()) }
                             else {
-                                match projects.iter().map(|id| family(&handle, id)).collect::<AppResult<Vec<_>>>() {
+                                match projects.iter().map(|id| family(&handle, id, FamilyUse::Binding)).collect::<AppResult<Vec<_>>>() {
                                     Err(error) => Err(error.message),
                                     Ok(resources) if conflicts(&resources, active.values().flat_map(|pending| &pending.resources)) => Err("project is being removed or mutated by an admitted operation".into()),
                                     Ok(resources) => {
@@ -482,6 +525,7 @@ impl ProjectCatalogActor {
                                     }
                                 }
                             };
+                            tracing::info!(target: "tyde::project_operation", operation = "project_bind", stage = "admission", accepted = result.is_ok(), project_count = projects.len(), active_count = active.len(), "catalog binding admission completed");
                             let _ = reply.send(result);
                         }
                         Command::Release(stream) => { bindings.remove(&stream); }
@@ -553,7 +597,7 @@ impl ProjectCatalogActor {
     }
 }
 
-fn family(catalog: &ProjectCatalogHandle, id: &ProjectId) -> AppResult<Resource> {
+fn family(catalog: &ProjectCatalogHandle, id: &ProjectId, usage: FamilyUse) -> AppResult<Resource> {
     let project = catalog.get(id).ok_or_else(|| {
         AppError::not_found(
             "project_admission",
@@ -562,6 +606,7 @@ fn family(catalog: &ProjectCatalogHandle, id: &ProjectId) -> AppResult<Resource>
     })?;
     Ok(Resource::Family(
         project.parent_project_id().unwrap_or(id).clone(),
+        usage,
     ))
 }
 
@@ -601,25 +646,29 @@ fn resources(
                     ),
                 ));
             }
-            held.push(family(catalog, &payload.id)?);
+            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
             held.extend(project.root_paths().into_iter().map(Resource::Root));
         }
         ProjectMutation::AddRoot(payload) => {
-            held.push(family(catalog, &payload.id)?);
+            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
             held.push(Resource::Root(payload.root.clone()));
         }
         ProjectMutation::DeleteRoot(payload) => {
-            held.push(family(catalog, &payload.id)?);
+            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
             held.push(Resource::Root(payload.root.clone()));
         }
         ProjectMutation::Rename(payload) => {
-            held.push(family(catalog, &payload.id)?);
+            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
         }
         ProjectMutation::RemoveWorkbench(payload) => {
-            held.push(family(catalog, &payload.id)?);
+            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
         }
         ProjectMutation::CreateWorkbench(payload) => {
-            held.push(family(catalog, &payload.parent_project_id)?);
+            held.push(family(
+                catalog,
+                &payload.parent_project_id,
+                FamilyUse::Creation,
+            )?);
             let parent = catalog.get(&payload.parent_project_id).ok_or_else(|| {
                 AppError::not_found("workbench_create", "parent project does not exist")
             })?;
@@ -644,11 +693,11 @@ fn resources(
                         .map_err(|error| project_store_error("project_reorder", error))?
                         .iter()
                         .filter(|project| !project.is_workbench())
-                        .map(|project| Resource::Family(project.id.clone())),
+                        .map(|project| Resource::Family(project.id.clone(), FamilyUse::Mutation)),
                 );
             }
             protocol::ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
-                held.push(family(catalog, parent_project_id)?)
+                held.push(family(catalog, parent_project_id, FamilyUse::Mutation)?)
             }
         },
     }
@@ -656,7 +705,26 @@ fn resources(
 }
 
 fn conflicts<'a>(resources: &[Resource], held: impl Iterator<Item = &'a Resource>) -> bool {
-    held.into_iter().any(|held| resources.contains(held))
+    held.into_iter().any(|held| {
+        resources.iter().any(|resource| match resource {
+            Resource::Family(id, usage) => match held {
+                Resource::Family(held_id, held_usage) => {
+                    id == held_id
+                        && match (usage, held_usage) {
+                            (FamilyUse::Mutation, _)
+                            | (_, FamilyUse::Mutation)
+                            | (FamilyUse::Creation, FamilyUse::Creation) => true,
+                            (FamilyUse::Creation, FamilyUse::Binding)
+                            | (FamilyUse::Binding, FamilyUse::Creation)
+                            | (FamilyUse::Binding, FamilyUse::Binding) => false,
+                        }
+                }
+                Resource::Root(_) | Resource::TopLevelOrder => false,
+            },
+            Resource::Root(root) => matches!(held, Resource::Root(held_root) if root == held_root),
+            Resource::TopLevelOrder => matches!(held, Resource::TopLevelOrder),
+        })
+    })
 }
 
 fn mutation_name(mutation: &ProjectMutation) -> &'static str {
@@ -813,6 +881,10 @@ async fn run_mutation(
     stream: &StreamPath,
     mutation: ProjectMutation,
     base: Option<BaseRevision>,
+    #[cfg(feature = "test-support")] creation_hook: Option<(
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+    )>,
 ) -> AppResult<(CatalogResult, Vec<ProjectOperationWarning>)> {
     let operation = mutation_name(&mutation);
     catalog.stage(stream, ProjectOperationStage::Queue, false);
@@ -861,6 +933,11 @@ async fn run_mutation(
                 ));
             }
             created.push(root.root.clone());
+        }
+        #[cfg(feature = "test-support")]
+        if let Some((reached, release)) = creation_hook {
+            let _ = reached.send(());
+            let _ = release.await;
         }
         if let Some(directory) = environment_directory {
             catalog.stage(stream, ProjectOperationStage::PrepareBuilds, true);

@@ -159,13 +159,20 @@ async fn call_agent_control_optional(
     name: &str,
     arguments: Value,
 ) -> (bool, String) {
-    let url = if name == "tyde_review" {
-        fixture
-            .agent_control_caller(caller.expect("review caller"))
-            .await
-            .await_url
-    } else {
-        fixture.agent_control_http_url().await
+    let url = match name {
+        "tyde_review" => {
+            fixture
+                .agent_control_caller(caller.expect("review caller"))
+                .await
+                .await_url
+        }
+        "tyde_preview_review" => {
+            fixture
+                .agent_control_caller(caller.expect("review caller"))
+                .await
+                .url
+        }
+        _ => fixture.agent_control_http_url().await,
     };
     let bearer = match caller {
         Some(caller) => {
@@ -2549,9 +2556,18 @@ async fn agent_control_multi_root_preflight_and_removed_spawn_are_atomic() {
 }
 
 #[tokio::test]
-async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
+async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     let repo = init_git_repo("remove-spawn-race");
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new_with_settings_file(&json!({"settings": {
+        "enabled_backends": ["codex"], "default_backend": "codex",
+        "review": {"enabled": true, "aspects": {
+            "correctness": {"name": "Correctness", "instructions": "Review product correctness", "enabled": true}
+        }}
+    }}).to_string()).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     let caller = spawn_project_caller(
         &mut fixture.client,
@@ -2561,6 +2577,232 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
     )
     .await;
     let workbench = create_workbench(&mut fixture.client, &parent, "feature/remove-spawn").await;
+    let (author_agent, author_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Sibling review author".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(workbench.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&workbench),
+                prompt: "Review author".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    fixture.finish_turn(&author_agent).await;
+    let author = author_agent.new_agent;
+    assert!(
+        author_start.session_id.is_some(),
+        "author native session established"
+    );
+    let (failed, body) = call_agent_control(
+        &fixture,
+        &author.agent_id,
+        "tyde_preview_review",
+        json!({"mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(!failed, "native-fork review preview must succeed");
+    let plan: protocol::ReviewPlan = serde_json::from_str(&body).expect("typed review plan");
+    assert!(
+        plan.unavailable_reason.is_none(),
+        "native-fork review must be available"
+    );
+    assert_eq!(plan.aspects.len(), 1);
+    assert_eq!(plan.assignments.len(), 1);
+    let assignment = &plan.assignments[0];
+    assert!(
+        matches!(
+            &plan.fork_capability,
+            protocol::ReviewForkCapability::Supported { session_id, backend_kind, .. }
+                if Some(session_id) == author_start.session_id.as_ref()
+                    && *backend_kind == BackendKind::Codex
+        ),
+        "author native session must be resumable"
+    );
+    assert!(
+        assignment.fork_from_session_id == author_start.session_id,
+        "review must fork the established author session"
+    );
+    assert_eq!(
+        assignment.target,
+        protocol::ReviewReviewerTarget::ForkCurrentAgent
+    );
+    assert_eq!(assignment.backend_kind, BackendKind::Codex);
+    assert!(
+        assignment.aspects == plan.aspects,
+        "native-fork reviewer must use the canonical aspect"
+    );
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: canonical aspect enabled; idle author resumable; native-fork assignment validated"
+    );
+    let workbench_root = Path::new(&workbench.root_paths()[0].0).to_owned();
+    fs::write(workbench_root.join("README.md"), "Review sibling changes\n").unwrap();
+    let (creation_reached, creation_release) = fixture
+        .host_for_test()
+        .hold_next_workbench_creation_for_test()
+        .await;
+    let (mut creator, _) = fixture.connect_with_bootstrap().await;
+    creator
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("feature/held-creation".into()),
+            name: "Held sibling creation".into(),
+        })
+        .await
+        .unwrap();
+    creation_reached
+        .await
+        .expect("real sibling Git creation reached");
+    assert!(expected_worktree_path(repo.path(), "feature-held-creation").exists());
+    eprintln!("CATALOG BINDING EVIDENCE: sibling creation held after real Git worktree-add");
+
+    let (failed, body) = call_agent_control(
+        &fixture,
+        &author.agent_id,
+        "tyde_review",
+        json!({"request_id": "sibling-create-review", "mode": "single_reviewer"}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "sibling review request must succeed during creation; catalog_conflict={}",
+        body.contains("being removed or mutated by an admitted operation")
+    );
+    let result: Value = serde_json::from_str(&body).unwrap();
+    let review_id: protocol::ReviewId =
+        serde_json::from_value(result["review_id"].clone()).expect("review identity");
+    fixture
+        .client
+        .review_subscribe(&review_id, protocol::ReviewSubscribePayload::default())
+        .await
+        .expect("subscribe to held-create review result");
+    let review = next_frame_matching_on(&mut fixture.client, "held-create review result", |env| {
+        env.kind == FrameKind::ReviewBootstrap
+            && env
+                .parse_payload::<protocol::ReviewBootstrapPayload>()
+                .is_ok_and(|payload| payload.review.id == review_id)
+    })
+    .await
+    .parse_payload::<protocol::ReviewBootstrapPayload>()
+    .expect("typed review result")
+    .review;
+    let catalog_conflict =
+        review.ai_reviewer.error.as_deref().is_some_and(|error| {
+            error.contains("being removed or mutated by an admitted operation")
+        });
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: held-create review completed={}; catalog_conflict={catalog_conflict}",
+        result["status"] == "completed"
+            && review.ai_reviewer.status == protocol::ReviewAiReviewerStatus::Completed
+    );
+    assert!(
+        result["status"] == "completed"
+            && review.ai_reviewer.status == protocol::ReviewAiReviewerStatus::Completed,
+        "native-fork review of an existing sibling must complete before creation is released; catalog_conflict={catalog_conflict}"
+    );
+    assert!(review.ai_reviewer.error.is_none());
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    assert!(snapshot.agents.iter().any(|agent| {
+        agent.name == "Review: Fork current agent"
+            && agent.parent_agent_id.as_ref() == Some(&author.agent_id)
+            && agent.project_id.as_ref() == Some(&workbench.id)
+            && agent.workspace_roots == project_roots(&workbench)
+    }));
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: native-fork reviewer registered in existing sibling before creation release"
+    );
+
+    let (binding_gate, _, _) = fixture
+        .host_for_test()
+        .install_next_agent_creation_reply_test_gate()
+        .await;
+    let auth = fixture.agent_control_caller(&caller.agent_id).await;
+    let target = workbench.id.clone();
+    let child = tokio::spawn(async move {
+        call_agent_control_request(
+            auth.url,
+            Some(auth.authorization.strip_prefix("Bearer ").unwrap().to_owned()),
+            "tyde_spawn_agent".into(),
+            json!({"project_id": target.0, "name": "Sibling concurrent child", "prompt": "Ready", "backend_kind": "codex"}),
+        )
+        .await
+    });
+    binding_gate.wait_until_entered().await;
+    creator
+        .project_rename(protocol::ProjectRenamePayload {
+            id: parent.id.clone(),
+            name: "Must remain protected".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_command_error(&mut creator, "mutation during held creation")
+            .await
+            .code,
+        CommandErrorCode::Conflict
+    );
+    creator
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("feature/conflicting-creation".into()),
+            name: "Must remain protected".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_command_error(&mut creator, "second creation during held creation")
+            .await
+            .code,
+        CommandErrorCode::Conflict
+    );
+    creation_release.send(()).expect("release actual creation");
+    let ProjectNotifyPayload::Upsert {
+        project: first_sibling,
+    } = expect_project_notify(&mut creator, "first sibling committed").await
+    else {
+        panic!("created sibling must publish")
+    };
+    let second_sibling = create_workbench(&mut creator, &parent, "feature/binding-first").await;
+    creator
+        .workbench_remove(WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_command_error(&mut creator, "removal during held binding")
+            .await
+            .code,
+        CommandErrorCode::Conflict
+    );
+    assert!(workbench_root.exists());
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: creation admitted with sibling binding held; mutation/removal conflicts preserved"
+    );
+    binding_gate.release_one();
+    let (failed, body) = child.await.expect("sibling spawn completed");
+    assert!(!failed, "sibling spawn must succeed during creation");
+    let result: Value = serde_json::from_str(&body).unwrap();
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    assert!(snapshot.agents.iter().any(|agent| {
+        Some(agent.agent_id.0.as_str()) == result["agent_id"].as_str()
+            && agent.project_id.as_ref() == Some(&workbench.id)
+            && agent.workspace_roots == project_roots(&workbench)
+    }));
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: direct spawn registered in existing sibling after reverse-order creation"
+    );
+    git(&workbench_root, &["restore", "README.md"]);
+    fixture.client = creator;
     let hook = fixture.install_workbench_remove_test_hook();
     let (mut remove_client, _) = fixture.connect_with_bootstrap().await;
     remove_client
@@ -2613,6 +2855,24 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
         "verifying losing concurrent spawn did not register",
     )
     .await;
+    drop(hook);
+    eprintln!(
+        "CATALOG BINDING EVIDENCE: held removal rejected MCP spawn; removal completed without losing spawn registration"
+    );
+    for sibling in [first_sibling, second_sibling] {
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: sibling.id.clone(),
+                force: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            expect_project_notify(&mut fixture.client, "sibling cleanup").await,
+            ProjectNotifyPayload::Delete { project } if project.id == sibling.id
+        ));
+    }
 }
 
 #[tokio::test]
