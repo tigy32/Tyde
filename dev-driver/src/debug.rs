@@ -196,6 +196,7 @@ struct DevInstanceRecord {
     instance_id: String,
     project_dir: PathBuf,
     frontend_port: u16,
+    frontend_build: devtools_protocol::DevFrontendAttestation,
     host_addr: SocketAddr,
     ui_debug_addr: SocketAddr,
     frontend_url: String,
@@ -224,6 +225,7 @@ struct DevInstanceSummary {
     ui_debug_addr: String,
     status: String,
     frontend_port: u16,
+    frontend_build: devtools_protocol::DevFrontendAttestation,
     started_at_ms: u64,
 }
 
@@ -445,6 +447,7 @@ struct StartInstanceResult {
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
+    frontend_build: devtools_protocol::DevFrontendAttestation,
 }
 
 fn tool_definitions() -> Vec<ToolDefinition> {
@@ -616,12 +619,10 @@ async fn start_instance(
     input: StartInstanceToolInput,
 ) -> Result<StartInstanceResult, String> {
     let project_dir = resolve_project_dir(&state.config.repo_root, &input.project_dir)?;
-    let frontend_port = reserve_loopback_port()?;
     let host_port = reserve_loopback_port()?;
     let ui_debug_port = reserve_loopback_port()?;
     let host_addr = loopback_addr(host_port);
     let ui_debug_addr = loopback_addr(ui_debug_port);
-    let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let instance_id = Uuid::new_v4().simple().to_string();
     let resolved_hermes_runtime = input
         .hermes
@@ -651,9 +652,7 @@ async fn start_instance(
         .transpose()?;
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
-    let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
-    let mut frontend_command =
-        devtools_protocol::frontend::command(&project_dir, &store_dir, frontend_port)?;
+    let mut frontend_command = devtools_protocol::frontend::command(&project_dir, &store_dir)?;
     frontend_command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -669,22 +668,33 @@ async fn start_instance(
     let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
         STARTUP_LOG_TAIL_BYTES,
     )));
-    let stdout = frontend_child
-        .take_stdout()
-        .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
     let stderr = frontend_child
         .take_stderr()
         .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
-    let mut startup_capture_tasks = vec![
-        tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
-        tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
-    ];
+    let mut startup_capture_tasks = vec![tokio::spawn(capture_startup_output(
+        stderr,
+        Arc::clone(&startup_output),
+    ))];
 
-    if let Err(error) =
-        devtools_protocol::frontend::wait_until_ready(&mut frontend_child, frontend_port).await
-    {
-        return Err(with_startup_diagnostics(error, &startup_output));
-    }
+    let frontend_ready =
+        match devtools_protocol::frontend::wait_until_ready(&mut frontend_child).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                frontend_child
+                    .kill()
+                    .await
+                    .map_err(|cleanup| format!("{error}; frontend cleanup failed: {cleanup}"))?;
+                for capture in startup_capture_tasks {
+                    capture
+                        .await
+                        .map_err(|join| format!("{error}; output capture failed: {join}"))?;
+                }
+                return Err(with_startup_diagnostics(error, &startup_output));
+            }
+        };
+    let frontend_port = frontend_ready.port;
+    let frontend_url = format!("http://127.0.0.1:{frontend_port}");
+    let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     tracing::debug!("dev frontend ready before desktop launch");
     let mut command = tauri_dev_command(&config_path)?;
     command
@@ -716,6 +726,7 @@ async fn start_instance(
         instance_id: instance_id.clone(),
         project_dir,
         frontend_port,
+        frontend_build: frontend_ready.attestation,
         host_addr,
         ui_debug_addr,
         frontend_url: frontend_url.clone(),
@@ -737,6 +748,7 @@ async fn start_instance(
     let result = StartInstanceResult {
         instance_id: instance_id.clone(),
         status: "ready",
+        frontend_build: record.frontend_build.clone(),
         project_dir: record.project_dir.display().to_string(),
         store_dir: record.store_dir.display().to_string(),
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
@@ -1179,6 +1191,7 @@ fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSummary {
         ui_debug_addr: record.ui_debug_addr.to_string(),
         status,
         frontend_port: record.frontend_port,
+        frontend_build: record.frontend_build.clone(),
         started_at_ms: record.started_at_ms,
     }
 }

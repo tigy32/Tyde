@@ -258,10 +258,25 @@ pub enum DevInstanceStartupProtocol {
 #[serde(deny_unknown_fields)]
 pub struct DevInstanceStartupContract {
     pub protocol: DevInstanceStartupProtocol,
+    pub frontend: DevFrontendProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevFrontendProtocol {
+    OwnedBuildServeV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DevFrontendAttestation {
+    pub protocol: DevFrontendProtocol,
+    pub index_sha256: String,
 }
 
 pub const DEV_INSTANCE_STARTUP_CONTRACT: DevInstanceStartupContract = DevInstanceStartupContract {
     protocol: DevInstanceStartupProtocol::NotificationsV1,
+    frontend: DevFrontendProtocol::OwnedBuildServeV1,
 };
 
 #[derive(Debug, Serialize, Deserialize)]

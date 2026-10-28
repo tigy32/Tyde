@@ -70,22 +70,11 @@ printf 'CLAUDE_CREDENTIAL_MATCH=1\n'
 exit 3
 "#;
 
-const FAKE_NODE: &str = r#"#!/usr/bin/python3
-import http.server,json,os,pathlib,socket,sys
-proof=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.frontend')
-def record(phase,port=None):
-    details={'phase':phase,'pid':os.getpid()}
-    if port is not None: details['port']=port
-    proof.write_text(json.dumps(details))
-    print(f'DEV FRONTEND phase={phase} port={port}',flush=True)
-control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
-record('control-connected')
-record('validating-frontend-arguments')
-assert sys.argv[1].endswith('/tools/trunk-command.mjs'), 'frontend-script-argument'
-assert sys.argv[2]=='serve' and '--no-autoreload' in sys.argv, 'frontend-serve-arguments'
-record('validating-workbench-namespace')
-engine=json.loads(pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER']).with_suffix('.execution').read_text())
+const FAKE_TRUNK: &str = r#"#!/usr/bin/python3
+import json,os,pathlib,socket,sys
+dist=pathlib.Path(sys.argv[sys.argv.index('--dist')+1])
+marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
+engine=json.loads(marker.with_suffix('.execution').read_text())
 if engine=='bubblewrap':
  assert os.getcwd()=='/mnt/tyde-workspace', 'frontend-logical-cwd'
  assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-private-namespace'
@@ -94,36 +83,39 @@ elif engine=='native':
   assert os.readlink('/proc/self/ns/mnt')==os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-native-namespace'
 else:
  raise AssertionError('frontend-execution-kind')
-record('parsing-port')
-port=int(sys.argv[sys.argv.index('--port')+1])
-record('launched')
-ready=False
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        global ready
-        if not ready:
-            assert self.client_address[1]!=port
-            record('request-held')
-            control.sendall(b'Q'+self.client_address[1].to_bytes(2,'big'))
-            assert control.recv(1)==b'R'
-            ready=True
-        self.send_response(200);self.end_headers();self.wfile.write(b'<html>fixture</html>')
-        record('response-served')
-    def log_message(self,*args):pass
-record('adopting-bound-listener',port)
-listener=socket.socket(fileno=0)
-assert listener.getsockname()==('127.0.0.1',port), 'inherited-frontend-endpoint'
-server=http.server.HTTPServer(('127.0.0.1',port),Handler,bind_and_activate=False)
-server.socket.close()
-server.socket=listener
-server.server_address=listener.getsockname()
-server.server_name='localhost'
-server.server_port=port
-server.server_activate()
-record('bound',port)
-control.sendall(b'B'+port.to_bytes(2,'big'))
-record('awaiting-request',port)
-server.serve_forever()
+marker.with_suffix('.frontend').write_text(json.dumps({'dist':str(dist),'wrapper_pid':os.getppid()}))
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL'])
+control.sendall(b'B')
+result=control.recv(1)
+assert sys.argv[1]=='build', 'explicit-initial-build-result-required'
+assert '--config' in sys.argv, 'exact-source-trunk-config-required'
+assert dist.is_dir() and not list(dist.iterdir()), 'fresh-isolated-output-required'
+if result==b'F':
+ print('OWNED_INITIAL_BUILD_ERROR',file=sys.stderr,flush=True)
+ sys.exit(17)
+assert result==b'R', 'explicit-build-release-required'
+(dist/'index.html').write_text('<html>owned frontend fixture</html>')
+(dist/'fixture.js').write_text('owned asset')
+# Compiler output must remain diagnostic, never a startup notification.
+print('{"protocol":"owned_build_serve_v1","event":{"kind":"serving","port":1}}',flush=True)
+"#;
+
+const FOREIGN_FRONTEND_RECEIPT: &str = r#"#!/usr/bin/python3
+import hashlib,json,os,pathlib,socket,sys
+marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
+dist=pathlib.Path(sys.argv[sys.argv.index('--dist')+1]);dist.mkdir()
+marker.with_suffix('.frontend').write_text(json.dumps({'dist':str(dist),'wrapper_pid':os.getpid()}))
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL']);control.sendall(b'B')
+assert control.recv(1)==b'R'
+port=int.from_bytes(control.recv(2,socket.MSG_WAITALL),'big')
+protocol=json.loads((pathlib.Path.cwd()/'devtools-protocol/dev-instance-startup.json').read_text())['frontend']
+def notify(event):print(json.dumps({'protocol':protocol,'event':event}),flush=True)
+print('Foreign serving receipt fixture',file=sys.stderr,flush=True)
+notify({'kind':'build_finished','exit_code':0,'signal':None})
+notify({'kind':'serving','port':port,'identity':'0'*64,'index_sha256':hashlib.sha256(b'foreign').hexdigest()})
+assert control.recv(1)==b'X'
 "#;
 
 // Nextest isolates each test in its own process, so the process environment
@@ -134,7 +126,7 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
     let bin = tools.path().join("bin");
     std::fs::create_dir(&bin).expect("fake bin dir");
     executable(&bin.join("cargo-tauri"), FAKE_CARGO_TAURI);
-    executable(&bin.join("node"), FAKE_NODE);
+    executable(&bin.join("trunk"), FAKE_TRUNK);
     let control_dir = tempfile::Builder::new()
         .prefix("tyde-front-")
         .tempdir_in("/tmp")
@@ -218,6 +210,8 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         "dev instance Claude must still read the parent's credentials"
     );
     let scenarios = [
+        DevScenario::NativeBuildFailure,
+        DevScenario::NativeForeignIdentity,
         DevScenario::NativeProtocolMismatch,
         DevScenario::NativeReady,
         #[cfg(target_os = "linux")]
@@ -228,6 +222,12 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         DevScenario::RemoveDuringDesktop,
     ];
     for scenario in scenarios {
+        let node = bin.join("node");
+        if matches!(scenario, DevScenario::NativeForeignIdentity) {
+            executable(&node, FOREIGN_FRONTEND_RECEIPT);
+        } else if node.exists() {
+            std::fs::remove_file(node).expect("restore real Node wrapper");
+        }
         if desktop_marker.exists() {
             std::fs::remove_file(&desktop_marker).expect("reset completed desktop marker");
         }
@@ -266,6 +266,11 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
                 error.is_empty(),
                 "ready attempt must complete without startup error"
             );
+        } else if matches!(scenario, DevScenario::NativeForeignIdentity) {
+            assert!(error.contains("Frontend serving identity mismatch"));
+        } else if matches!(scenario, DevScenario::NativeBuildFailure) {
+            assert!(error.contains("frontend initial build failed: exit_code=Some(17)"));
+            assert!(error.contains("OWNED_INITIAL_BUILD_ERROR"));
         } else if matches!(scenario, DevScenario::NativeProtocolMismatch) {
             assert!(
                 error.contains("IncompatibleProtocol"),
@@ -299,6 +304,8 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
 #[derive(Clone, Copy, Debug)]
 enum DevScenario {
     NativeExit,
+    NativeBuildFailure,
+    NativeForeignIdentity,
     NativeProtocolMismatch,
     NativeReady,
     #[cfg(target_os = "linux")]
@@ -313,7 +320,11 @@ impl DevScenario {
     fn is_native(self) -> bool {
         matches!(
             self,
-            Self::NativeExit | Self::NativeProtocolMismatch | Self::NativeReady
+            Self::NativeExit
+                | Self::NativeForeignIdentity
+                | Self::NativeBuildFailure
+                | Self::NativeProtocolMismatch
+                | Self::NativeReady
         )
     }
 
@@ -369,32 +380,7 @@ async fn start_dev_instance_expecting_exit(
     }
     let control_listener =
         tokio::net::UnixListener::bind(control_path).expect("bind frontend readiness gate");
-    // Keep both endpoints bound; transfer frontend ownership to the child
-    // without the reserve-close-bind gap that caused AddressAlreadyInUse.
-    let frontend_listener = std::sync::Arc::new(
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind owned fixture frontend"),
-    );
-    #[cfg(target_os = "linux")]
-    let listener_is_open = {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-        let inode = std::fs::metadata(format!("/proc/self/fd/{}", frontend_listener.as_raw_fd()))
-            .expect("identify owned listener socket")
-            .ino();
-        move || {
-            std::fs::read_to_string("/proc/net/tcp")
-                .expect("inspect owned IPv4 listener state")
-                .lines()
-                .skip(1)
-                .any(|line| {
-                    let fields: Vec<_> = line.split_whitespace().collect();
-                    fields[3] == "0A"
-                        && fields[9].parse::<u64>().expect("kernel socket inode") == inode
-                })
-        }
-    };
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
-        dev_frontend_listener: Some(frontend_listener),
         debug_mcp_bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         ..Default::default()
     })
@@ -446,7 +432,7 @@ async fn start_dev_instance_expecting_exit(
         .expect("declare supported fixture startup protocol");
         std::fs::write(
             source.join("tools/trunk-command.mjs"),
-            "// explicit DEV workload fixture\n",
+            include_str!("../../tools/trunk-command.mjs"),
         )
         .expect("frontend workload source");
         std::fs::write(
@@ -632,11 +618,10 @@ async fn start_dev_instance_expecting_exit(
         !desktop_marker.exists(),
         "desktop started before frontend was ready"
     );
-    let port = control.read_u16().await.expect("owned frontend endpoint");
     probe_entered
         .await
         .expect("real canonical probe is held before connecting");
-    eprintln!("DEV READINESS scenario={scenario:?} phase=canonical-probe-held producer_bound=true");
+    eprintln!("DEV READINESS scenario={scenario:?} phase=canonical-probe-held build_held=true");
     // Fails immediately on the old implementation while the real child is
     // held: its ready-only registry incorrectly reports no owned attempt.
     let listed = debug_json(&debug_call(service.peer(), "tyde_dev_instance_list", json!({})).await);
@@ -704,55 +689,98 @@ async fn start_dev_instance_expecting_exit(
         "pending output must expose a resumable cursor"
     );
 
-    // The old producer announced B with no listener, letting a competing
-    // endpoint (or self-connect) answer before the intended readiness gate.
-    // B now attests a bound child; release only the real probe, not HTTP200.
-    let ownership = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
-    assert!(
-        matches!(ownership, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
-        "frontend gate must retain its actual bound endpoint"
-    );
-    #[cfg(target_os = "linux")]
-    assert!(
-        listener_is_open(),
-        "owned child listener must be observable while held"
-    );
-    #[cfg(not(target_os = "linux"))]
-    let cleanup_probe = {
-        let socket = tokio::net::TcpSocket::new_v4().expect("create endpoint release probe");
-        socket
-            .bind("127.0.0.1:0".parse().unwrap())
-            .expect("bind distinct cleanup probe endpoint");
-        socket
-    };
     release_probe
         .send(())
-        .expect("release actual canonical frontend probe");
+        .expect("release canonical startup pipe reader, not the build");
     drop(probe_gate);
-    assert_eq!(
-        control
-            .read_u8()
-            .await
-            .expect("owned frontend HTTP request"),
-        b'Q'
-    );
-    let peer_port = control.read_u16().await.expect("actual probe endpoint");
-    assert_ne!(peer_port, port, "readiness must not be a TCP self-connect");
+    // A real unrelated HTTP listener can return either status while the owned
+    // build remains held. Neither response is an owned build/serve receipt.
+    let foreign = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("unrelated listener");
+    let foreign_addr = foreign.local_addr().expect("unrelated endpoint");
+    for status in [200, 404] {
+        let request = async {
+            let mut stream = tokio::net::TcpStream::connect(foreign_addr).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains(&status.to_string())
+            );
+        };
+        let respond = async {
+            let (mut stream, _) = foreign.accept().await.unwrap();
+            let mut request = [0; 256];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status} fixture\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        tokio::join!(request, respond);
+        let pending =
+            debug_json(&debug_call(service.peer(), "tyde_dev_instance_list", json!({})).await);
+        assert_eq!(pending[0]["status"]["kind"], "starting");
+        assert!(
+            !desktop_marker.exists(),
+            "foreign HTTP must not attest frontend readiness"
+        );
+    }
+    let proof: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&producer_proof).expect("actual wrapper/build proof"),
+    )
+    .expect("producer proof JSON");
+    let dist = PathBuf::from(proof["dist"].as_str().expect("isolated build output"));
     assert!(
-        !desktop_marker.exists(),
-        "desktop started before the held HTTP readiness response"
+        !dist.join("index.html").exists(),
+        "held build has no ready index"
     );
-    eprintln!(
-        "DEV READINESS scenario={scenario:?} phase=owned-http-request local=127.0.0.1:{port} peer=127.0.0.1:{peer_port} self_connected=false awaiting_http200=true"
-    );
+    let wrapper_pid = proof["wrapper_pid"].as_i64().expect("owned wrapper pid") as libc::pid_t;
+    let mut foreign = Some(foreign);
+    let foreign_probe = if matches!(scenario, DevScenario::NativeForeignIdentity) {
+        let foreign = foreign.take().expect("foreign listener fixture");
+        Some(tokio::spawn(async move {
+            let (mut stream, _) = foreign
+                .accept()
+                .await
+                .expect("canonical probe reached foreign listener");
+            let mut request = [0; 256];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nforeign")
+                .await
+                .unwrap();
+            foreign
+        }))
+    } else {
+        None
+    };
     let mut desktop_control = None;
     let mut host_probe = None;
     let mut ui_probe = None;
     if !scenario.holds_frontend() {
         control
-            .write_all(b"R")
+            .write_all(if matches!(scenario, DevScenario::NativeBuildFailure) {
+                b"F"
+            } else {
+                b"R"
+            })
             .await
-            .expect("release actual frontend readiness");
+            .expect("release actual owned initial build result");
+        if matches!(scenario, DevScenario::NativeForeignIdentity) {
+            control
+                .write_all(&foreign_addr.port().to_be_bytes())
+                .await
+                .unwrap();
+        }
         if scenario.holds_desktop() {
             let (mut connected, _) = control_listener
                 .accept()
@@ -874,6 +902,10 @@ async fn start_dev_instance_expecting_exit(
     if let Some(probe) = ui_probe {
         probe.await.expect("join actual UI readiness transport");
     }
+    if let Some(probe) = foreign_probe {
+        foreign = Some(probe.await.expect("join foreign HTTP responder"));
+    }
+    let foreign = foreign.expect("unrelated listener remains owned");
     let terminal = debug_json(&result);
     assert!(
         terminal["instanceId"].as_str() == Some(instance_id.as_str()),
@@ -887,6 +919,57 @@ async fn start_dev_instance_expecting_exit(
             .as_str()
             .expect("canonical ready store");
         assert!(Path::new(store).is_dir());
+        assert_eq!(
+            terminal["frontendBuild"]["protocol"],
+            "owned_build_serve_v1"
+        );
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            terminal["frontendBuild"]["indexSha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(b"<html>owned frontend fixture</html>")
+            )
+        );
+        let port = terminal["frontendPort"]
+            .as_u64()
+            .expect("owned serving port") as u16;
+        assert_ne!(port, foreign_addr.port());
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("owned asset HTTP client");
+        for (path, expected_status, expected_body) in [
+            ("/", 200, "<html>owned frontend fixture</html>"),
+            ("/fixture.js", 200, "owned asset"),
+            ("/missing.js", 404, ""),
+        ] {
+            let response = http
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .expect("owned serving endpoint");
+            assert_eq!(response.status().as_u16(), expected_status);
+            // Node's empty 404 uses a chunk terminator (0\r\n\r\n) on the
+            // wire. Compare the decoded entity, not HTTP transfer framing.
+            assert_eq!(
+                response.text().await.expect("decoded HTTP entity"),
+                expected_body
+            );
+        }
+        #[cfg(target_os = "linux")]
+        let listener_inode = std::fs::read_to_string("/proc/net/tcp")
+            .unwrap()
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                (fields[1] == format!("0100007F:{port:04X}") && fields[3] == "0A")
+                    .then(|| fields[9].to_owned())
+            })
+            .expect("owned listener kernel identity");
         let stop = debug_call(
             service.peer(),
             "tyde_dev_instance_stop",
@@ -898,6 +981,18 @@ async fn start_dev_instance_expecting_exit(
         assert!(
             !Path::new(store).exists(),
             "explicit stop must join private resource cleanup"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::fs::read_to_string("/proc/net/tcp")
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields[3] == "0A" && fields[9] == listener_inode
+                }),
+            "stop must release the exact owned serving socket"
         );
         String::new()
     } else {
@@ -982,7 +1077,11 @@ async fn start_dev_instance_expecting_exit(
     };
     assert_eq!(
         desktop_marker.exists(),
-        !scenario.holds_frontend(),
+        !scenario.holds_frontend()
+            && !matches!(
+                scenario,
+                DevScenario::NativeBuildFailure | DevScenario::NativeForeignIdentity
+            ),
         "desktop launch must follow actual frontend readiness: tool_error={} frontend_exit={} frontend_connection={} frontend_response={} frontend_index={} port_in_use={} desktop_spawn={} cli_missing={}",
         result.is_error == Some(true),
         startup_error.contains("dev frontend exited before ready"),
@@ -1012,22 +1111,22 @@ async fn start_dev_instance_expecting_exit(
         0,
         "failed dev start must stop its owned frontend"
     );
-    // A port can already belong to an unrelated listener after cleanup. Test
-    // the original kernel socket, not a new connection to that port number.
-    #[cfg(target_os = "linux")]
     assert!(
-        !listener_is_open(),
-        "joined startup cleanup must release the owned child's listener"
+        !dist.exists(),
+        "terminal cleanup must remove exact isolated build output"
     );
-    #[cfg(not(target_os = "linux"))]
-    {
-        let released = cleanup_probe
-            .connect((std::net::Ipv4Addr::LOCALHOST, port).into())
-            .await
-            .expect_err("joined startup cleanup must release the child's listener");
-        assert_eq!(released.kind(), std::io::ErrorKind::ConnectionRefused);
-    }
-    eprintln!("DEV READINESS scenario={scenario:?} phase=endpoint-released-after-cleanup");
+    assert_eq!(
+        unsafe { libc::kill(wrapper_pid, 0) },
+        -1,
+        "joined cleanup must reap owned frontend wrapper"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    // Our unrelated service remains owned and usable after instance cleanup.
+    assert_eq!(foreign.local_addr().unwrap(), foreign_addr);
+    eprintln!("DEV READINESS scenario={scenario:?} phase=owned-cleanup-joined");
     service.cancel().await.expect("cancel debug MCP client");
     let error = startup_error;
     if let Some(project) = workbench

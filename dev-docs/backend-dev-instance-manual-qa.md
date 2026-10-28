@@ -9,6 +9,26 @@ authorization under `AGENTS.md`; no per-run permission is required.
 Certification favors feature coverage, but it must obtain that coverage with
 the cheapest suitable models, bounded prompts, and bounded commands.
 
+## Frontend startup identity
+
+The canonical dev-instance launcher builds once with `trunk build` into a fresh,
+private `frontend-dist`, then serves that snapshot on a producer-owned ephemeral
+loopback listener. Restart the disposable instance to pick up source changes.
+Ordinary development `trunk serve` is unchanged.
+
+Readiness requires ordered, typed build/serving receipts on the owned child's
+stdout pipe, followed by one HTTP index request whose private serving identity
+and SHA-256 match the receipt. Compiler output is captured from stderr, never
+interpreted as readiness. A build failure, missing index, foreign responder or
+index mismatch fails startup and joins owned-process/output cleanup. There are
+no build deadlines, readiness sleeps or HTTP retries.
+
+The ready result includes `frontendBuild.protocol` and
+`frontendBuild.indexSha256`. Record them with the exact source commit and the
+canonical `frontendUrl`; do not export the private HTTP identity header. Keep
+cold compilation/setup and warm launch durations separate from UI-action
+measurements. A build or readiness failure leaves UI actions unmeasured.
+
 ## Certification contract
 
 A run certifies one exact combination of Tyde commit, backend CLI version,

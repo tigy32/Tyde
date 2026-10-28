@@ -217,12 +217,7 @@ struct ClosingDevProject {
     error: Option<String>,
 }
 
-fn start_instance_registry(
-    mut receiver: mpsc::UnboundedReceiver<InstanceCommand>,
-    #[cfg(all(feature = "test-support", unix))] mut frontend_listener: Option<
-        Arc<std::net::TcpListener>,
-    >,
-) {
+fn start_instance_registry(mut receiver: mpsc::UnboundedReceiver<InstanceCommand>) {
     tokio::spawn(async move {
         let mut records = HashMap::<DevInstanceId, DevInstanceRecord>::new();
         let mut attempts = HashMap::<DevInstanceId, DevAttempt>::new();
@@ -381,8 +376,6 @@ fn start_instance_registry(
                                 cancellation,
                                 output,
                                 reporter,
-                                #[cfg(all(feature = "test-support", unix))]
-                                frontend_listener.take(),
                             ));
                             pending.insert(task.id(), instance_id);
                             // Losing this reply does not withdraw the actor's process ownership.
@@ -631,6 +624,7 @@ impl DevBuildProcesses {
 
 struct DevInstanceRecord {
     frontend_port: u16,
+    frontend_build: devtools_protocol::DevFrontendAttestation,
     host_addr: SocketAddr,
     ui_debug_addr: SocketAddr,
     frontend_url: String,
@@ -667,6 +661,7 @@ struct DevInstanceReady {
     host_addr: String,
     ui_debug_addr: String,
     frontend_port: u16,
+    frontend_build: devtools_protocol::DevFrontendAttestation,
 }
 
 #[derive(Clone)]
@@ -943,8 +938,6 @@ struct HealthResponse {
 }
 
 pub fn start_server(config: &crate::host::HostRuntimeConfig) -> Result<DebugMcpHandle, String> {
-    #[cfg(all(feature = "test-support", unix))]
-    let frontend_listener = config.dev_frontend_listener.clone();
     let bind_addr = config.debug_mcp_bind_addr.unwrap_or_else(|| {
         DEFAULT_BIND_ADDR
             .parse()
@@ -978,11 +971,7 @@ pub fn start_server(config: &crate::host::HostRuntimeConfig) -> Result<DebugMcpH
                 .build()
                 .expect("failed to build debug MCP runtime");
             runtime.block_on(async move {
-                start_instance_registry(
-                    instance_commands,
-                    #[cfg(all(feature = "test-support", unix))]
-                    frontend_listener,
-                );
+                start_instance_registry(instance_commands);
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio debug MCP listener");
                 let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
@@ -1068,9 +1057,6 @@ async fn build_instance(
     cancellation: CancellationToken,
     startup_output: StartupOutput,
     reporter: StartupReporter,
-    #[cfg(all(feature = "test-support", unix))] frontend_listener: Option<
-        Arc<std::net::TcpListener>,
-    >,
 ) -> Result<DevInstanceRecord, DevStartFailure> {
     let logical_project_dir = match execution_project.as_ref().map(|project| &project.source) {
         Some(ProjectSource::GitWorkbench {
@@ -1087,21 +1073,10 @@ async fn build_instance(
         | None => project_dir.clone(),
     };
     let instance_id = reporter.instance_id.clone();
-    #[cfg(all(feature = "test-support", unix))]
-    let frontend_port = match &frontend_listener {
-        Some(listener) => listener
-            .local_addr()
-            .map_err(|error| format!("failed to read fixture frontend endpoint: {error}"))?
-            .port(),
-        None => reserve_loopback_port()?,
-    };
-    #[cfg(not(all(feature = "test-support", unix)))]
-    let frontend_port = reserve_loopback_port()?;
     let host_port = reserve_loopback_port()?;
     let ui_debug_port = reserve_loopback_port()?;
     let host_addr = loopback_addr(host_port);
     let ui_debug_addr = loopback_addr(ui_debug_port);
-    let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let resolved_hermes_runtime = input
         .hermes
         .as_ref()
@@ -1132,17 +1107,8 @@ async fn build_instance(
         .transpose()?;
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id.0));
-    let config_path = write_dev_config(&project_dir, frontend_port, &instance_id.0)?;
     let mut frontend_command =
-        devtools_protocol::frontend::command(&logical_project_dir, &store_dir, frontend_port)?;
-    #[cfg(all(feature = "test-support", unix))]
-    if let Some(listener) = frontend_listener {
-        let descriptor: std::os::fd::OwnedFd = listener
-            .try_clone()
-            .map_err(|error| format!("failed to transfer fixture frontend listener: {error}"))?
-            .into();
-        frontend_command.stdin(std::fs::File::from(descriptor));
-    }
+        devtools_protocol::frontend::command(&logical_project_dir, &store_dir)?;
 
     if let Some(project) = &execution_project {
         frontend_command.in_project(project.clone());
@@ -1166,14 +1132,10 @@ async fn build_instance(
             .frontend
             .as_mut()
             .ok_or_else(|| "DEV frontend ownership missing".to_owned())?;
-        let stdout = frontend_child
-            .take_stdout()
-            .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
         let stderr = frontend_child
             .take_stderr()
             .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
         processes.captures = vec![
-            tokio::spawn(capture_startup_output(stdout, startup_output.clone())),
             tokio::spawn(capture_startup_output(stderr, startup_output.clone())),
         ];
 
@@ -1190,11 +1152,14 @@ async fn build_instance(
             .map_err(|error| format!("DEV frontend probe observer failed: {error}"))?;
         }
 
-        tokio::select! {
+        let frontend_ready = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(DevStartFailure::cancelled()),
-            result = devtools_protocol::frontend::wait_until_ready(frontend_child, frontend_port) => result.map_err(DevStartFailure::from),
+            result = devtools_protocol::frontend::wait_until_ready(frontend_child) => result.map_err(DevStartFailure::from),
         }?;
+        let frontend_port = frontend_ready.port;
+        let frontend_url = format!("http://127.0.0.1:{frontend_port}");
+        let config_path = write_dev_config(&project_dir, frontend_port, &instance_id.0)?;
         tracing::debug!("dev frontend ready before desktop launch");
         reporter.phase(DevInstanceStartupPhase::Desktop)?;
         let startup_listener = TcpListener::bind("127.0.0.1:0").await
@@ -1240,6 +1205,7 @@ async fn build_instance(
 
         let mut record = DevInstanceRecord {
             frontend_port,
+            frontend_build: frontend_ready.attestation,
             host_addr,
             ui_debug_addr,
             frontend_url: frontend_url.clone(),
@@ -1765,6 +1731,7 @@ fn dev_instance_summary(
             host_addr: record.host_addr.to_string(),
             ui_debug_addr: record.ui_debug_addr.to_string(),
             frontend_port: record.frontend_port,
+            frontend_build: record.frontend_build.clone(),
         }
     });
     DevInstanceSummary {
