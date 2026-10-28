@@ -5044,9 +5044,14 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         "fn main() { println!(\"{}\", reuse_shared::value()); }\n",
     )
     .unwrap();
+    // Without a rerun-if directive Cargo fingerprints a build script by the
+    // name of the first newest package file in directory order. Checkout
+    // mtimes can tie and ZFS orders every new directory differently, so that
+    // name can differ between workbenches. Declared inputs keep Cargo on the
+    // content and mtimes that reuse restores.
     fs::write(
         rust.join("build.rs"),
-        "fn main() { std::fs::write(\"build-hook-ran\", \"explicit\").unwrap(); }\n",
+        "fn main() { println!(\"cargo::rerun-if-changed=build.rs\"); std::fs::write(\"build-hook-ran\", \"explicit\").unwrap(); }\n",
     )
     .unwrap();
     fs::write(
@@ -5309,11 +5314,15 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         cargo_result["returncode"], 0,
         "actual reuse Cargo process must succeed"
     );
-    assert!(
-        captured_artifacts.len() >= 2
-            && captured_artifacts
-                .iter()
-                .all(|value| value["fresh"] == true),
+    let mut captured_units = summarize(&captured_artifacts);
+    captured_units.sort_by(|a, b| a["target"].as_str().cmp(&b["target"].as_str()));
+    assert_eq!(
+        captured_units,
+        [
+            json!({"target": "build-script-build", "kind": ["custom-build"], "fresh": true}),
+            json!({"target": "reuse_app", "kind": ["bin"], "fresh": true}),
+            json!({"target": "reuse_shared", "kind": ["lib"], "fresh": true}),
+        ],
         "actual Cargo process must report complete Fresh cross-workbench artifacts"
     );
     let original = fs::read(Path::new(&second_paths[0].0).join("src/main.rs")).unwrap();

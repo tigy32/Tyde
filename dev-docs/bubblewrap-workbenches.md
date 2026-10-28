@@ -92,6 +92,10 @@ The normal build tool remains responsible for deciding freshness and correctness
 Artifacts are inventoried, strictly reflinked and reverified before publication.
 Recipients verify the immutable cohort and restore source timestamps only after
 content/mode identity checks, preserving real incremental-build behavior.
+Cargo fingerprints a build script without `rerun-if` directives by the first
+newest package file in directory order. When checkout mtimes tie and directory
+order differs per checkout (as on ZFS), that script and its dependents may
+rebuild. Tyde does not rewrite timestamps to steer that choice.
 
 Changed source metadata or provenance declines publication with an explicit
 reason; it does **not** prevent ordinary source-preserving Git removal. Restoring
