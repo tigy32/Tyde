@@ -917,13 +917,13 @@ mod wasm_tests {
         let _mount = mount_chat_with_sheet(&container, state.clone());
         next_tick().await;
 
-        let stop: HtmlElement = container
-            .query_selector("[data-mobile-test='chat-stop']")
-            .unwrap()
-            .expect("Stop stays visible while the agent is responding")
-            .dyn_into()
-            .unwrap();
-        assert_eq!(stop.text_content().as_deref().map(str::trim), Some("Stop"));
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-stop']")
+                .unwrap()
+                .is_none(),
+            "the mobile header has no redundant Stop while responding"
+        );
         assert!(
             in_flight_response(&container).contains("partial answer still arriving"),
             "the response in progress is on screen before settings open"
@@ -969,14 +969,7 @@ mod wasm_tests {
         let settings_bounds = settings_item.get_bounding_client_rect();
         assert!(
             settings_bounds.width() >= 44.0 && settings_bounds.height() >= 44.0,
-            "session settings must stay a touch target while Stop is showing"
-        );
-        let stop_bounds = stop.get_bounding_client_rect();
-        assert!(
-            stop_bounds.height() >= 40.0 && stop_bounds.width() >= 40.0,
-            "Stop must stay a separate control, got {}x{}",
-            stop_bounds.width(),
-            stop_bounds.height()
+            "session settings must stay a touch target while responding"
         );
         let hit = |target: &web_sys::Element| {
             let bounds = target.get_bounding_client_rect();
@@ -1033,10 +1026,6 @@ mod wasm_tests {
         assert!(
             hit(settings_item.unchecked_ref()),
             "the session settings row must be reachable while the turn is running"
-        );
-        assert!(
-            hit(stop.unchecked_ref()),
-            "opening the menu must not cover Stop"
         );
         settings_item.click();
         next_tick().await;
@@ -1168,7 +1157,28 @@ mod wasm_tests {
             "the settings edit must not rewrite the response already arriving"
         );
 
-        stop_button_after_edit(&container).click();
+        let primary = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .expect("the composer retains its primary action");
+        assert_eq!(primary.text_content().as_deref(), Some("Queue"));
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+            .unwrap()
+            .expect("more send actions")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let cancel = container
+            .query_selector("[data-mobile-test='chat-send-menu-cancel']")
+            .unwrap()
+            .expect("Cancel stays available in the menu with a retained draft")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(cancel.text_content().as_deref(), Some("Cancel"));
+        assert_still_on_chat(&container);
+        cancel.click();
         next_tick().await;
         next_tick().await;
         next_tick().await;
@@ -1176,38 +1186,29 @@ mod wasm_tests {
         assert_eq!(
             lines.len(),
             2,
-            "Stop is its own frame after the settings edit"
+            "composer Cancel is its own frame after the settings edit"
         );
         let interrupt: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(interrupt["kind"], "interrupt");
         assert_eq!(
             interrupt["stream"], "/agent/settings/inst",
-            "Stop still addresses the agent that is responding: {interrupt}"
+            "Cancel still addresses the agent that is responding"
         );
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-stop']")
                 .unwrap()
-                .is_some(),
-            "admission is not interruption, so Stop stays until the server clears the turn"
+                .is_none(),
+            "the header never offers a redundant Stop"
         );
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-more']")
                 .unwrap()
                 .is_some(),
-            "the menu stays reachable after Stop is pressed"
+            "the menu stays reachable after composer Cancel is pressed"
         );
         assert_still_on_chat(&container);
-    }
-
-    fn stop_button_after_edit(container: &HtmlElement) -> HtmlElement {
-        container
-            .query_selector("[data-mobile-test='chat-stop']")
-            .unwrap()
-            .expect("Stop is still beside the menu")
-            .dyn_into()
-            .unwrap()
     }
 
     /// **An edit that never left the client must not sit on screen looking

@@ -151,50 +151,8 @@ fn context_compaction_status_label(
 /// independently of the stylesheet.
 const RECOVERY_TOUCH_TARGET: &str = "min-width:44px;min-height:44px;";
 
-/// Surface a failed interrupt.
-///
-/// An `Interrupt` carries no user text, so there is nothing to hold and nothing
-/// to recover — it is not a `PendingSubmission`. What it does have is a
-/// consequence: if the frame never went out, the agent is **still running**. That
-/// has to be said, not swallowed.
-///
-/// Routed through `mobile_shell_error`, which renders as a dismissible
-/// `role="alert"` banner — the same surface every other rejected admission uses,
-/// and one that sits above whatever the user navigates to next.
-fn report_interrupt_error(state: &AppState, message: String) {
-    log::error!("{message}");
-    state
-        .mobile_shell_error
-        .set(Some(crate::state::MobileShellError {
-            code: protocol::MobileAccessErrorCode::TransportFailed,
-            message,
-        }));
-}
-
-/// True when the exact `(host, agent_id)` behind an [`ActiveAgentRef`] died
-/// with `AgentError { fatal: true }`.
-///
-/// Host-scoped on purpose: two hosts can hand out the same textual `AgentId`,
-/// and a crash on one must never terminate the other's chat header.
-///
-/// Takes the `agents` signal rather than `&AppState` so callers inside a
-/// reactive closure capture only that `Copy` signal. Passing the whole
-/// `AppState` would defeat Rust's disjoint closure capture and move the entire
-/// struct in, which downgrades the surrounding view closure to `FnOnce`.
-fn agent_is_terminated(
-    agents: RwSignal<Vec<crate::state::AgentInfo>>,
-    active: &crate::state::ActiveAgentRef,
-) -> bool {
-    agents.with_untracked(|agents| {
-        agents.iter().any(|a| {
-            a.local_host_id == active.local_host_id
-                && a.agent_id == active.agent_id
-                && a.fatal_error.is_some()
-        })
-    })
-}
-
-/// Tracked twin of [`agent_is_terminated`] for render-time predicates.
+/// Tracked predicate for render-time checks: true when the active agent
+/// died with `AgentError { fatal: true }`.
 fn agent_is_terminated_tracked(
     agents: RwSignal<Vec<crate::state::AgentInfo>>,
     active: &crate::state::ActiveAgentRef,
@@ -206,65 +164,6 @@ fn agent_is_terminated_tracked(
                 && a.fatal_error.is_some()
         })
     })
-}
-
-/// Send an `Interrupt` for the header's Stop control.
-///
-/// A free function rather than a closure body so the fatal guard is reachable
-/// from a test. Once the agent dies the Stop control unmounts, so no DOM click
-/// can drive this path afterwards — yet that is exactly the race the guard
-/// exists for: a tap already dispatched when the fatal frame lands. Calling
-/// this directly is the honest way to prove the guard holds; asserting on a
-/// button that is no longer rendered would prove nothing.
-fn interrupt_active_agent(state: &AppState, active: &crate::state::ActiveAgentRef) {
-    // A fatal agent's stream is dead: an Interrupt sent to it can never be
-    // answered. Silent by design — the transcript's fatal Error row is the
-    // explanation, and reporting "could not stop the turn" would imply a turn
-    // is still running.
-    if agent_is_terminated(state.agents, active) {
-        return;
-    }
-    let agent_stream = state.agents.with_untracked(|agents| {
-        agents
-            .iter()
-            .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
-            .map(|a| a.instance_stream.clone())
-    });
-    let Some(stream) = agent_stream else {
-        report_interrupt_error(
-            state,
-            "Could not stop the turn: this agent's stream is no longer available.".to_owned(),
-        );
-        return;
-    };
-    let host_id = active.local_host_id.clone();
-    let state = state.clone();
-    spawn_local(async move {
-        // The result used to be dropped with `let _ =`. A rejected admission
-        // is exactly the case that matters here: the user taps Stop, the
-        // frame never enters the outbound queue, the turn keeps running — and
-        // nothing at all appears on screen. They are left believing they
-        // stopped an agent that is still spending money.
-        //
-        // Admission is also *only* admission. Nothing here claims the turn
-        // was interrupted: the agent stops when the server says it stopped,
-        // which the UI already reflects through `agent_turn_active`. There is
-        // no success message to make, so the success arm is silent — the
-        // failure arm is the whole point.
-        if let Err(error) = crate::send::send_frame(
-            &host_id,
-            stream,
-            protocol::FrameKind::Interrupt,
-            &protocol::InterruptPayload {},
-        )
-        .await
-        {
-            report_interrupt_error(
-                &state,
-                format!("Could not stop the turn: {error}. The agent is still running."),
-            );
-        }
-    });
 }
 
 /// The terminal state of a conversation that could not be loaded.
@@ -347,8 +246,7 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64) -> bool {
 ///
 /// Composition rules:
 /// - The header surfaces the agent name plus the current backend in the
-///   subtitle, and exposes Stop while a turn is active. Stop sits beside the
-///   agent-actions menu; it does not replace it. The back button is small but
+///   subtitle, and exposes the agent-actions menu. The back button is small but
 ///   always has an accessible label.
 /// - The transcript shows task list → messages → streaming →
 ///   transient events, in that order, because that is the
@@ -503,34 +401,6 @@ pub fn ChatView() -> impl IntoView {
             None
         })
     });
-
-    let s_interrupt = state.clone();
-    let on_interrupt = Callback::new(move |_: ()| {
-        let Some(ar) = s_interrupt.active_agent.get_untracked() else {
-            return;
-        };
-        interrupt_active_agent(&s_interrupt, &ar);
-    });
-
-    let s_turn = state.clone();
-    // Drives both the Stop control and the "Responding" subtitle. Fatal wins
-    // before `agent_turn_active` is read: the reducer normally clears the turn,
-    // but a stale or late-arriving turn flag must never offer to stop an agent
-    // that is already dead, nor claim it is still responding.
-    let is_turn_active = move || {
-        s_turn.active_agent.with(|ar| {
-            let Some(ar) = ar.as_ref() else {
-                return false;
-            };
-            if agent_is_terminated_tracked(s_turn.agents, ar) {
-                return false;
-            }
-            s_turn
-                .agent_turn_active
-                .with(|m| m.get(&ar.as_agent_ref()).copied())
-                .unwrap_or(false)
-        })
-    };
 
     // Rename state: when `rename_editing` is true the title becomes an
     // input. The draft is kept separate from the agent's actual name so
@@ -866,10 +736,6 @@ pub fn ChatView() -> impl IntoView {
                             </div>
                             <div class="chat-header-actions">
                                 {move || {
-                                    // A running turn used to swap the whole menu
-                                    // for Stop. The menu is how this chat reaches
-                                    // session settings, so Stop stays a separate
-                                    // control and the menu stays mounted.
                                     if !has_active_agent() {
                                         return view! { <div class="chat-header-action-spacer"></div> }
                                             .into_any();
@@ -877,18 +743,7 @@ pub fn ChatView() -> impl IntoView {
                                     let rename_cb = on_rename_open;
                                     let close_cb = on_close_agent;
                                     let settings_cb = on_open_session_settings;
-                                    let stop_cb = on_interrupt;
                                     view! {
-                                        <Show when=move || is_turn_active()>
-                                            <Button
-                                                label="Stop"
-                                                variant=ButtonVariant::Destructive
-                                                size=ButtonSize::Compact
-                                                data_mobile_test="chat-stop"
-                                                aria_label="Stop current turn".to_string()
-                                                on_click=stop_cb
-                                            />
-                                        </Show>
                                         <div class="chat-more-menu-wrap">
                                                 <button
                                                     type="button"
@@ -1615,7 +1470,7 @@ mod wasm_tests {
             seed_connected_agent(&state, &host_for_mount);
             *state_handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <ChatView /> }
+            view! { <crate::components::MobileShellErrorBanner /><ChatView /> }
         });
         let state = state_handle.borrow().as_ref().unwrap().clone();
         (state, handle)
@@ -2442,11 +2297,11 @@ mod wasm_tests {
         container.remove();
     }
 
-    fn stop_button(container: &HtmlElement) -> HtmlElement {
+    fn cancel_button(container: &HtmlElement) -> HtmlElement {
         container
-            .query_selector("[data-mobile-test='chat-stop']")
+            .query_selector("[data-mobile-test='chat-send']")
             .unwrap()
-            .expect("the stop control must render while a turn is running")
+            .expect("the composer must render while a turn is running")
             .dyn_into()
             .unwrap()
     }
@@ -2623,15 +2478,8 @@ mod wasm_tests {
         );
     }
 
-    /// **A stop that never left the client must not look like a stop that worked.**
-    ///
-    /// The result of the `Interrupt` send used to be thrown away with `let _ =`.
-    /// A rejected admission is exactly the case that matters: the user taps Stop,
-    /// the frame never enters the outbound queue, the agent keeps running and
-    /// keeps spending money — and absolutely nothing appears on screen. They walk
-    /// away believing they stopped it.
     #[wasm_bindgen_test]
-    async fn a_rejected_interrupt_is_surfaced_and_says_the_agent_is_still_running() {
+    async fn a_rejected_composer_cancel_surfaces_failure_without_claiming_interruption() {
         let _guard = crate::bridge::test_reject_sends();
         let container = make_container();
         let (state, _mount) = mount_active_chat(container.clone());
@@ -2650,36 +2498,24 @@ mod wasm_tests {
             "precondition: nothing surfaced yet"
         );
 
-        stop_button(&container).click();
+        cancel_button(&container).click();
         settle_autoscroll().await;
 
-        let surfaced = state
-            .mobile_shell_error
-            .get_untracked()
-            .expect("a stop that was never admitted must not fail silently");
-        assert!(
-            surfaced.message.contains("still running"),
-            "the user must be told the agent did not stop, got: {}",
-            surfaced.message
-        );
-        assert!(
-            !surfaced.message.to_lowercase().contains("stopped")
-                && !surfaced.message.to_lowercase().contains("interrupted"),
-            "nothing may claim the turn was interrupted: {}",
-            surfaced.message
+        let alert = container
+            .query_selector("[role='alert']")
+            .unwrap()
+            .expect("a rejected Cancel must visibly surface its failure")
+            .text_content()
+            .unwrap();
+        assert!(alert.contains("Failed to interrupt current turn"));
+        assert!(!alert.contains("Stopped") && !alert.contains("Interrupted"));
+        assert_eq!(
+            cancel_button(&container).text_content().as_deref(),
+            Some("Cancel")
         );
     }
 
-    /// **A dead agent is not responding, and cannot be stopped.**
-    ///
-    /// The header used to read `agent_turn_active` alone, so a fatal error that
-    /// arrived mid-turn left Stop armed and the subtitle claiming "Responding".
-    /// Tapping Stop then sent an Interrupt to a stream nobody was reading and,
-    /// on failure, told the user "the agent is still running" — about an agent
-    /// that had already crashed.
-    ///
-    /// The stale `agent_turn_active` here is deliberate: the reducer clears it,
-    /// but the header must not depend on that having happened first.
+    // Keep the stale turn flag to prove fatal status wins before reducer cleanup.
     #[wasm_bindgen_test]
     async fn a_terminated_agent_offers_no_stop_and_does_not_claim_it_is_responding() {
         let _guard = crate::bridge::test_capture_sends();
@@ -2717,13 +2553,13 @@ mod wasm_tests {
         });
         settle_autoscroll().await;
 
-        // Precondition: with a live turn the header does offer Stop.
+        // Status still describes the live turn without a header Stop control.
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-stop']")
                 .unwrap()
-                .is_some(),
-            "precondition: a running turn renders Stop"
+                .is_none(),
+            "a running turn has no redundant header Stop"
         );
 
         state.agents.update(|agents| {
@@ -2764,68 +2600,6 @@ mod wasm_tests {
             state.mobile_shell_error.get_untracked().is_none(),
             "and nothing may claim the turn could not be stopped — it already ended"
         );
-        let _ = agent_ref;
-    }
-
-    /// **The tap that was already in flight when the agent died.**
-    ///
-    /// This is the race the guard in `interrupt_active_agent` exists for, and
-    /// the DOM cannot reach it: Stop unmounts the instant the agent goes fatal,
-    /// so no click after that point dispatches anything. Asserting zero sends
-    /// against an unmounted button proves nothing — it would pass with the
-    /// guard deleted.
-    ///
-    /// So drive the callback path directly, which is why it is a free function.
-    /// The precondition half runs the same call on a *live* agent and requires
-    /// exactly one frame, so this cannot pass by the send stub being broken or
-    /// the call being a no-op for some unrelated reason.
-    #[wasm_bindgen_test]
-    async fn an_interrupt_dispatched_before_the_fatal_frame_never_reaches_the_dead_stream() {
-        let _guard = crate::bridge::test_capture_sends();
-        let container = make_container();
-        let (state, _mount) = mount_active_chat(container.clone());
-        let active = state.active_agent.get_untracked().expect("active agent");
-        state.agent_turn_active.update(|m| {
-            m.insert(active.as_agent_ref(), true);
-        });
-        settle_autoscroll().await;
-
-        // Precondition: this exact call does send, while the agent is alive.
-        interrupt_active_agent(&state, &active);
-        settle_autoscroll().await;
-        assert_eq!(
-            crate::bridge::test_send_attempts(),
-            1,
-            "precondition: the interrupt path emits one frame for a live agent"
-        );
-
-        // The agent dies. The stale turn flag stays set on purpose: the guard
-        // must key on fatal, not on the turn having been cleared first.
-        state.agents.update(|agents| {
-            for agent in agents.iter_mut() {
-                agent.fatal_error = Some("backend crashed".to_owned());
-            }
-        });
-        settle_autoscroll().await;
-        assert!(
-            state
-                .agent_turn_active
-                .with_untracked(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false)),
-            "the stale turn flag must still be set, or this proves nothing"
-        );
-
-        interrupt_active_agent(&state, &active);
-        settle_autoscroll().await;
-
-        assert_eq!(
-            crate::bridge::test_send_attempts(),
-            1,
-            "the retained tap must emit no second frame at the dead stream"
-        );
-        assert!(
-            state.mobile_shell_error.get_untracked().is_none(),
-            "and must not claim the turn could not be stopped — it already ended"
-        );
     }
 
     /// Admission is not interruption. A successfully *queued* Interrupt says
@@ -2847,7 +2621,7 @@ mod wasm_tests {
         });
         settle_autoscroll().await;
 
-        stop_button(&container).click();
+        cancel_button(&container).click();
         settle_autoscroll().await;
 
         assert_eq!(
@@ -4023,26 +3797,17 @@ mod wasm_tests {
         );
     }
 
-    /// With an active agent and no turn running, the header looks like an
-    /// iOS navigation bar: back affordance, centered title/subtitle, and a
-    /// compact More menu instead of text buttons.
     #[wasm_bindgen_test]
-    async fn chat_header_uses_ios_nav_and_more_menu_when_idle() {
+    async fn chat_header_keeps_navigation_and_menu_without_stop_while_composer_cancels() {
         crate::components::test_styles::ensure_styles_loaded();
-        let host = LocalHostId("host-1".to_owned());
-        let host_clone = host.clone();
+        let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
         container.style().set_property("position", "fixed").unwrap();
         container.style().set_property("top", "0").unwrap();
         container.style().set_property("left", "0").unwrap();
         container.style().set_property("width", "390px").unwrap();
         container.style().set_property("height", "700px").unwrap();
-        let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            seed_connected_agent(&state, &host_clone);
-            provide_context(state);
-            view! { <ChatView /> }
-        });
+        let (state, _mount) = mount_active_chat(container.clone());
         next_tick().await;
         assert!(
             container
@@ -4094,6 +3859,141 @@ mod wasm_tests {
         assert!(
             subtitle.contains("Claude"),
             "subtitle should show backend: {subtitle}"
+        );
+
+        let active = state.active_agent.get_untracked().unwrap();
+        state.agents.update(|agents| {
+            agents[0].name =
+                "A long agent title that must truncate rather than crowd navigation".to_owned();
+        });
+        for running in [true, false, true] {
+            state.agent_turn_active.update(|turns| {
+                turns.insert(active.as_agent_ref(), running);
+            });
+            next_tick().await;
+            for width in [320, 360, 390] {
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                next_tick().await;
+                let title = container
+                    .query_selector("[data-mobile-test='chat-title']")
+                    .unwrap()
+                    .unwrap();
+                let center = title.parent_element().unwrap();
+                let header = center.parent_element().unwrap();
+                let back = container
+                    .query_selector("[data-mobile-test='chat-back']")
+                    .unwrap()
+                    .unwrap();
+                let more = container
+                    .query_selector("[data-mobile-test='chat-more']")
+                    .unwrap()
+                    .unwrap();
+                let subtitle = container
+                    .query_selector("[data-mobile-test='chat-subtitle']")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    header.query_selector_all("button").unwrap().length(),
+                    2,
+                    "only Back and More belong in the header, including while responding"
+                );
+                assert!(!header.text_content().unwrap().contains("Stop"));
+                assert_eq!(
+                    subtitle.text_content().unwrap().contains("Responding"),
+                    running
+                );
+                let bounds = header.get_bounding_client_rect();
+                let back_bounds = back.get_bounding_client_rect();
+                let center_bounds = center.get_bounding_client_rect();
+                let more_bounds = more.get_bounding_client_rect();
+                assert!(
+                    bounds.width() > 0.0
+                        && bounds.left() >= 0.0
+                        && bounds.right() <= f64::from(width)
+                );
+                assert!(
+                    header.scroll_width() <= header.client_width(),
+                    "no header overflow at {width}px"
+                );
+                assert!(
+                    back_bounds.right() <= center_bounds.left()
+                        && center_bounds.right() <= more_bounds.left(),
+                    "title/status must not overlap navigation at {width}px"
+                );
+                assert!(
+                    title.get_bounding_client_rect().width() > 0.0
+                        && subtitle.get_bounding_client_rect().width() > 0.0
+                );
+                for control in [&back, &more] {
+                    let bounds = control.get_bounding_client_rect();
+                    let hit = web_sys::window()
+                        .unwrap()
+                        .document()
+                        .unwrap()
+                        .element_from_point(
+                            (bounds.x() + bounds.width() / 2.0) as f32,
+                            (bounds.y() + bounds.height() / 2.0) as f32,
+                        )
+                        .unwrap();
+                    assert!(
+                        control == &hit || control.contains(Some(&hit)),
+                        "header controls remain tappable"
+                    );
+                }
+            }
+        }
+        let cancel = cancel_button(&container);
+        assert_eq!(cancel.text_content().as_deref(), Some("Cancel"));
+        assert!(!cancel.has_attribute("disabled"));
+        // Native aa36 fixture: "Exact host client unavailable" before Cancel.
+        // Compare this mount's baseline; Cancel must not create or change an alert.
+        let alert_texts = || {
+            let alerts = container.query_selector_all("[role='alert']").unwrap();
+            (0..alerts.length())
+                .map(|index| alerts.item(index).unwrap().text_content().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let alerts_before = alert_texts();
+        console_log!("Composer Cancel alert baseline: {:?}", alerts_before);
+        assert!(
+            container
+                .query_selector("[data-mobile-test='mobile-shell-error-banner']")
+                .unwrap()
+                .is_none(),
+            "precondition: no interrupt error before Cancel"
+        );
+        cancel.click();
+        next_tick().await;
+        let frames: Vec<protocol::Envelope> = crate::bridge::test_sent_lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 1, "Cancel emits exactly one protocol frame");
+        assert_eq!(frames[0].kind, protocol::FrameKind::Interrupt);
+        assert_eq!(
+            frames[0].stream,
+            protocol::StreamPath("stream/1".to_owned())
+        );
+        assert_eq!(
+            cancel.text_content().as_deref(),
+            Some("Cancel"),
+            "admission does not end the turn"
+        );
+        let alerts_after = alert_texts();
+        console_log!("Composer Cancel alerts after admission: {:?}", alerts_after);
+        assert_eq!(
+            alerts_after, alerts_before,
+            "Cancel must not create or change an alert"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='mobile-shell-error-banner']")
+                .unwrap()
+                .is_none(),
+            "an admitted Cancel must not report an interrupt error"
         );
 
         let more_btn: web_sys::HtmlElement = container

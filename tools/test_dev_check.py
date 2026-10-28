@@ -3395,7 +3395,7 @@ class WasmToolScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary) / "repo"
             script, env, _ = self._write_run_fixture(root)
-            outputs = [root / "first.env", root / "second.env"]
+            outputs = [root / "check logs" / "first.env", root / "check logs" / "second.env"]
             inputs = []
             processes = []
             for index, output in enumerate(outputs):
@@ -3403,7 +3403,8 @@ class WasmToolScriptTests(unittest.TestCase):
                 capabilities.write_text(json.dumps({"checkOwner": index}))
                 inputs.append(capabilities)
                 processes.append(subprocess.Popen(
-                    [str(script), "--prepare", str(output)],
+                    [str(script), "--prepare", str(output.relative_to(root))],
+                    cwd=root,
                     env=dict(env, WASM_BINDGEN_TEST_WEBDRIVER_JSON=str(capabilities)),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 ))
@@ -3413,13 +3414,24 @@ class WasmToolScriptTests(unittest.TestCase):
             configs = []
             for index, output in enumerate(outputs):
                 loaded = subprocess.run(
-                    ["bash", "-c", 'source "$1"; printf "%s" "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"', "bash", str(output)],
-                    text=True, capture_output=True, check=True,
+                    ["bash", "-c", 'source "$1"; cd "$2"; python3 -c '
+                     + shlex.quote(
+                         "import json, os, pathlib; "
+                         "config = pathlib.Path(os.environ['WASM_BINDGEN_TEST_WEBDRIVER_JSON']); "
+                         "identity = pathlib.Path(os.environ['TYDE_WASM_IDENTITY_FILE']); "
+                         "print(json.dumps({'path': str(config), 'capabilities': json.loads(config.read_text()), "
+                         "'identity': identity.read_text()}))"
+                     ), "bash", str(output), str(root / "rtc-transport")],
+                    text=True, capture_output=True, check=False,
                 )
-                config = pathlib.Path(loaded.stdout)
+                self.assertEqual(loaded.returncode, 0, loaded.stdout + loaded.stderr)
+                consumed = json.loads(loaded.stdout)
+                config = pathlib.Path(consumed["path"])
                 configs.append(config)
-                self.assertEqual(json.loads(config.read_text())["checkOwner"], index)
-                self.assertIn(f"wasm.webdriver.source={inputs[index]}", output.with_suffix(".env.identity").read_text())
+                self.assertTrue(config.is_absolute())
+                self.assertEqual(consumed["capabilities"]["checkOwner"], index)
+                self.assertEqual(consumed["capabilities"]["goog:chromeOptions"]["binary"], env["CHROME"])
+                self.assertIn(f"wasm.webdriver.source={inputs[index]}", consumed["identity"])
             self.assertNotEqual(configs[0], configs[1])
 
 

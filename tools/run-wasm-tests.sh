@@ -43,7 +43,7 @@ case "${1:-}" in
             exit 2
         }
         mode="prepare"
-        prepare_output="$2"
+        prepare_output="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$2")"
         ;;
     --identity)
         [[ $# -eq 1 ]] || {
