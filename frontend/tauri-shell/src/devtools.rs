@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use devtools_protocol::{
     UiDebugRequest, UiDebugRequestEvent, UiDebugResponse, UiDebugResponseSubmission,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, sleep, timeout};
@@ -14,6 +14,170 @@ use uuid::Uuid;
 
 const UI_DEBUG_BIND_ENV: &str = "TYDE_DEV_UI_DEBUG_BIND_ADDR";
 const UI_DEBUG_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct VerifiedNativeIdentity {
+    instance_id: devtools_protocol::DevInstanceId,
+    identity: devtools_protocol::DevNativeIdentity,
+}
+
+/// Runs before the first native preference write or webview creation.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn verify_native_identity(
+    config: &tauri::Config,
+) -> Result<Option<VerifiedNativeIdentity>, String> {
+    let instance_id = match std::env::var(devtools_protocol::DEV_INSTANCE_ID_ENV) {
+        Ok(instance_id) => devtools_protocol::DevInstanceId(instance_id),
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(format!("Invalid DEV instance identity: {error}")),
+    };
+    #[cfg(target_os = "macos")]
+    let (bundle_identifier, preferences_domain) = observe_macos_identity(
+        &devtools_protocol::dev_instance_application_identifier(&instance_id),
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let (bundle_identifier, preferences_domain) = (None, None);
+    let identity = devtools_protocol::DevNativeIdentity {
+        application_identifier: config.identifier.clone(),
+        bundle_identifier,
+        preferences_domain,
+    };
+    identity.verify_owned(&instance_id)?;
+    Ok(Some(VerifiedNativeIdentity {
+        instance_id,
+        identity,
+    }))
+}
+
+/// Probes preferences only once the embedded bundle identity is owned, so a
+/// misbuilt child never reads another application's domain.
+#[cfg(target_os = "macos")]
+fn observe_macos_identity(owned: &str) -> Result<(Option<String>, Option<String>), String> {
+    let bundle = crate::macos_webview_defaults::main_bundle_identifier()?;
+    if bundle.as_deref() != Some(owned) {
+        return Ok((bundle, None));
+    }
+    let preferences = crate::macos_webview_defaults::current_application_preferences_domain(owned)?;
+    Ok((bundle, preferences))
+}
+
+/// Observes every created webview's actual data store before the host and UI
+/// startup signals.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn attest_native_state(
+    app: &tauri::App,
+    verified: VerifiedNativeIdentity,
+) -> Result<(), String> {
+    let mut windows: Vec<_> = app.webview_windows().into_iter().collect();
+    windows.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut webviews = Vec::with_capacity(windows.len());
+    for (label, window) in windows {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        window
+            .with_webview(move |webview| {
+                let _ = sender.send(webview_data_store(webview));
+            })
+            .map_err(|error| format!("Cannot inspect webview {label}: {error}"))?;
+        let data_store = receiver
+            .try_recv()
+            .map_err(|_| format!("Webview {label} was not inspected on the main thread"))??;
+        webviews.push(devtools_protocol::DevWebviewNativeState { label, data_store });
+    }
+    let attestation = devtools_protocol::DevNativeStateAttestation {
+        identity: verified.identity,
+        webviews,
+    };
+    attestation.verify_isolated(&verified.instance_id)?;
+    devtools_protocol::notify_dev_instance_startup(
+        devtools_protocol::DevInstanceStartupSignal::NativeState { attestation },
+    )
+}
+
+/// Runs before any window exists, so the launcher owns every directory the
+/// child creates even when startup fails before it attests native state.
+pub fn announce_application_directories(app: &tauri::App) -> Result<(), String> {
+    let Some(owner) = devtools_protocol::DevInstanceStartupOwner::from_env()? else {
+        return Ok(());
+    };
+    owner.notify(
+        devtools_protocol::DevInstanceStartupSignal::ApplicationDirectories {
+            directories: application_directories(app)?,
+        },
+    )
+}
+
+/// Tauri keys these by the configured identifier and creates the local data
+/// directory as every webview's data directory, even an incognito one.
+fn application_directories(app: &tauri::App) -> Result<Vec<std::path::PathBuf>, String> {
+    let paths = app.path();
+    let resolved = [
+        paths.app_config_dir(),
+        paths.app_data_dir(),
+        paths.app_local_data_dir(),
+        paths.app_cache_dir(),
+    ];
+    // Elsewhere the log directory lies inside the local data directory.
+    #[cfg(target_os = "macos")]
+    let resolved = resolved.into_iter().chain([paths.app_log_dir()]);
+    let mut directories = resolved
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot resolve application directories: {error}"))?;
+    // System frameworks in this process key a cache directory by its bundle
+    // identifier under the per-user Darwin cache directory, which ignores HOME.
+    #[cfg(target_os = "macos")]
+    directories.push(darwin_user_cache_dir()?.join(&app.config().identifier));
+    directories.sort();
+    directories.dedup();
+    Ok(directories)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_user_cache_dir() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+    let unresolved = || {
+        format!(
+            "Cannot resolve the Darwin user cache directory: {}",
+            std::io::Error::last_os_error()
+        )
+    };
+    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, std::ptr::null_mut(), 0) };
+    if length == 0 {
+        return Err(unresolved());
+    }
+    let mut value = vec![0_u8; length];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_CACHE_DIR,
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if written == 0 || written > value.len() {
+        return Err(unresolved());
+    }
+    value.truncate(written - 1);
+    Ok(std::ffi::OsString::from_vec(value).into())
+}
+
+#[cfg(target_os = "macos")]
+fn webview_data_store(
+    webview: tauri::webview::PlatformWebview,
+) -> Result<devtools_protocol::DevWebviewDataStore, String> {
+    crate::macos_webview_defaults::webview_data_store(webview)
+}
+
+#[cfg(target_os = "linux")]
+fn webview_data_store(
+    webview: tauri::webview::PlatformWebview,
+) -> Result<devtools_protocol::DevWebviewDataStore, String> {
+    use webkit2gtk::WebViewExt;
+    Ok(if webview.inner().is_ephemeral() {
+        devtools_protocol::DevWebviewDataStore::NonPersistent
+    } else {
+        devtools_protocol::DevWebviewDataStore::Persistent
+    })
+}
 
 pub struct UiDebugBridgeState {
     ready: AtomicBool,

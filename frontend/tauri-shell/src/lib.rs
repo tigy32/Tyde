@@ -38,17 +38,117 @@ use tauri_plugin_dialog::{
 
 #[cfg(target_os = "macos")]
 mod macos_webview_defaults {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
 
     use core_foundation_sys::{
-        base::{Boolean, CFRelease, CFTypeRef},
+        base::{Boolean, CFEqual, CFRelease, CFTypeRef},
+        bundle::{CFBundleGetIdentifier, CFBundleGetMainBundle},
         number::kCFBooleanFalse,
         preferences::{
             CFPreferencesAppSynchronize, CFPreferencesCopyAppValue, CFPreferencesSetAppValue,
             kCFPreferencesCurrentApplication,
         },
-        string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+        string::{
+            CFStringCreateWithCString, CFStringGetCString, CFStringGetLength,
+            CFStringGetMaximumSizeForEncoding, CFStringRef, kCFStringEncodingUTF8,
+        },
     };
+
+    pub fn main_bundle_identifier() -> Result<Option<String>, String> {
+        let bundle = unsafe { CFBundleGetMainBundle() };
+        if bundle.is_null() {
+            return Err("macOS main bundle is unavailable".to_owned());
+        }
+        let identifier = unsafe { CFBundleGetIdentifier(bundle) };
+        if identifier.is_null() {
+            return Ok(None);
+        }
+        let length = unsafe { CFStringGetLength(identifier) };
+        let max_size = unsafe { CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) };
+        let capacity = max_size
+            .checked_add(1)
+            .ok_or_else(|| "macOS main bundle identifier is too long".to_owned())?;
+        let buffer_len = usize::try_from(capacity)
+            .map_err(|error| format!("invalid macOS main bundle identifier size: {error}"))?;
+        let mut buffer = vec![0_u8; buffer_len];
+        let converted = unsafe {
+            CFStringGetCString(
+                identifier,
+                buffer.as_mut_ptr().cast(),
+                capacity,
+                kCFStringEncodingUTF8,
+            )
+        };
+        if converted == 0 {
+            return Err("macOS main bundle identifier is not UTF-8".to_owned());
+        }
+        CStr::from_bytes_until_nul(&buffer)
+            .map_err(|error| format!("macOS main bundle identifier is unterminated: {error}"))?
+            .to_str()
+            .map(|identifier| Some(identifier.to_owned()))
+            .map_err(|error| format!("macOS main bundle identifier is not UTF-8: {error}"))
+    }
+
+    /// Writes a fresh nonce only into `domain`, then reads it back through
+    /// the current-application domain that NSUserDefaults and the WebKit
+    /// defaults below use.
+    pub fn current_application_preferences_domain(domain: &str) -> Result<Option<String>, String> {
+        let domain_ref = OwnedCfString::new(domain)?;
+        let key = OwnedCfString::new("TydeDevInstancePreferencesDomainProbe")?;
+        let nonce = OwnedCfString::new(&uuid::Uuid::new_v4().simple().to_string())?;
+        unsafe { CFPreferencesSetAppValue(key.0, nonce.0 as CFTypeRef, domain_ref.0) };
+        synchronize(domain_ref.0)?;
+        let observed =
+            unsafe { CFPreferencesCopyAppValue(key.0, kCFPreferencesCurrentApplication) };
+        let resolved =
+            !observed.is_null() && unsafe { CFEqual(observed, nonce.0 as CFTypeRef) } != 0;
+        if !observed.is_null() {
+            unsafe { CFRelease(observed) };
+        }
+        unsafe { CFPreferencesSetAppValue(key.0, std::ptr::null(), domain_ref.0) };
+        synchronize(domain_ref.0)?;
+        Ok(resolved.then(|| domain.to_owned()))
+    }
+
+    pub fn webview_data_store(
+        webview: tauri::webview::PlatformWebview,
+    ) -> Result<devtools_protocol::DevWebviewDataStore, String> {
+        use objc2::{rc::Retained, runtime::AnyObject};
+        use objc2_web_kit::WKWebView;
+
+        // Tauri hands each macOS handle over as a retained pointer.
+        let wk_webview = unsafe { Retained::from_raw(webview.inner().cast::<WKWebView>()) };
+        drop(unsafe { Retained::from_raw(webview.controller().cast::<AnyObject>()) });
+        drop(unsafe { Retained::from_raw(webview.ns_window().cast::<AnyObject>()) });
+        let wk_webview = wk_webview.ok_or_else(|| "macOS webview handle is null".to_owned())?;
+        let persistent = unsafe { wk_webview.configuration().websiteDataStore().isPersistent() };
+        Ok(if persistent {
+            devtools_protocol::DevWebviewDataStore::Persistent
+        } else {
+            devtools_protocol::DevWebviewDataStore::NonPersistent
+        })
+    }
+
+    struct OwnedCfString(CFStringRef);
+
+    impl OwnedCfString {
+        fn new(value: &str) -> Result<Self, String> {
+            create_cf_string(value).map(Self)
+        }
+    }
+
+    impl Drop for OwnedCfString {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0 as CFTypeRef) };
+        }
+    }
+
+    fn synchronize(domain: CFStringRef) -> Result<(), String> {
+        if unsafe { CFPreferencesAppSynchronize(domain) } == 0 as Boolean {
+            return Err("CFPreferencesAppSynchronize returned false".to_owned());
+        }
+        Ok(())
+    }
 
     struct PreferenceKey {
         name: &'static str,
@@ -1365,6 +1465,34 @@ pub fn run() {
         }
         phase.finish();
     }
+    #[cfg(tyde_dev_instance_bundle)]
+    let context = {
+        tauri::embed_plist::embed_info_plist_bytes!(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/dev-instance-Info.plist"
+        )));
+        tauri::generate_context!(test = true)
+    };
+    #[cfg(not(tyde_dev_instance_bundle))]
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    let context = {
+        let mut context = context;
+        // WebKitGTK withholds external FileList data; use its native file drag source.
+        for window in &mut context.config_mut().app.windows {
+            window.drag_drop_enabled = true;
+        }
+        context
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let native_identity = match devtools::verify_native_identity(context.config()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::error!("Native startup failed phase=NativeStateIsolation");
+            eprintln!("DEV instance native state is not isolated: {error}");
+            std::process::exit(1);
+        }
+    };
     #[cfg(target_os = "macos")]
     {
         let phase = logging::startup(logging::StartupPhase::WebviewDefaults);
@@ -1600,20 +1728,13 @@ pub fn run() {
         }
     });
 
-    let context = tauri::generate_context!();
-    #[cfg(target_os = "linux")]
-    let context = {
-        let mut context = context;
-        // WebKitGTK withholds external FileList data; use its native file drag source.
-        for window in &mut context.config_mut().app.windows {
-            window.drag_drop_enabled = true;
-        }
-        context
-    };
-
     let build_phase = logging::startup(logging::StartupPhase::BuildShell);
     let app = builder
         .setup(move |app| {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(identity) = native_identity {
+                devtools::attest_native_state(app, identity).map_err(std::io::Error::other)?;
+            }
             let setup_phase = logging::startup(logging::StartupPhase::Setup);
             app.manage(logging::start_ui_diagnostics(app.handle()));
             let phase = logging::startup(logging::StartupPhase::HostStore);
@@ -1693,6 +1814,11 @@ pub fn run() {
         .build(context)
         .expect("failed to build desktop shell");
     build_phase.finish();
+    if let Err(error) = devtools::announce_application_directories(&app) {
+        tracing::error!("Native startup failed phase=ApplicationDirectories");
+        eprintln!("DEV instance application directories were not announced: {error}");
+        std::process::exit(1);
+    }
 
     app.run(move |app, event| {
         if let RunEvent::ExitRequested { code, api, .. } = event {

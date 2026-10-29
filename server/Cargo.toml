@@ -74,6 +74,9 @@ notify = "=9.0.0-rc.5"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 notify = "8"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
+
 [dev-dependencies]
 tychat-bot = { git = "https://github.com/tigy32/tychat-bot", rev = "b123ad6c76dc2aa9504a3ae03bee1c7fe56c8613", features = ["owner-kit"] }
 server = { path = ".", features = ["test-support"] }

@@ -10,18 +10,19 @@ use crate::process_env::launch::{
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use devtools_protocol::{
-    BoundedDebugOutput, CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV, DEV_INSTANCE_DENY_PROXY_URL,
-    DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_HOME_ENV,
+    BoundedDebugOutput, CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV, DEV_APPLICATION_DIRECTORIES_OWNED,
+    DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_HOME_ENV,
     DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_ID_ENV,
     DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DEV_INSTANCE_STARTUP_ADDR_ENV,
-    DEV_INSTANCE_STARTUP_CONTRACT, DEV_INSTANCE_STARTUP_CONTRACT_PATH, DebugOutputSlice,
-    DevInstanceFailureKind, DevInstanceHermesEnvironmentAttestation, DevInstanceId,
-    DevInstanceStartupCleanup, DevInstanceStartupContract, DevInstanceStartupNotification,
-    DevInstanceStartupPhase, DevInstanceStartupSignal, DevInstanceStatus,
-    DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
-    UiDebugResponse, dev_instance_mutable_paths, is_provider_environment_key,
+    DEV_INSTANCE_STARTUP_CONTRACT, DEV_INSTANCE_STARTUP_CONTRACT_PATH, DEV_NATIVE_STATE_ATTESTED,
+    DebugOutputSlice, DevInstanceFailureKind, DevInstanceHermesEnvironmentAttestation,
+    DevInstanceId, DevInstanceStartupCleanup, DevInstanceStartupContract,
+    DevInstanceStartupNotification, DevInstanceStartupPhase, DevInstanceStartupSignal,
+    DevInstanceStatus, DevNativeStateAttestation, DisposableHermesEnvironment,
+    PreparedDisposableHermesEnvironment, UiDebugRequest, UiDebugResponse,
+    dev_instance_application_identifier, dev_instance_mutable_paths, is_provider_environment_key,
     parent_claude_credential_store_dir, prepare_disposable_hermes_environment,
-    resolve_parent_hermes_runtime,
+    resolve_parent_hermes_runtime, verify_dev_application_directories,
 };
 use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use rmcp::{
@@ -589,23 +590,118 @@ impl DebugMcpState {
     }
 }
 
+/// macOS has no parent-death signal, so descendants the desktop placed in
+/// their own process groups, such as provider capacity probes, outlive its
+/// group kill and keep writing into the instance store. There the desktop
+/// leads a new session, which those descendants keep through reparenting.
+/// The unreaped leader pins the session id, so the sweep that kills every
+/// live member starts before stop reaps it, or as soon as an exit
+/// observation does, and never later against an id that may be reused.
+#[derive(Debug)]
+struct DevDesktop {
+    child: AsyncGroupChild,
+    #[cfg(target_os = "macos")]
+    session: Option<libc::pid_t>,
+    #[cfg(target_os = "macos")]
+    sweep: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl DevDesktop {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        let command = {
+            let mut command = command;
+            command.new_session();
+            command
+        };
+        let child = command
+            .group_spawn()
+            .await
+            .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
+        Ok(Self {
+            #[cfg(target_os = "macos")]
+            session: Some(
+                child
+                    .id()
+                    .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                    .ok_or_else(|| "DEV desktop session leader has no pid".to_owned())?,
+            ),
+            #[cfg(target_os = "macos")]
+            sweep: None,
+            child,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sweep_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.sweep = Some(tokio::task::spawn_blocking(move || {
+                owned_session::kill_members(session)
+            }));
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        #[cfg(target_os = "macos")]
+        if status.is_some() {
+            self.sweep_session();
+        }
+        Ok(status)
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        #[cfg(target_os = "macos")]
+        self.sweep_session();
+        Ok(status)
+    }
+
+    async fn stop(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let signalled = self.child.start_kill();
+        #[cfg(target_os = "macos")]
+        {
+            self.sweep_session();
+            if let Some(sweep) = self.sweep.take() {
+                match sweep.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(error),
+                    Err(error) => {
+                        errors.push(format!("DEV desktop session cleanup did not join: {error}"));
+                    }
+                }
+            }
+        }
+        match signalled {
+            Ok(()) => {
+                if let Err(error) = self.child.wait().await {
+                    errors.push(format!("failed to stop dev desktop: {error}"));
+                }
+            }
+            Err(error) => errors.push(format!("failed to stop dev desktop: {error}")),
+        }
+        errors
+    }
+}
+
 #[derive(Debug, Default)]
 struct DevBuildProcesses {
     frontend: Option<AsyncGroupChild>,
-    desktop: Option<AsyncGroupChild>,
+    desktop: Option<DevDesktop>,
     captures: Vec<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl DevBuildProcesses {
     async fn stop(mut self) -> Result<(), String> {
         let mut errors = Vec::new();
-        for child in [&mut self.desktop, &mut self.frontend]
-            .into_iter()
-            .flatten()
+        if let Some(desktop) = &mut self.desktop {
+            errors.extend(desktop.stop().await);
+        }
+        if let Some(frontend) = &mut self.frontend
+            && let Err(error) = frontend.kill().await
         {
-            if let Err(error) = child.kill().await {
-                errors.push(format!("DEV process cleanup failed: {error}"));
-            }
+            errors.push(format!("DEV process cleanup failed: {error}"));
         }
         for task in self.captures.drain(..) {
             match task.await {
@@ -631,9 +727,11 @@ struct DevInstanceRecord {
     config_path: PathBuf,
     store_dir: PathBuf,
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
+    native_state: Option<DevNativeStateAttestation>,
+    owned_native_state: DevOwnedNativeState,
 
     startup_capture_tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
-    child: AsyncGroupChild,
+    desktop: DevDesktop,
     frontend_child: AsyncGroupChild,
 }
 
@@ -657,6 +755,8 @@ struct DevInstanceReady {
     stores_ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
+    native_state: Option<DevNativeStateAttestation>,
+    application_directories: Vec<PathBuf>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -1158,7 +1258,7 @@ async fn build_instance(
         }?;
         let frontend_port = frontend_ready.port;
         let frontend_url = format!("http://127.0.0.1:{frontend_port}");
-        let config_path = write_dev_config(&project_dir, frontend_port, &instance_id.0)?;
+        let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
         tracing::debug!("dev frontend ready before desktop launch");
         reporter.phase(DevInstanceStartupPhase::Desktop)?;
         let startup_listener = TcpListener::bind("127.0.0.1:0").await
@@ -1180,16 +1280,12 @@ async fn build_instance(
             .stderr(Stdio::piped());
         configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref())?;
 
-        processes.desktop = Some(
-            command
-                .group_spawn()
-                .await
-                .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?,
-        );
-        let child = processes
+        processes.desktop = Some(DevDesktop::spawn(command).await?);
+        let child = &mut processes
             .desktop
             .as_mut()
-            .ok_or_else(|| "DEV desktop ownership missing".to_owned())?;
+            .ok_or_else(|| "DEV desktop ownership missing".to_owned())?
+            .child;
 
         let stdout = child
             .take_stdout()
@@ -1211,8 +1307,14 @@ async fn build_instance(
             config_path,
             store_dir,
             hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
+            native_state: None,
+            owned_native_state: DevOwnedNativeState {
+                #[cfg(target_os = "macos")]
+                preferences_domain: dev_instance_application_identifier(&instance_id),
+                directories: Vec::new(),
+            },
             startup_capture_tasks: std::mem::take(&mut processes.captures),
-            child: processes
+            desktop: processes
                 .desktop
                 .take()
                 .ok_or_else(|| "DEV desktop ownership missing".to_owned())?,
@@ -1484,11 +1586,547 @@ async fn stop_instance(
         .await?
 }
 
-async fn stop_record(mut record: DevInstanceRecord) -> Result<(), String> {
-    let mut errors = Vec::new();
-    if let Err(error) = record.child.kill().await {
-        errors.push(format!("failed to stop dev desktop: {error}"));
+/// Native state the child's platform keys by its owned application
+/// identifier outside the instance store; removed once the child is gone.
+struct DevOwnedNativeState {
+    #[cfg(target_os = "macos")]
+    preferences_domain: String,
+    directories: Vec<PathBuf>,
+}
+
+impl DevOwnedNativeState {
+    fn remove(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for directory in &self.directories {
+            if let Err(error) = std::fs::remove_dir_all(directory)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                errors.push(format!("DEV native directory cleanup failed: {error}"));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Err(error) = owned_preferences::remove_domain(&self.preferences_domain) {
+            errors.push(error);
+        }
+        errors
     }
+}
+
+/// cfprefsd keys the child's WebKit defaults and identity probe by its owned
+/// domain under the real user, regardless of the HOME the child was given.
+/// `CFPreferencesSynchronize` returns before cfprefsd writes the domain file,
+/// and a write landing after the file is unlinked recreates it. Removal
+/// therefore waits on file events until cfprefsd has written a fresh marker
+/// and then the emptied domain; with nothing left to write, the unlink holds.
+#[cfg(target_os = "macos")]
+mod owned_preferences {
+    use std::fs::{File, OpenOptions};
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    use core_foundation_sys::{
+        array::CFArrayGetCount,
+        base::{CFEqual, CFGetTypeID, CFIndex, CFRelease, CFTypeRef},
+        data::CFDataCreate,
+        dictionary::{
+            CFDictionaryGetCount, CFDictionaryGetTypeID, CFDictionaryGetValue, CFDictionaryRef,
+        },
+        preferences::{
+            CFPreferencesCopyKeyList, CFPreferencesSetMultiple, CFPreferencesSetValue,
+            CFPreferencesSynchronize, kCFPreferencesAnyHost, kCFPreferencesCurrentUser,
+        },
+        propertylist::{CFPropertyListCreateWithData, kCFPropertyListImmutable},
+        string::{CFStringCreateWithBytes, CFStringRef, kCFStringEncodingUTF8},
+    };
+
+    const CLEANUP_MARKER: &str = "TydeDevInstancePreferencesCleanupMarker";
+
+    struct Owned(CFTypeRef);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    enum OnDisk {
+        Absent,
+        Unreadable,
+        Dictionary { keys: CFIndex, marked: bool },
+    }
+
+    pub(super) fn remove_domain(name: &str) -> Result<(), String> {
+        let domain = cf_string(name)?;
+        let app_id: CFStringRef = domain.0.cast();
+        let marker = cf_string(CLEANUP_MARKER)?;
+        let nonce = cf_string(&uuid::Uuid::new_v4().simple().to_string())?;
+        let preferences = real_user_home()?.join("Library/Preferences");
+        let file = preferences.join(format!("{name}.plist"));
+        let events = FileEvents::watch(&preferences)?;
+        unsafe {
+            CFPreferencesSetValue(
+                marker.0.cast(),
+                nonce.0,
+                app_id,
+                kCFPreferencesCurrentUser,
+                kCFPreferencesAnyHost,
+            )
+        };
+        synchronize(app_id)?;
+        events.await_file(&file, &marker, &nonce, |disk| {
+            Ok(matches!(disk, OnDisk::Dictionary { marked: true, .. }))
+        })?;
+        if let Some(keys) = copy_key_list(app_id) {
+            unsafe {
+                CFPreferencesSetMultiple(
+                    std::ptr::null(),
+                    keys.0.cast(),
+                    app_id,
+                    kCFPreferencesCurrentUser,
+                    kCFPreferencesAnyHost,
+                )
+            };
+        }
+        synchronize(app_id)?;
+        let remaining =
+            copy_key_list(app_id).map_or(0, |keys| unsafe { CFArrayGetCount(keys.0.cast()) });
+        if remaining > 0 {
+            return Err("DEV preferences domain kept keys after cleanup".to_owned());
+        }
+        // After the marker landed, only it or the emptied domain may follow;
+        // any other state fails stop rather than wait on a write that cannot
+        // settle it.
+        events.await_file(&file, &marker, &nonce, |disk| match disk {
+            OnDisk::Dictionary { keys: 0, .. } => Ok(true),
+            OnDisk::Dictionary { marked: true, .. } => Ok(false),
+            OnDisk::Dictionary { .. } => {
+                Err("DEV preferences file gained keys after cleanup".to_owned())
+            }
+            OnDisk::Absent => {
+                Err("DEV preferences file disappeared before its emptied write".to_owned())
+            }
+            OnDisk::Unreadable => {
+                Err("DEV preferences file became unreadable after cleanup".to_owned())
+            }
+        })?;
+        match std::fs::remove_file(file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("DEV preferences file cleanup failed: {error}")),
+        }
+    }
+
+    /// Vnode events for the preferences directory, which sees cfprefsd's
+    /// renames, and for whichever domain file is being read.
+    struct FileEvents {
+        queue: OwnedFd,
+        directory: File,
+    }
+
+    impl FileEvents {
+        fn watch(directory: &Path) -> Result<Self, String> {
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Err(format!(
+                    "DEV preferences watch failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let events = Self {
+                queue: unsafe { OwnedFd::from_raw_fd(queue) },
+                directory: File::open(directory)
+                    .map_err(|error| format!("DEV preferences watch failed: {error}"))?,
+            };
+            events.register(&events.directory, libc::NOTE_WRITE)?;
+            Ok(events)
+        }
+
+        fn register(&self, file: &File, notes: u32) -> Result<(), String> {
+            let change = libc::kevent {
+                ident: file.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: notes,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let status = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    &change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if status < 0 {
+                return Err(format!(
+                    "DEV preferences watch failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        /// Each read follows registration for the file it reads, and every
+        /// earlier change was already registered, so no write goes unseen.
+        fn await_file(
+            &self,
+            path: &Path,
+            marker: &Owned,
+            nonce: &Owned,
+            settled: impl Fn(&OnDisk) -> Result<bool, String>,
+        ) -> Result<(), String> {
+            loop {
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                {
+                    Ok(file) => Some(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(format!("DEV preferences file read failed: {error}"));
+                    }
+                };
+                let disk = match &file {
+                    None => OnDisk::Absent,
+                    Some(file) => {
+                        self.register(
+                            file,
+                            libc::NOTE_WRITE
+                                | libc::NOTE_EXTEND
+                                | libc::NOTE_DELETE
+                                | libc::NOTE_RENAME
+                                | libc::NOTE_ATTRIB,
+                        )?;
+                        read_domain(file, marker, nonce)?
+                    }
+                };
+                if settled(&disk)? {
+                    return Ok(());
+                }
+                self.next()?;
+            }
+        }
+
+        fn next(&self) -> Result<(), String> {
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+            loop {
+                let received = unsafe {
+                    libc::kevent(
+                        self.queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if received > 0 {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                if received < 0 && error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(format!("DEV preferences watch failed: {error}"));
+                }
+            }
+        }
+    }
+
+    fn read_domain(mut file: &File, marker: &Owned, nonce: &Owned) -> Result<OnDisk, String> {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("DEV preferences file read failed: {error}"))?;
+        let length = CFIndex::try_from(bytes.len())
+            .map_err(|error| format!("DEV preferences file is too large: {error}"))?;
+        let data = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), length) };
+        if data.is_null() {
+            return Err("DEV preferences file could not be buffered".to_owned());
+        }
+        let data = Owned(data.cast());
+        let list = unsafe {
+            CFPropertyListCreateWithData(
+                std::ptr::null(),
+                data.0.cast(),
+                kCFPropertyListImmutable,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if list.is_null() {
+            return Ok(OnDisk::Unreadable);
+        }
+        let list = Owned(list);
+        if unsafe { CFGetTypeID(list.0) != CFDictionaryGetTypeID() } {
+            return Ok(OnDisk::Unreadable);
+        }
+        let dictionary: CFDictionaryRef = list.0.cast();
+        let value = unsafe { CFDictionaryGetValue(dictionary, marker.0) };
+        Ok(OnDisk::Dictionary {
+            keys: unsafe { CFDictionaryGetCount(dictionary) },
+            marked: !value.is_null() && unsafe { CFEqual(value, nonce.0) } != 0,
+        })
+    }
+
+    fn synchronize(domain: CFStringRef) -> Result<(), String> {
+        let synchronized = unsafe {
+            CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        };
+        if synchronized == 0 {
+            return Err("DEV preferences cleanup did not synchronize".to_owned());
+        }
+        Ok(())
+    }
+
+    fn cf_string(value: &str) -> Result<Owned, String> {
+        let length = CFIndex::try_from(value.len())
+            .map_err(|error| format!("Invalid DEV preferences string: {error}"))?;
+        let string = unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                value.as_ptr(),
+                length,
+                kCFStringEncodingUTF8,
+                0,
+            )
+        };
+        if string.is_null() {
+            return Err("DEV preferences string is not a CoreFoundation string".to_owned());
+        }
+        Ok(Owned(string.cast()))
+    }
+
+    fn real_user_home() -> Result<PathBuf, String> {
+        let mut buffer: Vec<libc::c_char> = vec![0; 4096];
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found = std::ptr::null_mut();
+        loop {
+            let status = unsafe {
+                libc::getpwuid_r(
+                    libc::getuid(),
+                    entry.as_mut_ptr(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut found,
+                )
+            };
+            match status {
+                0 => break,
+                libc::ERANGE => buffer.resize(buffer.len() * 2, 0),
+                _ => {
+                    return Err(format!(
+                        "Cannot read the DEV preferences user: {}",
+                        std::io::Error::from_raw_os_error(status)
+                    ));
+                }
+            }
+        }
+        if found.is_null() {
+            return Err("DEV preferences user has no account entry".to_owned());
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr((*found).pw_dir) };
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())))
+    }
+
+    fn copy_key_list(domain: CFStringRef) -> Option<Owned> {
+        let keys = unsafe {
+            CFPreferencesCopyKeyList(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        };
+        if keys.is_null() {
+            None
+        } else {
+            Some(Owned(keys.cast()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod owned_session {
+    use std::collections::HashSet;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// Each pass reads an atomic process table snapshot, kills every live
+    /// member and awaits their exits. A member alive after a snapshot was in
+    /// it or descends from one that was, so a pass with no live member and no
+    /// process that died since the previous pass leaves the session empty.
+    /// Pid allocation skips live session ids, so membership is unambiguous.
+    /// A member's pid returns to use only after allocation wraps past every
+    /// other pid, which the sweep relies on not spanning. A member a debugger
+    /// traces reports its exit once that debugger reaps or releases it.
+    pub(super) fn kill_members(session: libc::pid_t) -> Result<(), String> {
+        let mut settled_dead = HashSet::new();
+        loop {
+            let exits = ExitEvents::new()?;
+            let mut pending = HashSet::new();
+            let mut dead = HashSet::new();
+            for pid in process_ids()? {
+                if pid == 0 {
+                    continue;
+                }
+                match session_of(pid)? {
+                    Some(member) if member == session => {
+                        if exits.watch(pid)? {
+                            kill(pid)?;
+                            pending.insert(pid);
+                        } else {
+                            dead.insert(pid);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        dead.insert(pid);
+                    }
+                }
+            }
+            let empty = pending.is_empty() && dead.is_subset(&settled_dead);
+            exits.await_all(pending)?;
+            if empty {
+                return Ok(());
+            }
+            settled_dead = dead;
+        }
+    }
+
+    fn process_ids() -> Result<Vec<libc::pid_t>, String> {
+        let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let mut capacity = usize::try_from(estimate)
+            .map_err(|_| failure("process list", io::Error::last_os_error()))?
+            .max(1);
+        loop {
+            let mut pids = vec![0 as libc::pid_t; capacity];
+            let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice()))
+                .map_err(|error| format!("DEV desktop session process list failed: {error}"))?;
+            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            let count = usize::try_from(count)
+                .map_err(|_| failure("process list", io::Error::last_os_error()))?;
+            if count < capacity {
+                pids.truncate(count);
+                return Ok(pids);
+            }
+            capacity = capacity.checked_mul(2).ok_or_else(|| {
+                "DEV desktop session process list exceeds addressable memory".to_owned()
+            })?;
+        }
+    }
+
+    /// `None` once the process is exiting or gone.
+    fn session_of(pid: libc::pid_t) -> Result<Option<libc::pid_t>, String> {
+        let session = unsafe { libc::getsid(pid) };
+        if session >= 0 {
+            return Ok(Some(session));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(failure("membership read", error))
+        }
+    }
+
+    fn kill(pid: libc::pid_t) -> Result<(), String> {
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(failure("kill", error))
+        }
+    }
+
+    fn failure(action: &str, error: io::Error) -> String {
+        format!("DEV desktop session {action} failed: {error}")
+    }
+
+    struct ExitEvents(OwnedFd);
+
+    impl ExitEvents {
+        fn new() -> Result<Self, String> {
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Err(failure("exit watch", io::Error::last_os_error()));
+            }
+            Ok(Self(unsafe { OwnedFd::from_raw_fd(queue) }))
+        }
+
+        /// Attaching holds a process reference that exit drains before it
+        /// posts `NOTE_EXIT`, so a watch that attaches always sees the exit.
+        /// `false` when the process is already exiting.
+        fn watch(&self, pid: libc::pid_t) -> Result<bool, String> {
+            let change = libc::kevent {
+                ident: libc::uintptr_t::try_from(pid)
+                    .map_err(|error| format!("DEV desktop session pid is invalid: {error}"))?,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let status = unsafe {
+                libc::kevent(
+                    self.0.as_raw_fd(),
+                    &change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if status >= 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(failure("exit watch", error))
+            }
+        }
+
+        fn await_all(&self, mut pending: HashSet<libc::pid_t>) -> Result<(), String> {
+            while !pending.is_empty() {
+                let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+                let received = unsafe {
+                    libc::kevent(
+                        self.0.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if received < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(failure("exit wait", error));
+                }
+                if received == 0 {
+                    continue;
+                }
+                let event = unsafe { event.assume_init() };
+                if event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0 {
+                    let pid = libc::pid_t::try_from(event.ident)
+                        .map_err(|error| format!("DEV desktop session pid is invalid: {error}"))?;
+                    pending.remove(&pid);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn stop_record(mut record: DevInstanceRecord) -> Result<(), String> {
+    let mut errors = record.desktop.stop().await;
     if let Err(error) = record.frontend_child.kill().await {
         errors.push(format!("failed to stop dev frontend: {error}"));
     }
@@ -1503,6 +2141,11 @@ async fn stop_record(mut record: DevInstanceRecord) -> Result<(), String> {
     files.track_config(record.config_path.clone());
     if let Err(error) = files.cleanup() {
         errors.push(error);
+    }
+    let owned_native_state = record.owned_native_state;
+    match tokio::task::spawn_blocking(move || owned_native_state.remove()).await {
+        Ok(cleanup) => errors.extend(cleanup),
+        Err(error) => errors.push(format!("DEV native state cleanup did not join: {error}")),
     }
     if errors.is_empty() {
         Ok(())
@@ -1600,12 +2243,14 @@ async fn wait_for_instance_ready(
     listener: TcpListener,
     reporter: &StartupReporter,
 ) -> Result<(), DevStartFailure> {
+    let owned_native_state = &mut record.owned_native_state;
     let readiness = async {
+        let mut native_state = None;
         let mut host_addr = None;
         let mut ui_debug_addr = None;
         let mut ui_ready = false;
         while host_addr.is_none() || !ui_ready {
-            let (stream, remote) = listener
+            let (mut stream, remote) = listener
                 .accept()
                 .await
                 .map_err(|error| format!("DEV startup notification accept failed: {error}"))?;
@@ -1615,7 +2260,7 @@ async fn wait_for_instance_ready(
                     .into());
             }
             let mut body = Vec::new();
-            stream
+            (&mut stream)
                 .take(4097)
                 .read_to_end(&mut body)
                 .await
@@ -1637,7 +2282,56 @@ async fn wait_for_instance_ready(
                     .to_owned()
                     .into());
             }
+            let announcing_directories = matches!(
+                notification.signal,
+                DevInstanceStartupSignal::ApplicationDirectories { .. }
+            );
+            if owned_native_state.directories.is_empty() && !announcing_directories {
+                return Err(
+                    "DEV child announced startup before its application directories"
+                        .to_owned()
+                        .into(),
+                );
+            }
+            if DEV_NATIVE_STATE_ATTESTED
+                && native_state.is_none()
+                && !announcing_directories
+                && !matches!(
+                    notification.signal,
+                    DevInstanceStartupSignal::NativeState { .. }
+                )
+            {
+                return Err(
+                    "DEV child announced startup before attesting native-state isolation"
+                        .to_owned()
+                        .into(),
+                );
+            }
             match notification.signal {
+                DevInstanceStartupSignal::ApplicationDirectories { directories } => {
+                    if !owned_native_state.directories.is_empty() {
+                        return Err("Duplicate DEV application directories announcement"
+                            .to_owned()
+                            .into());
+                    }
+                    verify_dev_application_directories(&reporter.instance_id, &directories)?;
+                    owned_native_state.directories = directories;
+                    stream
+                        .write_all(&DEV_APPLICATION_DIRECTORIES_OWNED)
+                        .await
+                        .map_err(|error| {
+                            format!("DEV application directories acknowledgement failed: {error}")
+                        })?;
+                }
+                DevInstanceStartupSignal::NativeState { attestation } => {
+                    if !DEV_NATIVE_STATE_ATTESTED || native_state.is_some() {
+                        return Err("Unexpected or duplicate DEV native-state attestation"
+                            .to_owned()
+                            .into());
+                    }
+                    attestation.verify_isolated(&reporter.instance_id)?;
+                    native_state = Some(attestation);
+                }
                 DevInstanceStartupSignal::HostListening { address } => {
                     if host_addr.is_some()
                         || !address.ip().is_loopback()
@@ -1696,23 +2390,28 @@ async fn wait_for_instance_ready(
                 }
             }
         }
+        if DEV_NATIVE_STATE_ATTESTED && native_state.is_none() {
+            return Err("DEV native state was not attested".to_owned().into());
+        }
         Ok::<_, DevStartFailure>((
+            native_state,
             host_addr.ok_or_else(|| "DEV host endpoint was not announced".to_owned())?,
             ui_debug_addr.ok_or_else(|| "DEV UI endpoint was not announced".to_owned())?,
         ))
     };
-    let (host_addr, ui_debug_addr) = tokio::select! {
+    let (native_state, host_addr, ui_debug_addr) = tokio::select! {
         biased;
         status = record.frontend_child.wait() => match status {
             Ok(status) => Err(DevStartFailure::new(DevInstanceFailureKind::ChildExit, format!("dev frontend exited before desktop ready: {status}"))),
             Err(error) => Err(format!("failed to wait for dev frontend: {error}").into()),
         },
-        status = record.child.wait() => match status {
+        status = record.desktop.wait() => match status {
             Ok(status) => Err(DevStartFailure::new(DevInstanceFailureKind::ChildExit, format!("dev instance exited before ready: {status}"))),
             Err(error) => Err(format!("failed to wait for dev desktop: {error}").into()),
         },
         result = readiness => result,
     }?;
+    record.native_state = native_state;
     record.host_addr = host_addr;
     record.ui_debug_addr = ui_debug_addr;
     Ok(())
@@ -1729,21 +2428,21 @@ fn dev_instance_summary(
     }
     let ready = record.map(|record| {
         if matches!(attempt.status, DevInstanceStatus::Ready) {
-            for child in [&mut record.child, &mut record.frontend_child] {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        attempt.status = DevInstanceStatus::Exited {
-                            exit_status: status.to_string(),
-                        };
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        attempt.status = DevInstanceStatus::StatusError {
-                            error: error.to_string(),
-                        };
-                        break;
-                    }
+            let status = match record.desktop.try_wait() {
+                Ok(None) => record.frontend_child.try_wait(),
+                observed => observed,
+            };
+            match status {
+                Ok(Some(status)) => {
+                    attempt.status = DevInstanceStatus::Exited {
+                        exit_status: status.to_string(),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    attempt.status = DevInstanceStatus::StatusError {
+                        error: error.to_string(),
+                    };
                 }
             }
         }
@@ -1752,6 +2451,8 @@ fn dev_instance_summary(
             session_store_path: record.store_dir.join("sessions.json").display().to_string(),
             stores_ephemeral: true,
             hermes_environment: record.hermes_environment.clone(),
+            native_state: record.native_state.clone(),
+            application_directories: record.owned_native_state.directories.clone(),
             frontend_url: record.frontend_url.clone(),
             host_addr: record.host_addr.to_string(),
             ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -1859,7 +2560,7 @@ fn dev_instance_store_dir(instance_id: &str) -> PathBuf {
 fn write_dev_config(
     repo_root: &Path,
     frontend_port: u16,
-    instance_id: &str,
+    instance_id: &DevInstanceId,
 ) -> Result<PathBuf, String> {
     let source_path = repo_root.join("frontend/tauri-shell/tauri.conf.json");
     let contents = std::fs::read_to_string(&source_path)
@@ -1868,8 +2569,29 @@ fn write_dev_config(
         .map_err(|err| format!("failed to parse {}: {err}", source_path.display()))?;
     json["build"]["beforeDevCommand"] = Value::Null;
     json["build"]["devUrl"] = Value::String(format!("http://127.0.0.1:{frontend_port}"));
+    json["identifier"] = Value::String(dev_instance_application_identifier(instance_id));
+    match json.get_mut("app").and_then(|app| app.get_mut("windows")) {
+        None => {}
+        Some(Value::Array(windows)) => {
+            for window in windows {
+                let Value::Object(window) = window else {
+                    return Err(format!(
+                        "{} declares a non-object window",
+                        source_path.display()
+                    ));
+                };
+                window.insert("incognito".to_owned(), Value::Bool(true));
+            }
+        }
+        Some(_) => {
+            return Err(format!(
+                "{} declares non-array app.windows",
+                source_path.display()
+            ));
+        }
+    }
 
-    let output_path = dev_instance_config_path(instance_id);
+    let output_path = dev_instance_config_path(&instance_id.0);
     std::fs::write(
         &output_path,
         serde_json::to_vec_pretty(&json)

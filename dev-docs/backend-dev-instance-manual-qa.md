@@ -40,13 +40,40 @@ canonical `frontendUrl`; do not export the private HTTP identity header. Keep
 cold compilation/setup and warm launch durations separate from UI-action
 measurements. A build or readiness failure leaves UI actions unmeasured.
 
-The `notifications_v2` desktop startup contract requires the host and UI-debug
-owners to bind port-zero loopback listeners and announce their actual bound
-addresses. The launcher never picks and releases a port for a child to rebind.
-A host announcement must pass the normal protocol handshake; UI listening must
-precede UI-ready and a typed Ping/Pong. Duplicate, non-loopback, zero-port or
-shared host/UI endpoints fail explicitly. Launcher and source must declare the
-same contract; old notifications are rejected rather than used as a fallback.
+The launcher's generated config gives each instance its own Tauri identifier
+(`com.tyde.dev.i<instance>`) and incognito windows. The `notifications_v3`
+desktop startup contract first requires the child to announce, before it creates
+any window, the application directories Tauri keys by that identifier outside
+the store (it creates the local data directory even for incognito webviews).
+On macOS they include the bundle-keyed directory under the per-user Darwin
+cache directory, which system frameworks create regardless of HOME.
+Each must be absolute and end in the owned identifier. The launcher records them
+as `applicationDirectories` and acknowledges before the child may continue.
+Stopping the instance or any later startup failure removes them; on macOS stop
+and every startup failure after launch also clear the owned preference domain
+and delete its file, which cfprefsd keeps in the real user's home. cfprefsd
+writes that file after `CFPreferencesSynchronize` returns, so the launcher
+waits on file events for its write of a fresh marker and then of the emptied
+domain before deleting the file; a later write would recreate it.
+Any removal error fails the stop. On macOS and Linux hosts the native-state
+attestation must come next; other hosts have no native store observer, send none
+and report `nativeState: null`, so they cannot pass preflight item 8. On macOS
+the dev build embeds that identifier as the executable's CFBundleIdentifier;
+plain dev and production builds are unchanged. Before its first native
+preference write, the child reads its actual main-bundle identity and proves its
+current-application preference domain with a nonce written only to the owned
+domain. After creating its webviews and before its host and UI signals, it reads
+each webview's actual data store. It refuses to start unless the compiled
+identifier, bundle identity and preference domain are instance-owned (both
+absent off macOS) and every webview is non-persistent. The launcher rejects any
+other, missing or late attestation and returns it as `nativeState`. The contract
+then requires the host and UI-debug owners to bind port-zero loopback listeners
+and announce their actual bound addresses. The launcher never picks and releases
+a port for a child to rebind. A host announcement must pass the normal protocol
+handshake; UI listening must precede UI-ready and a typed Ping/Pong. Duplicate,
+non-loopback, zero-port or shared host/UI endpoints fail explicitly. Launcher
+and source must declare the same contract; old notifications are rejected rather
+than used as a fallback.
 
 ## Certification contract
 
@@ -712,13 +739,14 @@ a test-harness correction, not a new product behavior or a current UI pass.
    frontend stores, not merely a disposable filesystem workspace.
    `tyde_dev_instance_start` redirects every mutable store, including
    `TYDE_SESSION_STORE_PATH`, into an instance-specific temporary directory;
-   `tyde_dev_instance_stop` removes that directory. Require
-   `storesEphemeral: true` in the start result, record `storeDir` and
-   `sessionStorePath`, and confirm they contain no production records. Abort
-   before creating an agent if this attestation is missing or either path
-   points at the operator's normal stores. Running on the operator's normal
-   host, polluting its session history, or silently reusing any normal store is
-   an immediate setup `FAIL` and cannot certify a backend.
+   `tyde_dev_instance_stop` removes that directory. Require `storesEphemeral:
+   true` and every `nativeState.webviews[].dataStore: "non_persistent"` in the
+   start result, record `storeDir`, `sessionStorePath`,
+   `nativeState.identity` and `applicationDirectories`, and confirm they
+   contain no production records. Abort before creating an agent if this attestation is missing or
+   either path points at the operator's normal stores. Running on the
+   operator's normal host, polluting its session history, or silently reusing
+   any normal store is an immediate setup `FAIL` and cannot certify a backend.
    For Hermes, Tyde-store isolation alone is insufficient. Pass the typed
    `hermes` option with a loopback stub and additionally require
    `hermesEnvironment.homeEphemeral: true`,
@@ -1504,8 +1532,9 @@ backend recertification.
 
 Finally, call `tyde_dev_instance_stop` with the saved `instance_id`. Confirm it
 no longer appears in `tyde_dev_instance_list` and no backend child process from
-the run remains alive. Confirm the returned `storeDir` no longer exists; a
-surviving session store is cleanup `FAIL`.
+the run remains alive. Confirm the returned `storeDir` and every
+`applicationDirectories` entry no longer exist; a surviving session store or
+native directory is cleanup `FAIL`.
 
 ## Pass criteria
 

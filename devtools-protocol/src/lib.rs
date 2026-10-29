@@ -251,7 +251,7 @@ pub const DEV_INSTANCE_STARTUP_CONTRACT_PATH: &str = "devtools-protocol/dev-inst
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevInstanceStartupProtocol {
-    NotificationsV2,
+    NotificationsV3,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,15 +275,151 @@ pub struct DevFrontendAttestation {
 }
 
 pub const DEV_INSTANCE_STARTUP_CONTRACT: DevInstanceStartupContract = DevInstanceStartupContract {
-    protocol: DevInstanceStartupProtocol::NotificationsV2,
+    protocol: DevInstanceStartupProtocol::NotificationsV3,
     frontend: DevFrontendProtocol::OwnedBuildServeV1,
 };
+
+pub fn dev_instance_application_identifier(instance_id: &DevInstanceId) -> String {
+    format!("com.tyde.dev.i{}", instance_id.0)
+}
+
+/// Runs before the launcher takes responsibility for removing announced
+/// directories, so it only ever removes instance-keyed paths.
+pub fn verify_dev_application_directories(
+    instance_id: &DevInstanceId,
+    directories: &[PathBuf],
+) -> Result<(), String> {
+    if directories.is_empty() {
+        return Err("DEV child announced no application directory".to_owned());
+    }
+    let owned = dev_instance_application_identifier(instance_id);
+    for directory in directories {
+        let normal = directory.is_absolute()
+            && directory.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
+                )
+            });
+        if !normal || directory.file_name().and_then(|name| name.to_str()) != Some(owned.as_str()) {
+            return Err("DEV child application directory is not keyed by this instance".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Hosts whose DEV child observes and attests its native state right after
+/// announcing its application directories. Elsewhere startup carries no
+/// attestation and the ready result reports none.
+pub const DEV_NATIVE_STATE_ATTESTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevWebviewDataStore {
+    NonPersistent,
+    Persistent,
+}
+
+/// Native identity a DEV child observes before its first native preference or
+/// WebKit access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DevNativeIdentity {
+    /// Identifier of the loaded Tauri config; keys the application config,
+    /// data, cache and log directories.
+    pub application_identifier: String,
+    /// Main-bundle identifier CoreFoundation resolved; keys macOS default
+    /// WebKit, cache and saved-state storage. Absent off macOS.
+    pub bundle_identifier: Option<String>,
+    /// Domain a round-trip probe proved CoreFoundation resolves for
+    /// current-application preferences. Absent off macOS.
+    pub preferences_domain: Option<String>,
+}
+
+impl DevNativeIdentity {
+    pub fn verify_owned(&self, instance_id: &DevInstanceId) -> Result<(), String> {
+        let owned = dev_instance_application_identifier(instance_id);
+        if self.application_identifier != owned {
+            return Err(format!(
+                "DEV child application identity {} is not owned by this instance",
+                self.application_identifier
+            ));
+        }
+        let expected = cfg!(target_os = "macos").then_some(owned.as_str());
+        if self.bundle_identifier.as_deref() != expected {
+            return Err(match &self.bundle_identifier {
+                Some(bundle) => {
+                    format!("DEV child bundle identity {bundle} is not owned by this instance")
+                }
+                None => "DEV child has no instance-owned bundle identity".to_owned(),
+            });
+        }
+        if self.preferences_domain.as_deref() != expected {
+            return Err(match &self.preferences_domain {
+                Some(domain) => {
+                    format!("DEV child preferences domain {domain} is not owned by this instance")
+                }
+                None => "DEV child preferences do not resolve to an owned domain".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DevWebviewNativeState {
+    pub label: String,
+    /// Data store the created native webview actually uses.
+    pub data_store: DevWebviewDataStore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DevNativeStateAttestation {
+    pub identity: DevNativeIdentity,
+    pub webviews: Vec<DevWebviewNativeState>,
+}
+
+impl DevNativeStateAttestation {
+    pub fn verify_isolated(&self, instance_id: &DevInstanceId) -> Result<(), String> {
+        self.identity.verify_owned(instance_id)?;
+        if self.webviews.is_empty() {
+            return Err("DEV child attested no native webview".to_owned());
+        }
+        if let Some(webview) = self
+            .webviews
+            .iter()
+            .find(|webview| webview.data_store != DevWebviewDataStore::NonPersistent)
+        {
+            return Err(format!(
+                "DEV child webview {} uses persistent WebKit storage",
+                webview.label
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DevInstanceStartupSignal {
-    HostListening { address: std::net::SocketAddr },
-    UiListening { address: std::net::SocketAddr },
+    /// Directories the child's path resolver keys by its owned identifier,
+    /// outside the instance store, announced before any window creates them.
+    ApplicationDirectories {
+        directories: Vec<PathBuf>,
+    },
+    NativeState {
+        attestation: DevNativeStateAttestation,
+    },
+    HostListening {
+        address: std::net::SocketAddr,
+    },
+    UiListening {
+        address: std::net::SocketAddr,
+    },
     UiReady,
 }
 
@@ -295,36 +431,80 @@ pub struct DevInstanceStartupNotification {
     pub signal: DevInstanceStartupSignal,
 }
 
+/// The launcher's reply once it owns announced application directories.
+pub const DEV_APPLICATION_DIRECTORIES_OWNED: [u8; 5] = *b"owned";
+
+/// The launcher that owns this DEV child's startup.
+#[cfg(feature = "launcher")]
+pub struct DevInstanceStartupOwner {
+    address: std::net::SocketAddr,
+    instance_id: DevInstanceId,
+}
+
+#[cfg(feature = "launcher")]
+impl DevInstanceStartupOwner {
+    /// None outside a DEV instance; partial ownership is an error.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let address = std::env::var(DEV_INSTANCE_STARTUP_ADDR_ENV);
+        let instance_id = std::env::var(DEV_INSTANCE_ID_ENV);
+        let (address, instance_id) = match (address, instance_id) {
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+                return Ok(None);
+            }
+            (Ok(address), Ok(instance_id)) => (address, DevInstanceId(instance_id)),
+            _ => return Err("Incomplete DEV startup notification ownership".to_owned()),
+        };
+        let address: std::net::SocketAddr = address
+            .parse()
+            .map_err(|error| format!("Invalid DEV startup notification endpoint: {error}"))?;
+        if !address.ip().is_loopback() {
+            return Err("DEV startup notifications require a loopback endpoint".to_owned());
+        }
+        Ok(Some(Self {
+            address,
+            instance_id,
+        }))
+    }
+
+    pub fn notify(&self, signal: DevInstanceStartupSignal) -> Result<(), String> {
+        use std::io::{Read, Write};
+        let transfers_ownership = matches!(
+            signal,
+            DevInstanceStartupSignal::ApplicationDirectories { .. }
+        );
+        let body = serde_json::to_vec(&DevInstanceStartupNotification {
+            protocol: DEV_INSTANCE_STARTUP_CONTRACT.protocol,
+            instance_id: self.instance_id.clone(),
+            signal,
+        })
+        .map_err(|error| format!("Cannot serialize DEV startup notification: {error}"))?;
+        let mut stream = std::net::TcpStream::connect(self.address)
+            .map_err(|error| format!("Cannot connect to DEV startup owner: {error}"))?;
+        stream
+            .write_all(&body)
+            .map_err(|error| format!("Cannot notify DEV startup owner: {error}"))?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| format!("Cannot finish DEV startup notification: {error}"))?;
+        if transfers_ownership {
+            let mut reply = [0; DEV_APPLICATION_DIRECTORIES_OWNED.len()];
+            stream.read_exact(&mut reply).map_err(|error| {
+                format!("DEV startup owner did not take application directories: {error}")
+            })?;
+            if reply != DEV_APPLICATION_DIRECTORIES_OWNED {
+                return Err("DEV startup owner did not take application directories".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "launcher")]
 pub fn notify_dev_instance_startup(signal: DevInstanceStartupSignal) -> Result<(), String> {
-    use std::io::Write;
-    let address = std::env::var(DEV_INSTANCE_STARTUP_ADDR_ENV);
-    let instance_id = std::env::var(DEV_INSTANCE_ID_ENV);
-    let (address, instance_id) = match (address, instance_id) {
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => return Ok(()),
-        (Ok(address), Ok(instance_id)) => (address, DevInstanceId(instance_id)),
-        _ => return Err("Incomplete DEV startup notification ownership".to_owned()),
-    };
-    let address: std::net::SocketAddr = address
-        .parse()
-        .map_err(|error| format!("Invalid DEV startup notification endpoint: {error}"))?;
-    if !address.ip().is_loopback() {
-        return Err("DEV startup notifications require a loopback endpoint".to_owned());
+    match DevInstanceStartupOwner::from_env()? {
+        Some(owner) => owner.notify(signal),
+        None => Ok(()),
     }
-    let body = serde_json::to_vec(&DevInstanceStartupNotification {
-        protocol: DEV_INSTANCE_STARTUP_CONTRACT.protocol,
-        instance_id,
-        signal,
-    })
-    .map_err(|error| format!("Cannot serialize DEV startup notification: {error}"))?;
-    let mut stream = std::net::TcpStream::connect(address)
-        .map_err(|error| format!("Cannot connect to DEV startup owner: {error}"))?;
-    stream
-        .write_all(&body)
-        .map_err(|error| format!("Cannot notify DEV startup owner: {error}"))?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|error| format!("Cannot finish DEV startup notification: {error}"))
 }
 
 /// The parent's Claude CLI credential store, for a dev instance whose

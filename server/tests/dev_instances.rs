@@ -31,14 +31,27 @@ const FAKE_CARGO_TAURI: &str = r#"#!/bin/sh
 /usr/bin/python3 - "$@" <<'PYCONFIG' || exit 89
 import json,pathlib,sys,os,socket
 path=sys.argv[sys.argv.index('--config')+1]
-assert json.load(open(path))['build']['beforeDevCommand'] is None
+config=json.load(open(path))
+assert config['build']['beforeDevCommand'] is None
 marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
 marker.touch()
 marker.with_suffix('.namespace').write_text(json.dumps({'logical_cwd':os.getcwd()==json.loads(marker.with_suffix('.logical').read_text()),'private_namespace':os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'] if pathlib.Path('/proc/self/ns/mnt').exists() else False}))
+mode_path=marker.with_suffix('.mode')
+def notify(signal,owned=False):
+ address,port=os.environ['TYDE_DEV_INSTANCE_STARTUP_ADDR'].rsplit(':',1)
+ with socket.create_connection((address,int(port))) as stream:
+  stream.sendall(json.dumps({'protocol':json.load(open(pathlib.Path.cwd()/'devtools-protocol/dev-instance-startup.json'))['protocol'],'instance_id':os.environ['TYDE_DEV_INSTANCE_ID'],'signal':signal}).encode())
+  stream.shutdown(socket.SHUT_WR)
+  if owned:
+   assert stream.recv(5,socket.MSG_WAITALL)==b'owned'
+if mode_path.exists():
+ application=marker.with_name(config['identifier'])
+ notify({'kind':'application_directories','directories':[str(application)]},owned=True)
+ (application/'webview').mkdir(parents=True)
+ (application/'webview'/'state').write_text('owned')
 if marker.with_suffix('.hold').exists():
  control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
  control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL']);control.sendall(b'D')
- mode_path=marker.with_suffix('.mode')
  if mode_path.exists():
   host_port=int(os.environ['TYDE_DEV_HOST_BIND_ADDR'].rsplit(':',1)[1])
   ui_port=int(os.environ['TYDE_DEV_UI_DEBUG_BIND_ADDR'].rsplit(':',1)[1])
@@ -47,11 +60,8 @@ if marker.with_suffix('.hold').exists():
   ui_port=int.from_bytes(control.recv(2,socket.MSG_WAITALL),'big')
  assert control.recv(1)==b'R'
  if mode_path.exists():
-  def notify(signal):
-   address,port=os.environ['TYDE_DEV_INSTANCE_STARTUP_ADDR'].rsplit(':',1)
-   with socket.create_connection((address,int(port))) as stream:
-    stream.sendall(json.dumps({'protocol':json.load(open(pathlib.Path.cwd()/'devtools-protocol/dev-instance-startup.json'))['protocol'],'instance_id':os.environ['TYDE_DEV_INSTANCE_ID'],'signal':signal}).encode())
-    stream.shutdown(socket.SHUT_WR)
+  bundle=config['identifier'] if sys.platform=='darwin' else None
+  notify({'kind':'native_state','attestation':{'identity':{'applicationIdentifier':config['identifier'],'bundleIdentifier':bundle,'preferencesDomain':bundle},'webviews':[{'label':window['label'],'dataStore':'non_persistent' if window.get('incognito') else 'persistent'} for window in config['app']['windows']]}})
   notify({'kind':'host_listening','address':f'127.0.0.1:{host_port}'})
   if mode_path.read_text()=='ready':
    notify({'kind':'ui_listening','address':f'127.0.0.1:{ui_port}'})
@@ -171,6 +181,8 @@ fn dev_instance_claude_writes_stay_out_of_parent_claude_home() {
         std::env::remove_var("CLAUDE_SECURESTORAGE_CONFIG_DIR");
     }
     server::process_env::initialize_process_env().expect("resolve login PATH");
+    std::fs::write(desktop_marker.with_extension("mode"), "exit")
+        .expect("exit after creating announced native directories");
 
     let error = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -971,10 +983,33 @@ async fn start_dev_instance_expecting_exit(
         terminal["instanceId"].as_str() == Some(instance_id.as_str()),
         "terminal result must belong to the original attempt"
     );
+    let owned = devtools_protocol::dev_instance_application_identifier(
+        &devtools_protocol::DevInstanceId(instance_id.clone()),
+    );
+    let application_directory = desktop_marker.with_file_name(&owned);
     let startup_error = if matches!(scenario, DevScenario::NativeReady) {
         assert_ne!(result.is_error, Some(true));
         assert_eq!(terminal["status"]["kind"], "ready");
         assert_eq!(terminal["storesEphemeral"], true);
+        let bundle = cfg!(target_os = "macos").then_some(owned.as_str());
+        assert_eq!(
+            terminal["nativeState"],
+            json!({
+                "identity": {
+                    "applicationIdentifier": owned,
+                    "bundleIdentifier": bundle,
+                    "preferencesDomain": bundle,
+                },
+                "webviews": [{"label": "main", "dataStore": "non_persistent"}],
+            }),
+            "ready must attest instance-owned identity and non-persistent WebKit storage"
+        );
+        assert_eq!(
+            terminal["applicationDirectories"],
+            json!([application_directory]),
+            "ready must report the announced instance-keyed native directories"
+        );
+        assert!(application_directory.join("webview/state").is_file());
         let store = terminal["storeDir"]
             .as_str()
             .expect("canonical ready store");
@@ -1042,6 +1077,10 @@ async fn start_dev_instance_expecting_exit(
             !Path::new(store).exists(),
             "explicit stop must join private resource cleanup"
         );
+        assert!(
+            !application_directory.exists(),
+            "explicit stop must remove the announced instance-keyed native directories"
+        );
         #[cfg(target_os = "linux")]
         assert!(
             !std::fs::read_to_string("/proc/net/tcp")
@@ -1062,6 +1101,15 @@ async fn start_dev_instance_expecting_exit(
             "actual startup failure must remain a tool error"
         );
         assert_eq!(terminal["status"]["kind"], "failed");
+        if matches!(
+            scenario,
+            DevScenario::NativeExit | DevScenario::NativeProtocolMismatch
+        ) {
+            assert!(
+                !application_directory.exists(),
+                "startup failure must remove its announced native directories"
+            );
+        }
         if matches!(scenario, DevScenario::NativeProtocolMismatch) {
             assert_eq!(terminal["status"]["phase"], "host_handshake");
             assert_eq!(

@@ -806,7 +806,7 @@ impl GroupCommand {
     }
 
     #[cfg(unix)]
-    pub(crate) fn new_session(&mut self) -> &mut Self {
+    pub fn new_session(&mut self) -> &mut Self {
         self.session = SessionMode::New;
         self
     }
