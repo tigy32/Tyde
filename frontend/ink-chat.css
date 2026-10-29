@@ -879,6 +879,28 @@
     cursor: pointer;
 }
 
+.chat-view[data-chat-appearance="ink"] .ink-session-toggle {
+    gap: 6px;
+    box-sizing: border-box;
+    height: 32px;
+    padding: 0 0 0 10px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    background: var(--surface-3);
+    font: 600 0.846rem/1 var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .ink-session-toggle > span[aria-hidden="true"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 24px;
+    width: 24px;
+    align-self: stretch;
+    font-size: 0.7rem;
+    line-height: 1;
+}
+
 .chat-view[data-chat-chrome="ink"] .session-settings-header .session-settings-toggle { display: none; }
 .chat-view[data-chat-chrome="ink"] .session-settings-header:not(:has(.session-task-usage)) { display: none; }
 

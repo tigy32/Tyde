@@ -11101,6 +11101,72 @@ mod wasm_tests {
             let controls = chat
                 .query_selector_all(".ink-session-toggle, .chat-send-split")
                 .unwrap();
+            if id == "ink" {
+                let session = chat
+                    .query_selector(".ink-session-toggle")
+                    .unwrap()
+                    .expect("Flow shows the backend selector");
+                let send = chat
+                    .query_selector(".chat-send-split")
+                    .unwrap()
+                    .expect("Flow shows the send split");
+                assert!(
+                    (session.get_bounding_client_rect().height()
+                        - send.get_bounding_client_rect().height())
+                    .abs()
+                        < 0.5,
+                    "Flow backend selector and send split share a height"
+                );
+                let session_style = window.get_computed_style(&session).unwrap().unwrap();
+                let primary = chat
+                    .query_selector(".chat-send-split-primary")
+                    .unwrap()
+                    .unwrap();
+                let primary_style = window.get_computed_style(&primary).unwrap().unwrap();
+                assert_eq!(
+                    session_style.get_property_value("border-radius").unwrap(),
+                    primary_style
+                        .get_property_value("border-top-left-radius")
+                        .unwrap()
+                );
+                assert_eq!(
+                    session_style.get_property_value("font-size").unwrap(),
+                    primary_style.get_property_value("font-size").unwrap()
+                );
+                let session_chevron = session
+                    .query_selector("[aria-hidden='true']")
+                    .unwrap()
+                    .unwrap();
+                let send_toggle = send
+                    .query_selector(".chat-send-split-toggle")
+                    .unwrap()
+                    .unwrap();
+                let send_chevron = send_toggle
+                    .query_selector("[aria-hidden='true']")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    window
+                        .get_computed_style(&session_chevron)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("font-size")
+                        .unwrap(),
+                    window
+                        .get_computed_style(&send_chevron)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("font-size")
+                        .unwrap()
+                );
+                assert!(
+                    (session_chevron.get_bounding_client_rect().width()
+                        - send_toggle.get_bounding_client_rect().width())
+                    .abs()
+                        < 1.0,
+                    "Flow chevrons share a hit width"
+                );
+            }
             for index in 0..controls.length() {
                 let control: web_sys::Element = controls.item(index).unwrap().dyn_into().unwrap();
                 let rect = control.get_bounding_client_rect();

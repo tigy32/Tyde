@@ -875,6 +875,57 @@ mod wasm_tests {
             .unwrap()
     }
 
+    /// The painted sRGB color of a computed color property, composited over
+    /// `under` when translucent.
+    fn opaque_color(
+        element: &web_sys::Element,
+        property: &str,
+        under: Option<[f64; 3]>,
+    ) -> [f64; 3] {
+        let value = computed(element, property);
+        let (body, scale) = match value.strip_prefix("color(srgb ") {
+            Some(body) => (body, 1.0),
+            None => (
+                value
+                    .strip_prefix("rgba(")
+                    .or_else(|| value.strip_prefix("rgb("))
+                    .unwrap_or_else(|| panic!("{property} is an sRGB color, got {value:?}")),
+                255.0,
+            ),
+        };
+        let parts: Vec<f64> = body
+            .trim_end_matches(')')
+            .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap())
+            .collect();
+        let alpha = parts.get(3).copied().unwrap_or(1.0);
+        let under = under.unwrap_or_else(|| {
+            assert_eq!(alpha, 1.0, "{property} is opaque, got {value:?}");
+            [0.0; 3]
+        });
+        std::array::from_fn(|i| {
+            let channel = parts[i] * 255.0 / scale * alpha + under[i] * (1.0 - alpha);
+            (channel * 1000.0).round() / 1000.0
+        })
+    }
+
+    fn contrast_ratio(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let luminance = |rgb: [f64; 3]| {
+            let [r, g, b] = rgb.map(|channel| {
+                let c = channel / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     /// Home is a compact launcher over the canonical host and project state:
     /// New Chat opens at the chosen destination with that host's configured
     /// default profile and Home role, a host change goes through the host
@@ -1292,6 +1343,50 @@ mod wasm_tests {
                     (start.left() - host.left()).abs() < 0.5
                         && (choose.right() - form_right).abs() < 0.5,
                     "New Chat spans the form"
+                );
+                assert_eq!(
+                    start.height(),
+                    choose.height(),
+                    "New Chat halves share a height"
+                );
+                assert_eq!(computed(&new_chat(), "border-top-left-radius"), "6px");
+                assert_eq!(computed(&new_chat(), "border-top-right-radius"), "0px");
+                assert_eq!(computed(&new_chat(), "border-bottom-right-radius"), "0px");
+                assert_eq!(computed(&chooser(), "border-top-left-radius"), "0px");
+                assert_eq!(computed(&chooser(), "border-bottom-left-radius"), "0px");
+                assert_eq!(computed(&chooser(), "border-top-right-radius"), "6px");
+                let join = choose.left() - start.right();
+                assert!(
+                    (-1.5..0.5).contains(&join),
+                    "New Chat is one shape with a flat separator, join {join}"
+                );
+                let fill = opaque_color(&chooser(), "background-color", None);
+                assert_eq!(
+                    fill,
+                    opaque_color(&new_chat(), "background-color", None),
+                    "New Chat halves share one fill"
+                );
+                for (half, side) in [
+                    (new_chat(), "top"),
+                    (new_chat(), "bottom"),
+                    (new_chat(), "left"),
+                    (chooser(), "top"),
+                    (chooser(), "bottom"),
+                    (chooser(), "right"),
+                ] {
+                    assert_eq!(
+                        opaque_color(&half, &format!("border-{side}-color"), Some(fill)),
+                        fill,
+                        "New Chat outer {side} edge is continuous with its fill"
+                    );
+                }
+                assert_eq!(px(&chooser(), "border-left-width"), 1.0);
+                let divider = opaque_color(&chooser(), "border-left-color", Some(fill));
+                let contrast = contrast_ratio(divider, fill);
+                assert!(
+                    contrast >= 1.4,
+                    "New Chat shows a visible separator before its chooser in the {theme} \
+                     theme, contrast {contrast:.2}"
                 );
                 assert!(
                     start.top() >= host.bottom().max(picker.bottom()),

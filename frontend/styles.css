@@ -1917,25 +1917,36 @@ details summary:focus:not(:focus-visible) {
 .home-new-chat {
     display: flex;
     width: 100%;
+    align-items: stretch;
 }
 
 .home-new-chat .action-btn {
     padding-top: var(--space-3);
     padding-bottom: var(--space-3);
+    border-radius: 0;
 }
 
-.home-new-chat-start {
+/* One outer silhouette: square inner corners and overlapping borders.
+   `.action-btn` otherwise paints a full radius on both halves and pinches the join. */
+.home-new-chat .home-new-chat-start {
     flex: 1;
     min-width: 0;
     border-radius: 6px 0 0 6px;
 }
 
-.home-new-chat-choose {
+.home-new-chat .home-new-chat-choose {
     flex: none;
+    margin-left: -1px;
     padding-left: var(--space-4);
     padding-right: var(--space-4);
-    border-left: 1px solid color-mix(in srgb, var(--text-on-accent) 25%, transparent);
     border-radius: 0 6px 6px 0;
+}
+
+/* The separator outranks `.action-btn.primary` and its hover, whose border-color
+   would otherwise paint the join in the fill color. */
+.home-new-chat .action-btn.primary.home-new-chat-choose,
+.home-new-chat .action-btn.primary.home-new-chat-choose:hover {
+    border-left-color: color-mix(in srgb, var(--text-on-accent) 35%, transparent);
 }
 
 .home-secondary-actions {
