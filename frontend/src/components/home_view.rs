@@ -1219,6 +1219,18 @@ mod wasm_tests {
         root.style()
             .set_property("--base-font-size", "20px")
             .unwrap();
+        project().click();
+        next_tick().await;
+        let search = element(&home(), "input[aria-label='Find a project']");
+        let family = computed(&search, "font-family");
+        assert!(
+            family.contains("monospace") && px(&search, "font-size") == 20.0,
+            "the project search follows the configured font, got {family:?} at {}px",
+            px(&search, "font-size")
+        );
+        key(&search, "Escape", false);
+        next_tick().await;
+        assert!(project_choices().is_empty());
         let mut title_colors = Vec::new();
         for theme in ["dark", "light"] {
             // The theme lives on the root beside the configured font, as the

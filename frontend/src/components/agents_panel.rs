@@ -10076,6 +10076,49 @@ mod wasm_tests {
         let heading = container.query_selector("header").unwrap().unwrap();
         assert_eq!(font(&destination), font(&heading));
         assert_eq!(font(&search), font(&heading));
+        let text_parts: Vec<web_sys::Element> = [".modal-title", ".agent-move-description"]
+            .into_iter()
+            .map(|selector| container.query_selector(selector).unwrap().unwrap())
+            .chain([search.clone().into(), destination.clone().into()])
+            .collect();
+        let sizes = || -> Vec<f64> {
+            text_parts
+                .iter()
+                .map(|element| {
+                    window
+                        .get_computed_style(element)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("font-size")
+                        .unwrap()
+                        .trim_end_matches("px")
+                        .parse()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let root: HtmlElement = window
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        root.style()
+            .set_property("--base-font-size", "13px")
+            .unwrap();
+        let default_sizes = sizes();
+        assert_eq!(default_sizes, vec![17.004, 13.0, 13.0, 13.0]);
+        root.style()
+            .set_property("--base-font-size", "20px")
+            .unwrap();
+        for (scaled, default) in sizes().into_iter().zip(default_sizes) {
+            assert!(
+                (scaled - default * 20.0 / 13.0).abs() < 0.05,
+                "move dialog text follows the Appearance font size: {default}px became {scaled}px"
+            );
+        }
+        root.style().remove_property("--base-font-size").unwrap();
         let dialog: HtmlElement = container
             .query_selector("[role='dialog']")
             .unwrap()

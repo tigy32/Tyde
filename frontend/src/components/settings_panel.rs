@@ -254,7 +254,7 @@ const FONT_FAMILIES: &[(&str, &str, &str)] = &[
     (
         "sf",
         "SF Pro",
-        "\"-apple-system\", \"SF Pro Text\", system-ui, sans-serif",
+        "-apple-system, \"SF Pro Text\", system-ui, sans-serif",
     ),
 ];
 

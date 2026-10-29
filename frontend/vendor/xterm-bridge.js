@@ -63,8 +63,12 @@
             return attach(id, container);
         }
 
+        const fontFamily = getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim();
+        if (!fontFamily) {
+            throw new Error("--font-mono is not defined on the document root");
+        }
         const term = new window.Terminal({
-            fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+            fontFamily,
             fontSize: 13,
             lineHeight: 1.2,
             cursorBlink: true,
