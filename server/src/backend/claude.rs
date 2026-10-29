@@ -40,8 +40,9 @@ use crate::backend::turn_emitter::{
     TurnEmitter,
 };
 use crate::backend::{
-    AgentIdentity, CancelBackgroundTaskOutcome, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand,
-    StartupMcpServer, StartupMcpTransport, normalize_mcp_call_tool_result,
+    AgentIdentity, BackendDiscoveryError, CancelBackgroundTaskOutcome,
+    READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer, StartupMcpTransport,
+    normalize_mcp_call_tool_result,
 };
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
@@ -4252,6 +4253,10 @@ impl ClaudeInner {
     }
 
     async fn ensure_process_ready(self: &Arc<Self>) -> Result<(), String> {
+        self.prepare_process().await.map_err(String::from)
+    }
+
+    async fn prepare_process(self: &Arc<Self>) -> Result<(), BackendDiscoveryError> {
         let reserved = self
             .state
             .with_after(ClaudeHold::CallerTurnJobs, |state, inner| {
@@ -4371,7 +4376,7 @@ impl ClaudeInner {
             Err(error) => {
                 drop(reservation);
                 self.fail_resume_bootstrap(process_generation, &error).await;
-                return Err(error);
+                return Err(error.into());
             }
         };
         let admission = self
@@ -4400,7 +4405,7 @@ impl ClaudeInner {
                     "Claude late process installation rejected"
                 );
                 runtime.kill().await;
-                return Err("Claude backend is shutting down".to_owned());
+                return Err("Claude backend is shutting down".to_owned().into());
             }
         }
         match tokio::time::timeout(
@@ -4429,11 +4434,13 @@ impl ClaudeInner {
                     }
                     Ok(_) => {
                         self.shutdown_process().await;
-                        return Err("Claude reported no selectable models".to_owned());
+                        return Err(BackendDiscoveryError::no_models(
+                            "Claude reported no selectable models".to_owned(),
+                        ));
                     }
                     Err(error) => {
                         self.shutdown_process().await;
-                        return Err(error);
+                        return Err(error.into());
                     }
                 }
                 self.configure_capacity_from_initialize(&response).await;
@@ -4450,16 +4457,18 @@ impl ClaudeInner {
                 };
                 if let Err(error) = mcp_ready {
                     self.shutdown_process().await;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
             Ok(Err(err)) => {
                 self.shutdown_process().await;
-                return Err(err);
+                return Err(err.into());
             }
             Err(_) => {
                 self.shutdown_process().await;
-                return Err("Timed out initializing Claude CLI control protocol".to_string());
+                return Err("Timed out initializing Claude CLI control protocol"
+                    .to_string()
+                    .into());
             }
         }
 
@@ -17165,7 +17174,7 @@ impl Backend for ClaudeBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, BackendDiscoveryError> {
         let (session, events) = ClaudeSession::spawn_ephemeral(
             &context.workspace_roots,
             None,
@@ -17183,13 +17192,15 @@ impl Backend for ClaudeBackend {
             .state
             .with(move |state| state.program = program)
             .await;
-        let result = match session.inner.ensure_process_ready().await {
+        let result = match session.inner.prepare_process().await {
             Ok(()) => session
                 .inner
                 .state
                 .with(|state| state.native_models.clone())
                 .await
-                .ok_or_else(|| "Claude model catalog unavailable".to_owned())
+                .ok_or_else(|| {
+                    BackendDiscoveryError::from("Claude model catalog unavailable".to_owned())
+                })
                 .map(|models| crate::backend::BackendDiscovery {
                     schema: claude_session_schema(&models),
                     launch_profiles: Vec::new(),

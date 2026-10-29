@@ -281,7 +281,7 @@ impl crate::backend::Backend for OpencodeBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, crate::backend::BackendDiscoveryError> {
         let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
         if let Some(program) = &context.program {
             spec.command.clone_from(program);
@@ -294,7 +294,7 @@ impl crate::backend::Backend for OpencodeBackend {
         .await?;
         schema.backend_kind = BackendKind::Opencode;
         if !schema.fields.iter().any(|field| field.key == "model") {
-            return Err("OpenCode reported no selectable models".to_owned());
+            return Err("OpenCode reported no selectable models".to_owned().into());
         }
         tracing::info!("Discovered OpenCode settings from its native ACP catalog");
         Ok(crate::backend::BackendDiscovery {

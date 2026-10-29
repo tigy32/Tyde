@@ -38,8 +38,8 @@ use crate::backend::{
     Backend, BackendCompactionAvailability, BackendCompactionCapability,
     BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
     BackendCompactionNotDispatchedReason, BackendCompactionRequest, BackendCompactionStart,
-    BackendCompactionUnavailableReason, BackendEvent, BackendSession, BackendSpawnConfig,
-    BackendStartupError, EventStream, StartupMcpServer, StartupMcpTransport,
+    BackendCompactionUnavailableReason, BackendDiscoveryError, BackendEvent, BackendSession,
+    BackendSpawnConfig, BackendStartupError, EventStream, StartupMcpServer, StartupMcpTransport,
     backend_fork_unsupported_message, render_combined_spawn_instructions,
     resolve_settings as resolve_backend_settings,
 };
@@ -2797,14 +2797,16 @@ impl Backend for AntigravityBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, crate::backend::BackendDiscoveryError> {
         let program = context.program.as_deref().unwrap_or("agy");
         let (cwd, _) = resolve_workspace_roots(&context.workspace_roots)?;
         let options = antigravity_model_catalog(program, Path::new(&cwd)).await?;
         let default = antigravity_default_model(program, Some(Path::new(&cwd))).await?;
         if !options.iter().any(|option| option.value == default) {
             return Err(
-                "Antigravity's selected model is absent from its native catalog".to_owned(),
+                "Antigravity's selected model is absent from its native catalog"
+                    .to_owned()
+                    .into(),
             );
         }
         tracing::info!(
@@ -3370,23 +3372,39 @@ pub(crate) fn resolve_antigravity_conversations_dir(
     }
 }
 
-async fn antigravity_model_catalog(program: &str, cwd: &Path) -> Result<Vec<SelectOption>, String> {
+async fn antigravity_model_catalog(
+    program: &str,
+    cwd: &Path,
+) -> Result<Vec<SelectOption>, BackendDiscoveryError> {
     let mut command = crate::backend::subprocess::command(program)?;
     command
         .arg("models")
         .current_dir(cwd)
         .stdin(crate::backend::subprocess::ProcessStdio::Null)
         .stdout(crate::backend::subprocess::ProcessStdio::Piped)
-        .stderr(crate::backend::subprocess::ProcessStdio::Null);
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
     let output = tokio::time::timeout(ANTIGRAVITY_COMMAND_TIMEOUT, command.output())
         .await
         .map_err(|_| "Antigravity model catalog timed out".to_owned())?
         .map_err(|error| format!("Cannot read Antigravity model catalog: {error}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "Antigravity model catalog failed with {}",
-            output.status
-        ));
+        // `agy models` has no structured status mode. Match its complete native
+        // sign-in diagnostic, never a generic exit code or an error substring.
+        const SIGN_IN_REQUIRED: &str = concat!(
+            "Fetching available models...\n",
+            "Error: Please sign in to view available models. ",
+            "Launch the CLI without arguments to sign in.\n",
+        );
+        if output.status.code() == Some(1)
+            && output.stdout.is_empty()
+            && output.stderr == SIGN_IN_REQUIRED.as_bytes()
+        {
+            return Err(BackendDiscoveryError::authentication_required(
+                "Antigravity: Please sign in to view available models. Launch the CLI without arguments to sign in."
+                    .to_owned(),
+            ));
+        }
+        return Err(format!("Antigravity model catalog failed with {}", output.status).into());
     }
     let text = String::from_utf8(output.stdout)
         .map_err(|error| format!("Invalid Antigravity model catalog encoding: {error}"))?;
@@ -3401,7 +3419,11 @@ async fn antigravity_model_catalog(program: &str, cwd: &Path) -> Result<Vec<Sele
             || label.contains('\t')
             || !seen.insert(label.to_owned())
         {
-            return Err("Antigravity model catalog has an invalid or duplicate label".to_owned());
+            return Err(
+                "Antigravity model catalog has an invalid or duplicate label"
+                    .to_owned()
+                    .into(),
+            );
         }
         models.push(SelectOption {
             value: label.to_owned(),
@@ -3409,7 +3431,9 @@ async fn antigravity_model_catalog(program: &str, cwd: &Path) -> Result<Vec<Sele
         });
     }
     if models.is_empty() {
-        return Err("Antigravity reported no selectable models".to_owned());
+        return Err("Antigravity reported no selectable models"
+            .to_owned()
+            .into());
     }
     Ok(models)
 }

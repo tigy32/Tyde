@@ -19,8 +19,9 @@ use tokio::{
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
 use super::{
-    Backend, BackendDiscovery, BackendProbeContext, BackendSession, BackendSpawnConfig,
-    BackendStartupError, CancelBackgroundTaskOutcome, EventStream, SendOutcome, SteerOutcome,
+    Backend, BackendDiscovery, BackendDiscoveryError, BackendProbeContext, BackendSession,
+    BackendSpawnConfig, BackendStartupError, CancelBackgroundTaskOutcome, EventStream, SendOutcome,
+    SteerOutcome,
 };
 use actor::{Actor, Command};
 use transport::Connection;
@@ -350,7 +351,7 @@ impl Backend for MuseBackend {
 
     async fn discover_in_workspace(
         context: &BackendProbeContext,
-    ) -> Result<BackendDiscovery, String> {
+    ) -> Result<BackendDiscovery, BackendDiscoveryError> {
         let program = context.program.as_deref().unwrap_or("muse");
         let (connection, _notifications, _host) = connect(
             program,
@@ -366,10 +367,10 @@ impl Backend for MuseBackend {
         let models: Models = connection.typed("model/list", json!({})).await?;
         connection.shutdown();
         if models.models.is_empty() {
-            return Err(
+            return Err(BackendDiscoveryError::no_models(
                 "Muse returned no available models; run muse login or configure META_API_KEY"
                     .to_owned(),
-            );
+            ));
         }
         let default = models
             .models

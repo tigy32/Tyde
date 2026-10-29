@@ -668,6 +668,221 @@ backend event stream remains open after each rejection. The scenario is
 registered for every supported backend with identical setup and assertions.
 Real runs, including a baseline run without the fix, still require approval.
 
+## Fresh-home discovery regression
+
+Linux stall QA (c043) reported completed Claude and Codex probes left
+unpublished while signed-out Grok discovery did not settle; OpenCode and
+Muse were never probed. The old Grok adapter classified its advertised
+`grok.com` method as protocol authentication, causing discovery to send ACP
+`authenticate`. That behavior arrived with Grok support in `b8155071`
+(authored 2026-09-02, first released in `v0.9.1-beta.7`). Host discovery
+amplified it: every backend was probed in sequence under one async lock and
+published only after the last probe, predating Grok (`02ba62b5`, 2026-07-16,
+`v0.8.19-beta.31`).
+
+Grok's `grok.com` method is now external setup, as Kiro's login already is:
+discovery reports `Grok authentication required via 'grok.com'. Sign in to
+Grok from Getting started on desktop, then try again.` That sign-in runs
+`grok login` in a Tyde terminal and re-probes when it exits; a spawn
+deliberately does not re-probe an unavailable schema. Other Grok methods still
+use protocol authentication. Host discovery is single-flight per backend and
+publishes each backend's schema, config schema and launch profiles as soon as
+its own probe settles; the global discovery async lock is gone. Settings
+writes, native writes and settings actions register runs without waiting for
+their probes. A write that reconciles a paired, enabled Tychat still waits for
+Tychat's own backend schema. The pre-existing sign-in recheck lock also remains;
+neither residual is claimed fixed here.
+
+The launch-profile editor renders the selected host or saved profile's typed
+`SessionSchemaEntry` without discarding its state: `Pending` shows loading,
+`Ready` supplies controls, and `Unavailable` displays the server's diagnostic.
+A missing entry is not inferred to be loading. The existing new-profile and
+custom-ACP profile DOM flows cover live schema updates, including a pending or
+unavailable saved profile while the host-level catalog is already ready.
+
+The settings sim
+`stalled_provider_discovery_does_not_block_other_providers` parks Grok's probe
+and requires Codex to stay selectable and spawnable and a settings write to
+commit before Grok resolves to its own typed unavailable entry. An interrupted
+worker invalidates that provider's schemas and discovered launch profiles
+before releasing failed-run waiters. A spawn joined to that run fails rather
+than reading the superseded Ready schema. Ordinary returned-error retention
+policy is unchanged. The protocol flow
+`unwound_discovery_rejects_stale_ready_schema_and_can_refresh_again` starts
+from Ready, parks a refresh, joins a spawn, then actually unwinds the mock
+worker. It requires typed schema unavailability and a fatal BackendFailed
+startup bootstrap, then a new settings write must publish a fresh catalog.
+This is server coverage, not real-provider conformance.
+`real_signed_out_discovery_settles` retains its historical test name, but its
+fixture is an empty private local home and a cleared credential environment,
+not proof that every native provider is unauthenticated or that the ordinary
+host needs login. Native catalogs can still report selectable models. The
+fixture also clears `DISPLAY` and installs recorders in place
+of `$BROWSER`, `xdg-open`, `x-www-browser`, `sensible-browser`, `www-browser`
+and `gio`. It calls the production `Backend::discover` directly and requires a
+schema or a source-typed `AuthenticationRequired` / `NoModels` outcome with a nonempty
+message and zero browser launches. Setup and assertions are identical for every
+backend. It requests no model inference and needs
+`TYDE_TEST_PROCESS_EXECUTABLE` to name the check-built `tyde-server`.
+Discovery errors retain their actual kind and message in a private
+`discovery-error.json` before assertions run: the evidence directory is mode
+0700 and the error file is created exclusively with mode 0600. Public test
+output contains only the typed outcome or Ready, never provider error payloads.
+This preserves the failure's cause without changing the discovery oracle.
+
+There is no parallel CLI-version preflight. `BackendDiscoveryError` defaults
+every untyped error to `Failed`, including process-environment initialization,
+missing executables or companions, Hermes Python/module resolution, transport,
+protocol, compatibility and cleanup failures. Expected unavailability is tagged
+only at its native source: ACP-advertised external authentication, validated
+Claude, Codex, Hermes and Muse model catalogs with no available models, or
+Antigravity's complete native sign-in-required catalog diagnostic. Antigravity
+requires exit 1, empty stdout and an exact match of that entire stderr; other
+failures remain `Failed`, not authentication guesses. Codex's nonempty but
+unusable catalog is still `Failed`. Hermes's empty current provider means no
+selected provider, not a malformed catalog or `NoModels`; its current-model
+and all provider-row validations remain strict. No provider or default is
+inferred from that empty selection. The host and normal session-startup
+boundaries retain diagnostic strings except for Antigravity's now-explicit
+native setup instruction. Explicit sign-in, UI state, launch selection, provider
+requests and lifecycle behavior are unchanged.
+
+The isolated environment preserves explicit `HERMES_PYTHON` and
+`HERMES_EXECUTABLE` runtime selections, not credentials. The same case can thus
+reject a real primary CLI with missing or non-importable gateway Python through
+production resolution, without fake providers or another oracle.
+
+### Preserved evidence and limits (2026-10-29)
+
+Retained helper and child logs report fresh-home discovery passing for all
+eight providers on candidate `2f9489a9`. Claude 2.1.312, Codex 0.162.1 and
+OpenCode 1.18.30 returned schemas. Grok 1.0.41 and Kiro 2.21.2 reported their
+login instructions, Muse 1.4.10 reported no models before `muse login`, Hermes
+v0.21.1 reported its empty provider option, and Antigravity reported its failed
+model catalog. The helper PASS checks zero browser launches. The prior owner's
+source-at-run attribution is corroborated by preserved matching executable
+hashes and the clean candidate's gate fingerprint; per-invocation source and
+binary hashes were not recorded independently. The original isolated homes and
+browser logs were lost. These are retained qualified GREENs, not newly witnessed
+runs or fresh coverage of later unrelated changes.
+
+The original production Backend RED log was lost. A surviving replacement
+probe drove the real Grok ACP CLI directly: it recorded one browser launch and
+no authentication reply during a 120-second absence window. That is CLI-boundary
+evidence only, not production Backend conformance. It does not substantiate the
+former claim of a preserved 20-minute Backend run or a failed zero-launch
+assertion. Two historical sim logs retain 600-second hung-test timeouts for the
+serial-discovery control and an intermediate settings-write-waits draft; their
+source-at-run attribution comes from the prior owner, not immutable identities
+in those logs. Candidate `2f9489a9`'s original gate had 578 native passes and
+five namespace-denied failures; that was not a successful Native gate.
+
+New production Backend RED evidence uses immutable control `61a3354a`, tree
+`9fdc84ee25a79c2442f78766d8dbc9d96ec05cc5`, parent `2f9489a9`. Only
+`server/src/backend/acp/adapters/grok.rs` was restored from `44386c6e`; the new
+conformance case, isolation helper and host fix were unchanged. In its own
+entered Native project, the executor built this control with `./dev.sh check`:
+all 25 stages passed, including 583 native tests. That is control-build
+validation, not the final candidate's gate.
+
+One scoped `real_signed_out_discovery_settles::grok` run then called the actual
+production Backend with Grok 1.0.41 from a fresh signed-out home. It recorded one
+`browser` launch and remained pending until the unchanged individual
+600-second guard timed out the case. The outer helper never reached its
+zero-browser assertion; the launcher log independently records the violation.
+No model inference, retries, fake provider, direct ACP substitute or manual
+process termination was used. The selected conformance executable, linked
+server library, source inputs and fingerprints were unchanged before and after
+execution. The scoped invocation also compiled ancillary `tauri-shell`; its
+trigger was not established. This deviation is retained: the Backend runtime
+provenance qualifies, but strict build-only-through-`dev.sh check` compliance
+for the entire invocation is not claimed.
+
+The immutable control establishes the Grok fail-before behavior. The retained
+GREENs corroborate the earlier no-browser observations, but their permissive
+error oracle does not establish launch-prerequisite rejection. In particular,
+Hermes reported an empty provider field and Antigravity's catalog command
+exited unsuccessfully; both are `Failed` under the stricter oracle, not fresh
+conformance PASS evidence. Revised typed-outcome coverage is required on all
+eight providers; these historical receipts are not rewritten or discarded.
+Detailed custody is retained under
+`~/tyde-evidence/backend-settings-probe-isolation-nativebf-2f9489a9-recovery-20261029/`
+in `PHASED-PROOF-RECEIPT.json`, SHA256
+`e8f126abe0eda3c44eb50f17833b6a4ea5ac62f1b572bcf126044b90ef0fccb0`.
+Candidate `b8ed80f0` subsequently passed all 25 canonical stages, including 583
+native tests, in Native. Its default reviewer was cancelled by a host restart
+after reporting a supported prerequisite-oracle finding: any nonempty discovery
+error could previously pass even when no provider could launch. The prerequisite
+oracle correction rejects such errors instead of treating them as availability.
+The interrupted review and failed same-ID reattachment are not a completed
+review. Candidates `256e12a9` and `499b8824` then received completed configured
+default reviews in Native: review `fe1c8f72-bdf9-4313-974e-480557353a30`,
+executions `66c99429-eb66-4667-b0a6-f904b3c23ccd` and
+`e5293dfd-90b0-481e-8749-d14b0cc8d8c4`. Each reported one supported P2 and zero
+failed reviewers: checking Kiro's primary CLI missed its chat companion, and
+checking Hermes's version missed its Python gateway. No candidate gate or
+revised provider cases ran before either correction returned to the source
+owner. The version preflight is now removed, rather than extended one provider
+at a time. Only native-source typed unavailability can pass the shared case;
+all other actual discovery errors fail it. Final-candidate canonical
+validation, revised conformance and configured review remain separate from
+the preserved control proof and earlier gate results.
+
+Candidate `6279a03a` subsequently passed the canonical Native check: all 25
+stages, 583 native tests and the wasm suites. Its completed configured default
+review (`670c7f38-4d27-42fc-bd39-2f6e91de0791`, same review ID) reported one
+supported runtime P2 and zero failed reviewers: an unwound discovery worker
+could release a waiting spawn into stale Ready state. No revised provider
+cases ran before that correction returned to the source owner. That gate and
+its check-built artifacts remain prior-pin evidence, not validation of the
+worker-settlement correction or the stricter conformance matrix.
+
+Candidate `56a0d970` then passed all 25 canonical Native stages, all 584 native
+tests and the 864+1+323 wasm tests. Its completed configured default review
+(`679f10c6-dbc0-407c-95e4-92ad11cd7dfd`, same review ID) reported zero new
+findings and zero failed reviewers. The 20 scoped discovery invocations ran
+once: Claude, Codex, Grok, Kiro, Muse and OpenCode passed; all 12 prerequisite
+negatives correctly failed the strict oracle. Normal Antigravity and Hermes
+returned typed `Failed`, with zero browser launches across all 20 invocations.
+The worker-unwind and Kiro findings were resolved with executable proof;
+Hermes remains pending its required normal positive. The two error messages
+were not retained by that candidate, so that run did not establish their
+causes. The private error receipt added afterward is observability only, not an
+auth classification or passing provider result. These partial results do not
+establish readiness; prior proof is retained without repeating paid cases,
+the control RED or confirmed prerequisite negatives.
+
+Candidate `a6df834e` passed the source workbench's 25-stage canonical check,
+584 native tests and 864+1+323 wasm tests. NativeHome's canonical invocation
+legitimately reused that result; it did not execute those tests freshly. The
+completed `ed3a38e4` default review reported zero new findings and zero failed
+reviewers; its exact scope is retained with the formatter-only `a6df834e`
+qualification, not relabeled as a new review. Two NativeHome Backend invocations
+used hash-verified source-built artifacts directly, without rebuilding or
+copying them. Both still returned `Failed` with zero browser launches: AGY's
+catalog command exited 1, and Hermes rejected its empty current provider.
+These are strict-oracle RED results, not Native-built artifacts or successes.
+
+Subsequent bounded native cause probes captured AGY's explicit instruction to
+sign in before listing models. Its installed help advertises neither a separate
+read-only authentication-status command nor a JSON models mode. The adapter now
+recognizes only the complete observed sign-in diagnostic, not arbitrary catalog
+failures. This was an intentionally fresh-home, credential-cleared fixture;
+it is not evidence that the user's ordinary host needs login, and no login was
+requested or performed. Hermes's one actual no-session `model.options` response
+had an empty current provider, a nonempty current model, and two valid rows
+marked authenticated by the native gateway with nine selectable models.
+`config.yaml` was absent before and after. Installed source confirms that an
+unset current provider is serialized as an empty string. The adapter now
+accepts that absence without inventing a default, while validating every row;
+it does not classify this usable catalog as `NoModels`. Native authentication
+flags are not independent proof of paid access or credential provenance.
+These repairs require positive results from both real Backend cases, canonical
+validation and configured default review; the earlier failures are not relabeled
+as passing. The six earlier normal positives, twelve prerequisite negatives and
+immutable controls retain their original qualifications and are not repeated
+merely for this local repair.
+
 ## Workspace relocation
 
 Real runs on 2026-09-11 used the same filesystem and retained-history

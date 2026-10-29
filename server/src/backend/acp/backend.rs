@@ -32,8 +32,9 @@ use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
 use crate::backend::{
-    BackendStartupError, SessionCommand, StartupMcpServer, backend_fork_unsupported_message,
-    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
+    BackendDiscoveryError, BackendStartupError, SessionCommand, StartupMcpServer,
+    backend_fork_unsupported_message, normalize_mcp_call_tool_result,
+    render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
@@ -262,7 +263,7 @@ async fn authenticate_if_required(
     bridge: &AcpBridge,
     capabilities: &AcpCapabilities,
     adapter: &dyn AcpAgentAdapter,
-) -> Result<(), String> {
+) -> Result<(), BackendDiscoveryError> {
     if capabilities.auth_methods.is_empty() {
         return Ok(());
     }
@@ -294,9 +295,9 @@ async fn authenticate_if_required(
     }
 
     if let [(method_id, instruction)] = external_requirements.as_slice() {
-        return Err(format!(
+        return Err(BackendDiscoveryError::authentication_required(format!(
             "{agent} authentication required via '{method_id}'. {instruction}"
-        ));
+        )));
     }
     if !external_requirements.is_empty() {
         let methods = external_requirements
@@ -304,9 +305,9 @@ async fn authenticate_if_required(
             .map(|(method_id, instruction)| format!("'{method_id}': {instruction}"))
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(format!(
+        return Err(BackendDiscoveryError::authentication_required(format!(
             "{agent} authentication requires external setup. Complete one of: {methods}"
-        ));
+        )));
     }
 
     Err(format!(
@@ -319,7 +320,8 @@ async fn authenticate_if_required(
             .collect::<Vec<_>>()
             .join(", "),
         last_error.unwrap_or_else(|| "no methods advertised".to_string())
-    ))
+    )
+    .into())
 }
 
 #[derive(Clone)]
@@ -394,6 +396,7 @@ impl KiroSession {
             },
         )
         .await
+        .map_err(String::from)
     }
 
     pub async fn spawn_ephemeral(
@@ -417,6 +420,7 @@ impl KiroSession {
             },
         )
         .await
+        .map_err(String::from)
     }
 
     pub async fn spawn_admin(
@@ -459,13 +463,14 @@ impl KiroSession {
             },
         )
         .await
+        .map_err(String::from)
     }
 
     async fn spawn_schema_probe(
         workspace_roots: &[String],
         adapter: Arc<dyn AcpAgentAdapter>,
         probe_deadline: tokio::time::Instant,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), BackendDiscoveryError> {
         Self::spawn_with_mode(
             workspace_roots,
             KiroSpawnMode {
@@ -485,7 +490,7 @@ impl KiroSession {
     async fn spawn_with_mode(
         workspace_roots: &[String],
         mode: KiroSpawnMode<'_>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), BackendDiscoveryError> {
         let adapter = mode.adapter.clone();
         let roots = await_kiro_stage(
             mode.probe_deadline,
@@ -1330,7 +1335,9 @@ impl KiroInner {
             let capabilities = parse_capabilities(&initialized);
             authenticate_if_required(&self.bridge, &capabilities, self.adapter.as_ref())
                 .await
-                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+                .map_err(|error| {
+                    crate::backend::WorkspaceRelocationError::OutcomeUnknown(error.into())
+                })?;
         }
         let response = self
             .bridge
@@ -6897,7 +6904,7 @@ pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
     program_override: Option<String>,
     agent: Option<&protocol::AcpAgentSpec>,
-) -> Result<protocol::SessionSettingsSchema, String> {
+) -> Result<protocol::SessionSettingsSchema, BackendDiscoveryError> {
     let adapter = match agent {
         Some(spec) => adapter_for_spec(spec),
         None => kiro_adapter(program_override),
@@ -6956,14 +6963,14 @@ pub(crate) async fn probe_session_settings_schema(
 
     match (probe_result, shutdown_result) {
         (Ok(schema), Ok(())) => Ok(schema),
-        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
-        (Err(probe_error), Ok(())) => Err(probe_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
+        (Err(probe_error), Ok(())) => Err(probe_error.into()),
         (Err(probe_error), Err(shutdown_error)) => {
             tracing::warn!(
                 error = %shutdown_error,
                 "ACP schema probe cleanup failed after an earlier probe failure"
             );
-            Err(probe_error)
+            Err(probe_error.into())
         }
     }
 }
@@ -7667,7 +7674,7 @@ impl Backend for KiroBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, BackendDiscoveryError> {
         Ok(crate::backend::BackendDiscovery {
             schema: probe_session_settings_schema(
                 &context.workspace_roots,

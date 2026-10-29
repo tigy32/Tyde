@@ -2708,6 +2708,314 @@ async fn expect_agent_session_settings(
     .unwrap_or_else(|err| panic!("parse SessionSettings for {context}: {err}"))
 }
 
+/// A provider whose discovery never answers holds back only itself: while
+/// Grok's probe is parked, Codex's schema publishes beside Grok's Pending
+/// entry, a Codex agent starts with it, and a settings write commits. Grok
+/// then resolves to its own typed Unavailable entry without disturbing
+/// Codex.
+#[tokio::test]
+async fn stalled_provider_discovery_does_not_block_other_providers() {
+    let grok_probe = server::backend::mock::MockGateHandle::new();
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [
+                (
+                    BackendKind::Codex,
+                    server::backend::mock::MockDiscovery::new(vec![Ok(mock_model_discovery(
+                        "gpt-test",
+                        &["medium"],
+                    ))]),
+                ),
+                (
+                    BackendKind::Grok,
+                    server::backend::mock::MockDiscovery::parked(
+                        &grok_probe,
+                        vec![Err("Grok sign-in required".to_owned())],
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        r#"{
+  "settings": {
+    "enabled_backends": ["grok", "codex"],
+    "default_backend": "codex"
+  }
+}"#,
+    )
+    .await;
+    grok_probe.wait_until_entered().await;
+    let grok_entry = |schemas: &[protocol::SessionSchemaEntry]| {
+        schemas
+            .iter()
+            .find(|entry| entry.backend_kind() == BackendKind::Grok)
+            .cloned()
+    };
+
+    let published = next_frame_matching_on(
+        &mut fixture.client,
+        "Codex schema while Grok discovery is parked",
+        |env| {
+            env.kind == FrameKind::SessionSchemas
+                && codex_schema_offers(
+                    &env.parse_payload::<SessionSchemasPayload>()
+                        .expect("parse SessionSchemas")
+                        .schemas,
+                    "gpt-test",
+                )
+        },
+    )
+    .await
+    .parse_payload::<SessionSchemasPayload>()
+    .expect("parse SessionSchemas");
+    assert!(
+        matches!(
+            grok_entry(&published.schemas),
+            Some(protocol::SessionSchemaEntry::Pending { .. })
+        ),
+        "Grok stays Pending while its probe is parked: {:?}",
+        grok_entry(&published.schemas)
+    );
+
+    let (agent, _) = fixture
+        .spawn_with(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Codex beside parked Grok".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: protocol::BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    let started = expect_agent_session_settings(
+        &mut fixture.client,
+        &agent.stream,
+        "Codex settings while Grok discovery is parked",
+    )
+    .await;
+    assert_eq!(
+        started.schema.as_ref().map(codex_schema_model),
+        Some(vec!["gpt-test".to_owned()])
+    );
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-enable-claude-while-grok-parked",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["claude", "codex", "grok"]),
+            serde_json::to_value(&fixture.bootstrap.settings.enabled_backends)
+                .expect("serialize enabled backends"),
+        )],
+    )
+    .await;
+    let written = expect_settings_write_result(
+        &mut fixture.client,
+        "w-enable-claude-while-grok-parked",
+        "settings write while Grok discovery is parked",
+    )
+    .await;
+    assert!(written.applied, "{:?}", written.field_errors);
+
+    // The first release answers the parked probe; the second answers the
+    // rerun the settings write queued behind it.
+    grok_probe.release_one();
+    grok_probe.release_one();
+    let resolved = next_frame_matching_on(&mut fixture.client, "Grok discovery result", |env| {
+        env.kind == FrameKind::SessionSchemas
+            && matches!(
+                grok_entry(
+                    &env.parse_payload::<SessionSchemasPayload>()
+                        .expect("parse SessionSchemas")
+                        .schemas
+                ),
+                Some(protocol::SessionSchemaEntry::Unavailable { .. })
+            )
+    })
+    .await
+    .parse_payload::<SessionSchemasPayload>()
+    .expect("parse SessionSchemas");
+    match grok_entry(&resolved.schemas) {
+        Some(protocol::SessionSchemaEntry::Unavailable { message, .. }) => {
+            assert!(message.contains("Grok sign-in required"), "{message}");
+        }
+        other => panic!("Grok must resolve Unavailable, got {other:?}"),
+    }
+    assert!(
+        codex_schema_offers(&resolved.schemas, "gpt-test"),
+        "Codex stays Ready after Grok resolves"
+    );
+}
+
+#[tokio::test]
+async fn unwound_discovery_rejects_stale_ready_schema_and_can_refresh_again() {
+    let probe = server::backend::mock::MockGateHandle::new();
+    let discovery = server::backend::mock::MockDiscovery::parked(
+        &probe,
+        vec![
+            Ok(mock_model_discovery("gpt-before", &["medium"])),
+            Ok(mock_model_discovery("gpt-after", &["medium"])),
+        ],
+    );
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [(BackendKind::Codex, discovery.clone())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+        r#"{
+  "settings": {
+    "enabled_backends": ["codex"],
+    "default_backend": "codex"
+  }
+}"#,
+    )
+    .await;
+    probe.wait_until_entered().await;
+    probe.release_one();
+    wait_for_codex_catalog(&mut fixture, "gpt-before").await;
+    let host = fixture.host_for_test();
+    drop(host.hold_session_schema_refresh_for_test().await);
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-refresh-before-unwind",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["claude", "codex"]),
+            serde_json::json!(["codex"]),
+        )],
+    )
+    .await;
+    let written = expect_settings_write_result(
+        &mut fixture.client,
+        "w-refresh-before-unwind",
+        "settings write registers refresh before worker unwind",
+    )
+    .await;
+    assert!(written.applied, "{:?}", written.field_errors);
+    probe.wait_until_entered().await;
+
+    let joined = host
+        .observe_next_session_schema_spawn_wait_for_test(BackendKind::Codex)
+        .await;
+    fixture
+        .client
+        .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Codex waiting for failed refresh".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: protocol::BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit spawn during refresh");
+    joined.await.expect("spawn joined the parked discovery run");
+    discovery.unwind_next_probe();
+    probe.release_one();
+
+    let mut agent_stream = None;
+    let mut saw_unavailable = false;
+    let mut saw_startup_failure = false;
+    while !(saw_unavailable && saw_startup_failure) {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read failed refresh events")
+            .expect("connection remains open after discovery worker unwind");
+        match env.kind {
+            FrameKind::SessionSchemas => {
+                let payload: SessionSchemasPayload = env.parse_payload().expect("parse schemas");
+                saw_unavailable |= payload.schemas.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        protocol::SessionSchemaEntry::Unavailable {
+                            backend_kind,
+                            message,
+                            ..
+                        } if *backend_kind == BackendKind::Codex
+                            && message.contains("discovery task stopped before completing")
+                    )
+                });
+            }
+            FrameKind::NewAgent => {
+                let payload: protocol::NewAgentPayload = env.parse_payload().expect("parse agent");
+                agent_stream = Some(payload.instance_stream);
+            }
+            FrameKind::AgentBootstrap if agent_stream.as_ref() == Some(&env.stream) => {
+                assert_eq!(env.seq, 0);
+                let payload: protocol::AgentBootstrapPayload =
+                    env.parse_payload().expect("parse failed startup bootstrap");
+                let errors = payload
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        protocol::AgentBootstrapEvent::AgentError(error) => Some(error),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(errors.len(), 1, "stale schema admitted the spawn");
+                assert!(errors[0].fatal);
+                assert_eq!(errors[0].code, protocol::AgentErrorCode::BackendFailed);
+                assert!(
+                    errors[0]
+                        .message
+                        .contains("discovery task stopped before completing")
+                );
+                saw_startup_failure = true;
+            }
+            FrameKind::CommandError | FrameKind::AgentStart => {
+                panic!("failed schema refresh must yield a typed startup failure");
+            }
+            _ => {}
+        }
+    }
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-refresh-after-unwind",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["codex"]),
+            serde_json::json!(["claude", "codex"]),
+        )],
+    )
+    .await;
+    let recovered = expect_settings_write_result(
+        &mut fixture.client,
+        "w-refresh-after-unwind",
+        "settings write starts a fresh run after worker unwind",
+    )
+    .await;
+    assert!(recovered.applied, "{:?}", recovered.field_errors);
+    probe.wait_until_entered().await;
+    probe.release_one();
+    wait_for_codex_catalog(&mut fixture, "gpt-after").await;
+}
+
 /// A running agent validates session-setting edits against the schema it
 /// started with, not the host's current catalog. The agent's settings carry
 /// that schema, so a client renders what this agent accepts: after the

@@ -347,7 +347,7 @@ impl crate::backend::Backend for GrokBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, crate::backend::BackendDiscoveryError> {
         let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
         if let Some(program) = &context.program {
             spec.command.clone_from(program);
@@ -363,7 +363,7 @@ impl crate::backend::Backend for GrokBackend {
             .fields
             .iter()
             .find(|field| field.key == "model")
-            .ok_or("Grok reported no selectable models")?;
+            .ok_or_else(|| "Grok reported no selectable models".to_owned())?;
         let model_count = model
             .select_options(&protocol::SessionSettingsValues::default())
             .map_or(0, |options| options.len());

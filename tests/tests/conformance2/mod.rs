@@ -12,6 +12,7 @@ use protocol::{
 use server::backend::{
     Backend, BackendEvent, BackendSpawnConfig, EventStream, SendOutcome, SteerOutcome,
 };
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 use tyde_agent_adapter::BackendCapability;
@@ -3565,6 +3566,137 @@ pub async fn isolated_process_case<B: Backend>(host: &Harness<B>) -> bool {
     assert!(
         status.success(),
         "isolated process case failed; see private evidence log"
+    );
+    false
+}
+
+// Provider errors may contain native identifiers or payloads, so retain them
+// privately rather than exposing them in assertion output.
+pub fn retain_signed_out_discovery_error(
+    backend: BackendKind,
+    error: &server::backend::BackendDiscoveryError,
+) {
+    let path = std::env::var_os("TYDE_SIGNED_OUT_ERROR_PATH")
+        .expect("signed-out parent must provide the private error evidence path");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .expect("create private discovery error evidence");
+    serde_json::to_writer(
+        file,
+        &serde_json::json!({
+            "backend": backend,
+            "kind": format!("{:?}", error.kind),
+            "message": error.message,
+        }),
+    )
+    .expect("retain private discovery error evidence");
+}
+
+/// Re-run with a fresh local home and cleared credential environment, not a
+/// claim about host authentication or the native catalog's available providers.
+/// Every browser launcher records instead of opening a page.
+pub async fn isolated_signed_out_case<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var("TYDE_SIGNED_OUT_CASE").ok().as_deref() == Some(&host.test_name) {
+        return true;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("tyde-signed-out-case-")
+        .tempdir()
+        .expect("create private signed-out evidence")
+        .keep();
+    std::fs::set_permissions(
+        &directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("restrict signed-out evidence");
+    let home = directory.join("home");
+    let launchers = directory.join("launchers");
+    let launches = directory.join("browser-launches.log");
+    for path in [&home, &launchers] {
+        std::fs::create_dir(path).expect("create signed-out directory");
+    }
+    std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("restrict signed-out home");
+    let recorder = format!("#!/bin/sh\nbasename \"$0\" >> '{}'\n", launches.display());
+    for name in [
+        "browser",
+        "xdg-open",
+        "x-www-browser",
+        "sensible-browser",
+        "www-browser",
+        "gio",
+    ] {
+        let launcher = launchers.join(name);
+        std::fs::write(&launcher, &recorder).expect("write recording browser launcher");
+        std::fs::set_permissions(
+            &launcher,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make recording browser launcher executable");
+    }
+    let path = std::env::join_paths(std::iter::once(launchers.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH")),
+    ))
+    .expect("signed-out PATH");
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("run.log"))
+        .expect("create evidence log");
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", &host.test_name, "--ignored", "--nocapture"])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("BROWSER", launchers.join("browser"))
+        .env("TYDE_SIGNED_OUT_CASE", &host.test_name)
+        .env(
+            "TYDE_SIGNED_OUT_ERROR_PATH",
+            directory.join("discovery-error.json"),
+        )
+        .env(
+            "TYDE_TEST_PROCESS_EXECUTABLE",
+            std::env::var_os("TYDE_TEST_PROCESS_EXECUTABLE")
+                .expect("TYDE_TEST_PROCESS_EXECUTABLE must name the built tyde-server launcher"),
+        )
+        .stdout(log.try_clone().expect("clone evidence log"))
+        .stderr(log);
+    for name in [
+        "SHELL",
+        "HERMES_PYTHON",
+        "HERMES_EXECUTABLE",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "TMPDIR",
+        "TYDE_RUN_REAL_AI_TESTS",
+        "TYDE_REAL_BACKENDS",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let status = command.status().await.expect("run signed-out case");
+    eprintln!("Fresh-home case evidence: {}", directory.display());
+    let opened = match std::fs::read_to_string(&launches) {
+        Ok(log) => log.lines().count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read recorded browser launches: {error}"),
+    };
+    assert_eq!(opened, 0, "fresh-home discovery opened a browser sign-in");
+    assert!(
+        status.success(),
+        "fresh-home case failed; see private evidence log"
     );
     false
 }

@@ -758,6 +758,97 @@ enum SessionSchemaResolution {
     Unavailable(String),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SessionSchemaDiscoveryRequest {
+    /// Re-probe keys that already resolved, not only Pending ones.
+    retry_unavailable: bool,
+    /// Probe even while the backend is not enabled.
+    explicit: bool,
+}
+
+impl SessionSchemaDiscoveryRequest {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            retry_unavailable: self.retry_unavailable || other.retry_unavailable,
+            explicit: self.explicit || other.explicit,
+        }
+    }
+}
+
+/// The single in-flight discovery for one backend. Each backend probes and
+/// publishes independently, so a provider that never answers holds back only
+/// its own schema.
+struct SessionSchemaDiscoveryRun {
+    rerun: Option<SessionSchemaDiscoveryRequest>,
+    settled: Vec<oneshot::Sender<SessionSchemaDiscoveryCompletion>>,
+}
+
+#[derive(Clone, Copy)]
+enum SessionSchemaDiscoveryCompletion {
+    Published,
+    WorkerStopped,
+}
+
+const SESSION_SCHEMA_DISCOVERY_STOPPED: &str =
+    "session schema discovery task stopped before completing";
+
+/// Invalidates an interrupted run's schemas before releasing its waiters.
+/// Dropping a completion channel alone would leave a superseded Ready schema.
+struct SessionSchemaDiscoveryRunGuard {
+    state: Weak<StateOwner<HostState>>,
+    kind: BackendKind,
+    settled: bool,
+}
+
+impl Drop for SessionSchemaDiscoveryRunGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let kind = self.kind;
+        tracing::error!(
+            ?kind,
+            "session schema discovery worker stopped before completing"
+        );
+        if let Some(state) = self.state.upgrade()
+            && let Err(error) = state.apply(move |state| {
+                let Some(run) = state.session_schema_discovery.remove(&kind) else {
+                    return;
+                };
+                for ((backend, _), resolution) in &mut state.session_schemas {
+                    if *backend == kind {
+                        *resolution = SessionSchemaResolution::Unavailable(
+                            SESSION_SCHEMA_DISCOVERY_STOPPED.to_owned(),
+                        );
+                    }
+                }
+                state.session_schemas.insert(
+                    discovery_key(kind, None),
+                    SessionSchemaResolution::Unavailable(
+                        SESSION_SCHEMA_DISCOVERY_STOPPED.to_owned(),
+                    ),
+                );
+                state.discovered_launch_profiles.remove(&kind);
+                fan_out_session_schemas(state, false);
+                fan_out_backend_config_schemas(state);
+                fan_out_launch_profile_catalog(state);
+                for waiter in run.settled {
+                    let _ = waiter.send(SessionSchemaDiscoveryCompletion::WorkerStopped);
+                }
+            })
+        {
+            tracing::error!(?kind, %error, "could not publish discovery worker failure");
+        }
+    }
+}
+
+/// Test hold on session schema discovery; dropping it releases every run
+/// parked behind it.
+#[cfg(any(test, feature = "test-support"))]
+pub struct SessionSchemaDiscoveryHold {
+    _release: tokio::sync::watch::Sender<()>,
+}
+
 type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
@@ -845,6 +936,11 @@ pub(crate) struct HostState {
     pub mobile_access: MobileAccessHandle,
     session_schemas: HashMap<DiscoveryKey, SessionSchemaResolution>,
     discovered_launch_profiles: HashMap<BackendKind, Vec<LaunchProfileEntry>>,
+    session_schema_discovery: HashMap<BackendKind, SessionSchemaDiscoveryRun>,
+    #[cfg(any(test, feature = "test-support"))]
+    session_schema_discovery_hold: Option<tokio::sync::watch::Receiver<()>>,
+    #[cfg(any(test, feature = "test-support"))]
+    session_schema_spawn_wait_observer: Option<(BackendKind, oneshot::Sender<()>)>,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
@@ -1028,7 +1124,6 @@ pub struct HostHandle {
     state: Arc<StateOwner<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
     backend_setup_refresh_lock: Arc<Mutex<()>>,
-    session_schema_refresh_lock: Arc<Mutex<()>>,
     /// Serializes the complete lifecycle of a host-settings apply — CAS
     /// read, commit, backend propagation, fanout, coupled refreshes, and
     /// result emission — across both write paths. Without it a slow
@@ -1250,7 +1345,6 @@ pub(crate) struct WeakHostHandle {
     state: Weak<StateOwner<HostState>>,
     workflow_save_lock: Weak<Mutex<()>>,
     backend_setup_refresh_lock: Weak<Mutex<()>>,
-    session_schema_refresh_lock: Weak<Mutex<()>>,
     settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
     #[cfg(feature = "test-support")]
     task_usage_refresh_sync: mpsc::UnboundedSender<oneshot::Sender<()>>,
@@ -1266,7 +1360,6 @@ impl WeakHostHandle {
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
-            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
@@ -1282,7 +1375,6 @@ impl WeakHostHandle {
             state: self.state.upgrade()?,
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
             backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
-            session_schema_refresh_lock: self.session_schema_refresh_lock.upgrade()?,
             settings_apply_tx: self.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
@@ -1301,7 +1393,6 @@ impl Clone for HostHandle {
             state: Arc::clone(&self.state),
             workflow_save_lock: Arc::clone(&self.workflow_save_lock),
             backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
-            session_schema_refresh_lock: Arc::clone(&self.session_schema_refresh_lock),
             settings_apply_tx: self.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
@@ -2944,40 +3035,56 @@ impl HostHandle {
 
 #[cfg(any(test, feature = "test-support"))]
 impl HostHandle {
-    pub async fn hold_session_schema_refresh_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.session_schema_refresh_lock)
-            .lock_owned()
-            .await
+    pub async fn observe_next_session_schema_spawn_wait_for_test(
+        &self,
+        kind: BackendKind,
+    ) -> oneshot::Receiver<()> {
+        let (joined, wait) = oneshot::channel();
+        self.state
+            .with(move |state| {
+                assert!(state.session_schema_spawn_wait_observer.is_none());
+                state.session_schema_spawn_wait_observer = Some((kind, joined));
+            })
+            .await;
+        wait
+    }
+
+    /// Parks every session schema discovery that starts after this returns
+    /// until the hold is dropped. Waits for in-flight discovery to settle
+    /// first, so the hold never parks a run it is waiting on.
+    pub async fn hold_session_schema_refresh_for_test(&self) -> SessionSchemaDiscoveryHold {
+        let (release, held) = tokio::sync::watch::channel(());
+        self.with_session_schema_discovery_settled_for_test(move |state| {
+            state.session_schema_discovery_hold = Some(held);
+        })
+        .await;
+        SessionSchemaDiscoveryHold { _release: release }
     }
 
     pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
         let schema = session_settings_schema_for_backend(backend_kind);
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        {
-            self.state
-                .with(move |state| {
-                    assert!(backend_has_dynamic_session_schema(backend_kind));
-                    state.session_schemas.insert(
-                        discovery_key(backend_kind, None),
-                        SessionSchemaResolution::Ready(schema),
+        self.with_session_schema_discovery_settled_for_test(move |state| {
+            assert!(backend_has_dynamic_session_schema(backend_kind));
+            state.session_schemas.insert(
+                discovery_key(backend_kind, None),
+                SessionSchemaResolution::Ready(schema),
+            );
+            for kind in crate::backend::SUPPORTED_BACKENDS
+                .into_iter()
+                .filter(|kind| backend_has_dynamic_session_schema(*kind))
+            {
+                let entry = state
+                    .session_schemas
+                    .entry(discovery_key(kind, None))
+                    .or_insert(SessionSchemaResolution::Pending);
+                if matches!(entry, SessionSchemaResolution::Pending) {
+                    *entry = SessionSchemaResolution::Unavailable(
+                        "test schema not configured".to_owned(),
                     );
-                    for kind in crate::backend::SUPPORTED_BACKENDS
-                        .into_iter()
-                        .filter(|kind| backend_has_dynamic_session_schema(*kind))
-                    {
-                        let entry = state
-                            .session_schemas
-                            .entry(discovery_key(kind, None))
-                            .or_insert(SessionSchemaResolution::Pending);
-                        if matches!(entry, SessionSchemaResolution::Pending) {
-                            *entry = SessionSchemaResolution::Unavailable(
-                                "test schema not configured".to_owned(),
-                            );
-                        }
-                    }
-                })
-                .await
-        }
+                }
+            }
+        })
+        .await
     }
 
     pub async fn set_session_schema_unavailable_for_test(
@@ -2985,20 +3092,46 @@ impl HostHandle {
         backend_kind: BackendKind,
         message: &str,
     ) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        {
-            let message = message.to_owned();
-            self.state
-                .with(move |state| {
-                    let message = &message;
+        let message = message.to_owned();
+        self.with_session_schema_discovery_settled_for_test(move |state| {
+            assert!(backend_has_dynamic_session_schema(backend_kind));
+            state.session_schemas.insert(
+                discovery_key(backend_kind, None),
+                SessionSchemaResolution::Unavailable(message),
+            );
+        })
+        .await
+    }
 
-                    assert!(backend_has_dynamic_session_schema(backend_kind));
-                    state.session_schemas.insert(
-                        discovery_key(backend_kind, None),
-                        SessionSchemaResolution::Unavailable(message.to_owned()),
-                    );
-                })
-                .await
+    /// Applies `transition` once no session schema discovery is in flight,
+    /// so a test write is never overwritten by a probe that started earlier.
+    async fn with_session_schema_discovery_settled_for_test<R, F>(&self, transition: F) -> R
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut HostState) -> R + Send + 'static,
+    {
+        let mut transition = transition;
+        loop {
+            let (settled, wait) = oneshot::channel();
+            let outcome = self
+                .state
+                .with(
+                    move |state| match state.session_schema_discovery.values_mut().next() {
+                        Some(run) => {
+                            run.settled.push(settled);
+                            Err(transition)
+                        }
+                        None => Ok(transition(state)),
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(value) => return value,
+                Err(pending) => {
+                    transition = pending;
+                    let _ = wait.await;
+                }
+            }
         }
     }
 
@@ -10494,7 +10627,7 @@ std::ops::ControlFlow::Continue((
         if outcome.refresh_required {
             self.refresh_backend_config_snapshots_after_native_save()
                 .await;
-            self.refresh_session_schemas_with_fanout(true).await;
+            self.start_session_schema_refresh(true).await;
         }
         let outcome = outcome.result;
 
@@ -10563,7 +10696,7 @@ std::ops::ControlFlow::Continue((
         if let Ok(tombstones) = &outcome {
             self.refresh_backend_config_snapshots_after_settings_action(tombstones)
                 .await;
-            self.refresh_session_schemas_with_fanout(true).await;
+            self.start_session_schema_refresh(true).await;
         }
 
         let current_etag = {
@@ -10614,10 +10747,19 @@ std::ops::ControlFlow::Continue((
             || !effects.refresh_schema_backends.is_empty()
         {
             if effects.refresh_session_schemas {
-                self.refresh_session_schemas().await;
+                self.start_session_schema_refresh(false).await;
             }
             for kind in effects.refresh_schema_backends {
-                self.refresh_session_schema_for_backend(kind).await;
+                drop(
+                    self.start_session_schema_discovery(
+                        kind,
+                        SessionSchemaDiscoveryRequest {
+                            retry_unavailable: true,
+                            explicit: true,
+                        },
+                    )
+                    .await,
+                );
             }
             if effects.refresh_backend_config_snapshots {
                 self.refresh_backend_config_snapshots().await;
@@ -11729,17 +11871,18 @@ std::ops::ControlFlow::Continue((
         }
     }
 
-    pub(crate) async fn refresh_session_schemas(&self) {
-        self.refresh_session_schemas_with_fanout(false).await;
-    }
-
     pub(crate) async fn refresh_session_schema_for_backend(
         &self,
         backend_kind: protocol::BackendKind,
     ) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        self.refresh_session_schemas_with_fanout_unlocked(false, true, Some(backend_kind))
-            .await;
+        self.discover_session_schema(
+            backend_kind,
+            SessionSchemaDiscoveryRequest {
+                retry_unavailable: true,
+                explicit: true,
+            },
+        )
+        .await;
     }
 
     async fn resolve_session_schema_for_spawn(
@@ -11750,8 +11893,58 @@ std::ops::ControlFlow::Continue((
         if !backend_has_dynamic_session_schema(backend_kind) {
             return Ok(Some(session_settings_schema_for_backend(backend_kind)));
         }
-        let mut resolution = {
-            {
+        let (mut resolution, discovering) = {
+            let profile_id = profile_id.cloned();
+            self.state
+                .with(move |state| {
+                    (
+                        session_schema_resolution_for_backend(
+                            state,
+                            backend_kind,
+                            profile_id.as_ref(),
+                        ),
+                        state.session_schema_discovery.contains_key(&backend_kind),
+                    )
+                })
+                .await
+        };
+        if discovering || matches!(&resolution, SessionSchemaResolution::Pending) {
+            let wait_started = Instant::now();
+            let settled = self
+                .start_session_schema_discovery(
+                    backend_kind,
+                    SessionSchemaDiscoveryRequest {
+                        retry_unavailable: false,
+                        explicit: true,
+                    },
+                )
+                .await;
+            #[cfg(any(test, feature = "test-support"))]
+            self.state
+                .with(move |state| {
+                    let observer = state.session_schema_spawn_wait_observer.take();
+                    match observer {
+                        Some((kind, joined)) if kind == backend_kind => {
+                            let _ = joined.send(());
+                        }
+                        observer => state.session_schema_spawn_wait_observer = observer,
+                    }
+                })
+                .await;
+            if matches!(
+                Self::await_session_schema_discovery(backend_kind, settled).await,
+                SessionSchemaDiscoveryCompletion::WorkerStopped
+            ) {
+                return Err(AgentStartupFailure::backend_failed(format!(
+                    "{backend_kind:?} session settings schema unavailable: {SESSION_SCHEMA_DISCOVERY_STOPPED}"
+                )));
+            }
+            tracing::info!(
+                ?backend_kind,
+                wait_ms = wait_started.elapsed().as_millis(),
+                "spawn waited for session schema discovery"
+            );
+            resolution = {
                 let profile_id = profile_id.cloned();
                 self.state
                     .with(move |state| {
@@ -11762,31 +11955,6 @@ std::ops::ControlFlow::Continue((
                         )
                     })
                     .await
-            }
-        };
-        if matches!(&resolution, SessionSchemaResolution::Pending) {
-            let wait_started = Instant::now();
-            let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-            tracing::info!(
-                ?backend_kind,
-                wait_ms = wait_started.elapsed().as_millis(),
-                "spawn waited for pending session schema discovery"
-            );
-            self.refresh_session_schemas_with_fanout_unlocked(false, false, Some(backend_kind))
-                .await;
-            resolution = {
-                {
-                    let profile_id = profile_id.cloned();
-                    self.state
-                        .with(move |state| {
-                            session_schema_resolution_for_backend(
-                                state,
-                                backend_kind,
-                                profile_id.as_ref(),
-                            )
-                        })
-                        .await
-                }
             };
         }
         match resolution {
@@ -11803,99 +11971,245 @@ std::ops::ControlFlow::Continue((
     }
 
     async fn refresh_session_schemas_with_fanout(&self, force_emit: bool) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        self.refresh_session_schemas_with_fanout_unlocked(force_emit, true, None)
-            .await;
+        let request = SessionSchemaDiscoveryRequest {
+            retry_unavailable: true,
+            explicit: false,
+        };
+        futures_util::future::join_all(
+            crate::backend::SUPPORTED_BACKENDS
+                .into_iter()
+                .filter(|kind| backend_has_dynamic_session_schema(*kind))
+                .map(|kind| self.discover_session_schema(kind, request)),
+        )
+        .await;
+        if force_emit {
+            self.state
+                .with(move |state| fan_out_session_schemas(state, true))
+                .await;
+        }
+    }
+
+    /// Starts discovery for every dynamic backend without waiting for its
+    /// probes, so a settings mutation never queues behind a provider that has
+    /// not answered. The runs are registered before this returns, so a later
+    /// spawn joins them instead of reading the superseded schema.
+    async fn start_session_schema_refresh(&self, force_emit: bool) {
+        let request = SessionSchemaDiscoveryRequest {
+            retry_unavailable: true,
+            explicit: false,
+        };
+        let settled = futures_util::future::join_all(
+            crate::backend::SUPPORTED_BACKENDS
+                .into_iter()
+                .filter(|kind| backend_has_dynamic_session_schema(*kind))
+                .map(|kind| self.start_session_schema_discovery(kind, request)),
+        )
+        .await;
+        if force_emit {
+            let host = self.clone();
+            tokio::spawn(async move {
+                futures_util::future::join_all(settled).await;
+                host.state
+                    .with(move |state| fan_out_session_schemas(state, true))
+                    .await;
+            });
+        }
     }
 
     async fn refresh_pending_session_discovery(&self) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let (enabled, pending) = {
-            {
-                self.state
-                    .with(move |state| {
-                        let settings = state
-                            .settings_store
-                            .get()
-                            .expect("load settings for discovery");
-                        let pending = settings
-                            .enabled_backends
-                            .iter()
-                            .copied()
-                            .filter(|kind| backend_has_dynamic_session_schema(*kind))
-                            .filter(|kind| {
-                                matches!(
-                                    session_schema_resolution_for_backend(state, *kind, None),
-                                    SessionSchemaResolution::Pending
-                                )
-                            })
-                            .collect::<HashSet<_>>();
-                        (settings.enabled_backends, pending)
-                    })
-                    .await
-            }
-        };
-        if !pending.is_empty() {
-            self.refresh_session_schemas_with_fanout_unlocked(false, false, None)
-                .await;
-        }
-        for kind in enabled {
-            if !pending.contains(&kind) && crate::backend::discovery_policy(kind).refresh_on_connect
-            {
-                self.refresh_session_schemas_with_fanout_unlocked(false, true, Some(kind))
-                    .await;
+        let (enabled, any_pending) = self
+            .state
+            .with(move |state| {
+                let settings = state
+                    .settings_store
+                    .get()
+                    .expect("load settings for discovery");
+                let enabled = settings
+                    .enabled_backends
+                    .iter()
+                    .copied()
+                    .filter(|kind| backend_has_dynamic_session_schema(*kind))
+                    .collect::<Vec<_>>();
+                let any_pending = enabled.iter().any(|kind| {
+                    matches!(
+                        session_schema_resolution_for_backend(state, *kind, None),
+                        SessionSchemaResolution::Pending
+                    )
+                });
+                (enabled, any_pending)
+            })
+            .await;
+        futures_util::future::join_all(enabled.into_iter().filter_map(|kind| {
+            let retry_unavailable = crate::backend::discovery_policy(kind).refresh_on_connect;
+            (any_pending || retry_unavailable).then(|| {
+                self.discover_session_schema(
+                    kind,
+                    SessionSchemaDiscoveryRequest {
+                        retry_unavailable,
+                        explicit: false,
+                    },
+                )
+            })
+        }))
+        .await;
+    }
+
+    /// Joins the backend's in-flight discovery, or starts one, and reports
+    /// whether it published resolutions or stopped before completing.
+    async fn discover_session_schema(
+        &self,
+        kind: BackendKind,
+        request: SessionSchemaDiscoveryRequest,
+    ) -> SessionSchemaDiscoveryCompletion {
+        let settled = self.start_session_schema_discovery(kind, request).await;
+        Self::await_session_schema_discovery(kind, settled).await
+    }
+
+    async fn await_session_schema_discovery(
+        kind: BackendKind,
+        settled: oneshot::Receiver<SessionSchemaDiscoveryCompletion>,
+    ) -> SessionSchemaDiscoveryCompletion {
+        match settled.await {
+            Ok(completion) => completion,
+            Err(error) => {
+                tracing::error!(?kind, %error, "session schema discovery completion lost");
+                SessionSchemaDiscoveryCompletion::WorkerStopped
             }
         }
     }
 
-    async fn refresh_session_schemas_with_fanout_unlocked(
+    /// Joins the backend's in-flight discovery, or starts one, and returns a
+    /// receiver for its typed completion. The detached run cannot strand its
+    /// other waiters when a caller is cancelled.
+    async fn start_session_schema_discovery(
         &self,
-        force_emit: bool,
-        retry_unavailable: bool,
-        only: Option<BackendKind>,
+        kind: BackendKind,
+        request: SessionSchemaDiscoveryRequest,
+    ) -> oneshot::Receiver<SessionSchemaDiscoveryCompletion> {
+        let (settled, wait) = oneshot::channel();
+        let host = self.clone();
+        self.state
+            .with(
+                move |state| match state.session_schema_discovery.entry(kind) {
+                    std::collections::hash_map::Entry::Occupied(mut run) => {
+                        let run = run.get_mut();
+                        run.rerun = Some(run.rerun.map_or(request, |queued| queued.merge(request)));
+                        run.settled.push(settled);
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(SessionSchemaDiscoveryRun {
+                            rerun: None,
+                            settled: vec![settled],
+                        });
+                        tokio::spawn(host.run_session_schema_discovery(kind, request));
+                    }
+                },
+            )
+            .await;
+        wait
+    }
+
+    async fn run_session_schema_discovery(
+        self,
+        kind: BackendKind,
+        mut request: SessionSchemaDiscoveryRequest,
     ) {
-        let (settings_store, programs, root, disabled, previous, previous_profiles) = {
-            {
-                self.state
-                    .with(move |state| {
-                        #[cfg(any(test, feature = "test-support"))]
-                        {
-                            state.session_schema_probe_count =
-                                state.session_schema_probe_count.saturating_add(1);
-                        }
-                        let previous = state.session_schemas.clone();
-                        if retry_unavailable {
-                            state
-                                .session_schemas
-                                .retain(|(kind, _), _| only.is_some_and(|scoped| scoped != *kind));
-                        }
-                        (
-                            Arc::clone(&state.settings_store),
-                            state.backend_probe_programs.clone(),
-                            state.backend_probe_workspace_root.clone(),
-                            state.skip_real_backend_probe,
-                            previous,
-                            state.discovered_launch_profiles.clone(),
-                        )
-                    })
-                    .await
-            }
+        let mut run = SessionSchemaDiscoveryRunGuard {
+            state: Arc::downgrade(&self.state),
+            kind,
+            settled: false,
         };
+        loop {
+            #[cfg(any(test, feature = "test-support"))]
+            self.wait_for_session_schema_discovery_hold().await;
+            self.discover_session_schema_pass(kind, request).await;
+            let rerun = self
+                .state
+                .with(move |state| {
+                    let run = state
+                        .session_schema_discovery
+                        .get_mut(&kind)
+                        .expect("session schema discovery run registered");
+                    let rerun = run.rerun.take();
+                    if rerun.is_none() {
+                        let run = state
+                            .session_schema_discovery
+                            .remove(&kind)
+                            .expect("session schema discovery run registered");
+                        for waiter in run.settled {
+                            let _ = waiter.send(SessionSchemaDiscoveryCompletion::Published);
+                        }
+                    }
+                    rerun
+                })
+                .await;
+            match rerun {
+                Some(next) => request = next,
+                None => break,
+            }
+        }
+        run.settled = true;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn wait_for_session_schema_discovery_hold(&self) {
+        let held = self
+            .state
+            .with(move |state| {
+                let held = state
+                    .session_schema_discovery_hold
+                    .as_ref()
+                    .filter(|held| held.has_changed().is_ok())
+                    .cloned();
+                if held.is_none() {
+                    state.session_schema_discovery_hold = None;
+                }
+                held
+            })
+            .await;
+        if let Some(mut held) = held {
+            while held.changed().await.is_ok() {}
+        }
+    }
+
+    /// Probes one backend outside the state owner, then replaces only that
+    /// backend's resolutions and publishes them.
+    async fn discover_session_schema_pass(
+        &self,
+        kind: BackendKind,
+        request: SessionSchemaDiscoveryRequest,
+    ) {
+        let (settings_store, program, root, disabled, previous, previous_profiles) = self
+            .state
+            .with(move |state| {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    state.session_schema_probe_count =
+                        state.session_schema_probe_count.saturating_add(1);
+                }
+                (
+                    Arc::clone(&state.settings_store),
+                    state.backend_probe_programs.get(&kind).cloned(),
+                    state.backend_probe_workspace_root.clone(),
+                    state.skip_real_backend_probe,
+                    backend_session_schemas(state, kind),
+                    state.discovered_launch_profiles.get(&kind).cloned(),
+                )
+            })
+            .await;
+        #[cfg(any(test, feature = "test-support"))]
+        let mock_discovery = self
+            .state
+            .with(move |state| state.mock_backend_discovery.get(&kind).cloned())
+            .await;
         let settings = settings_store.get().expect("load settings for discovery");
-        let root = backend_probe_workspace_root(root.as_deref());
         let mut schemas = previous.clone();
         let mut profiles = previous_profiles;
-        for kind in crate::backend::SUPPORTED_BACKENDS {
-            if !backend_has_dynamic_session_schema(kind)
-                || only.is_some_and(|scoped| scoped != kind)
-            {
-                continue;
-            }
-            if !settings.enabled_backends.contains(&kind) && only != Some(kind) {
-                schemas.retain(|(stored, _), _| *stored != kind);
-                profiles.remove(&kind);
-                continue;
-            }
+        if !settings.enabled_backends.contains(&kind) && !request.explicit {
+            schemas.clear();
+            profiles = None;
+        } else {
+            let root = backend_probe_workspace_root(root.as_deref());
             let policy = crate::backend::discovery_policy(kind);
             let mut keys = vec![discovery_key(kind, None)];
             if policy.profile_scope.is_some() {
@@ -11910,13 +12224,14 @@ std::ops::ControlFlow::Continue((
                         .map(|profile| discovery_key(kind, Some(&profile.id))),
                 );
             }
-            schemas.retain(|key, _| key.0 != kind || keys.contains(key));
+            schemas.retain(|key, _| keys.contains(key));
             for key in keys {
                 let prior = previous
                     .get(&key)
                     .cloned()
                     .unwrap_or(SessionSchemaResolution::Pending);
-                if !retry_unavailable && !matches!(prior, SessionSchemaResolution::Pending) {
+                if !request.retry_unavailable && !matches!(prior, SessionSchemaResolution::Pending)
+                {
                     continue;
                 }
                 let custom_profile = key
@@ -11925,19 +12240,12 @@ std::ops::ControlFlow::Continue((
                     .filter(|id| Some(*id) != policy.profile_scope.as_ref());
                 let context = crate::backend::BackendProbeContext {
                     #[cfg(any(test, feature = "test-support"))]
-                    mock_discovery: {
-                        self.state
-                            .with(move |state| state.mock_backend_discovery.get(&kind).cloned())
-                            .await
-                    },
+                    mock_discovery: mock_discovery.clone(),
                     workspace_roots: root
                         .as_ref()
                         .map(|root| vec![root.clone()])
                         .unwrap_or_default(),
-                    program: custom_profile
-                        .is_none()
-                        .then(|| programs.get(&kind).cloned())
-                        .flatten(),
+                    program: custom_profile.is_none().then(|| program.clone()).flatten(),
                     launch: custom_profile
                         .and_then(|id| settings.launch_profiles.get(id))
                         .and_then(|profile| profile.acp.clone()),
@@ -11961,7 +12269,7 @@ std::ops::ControlFlow::Continue((
                     Ok(discovery) => {
                         schemas.insert(key, SessionSchemaResolution::Ready(discovery.schema));
                         if is_default_profile {
-                            profiles.insert(kind, discovery.launch_profiles);
+                            profiles = Some(discovery.launch_profiles);
                         }
                     }
                     Err(error) => {
@@ -11973,24 +12281,32 @@ std::ops::ControlFlow::Continue((
                         } else {
                             schemas.insert(key, SessionSchemaResolution::Unavailable(error));
                             if is_default_profile {
-                                profiles.remove(&kind);
+                                profiles = None;
                             }
                         }
                     }
                 }
             }
         }
-        {
-            self.state
-                .with(move |state| {
-                    state.session_schemas = schemas;
-                    state.discovered_launch_profiles = profiles;
-                    fan_out_session_schemas(state, force_emit);
-                    fan_out_backend_config_schemas(state);
-                    fan_out_launch_profile_catalog(state);
-                })
-                .await
-        }
+        self.state
+            .with(move |state| {
+                state
+                    .session_schemas
+                    .retain(|(stored, _), _| *stored != kind);
+                state.session_schemas.extend(schemas);
+                match profiles {
+                    Some(profiles) => {
+                        state.discovered_launch_profiles.insert(kind, profiles);
+                    }
+                    None => {
+                        state.discovered_launch_profiles.remove(&kind);
+                    }
+                }
+                fan_out_session_schemas(state, false);
+                fan_out_backend_config_schemas(state);
+                fan_out_launch_profile_catalog(state);
+            })
+            .await
     }
 
     async fn refresh_after_backend_setup(&self) {
@@ -19594,6 +19910,11 @@ fn spawn_host_inner(
         mobile_access: mobile_access.clone(),
         session_schemas: HashMap::new(),
         discovered_launch_profiles: HashMap::new(),
+        session_schema_discovery: HashMap::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        session_schema_discovery_hold: None,
+        #[cfg(any(test, feature = "test-support"))]
+        session_schema_spawn_wait_observer: None,
         backend_config_snapshots: Vec::new(),
         backend_native_settings_snapshots: Vec::new(),
         backend_capacity: initial_backend_capacity_snapshots(),
@@ -19688,7 +20009,6 @@ fn spawn_host_inner(
         state: Arc::new(state),
         workflow_save_lock: Arc::new(Mutex::new(())),
         backend_setup_refresh_lock: Arc::new(Mutex::new(())),
-        session_schema_refresh_lock: Arc::new(Mutex::new(())),
         settings_apply_tx,
         #[cfg(feature = "test-support")]
         task_usage_refresh_sync,
@@ -19708,7 +20028,6 @@ fn spawn_host_inner(
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
-            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
@@ -19738,7 +20057,6 @@ fn spawn_host_inner(
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
-            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
@@ -25850,6 +26168,18 @@ fn session_schema_for_backend(
         SessionSchemaResolution::Ready(schema) => Some(schema),
         SessionSchemaResolution::Pending | SessionSchemaResolution::Unavailable(_) => None,
     }
+}
+
+fn backend_session_schemas(
+    state: &HostState,
+    kind: BackendKind,
+) -> HashMap<DiscoveryKey, SessionSchemaResolution> {
+    state
+        .session_schemas
+        .iter()
+        .filter(|((stored, _), _)| *stored == kind)
+        .map(|(key, resolution)| (key.clone(), resolution.clone()))
+        .collect()
 }
 
 fn session_schema_resolution_for_backend(

@@ -21,9 +21,9 @@ use protocol::{
     MobileConnectionStatus, MobileDeviceState, MobileDirectHostingStatus, MobilePairingOfferId,
     MobilePairingOfferPayload, MobilePairingState, MobilePushState, MobileWebBundleSource,
     ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering,
-    SteeringId, SteeringScope, ToolPolicy,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsValues, SettingExpectation,
+    SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering, SteeringId,
+    SteeringScope, ToolPolicy,
 };
 use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 
@@ -3753,8 +3753,7 @@ fn LaunchProfileEditor(
     // this profile against. A saved profile has its own server-emitted schema
     // (ACP profiles discover their own catalog from their agent command); a
     // new profile, or one being moved to another backend, is not known to the
-    // server yet, so it uses the host's schema for the selected backend. Falls
-    // back to a note when the schema is not available.
+    // server yet, so it uses the host's schema for the selected backend.
     let state_for_schema = state.clone();
     let saved_profile = (!is_new).then(|| {
         (
@@ -3762,10 +3761,10 @@ fn LaunchProfileEditor(
             backend_kind_sig.get_untracked(),
         )
     });
-    let schema_for_backend = move || -> Option<SessionSettingsSchema> {
+    let schema_for_backend = move || -> Option<SessionSchemaEntry> {
         let host_id = state_for_schema.selected_host_id.get()?;
         let kind = backend_kind_sig.get();
-        let entry = match &saved_profile {
+        Some(match &saved_profile {
             Some((profile_id, saved_kind)) if *saved_kind == kind => state_for_schema
                 .launch_profile_catalog
                 .get()
@@ -3781,8 +3780,7 @@ fn LaunchProfileEditor(
                 .get(&host_id)?
                 .get(&kind)?
                 .clone(),
-        };
-        entry.ready_schema().cloned()
+        })
     };
 
     let settings_values: Signal<SessionSettingsValues> =
@@ -3990,7 +3988,7 @@ fn LaunchProfileEditor(
                 <div class="settings-form-label">
                     <span>"Session settings"</span>
                     {move || match schema_for_backend() {
-                        Some(schema)
+                        Some(SessionSchemaEntry::Ready { schema })
                             if !schema.fields.is_empty()
                                 || !session_settings_sig.get().0.is_empty() => view! {
                             <SessionSettingsControls
@@ -4000,10 +3998,18 @@ fn LaunchProfileEditor(
                                 remove_unsupported_keys=true
                             />
                         }.into_any(),
-                        Some(_) => view! {
+                        Some(SessionSchemaEntry::Ready { .. }) => view! {
                             <p class="settings-description">
                                 "This backend has no configurable session settings."
                             </p>
+                        }.into_any(),
+                        Some(SessionSchemaEntry::Pending { .. }) => view! {
+                            <p class="settings-description" role="status">
+                                "Loading session settings…"
+                            </p>
+                        }.into_any(),
+                        Some(SessionSchemaEntry::Unavailable { message, .. }) => view! {
+                            <p class="settings-error" role="alert">{message}</p>
                         }.into_any(),
                         None => view! {
                             <p class="settings-description">
@@ -10246,7 +10252,7 @@ mod wasm_tests {
     // Only the tests construct command-error payloads, so this stays out of the
     // production import list — where it would be an unused import on any target that
     // compiles the crate without the wasm test module.
-    use protocol::SelectOption;
+    use protocol::{SelectOption, SessionSettingsSchema};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
@@ -18912,6 +18918,15 @@ mod wasm_tests {
                 .unwrap()
                 .insert(BackendKind::Muse, muse_schema.clone());
         });
+        let hermes_schema = state.session_schemas.get()["host-lp"][&BackendKind::Hermes].clone();
+        state.session_schemas.update(|hosts| {
+            hosts.get_mut("host-lp").unwrap().insert(
+                BackendKind::Hermes,
+                SessionSchemaEntry::Pending {
+                    backend_kind: BackendKind::Hermes,
+                },
+            );
+        });
         crate::dispatch::reset_inbound_state_for_host("host-lp");
         let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -18936,6 +18951,43 @@ mod wasm_tests {
             .expect("New button")
             .click();
         next_tick().await;
+
+        let form = container.query_selector(".settings-form").unwrap().unwrap();
+        assert_eq!(
+            form.query_selector("[role=status]")
+                .unwrap()
+                .expect("explicit Pending must render loading")
+                .text_content()
+                .as_deref(),
+            Some("Loading session settings…")
+        );
+        assert!(!form.text_content().unwrap().contains("unavailable"));
+        assert!(
+            form.query_selector(".session-setting-select")
+                .unwrap()
+                .is_none()
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-lp",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-lp".to_owned()),
+                FrameKind::SessionSchemas,
+                0,
+                &protocol::SessionSchemasPayload {
+                    schemas: vec![hermes_schema, muse_schema.clone()],
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(form.query_selector("[role=status]").unwrap().is_none());
+        assert!(
+            form.query_selector(".session-setting-select")
+                .unwrap()
+                .is_some()
+        );
+        assert!(form.text_content().unwrap().contains("Sonnet"));
 
         let inputs = container
             .query_selector_all(".settings-form .settings-text-input")
@@ -19081,7 +19133,7 @@ mod wasm_tests {
             protocol::Envelope::from_payload(
                 stream.clone(),
                 FrameKind::HostSettings,
-                0,
+                1,
                 &settings_model::HostSettingsPayload {
                     settings,
                     etag: "saved-profile".to_owned(),
@@ -19096,7 +19148,7 @@ mod wasm_tests {
             protocol::Envelope::from_payload(
                 stream,
                 FrameKind::LaunchProfileCatalogNotify,
-                1,
+                2,
                 &protocol::LaunchProfileCatalogPayload {
                     catalog: protocol::LaunchProfileCatalog {
                         home_custom_agent_id: None,
@@ -19414,8 +19466,11 @@ mod wasm_tests {
 
         let calls = install_settings_send_stub();
         let container = make_container();
+        let state = AppState::new();
+        let mounted_state = state.clone();
+        crate::dispatch::reset_inbound_state_for_host("host-lp");
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
+            let state = mounted_state.clone();
             let mut profile = launch_profile_config("kiro:custom", "Custom ACP");
             profile.backend_kind = BackendKind::Kiro;
             profile.session_settings.0.insert(
@@ -19452,7 +19507,9 @@ mod wasm_tests {
                         default_profile_id: None,
                         custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {
                             launch_profile_id: LaunchProfileId("kiro:custom".to_owned()),
-                            schema: model_schema(&["custom-a", "custom-b"]),
+                            schema: SessionSchemaEntry::Pending {
+                                backend_kind: BackendKind::Kiro,
+                            },
                         }],
                     },
                 );
@@ -19466,6 +19523,87 @@ mod wasm_tests {
             .expect("Edit button")
             .click();
         next_tick().await;
+
+        let form = container.query_selector(".settings-form").unwrap().unwrap();
+        assert_eq!(
+            form.query_selector("[role=status]")
+                .unwrap()
+                .expect("the saved profile's Pending must not use the host's Ready schema")
+                .text_content()
+                .as_deref(),
+            Some("Loading session settings…")
+        );
+        assert!(
+            form.query_selector(".session-setting-select")
+                .unwrap()
+                .is_none()
+        );
+        let publish_profile_schema = |seq, schema: Option<SessionSchemaEntry>| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "host-lp",
+                protocol::Envelope::from_payload(
+                    protocol::StreamPath("/host/host-lp".to_owned()),
+                    FrameKind::LaunchProfileCatalogNotify,
+                    seq,
+                    &protocol::LaunchProfileCatalogPayload {
+                        catalog: protocol::LaunchProfileCatalog {
+                            home_custom_agent_id: None,
+                            entries: Vec::new(),
+                            default_profile_id: None,
+                            custom_profile_schemas: schema
+                                .map(|schema| protocol::LaunchProfileSessionSchema {
+                                    launch_profile_id: LaunchProfileId("kiro:custom".to_owned()),
+                                    schema,
+                                })
+                                .into_iter()
+                                .collect(),
+                        },
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        publish_profile_schema(
+            0,
+            Some(SessionSchemaEntry::Unavailable {
+                backend_kind: BackendKind::Kiro,
+                message: "Authentication is required to discover models.".to_owned(),
+            }),
+        );
+        next_tick().await;
+        assert_eq!(
+            form.query_selector("[role=alert]")
+                .unwrap()
+                .expect("typed Unavailable must retain its server diagnostic")
+                .text_content()
+                .as_deref(),
+            Some("Authentication is required to discover models.")
+        );
+        assert!(form.query_selector("[role=status]").unwrap().is_none());
+        assert!(
+            form.query_selector(".session-setting-select")
+                .unwrap()
+                .is_none()
+        );
+        publish_profile_schema(1, None);
+        next_tick().await;
+        assert!(
+            form.text_content().unwrap().contains(
+                "Session settings for this backend are unavailable on the selected host."
+            )
+        );
+        assert!(form.query_selector("[role=status]").unwrap().is_none());
+        assert!(
+            form.query_selector(".session-setting-select")
+                .unwrap()
+                .is_none()
+        );
+        publish_profile_schema(2, Some(model_schema(&["custom-a", "custom-b"])));
+        next_tick().await;
+        assert!(form.query_selector("[role=status]").unwrap().is_none());
+        assert!(form.query_selector("[role=alert]").unwrap().is_none());
+        assert!(!form.text_content().unwrap().contains("unavailable"));
 
         let select: HtmlSelectElement = container
             .query_selector(".settings-form .session-setting-select")

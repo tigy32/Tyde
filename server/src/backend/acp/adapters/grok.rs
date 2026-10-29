@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
-    AcpAgentAdapter, AcpCapabilities, AcpSessionKind, AcpSessionRoots, AcpSlashCommandCtx,
-    AcpSlashCommandPlan, NormalizedUpdate,
+    AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpSessionKind,
+    AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan, NormalizedUpdate,
 };
 use crate::backend::acp::adapters::stock::pick_local_workspace_root;
 
@@ -21,6 +21,12 @@ const GROK_SESSION_INFO_COMMANDS: &[&str] = &["context", "session-info"];
 
 /// A permission-mode toggle of Grok's own terminal UI; Tyde owns approvals.
 const GROK_TERMINAL_ONLY_COMMANDS: &[&str] = &["always-approve"];
+
+/// Grok's interactive sign-in. Without cached credentials, ACP `authenticate`
+/// with this method opens a browser device login and never replies.
+const GROK_INTERACTIVE_LOGIN_METHOD_ID: &str = "grok.com";
+const GROK_LOGIN_INSTRUCTION: &str =
+    "Sign in to Grok from Getting started on desktop, then try again.";
 
 pub struct GrokAdapter {
     spec: AcpAgentSpec,
@@ -53,6 +59,16 @@ impl AcpAgentAdapter for GrokAdapter {
         // Grok 1.0.13 advertises image=false but accepts ACP ImageContent,
         // preserves it in session history, and sends it to the vision model.
         capabilities.image = true;
+    }
+
+    fn auth_method_handling(&self, method: &AcpAuthMethod) -> AcpAuthMethodHandling {
+        if method.id == GROK_INTERACTIVE_LOGIN_METHOD_ID {
+            AcpAuthMethodHandling::ExternalSetup {
+                instruction: GROK_LOGIN_INSTRUCTION.to_owned(),
+            }
+        } else {
+            AcpAuthMethodHandling::ProtocolAuthenticate
+        }
     }
 
     fn resolve_roots<'a>(

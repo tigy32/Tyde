@@ -7,6 +7,8 @@ mod gate;
 mod script;
 
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +46,8 @@ pub use script::{
 #[derive(Debug, Clone)]
 pub struct MockDiscovery {
     responses: Arc<Mutex<std::collections::VecDeque<Result<super::BackendDiscovery, String>>>>,
+    parked: Option<gate::MockGate>,
+    unwind_next: Arc<AtomicBool>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -55,7 +59,36 @@ impl MockDiscovery {
         );
         Self {
             responses: Arc::new(Mutex::new(responses.into())),
+            parked: None,
+            unwind_next: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Discovery that parks every probe on `gate` until the test releases it,
+    /// standing in for a provider whose probe has not answered.
+    pub fn parked(
+        gate: &MockGateHandle,
+        responses: Vec<Result<super::BackendDiscovery, String>>,
+    ) -> Self {
+        Self {
+            parked: Some(gate.gate()),
+            ..Self::new(responses)
+        }
+    }
+
+    pub fn unwind_next_probe(&self) {
+        self.unwind_next.store(true, Ordering::SeqCst);
+    }
+
+    async fn respond(&self) -> Result<super::BackendDiscovery, String> {
+        if let Some(gate) = &self.parked {
+            gate.wait().await;
+        }
+        assert!(
+            !self.unwind_next.swap(false, Ordering::SeqCst),
+            "controlled mock discovery worker unwind"
+        );
+        self.next()
     }
 
     fn next(&self) -> Result<super::BackendDiscovery, String> {
@@ -640,12 +673,14 @@ impl Backend for MockBackend {
     #[cfg(any(test, feature = "test-support"))]
     async fn discover_in_workspace(
         context: &super::BackendProbeContext,
-    ) -> Result<super::BackendDiscovery, String> {
+    ) -> Result<super::BackendDiscovery, super::BackendDiscoveryError> {
         context
             .mock_discovery
             .as_ref()
             .ok_or_else(|| "mock discovery not configured".to_owned())?
-            .next()
+            .respond()
+            .await
+            .map_err(super::BackendDiscoveryError::from)
     }
 
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {

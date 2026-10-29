@@ -47,9 +47,9 @@ use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
 use crate::backend::{
-    BackendExecutionMode, BackendStartupError, CancelBackgroundTaskOutcome, SessionCommand,
-    StartupMcpServer, StartupMcpTransport, SteerOutcome, normalize_mcp_call_tool_result,
-    render_combined_spawn_instructions,
+    BackendDiscoveryError, BackendExecutionMode, BackendStartupError, CancelBackgroundTaskOutcome,
+    SessionCommand, StartupMcpServer, StartupMcpTransport, SteerOutcome,
+    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -2907,7 +2907,7 @@ pub(crate) async fn read_capacity_out_of_band(
 
 pub(crate) async fn probe_session_settings_schema(
     program: Option<&str>,
-) -> Result<SessionSettingsSchema, String> {
+) -> Result<SessionSettingsSchema, BackendDiscoveryError> {
     let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
         None,
         &[],
@@ -2933,7 +2933,8 @@ pub(crate) async fn probe_session_settings_schema(
         return codex_probe_result_with_cleanup(
             Err(format!("Codex model discovery initialize failed: {err}")),
             rpc.terminate().await,
-        );
+        )
+        .map_err(BackendDiscoveryError::from);
     }
 
     let response = rpc
@@ -2954,7 +2955,12 @@ pub(crate) async fn probe_session_settings_schema(
     let models = codex_model_metadata_from_raw(raw_models);
 
     if models.is_empty() {
-        return Err("Codex model discovery model/list returned no usable models".to_string());
+        let message = "Codex model discovery model/list returned no usable models".to_string();
+        return Err(if raw_models.is_empty() {
+            BackendDiscoveryError::no_models(message)
+        } else {
+            message.into()
+        });
     }
 
     Ok(codex_session_settings_schema(models))
@@ -23651,7 +23657,7 @@ impl Backend for CodexBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, BackendDiscoveryError> {
         Ok(crate::backend::BackendDiscovery {
             schema: probe_session_settings_schema(context.program.as_deref()).await?,
             launch_profiles: Vec::new(),

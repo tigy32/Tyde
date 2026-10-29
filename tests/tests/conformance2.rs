@@ -13134,6 +13134,41 @@ async fn real_process_launch<B: Backend>(host: &mut Harness<B>) {
 
 conformance2_scenario!(real_process_launch, []);
 
+async fn real_signed_out_discovery_settles<B: Backend>(host: &mut Harness<B>) {
+    if !isolated_signed_out_case(host).await {
+        return;
+    }
+    let discovery = B::discover(&server::backend::BackendProbeContext {
+        workspace_roots: host.workspace_roots(),
+        ..Default::default()
+    })
+    .await;
+    match discovery {
+        Ok(discovery) => {
+            eprintln!("Fresh-home discovery outcome: Ready");
+            assert_eq!(discovery.schema.backend_kind, host.backend());
+        }
+        Err(error) => {
+            retain_signed_out_discovery_error(host.backend(), &error);
+            eprintln!("Fresh-home discovery outcome: {:?}", error.kind);
+            assert!(
+                matches!(
+                    error.kind,
+                    server::backend::BackendDiscoveryErrorKind::AuthenticationRequired
+                        | server::backend::BackendDiscoveryErrorKind::NoModels
+                ),
+                "fresh-home discovery failed its actual runtime prerequisites or protocol"
+            );
+            assert!(
+                !error.message.trim().is_empty(),
+                "fresh-home discovery must say why the provider is unavailable"
+            );
+        }
+    }
+}
+
+conformance2_scenario!(real_signed_out_discovery_settles, []);
+
 async fn real_conversation<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let payload = unique_payload();
@@ -15876,7 +15911,7 @@ fn real_codex_discovery_lifecycle() {
                 .expect("discovery task must not panic")
                 .expect_err("disconnected real app-server must fail discovery");
             assert!(
-                dead.contains("exited before response"),
+                dead.message.contains("exited before response"),
                 "report process death, not a request deadline: {dead}"
             );
 

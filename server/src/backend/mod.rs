@@ -1214,6 +1214,58 @@ pub struct BackendDiscovery {
     pub launch_profiles: Vec<protocol::LaunchProfileEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendDiscoveryErrorKind {
+    Failed,
+    AuthenticationRequired,
+    NoModels,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendDiscoveryError {
+    pub kind: BackendDiscoveryErrorKind,
+    pub message: String,
+}
+
+impl BackendDiscoveryError {
+    pub(crate) fn authentication_required(message: String) -> Self {
+        Self {
+            kind: BackendDiscoveryErrorKind::AuthenticationRequired,
+            message,
+        }
+    }
+
+    pub(crate) fn no_models(message: String) -> Self {
+        Self {
+            kind: BackendDiscoveryErrorKind::NoModels,
+            message,
+        }
+    }
+}
+
+impl From<String> for BackendDiscoveryError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: BackendDiscoveryErrorKind::Failed,
+            message,
+        }
+    }
+}
+
+impl From<BackendDiscoveryError> for String {
+    fn from(error: BackendDiscoveryError) -> Self {
+        error.message
+    }
+}
+
+impl std::fmt::Display for BackendDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BackendDiscoveryError {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TokenUsageTrackingMode {
     #[default]
@@ -1357,7 +1409,7 @@ pub trait Backend: Send + Sync + 'static {
 
     fn discover(
         context: &BackendProbeContext,
-    ) -> impl std::future::Future<Output = Result<BackendDiscovery, String>> + Send
+    ) -> impl std::future::Future<Output = Result<BackendDiscovery, BackendDiscoveryError>> + Send
     where
         Self: Sized,
     {
@@ -1369,7 +1421,7 @@ pub trait Backend: Send + Sync + 'static {
 
     fn discover_in_workspace(
         context: &BackendProbeContext,
-    ) -> impl std::future::Future<Output = Result<BackendDiscovery, String>> + Send
+    ) -> impl std::future::Future<Output = Result<BackendDiscovery, BackendDiscoveryError>> + Send
     where
         Self: Sized,
     {
@@ -2814,9 +2866,11 @@ pub(crate) async fn discover(
 ) -> Result<BackendDiscovery, String> {
     #[cfg(any(test, feature = "test-support"))]
     if context.has_mock_discovery() {
-        return mock::MockBackend::discover(context).await;
+        return mock::MockBackend::discover(context)
+            .await
+            .map_err(String::from);
     }
-    with_backend_type!(kind, |B| B::discover(context).await, removed => Err("Tycode backend has been removed".to_owned()))
+    with_backend_type!(kind, |B| B::discover(context).await.map_err(String::from), removed => Err("Tycode backend has been removed".to_owned()))
 }
 
 pub(crate) fn has_dynamic_session_schema(kind: BackendKind) -> bool {

@@ -38,12 +38,12 @@ use crate::backend::{
     BackendCompactionProgress, BackendCompactionRequest, BackendCompactionResult,
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
     BackendCompactionUnavailableReason, BackendCompactionUserFocus,
-    BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
-    BackendSpawnConfig, BackendStartupError, CancelBackgroundTaskOutcome, EventStream,
-    PostCompactionTokenCount, SendOutcome, StartupMcpServer, StartupMcpTransport, SteerOutcome,
-    backend_fork_unsupported_message, normalize_mcp_call_tool_result,
-    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
-    tyde_owned_no_root_cwd,
+    BackendCompactionUserFocusProvenance, BackendDiscoveryError, BackendEvent,
+    BackendObservedCompaction, BackendSession, BackendSpawnConfig, BackendStartupError,
+    CancelBackgroundTaskOutcome, EventStream, PostCompactionTokenCount, SendOutcome,
+    StartupMcpServer, StartupMcpTransport, SteerOutcome, backend_fork_unsupported_message,
+    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
+    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
 };
 use crate::mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
@@ -1636,7 +1636,7 @@ impl Backend for HermesBackend {
 
     async fn discover_in_workspace(
         context: &crate::backend::BackendProbeContext,
-    ) -> Result<crate::backend::BackendDiscovery, String> {
+    ) -> Result<crate::backend::BackendDiscovery, BackendDiscoveryError> {
         let probe =
             probe_session_settings_schema(&context.workspace_roots, &context.disabled_providers)
                 .await?;
@@ -2768,7 +2768,7 @@ pub(crate) struct HermesSessionSchemaProbe {
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
     disabled_providers: &HashMap<String, Vec<String>>,
-) -> Result<HermesSessionSchemaProbe, String> {
+) -> Result<HermesSessionSchemaProbe, BackendDiscoveryError> {
     let profiles = hermes_config::discover_profiles()?;
     let probes = futures_util::future::join_all(
         profiles
@@ -2788,7 +2788,7 @@ fn session_schema_probe_from_model_options(
     profiles: &[HermesProfileRef],
     payloads: Vec<Result<Value, String>>,
     disabled_providers: &HashMap<String, Vec<String>>,
-) -> Result<HermesSessionSchemaProbe, String> {
+) -> Result<HermesSessionSchemaProbe, BackendDiscoveryError> {
     struct ProfileModels {
         name: String,
         options: Vec<SelectOption>,
@@ -2802,10 +2802,13 @@ fn session_schema_probe_from_model_options(
             .get(&profile.name)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let parsed = payload.and_then(|payload| {
-            model_select_options_from_payload(&payload, disabled)
-                .map(|(options, default)| (options, default, model_summary_from_payload(&payload)))
-        });
+        let parsed = payload
+            .map_err(BackendDiscoveryError::from)
+            .and_then(|payload| {
+                model_select_options_from_payload(&payload, disabled).map(|(options, default)| {
+                    (options, default, model_summary_from_payload(&payload))
+                })
+            });
         match parsed {
             Ok((options, default, summary)) => {
                 infos.push(HermesLaunchProfileInfo {
@@ -2826,7 +2829,7 @@ fn session_schema_probe_from_model_options(
                 infos.push(HermesLaunchProfileInfo {
                     name: profile.name.clone(),
                     summary: None,
-                    error: Some(error),
+                    error: Some(error.into()),
                 });
             }
         }
@@ -8403,13 +8406,14 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
 fn model_select_options_from_payload(
     value: &Value,
     disabled: &[String],
-) -> Result<(Vec<SelectOption>, Option<String>), String> {
+) -> Result<(Vec<SelectOption>, Option<String>), BackendDiscoveryError> {
     let providers = value
         .get("providers")
         .and_then(Value::as_array)
         .ok_or_else(|| "Hermes model.options response missing providers array".to_string())?;
-    let current_provider =
-        optional_present_non_empty_string(value, &["provider"], "model.options")?;
+    // Hermes can publish an empty current provider alongside a usable catalog.
+    let current_provider = optional_raw_string(value, &["provider"], "model.options")?
+        .and_then(|provider| non_empty_trimmed(&provider));
     let current_model = optional_present_non_empty_string(value, &["model"], "model.options")?;
     let mut model_options = Vec::new();
     let mut model_default = None;
@@ -8418,7 +8422,8 @@ fn model_select_options_from_payload(
         if !provider.is_object() {
             return Err(format!(
                 "Hermes model.options providers[{provider_index}] must be an object"
-            ));
+            )
+            .into());
         }
         let provider_context = format!("model.options providers[{provider_index}]");
         let slug = required_non_empty_string(provider, &["slug"], &provider_context)?;
@@ -8443,12 +8448,14 @@ fn model_select_options_from_payload(
             let Some(model) = model.as_str() else {
                 return Err(format!(
                     "Hermes model.options providers[{provider_index}] '{slug}' models[{model_index}] must be a string"
-                ));
+                )
+                .into());
             };
             let Some(model) = non_empty_trimmed(model) else {
                 return Err(format!(
                     "Hermes model.options providers[{provider_index}] '{slug}' models[{model_index}] must be non-empty"
-                ));
+                )
+                .into());
             };
             if !authenticated || disabled.contains(&slug) {
                 continue;
@@ -8472,14 +8479,17 @@ fn model_select_options_from_payload(
         // Hermes install, and sending the user hunting for that when they
         // simply disabled every provider in Tyde would be actively misleading.
         return Err(if disabled.is_empty() {
-            "Hermes model.options reported no authenticated providers with selectable models"
-                .to_string()
+            BackendDiscoveryError::no_models(
+                "Hermes model.options reported no authenticated providers with selectable models"
+                    .to_string(),
+            )
         } else {
             format!(
                 "every authenticated Hermes provider is disabled in Tyde for this profile \
                  ({}); re-enable one in the Hermes settings Providers tab",
                 disabled.join(", ")
             )
+            .into()
         });
     }
 
