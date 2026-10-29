@@ -150,6 +150,7 @@ fn pairing_status_line(phase: &MobilePairingState) -> Option<String> {
 
 const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_CHAT_APPEARANCE: &str = "tyde-chat-appearance";
+const STORAGE_FLOW_SHOW_REASONING: &str = "tyde-flow-show-reasoning";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
 const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
 const STORAGE_SYNTAX_THEME: &str = "tyde-syntax-theme";
@@ -350,6 +351,27 @@ pub fn restore_appearance(state: &AppState) {
             crate::notices::report_error(
                 crate::notices::NoticeScope::Settings(None),
                 "Could not restore chat presentation. Enable local storage and choose a presentation in Appearance.",
+            );
+        }
+    }
+
+    match storage.get_item(STORAGE_FLOW_SHOW_REASONING) {
+        Ok(Some(raw)) => match raw.as_str() {
+            "true" => state.flow_show_reasoning.set(true),
+            "false" => state.flow_show_reasoning.set(false),
+            _ => {
+                crate::notices::report_error(
+                    crate::notices::NoticeScope::Settings(None),
+                    "Unrecognized Flow reasoning setting. Choose Show reasoning in Appearance.",
+                );
+            }
+        },
+        Ok(None) => state.flow_show_reasoning.set(false),
+        Err(error) => {
+            log::error!("Could not restore Flow reasoning setting: {error:?}");
+            crate::notices::report_error(
+                crate::notices::NoticeScope::Settings(None),
+                "Could not restore Flow reasoning setting. Enable local storage and choose Show reasoning in Appearance.",
             );
         }
     }
@@ -618,6 +640,8 @@ impl SettingsTab {
                 "Default",
                 "Flow",
                 "Notebook",
+                "Show reasoning",
+                "Reasoning",
                 "Color Theme",
                 "Choose the color scheme for the interface",
                 "Dark",
@@ -2194,6 +2218,50 @@ fn AppearanceTab() -> impl IntoView {
                     }).collect::<Vec<_>>()}
                 </select>
             </div>
+
+            <Show when=move || state.chat_appearance.get() == crate::appearance::ChatAppearance::Ink>
+                <div class="settings-field">
+                    <div class="settings-toggle-row">
+                        <div>
+                            <label class="settings-label" for="flow-show-reasoning">"Show reasoning"</label>
+                        </div>
+                        <label class="settings-toggle">
+                            <input
+                                id="flow-show-reasoning"
+                                type="checkbox"
+                                aria-label="Show reasoning"
+                                prop:checked=move || state.flow_show_reasoning.get()
+                                on:change=move |ev: web_sys::Event| {
+                                    let input: web_sys::HtmlInputElement = event_target(&ev);
+                                    let enabled = input.checked();
+                                    input.set_checked(state.flow_show_reasoning.get_untracked());
+                                    let Some(storage) = local_storage() else {
+                                        crate::notices::report_error(
+                                            crate::notices::NoticeScope::Settings(None),
+                                            "Could not save Flow reasoning setting: local storage unavailable.",
+                                        );
+                                        return;
+                                    };
+                                    if let Err(error) = storage.set_item(
+                                        STORAGE_FLOW_SHOW_REASONING,
+                                        if enabled { "true" } else { "false" },
+                                    ) {
+                                        log::error!("Could not save Flow reasoning setting: {error:?}");
+                                        crate::notices::report_error(
+                                            crate::notices::NoticeScope::Settings(None),
+                                            "Could not save Flow reasoning setting.",
+                                        );
+                                        return;
+                                    }
+                                    state.flow_show_reasoning.set(enabled);
+                                    input.set_checked(enabled);
+                                }
+                            />
+                            <span class="settings-toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </Show>
 
             <div class="settings-field">
                 <label class="settings-label">{move || format!("Font size ({}px)", state.font_size.get())}</label>
@@ -10664,11 +10732,13 @@ mod wasm_tests {
         let document = window.document().unwrap();
         let storage = window.local_storage().unwrap().unwrap();
         let previous = storage.get_item(STORAGE_CHAT_APPEARANCE).unwrap();
+        let previous_flow_reasoning = storage.get_item(STORAGE_FLOW_SHOW_REASONING).unwrap();
         let previous_theme = storage.get_item(STORAGE_THEME).unwrap();
         let root = document.document_element().unwrap();
         let previous_scheme = root.get_attribute("data-theme");
         let previous_appearance = root.get_attribute("data-appearance-theme");
         storage.remove_item(STORAGE_CHAT_APPEARANCE).unwrap();
+        storage.remove_item(STORAGE_FLOW_SHOW_REASONING).unwrap();
         let calls = install_settings_send_stub();
         let style = document.create_element("style").unwrap();
         style.set_text_content(Some(include_str!("../../styles.css")));
@@ -10896,6 +10966,24 @@ mod wasm_tests {
         assert!(
             storage.get_item(STORAGE_CHAT_APPEARANCE).unwrap().is_none(),
             "startup must not migrate the preference"
+        );
+        assert!(
+            !state.flow_show_reasoning.get_untracked(),
+            "Flow reasoning is off by default when unset"
+        );
+        assert!(
+            storage
+                .get_item(STORAGE_FLOW_SHOW_REASONING)
+                .unwrap()
+                .is_none(),
+            "startup must not write a Flow reasoning migration value"
+        );
+        assert!(
+            settings
+                .query_selector("input[aria-label='Show reasoning']")
+                .unwrap()
+                .is_none(),
+            "Show reasoning is only offered when Flow is selected"
         );
         let input: web_sys::HtmlTextAreaElement = chat
             .query_selector("textarea")
@@ -11586,6 +11674,91 @@ mod wasm_tests {
             restored.chat_appearance.get_untracked(),
             crate::appearance::ChatAppearance::Ink
         );
+        assert!(
+            !restored.flow_show_reasoning.get_untracked(),
+            "unset Flow reasoning restores as off"
+        );
+        assert!(
+            settings
+                .query_selector("input[aria-label='Show reasoning']")
+                .unwrap()
+                .is_none(),
+            "Notebook does not expose Flow's reasoning toggle"
+        );
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        next_tick().await;
+        let flow_reasoning_toggle: HtmlInputElement = settings
+            .query_selector("input[aria-label='Show reasoning']")
+            .unwrap()
+            .expect("Flow appearance exposes Show reasoning toggle")
+            .dyn_into()
+            .unwrap();
+        assert!(!flow_reasoning_toggle.checked());
+        flow_reasoning_toggle.click();
+        next_tick().await;
+        assert!(flow_reasoning_toggle.checked());
+        assert!(state.flow_show_reasoning.get_untracked());
+        assert_eq!(
+            storage
+                .get_item(STORAGE_FLOW_SHOW_REASONING)
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "toggling Show reasoning on persists true"
+        );
+        restore_appearance(&restored);
+        assert!(
+            restored.flow_show_reasoning.get_untracked(),
+            "persisted Show reasoning=true survives reload"
+        );
+        picker.set_value("notebook");
+        picker
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            settings
+                .query_selector("input[aria-label='Show reasoning']")
+                .unwrap()
+                .is_none(),
+            "Notebook does not expose Flow's reasoning toggle"
+        );
+        assert!(
+            state.flow_show_reasoning.get_untracked(),
+            "switching appearances preserves the user's Flow reasoning choice"
+        );
+        picker.set_value("ink");
+        picker
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        let flow_reasoning_toggle: HtmlInputElement = settings
+            .query_selector("input[aria-label='Show reasoning']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(flow_reasoning_toggle.checked());
+        flow_reasoning_toggle.click();
+        next_tick().await;
+        assert!(!flow_reasoning_toggle.checked());
+        assert!(!state.flow_show_reasoning.get_untracked());
+        assert_eq!(
+            storage
+                .get_item(STORAGE_FLOW_SHOW_REASONING)
+                .unwrap()
+                .as_deref(),
+            Some("false"),
+            "toggling Show reasoning off persists false"
+        );
+        let restored_off = AppState::new();
+        restore_appearance(&restored_off);
+        assert!(
+            !restored_off.flow_show_reasoning.get_untracked(),
+            "persisted Show reasoning=false survives reload"
+        );
         emit(ChatEvent::TypingStatusChanged(false));
         input.set_value("");
         input
@@ -11666,6 +11839,10 @@ mod wasm_tests {
         match previous {
             Some(id) => storage.set_item(STORAGE_CHAT_APPEARANCE, &id).unwrap(),
             None => storage.remove_item(STORAGE_CHAT_APPEARANCE).unwrap(),
+        }
+        match previous_flow_reasoning {
+            Some(val) => storage.set_item(STORAGE_FLOW_SHOW_REASONING, &val).unwrap(),
+            None => storage.remove_item(STORAGE_FLOW_SHOW_REASONING).unwrap(),
         }
 
         assert!(crate::syntax_highlight::set_selected_theme(

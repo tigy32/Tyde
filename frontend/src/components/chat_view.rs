@@ -203,14 +203,20 @@ pub fn ChatView(
     // and subscribes to nothing here.
     let ink_state = state.clone();
     let ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>> = Memo::new(move |_| {
-        if !ink_state.chat_appearance.get().uses_ink_chrome() {
+        let appearance = ink_state.chat_appearance.get();
+        if !appearance.uses_ink_chrome() {
             return None;
         }
+        let flow_show_reasoning = ink_state.flow_show_reasoning.get();
         active_agent_id()?;
         let mut span = CaptureSpan::new(ChatProjection::InkLayout);
         let rows = row_handles();
         span.items(rows.len());
-        Some(Arc::new(ink_row_layouts(&rows)))
+        Some(Arc::new(ink_row_layouts(
+            &rows,
+            appearance,
+            flow_show_reasoning,
+        )))
     });
 
     let prior_history: Signal<Option<crate::state::SessionHistoryState>> =
@@ -790,6 +796,13 @@ pub fn ChatView(
             // what the browser actually lays out. The very first row
             // gets no leading gap.
             let slot_height = |idx: usize| -> f64 {
+                if layouts
+                    .as_ref()
+                    .and_then(|layouts| layouts.get(&rows[idx].id))
+                    .is_some_and(|layout| layout.empty)
+                {
+                    return 0.0;
+                }
                 let raw = map
                     .get(&rows[idx].id)
                     .copied()
@@ -1222,6 +1235,9 @@ fn MeasuredRow(
             }
             if layout.actions_only {
                 class.push_str(" ink-actions-only");
+            }
+            if layout.empty {
+                class.push_str(" ink-empty");
             }
             class
         })
@@ -2896,10 +2912,50 @@ mod wasm_tests {
         // The user explicitly replaced the old folded-action contract:
         // Summary hides output, never the action chronology itself.
         settle().await;
+        assert!(
+            visible(".chat-card-reasoning").is_empty(),
+            "Flow hides reasoning disclosures by default when Show reasoning is off"
+        );
+        state.flow_show_reasoning.set(true);
+        settle().await;
         assert_eq!(
             visible(".chat-card-reasoning").len(),
             1,
-            "reasoning retains its own disclosure beside visible actions"
+            "enabling Show reasoning reveals the compact disclosure beside visible actions"
+        );
+        {
+            let reasoning_summary = container
+                .query_selector(".chat-card-reasoning summary")
+                .unwrap()
+                .unwrap();
+            let sender = container
+                .query_selector(".token-stat-agent")
+                .unwrap()
+                .unwrap();
+            let px_of = |el: &Element| -> f64 {
+                web_sys::window()
+                    .unwrap()
+                    .get_computed_style(el)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("font-size")
+                    .unwrap()
+                    .trim_end_matches("px")
+                    .parse()
+                    .unwrap()
+            };
+            assert!(
+                px_of(&reasoning_summary) < px_of(&sender),
+                "Flow reasoning summary ({}px) stays smaller than sender label ({}px)",
+                px_of(&reasoning_summary),
+                px_of(&sender)
+            );
+        }
+        state.flow_show_reasoning.set(false);
+        settle().await;
+        assert!(
+            visible(".chat-card-reasoning").is_empty(),
+            "disabling Show reasoning hides Flow reasoning again while keeping text and tools"
         );
         assert_eq!(bylines(), 1, "the stretch carries a single byline");
         let headers = command_headers();
@@ -3106,6 +3162,18 @@ mod wasm_tests {
         settle().await;
         assert_eq!(command_headers().len(), 3, "Current shows every tool card");
         assert_eq!(bylines(), 4, "Current keeps a byline per reply");
+        assert_eq!(
+            visible(".chat-card-reasoning").len(),
+            1,
+            "Default presentation still renders reasoning when Flow Show reasoning is off"
+        );
+        state.chat_appearance.set(ChatAppearance::Notebook);
+        settle().await;
+        assert_eq!(
+            visible(".chat-card-reasoning").len(),
+            1,
+            "Notebook presentation still renders reasoning when Flow Show reasoning is off"
+        );
         state.chat_appearance.set(ChatAppearance::Ink);
         settle().await;
         assert_eq!(command_headers().len(), 3);
@@ -3775,6 +3843,171 @@ mod wasm_tests {
             messages.scroll_width() <= messages.client_width(),
             "narrow Flow contains expanded command, code, image, and failure output"
         );
+        container.style().set_property("width", "800px").unwrap();
+        settle().await;
+        dispatch(ChatEvent::MessageAdded(protocol::ChatMessage {
+            origin: None,
+            message_id: None,
+            timestamp: 10,
+            sender: protocol::MessageSender::User,
+            content: "Check reasoning-only stream and turn".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }));
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "codex".to_owned(),
+            model: Some("gpt-test".to_owned()),
+        }));
+        dispatch(ChatEvent::StreamReasoningDelta(
+            protocol::StreamTextDeltaData {
+                text: "Planning before emitting any prose or tool.".to_owned(),
+            },
+        ));
+        settle().await;
+        assert!(
+            container
+                .query_selector(".chat-card-streaming")
+                .unwrap()
+                .is_none(),
+            "reasoning-only stream in Flow with Show reasoning off leaves no empty card"
+        );
+        assert!(
+            container
+                .query_selector(".chat-card-thinking")
+                .unwrap()
+                .is_none(),
+            "Flow never renders a replacement Thinking… line"
+        );
+        state.flow_show_reasoning.set(true);
+        settle().await;
+        assert!(
+            container
+                .query_selector(".chat-card-streaming .chat-card-reasoning")
+                .unwrap()
+                .is_some(),
+            "enabling Show reasoning reveals the live reasoning disclosure in Flow"
+        );
+        assert!(
+            container
+                .query_selector(".chat-card-thinking")
+                .unwrap()
+                .is_none(),
+            "Flow omits the redundant Thinking… line even when Show reasoning is on"
+        );
+        assert!(
+            container
+                .query_selector(".chat-card-streaming .chat-card-body")
+                .unwrap()
+                .is_none(),
+            "Flow omits an empty body box while only reasoning is streaming"
+        );
+        let live_summary: HtmlElement = container
+            .query_selector(".chat-card-streaming .chat-card-reasoning summary")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let live_sender: Element = container
+            .query_selector(".chat-card-streaming .chat-card-sender")
+            .unwrap()
+            .unwrap();
+        let font_px = |el: &Element| -> f64 {
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(el)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-size")
+                .unwrap()
+                .trim_end_matches("px")
+                .parse()
+                .unwrap()
+        };
+        assert!(
+            font_px(live_summary.as_ref()) < font_px(&live_sender),
+            "live Flow reasoning summary is visually smaller than the sender header"
+        );
+        live_summary.click();
+        settle().await;
+        let live_reasoning = container
+            .query_selector(".chat-card-streaming .reasoning-content")
+            .unwrap()
+            .expect("expanding Flow reasoning reveals the live trace");
+        assert!(
+            live_reasoning
+                .text_content()
+                .unwrap_or_default()
+                .contains("Planning before emitting any prose or tool.")
+        );
+        state.flow_show_reasoning.set(false);
+        settle().await;
+        let assistant_cards_before = visible(".chat-card-assistant").len();
+        let mut standalone_reasoning = assistant("");
+        standalone_reasoning.reasoning = Some(protocol::ReasoningData {
+            text: "Planning before emitting any prose or tool.".to_owned(),
+            tokens: Some(9),
+            signature: None,
+            blob: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: standalone_reasoning,
+        }));
+        settle().await;
+        assert_eq!(
+            visible(".chat-card-assistant").len(),
+            assistant_cards_before,
+            "completed reasoning-only message leaves no empty card when Show reasoning is off"
+        );
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "codex".to_owned(),
+            model: Some("gpt-test".to_owned()),
+        }));
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: "Visible answer after hidden reasoning.".to_owned(),
+        }));
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: assistant("Visible answer after hidden reasoning."),
+        }));
+        settle().await;
+        let reply_after_reasoning = visible(".chat-card-assistant")
+            .into_iter()
+            .find(|card| text_of(card).contains("Visible answer after hidden reasoning."))
+            .expect("visible reply after hidden reasoning-only message");
+        let reply_footer = reply_after_reasoning
+            .query_selector(".chat-card-footer")
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply_footer.get_bounding_client_rect().height() > 0.0
+                && web_sys::window()
+                    .unwrap()
+                    .get_computed_style(&reply_footer)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("opacity")
+                    .unwrap()
+                    != "0",
+            "byline footer on the visible reply is rendered and opaque"
+        );
+        state.flow_show_reasoning.set(true);
+        settle().await;
+        for summary in visible(".chat-card-reasoning summary") {
+            summary.dyn_ref::<HtmlElement>().unwrap().click();
+        }
+        settle().await;
+        assert!(
+            visible(".reasoning-content")
+                .iter()
+                .any(|content| text_of(content)
+                    .contains("Planning before emitting any prose or tool.")),
+            "enabling Show reasoning and expanding reveals the completed reasoning-only message trace"
+        );
+        state.flow_show_reasoning.set(false);
+        settle().await;
         drop(handle);
         container.remove();
     }

@@ -1912,3 +1912,48 @@
 .chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-time::before {
     content: "· ";
 }
+
+.chat-view[data-chat-appearance="ink"] .virt-row.ink-empty {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning {
+    margin-block: 0;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning:not(:last-child) {
+    margin-bottom: 4px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary {
+    gap: 6px;
+    padding: 1px 6px 1px 0;
+    font-size: .846rem;
+    line-height: 1.4;
+    color: var(--text-tertiary);
+    font-weight: 400;
+    font-family: var(--font-sans);
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary::before {
+    width: 5px;
+    height: 5px;
+    margin: 0 3px 0 2px;
+    border-right-width: 1.25px;
+    border-bottom-width: 1.25px;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-reasoning summary:hover {
+    color: var(--text-secondary);
+}
+
+.chat-view[data-chat-appearance="ink"] .reasoning-content {
+    margin: 2px 0 6px 2px;
+    padding: 2px 0 2px 10px;
+    border-left: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    font-size: .846rem;
+    line-height: 1.45;
+    font-family: var(--font-sans);
+}
+

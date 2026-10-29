@@ -31,6 +31,15 @@ pub fn ChatStreamingView(
 ) -> impl IntoView {
     let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
     let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
+    let is_flow = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_some_and(|layout| layout.is_flow))
+    });
+    let show_reasoning = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_none_or(|layout| layout.show_reasoning))
+    });
+    let is_empty = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_some_and(|layout| layout.empty))
+    });
     let show_header = Memo::new(move |_| {
         ink_layout.with(|layout| layout.as_ref().is_none_or(|layout| layout.byline))
     });
@@ -41,6 +50,10 @@ pub fn ChatStreamingView(
     let model = streaming.model;
 
     let throttled_text = throttled_string_signal(text.clone(), clone_text, None);
+    let has_body = Memo::new({
+        let throttled = throttled_text.clone();
+        move |_| throttled.with(|current| !current.trim().is_empty())
+    });
     // Ink keeps live reasoning folded behind its quiet label.
     let reasoning_open = RwSignal::new(!is_ink.get_untracked());
     let throttled_reasoning = throttled_string_signal(
@@ -49,94 +62,115 @@ pub fn ChatStreamingView(
         Some(reasoning_open),
     );
     let throttled_reasoning_slot = StoredValue::new_local(throttled_reasoning);
-    let reasoning_has_content = Memo::new(move |_| reasoning.with(|text| !text.is_empty()));
+    let reasoning_has_content = Memo::new(move |_| {
+        reasoning.with(|text| {
+            if is_flow.get() {
+                !text.trim().is_empty()
+            } else {
+                !text.is_empty()
+            }
+        })
+    });
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let throttled_text_slot = StoredValue::new_local(throttled_text);
+    let tool_requests_slot = StoredValue::new_local(tool_requests);
+    let agent_name_slot = StoredValue::new_local(agent_name);
+    let model_slot = StoredValue::new_local(model);
 
     view! {
-        <div class="chat-card chat-card-assistant chat-card-streaming">
-            <Show when=move || show_header.get()>
-                <div class="chat-card-header">
-                    <span class="chat-card-sender">{agent_name.clone()}</span>
-                    {model.clone().map(|m| view! {
-                        <span class="chat-card-model">{m}</span>
-                    })}
-                    <span class="streaming-dot"></span>
-                </div>
-            </Show>
-            {move || {
-                if !reasoning_has_content.get() {
-                    None
-                } else {
-                    Some(view! {
-                        <details
-                            class="chat-card-reasoning"
-                            open=reasoning_open.get_untracked()
-                            on:toggle=move |ev: leptos::ev::Event| {
-                                if let Some(target) = ev.target()
-                                    && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
-                                {
-                                    reasoning_open.set(el.open());
-                                }
-                            }
-                        >
-                            <summary>
-                                {move || if is_ink.get() {
-                                    "Reasoning".into_any()
-                                } else {
-                                    view! {
-                                        <span class="reasoning-icon">"💭"</span>
-                                        " Thinking"
+        <Show when=move || !is_empty.get()>
+            <div class="chat-card chat-card-assistant chat-card-streaming">
+                <Show when=move || show_header.get()>
+                    <div class="chat-card-header">
+                        <span class="chat-card-sender">{agent_name_slot.with_value(Clone::clone)}</span>
+                        {model_slot.with_value(Clone::clone).map(|m| view! {
+                            <span class="chat-card-model">{m}</span>
+                        })}
+                        <span class="streaming-dot"></span>
+                    </div>
+                </Show>
+                {move || {
+                    if !show_reasoning.get() || !reasoning_has_content.get() {
+                        None
+                    } else {
+                        Some(view! {
+                            <details
+                                class="chat-card-reasoning"
+                                open=reasoning_open.get_untracked()
+                                on:toggle=move |ev: leptos::ev::Event| {
+                                    if let Some(target) = ev.target()
+                                        && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
+                                    {
+                                        reasoning_open.set(el.open());
                                     }
-                                    .into_any()
-                                }}
-                            </summary>
-                            <Show when=move || reasoning_open.get()>
-                                <pre class="reasoning-content">
-                                    {move || throttled_reasoning_slot.with_value(|signal| signal.get())}
-                                </pre>
-                            </Show>
-                        </details>
-                    })
-                }
-            }}
-            <div class="chat-card-body" node_ref=body_ref>
-                {
-                    let throttled = throttled_text.clone();
-                    move || {
-                        // Read through `with` so render_markdown sees the
-                        // string in place rather than getting a fresh clone.
-                        // Markdown re-rendering at 30Hz over a long
-                        // response shouldn't also pay a per-tick String
-                        // clone of the accumulated text.
-                        throttled.with(|current| {
-                            if current.is_empty() {
-                                view! { <p class="chat-card-thinking">"Thinking\u{2026}"</p> }
-                                    .into_any()
-                            } else {
-                                let html = render_markdown(current);
-                                view! {
-                                    <>
-                                        <div inner_html=html></div>
-                                        <span class="streaming-cursor"></span>
-                                    </>
                                 }
-                                .into_any()
-                            }
+                            >
+                                <summary>
+                                    {move || if is_ink.get() {
+                                        "Reasoning".into_any()
+                                    } else {
+                                        view! {
+                                            <span class="reasoning-icon">"💭"</span>
+                                            " Thinking"
+                                        }
+                                        .into_any()
+                                    }}
+                                </summary>
+                                <Show when=move || reasoning_open.get()>
+                                    <pre class="reasoning-content">
+                                        {move || throttled_reasoning_slot.with_value(|signal| signal.get())}
+                                    </pre>
+                                </Show>
+                            </details>
                         })
                     }
-                }
-            </div>
-            {move || {
-                if tool_requests.with(|tools| tools.is_empty()) {
-                    None
-                } else {
-                    Some(view! {
-                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() />
+                }}
+                <Show when=move || !is_flow.get() || has_body.get()>
+                    <div class="chat-card-body" node_ref=body_ref>
+                        {move || {
+                            // Read through `with` so render_markdown sees the
+                            // string in place rather than getting a fresh clone.
+                            // Markdown re-rendering at 30Hz over a long
+                            // response shouldn't also pay a per-tick String
+                            // clone of the accumulated text.
+                            throttled_text_slot.with_value(|throttled| {
+                                throttled.with(|current| {
+                                    if current.is_empty() {
+                                        if is_flow.get() {
+                                            ().into_any()
+                                        } else {
+                                            view! { <p class="chat-card-thinking">"Thinking\u{2026}"</p> }
+                                                .into_any()
+                                        }
+                                    } else {
+                                        let html = render_markdown(current);
+                                        view! {
+                                            <>
+                                                <div inner_html=html></div>
+                                                <span class="streaming-cursor"></span>
+                                            </>
+                                        }
+                                        .into_any()
+                                    }
+                                })
+                            })
+                        }}
+                    </div>
+                </Show>
+                {move || {
+                    tool_requests_slot.with_value(|tool_requests| {
+                        if tool_requests.with(|tools| tools.is_empty()) {
+                            None
+                        } else {
+                            Some(view! {
+                                <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() />
+                            })
+                        }
                     })
-                }
-            }}
-        </div>
+                }}
+            </div>
+        </Show>
     }
 }
 
@@ -173,14 +207,21 @@ fn throttled_string_signal(
         ))
     };
 
+    let throttled_for_effect = throttled.clone();
     let source_for_effect = source.clone();
     let timer_cb_for_effect = timer_cb.clone();
     let timer_id_for_effect = timer_id.clone();
     Effect::new(move |_| {
-        if let Some(enabled) = enabled.as_ref()
-            && !enabled.get()
-        {
-            return;
+        if let Some(enabled) = enabled.as_ref() {
+            if !enabled.get() {
+                return;
+            }
+            if throttled_for_effect.with_untracked(String::is_empty)
+                && source_for_effect.with(|text| !text.is_empty())
+            {
+                throttled_for_effect.set(source_for_effect.with_untracked(|text| transform(text)));
+                return;
+            }
         }
         source_for_effect.with(|_| ());
         if render_pending.get() {

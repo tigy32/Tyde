@@ -205,6 +205,15 @@ pub fn ChatMessageView(
 ) -> impl IntoView {
     let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
     let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
+    let is_flow = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_some_and(|layout| layout.is_flow))
+    });
+    let show_reasoning = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_none_or(|layout| layout.show_reasoning))
+    });
+    let is_empty = Memo::new(move |_| {
+        ink_layout.with(|layout| layout.as_ref().is_some_and(|layout| layout.empty))
+    });
     // Each Memo reads through `with` to avoid cloning the entire
     // ChatMessageEntry (which carries a potentially-long
     // `message.content: String`) just to extract a field. Memos
@@ -276,10 +285,11 @@ pub fn ChatMessageView(
 
     let copy_state = RwSignal::new("copy");
     let copy_error = RwSignal::new(None::<String>);
+    let entry_slot = StoredValue::new_local(entry);
 
-    let entry_for_copy = entry.clone();
     let on_copy = move |_| {
-        let text = entry_for_copy.with_untracked(|entry| entry.message.content.clone());
+        let text = entry_slot
+            .with_value(|entry| entry.with_untracked(|entry| entry.message.content.clone()));
         if text.is_empty() {
             return;
         }
@@ -316,12 +326,8 @@ pub fn ChatMessageView(
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
     let reasoning_open = RwSignal::new(false);
 
-    let entry_for_reasoning = entry.clone();
-    let entry_for_tools = entry.clone();
-    let entry_for_footer = entry.clone();
-    let entry_for_reasoning_slot = StoredValue::new_local(entry_for_reasoning.clone());
-
     view! {
+        <Show when=move || !is_empty.get()>
         <div
             class=move || card_meta.with(|(c, _, _, _, _)| c.clone())
             role=move || card_meta.with(|(_, _, _, _, is_error)| is_error.then_some("alert"))
@@ -339,52 +345,65 @@ pub fn ChatMessageView(
 
             // Reasoning (collapsible)
             {move || {
-                entry_for_reasoning.with(|entry| entry.message.reasoning.as_ref().map(|r| r.tokens)).map(|token_count| {
-                    view! {
-                        <details
-                            class="chat-card-reasoning"
-                            on:toggle=move |ev: leptos::ev::Event| {
-                                if let Some(target) = ev.target()
-                                    && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
-                                {
-                                    reasoning_open.set(el.open());
+                if !show_reasoning.get() {
+                    return None;
+                }
+                entry_slot
+                    .with_value(|entry_for_reasoning| {
+                        entry_for_reasoning.with(|entry| {
+                            entry.message.reasoning.as_ref().and_then(|r| {
+                                (!is_flow.get() || !r.text.trim().is_empty() || r.tokens.is_some())
+                                    .then_some(r.tokens)
+                            })
+                        })
+                    })
+                    .map(|token_count| {
+                        view! {
+                            <details
+                                class="chat-card-reasoning"
+                                open=reasoning_open.get_untracked()
+                                on:toggle=move |ev: leptos::ev::Event| {
+                                    if let Some(target) = ev.target()
+                                        && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
+                                    {
+                                        reasoning_open.set(el.open());
+                                    }
                                 }
-                            }
-                        >
-                            <summary title=move || is_ink.get().then(|| token_count.map(|t| format!("{} reasoning tokens", format_compact(t)))).flatten()>
-                                {move || if is_ink.get() {
-                                    "Reasoning".into_any()
-                                } else {
-                                    view! {
-                                        <span class="reasoning-icon">"💭"</span>
-                                        " Thinking"
-                                        {token_count.map(|t| view! {
-                                            <span class="reasoning-tokens">{format!(" ({} tokens)", format_compact(t))}</span>
-                                        })}
-                                    }.into_any()
-                                }}
-                            </summary>
-                            <Show when=move || reasoning_open.get()>
-                                {move || {
-                                    entry_for_reasoning_slot.with_value(|entry_for_reasoning_body| entry_for_reasoning_body.with(|entry| {
-                                        entry.message.reasoning.as_ref().map(|reasoning| {
-                                            view! {
-                                                <pre class="reasoning-content">{reasoning.text.clone()}</pre>
-                                            }
-                                        })
-                                    }))
-                                }}
-                            </Show>
-                        </details>
-                    }
-                })
+                            >
+                                <summary title=move || is_ink.get().then(|| token_count.map(|t| format!("{} reasoning tokens", format_compact(t)))).flatten()>
+                                    {move || if is_ink.get() {
+                                        "Reasoning".into_any()
+                                    } else {
+                                        view! {
+                                            <span class="reasoning-icon">"💭"</span>
+                                            " Thinking"
+                                            {token_count.map(|t| view! {
+                                                <span class="reasoning-tokens">{format!(" ({} tokens)", format_compact(t))}</span>
+                                            })}
+                                        }.into_any()
+                                    }}
+                                </summary>
+                                <Show when=move || reasoning_open.get()>
+                                    {move || {
+                                        entry_slot.with_value(|entry_for_reasoning_body| entry_for_reasoning_body.with(|entry| {
+                                            entry.message.reasoning.as_ref().map(|reasoning| {
+                                                view! {
+                                                    <pre class="reasoning-content">{reasoning.text.clone()}</pre>
+                                                }
+                                            })
+                                        }))
+                                    }}
+                                </Show>
+                            </details>
+                        }
+                    })
             }}
 
             // Body and tool cards, interleaved in the order the model produced
             // them. Reads only this row's signal, so a tool update does not
             // invalidate sibling rows.
             {move || {
-                let entry = entry_for_tools.get();
+                let entry = entry_slot.with_value(|entry_for_tools| entry_for_tools.get());
                 // Third member is `is_user`; the first is the card's CSS class.
                 let is_user = card_meta.with(|(_, _, is_user, _, _)| *is_user);
                 let images = entry.message.images.clone();
@@ -492,7 +511,7 @@ pub fn ChatMessageView(
                 if !is_assistant {
                     return None;
                 }
-                let e = entry_for_footer.get();
+                let e = entry_slot.with_value(|entry_for_footer| entry_for_footer.get());
                 let model_display = e.message.model_info.as_ref().map(|mi| mi.model.clone());
                 let agent_display = match &e.message.sender {
                     MessageSender::Assistant { agent } => agent.clone(),
@@ -511,7 +530,7 @@ pub fn ChatMessageView(
                     .unwrap_or_default();
                 let footer_time = format_relative_time(e.message.timestamp);
                 let footer_content_empty = e.message.content.is_empty();
-                let on_copy_handler = on_copy.clone();
+                let on_copy_handler = on_copy;
 
                 Some(view! {
                     <div class="chat-card-footer">
@@ -562,6 +581,7 @@ pub fn ChatMessageView(
                 })
             }}
         </div>
+        </Show>
     }
 }
 
