@@ -182,16 +182,19 @@ pub(crate) mod self_improvement;
 
 #[cfg(feature = "test-support")]
 pub async fn prepare_workbench_environment(
-    root: &std::path::Path,
+    parent_root: &std::path::Path,
+    worktree_root: &std::path::Path,
     environment_root: &std::path::Path,
 ) -> Result<protocol::WorkbenchEnvironment, String> {
-    let root = root
-        .to_str()
-        .ok_or_else(|| "Workbench root must be UTF-8".to_owned())?;
+    let path = |root: &std::path::Path| {
+        root.to_str()
+            .map(|root| protocol::ProjectRootPath(root.to_owned()))
+            .ok_or_else(|| "Workbench roots must be UTF-8".to_owned())
+    };
     workbench::prepare(
         &[protocol::WorkbenchRoot {
-            parent_root: protocol::ProjectRootPath(root.to_owned()),
-            worktree_root: protocol::ProjectRootPath(root.to_owned()),
+            parent_root: path(parent_root)?,
+            worktree_root: path(worktree_root)?,
         }],
         environment_root,
         &uuid::Uuid::new_v4().to_string(),
@@ -201,22 +204,9 @@ pub async fn prepare_workbench_environment(
 }
 
 #[cfg(feature = "test-support")]
-pub async fn seal_workbench_environment(project: &protocol::Project) -> Result<(), String> {
-    workbench::seal(project, false)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(feature = "test-support")]
 pub async fn finish_workbench_environment(
     environment: &protocol::WorkbenchEnvironment,
-    discard_artifacts: bool,
 ) -> Result<(), String> {
-    if !discard_artifacts {
-        return Err(
-            "Sealing a snapshot requires the canonical Project and its source root".to_owned(),
-        );
-    }
     workbench::finish(environment)
         .await
         .map_err(|error| error.to_string())

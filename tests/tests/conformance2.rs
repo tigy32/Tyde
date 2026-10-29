@@ -16893,19 +16893,10 @@ conformance2_scenario!(real_bubblewrap_workbench, []);
 
 async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
     let (project, peer_project) = host.prepare_bubblewrap().await;
-    let protocol::ProjectSource::GitWorkbench { environment, .. } = &project.source else {
-        panic!("engine fixture must be a workbench");
-    };
-    assert!(
-        matches!(
-            environment,
-            protocol::WorkbenchEnvironment::Bubblewrap {
-                initialization: protocol::WorkbenchInitialization::Snapshot { .. },
-                ..
-            }
-        ),
-        "consumers must use actual sealed CoW artifacts"
-    );
+    let logical_root = host.bubblewrap_logical_root();
+    let parent = host.bubblewrap_parent().to_path_buf();
+    let parent_head = git_stdout(&parent, &["rev-parse", "HEAD"]);
+    let parent_status = git_stdout(&parent, &["status", "--porcelain=v1"]);
     let probe_dir = host.workspace().join(MCP_PROBE_DIR);
     std::fs::create_dir_all(&probe_dir).expect("create startup MCP probe directory");
     let probe_script = probe_dir.join("probe.py");
@@ -16914,7 +16905,10 @@ async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
         .replace("import json, sys, time", "import json, os, sys, time")
         .replace(
             "json.dumps(arguments, sort_keys=True)",
-            "json.dumps(dict(arguments, runtime_namespace=os.readlink('/proc/self/ns/mnt'), source_read=Path('/mnt/tyde-workspace/README.txt').read_text()), sort_keys=True)",
+            &format!(
+                "json.dumps(dict(arguments, runtime_namespace=os.readlink('/proc/self/ns/mnt'), source_read=Path({:?}).read_text()), sort_keys=True)",
+                format!("{logical_root}/README.txt")
+            ),
         );
     std::fs::write(&probe_script, source).expect("write real startup MCP probe server");
     install_mcp_server(
@@ -16928,7 +16922,6 @@ async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
     )
     .await;
     let host_root = host.workspace().to_string_lossy().into_owned();
-    let parent = host.bubblewrap_parent().to_path_buf();
     let peer = host.bubblewrap_peer().to_path_buf();
     let host_namespace = std::fs::read_link("/proc/self/ns/mnt")
         .expect("host mount namespace")
@@ -16943,7 +16936,7 @@ async fn real_bubblewrap_workbench<B: Backend>(host: &mut Harness<B>) {
     ));
     let script = format!(
         r#"import json, os, pathlib, subprocess
-root = pathlib.Path('/mnt/tyde-workspace')
+root = pathlib.Path({logical_root:?})
 source = root / 'README.txt'
 clone = root / 'build-output/private-copy.txt'
 peer = pathlib.Path({peer:?})
@@ -16951,16 +16944,19 @@ before = source.read_text()
 with open('/dev/null', 'r+b', buffering=0) as device:
     sample = b'native device probe'
     devices = device.write(sample) == len(sample) and device.read(1) == b''
-seeded = clone.read_text() == before and (peer / 'build-output/private-copy.txt').read_text() == before
-metadata = clone.stat()
-build = subprocess.run(['python3', 'build.py'], check=True, capture_output=True, text=True)
-warm = json.loads(build.stdout)['reused'] and clone.stat().st_ino == metadata.st_ino and clone.stat().st_mtime_ns == metadata.st_mtime_ns
-private_inode = clone.stat().st_ino != (peer / 'build-output/private-copy.txt').stat().st_ino
+def git(*args):
+    return subprocess.run(['git', *args], check=True, capture_output=True, text=True).stdout
+status = git('status', '--porcelain=v1').splitlines()
+captured = clone.read_text() == before and (root / 'tracked.txt').read_text() == 'unstaged parent edit\n' and (root / 'staged.txt').read_text() == 'staged parent state\n' and (root / 'untracked.txt').read_text() == 'untracked parent state\n'
+index = {{line for line in status if not line.startswith('??')}} == {{'A  staged.txt', ' M tracked.txt'}} and '?? untracked.txt' in status
+repository = git('rev-parse', '--show-toplevel').strip() == str(root) and git('rev-parse', '--abbrev-ref', 'HEAD').strip() == 'feature/bubblewrap-primary' and git('rev-parse', 'HEAD').strip() == {parent_head:?}
+seeded = (peer / 'build-output/private-copy.txt').read_text() == before
 clone.write_text('private build artifact\n')
 source.write_text('private source edit\n')
 (root / 'boundary.txt').write_text('created\n')
 (root / 'session-owner.txt').write_text({primary_owner:?})
-print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'warm': warm, 'devices': devices, 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': seeded and private_inode and (peer / 'build-output/private-copy.txt').read_text() == before, 'source': (peer / 'README.txt').read_text() == before and pathlib.Path({parent:?}, 'README.txt').read_text() == before, 'alias': root.samefile({host_root:?}), 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+private = seeded and (peer / 'build-output/private-copy.txt').read_text() == before and (peer / 'README.txt').read_text() == before and not (peer / 'boundary.txt').exists()
+print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'captured': captured, 'index': index, 'repository': repository, 'devices': devices, 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'private': private, 'alias': root.samefile({host_root:?}), 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
 "#
     );
     let prompt = format!(
@@ -16977,11 +16973,12 @@ print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'warm
             "created",
             &[
                 "cwd",
-                "warm",
+                "captured",
+                "index",
+                "repository",
                 "devices",
                 "namespace",
-                "cow",
-                "source",
+                "private",
                 "alias",
                 "generic",
             ],
@@ -16997,6 +16994,7 @@ print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'warm
         );
         let followup = bubblewrap_followup_prompt(
             host.backend(),
+            &logical_root,
             "created",
             "edited",
             "runtime-created",
@@ -17053,9 +17051,10 @@ print(json.dumps({{'boundary': 'created', 'cwd': os.getcwd() == str(root), 'warm
         r#"Use your real shell tool at the default workspace cwd to execute exactly this Python script, without changing directory:
 python3 - <<'TYDE_PEER_PY'
 import json, os, pathlib
-root = pathlib.Path('/mnt/tyde-workspace')
+root = pathlib.Path({logical_root:?})
 assert (root / 'README.txt').read_text() == 'tyde conformance workspace'
 assert (root / 'build-output/private-copy.txt').read_text() == 'tyde conformance workspace'
+assert (root / 'untracked.txt').read_text() == 'untracked parent state\n'
 assert not (root / 'boundary.txt').exists()
 (root / 'session-owner.txt').write_text({peer_owner:?})
 print(json.dumps({{'boundary': 'peer-created', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'owner': (root / 'session-owner.txt').read_text() == {peer_owner:?}}}))
@@ -17095,6 +17094,7 @@ Briefly confirm completion."#
         assert_bubblewrap_replayed_owner(&resumed, &primary_owner, &peer_owner);
         let resume_prompt = bubblewrap_followup_prompt(
             host.backend(),
+            &logical_root,
             "edited",
             "resumed",
             "runtime-created",
@@ -17135,7 +17135,7 @@ Briefly confirm completion."#
             r#"Use your real shell tool at the default workspace cwd to execute exactly:
 python3 - <<'TYDE_PEER_PY'
 import json, os, pathlib
-root = pathlib.Path('/mnt/tyde-workspace')
+root = pathlib.Path({logical_root:?})
 assert not (root / 'boundary.txt').exists()
 assert (root / 'README.txt').read_text() == 'tyde conformance workspace'
 assert (root / 'build-output/private-copy.txt').read_text() == 'tyde conformance workspace'
@@ -17176,10 +17176,38 @@ Briefly confirm completion."#
         std::fs::read_to_string(parent.join("README.txt")).expect("unchanged parent source"),
         "tyde conformance workspace"
     );
+    assert_eq!(
+        std::fs::read_to_string(parent.join("build-output/private-copy.txt"))
+            .expect("unchanged parent artifact"),
+        "tyde conformance workspace"
+    );
+    assert_eq!(
+        git_stdout(&parent, &["status", "--porcelain=v1"]),
+        parent_status,
+        "workbench Git operations must not alter the parent's index or tree"
+    );
+    assert_eq!(
+        git_stdout(&parent, &["rev-parse", "HEAD"]),
+        parent_head,
+        "workbench Git operations must not move the parent checkout"
+    );
     assert!(
         !parent.join("boundary.txt").exists() && !peer.join("boundary.txt").exists(),
         "provider writes must stay in their workspace"
     );
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("run host git");
+    assert!(output.status.success(), "host git {args:?} failed");
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim_end()
+        .to_owned()
 }
 
 async fn record_bubblewrap_session(
@@ -17291,6 +17319,7 @@ fn assert_bubblewrap_replayed_owner(agent: &Agent, owner: &str, peer_owner: &str
 
 fn bubblewrap_followup_prompt(
     backend: BackendKind,
+    logical_root: &str,
     before: &str,
     after: &str,
     runtime_before: &str,
@@ -17340,7 +17369,7 @@ assert pathlib.Path('README.txt').read_text() == 'private source edit\n'
 assert pathlib.Path('build-output/private-copy.txt').read_text() == 'private build artifact\n'
 p.write_text({after:?} + '\n')
 (runtime / 'private/runtime-boundary.txt').write_text({runtime_after:?} + '\n')
-print(json.dumps({{'boundary': {after:?}, 'readback': True, 'runtime_readback': True, 'runtime_instance': identity, 'proof_hashes': {{name: hashlib.sha256(value.encode()).hexdigest() for name, value in proofs.items()}}, 'cwd': os.getcwd() == '/mnt/tyde-workspace', 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}}}))
+print(json.dumps({{'boundary': {after:?}, 'readback': True, 'runtime_readback': True, 'runtime_instance': identity, 'proof_hashes': {{name: hashlib.sha256(value.encode()).hexdigest() for name, value in proofs.items()}}, 'cwd': os.getcwd() == {logical_root:?}, 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}}}))
 TYDE_BOUNDARY_PY
 Briefly confirm completion."#
     )

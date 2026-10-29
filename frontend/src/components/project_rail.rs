@@ -639,6 +639,12 @@ fn ProjectRow(
                     ..
                 } => {
                     let title = match &initialization {
+                        protocol::WorkbenchInitialization::Captured {
+                            copy_on_write: true,
+                        } => "Bubblewrap · Cloned (copy-on-write)".to_owned(),
+                        protocol::WorkbenchInitialization::Captured {
+                            copy_on_write: false,
+                        } => "Bubblewrap · Copied".to_owned(),
                         protocol::WorkbenchInitialization::Cold => {
                             "Bubblewrap · Ready (cold)".to_owned()
                         }
@@ -1741,13 +1747,15 @@ mod wasm_tests {
                 build_blockers: Vec::new(),
                 support: Default::default(),
                 lifecycle: Default::default(),
-                initialization: protocol::WorkbenchInitialization::Cold,
+                initialization: protocol::WorkbenchInitialization::Captured {
+                    copy_on_write: true,
+                },
             };
         });
         next_tick().await;
         assert!(
             container
-                .query_selector("[title='Bubblewrap · Ready (cold)']")
+                .query_selector("[title='Bubblewrap · Cloned (copy-on-write)']")
                 .unwrap()
                 .is_some()
         );
@@ -1783,11 +1791,21 @@ mod wasm_tests {
         );
         assert!(
             container
-                .query_selector("[title='Bubblewrap · Ready (cold)']")
+                .query_selector("[title='Bubblewrap · Cloned (copy-on-write)']")
                 .unwrap()
                 .is_none()
         );
         for (initialization, title) in [
+            (
+                protocol::WorkbenchInitialization::Captured {
+                    copy_on_write: false,
+                },
+                "Bubblewrap · Copied",
+            ),
+            (
+                protocol::WorkbenchInitialization::Cold,
+                "Bubblewrap · Ready (cold)",
+            ),
             (
                 protocol::WorkbenchInitialization::Prepared {
                     cohort: "prepared".into(),
@@ -2018,23 +2036,20 @@ mod wasm_tests {
             "/project-operation/create",
             mutation.clone(),
             ProjectOperationState::Running {
-                stage: ProjectOperationStage::PrepareBuilds,
+                stage: ProjectOperationStage::CloneWorkspace,
             },
         );
         next_tick().await;
         assert!(
-            !container
-                .text_content()
-                .unwrap()
-                .contains("Preparing or restoring a verified warm build baseline"),
-            "preparing must not render an app-wide banner"
+            !container.text_content().unwrap().contains("Cloning"),
+            "cloning must not render an app-wide banner"
         );
         assert!(
             container
                 .query_selector(".browser-notices .inline-notice")
                 .unwrap()
                 .is_none(),
-            "preparing must not render an app-wide banner"
+            "cloning must not render an app-wide banner"
         );
         assert!(
             textarea.value() == "Unrelated chat draft",
@@ -2171,12 +2186,7 @@ mod wasm_tests {
                 .contains("Completion is unknown"),
             "host refresh must not paint an app-wide notice"
         );
-        assert!(
-            !container
-                .text_content()
-                .unwrap()
-                .contains("Preparing or restoring a verified warm build baseline")
-        );
+        assert!(!container.text_content().unwrap().contains("Cloning"));
         // An empty bootstrap removes p-orphan and disables Save because its
         // record is missing, not because another project's mutation is pending.
         let catalog = state.projects.with_untracked(|projects| {

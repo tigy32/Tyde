@@ -251,6 +251,7 @@ _tyde_httpx.Client.send = _tyde_http_send
 
 from agent import tool_executor as _tyde_tool_executor
 _tyde_original_commit_tool_result = _tyde_tool_executor._commit_tool_result
+_tyde_parse_tool_call = _tyde_tool_executor._parse_tool_call
 
 def _tyde_commit_tool_result(agent, messages, ref, *args, **kwargs):
     committed = _tyde_original_commit_tool_result(agent, messages, ref, *args, **kwargs)
@@ -293,12 +294,14 @@ def _tyde_make_agent(*args, **kwargs):
             call_id = coalesce_tool_call_id(call)
             if not call_id:
                 raise RuntimeError("Hermes completed tool response has no native call identity")
-            arguments, parse_error = _tyde_tool_executor._parse_tool_arguments(call.function.arguments)
-            if parse_error is not None:
-                # Preserve rejected provider input; only the native executor
-                # validates it and persists the failed, non-executed attempt.
-                arguments = call.function.arguments
-            calls.append({"tool_id": call_id, "name": call.function.name, "args": arguments})
+            # Declare the call Hermes dispatches, displays and records: its
+            # native parse canonicalizes legacy aliases and peels the Tool
+            # Search `tool_call` broker. Rejected input keeps the provider's
+            # raw arguments; only the native executor validates it and
+            # persists the failed, non-executed attempt.
+            parsed = _tyde_parse_tool_call(agent, call)
+            args = call.function.arguments if parsed.parse_error is not None else parsed.args
+            calls.append({"tool_id": call_id, "name": parsed.name, "args": args})
         # Native run_tool_round has persisted this complete response before
         # entering execution. Cancellation must not erase its declarations.
         text = assistant_message.content

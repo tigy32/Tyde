@@ -4399,7 +4399,9 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
 
 #[tokio::test]
 async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
-    use protocol::{WorkbenchAvailability, WorkbenchEngine, WorkbenchEnvironment};
+    use protocol::{
+        WorkbenchAvailability, WorkbenchEngine, WorkbenchEnvironment, WorkbenchInitialization,
+    };
 
     let mut fixture = Fixture::new().await;
     fixture
@@ -4417,6 +4419,36 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         repo.path(),
         &["commit", "-m", "Ignore private build output"],
     );
+    let remote = tempfile::tempdir().expect("bare remote");
+    git(remote.path(), &["init", "--bare", "-q"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    let parent_readme = "# bubblewrap-boundary\nparent work in progress\n";
+    let artifact = "parent build output\n";
+    fs::write(repo.path().join("README.md"), parent_readme).expect("unstaged parent edit");
+    fs::write(repo.path().join("staged.txt"), "staged parent file\n").expect("staged file");
+    git(repo.path(), &["add", "staged.txt"]);
+    fs::write(repo.path().join("notes.txt"), "untracked parent notes\n").expect("untracked file");
+    fs::create_dir(repo.path().join("build-output")).expect("ignored output directory");
+    fs::write(repo.path().join("build-output/artifact.bin"), artifact).expect("ignored artifact");
+    let parent_status = git_stdout(
+        repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let parent_index = git_stdout(repo.path(), &["ls-files", "--stage"]);
+    let parent_head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        parent_status.lines().count(),
+        3,
+        "parent must carry unstaged, staged and untracked changes"
+    );
+    let logical = fs::canonicalize(repo.path())
+        .expect("canonical parent")
+        .to_str()
+        .expect("UTF-8 parent path")
+        .to_owned();
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     let write_id = fixture
         .client
@@ -4465,29 +4497,21 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         assert_eq!(error.request_kind, FrameKind::WorkbenchCreate);
         assert_eq!(error.code, CommandErrorCode::InvalidInput);
         assert!(!error.fatal);
-        match &configured.workbench_support.bubblewrap {
-            WorkbenchAvailability::Unsupported { reason, message } => {
-                assert_ne!(*reason, protocol::WorkbenchUnsupportedReason::NotProbed);
-                assert_eq!(error.workbench_reason, Some(*reason));
-                assert!(
-                    !message.is_empty() && error.message.contains(message),
-                    "unsupported engine must report its probed prerequisite failure"
-                );
-                eprintln!("Bubblewrap boundary explicitly unsupported: {reason:?}");
-            }
-            WorkbenchAvailability::Available => {
-                assert_eq!(
-                    error.workbench_reason,
-                    Some(protocol::WorkbenchUnsupportedReason::ReflinkUnsupported)
-                );
-                assert!(
-                    error.message.contains("Strict CoW cloning failed")
-                        || error.message.contains("CoW probe"),
-                    "available namespace may reject storage only with an explicit CoW failure"
-                );
-                eprintln!("Bubblewrap boundary explicitly unsupported: ReflinkUnsupported");
-            }
-        }
+        let WorkbenchAvailability::Unsupported { reason, message } =
+            &configured.workbench_support.bubblewrap
+        else {
+            panic!(
+                "available Bubblewrap must clone the parent: reason={:?} message={}",
+                error.workbench_reason, error.message
+            );
+        };
+        assert_ne!(*reason, protocol::WorkbenchUnsupportedReason::NotProbed);
+        assert_eq!(error.workbench_reason, Some(*reason));
+        assert!(
+            !message.is_empty() && error.message.contains(message),
+            "unsupported engine must report its probed prerequisite failure"
+        );
+        eprintln!("Bubblewrap boundary explicitly unsupported: {reason:?}");
         let (_, replay) = fixture.connect_with_bootstrap().await;
         assert!(
             !replay
@@ -4499,6 +4523,14 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         assert!(
             !expected_worktree_path(repo.path(), "feature-bubblewrap-boundary").exists(),
             "unsupported setup must roll back its real worktree"
+        );
+        assert_eq!(
+            git_stdout(
+                repo.path(),
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            ),
+            parent_status,
+            "failed setup must leave the parent's dirty state alone"
         );
         assert_eq!(
             replay.settings.workbenches.engine,
@@ -4521,13 +4553,77 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     else {
         panic!("Bubblewrap selection cannot route through Native");
     };
-    assert_eq!(logical_root.0, "/mnt/tyde-workspace");
+    assert_eq!(
+        logical_root.0, logical,
+        "the view must present the clone at its parent's path"
+    );
     assert!(matches!(
         initialization,
-        protocol::WorkbenchInitialization::Cold
+        WorkbenchInitialization::Captured { .. }
     ));
-    let manifest_path = PathBuf::from(&manifest_path.0);
+    let environment_directory = PathBuf::from(&manifest_path.0)
+        .parent()
+        .expect("environment directory")
+        .to_path_buf();
     let root = project.root_paths()[0].clone();
+    let child = PathBuf::from(&root.0);
+    for file in [
+        "README.md",
+        "staged.txt",
+        "notes.txt",
+        "build-output/artifact.bin",
+    ] {
+        assert_eq!(
+            fs::read(child.join(file)).expect("captured child file"),
+            fs::read(repo.path().join(file)).expect("parent file"),
+            "capture must carry the parent's dirty, untracked and ignored content"
+        );
+    }
+    assert_eq!(
+        git_stdout(
+            &child,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        parent_status,
+        "capture must reproduce the parent's staged, unstaged and untracked state"
+    );
+    assert_eq!(git_stdout(&child, &["rev-parse", "HEAD"]), parent_head);
+    assert_eq!(
+        git_stdout(&child, &["symbolic-ref", "--short", "HEAD"]),
+        "feature/bubblewrap-boundary"
+    );
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: project.id.clone(),
+            force: false,
+        })
+        .await
+        .expect("request unforced removal of a dirty clone");
+    let refused = next_frame_matching_on(&mut fixture.client, "dirty removal outcome", |env| {
+        env.kind == FrameKind::CommandError
+            || (env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                ProjectNotifyPayload::Delete { project: deleted } if deleted.id == project.id))
+    })
+    .await;
+    assert_eq!(
+        refused.kind,
+        FrameKind::CommandError,
+        "removing a dirty clone must require force"
+    );
+    assert_eq!(
+        refused.parse_payload::<CommandErrorPayload>().unwrap().code,
+        CommandErrorCode::Conflict
+    );
+    assert_eq!(
+        git_stdout(
+            &child,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        parent_status,
+        "a refused removal must leave the clone untouched"
+    );
     let (caller, caller_start) = fixture
         .spawn_with(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
@@ -4553,20 +4649,19 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     );
     fixture.finish_turn(&caller).await;
     let caller = caller.new_agent;
-    eprintln!("BUBBLEWRAP FLOW MCP caller durable-and-idle");
     for (path, cause) in [
+        (format!("{logical}/../boundary-outside"), "parent traversal"),
         (
-            "/mnt/tyde-workspace/../boundary-outside",
+            format!("{logical}/dir/../../boundary-outside"),
             "parent traversal",
         ),
-        (
-            "/mnt/tyde-workspace/dir/../../boundary-outside",
-            "parent traversal",
-        ),
-        ("/mnt/tyde-runtime/private", "Engine-only"),
-        ("/mnt//tyde-runtime/private", "Engine-only"),
-        ("/mnt/tyde-producer-receipts", "Engine-only"),
-        ("/mnt", "Engine-only"),
+        ("/mnt/tyde-git".to_owned(), "Engine-only"),
+        ("/mnt/tyde-git/0/worktrees".to_owned(), "Engine-only"),
+        ("/mnt/tyde-workspace".to_owned(), "Engine-only"),
+        ("/mnt/tyde-runtime/private".to_owned(), "Engine-only"),
+        ("/mnt//tyde-runtime/private".to_owned(), "Engine-only"),
+        ("/mnt/tyde-producer-receipts".to_owned(), "Engine-only"),
+        ("/mnt".to_owned(), "Engine-only"),
     ] {
         let (is_error, body) = call_agent_control(
             &fixture,
@@ -4581,40 +4676,36 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         .await;
         assert!(
             is_error && body.contains(cause),
-            "MCP must reject unrepresentable host paths before spawning"
+            "MCP must reject unrepresentable host path {path} with {cause}"
         );
     }
-    eprintln!("BUBBLEWRAP FLOW mapped-child MCP requested");
     let (is_error, _) = call_agent_control(
         &fixture,
         &caller.agent_id,
         "tyde_spawn_agent",
         json!({
-            "workspace_roots": ["/mnt//tyde-workspace/./"],
+            "workspace_roots": [format!("{logical}//./")],
             "prompt": "inherit the explicitly mapped host workspace",
             "backend_kind": "codex"
         }),
     )
     .await;
     assert!(!is_error, "MCP must map an ordinary logical workspace root");
-    eprintln!("BUBBLEWRAP FLOW mapped-child MCP returned; awaiting NewAgent");
-    let child = expect_kind(&mut fixture.client, FrameKind::NewAgent, "mapped MCP child")
+    let mapped = expect_kind(&mut fixture.client, FrameKind::NewAgent, "mapped MCP child")
         .await
         .parse_payload::<NewAgentPayload>()
         .expect("mapped MCP child payload");
-    assert_eq!(child.workspace_roots, vec![root.0.clone()]);
-    assert_eq!(child.project_id, Some(project.id.clone()));
+    assert_eq!(mapped.workspace_roots, vec![root.0.clone()]);
+    assert_eq!(mapped.project_id, Some(project.id.clone()));
     assert!(
-        child.parent_agent_id.as_ref() == Some(&caller.agent_id),
+        mapped.parent_agent_id.as_ref() == Some(&caller.agent_id),
         "MCP child must preserve its authenticated caller as parent"
     );
-    eprintln!("BUBBLEWRAP FLOW mapped-child NewAgent received; awaiting host replay");
     let (_, replay) = fixture.connect_with_bootstrap().await;
     assert!(
         replay.projects.iter().any(|entry| entry == &project),
         "replay must carry the same typed environment and host root"
     );
-    eprintln!("BUBBLEWRAP FLOW host replay verified; requesting engine terminal");
     fixture
         .client
         .terminal_create(TerminalCreatePayload {
@@ -4628,7 +4719,6 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         })
         .await
         .expect("create real engine terminal");
-    eprintln!("BUBBLEWRAP FLOW engine terminal request sent; awaiting NewTerminal");
     let terminal = next_frame_matching_on(&mut fixture.client, "engine terminal", |env| {
         matches!(env.kind, FrameKind::NewTerminal | FrameKind::CommandError)
     })
@@ -4639,7 +4729,6 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         "engine terminal creation must succeed"
     );
     let terminal = terminal.parse_payload::<NewTerminalPayload>().unwrap();
-    eprintln!("BUBBLEWRAP FLOW NewTerminal received; awaiting TerminalBootstrap");
     let bootstrap =
         next_frame_matching_on(&mut fixture.client, "engine terminal bootstrap", |env| {
             env.stream == terminal.stream
@@ -4659,31 +4748,48 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     let bootstrap = bootstrap
         .parse_payload::<protocol::TerminalBootstrapPayload>()
         .unwrap();
-    eprintln!("BUBBLEWRAP FLOW TerminalBootstrap received");
     assert_eq!(bootstrap.start.project_id, Some(project.id.clone()));
     assert_eq!(bootstrap.start.root, Some(root.clone()));
-    let host_namespace = fs::read_link("/proc/self/ns/mnt")
-        .expect("host namespace")
-        .to_string_lossy()
-        .into_owned();
+    let expected = json!({
+        "root": logical,
+        "status": parent_status,
+        "branch": "feature/bubblewrap-boundary",
+        "artifact": artifact,
+        "host_namespace": fs::read_link("/proc/self/ns/mnt")
+            .expect("host namespace")
+            .to_string_lossy(),
+    });
     let script = format!(
-        r#"import json, os, pathlib, subprocess
-root = pathlib.Path('/mnt/tyde-workspace')
-source = root / 'README.md'
-output = root / 'build-output'
-output.mkdir()
-clone = output / 'private-copy.txt'
-before = source.read_text()
+        r#"import json, os, subprocess
+expected = json.loads(r'''{expected}''')
+root = expected['root']
+def git(*args):
+    return subprocess.run(['git', *args], check=True, capture_output=True, text=True).stdout
+artifact = os.path.join(root, 'build-output', 'artifact.bin')
+with open(artifact) as reader:
+    ignored = reader.read() == expected['artifact']
 with open('/dev/null', 'r+b', buffering=0) as device:
     sample = b'native device probe'
     devices = device.write(sample) == len(sample) and device.read(1) == b''
-subprocess.run(['cp', '--reflink=always', str(source), str(clone)], check=True)
-independent = clone.stat().st_ino != source.stat().st_ino
-clone.write_text('private artifact\n')
-private = independent and source.read_text() == before
-source.write_text('edited in engine terminal\n')
+evidence = {{
+    'cwd': os.getcwd() == root,
+    'namespace': os.readlink('/proc/self/ns/mnt') != expected['host_namespace'],
+    'devices': devices,
+    'root_env': os.environ.get('TYDE_WORKBENCH_ROOT') == root,
+    'status': git('status', '--porcelain=v1', '--untracked-files=all').strip() == expected['status'],
+    'branch': git('symbolic-ref', '--short', 'HEAD').strip() == expected['branch'],
+    'ignored': ignored,
+}}
+with open(artifact, 'w') as writer:
+    writer.write('rebuilt in workbench\n')
+with open(os.path.join(root, 'README.md'), 'w') as writer:
+    writer.write('edited in engine terminal\n')
+git('add', '-A')
+git('commit', '-qm', 'Commit from the workbench view')
+git('push', '-q', 'origin', expected['branch'])
+evidence['committed'] = git('status', '--porcelain=v1', '--untracked-files=all').strip() == ''
 # Frame machine-readable output after Bash's bracketed-paste CSI plus bare CR.
-print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root), 'namespace': os.readlink('/proc/self/ns/mnt') != {host_namespace:?}, 'cow': private, 'devices': devices, 'generic': not (root / 'Cargo.toml').exists() and os.environ.get('TYDE_WORKBENCH_ROOT') == str(root)}}))
+print('\n' + json.dumps({{'boundary': evidence}}))
 "#
     );
     fixture
@@ -4696,7 +4802,6 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
         )
         .await
         .expect("run namespace boundary command");
-    eprintln!("BUBBLEWRAP FLOW boundary command sent; awaiting completion record");
     let mut output = String::new();
     loop {
         let event = next_frame_matching_on(&mut fixture.client, "engine command output", |env| {
@@ -4722,51 +4827,157 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .collect::<Vec<_>>();
-        eprintln!(
-            "BUBBLEWRAP FLOW boundary output bytes={} parsed_records={}",
-            output.len(),
-            records.len()
-        );
         if let Some(completed) = records
             .iter()
             .find(|record| record.get("boundary_command_finished").is_some())
         {
             assert_eq!(
                 completed["boundary_command_finished"], 0,
-                "boundary command failed before producing its assertion record"
+                "boundary command failed before producing its assertion record:\n{output}"
             );
             let evidence = records
                 .iter()
-                .find(|value| value["boundary"] == "complete")
+                .find_map(|value| value["boundary"].as_object())
                 .expect("completed boundary command must emit its assertion record");
+            let failed = evidence
+                .iter()
+                .filter(|(_, held)| held.as_bool() != Some(true))
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>();
             assert!(
-                ["cwd", "namespace", "cow", "devices", "generic"]
-                    .iter()
-                    .all(|key| evidence[*key].as_bool() == Some(true)),
-                "actual terminal output must establish every isolation boundary"
+                evidence.len() == 8 && failed.is_empty(),
+                "actual terminal output must establish every boundary; failed={failed:?}"
             );
             break;
         }
     }
-    assert!(
-        fs::read_to_string(Path::new(&root.0).join("README.md"))
-            .expect("terminal-edited host worktree")
-            == "edited in engine terminal\n"
+    // A shell job inherits the terminal its runtime owns without leading that
+    // session, so a nested engine launch must not claim it.
+    fixture
+        .client
+        .terminal_send(
+            &terminal.terminal_id,
+            protocol::TerminalSendPayload {
+                data: "printf '\\n'; python3 /mnt/tyde-runtime/runner.py probe; printf '\\n{\"nested_probe_finished\":%s}\\n' \"$?\"\n".to_owned(),
+            },
+        )
+        .await
+        .expect("run nested engine probe");
+    let mut output = String::new();
+    loop {
+        let event = next_frame_matching_on(&mut fixture.client, "nested probe output", |env| {
+            env.stream == terminal.stream
+                && matches!(
+                    env.kind,
+                    FrameKind::TerminalOutput | FrameKind::TerminalError | FrameKind::TerminalExit
+                )
+        })
+        .await;
+        assert_eq!(
+            event.kind,
+            FrameKind::TerminalOutput,
+            "terminal must remain running through the nested probe"
+        );
+        output.push_str(
+            &event
+                .parse_payload::<protocol::TerminalOutputPayload>()
+                .unwrap()
+                .data,
+        );
+        let records = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        if let Some(completed) = records
+            .iter()
+            .find(|record| record.get("nested_probe_finished").is_some())
+        {
+            assert_eq!(
+                completed["nested_probe_finished"], 0,
+                "nested probe failed:\n{output}"
+            );
+            let probe = records
+                .iter()
+                .find(|record| record.get("bubblewrap").is_some())
+                .expect("nested probe must report its capabilities");
+            let expected = match &configured.workbench_support.nested_namespaces {
+                WorkbenchAvailability::Available => json!({"kind": "available"}),
+                WorkbenchAvailability::Unsupported { .. } => json!("namespace_denied"),
+            };
+            let observed = match probe["bubblewrap"]["kind"].as_str() {
+                Some("available") => probe["bubblewrap"].clone(),
+                _ => probe["bubblewrap"]["reason"].clone(),
+            };
+            assert_eq!(
+                observed, expected,
+                "a workbench terminal must support exactly the host's nested namespaces:\n{output}"
+            );
+            break;
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(child.join("README.md")).expect("terminal-edited clone"),
+        "edited in engine terminal\n"
     );
-    assert!(
-        fs::read_to_string(repo.path().join("README.md")).expect("parent source")
-            == "# bubblewrap-boundary\n",
-        "workbench writes must not alter the parent checkout"
+    assert_eq!(
+        fs::read_to_string(child.join("build-output/artifact.bin")).expect("clone artifact"),
+        "rebuilt in workbench\n"
+    );
+    let parent_unchanged = |phase: &str| {
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README.md")).expect("parent source"),
+            parent_readme,
+            "{phase}: workbench writes must not alter the parent checkout"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("build-output/artifact.bin"))
+                .expect("parent ignored artifact"),
+            artifact,
+            "{phase}: the parent's ignored output must stay intact"
+        );
+        assert_eq!(
+            git_stdout(repo.path(), &["ls-files", "--stage"]),
+            parent_index,
+            "{phase}: the parent index must be unchanged"
+        );
+        assert_eq!(
+            git_stdout(
+                repo.path(),
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            ),
+            parent_status,
+            "{phase}: the parent status must be unchanged"
+        );
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), parent_head);
+    };
+    parent_unchanged("after view commit");
+    let pushed = git_stdout(
+        remote.path(),
+        &["rev-parse", "refs/heads/feature/bubblewrap-boundary"],
+    );
+    assert_eq!(pushed, git_stdout(&child, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        git_stdout(remote.path(), &["rev-parse", &format!("{pushed}^")]),
+        parent_head,
+        "the view commit must build on the captured base"
+    );
+    assert_eq!(
+        git_stdout(remote.path(), &["ls-tree", "-r", "--name-only", &pushed]),
+        ".gitignore\nREADME.md\nnotes.txt\nstaged.txt",
+        "the pushed commit must carry the captured changes but no ignored output"
+    );
+    assert_eq!(
+        git_stdout(remote.path(), &["show", &format!("{pushed}:README.md")]),
+        "edited in engine terminal"
     );
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: project.id.clone(),
-            force: true,
+            force: false,
         })
         .await
-        .expect("remove engine workbench and terminal");
-    eprintln!("BUBBLEWRAP FLOW boundary verified; awaiting engine removal");
+        .expect("remove clean engine workbench and terminal");
     let removed = next_frame_matching_on(&mut fixture.client, "engine removed", |env| {
         env.kind == FrameKind::CommandError
             || (env.kind == FrameKind::ProjectNotify
@@ -4777,13 +4988,17 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
     assert_eq!(
         removed.kind,
         FrameKind::ProjectNotify,
-        "engine removal must succeed"
+        "a committed clone with only ignored output must remove without force"
     );
     assert!(
-        !Path::new(&root.0).exists(),
-        "remove must finish host worktree cleanup"
+        !child.exists(),
+        "remove must delete the clone including its ignored output"
     );
-    assert!(!manifest_path.exists(), "remove must finish engine cleanup");
+    assert!(
+        !environment_directory.exists(),
+        "remove must finish engine cleanup"
+    );
+    parent_unchanged("after removal");
     let (_, replay) = fixture.connect_with_bootstrap().await;
     assert!(!replay.projects.iter().any(|entry| entry.id == project.id));
     assert!(replay.projects.iter().any(|entry| entry.id == parent.id));
@@ -4791,230 +5006,6 @@ print('\n' + json.dumps({{'boundary': 'complete', 'cwd': os.getcwd() == str(root
         replay.settings.workbenches.engine,
         WorkbenchEngine::Bubblewrap
     );
-    eprintln!("BUBBLEWRAP FLOW initial-terminal-and-removal verified");
-    let snapshots = repo.path().join(".git/tyde-workbench-snapshots-v2");
-    assert!(
-        fs::read_dir(&snapshots)
-            .expect("snapshot directory")
-            .next()
-            .is_none(),
-        "a cold unconfigured directory cannot publish artifacts"
-    );
-
-    fs::create_dir(repo.path().join(".tyde")).expect("project configuration directory");
-    fs::write(
-        repo.path().join("requirements.lock"),
-        "opaque-project-input-v1\n",
-    )
-    .expect("tracked project-relative provenance input");
-    fs::write(repo.path().join("assemble.py"),
-        "from pathlib import Path\np = Path('build-output'); p.mkdir()\n(p / 'result.data').write_bytes(Path('README.md').read_bytes())\n").expect("non-Rust producer source");
-    let python = tyde_process_env::find_executable_in_path("python3")
-        .expect("the successful engine terminal established host Python availability");
-    fs::write(
-        repo.path().join(".tyde/workbench.json"),
-        serde_json::to_vec(&json!({
-            "environment": {
-                "PATH": "${PATH}:/tyde-qa-provenance",
-                "QA_PRODUCER_PATH": "/mnt/tyde-runtime/bin:${PATH}:/tyde-qa-provenance"
-            },
-            "snapshot": {
-                "include": ["build-output"],
-                "provenance_paths": [python, "requirements.lock"],
-                "provenance_environment": ["PATH"]
-            }
-        }))
-        .unwrap(),
-    )
-    .expect("explicit generic project configuration");
-    git(repo.path(), &["add", "."]);
-    git(
-        repo.path(),
-        &["commit", "-m", "Configure opaque project artifacts"],
-    );
-    let caller = spawn_project_caller(
-        &mut fixture.client,
-        &parent,
-        "snapshot caller",
-        BackendAccessMode::Unrestricted,
-    )
-    .await;
-    let (failed, response) = call_agent_control(&fixture, &caller.agent_id, "tyde_create_workbench", json!({
-        "parent_project_id": parent.id.0, "branch": "feature/generic-producer", "action": "create_only"
-    })).await;
-    assert!(!failed, "MCP must use the selected server-owned engine");
-    let response: Value = serde_json::from_str(&response).expect("MCP creation result");
-    assert_eq!(response["environment"]["kind"], "bubblewrap");
-    assert_eq!(response["environment"]["initialization"]["kind"], "cold");
-    let producer_id = ProjectId(response["project_id"].as_str().unwrap().to_owned());
-    let producer = fixture
-        .connect_with_bootstrap()
-        .await
-        .1
-        .projects
-        .into_iter()
-        .find(|project| project.id == producer_id)
-        .expect("canonical MCP-created project");
-    let producer_root = producer.root_paths()[0].clone();
-    assert!(
-        !Path::new(&producer_root.0).join("build-output").exists(),
-        "creation must not run a build"
-    );
-    fixture
-        .client
-        .terminal_create(TerminalCreatePayload {
-            target: TerminalLaunchTarget::Project {
-                project_id: producer_id.clone(),
-                root: producer_root.clone(),
-                relative_cwd: None,
-            },
-            cols: 120,
-            rows: 30,
-        })
-        .await
-        .expect("generic producer terminal");
-    let producer_terminal = expect_kind(
-        &mut fixture.client,
-        FrameKind::NewTerminal,
-        "producer terminal",
-    )
-    .await
-    .parse_payload::<NewTerminalPayload>()
-    .unwrap();
-    expect_kind(
-        &mut fixture.client,
-        FrameKind::TerminalBootstrap,
-        "producer terminal bootstrap",
-    )
-    .await;
-    fixture.client.terminal_send(&producer_terminal.terminal_id, protocol::TerminalSendPayload {
-        data: "PATH=\"$QA_PRODUCER_PATH\" python3 assemble.py; status=$?; printf '\\n{\"producer_completed\":%s}\\n' \"$status\"\n".to_owned(),
-    }).await.expect("explicit generic producer request");
-    eprintln!("BUBBLEWRAP FLOW explicit-producer requested");
-    let mut produced = String::new();
-    loop {
-        let event =
-            next_frame_matching_on(&mut fixture.client, "producer command completion", |env| {
-                env.stream == producer_terminal.stream
-                    && matches!(
-                        env.kind,
-                        FrameKind::TerminalOutput
-                            | FrameKind::TerminalError
-                            | FrameKind::TerminalExit
-                    )
-            })
-            .await;
-        assert_eq!(
-            event.kind,
-            FrameKind::TerminalOutput,
-            "producer command must complete successfully"
-        );
-        produced.push_str(
-            &event
-                .parse_payload::<protocol::TerminalOutputPayload>()
-                .unwrap()
-                .data,
-        );
-        assert!(
-            !produced.contains("\"error\": {\"reason\":"),
-            "explicit producer emitted a typed runtime failure before completion"
-        );
-        if let Some(completed) = produced
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|value| value.get("producer_completed").is_some())
-        {
-            assert_eq!(
-                completed["producer_completed"], 0,
-                "explicit producer must succeed"
-            );
-            break;
-        }
-    }
-    fixture
-        .client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: producer_id.clone(),
-            force: false,
-        })
-        .await
-        .expect("seal completed producer and remove resources");
-    let removed = next_frame_matching_on(&mut fixture.client, "producer removed", |env| {
-        env.kind == FrameKind::CommandError
-            || (env.kind == FrameKind::ProjectNotify
-                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
-            ProjectNotifyPayload::Delete { project } if project.id == producer_id))
-    })
-    .await;
-    assert_eq!(
-        removed.kind,
-        FrameKind::ProjectNotify,
-        "quiescent completed producer must seal successfully, not emit CommandError"
-    );
-    eprintln!("BUBBLEWRAP FLOW quiescent-producer removed");
-    let cohorts: Vec<_> = fs::read_dir(&snapshots)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(
-        cohorts.len(),
-        1,
-        "one completed quiescent producer must publish one actual cohort"
-    );
-    let (failed, response) = call_agent_control(&fixture, &caller.agent_id, "tyde_create_workbench", json!({
-        "parent_project_id": parent.id.0, "branch": "feature/generic-consumer", "action": "create_only"
-    })).await;
-    assert!(
-        !failed,
-        "compatible MCP creation must clone opaque artifacts"
-    );
-    let response: Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(
-        response["environment"]["initialization"]["kind"],
-        "snapshot"
-    );
-    let consumer_id = ProjectId(response["project_id"].as_str().unwrap().to_owned());
-    let consumer_root = PathBuf::from(response["roots"][0]["worktree_root"].as_str().unwrap());
-    let result = consumer_root.join("build-output/result.data");
-    let donor = cohorts[0].join("files/build-output/result.data");
-    assert_eq!(
-        fs::read(&result).unwrap(),
-        fs::read(repo.path().join("README.md")).unwrap()
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        assert_ne!(
-            fs::metadata(&result).unwrap().ino(),
-            fs::metadata(&donor).unwrap().ino()
-        );
-    }
-    fs::write(&result, "private consumer edit").unwrap();
-    assert_eq!(
-        fs::read(&donor).unwrap(),
-        fs::read(repo.path().join("README.md")).unwrap()
-    );
-    fixture
-        .client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: consumer_id.clone(),
-            force: true,
-        })
-        .await
-        .expect("remove private consumer");
-    let removed = next_frame_matching_on(&mut fixture.client, "consumer removed", |env| {
-        env.kind == FrameKind::CommandError
-            || (env.kind == FrameKind::ProjectNotify
-                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
-                ProjectNotifyPayload::Delete { project } if project.id == consumer_id))
-    })
-    .await;
-    assert_eq!(
-        removed.kind,
-        FrameKind::ProjectNotify,
-        "consumer removal must succeed"
-    );
-    assert!(!consumer_root.exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -5117,7 +5108,7 @@ os._exit(0)
     assert_eq!(
         result.kind,
         FrameKind::ProjectNotify,
-        "service lifecycle regression requires a strict-CoW filesystem; creation must succeed, reason={:?}",
+        "service lifecycle regression requires working Bubblewrap namespaces; creation must succeed, reason={:?}",
         (result.kind == FrameKind::CommandError).then(|| result
             .parse_payload::<CommandErrorPayload>()
             .unwrap()
@@ -5274,9 +5265,13 @@ os._exit(0)
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
+async fn bubblewrap_multiroot_capture_reuse_and_independence() {
     use protocol::{WorkbenchEngine, WorkbenchEnvironment, WorkbenchInitialization};
-    use std::os::unix::fs::MetadataExt;
+
+    // A host compiler-cache daemon runs outside the view, where a logical
+    // parent path names the parent's files, so these builds compile locally.
+    const CARGO: &str = "env -u CARGO_BUILD_RUSTC_WRAPPER -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR RUSTC_WRAPPER= cargo";
+    const STATUS: &[&str] = &["status", "--porcelain=v1", "--untracked-files=all"];
 
     async fn terminal(client: &mut client::Connection, project: &Project) -> NewTerminalPayload {
         client
@@ -5291,7 +5286,7 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
             })
             .await
             .unwrap();
-        let terminal = expect_kind(client, FrameKind::NewTerminal, "namespace terminal")
+        let terminal = expect_kind(client, FrameKind::NewTerminal, "project terminal")
             .await
             .parse_payload()
             .unwrap();
@@ -5303,7 +5298,7 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         client: &mut client::Connection,
         terminal: &NewTerminalPayload,
         command: &str,
-    ) -> String {
+    ) {
         client.terminal_send(&terminal.terminal_id, protocol::TerminalSendPayload {
             data: format!("{command}\nstatus=$?; printf '\\n{{\"build_finished\":%s}}\\n' \"$status\"\n"),
         }).await.unwrap();
@@ -5322,7 +5317,7 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
             assert_eq!(
                 event.kind,
                 FrameKind::TerminalOutput,
-                "namespace command must remain usable"
+                "terminal must remain usable"
             );
             output.push_str(
                 &event
@@ -5335,93 +5330,59 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .find(|value| value.get("build_finished").is_some())
             {
-                assert_eq!(record["build_finished"], 0, "explicit build must succeed");
-                return output;
+                assert_eq!(
+                    record["build_finished"], 0,
+                    "explicit command must succeed:\n{output}"
+                );
+                return;
             }
         }
     }
 
-    async fn remove(client: &mut client::Connection, project: &Project, phase: &str) {
+    async fn remove(client: &mut client::Connection, project: &Project) {
         client
             .workbench_remove(WorkbenchRemovePayload {
                 id: project.id.clone(),
-                force: false,
+                force: true,
             })
             .await
             .unwrap();
-        let event = next_frame_matching_on(client, "strict source-preserving removal", |env| env.kind == FrameKind::CommandError || (env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project: removed } if removed.id == project.id))).await;
-        if event.kind == FrameKind::CommandError {
-            let error = event.parse_payload::<CommandErrorPayload>().unwrap();
-            eprintln!(
-                "BWRAP REMOVAL DIAGNOSTIC phase={phase} code={:?} reason={:?}",
-                error.code, error.workbench_reason
-            );
-        }
-        eprintln!(
-            "BWRAP REMOVAL DIAGNOSTIC phase={phase} event={:?} roots_remaining={}",
-            event.kind,
-            project
-                .root_paths()
-                .iter()
-                .filter(|root| Path::new(&root.0).exists())
-                .count()
-        );
+        let event = next_frame_matching_on(client, "dirty clone removal", |env| env.kind == FrameKind::CommandError || (env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project: removed } if removed.id == project.id))).await;
         assert_eq!(
             event.kind,
             FrameKind::ProjectNotify,
-            "artifact reuse must never require forceful Git removal"
+            "forced removal of a dirty clone must succeed"
         );
         assert!(
             project
                 .root_paths()
                 .iter()
-                .all(|root| !Path::new(&root.0).exists())
+                .all(|root| !Path::new(&root.0).exists()),
+            "removal must delete every clone root including its build output"
         );
     }
 
+    fn run(binary: &Path) -> String {
+        let output = Command::new(binary).output().expect("run built binary");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("UTF-8 binary output")
+    }
+
     let workspace = tempfile::tempdir().unwrap();
-    let roots = ["rust", "shared", "web", "library"].map(|name| workspace.path().join(name));
-    let [rust, shared, web, library] = &roots;
-    for root in &roots {
-        fs::create_dir(root).unwrap();
+    let workspace_path = fs::canonicalize(workspace.path()).unwrap();
+    let rust = workspace_path.join("rust");
+    let shared = workspace_path.join("shared");
+    for root in [&rust, &shared] {
+        fs::create_dir_all(root.join("src")).unwrap();
         git(root, &["init", "-q"]);
         git(root, &["config", "user.email", "tests@example.com"]);
         git(root, &["config", "user.name", "Tests"]);
-        fs::write(
-            root.join(".gitignore"),
-            "/target/\n/Cargo.lock\n/node_modules/\n/dist/\n/*-hook-ran\n",
-        )
-        .unwrap();
-    }
-    for root in [rust, shared] {
-        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "/target/\n/Cargo.lock\n").unwrap();
     }
     fs::write(rust.join("Cargo.toml"), "[package]\nname='reuse_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nreuse_shared={path='../shared'}\n").unwrap();
     fs::write(
         rust.join("src/main.rs"),
         "fn main() { println!(\"{}\", reuse_shared::value()); }\n",
-    )
-    .unwrap();
-    // Without a rerun-if directive Cargo fingerprints a build script by the
-    // name of the first newest package file in directory order. Checkout
-    // mtimes can tie and ZFS orders every new directory differently, so that
-    // name can differ between workbenches. Declared inputs keep Cargo on the
-    // content and mtimes that reuse restores.
-    fs::write(
-        rust.join("build.rs"),
-        r#"fn main() {
-    println!("cargo::rerun-if-changed=build.rs");
-    if let Ok(path) = std::env::var("TYDE_TEST_BUILD_BARRIER") {
-        use std::io::{Read, Write};
-        let mut barrier = std::os::unix::net::UnixStream::connect(path).unwrap();
-        barrier.write_all(b"B").unwrap();
-        let mut release = [0];
-        barrier.read_exact(&mut release).unwrap();
-        assert_eq!(release, [b'R']);
-    }
-    std::fs::write("build-hook-ran", "explicit").unwrap();
-}
-"#,
     )
     .unwrap();
     fs::write(
@@ -5430,26 +5391,27 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
     )
     .unwrap();
     fs::write(shared.join("src/lib.rs"), "pub fn value() -> u32 { 42 }\n").unwrap();
-    fs::write(web.join("package.json"), r#"{"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"},"scripts":{"preinstall":"node -e \"require('fs').writeFileSync('install-hook-ran','explicit')\"","build":"node build.js"}}"#).unwrap();
-    fs::write(web.join("package-lock.json"), r#"{"name":"web","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"web","version":"1.0.0","dependencies":{"library":"file:../library"}},"../library":{"name":"library","version":"1.0.0"},"node_modules/library":{"resolved":"../library","link":true}}}"#).unwrap();
-    fs::write(web.join("build.js"), "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});const p='dist/value',v=String(require('library'));if(!fs.existsSync(p)||fs.readFileSync(p,'utf8')!==v)fs.writeFileSync(p,v);\n").unwrap();
-    fs::write(
-        library.join("package.json"),
-        "{\"name\":\"library\",\"version\":\"1.0.0\",\"main\":\"index.js\"}\n",
-    )
-    .unwrap();
-    fs::write(library.join("package-lock.json"), "{\"name\":\"library\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"packages\":{\"\":{\"name\":\"library\",\"version\":\"1.0.0\"}}}\n").unwrap();
-    fs::write(library.join("index.js"), "module.exports=42;\n").unwrap();
-    for root in &roots {
+    for root in [&rust, &shared] {
         git(root, &["add", "."]);
-        git(root, &["commit", "-qm", "Unbuilt source"]);
+        git(root, &["commit", "-qm", "Committed source"]);
     }
+    let parent_lib = "pub fn value() -> u32 { 43 }\n";
+    fs::write(shared.join("src/lib.rs"), parent_lib).unwrap();
+    fs::write(rust.join("notes.txt"), "untracked parent notes\n").unwrap();
+
     let mut fixture = Fixture::new().await;
-    let parent = create_project(
+    let parent = create_project(&mut fixture.client, vec![rust.as_path(), shared.as_path()]).await;
+    let parent_terminal = terminal(&mut fixture.client, &parent).await;
+    command(
         &mut fixture.client,
-        roots.iter().map(PathBuf::as_path).collect(),
+        &parent_terminal,
+        &format!("{CARGO} build --offline && (cd ../shared && {CARGO} build --offline)"),
     )
     .await;
+    let parent_binary = fs::read(rust.join("target/debug/reuse_app")).unwrap();
+    assert_eq!(run(&rust.join("target/debug/reuse_app")), "43\n");
+    let parent_status = [&rust, &shared].map(|root| git_stdout(root, STATUS));
+    assert!(parent_status.iter().all(|status| !status.is_empty()));
     fixture
         .client
         .replace_setting(
@@ -5469,456 +5431,144 @@ async fn bubblewrap_cold_multiroot_builds_and_recipe_free_reuse() {
         .client
         .workbench_create(WorkbenchCreatePayload {
             parent_project_id: parent.id.clone(),
-            branch: GitBranchName("cold-first".into()),
-            name: "Cold usable checkout".into(),
+            branch: GitBranchName("capture-edited".into()),
+            name: "Edited view".into(),
         })
         .await
         .unwrap();
-    let event = next_frame_matching_on(&mut fixture.client, "cold creation", |env| {
+    let event = next_frame_matching_on(&mut fixture.client, "captured creation", |env| {
         matches!(env.kind, FrameKind::ProjectNotify | FrameKind::CommandError)
     })
     .await;
-    assert_eq!(
-        event.kind,
-        FrameKind::ProjectNotify,
-        "real Bubblewrap build/reuse flow requires working namespaces and reflinks"
-    );
-    let ProjectNotifyPayload::Upsert { project: first } = event.parse_payload().unwrap() else {
+    if event.kind == FrameKind::CommandError {
+        let error = event.parse_payload::<CommandErrorPayload>().unwrap();
+        panic!(
+            "multiroot capture requires working Bubblewrap namespaces: reason={:?} message={}",
+            error.workbench_reason, error.message
+        );
+    }
+    let ProjectNotifyPayload::Upsert { project: edited } = event.parse_payload().unwrap() else {
         panic!("created workbench")
     };
-    assert!(
-        matches!(&first.source, ProjectSource::GitWorkbench { environment: WorkbenchEnvironment::Bubblewrap { initialization: WorkbenchInitialization::Cold, additional_roots, build_blockers, .. }, .. } if additional_roots.len() == 3 && build_blockers.is_empty())
-    );
-    let paths = first.root_paths();
-    for root in &paths {
-        for artifact in [
-            "target",
-            "node_modules",
-            "dist",
-            "build-hook-ran",
-            "install-hook-ran",
-        ] {
-            assert!(
-                !Path::new(&root.0).join(artifact).exists(),
-                "creation must not execute project/build/install scripts"
+    let sibling = create_workbench(&mut fixture.client, &parent, "capture-sibling").await;
+    for project in [&edited, &sibling] {
+        let ProjectSource::GitWorkbench {
+            environment:
+                WorkbenchEnvironment::Bubblewrap {
+                    logical_root,
+                    additional_roots,
+                    build_blockers,
+                    initialization: WorkbenchInitialization::Captured { .. },
+                    ..
+                },
+            ..
+        } = &project.source
+        else {
+            panic!("multiroot workbench must be a captured Bubblewrap clone");
+        };
+        assert_eq!(
+            [logical_root.0.as_str()]
+                .into_iter()
+                .chain(additional_roots.iter().map(|root| root.0.as_str()))
+                .collect::<Vec<_>>(),
+            [rust.to_str().unwrap(), shared.to_str().unwrap()],
+            "each root must be viewed at its own parent path"
+        );
+        assert!(build_blockers.is_empty());
+        let roots = project.root_paths();
+        for (index, root) in roots.iter().enumerate() {
+            let root = Path::new(&root.0);
+            assert!(root.join("target/debug").is_dir(), "build output captured");
+            assert_eq!(
+                git_stdout(root, STATUS),
+                parent_status[index],
+                "dirty state captured"
             );
         }
-        assert!(!Path::new(&root.0).join(".tyde/workbench.json").exists());
+        assert_eq!(
+            fs::read(Path::new(&roots[0].0).join("target/debug/reuse_app")).unwrap(),
+            parent_binary
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&roots[1].0).join("src/lib.rs")).unwrap(),
+            parent_lib
+        );
     }
-    let store = rust.join(".git/tyde-workbench-snapshots-v2");
-    assert_eq!(
-        fs::read_dir(&store).unwrap().count(),
-        0,
-        "new cache must be genuinely empty"
-    );
-    let (mut cold_client, _) = fixture.connect_with_bootstrap().await;
-    let cold_terminal = terminal(&mut cold_client, &first).await;
-    let host_namespace = fs::read_link("/proc/self/ns/user").unwrap();
-    let namespace = command(&mut cold_client, &cold_terminal, &format!("python3 -c 'import os,subprocess; assert os.readlink(\"/proc/self/ns/user\") != {}; assert os.path.isdir(\"/mnt/tyde-runtime\"); subprocess.run([\"bwrap\",\"--unshare-user\",\"--ro-bind\",\"/\",\"/\",\"--\",\"/bin/true\"],check=True); print(\"namespace_verified\")'", serde_json::to_string(&host_namespace).unwrap())).await;
-    assert!(namespace.contains("namespace_verified"));
+    let view = terminal(&mut fixture.client, &edited).await;
     command(
-        &mut cold_client,
-        &cold_terminal,
-        r#"python3 -c 'import json,subprocess; from pathlib import Path; runtime=Path("/mnt/tyde-runtime"); venv=runtime/"probe-venv"; subprocess.run(["python3","-m","venv","--without-pip",str(venv)],check=True); p=subprocess.run([str(venv/"bin/python3"),str(runtime/"runner.py"),"probe"],stdin=subprocess.DEVNULL,check=True,capture_output=True,text=True); support=json.loads(p.stdout); assert support["bubblewrap"]["kind"] == "available"; assert support["nested_namespaces"]["kind"] == "available"'"#,
-    ).await;
-    let delegated = workspace.path().join("delegated-yarn");
-    fs::create_dir(&delegated).unwrap();
-    git(&delegated, &["init", "-q"]);
-    git(&delegated, &["config", "user.email", "tests@example.com"]);
-    git(&delegated, &["config", "user.name", "Tests"]);
-    fs::write(
-        delegated.join("package.json"),
-        "{\"name\":\"delegated\",\"version\":\"1.0.0\"}\n",
-    )
-    .unwrap();
-    fs::write(delegated.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
-    fs::write(delegated.join(".yarnrc.yml"), "yarnPath: ./dispatch.cjs\n").unwrap();
-    let dispatched = workspace.path().join("yarn-dispatched");
-    fs::write(
-        delegated.join("dispatch.cjs"),
-        format!(
-            "require('fs').writeFileSync({}, 'unexpected');console.log('1.22.22');\n",
-            serde_json::to_string(&dispatched).unwrap()
-        ),
-    )
-    .unwrap();
-    git(&delegated, &["add", "."]);
-    git(&delegated, &["commit", "-qm", "Project-dispatched Yarn"]);
-    let delegated_project = create_project(&mut fixture.client, vec![delegated.as_path()]).await;
-    for explicit in [false, true] {
-        if explicit {
-            fs::create_dir(delegated.join(".tyde")).unwrap();
-            fs::write(
-                delegated.join(".tyde/workbench.json"),
-                r#"{"snapshot":{"include":["output"],"provenance_paths":[],"provenance_environment":[],"provenance_tools":["yarn"]}}"#,
-            )
-            .unwrap();
-            git(&delegated, &["add", "."]);
-            git(&delegated, &["commit", "-qm", "Explicit tool provenance"]);
-        }
-        fixture
-            .client
-            .workbench_create(WorkbenchCreatePayload {
-                parent_project_id: delegated_project.id.clone(),
-                branch: GitBranchName(format!("reject-yarn-{explicit}")),
-                name: "Reject project-dispatched tool identity".into(),
-            })
-            .await
-            .unwrap();
-        let result =
-            next_frame_matching_on(&mut fixture.client, "Yarn identity rejection", |env| {
-                matches!(env.kind, FrameKind::CommandError | FrameKind::ProjectNotify)
-            })
-            .await;
-        assert_eq!(
-            result.kind,
-            FrameKind::CommandError,
-            "project-dispatched Yarn must be rejected before optional tool discovery"
-        );
-        let error = result.parse_payload::<CommandErrorPayload>().unwrap();
-        assert_eq!(
-            error.workbench_reason,
-            Some(protocol::WorkbenchUnsupportedReason::RuntimeConfigurationInvalid)
-        );
-        assert!(error.message.contains("Yarn identity queries"));
-        assert!(
-            !dispatched.exists(),
-            "creation must never dispatch a project package-manager script on the host"
-        );
-    }
-    let concurrent = create_workbench(&mut fixture.client, &parent, "independent-feature").await;
-    let concurrent_root = PathBuf::from(&concurrent.root_paths()[0].0);
-    let independent_source = concurrent_root.join("src/main.rs");
-    let original_source = fs::read(&independent_source).unwrap();
-    fs::write(&independent_source, "fn main() { println!(\"99\"); }\n").unwrap();
-    let concurrent_terminal = terminal(&mut fixture.client, &concurrent).await;
-    let barrier_path = workspace.path().join("build.sock");
-    let barrier = tokio::net::UnixListener::bind(&barrier_path).unwrap();
-    let mut cold_build = tokio::spawn(async move {
-        command(&mut cold_client, &cold_terminal, &format!(
-            "TYDE_TEST_BUILD_BARRIER='{}' cargo build --offline --message-format=json && (cd ../shared && cargo build --offline) && (cd ../web && npm ci --offline && npm run build) && (cd ../library && npm ci --offline)",
-            barrier_path.to_string_lossy().replace('\'', "'\"'\"'")
-        )).await;
-    });
-    let (mut building, _) = tokio::select! {
-        connection = barrier.accept() => connection.unwrap(),
-        result = &mut cold_build => {
-            result.unwrap();
-            panic!("the held build completed before reaching its barrier");
-        }
-    };
-    let mut started = [0];
-    tokio::io::AsyncReadExt::read_exact(&mut building, &mut started)
-        .await
-        .unwrap();
-    assert_eq!(started, [b'B']);
-    command(&mut fixture.client, &concurrent_terminal, "cargo build --offline && python3 -c 'import subprocess; assert subprocess.check_output([\"target/debug/reuse_app\"]) == b\"99\\n\"'").await;
-    assert!(
-        !cold_build.is_finished(),
-        "an independent feature must complete while its peer build is held"
-    );
-    tokio::io::AsyncWriteExt::write_all(&mut building, b"R")
-        .await
-        .unwrap();
-    cold_build.await.unwrap();
-    fs::write(independent_source, original_source).unwrap();
-    remove(&mut fixture.client, &concurrent, "independent-feature").await;
-
-    assert!(Path::new(&paths[0].0).join("build-hook-ran").exists());
-    assert!(Path::new(&paths[2].0).join("install-hook-ran").exists());
-    let donor_binary = Path::new(&paths[0].0).join("target/debug/reuse_app");
-    let donor_metadata = fs::metadata(&donor_binary).unwrap();
-    let donor_bytes = fs::read(&donor_binary).unwrap();
-    remove(&mut fixture.client, &first, "donor-seal").await;
-    assert_eq!(
-        fs::read_dir(&store).unwrap().count(),
-        1,
-        "normal explicit builds must populate a cohort without a recipe or helper"
-    );
-    let second = create_workbench(&mut fixture.client, &parent, "recipe-free-second").await;
-    assert!(matches!(
-        &second.source,
-        ProjectSource::GitWorkbench {
-            environment: WorkbenchEnvironment::Bubblewrap {
-                initialization: WorkbenchInitialization::Snapshot { .. },
-                ..
-            },
-            ..
-        }
-    ));
-    let second_paths = second.root_paths();
-    let binary = Path::new(&second_paths[0].0).join("target/debug/reuse_app");
-    assert_eq!(fs::read(&binary).unwrap(), donor_bytes);
-    assert_ne!(fs::metadata(&binary).unwrap().ino(), donor_metadata.ino());
-    assert_eq!(
-        fs::metadata(&binary).unwrap().modified().unwrap(),
-        donor_metadata.modified().unwrap()
-    );
-    assert_eq!(
-        fs::read_to_string(Path::new(&second_paths[2].0).join("dist/value")).unwrap(),
-        "42"
-    );
-    let consumer_terminal = terminal(&mut fixture.client, &second).await;
-    let output = command(
         &mut fixture.client,
-        &consumer_terminal,
-        r#"python3 -c 'import json,os,subprocess,sys; from pathlib import Path; p=subprocess.run(["cargo","build","--offline","--message-format=json"],env=dict(os.environ,CARGO_LOG="cargo::core::compiler::fingerprint=trace,cargo::compiler::fingerprint=trace"),capture_output=True); Path("target/reuse-cargo-result.json").write_text(json.dumps({"returncode":p.returncode,"stdout":p.stdout.decode("utf-8"),"stderr":p.stderr.decode("utf-8")})); sys.stdout.buffer.write(p.stdout); sys.stderr.buffer.write(p.stderr); sys.exit(p.returncode)' && (cd ../web && npm run build)"#,
+        &view,
+        &format!("{CARGO} build --offline --message-format=json > target/reuse.jsonl"),
     )
     .await;
-    let terminal_artifacts: Vec<Value> = output
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|value| value["reason"] == "compiler-artifact")
-        .collect();
-    let cargo_result: Value = serde_json::from_slice(
-        &fs::read(Path::new(&second_paths[0].0).join("target/reuse-cargo-result.json")).unwrap(),
-    )
-    .unwrap();
-    // Host capture had three Cargo artifacts but only two in PTY parsing.
-    // Only the completed process's unframed JSON determines build freshness.
-    let captured_artifacts: Vec<Value> = cargo_result["stdout"]
-        .as_str()
+    let edited_roots = edited.root_paths();
+    let edited_rust = PathBuf::from(&edited_roots[0].0);
+    let mut units = fs::read_to_string(edited_rust.join("target/reuse.jsonl"))
         .unwrap()
         .lines()
-        .map(|line| {
-            serde_json::from_str::<Value>(line)
-                .expect("actual Cargo stdout must contain complete JSON records")
-        })
-        .filter(|value| value["reason"] == "compiler-artifact")
-        .collect();
-    let summarize = |records: &[Value]| {
-        records
-            .iter()
-            .map(|record| {
-                json!({
-                    "target": record["target"]["name"],
-                    "kind": record["target"]["kind"],
-                    "fresh": record["fresh"],
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    eprintln!(
-        "REUSE CARGO DIAGNOSTIC {}",
-        json!({
-            "terminal_bytes": output.len(),
-            "terminal_escape_bytes": output.bytes().filter(|byte| *byte == 27).count(),
-            "terminal_artifact_count": terminal_artifacts.len(),
-            "terminal_artifacts": summarize(&terminal_artifacts),
-            "process_exit": cargo_result["returncode"],
-            "process_artifact_count": captured_artifacts.len(),
-            "process_artifacts": summarize(&captured_artifacts),
-            "fingerprint_stderr": cargo_result["stderr"],
-        })
-    );
+        .map(|line| serde_json::from_str::<Value>(line).expect("complete Cargo JSON record"))
+        .filter(|record| record["reason"] == "compiler-artifact")
+        .map(|record| json!({"target": record["target"]["name"], "fresh": record["fresh"]}))
+        .collect::<Vec<_>>();
+    units.sort_by(|a, b| a["target"].as_str().cmp(&b["target"].as_str()));
     assert_eq!(
-        cargo_result["returncode"], 0,
-        "actual reuse Cargo process must succeed"
-    );
-    let mut captured_units = summarize(&captured_artifacts);
-    captured_units.sort_by(|a, b| a["target"].as_str().cmp(&b["target"].as_str()));
-    assert_eq!(
-        captured_units,
+        units,
         [
-            json!({"target": "build-script-build", "kind": ["custom-build"], "fresh": true}),
-            json!({"target": "reuse_app", "kind": ["bin"], "fresh": true}),
-            json!({"target": "reuse_shared", "kind": ["lib"], "fresh": true}),
+            json!({"target": "reuse_app", "fresh": true}),
+            json!({"target": "reuse_shared", "fresh": true}),
         ],
-        "actual Cargo process must report complete Fresh cross-workbench artifacts"
+        "the captured parent build must be fresh in the view"
     );
-    let original = fs::read(Path::new(&second_paths[0].0).join("src/main.rs")).unwrap();
-    let original_mtime = fs::metadata(Path::new(&second_paths[0].0).join("src/main.rs"))
-        .unwrap()
-        .modified()
-        .unwrap();
-    command(&mut fixture.client, &consumer_terminal, "python3 -c 'from pathlib import Path;Path(\"src/main.rs\").write_text(\"fn main() { println!(\\\"scratch-rebuilt\\\"); }\\n\")' && cargo build --offline --message-format=json && target/debug/reuse_app").await;
-    let scratch_output = command(
-        &mut fixture.client,
-        &consumer_terminal,
-        "target/debug/reuse_app",
-    )
-    .await;
-    let scratch_process = command(
-        &mut fixture.client,
-        &consumer_terminal,
-        "python3 -c 'import json,subprocess; from pathlib import Path; p=subprocess.run([\"target/debug/reuse_app\"],capture_output=True); result=json.dumps({\"scratch_returncode\":p.returncode,\"scratch_stdout\":p.stdout.decode(\"utf-8\"),\"scratch_stderr\":p.stderr.decode(\"utf-8\")}); Path(\"target/scratch-result.json\").write_text(result); print(result)'",
-    ).await;
-    // Host capture had exact process stdout but prompt/OSC/CSI framing on
-    // its terminal line. Assert the process result, not the PTY presentation.
-    let scratch_result: Value = serde_json::from_slice(
-        &fs::read(Path::new(&second_paths[0].0).join("target/scratch-result.json")).unwrap(),
-    )
-    .unwrap();
-    eprintln!(
-        "SCRATCH REBUILD DIAGNOSTIC binary_changed={} terminal_bytes={} captured_bytes={} process={scratch_result}",
-        fs::read(&binary).unwrap() != donor_bytes,
-        scratch_output.len(),
-        scratch_process.len()
-    );
-    assert!(
-        fs::read(&binary).unwrap() != donor_bytes,
-        "scratch source change must produce different executable bytes"
-    );
-    assert_eq!(
-        scratch_result,
-        json!({
-            "scratch_returncode": 0,
-            "scratch_stdout": "scratch-rebuilt\n",
-            "scratch_stderr": "",
-        }),
-        "scratch source change must actually change executable behavior"
-    );
-    fs::write(Path::new(&second_paths[0].0).join("src/main.rs"), original).unwrap();
-    eprintln!(
-        "BWRAP SCRATCH RESTORE DIAGNOSTIC mtime_matches_authority={}",
-        fs::metadata(Path::new(&second_paths[0].0).join("src/main.rs"))
-            .unwrap()
-            .modified()
-            .unwrap()
-            == original_mtime
-    );
-    let cohort = fs::read_dir(&store)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let receipt = fs::read(cohort.join("cohort.json")).unwrap();
-    remove(&mut fixture.client, &second, "scratch-discard").await;
-    let cohort_count = fs::read_dir(&store).unwrap().count();
-    let receipt_unchanged = fs::read(cohort.join("cohort.json")).unwrap() == receipt;
-    eprintln!(
-        "BWRAP SCRATCH DISCARD DIAGNOSTIC cohort_count={cohort_count} receipt_unchanged={receipt_unchanged}"
-    );
-    assert_eq!(cohort_count, 1);
-    assert!(
-        receipt_unchanged,
-        "scratch artifacts must not replace the immutable cohort"
-    );
-    let third = create_workbench(&mut fixture.client, &parent, "isolated-third").await;
-    let donor_restored =
-        fs::read(Path::new(&third.root_paths()[0].0).join("target/debug/reuse_app")).unwrap()
-            == donor_bytes;
-    eprintln!(
-        "BWRAP THIRD CONSUMER DIAGNOSTIC snapshot={} donor_restored={donor_restored}",
-        matches!(
-            &third.source,
-            ProjectSource::GitWorkbench {
-                environment: WorkbenchEnvironment::Bubblewrap {
-                    initialization: WorkbenchInitialization::Snapshot { .. },
-                    ..
-                },
-                ..
-            }
-        )
-    );
-    assert!(
-        donor_restored,
-        "normal removal must discard incompatible scratch output without forcing Git deletion"
-    );
-    let third_terminal = terminal(&mut fixture.client, &third).await;
-    command(&mut fixture.client, &third_terminal, "python3 -c 'from pathlib import Path;Path(\"../web/dist/private\").write_text(\"private\");assert not Path(\"../web/dist/private\").is_symlink()'").await;
-    eprintln!(
-        "BWRAP PRIVATE WRITE DIAGNOSTIC consumer_present={} cohort_present={}",
-        Path::new(&third.root_paths()[2].0)
-            .join("dist/private")
-            .exists(),
-        cohort.join("files/2/dist/private").exists()
-    );
-    assert!(
-        !cohort.join("files/2/dist/private").exists(),
-        "consumer writes must not alter sealed artifacts"
-    );
-    remove(&mut fixture.client, &third, "private-consumer").await;
-    fs::write(library.join("index.js"), "module.exports=43;\n").unwrap();
-    git(library, &["add", "."]);
-    git(library, &["commit", "-qm", "Change sibling input"]);
-    let changed = create_workbench(&mut fixture.client, &parent, "changed-source-cold").await;
-    eprintln!(
-        "BWRAP INVALIDATION DIAGNOSTIC cold={} restored_dist_present={}",
-        matches!(
-            &changed.source,
-            ProjectSource::GitWorkbench {
-                environment: WorkbenchEnvironment::Bubblewrap {
-                    initialization: WorkbenchInitialization::Cold,
-                    ..
-                },
-                ..
-            }
-        ),
-        Path::new(&changed.root_paths()[2].0).join("dist").exists()
-    );
-    assert!(matches!(
-        &changed.source,
-        ProjectSource::GitWorkbench {
-            environment: WorkbenchEnvironment::Bubblewrap {
-                initialization: WorkbenchInitialization::Cold,
-                ..
-            },
-            ..
-        }
-    ));
-    assert!(
-        !Path::new(&changed.root_paths()[2].0).join("dist").exists(),
-        "changed sibling input must invalidate the entire cohort, without rebuilding"
-    );
-    let changed_terminal = terminal(&mut fixture.client, &changed).await;
     command(
         &mut fixture.client,
-        &changed_terminal,
-        "mkdir -p ../web/dist && ln -s /etc/os-release ../web/dist/external",
+        &view,
+        &format!("printf 'pub fn value() -> u32 {{ 44 }}\\n' > ../shared/src/lib.rs && {CARGO} build --offline && target/debug/reuse_app > target/edited.txt"),
     )
     .await;
-    fixture
-        .client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: changed.id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap();
-    let rejected = next_frame_matching_on(&mut fixture.client, "unsafe artifact publication result", |env| env.kind == FrameKind::CommandError || (env.kind == FrameKind::ProjectNotify && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(), ProjectNotifyPayload::Delete { project } if project.id == changed.id))).await;
-    eprintln!(
-        "BWRAP SECURITY DIAGNOSTIC event={:?} source_retained={}",
-        rejected.kind,
-        Path::new(&changed.root_paths()[0].0).exists()
+    assert_eq!(
+        fs::read_to_string(edited_rust.join("target/edited.txt")).unwrap(),
+        "44\n",
+        "a view edit to a sibling root must rebuild against that root's clone"
     );
     assert_eq!(
-        rejected.kind,
-        FrameKind::CommandError,
-        "unsafe artifacts must fail publication explicitly"
+        fs::read_to_string(Path::new(&edited_roots[1].0).join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 44 }\n"
     );
-    let rejection = rejected.parse_payload::<CommandErrorPayload>().unwrap();
-    eprintln!(
-        "BWRAP SECURITY DIAGNOSTIC code={:?} reason={:?} message_has_symlink={} message_has_relative={}",
-        rejection.code,
-        rejection.workbench_reason,
-        rejection.message.contains("symlink"),
-        rejection.message.contains("relative")
-    );
-    assert_eq!(
-        rejection.workbench_reason,
-        Some(protocol::WorkbenchUnsupportedReason::IncompatibleEnvironment)
-    );
-    assert!(rejection.message.contains("symlink") && rejection.message.contains("relative"));
-    assert!(
-        Path::new(&changed.root_paths()[0].0).exists(),
-        "security failures must remain explicit, not Native/cold substitutes"
-    );
-    fs::remove_file(Path::new(&changed.root_paths()[2].0).join("dist/external")).unwrap();
-    fs::remove_dir(Path::new(&changed.root_paths()[2].0).join("dist")).unwrap();
-    remove(&mut fixture.client, &changed, "security-retry").await;
-    for (index, root) in roots.iter().enumerate() {
-        eprintln!(
-            "BWRAP PARENT DIAGNOSTIC root={index} target_present={} dependencies_present={}",
-            root.join("target").exists(),
-            root.join("node_modules").exists()
+    let sibling_roots = sibling.root_paths();
+    for (source, binary, owner) in [
+        (
+            shared.clone(),
+            rust.join("target/debug/reuse_app"),
+            "parent",
+        ),
+        (
+            PathBuf::from(&sibling_roots[1].0),
+            Path::new(&sibling_roots[0].0).join("target/debug/reuse_app"),
+            "sibling",
+        ),
+    ] {
+        assert_eq!(
+            fs::read_to_string(source.join("src/lib.rs")).unwrap(),
+            parent_lib,
+            "a view edit must not reach the {owner} source"
         );
-        assert!(
-            !root.join("target").exists() && !root.join("node_modules").exists(),
-            "native parent must stay unbuilt"
+        assert_eq!(
+            fs::read(&binary).unwrap(),
+            parent_binary,
+            "a view build must not reach the {owner} output"
         );
     }
+    remove(&mut fixture.client, &edited).await;
+    remove(&mut fixture.client, &sibling).await;
+    assert_eq!(
+        [&rust, &shared].map(|root| git_stdout(root, STATUS)),
+        parent_status
+    );
+    assert_eq!(run(&rust.join("target/debug/reuse_app")), "43\n");
+    assert!(
+        shared.join("target/debug").is_dir(),
+        "removal must not delete the parent's ignored output"
+    );
 }
 
 #[tokio::test]
@@ -6053,7 +5703,7 @@ async fn interrupted_creation_rolls_back_before_identical_retry() {
         );
         assert!(
             environment.as_ref().is_none_or(|path| !path.exists()),
-            "owned environment rolled back without publishing snapshots"
+            "owned environment rolled back before retry"
         );
         assert!(
             staging.as_ref().is_none_or(|path| !path.exists()),

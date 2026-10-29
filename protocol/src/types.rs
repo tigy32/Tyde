@@ -6162,6 +6162,7 @@ impl Project {
         if path == "/mnt"
             || [
                 "/mnt/tyde-workspace",
+                "/mnt/tyde-git",
                 "/mnt/tyde-runtime",
                 "/mnt/tyde-producer-receipts",
             ]
@@ -6220,7 +6221,6 @@ pub enum WorkbenchEngine {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkbenchConfiguration {
-    pub snapshot: Option<WorkbenchSnapshotConfiguration>,
     pub environment: BTreeMap<String, String>,
     pub remove_environment: Vec<String>,
     pub writable_paths: Vec<String>,
@@ -6229,29 +6229,6 @@ pub struct WorkbenchConfiguration {
     pub runtime_file_bindings: Vec<WorkbenchRuntimeFileBinding>,
     pub readonly_bindings: Vec<WorkbenchRuntimePathBinding>,
     pub services: Vec<WorkbenchServiceConfiguration>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WorkbenchSnapshotConfiguration {
-    pub include: Vec<String>,
-    pub provenance_paths: Vec<String>,
-    pub provenance_environment: Vec<String>,
-    #[serde(default)]
-    pub provenance_tools: Vec<WorkbenchProvenanceTool>,
-    #[serde(default)]
-    pub optional_include: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkbenchProvenanceTool {
-    Cargo,
-    Rustc,
-    Node,
-    Npm,
-    Pnpm,
-    Yarn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -6285,7 +6262,6 @@ pub enum WorkbenchUnsupportedReason {
     NotLinux,
     BubblewrapMissing,
     NamespaceDenied,
-    ReflinkUnsupported,
     RuntimeToolMissing,
     RuntimeConfigurationInvalid,
     RuntimeServiceFailed,
@@ -6322,6 +6298,7 @@ pub struct WorkbenchSupport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkbenchInitialization {
+    Captured { copy_on_write: bool },
     Cold,
     Snapshot { cohort: String },
     Prepared { cohort: String },
@@ -6331,7 +6308,7 @@ pub enum WorkbenchInitialization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkbenchRemovalPhase {
-    SealArtifacts,
+    #[serde(alias = "seal_artifacts")]
     RemoveResources,
 }
 
@@ -6451,7 +6428,8 @@ pub enum ProjectOperationStage {
     Queue,
     Git,
     Filesystem,
-    PrepareBuilds,
+    #[serde(alias = "prepare_builds")]
+    CloneWorkspace,
     Persistence,
     Cleanup,
     Fanout,

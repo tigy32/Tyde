@@ -34,7 +34,7 @@ path=sys.argv[sys.argv.index('--config')+1]
 assert json.load(open(path))['build']['beforeDevCommand'] is None
 marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
 marker.touch()
-marker.with_suffix('.namespace').write_text(json.dumps({'logical_cwd':os.getcwd()=='/mnt/tyde-workspace','private_namespace':os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'] if pathlib.Path('/proc/self/ns/mnt').exists() else False}))
+marker.with_suffix('.namespace').write_text(json.dumps({'logical_cwd':os.getcwd()==json.loads(marker.with_suffix('.logical').read_text()),'private_namespace':os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'] if pathlib.Path('/proc/self/ns/mnt').exists() else False}))
 if marker.with_suffix('.hold').exists():
  control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
  control.connect(os.environ['TYDE_TEST_FRONTEND_CONTROL']);control.sendall(b'D')
@@ -80,7 +80,7 @@ dist=pathlib.Path(sys.argv[sys.argv.index('--dist')+1])
 marker=pathlib.Path(os.environ['TYDE_TEST_DESKTOP_MARKER'])
 engine=json.loads(marker.with_suffix('.execution').read_text())
 if engine=='bubblewrap':
- assert os.getcwd()=='/mnt/tyde-workspace', 'frontend-logical-cwd'
+ assert os.getcwd()==json.loads(marker.with_suffix('.logical').read_text()), 'frontend-logical-cwd'
  assert os.readlink('/proc/self/ns/mnt')!=os.environ['TYDE_TEST_HOST_NAMESPACE'], 'frontend-private-namespace'
 elif engine=='native':
  if pathlib.Path('/proc/self/ns/mnt').exists():
@@ -366,8 +366,9 @@ async fn start_dev_instance_expecting_exit(
     scenario: DevScenario,
 ) -> String {
     eprintln!("DEV READINESS scenario={scenario:?} phase=starting");
-    // A native scenario can itself run from /mnt/tyde-workspace. Its source
-    // path does not establish whether the child needs a private namespace.
+    // A native scenario can itself run inside a Bubblewrap view at its
+    // parent's path. Its source path does not establish whether the child
+    // needs a private namespace.
     let engine = if scenario.is_native() {
         protocol::WorkbenchEngine::Native
     } else {
@@ -390,7 +391,7 @@ async fn start_dev_instance_expecting_exit(
     })
     .await;
     let fixture_root = tempfile::tempdir().expect("disposable project container");
-    let workbench = if !scenario.is_native() {
+    let (workbench, logical_root) = if !scenario.is_native() {
         assert!(
             matches!(
                 fixture.bootstrap.workbench_support.bubblewrap,
@@ -527,7 +528,7 @@ async fn start_dev_instance_expecting_exit(
         assert_eq!(
             created.kind,
             protocol::FrameKind::ProjectNotify,
-            "DEV isolation regression requires a strict-CoW filesystem; creation must succeed, reason={:?}",
+            "DEV isolation regression requires working Bubblewrap namespaces; creation must succeed, reason={:?}",
             (created.kind == protocol::FrameKind::CommandError).then(|| created
                 .parse_payload::<protocol::CommandErrorPayload>()
                 .unwrap()
@@ -538,10 +539,33 @@ async fn start_dev_instance_expecting_exit(
         else {
             panic!("workbench upsert required")
         };
-        Some(project)
+        let logical_root = std::fs::canonicalize(&source)
+            .expect("canonical DEV parent")
+            .to_string_lossy()
+            .into_owned();
+        let protocol::ProjectSource::GitWorkbench {
+            environment:
+                protocol::WorkbenchEnvironment::Bubblewrap {
+                    logical_root: view, ..
+                },
+            ..
+        } = &project.source
+        else {
+            panic!("DEV workbench must be a Bubblewrap clone")
+        };
+        assert_eq!(
+            view.0, logical_root,
+            "the view must show the clone at its canonical parent path, not the symlinked alias"
+        );
+        (Some(project), Some(logical_root))
     } else {
-        None
+        (None, None)
     };
+    std::fs::write(
+        desktop_marker.with_extension("logical"),
+        serde_json::to_vec(&logical_root).expect("expected logical cwd"),
+    )
+    .expect("declare scenario logical cwd");
     let repo_root = match &workbench {
         Some(project) => PathBuf::from(&project.root_paths()[0].0),
         None => {

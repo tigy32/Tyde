@@ -1616,12 +1616,14 @@ mod wasm_tests {
                         manifest_path: protocol::HostAbsPath(
                             "/host/workbench/manifest.json".to_owned(),
                         ),
-                        logical_root: ProjectRootPath("/workspace".to_owned()),
+                        logical_root: ProjectRootPath("/host/project".to_owned()),
                         additional_roots: Vec::new(),
                         build_blockers: Vec::new(),
                         support: Default::default(),
                         lifecycle: Default::default(),
-                        initialization: protocol::WorkbenchInitialization::Cold,
+                        initialization: protocol::WorkbenchInitialization::Captured {
+                            copy_on_write: true,
+                        },
                     },
                 },
             },
@@ -1643,7 +1645,7 @@ mod wasm_tests {
         let handle = leptos::mount::mount_to(container.clone(), || {
             view! {
                 <div class="chat-card-body" inner_html=crate::markdown::render_markdown(
-                    "[Open source](/workspace/src/main.rs)"
+                    "[Open source](/host/project/src/main.rs)"
                 ) />
             }
         });

@@ -21,11 +21,6 @@ def tools_root(repository: pathlib.Path) -> pathlib.Path:
     configured = os.environ.get("TYDE_NATIVE_BUILD_TOOLS_ROOT")
     if configured is not None:
         return pathlib.Path(configured).resolve()
-    runtime = os.environ.get("TYDE_WORKBENCH_RUNTIME")
-    if runtime is not None:
-        # A venv references the host interpreter; it is a runtime tool, not
-        # a portable compiler output eligible for an artifact snapshot.
-        return pathlib.Path(runtime) / "native-build-tools"
     return repository / "target" / "native-build-tools"
 
 

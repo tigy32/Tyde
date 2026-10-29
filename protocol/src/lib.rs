@@ -208,8 +208,7 @@ pub use types::{
     VoiceTranscriptSpeaker, VoiceUnavailableReason,
 };
 pub use types::{
-    WorkbenchConfiguration, WorkbenchProvenanceTool, WorkbenchRuntimeFileBinding,
-    WorkbenchServiceConfiguration, WorkbenchSnapshotConfiguration,
+    WorkbenchConfiguration, WorkbenchRuntimeFileBinding, WorkbenchServiceConfiguration,
 };
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).

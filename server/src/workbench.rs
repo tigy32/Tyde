@@ -235,89 +235,43 @@ pub(crate) async fn prepare(
         )
         .with_workbench_reason(WorkbenchUnsupportedReason::NotLinux));
     }
+    // The checkout is still empty; the configuration is the parent's, which
+    // capture copies into the workbench verbatim.
     let mut configurations = Vec::new();
-    let mut automatic = Vec::new();
     for root in roots {
-        let path = Path::new(&root.worktree_root.0).join(".tyde/workbench.json");
+        let path = Path::new(&root.parent_root.0).join(".tyde/workbench.json");
         match tokio::fs::read(path).await {
-            Ok(contents) => {
-                configurations.push(
-                    serde_json::from_slice::<protocol::WorkbenchConfiguration>(&contents).map_err(
-                        |_| {
-                            AppError::invalid(
-                                "workbench_create",
-                                "Invalid .tyde/workbench.json configuration",
-                            )
-                            .with_workbench_reason(
-                                WorkbenchUnsupportedReason::RuntimeConfigurationInvalid,
-                            )
-                        },
-                    )?,
-                );
-                automatic.push(false);
-            }
+            Ok(contents) => configurations.push(
+                serde_json::from_slice::<protocol::WorkbenchConfiguration>(&contents).map_err(
+                    |_| {
+                        AppError::invalid(
+                            "workbench_create",
+                            "Invalid .tyde/workbench.json configuration",
+                        )
+                        .with_workbench_reason(
+                            WorkbenchUnsupportedReason::RuntimeConfigurationInvalid,
+                        )
+                    },
+                )?,
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 configurations.push(protocol::WorkbenchConfiguration::default());
-                automatic.push(true);
             }
             Err(error) => return Err(AppError::internal("workbench_create", error)),
         }
     }
     let mut request = tempfile::NamedTempFile::new()
         .map_err(|error| AppError::internal("workbench_create", error))?;
-    serde_json::to_writer(&mut request, &serde_json::json!({"roots": roots, "configurations": configurations, "automatic": automatic})).map_err(|error| AppError::internal("workbench_create", error))?;
-    let mut setup = tempfile::NamedTempFile::new()
-        .map_err(|error| AppError::internal("workbench_create", error))?;
-    std::io::Write::write_all(&mut setup, include_str!("workbench/setup.py").as_bytes())
-        .map_err(|error| AppError::internal("workbench_create", error))?;
+    serde_json::to_writer(
+        &mut request,
+        &serde_json::json!({"roots": roots, "configurations": configurations}),
+    )
+    .map_err(|error| AppError::internal("workbench_create", error))?;
     invoke(
         "prepare",
-        &[
-            request.path(),
-            environment_root,
-            setup.path(),
-            Path::new(claim),
-        ],
+        &[request.path(), environment_root, Path::new(claim)],
     )
     .await
-}
-
-#[derive(Deserialize)]
-struct SnapshotResult {
-    published: bool,
-    #[serde(default)]
-    cohort: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-pub(crate) async fn seal(project: &Project, discard_artifacts: bool) -> AppResult<()> {
-    let ProjectSource::GitWorkbench {
-        environment: WorkbenchEnvironment::Bubblewrap { manifest_path, .. },
-        roots,
-        ..
-    } = &project.source
-    else {
-        return Ok(());
-    };
-    let Some(root) = roots.first() else {
-        return Err(
-            AppError::invalid("workbench_remove", "Bubblewrap requires a source root")
-                .with_workbench_reason(WorkbenchUnsupportedReason::UnsupportedRoots),
-        );
-    };
-    if !discard_artifacts {
-        let result: SnapshotResult = invoke(
-            "snapshot",
-            &[
-                Path::new(&manifest_path.0),
-                Path::new(&root.worktree_root.0),
-            ],
-        )
-        .await?;
-        tracing::info!(published = result.published, cohort = ?result.cohort, reason = ?result.reason, "Workbench artifact snapshot completed");
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]

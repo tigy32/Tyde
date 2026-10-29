@@ -8663,25 +8663,19 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 "cannot remove non-workbench project as workbench",
             ));
         };
-        let removal_phase = match environment {
-            protocol::WorkbenchEnvironment::Native => None,
-            protocol::WorkbenchEnvironment::Bubblewrap { lifecycle, .. } => {
-                let phase = match lifecycle {
-                    protocol::WorkbenchEnvironmentLifecycle::Active => {
-                        catalog
-                            .persist_removal_phase(
-                                stream,
-                                payload,
-                                protocol::WorkbenchRemovalPhase::SealArtifacts,
-                            )
-                            .await?;
-                        protocol::WorkbenchRemovalPhase::SealArtifacts
-                    }
-                    protocol::WorkbenchEnvironmentLifecycle::Removing { phase } => *phase,
-                };
-                Some(phase)
-            }
-        };
+        if let protocol::WorkbenchEnvironment::Bubblewrap {
+            lifecycle: protocol::WorkbenchEnvironmentLifecycle::Active,
+            ..
+        } = environment
+        {
+            catalog
+                .persist_removal_phase(
+                    stream,
+                    payload,
+                    protocol::WorkbenchRemovalPhase::RemoveResources,
+                )
+                .await?;
+        }
         let (agents, terminals) = {
             {
                 let project = project.to_owned();
@@ -8737,18 +8731,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         }
         self.stop_project_services(&payload.id).await?;
-        if removal_phase != Some(protocol::WorkbenchRemovalPhase::RemoveResources) {
-            crate::workbench::seal(project, payload.force).await?;
-            if removal_phase.is_some() {
-                catalog
-                    .persist_removal_phase(
-                        stream,
-                        payload,
-                        protocol::WorkbenchRemovalPhase::RemoveResources,
-                    )
-                    .await?;
-            }
-        }
         let started = std::time::Instant::now();
         for root in roots {
             let metadata = tokio::fs::try_exists(Path::new(&root.worktree_root.0).join(".git"))

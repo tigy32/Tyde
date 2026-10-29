@@ -1,0 +1,36 @@
+{
+  "environment": {
+    "RUSTC_WRAPPER": "sccache",
+    "SCCACHE_CONF": "${TYDE_WORKBENCH_RUNTIME}/compiler-cache.toml",
+    "SCCACHE_DIR": "${TYDE_WORKBENCH_RUNTIME}/compiler-cache",
+    "SCCACHE_SERVER_UDS": "${TYDE_WORKBENCH_RUNTIME}/compiler-cache.sock",
+    "SCCACHE_IDLE_TIMEOUT": "0"
+  },
+  "remove_environment": [
+    "SCCACHE_BUILD_ENV",
+    "SCCACHE_CACHE_SIZE",
+    "SCCACHE_EXECUTABLE",
+    "SCCACHE_SERVER_PORT",
+    "SCCACHE_SERVER_TMPDIR",
+    "SCCACHE_REDIS",
+    "SCCACHE_BUCKET",
+    "SCCACHE_GCS_BUCKET",
+    "SCCACHE_AZURE_CONNECTION_STRING",
+    "SCCACHE_WEBDAV_ENDPOINT"
+  ],
+  "runtime_directories": ["compiler-cache"],
+  "runtime_files": {"compiler-cache.toml": ""},
+  "services": [
+    {
+      "name": "compiler-cache",
+      "command": ["sccache"],
+      "environment": {
+        "SCCACHE_START_SERVER": "1",
+        "SCCACHE_NO_DAEMON": "1",
+        "SCCACHE_STARTUP_NOTIFY": "${TYDE_WORKBENCH_RUNTIME}/compiler-cache-ready.sock"
+      },
+      "ready_notification": "compiler-cache-ready.sock",
+      "stop_command": ["sccache", "--stop-server"]
+    }
+  ]
+}

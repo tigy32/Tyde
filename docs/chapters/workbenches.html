@@ -3,7 +3,8 @@
 <p>Use one for a feature, a bug fix, or another bounded task. For a multi-root project, the workbench follows the parent’s roots so related repository work stays together.</p>
 <h2 id="create">Create and open a workbench</h2>
 <ol><li>Select a project with Git roots and open its context menu.</li><li>Choose <strong>New Workbench</strong>.</li><li>Provide a new branch name that describes the change, such as <code>feature/search-empty-state</code>.</li><li>Select <strong>Create Workbench</strong>, wait for creation to complete, then open it.</li><li>Start the implementation agent from the workbench context.</li></ol>
-<p>The new workbench starts from committed repository state. Uncommitted and untracked changes in the parent are not copied into it. Commit any prerequisites you intend the workbench to contain before creating it.</p>
+<p>With the default Native engine, the new workbench starts from committed repository state. Uncommitted and untracked changes in the parent are not copied into it. Commit any prerequisites you intend the workbench to contain before creating it.</p>
+<p>On Linux, the Bubblewrap engine (Settings → Workbenches) instead clones the parent checkout as it is, at the parent’s current commit: uncommitted, staged, untracked and ignored files, installed dependencies and build outputs. Inside the workbench the clone appears at the parent’s own path, so existing builds and tools keep working. Its Git branch, index and edits are independent of the parent.</p>
 <h2 id="work">Work and review inside it</h2>
 <p>Keep implementation, project checks, and review in the workbench. Check its branch and Git changes before committing. If several agents share a workbench, they still share that workbench’s files; agree on responsibilities.</p>
 <p>For two independent features, create two workbenches. This makes it easier to review each diff and decide when each change is ready.</p>

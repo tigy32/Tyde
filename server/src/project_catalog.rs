@@ -1072,8 +1072,17 @@ async fn run_mutation(
                     })?
                     .to_owned(),
             );
+            let base_commit = git_resolve_base_commit(&root.parent_root, base.as_ref()).await?;
+            if environment_directory.is_some()
+                && base_commit != git_resolve_base_commit(&root.parent_root, None).await?
+            {
+                return Err(AppError::invalid(
+                    operation,
+                    "Bubblewrap workbenches clone the parent's working tree, so they must start at the parent's current commit",
+                ));
+            }
             resolved.push(CreatedWorkbenchRoot {
-                base_commit: git_resolve_base_commit(&root.parent_root, base.as_ref()).await?,
+                base_commit,
                 parent_root_dirty: !git_status_porcelain(&root.parent_root)
                     .await
                     .map_err(|error| AppError::internal(operation, anyhow!(error)))?
@@ -1126,7 +1135,7 @@ async fn run_mutation(
                 hook => hook,
             };
             if let Some(directory) = environment_directory {
-                catalog.stage(stream, ProjectOperationStage::PrepareBuilds, true);
+                catalog.stage(stream, ProjectOperationStage::CloneWorkspace, true);
                 let roots = resolved
                     .iter()
                     .map(|root| root.root.clone())
@@ -1414,11 +1423,18 @@ async fn claim_creation_root(
         ),
     )
     .await?;
+    // Bubblewrap populates its checkout by cloning the parent's working tree.
+    let checkout = if intent.environment_directory.is_some() {
+        "--no-checkout"
+    } else {
+        "--checkout"
+    };
     let output = run_git(
         &root.root.parent_root,
         &[
             "worktree",
             "add",
+            checkout,
             &root.root.worktree_root.0,
             &intent.payload.branch.0,
         ],
@@ -1600,7 +1616,10 @@ async fn rollback_creation(intent: &protocol::WorkbenchCreationIntent) -> AppRes
             ));
         }
         if registered {
-            git_worktree_remove(&root.root.parent_root, &root.root.worktree_root, false)
+            // A partially cloned parent workspace is never clean; its claimed
+            // registration and unchanged branch establish ownership.
+            let clone = intent.environment_directory.is_some();
+            git_worktree_remove(&root.root.parent_root, &root.root.worktree_root, clone)
                 .await
                 .map_err(|error| AppError::conflict("workbench_recover", error))?;
             if creation_worktree_registered(root, &branch).await? {

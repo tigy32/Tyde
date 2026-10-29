@@ -732,106 +732,96 @@ impl<B: Backend> Harness<B> {
 
     pub async fn prepare_bubblewrap(&mut self) -> (protocol::Project, protocol::Project) {
         assert!(self.backend.is_none(), "prepare before provider launch");
-        std::fs::write(self.workspace().join(".gitignore"), "/build-output/\n")
-            .expect("ignore private build output");
-        std::fs::create_dir(self.workspace().join(".tyde")).expect("project configuration");
+        let parent = self.workspace.path();
         std::fs::write(
-            self.workspace().join("build.py"),
-            r#"import hashlib, json, os
-from pathlib import Path
-
-assert os.getcwd() == '/mnt/tyde-workspace'
-source = Path('README.txt').read_bytes()
-identity = {'cwd': os.getcwd(), 'source': hashlib.sha256(source).hexdigest()}
-output = Path('build-output')
-fingerprint = output / 'fingerprint.json'
-artifact = output / 'private-copy.txt'
-reused = fingerprint.exists() and json.loads(fingerprint.read_text()) == identity and artifact.read_bytes() == source
-if not reused:
-    output.mkdir(exist_ok=True)
-    artifact.write_bytes(source)
-    fingerprint.write_text(json.dumps(identity))
-print(json.dumps({'reused': reused}))
-"#,
+            parent.join(".gitignore"),
+            format!("/build-output/\n/{}/\n", super::MCP_PROBE_DIR),
         )
-        .expect("path-sensitive opaque build recipe");
+        .expect("ignore private build output and harness probes");
+        std::fs::create_dir(parent.join(".tyde")).expect("project configuration");
         let configuration = serde_json::json!({
             "runtime_directories": ["private"],
-            "runtime_files": {"private/runtime-boundary.txt": "runtime-created\n"},
-            "snapshot": {
-                "producer": ["python3", "build.py"],
-                "include": ["build-output"],
-                "provenance_paths": ["/usr/bin/python3"],
-                "provenance_environment": []
-            }
+            "runtime_files": {"private/runtime-boundary.txt": "runtime-created\n"}
         });
         std::fs::write(
-            self.workspace().join(".tyde/workbench.json"),
+            parent.join(".tyde/workbench.json"),
             configuration.to_string(),
         )
-        .expect("explicit language-agnostic snapshot configuration");
-        init_workspace_repo(self.workspace());
+        .expect("explicit language-agnostic runtime configuration");
+        std::fs::write(parent.join("tracked.txt"), "committed parent state\n")
+            .expect("tracked file the parent later modifies");
+        init_workspace_repo(parent);
+        // The parent's uncommitted state is part of what every clone captures.
+        std::fs::create_dir(parent.join("build-output")).expect("ignored build output");
+        std::fs::copy(
+            parent.join("README.txt"),
+            parent.join("build-output/private-copy.txt"),
+        )
+        .expect("ignored build artifact");
+        std::fs::write(parent.join("tracked.txt"), "unstaged parent edit\n")
+            .expect("unstaged parent modification");
+        std::fs::write(parent.join("untracked.txt"), "untracked parent state\n")
+            .expect("untracked parent file");
+        std::fs::write(parent.join("staged.txt"), "staged parent state\n")
+            .expect("staged parent file");
+        let staged = std::process::Command::new("git")
+            .current_dir(parent)
+            .args(["add", "staged.txt"])
+            .status()
+            .expect("stage parent file");
+        assert!(staged.success(), "stage parent file");
         let directory = tempfile::tempdir().expect("environment parent");
-        let seed = prepare_bubblewrap_root(self.workspace.path(), directory.path(), "seed").await;
-        assert!(
-            matches!(
-                workbench_environment(&seed),
-                protocol::WorkbenchEnvironment::Bubblewrap {
-                    initialization: protocol::WorkbenchInitialization::Cold,
-                    ..
-                }
-            ),
-            "the initial producer must not claim a preexisting snapshot"
-        );
-        self.workbench = Some((
-            directory,
-            workbench_environment(&seed),
-            seed.root_paths()[0].0.clone().into(),
-        ));
-        let mut producer =
-            tyde_process_env::launch::command("/bin/sh").expect("generic producer command");
-        producer
-            .in_project(seed.clone())
-            .args(["-c", "/mnt/tyde-runtime/bin/tyde-workbench-produce"]);
-        let produced = producer
-            .output()
-            .await
-            .expect("explicit producer completion");
-        assert!(
-            produced.status.success(),
-            "stable-path producer failed: {}",
-            String::from_utf8_lossy(&produced.stderr)
-        );
-        server::seal_workbench_environment(&seed)
-            .await
-            .expect("seal actual producer artifacts");
-        let directory = &self.workbench.as_ref().expect("owned environment").0;
-        let primary =
-            prepare_bubblewrap_root(self.workspace.path(), directory.path(), "primary").await;
-        self.bubblewrap_siblings.push((
-            workbench_environment(&seed),
-            seed.root_paths()[0].0.clone().into(),
-        ));
-        let (_, environment, root) = self.workbench.as_mut().expect("owned environment");
-        *environment = workbench_environment(&primary);
-        *root = primary.root_paths()[0].0.clone().into();
-        let directory = &self.workbench.as_ref().expect("owned environment").0;
-        let peer = prepare_bubblewrap_root(self.workspace.path(), directory.path(), "peer").await;
-        assert!(
-            matches!(
-                workbench_environment(&peer),
-                protocol::WorkbenchEnvironment::Bubblewrap {
-                    initialization: protocol::WorkbenchInitialization::Snapshot { .. },
-                    ..
-                }
-            ),
-            "the peer must independently restore the sealed snapshot"
-        );
+        let primary = prepare_bubblewrap_root(parent, directory.path(), "primary").await;
+        let peer = prepare_bubblewrap_root(parent, directory.path(), "peer").await;
+        let canonical = std::fs::canonicalize(parent).expect("canonical parent path");
+        for project in [&primary, &peer] {
+            let protocol::WorkbenchEnvironment::Bubblewrap {
+                logical_root,
+                additional_roots,
+                initialization,
+                ..
+            } = workbench_environment(project)
+            else {
+                panic!("Bubblewrap fixture must produce an engine environment");
+            };
+            assert!(
+                matches!(
+                    initialization,
+                    protocol::WorkbenchInitialization::Captured { .. }
+                ),
+                "creation must capture the parent workspace"
+            );
+            assert_eq!(
+                Path::new(&logical_root.0),
+                canonical.as_path(),
+                "clones must execute at the parent's own path"
+            );
+            assert!(additional_roots.is_empty());
+        }
         self.bubblewrap_siblings.push((
             workbench_environment(&peer),
             peer.root_paths()[0].0.clone().into(),
         ));
+        self.workbench = Some((
+            directory,
+            workbench_environment(&primary),
+            primary.root_paths()[0].0.clone().into(),
+        ));
         (primary, peer)
+    }
+
+    /// The path every Bubblewrap workbench of this harness executes at.
+    pub fn bubblewrap_logical_root(&self) -> String {
+        match self
+            .workbench
+            .as_ref()
+            .map(|(_, environment, _)| environment)
+        {
+            Some(protocol::WorkbenchEnvironment::Bubblewrap { logical_root, .. }) => {
+                logical_root.0.clone()
+            }
+            _ => panic!("Bubblewrap workbench was not prepared"),
+        }
     }
 
     pub fn bubblewrap_parent(&self) -> &Path {
@@ -851,7 +841,7 @@ print(json.dumps({'reused': reused}))
         if let Some((directory, environment, worktree)) = self.workbench.take() {
             self.bubblewrap_siblings.push((environment, worktree));
             for (environment, worktree) in self.bubblewrap_siblings.drain(..) {
-                server::finish_workbench_environment(&environment, true)
+                server::finish_workbench_environment(&environment)
                     .await
                     .expect("remove real Bubblewrap environment after provider shutdown");
                 let status = std::process::Command::new("git")
@@ -954,12 +944,13 @@ async fn prepare_bubblewrap_root(parent: &Path, directory: &Path, name: &str) ->
     let branch = format!("feature/bubblewrap-{name}");
     let status = std::process::Command::new("git")
         .current_dir(parent)
-        .args(["worktree", "add", "-q", "-b", &branch])
+        .args(["worktree", "add", "-q", "--no-checkout", "-b", &branch])
         .arg(&root)
         .status()
         .expect("create conformance Git workbench");
     assert!(status.success(), "create real Git workbench");
     let environment = server::prepare_workbench_environment(
+        parent,
         &root,
         &directory.join(format!("environment-{name}")),
     )

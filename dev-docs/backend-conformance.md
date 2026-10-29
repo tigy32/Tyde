@@ -2080,8 +2080,11 @@ The same flow also records a genuine MCP broker call, stops a foreground
 command only after its FIFO start acknowledgement, and requires its completed
 provider response and tool declarations to survive cancellation. Hermes emits
 that response at native `run_tool_round`'s persisted-response boundary before
-execution. Original model tool declarations remain intact; native resolved
-execution metadata types the actual request without renaming the declaration.
+execution. Each declaration is the call as Hermes's native parse dispatches
+and records it: legacy aliases are canonical, and a Tool Search `tool_call`
+broker invocation is declared as its underlying tool and arguments, so a
+brokered MCP card names the MCP call that ran. Native resolved execution
+metadata types the actual request.
 Request usage is recorded at that response boundary, not duplicated at turn end.
 
 Every eligible provider runs an identical isolated native-profile child. Its
