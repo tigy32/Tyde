@@ -314,6 +314,16 @@ impl MockTurn {
         )
     }
 
+    pub fn chat_events(events: Vec<protocol::ChatEvent>) -> Self {
+        Self::done(
+            std::iter::once(emit::typing(true))
+                .chain(events.into_iter().map(BackendEvent::Chat))
+                .chain(std::iter::once(emit::typing(false)))
+                .map(MockStep::emit)
+                .collect(),
+        )
+    }
+
     pub fn text(text: impl Into<String>) -> Self {
         Self::done(text_steps(text.into(), TextShape::default()))
     }

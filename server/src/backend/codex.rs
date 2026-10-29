@@ -4613,6 +4613,7 @@ enum CodexNotificationOwner {
 struct CodexState {
     thread_id: String,
     own_request_usage: HashMap<String, usage::OwnRequestUsage>,
+    retry_sequences: HashMap<String, protocol::RetrySequence>,
     workspace_roots_override: Option<Vec<String>>,
     workspace_relocation_in_flight: bool,
     response_projections: HashMap<String, CodexResponseProjection>,
@@ -4785,6 +4786,7 @@ fn initial_codex_state(
     );
     CodexState {
         own_request_usage: HashMap::new(),
+        retry_sequences: HashMap::new(),
         thread_id,
         workspace_roots_override: None,
         workspace_relocation_in_flight: false,
@@ -9883,7 +9885,7 @@ impl CodexInner {
             }
             CodexInbound::Stderr(line) => {
                 if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&line) {
-                    self.emitter.retry_attempt(RetryAttemptPayload {
+                    self.emitter.identified_retry_attempt(RetryAttemptPayload {
                         attempt,
                         max_retries,
                         error: &line,
@@ -9905,6 +9907,7 @@ impl CodexInner {
                 ));
             }
             CodexInbound::Closed { exit_code } => {
+                self.close_retry_sequences().await;
                 self.state.with(|state| state.transport_closed = true).await;
                 self.finalize_all_incomplete_strict_responses(
                     "Codex transport closed before rawResponse/completed",
@@ -11538,18 +11541,31 @@ impl CodexInner {
             return;
         };
         let usage = params.pointer("/tokenUsage").cloned();
-        let boundary = {
-            self.state
-                .with(move |state| {
-                    state
-                        .response_projections
-                        .get_mut(&thread_id)
-                        .is_some_and(|projection| {
-                            projection.token_usage_boundary_reached(usage.as_ref())
-                        })
-                })
-                .await
-        };
+        let boundary_thread = thread_id.clone();
+        let (boundary, recovered_turn) = self
+            .state
+            .with(move |state| {
+                let Some(projection) = state.response_projections.get_mut(&boundary_thread) else {
+                    return (false, None);
+                };
+                let advanced = usage.is_some() && projection.last_token_usage() != usage.as_ref();
+                let boundary = projection.token_usage_boundary_reached(usage.as_ref());
+                let recovered_turn = if advanced && boundary_thread == state.thread_id {
+                    state.active_turn_id.clone()
+                } else {
+                    None
+                };
+                (boundary, recovered_turn)
+            })
+            .await;
+        if let Some(turn_id) = recovered_turn {
+            self.finish_retry_sequence_for_turn(
+                thread_id,
+                turn_id,
+                protocol::RetrySequenceOutcome::Reconnected,
+            )
+            .await;
+        }
         if !boundary {
             return;
         }
@@ -11932,6 +11948,18 @@ impl CodexInner {
         {
             return;
         }
+        if method == "turn/completed" {
+            let outcome = match params
+                .get("turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("completed") => protocol::RetrySequenceOutcome::Reconnected,
+                Some("failed") => protocol::RetrySequenceOutcome::Failed,
+                _ => protocol::RetrySequenceOutcome::Unresolved,
+            };
+            self.finish_retry_sequence(params, outcome).await;
+        }
         match self.dispatch_response_notification(method, params).await {
             Ok(CodexResponseDispatch::ProviderResponse) => return,
             Ok(CodexResponseDispatch::ProviderItem | CodexResponseDispatch::Other) => {}
@@ -12217,6 +12245,11 @@ impl CodexInner {
             }
             "turn/completed" => {
                 self.handle_turn_completed(params).await;
+                if let Some(turn_id) = extract_turn_id(params) {
+                    self.state
+                        .with(move |state| state.retry_sequences.remove(&turn_id))
+                        .await;
+                }
             }
             "error" => {
                 self.handle_error_notification(params).await;
@@ -15485,7 +15518,18 @@ let stream_key = stream_key.as_str();
 
     async fn handle_legacy_codex_event(&self, method: &str, params: &Value) {
         if let Some(retry) = extract_legacy_codex_retry_attempt(method, params) {
-            self.emitter.retry_attempt(retry);
+            let progress = Some((retry.attempt, retry.max_retries));
+            let id = self.emitter.identified_retry_attempt(retry);
+            if let Some(diagnostic) = params.get("msg") {
+                self.record_retry_diagnostic(
+                    params,
+                    protocol::RetryDiagnosticSource::Attempt(id),
+                    diagnostic.to_string(),
+                    true,
+                    progress,
+                )
+                .await;
+            }
             return;
         }
         match self.dispatch_response_notification(method, params).await {
@@ -15538,7 +15582,242 @@ let stream_key = stream_key.as_str();
         self.append_reasoning_to_active_stream(&delta).await;
     }
 
+    async fn finish_retrying_root_item(&self, params: &Value) {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let Some(turn_id) = extract_turn_id(params) else {
+            return;
+        };
+        let stream = self
+            .state
+            .with(move |state| {
+                if thread_id != state.thread_id
+                    || state.active_turn_id.as_ref() != Some(&turn_id)
+                    || !matches!(
+                        state.response_projections.get(&thread_id),
+                        Some(CodexResponseProjection::Items { .. })
+                    )
+                {
+                    return None;
+                }
+                if state
+                    .active_stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.turn_id == turn_id)
+                {
+                    state.active_stream.take()
+                } else {
+                    None
+                }
+            })
+            .await;
+        let Some(stream) = stream else {
+            return;
+        };
+        let finalized = self
+            .finalize_root_provider_stream(stream, CodexProviderStreamFinalization::Superseded)
+            .await;
+        self.state
+            .with(move |state| {
+                push_codex_provider_item_tombstone(
+                    &mut state.provider_item_tombstones,
+                    CodexProviderItemTombstone {
+                        owner_thread_id: state.thread_id.clone(),
+                        turn_id: finalized.turn_id,
+                        message_id: finalized.message_id,
+                        kind: finalized.kind,
+                        disposition: CodexProviderItemDisposition::Superseded,
+                        accepted_text: finalized.content,
+                        accepted_reasoning: finalized.reasoning.unwrap_or_default(),
+                        late_text: String::new(),
+                        late_reasoning: String::new(),
+                        late_event_count: 0,
+                        late_bytes: 0,
+                    },
+                );
+            })
+            .await;
+    }
+
+    async fn record_native_retry_diagnostic(
+        &self,
+        params: &Value,
+        source: protocol::RetryDiagnosticSource,
+    ) {
+        let Some(retrying) = params
+            .get("willRetry")
+            .or_else(|| params.get("will_retry"))
+            .and_then(Value::as_bool)
+        else {
+            return;
+        };
+        let Some(error) = params.get("error") else {
+            self.emitter
+                .backend_error("Codex retry notification omitted native error details");
+            return;
+        };
+        let progress = error
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(parse_codex_reconnecting_attempt);
+        self.record_retry_diagnostic(params, source, error.to_string(), retrying, progress)
+            .await;
+    }
+
+    async fn close_retry_sequences(&self) {
+        let sequences = self
+            .state
+            .with(|state| {
+                state
+                    .retry_sequences
+                    .drain()
+                    .map(|(_, mut sequence)| {
+                        sequence.revision += 1;
+                        if sequence.outcome == protocol::RetrySequenceOutcome::Reconnecting {
+                            sequence.outcome = protocol::RetrySequenceOutcome::Unresolved;
+                        }
+                        sequence
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        for sequence in sequences {
+            self.emitter.retry_sequence(sequence);
+        }
+    }
+
+    async fn record_retry_diagnostic(
+        &self,
+        params: &Value,
+        source: protocol::RetryDiagnosticSource,
+        raw: String,
+        retrying: bool,
+        progress: Option<(u64, u64)>,
+    ) {
+        let Some(turn_id) = params
+            .get("turnId")
+            .or_else(|| params.get("turn_id"))
+            .or_else(|| params.pointer("/turn/id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        let sequence = self
+            .state
+            .with(move |state| {
+                if thread_id != state.thread_id
+                    || (!retrying && !state.retry_sequences.contains_key(&turn_id))
+                {
+                    return None;
+                }
+                if retrying
+                    && state.retry_sequences.get(&turn_id).is_some_and(|sequence| {
+                        sequence.outcome != protocol::RetrySequenceOutcome::Reconnecting
+                    })
+                {
+                    state.retry_sequences.remove(&turn_id);
+                }
+                let sequence = state
+                    .retry_sequences
+                    .entry(turn_id.clone())
+                    .or_insert_with(|| protocol::RetrySequence {
+                        id: protocol::RetrySequenceId(uuid::Uuid::new_v4().to_string()),
+                        request: protocol::ModelTurnId(turn_id.clone()),
+                        revision: 0,
+                        attempt: None,
+                        max_attempts: None,
+                        outcome: protocol::RetrySequenceOutcome::Reconnecting,
+                        diagnostics: Vec::new(),
+                    });
+                sequence.revision += 1;
+                if let Some((attempt, maximum)) = progress {
+                    sequence.attempt = Some(attempt + 1);
+                    sequence.max_attempts = Some(maximum + 1);
+                }
+                sequence
+                    .diagnostics
+                    .push(protocol::RetryDiagnostic { source, raw });
+                if !retrying {
+                    sequence.outcome = protocol::RetrySequenceOutcome::Failed;
+                }
+                let snapshot = sequence.clone();
+                Some(snapshot)
+            })
+            .await;
+        if let Some(sequence) = sequence {
+            self.emitter.retry_sequence(sequence);
+        }
+    }
+
+    async fn finish_retry_sequence(&self, params: &Value, outcome: protocol::RetrySequenceOutcome) {
+        let Some(turn_id) = extract_turn_id(params) else {
+            return;
+        };
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return;
+        };
+        self.finish_retry_sequence_for_turn(thread_id, turn_id, outcome)
+            .await;
+    }
+
+    async fn finish_retry_sequence_for_turn(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        outcome: protocol::RetrySequenceOutcome,
+    ) {
+        let sequence = self
+            .state
+            .with(move |state| {
+                if thread_id != state.thread_id {
+                    return None;
+                }
+                let mut sequence = state.retry_sequences.remove(&turn_id)?;
+                sequence.revision += 1;
+                if sequence.outcome != protocol::RetrySequenceOutcome::Failed {
+                    sequence.outcome = outcome;
+                }
+                if outcome == protocol::RetrySequenceOutcome::Failed {
+                    state.retry_sequences.insert(turn_id, sequence.clone());
+                }
+                Some(sequence)
+            })
+            .await;
+        if let Some(sequence) = sequence {
+            self.emitter.retry_sequence(sequence);
+        }
+    }
+
+    async fn emit_turn_retry_failure(&self, params: &Value, message: String) {
+        if let ChatEvent::MessageAdded(error) = backend_error_message(message) {
+            let id = self.emitter.diagnostic_message(error);
+            if let Some(diagnostic) = params.pointer("/turn/error") {
+                self.record_retry_diagnostic(
+                    params,
+                    protocol::RetryDiagnosticSource::Message(id),
+                    diagnostic.to_string(),
+                    false,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
     async fn handle_error_notification(&self, params: &Value) {
+        if params
+            .get("willRetry")
+            .or_else(|| params.get("will_retry"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.finish_retrying_root_item(params).await;
+        }
         let message = params
             .get("message")
             .and_then(Value::as_str)
@@ -15571,13 +15850,38 @@ let stream_key = stream_key.as_str();
         };
         if terminal {
             self.complete_all_codex_subagents().await;
-            self.emitter.backend_error(&message);
+            if let ChatEvent::MessageAdded(error) = backend_error_message(message) {
+                let id = self.emitter.diagnostic_message(error);
+                self.record_native_retry_diagnostic(
+                    params,
+                    protocol::RetryDiagnosticSource::Message(id),
+                )
+                .await;
+            }
             self.emitter.typing_status_changed(false);
             return;
         }
 
-        self.emitter
-            .subprocess_stderr(&format!("Codex warning: {message}"));
+        let message = format!("Codex warning: {message}");
+        let source =
+            if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&message) {
+                protocol::RetryDiagnosticSource::Attempt(
+                    self.emitter.identified_retry_attempt(RetryAttemptPayload {
+                        attempt,
+                        max_retries,
+                        error: &message,
+                        backoff_ms: 250u64
+                            .saturating_mul(1u64 << attempt.saturating_sub(1))
+                            .min(4_000),
+                    }),
+                )
+            } else {
+                protocol::RetryDiagnosticSource::Message(
+                    self.emitter
+                        .diagnostic_message(backend_warning_message(message)),
+                )
+            };
+        self.record_native_retry_diagnostic(params, source).await;
     }
 
     async fn handle_server_request(self: &Arc<Self>, id: Value, method: &str, params: &Value) {
@@ -18010,7 +18314,7 @@ let stream_key = stream_key.as_str();
                     .unwrap_or("Codex turn failed")
                     .to_string();
                 self.complete_all_codex_subagents().await;
-                self.emitter.backend_error(&message);
+                self.emit_turn_retry_failure(params, message).await;
             }
             return;
         }
@@ -18024,7 +18328,7 @@ let stream_key = stream_key.as_str();
                 .unwrap_or("Codex turn failed")
                 .to_string();
             self.complete_all_codex_subagents().await;
-            self.emitter.backend_error(&message);
+            self.emit_turn_retry_failure(params, message).await;
         }
         self.trace_terminal_emission("idle", None).await;
         self.emitter.typing_status_changed(false);
@@ -22795,8 +23099,8 @@ fn emit_codex_resume_startup_error(
     let _ = events_tx.send(BackendEvent::ResumeReplayComplete(Err(message)));
 }
 
-fn backend_warning_message(content: String) -> ChatEvent {
-    ChatEvent::MessageAdded(ChatMessage {
+fn backend_warning_message(content: String) -> ChatMessage {
+    ChatMessage {
         origin: None,
         message_id: None,
         timestamp: unix_now_ms(),
@@ -22808,7 +23112,7 @@ fn backend_warning_message(content: String) -> ChatEvent {
         token_usage: None,
         context_breakdown: None,
         images: None,
-    })
+    }
 }
 
 fn is_codex_thread_fork_unsupported_error(error: &str) -> bool {
@@ -23437,6 +23741,7 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::RestartRecovery { .. }
         | ChatEvent::OperationCancelled(_)
+        | ChatEvent::RetrySequenceUpdated(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
         | ChatEvent::ContextCompaction(_)
@@ -23489,6 +23794,7 @@ fn codex_backend_event_from_raw(
                     {
                         Some(CodexForwardedBackendEvent {
                             chat_event: ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                                id: None,
                                 attempt,
                                 max_retries,
                                 error: message,
@@ -23501,7 +23807,7 @@ fn codex_backend_event_from_raw(
                         })
                     } else if codex_stderr_is_visible_warning(&message) {
                         Some(CodexForwardedBackendEvent {
-                            chat_event: backend_warning_message(message),
+                            chat_event: ChatEvent::MessageAdded(backend_warning_message(message)),
                             terminal: false,
                             normalization_error: None,
                         })
@@ -23711,6 +24017,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::InterruptPreservesBackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
+            tyde_agent_adapter::BackendCapability::ConnectionRetrySequences,
             tyde_agent_adapter::BackendCapability::YieldedCodeCells,
             tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,
             tyde_agent_adapter::BackendCapability::NativeGoals,

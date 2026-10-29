@@ -3129,6 +3129,40 @@ pub struct TerminalInfo {
     pub exit_signal: Option<String>,
 }
 
+fn retry_sequence_signal(
+    rows: &[ChatRowHandle],
+    id: &protocol::RetrySequenceId,
+) -> Option<ArcRwSignal<ChatNotice>> {
+    rows.iter().find_map(|row| match &row.content {
+        ChatRowContent::Notice(notice) if notice.with_untracked(|notice| matches!(notice, ChatNotice::RetrySequence { sequence, .. } if sequence.id == *id)) => Some(notice.clone()),
+        _ => None,
+    })
+}
+
+fn update_retry_sequence(notice: &ArcRwSignal<ChatNotice>, incoming: protocol::RetrySequence) {
+    notice.update(|notice| {
+        if let ChatNotice::RetrySequence { sequence, .. } = notice
+            && incoming.revision > sequence.revision
+        {
+            *sequence = incoming;
+        }
+    });
+}
+
+pub(crate) fn upsert_retry_sequence(
+    rows: &mut Vec<ChatRowHandle>,
+    sequence: protocol::RetrySequence,
+) {
+    if let Some(notice) = retry_sequence_signal(rows, &sequence.id) {
+        update_retry_sequence(&notice, sequence);
+    } else {
+        rows.push(ChatRowHandle::notice(ChatNotice::RetrySequence {
+            sequence,
+            expanded: false,
+        }));
+    }
+}
+
 /// Something that happened to the *turn* rather than in it: the provider
 /// backed off and retried, or the turn was cancelled.
 ///
@@ -3146,7 +3180,12 @@ pub enum ChatNotice {
     OperationCancelled {
         message: String,
     },
+    RetrySequence {
+        sequence: protocol::RetrySequence,
+        expanded: bool,
+    },
     RetryAttempt {
+        id: Option<protocol::RetryAttemptId>,
         attempt: u64,
         max_retries: u64,
         error: String,
@@ -5323,6 +5362,12 @@ impl AppState {
         true
     }
 
+    pub fn push_retry_sequence(&self, agent_id: AgentId, sequence: protocol::RetrySequence) {
+        self.chat_rows.update(|rows| {
+            upsert_retry_sequence(rows.entry(agent_id).or_default(), sequence);
+        });
+    }
+
     /// Append a retry/cancel notice as a transcript row.
     ///
     /// No dedup index, unlike compaction markers: a notice has no id and is
@@ -5359,6 +5404,20 @@ impl AppState {
         let mut page_markers: HashMap<CompactionObservationId, usize> = HashMap::new();
 
         for row in rows {
+            if let ChatRowContent::Notice(notice) = &row.content
+                && let ChatNotice::RetrySequence { sequence, .. } = notice.get_untracked()
+            {
+                let existing = self.chat_rows.with_untracked(|map| {
+                    map.get(agent_id)
+                        .and_then(|rows| retry_sequence_signal(rows, &sequence.id))
+                });
+                if let Some(existing) = existing {
+                    update_retry_sequence(&existing, sequence);
+                } else {
+                    upsert_retry_sequence(&mut deduped, sequence);
+                }
+                continue;
+            }
             let Some(signal) = row.compaction_marker().cloned() else {
                 deduped.push(row);
                 continue;

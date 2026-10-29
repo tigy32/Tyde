@@ -1461,6 +1461,7 @@ impl AgentActivityStatsTracker {
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::RestartRecovery { .. }
             | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetrySequenceUpdated(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_)
             | ChatEvent::AgentHandoff(_) => {}
@@ -14959,6 +14960,34 @@ fn transcript_provider_identities(
         .collect()
 }
 
+fn interrupted_retry_sequences<'a>(
+    events: impl IntoIterator<Item = &'a ChatEvent>,
+) -> Vec<protocol::RetrySequence> {
+    let mut latest =
+        indexmap::IndexMap::<protocol::RetrySequenceId, protocol::RetrySequence>::new();
+    for event in events {
+        if let ChatEvent::RetrySequenceUpdated(sequence) = event {
+            let current = latest
+                .entry(sequence.id.clone())
+                .or_insert_with(|| sequence.clone());
+            if sequence.revision > current.revision {
+                *current = sequence.clone();
+            }
+        }
+    }
+    latest
+        .into_values()
+        .filter_map(|mut sequence| {
+            if sequence.outcome != protocol::RetrySequenceOutcome::Reconnecting {
+                return None;
+            }
+            sequence.revision += 1;
+            sequence.outcome = protocol::RetrySequenceOutcome::Unresolved;
+            Some(sequence)
+        })
+        .collect()
+}
+
 async fn seed_fork_transcript_history(
     store: &TranscriptStore,
     source_session_id: &SessionId,
@@ -14974,6 +15003,8 @@ async fn seed_fork_transcript_history(
     let source_records = tokio::task::spawn_blocking(move || store_for_load.load(&source_for_load))
         .await
         .map_err(|error| format!("fork transcript load task failed: {error}"))??;
+    let retry_updates =
+        interrupted_retry_sequences(source_records.iter().map(|record| &record.event));
     let mut fork_records = Vec::new();
     for source in source_records.into_iter().filter(|record| {
         matches!(
@@ -14998,6 +15029,27 @@ async fn seed_fork_transcript_history(
             provider_identity: source.provider_identity,
             event: source.event,
             timestamp_ms: source.timestamp_ms,
+        });
+    }
+    for sequence in retry_updates {
+        let event_id = format!("fork-retry:{}:{}", sequence.id.0, sequence.revision);
+        let event = ChatEvent::RetrySequenceUpdated(sequence);
+        let sequence = event_log.len() as u64;
+        event_log.push(replay_envelope(
+            canonical_stream,
+            sequence,
+            FrameKind::ChatEvent,
+            &event,
+        ));
+        fork_records.push(crate::store::transcript::TranscriptRecord {
+            logical_session_id: fork_session_id.clone(),
+            sequence,
+            event_id,
+            visibility: crate::store::transcript::TranscriptVisibility::Visible,
+            accounting_scope: crate::store::transcript::TranscriptAccountingScope::InheritedContext,
+            provider_identity: None,
+            event,
+            timestamp_ms: now_ms(),
         });
     }
     let store_for_write = store.clone();
@@ -15030,6 +15082,11 @@ async fn seed_existing_transcript_history(
         tokio::task::spawn_blocking(move || store_for_load.load_accounting(&session_for_load))
             .await
             .map_err(|error| format!("resume transcript load task failed: {error}"))??;
+    let retry_updates = if project_history {
+        interrupted_retry_sequences(records.iter().map(|record| &record.event))
+    } else {
+        Vec::new()
+    };
     let mut visible_tool_calls = HashSet::new();
     let mut open_stream_events = Vec::new();
     let mut active_text = String::new();
@@ -15109,7 +15166,7 @@ async fn seed_existing_transcript_history(
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let interrupted_events = open_stream_events
+    let mut interrupted_events = open_stream_events
         .into_iter()
         .filter(|event| match event {
             ChatEvent::ToolRequest(request) => interrupted_calls.contains(&request.tool_call_id),
@@ -15119,6 +15176,12 @@ async fn seed_existing_transcript_history(
             _ => false,
         })
         .collect::<Vec<_>>();
+    // A new backend process cannot attest to the old process's unfinished retry.
+    interrupted_events.extend(
+        retry_updates
+            .into_iter()
+            .map(ChatEvent::RetrySequenceUpdated),
+    );
     if interrupted_events.is_empty() {
         return Ok(());
     }
@@ -16351,6 +16414,7 @@ fn record_chat_event_for_replay(
         | ChatEvent::GoalChanged(_)
         | ChatEvent::GoalCompleted(_)
         | ChatEvent::TaskUpdate(_)
+        | ChatEvent::RetrySequenceUpdated(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
         | ChatEvent::ContextCompaction(_) => {
@@ -16762,6 +16826,7 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
             "Operation cancelled: {}",
             cap_activity_text(&cancelled.message, 500)
         )),
+        ChatEvent::RetrySequenceUpdated(_) => None,
         ChatEvent::RetryAttempt(retry) => Some(format!(
             "Retry attempt {}/{} after error: {}",
             retry.attempt,

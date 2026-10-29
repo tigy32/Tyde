@@ -195,6 +195,9 @@ pub fn ChatView(
                 },
             );
         }
+        if state.chat_appearance.get() != crate::appearance::ChatAppearance::Ink {
+            rows.retain(|row| !matches!(&row.content, ChatRowContent::Notice(notice) if notice.with(|notice| matches!(notice, ChatNotice::RetrySequence { .. }))));
+        }
         span.items(rows.len());
         rows
     };
@@ -1569,8 +1572,12 @@ fn ChatNoticeView(
     notice: ArcRwSignal<ChatNotice>,
 ) -> impl IntoView {
     let appearance = expect_context::<AppState>().chat_appearance;
+    if notice.with_untracked(|notice| matches!(notice, ChatNotice::RetrySequence { .. })) {
+        return view! { <RetrySequenceView notice=notice /> }.into_any();
+    }
     view! {
         {move || match notice.get() {
+            ChatNotice::RetrySequence { .. } => ().into_any(),
             ChatNotice::AgentHandoff(handoff) => view! {
                 <AgentHandoffView agent_ref=agent_ref handoff=handoff />
             }.into_any(),
@@ -1593,7 +1600,14 @@ fn ChatNoticeView(
                     </div>
                 </div>
             }.into_any(),
-            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms }
+            ChatNotice::RetryAttempt { error, attempt, max_retries, backoff_ms, .. }
+                if appearance.get() == crate::appearance::ChatAppearance::Ink => view! {
+                <details class="flow-retry" data-test="chat-notice-retry">
+                    <summary><span aria-hidden="true" class="flow-warning-icon">"⚠"</span><span>{format!("Retry {attempt}/{max_retries}")}</span></summary>
+                    <div class="flow-retry-details"><pre>{error}</pre><p>{format!("Attempt {attempt} of {max_retries} · Reported backoff: {backoff_ms}ms")}</p></div>
+                </details>
+            }.into_any(),
+            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms, .. }
                 if appearance.get().uses_ink_chrome() => view! {
                 <details class="ink-retry" data-test="chat-notice-retry">
                     <summary>
@@ -1605,7 +1619,7 @@ fn ChatNoticeView(
                     <p>{format!("Reported backoff: {backoff_ms}ms")}</p>
                 </details>
             }.into_any(),
-            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms } => view! {
+            ChatNotice::RetryAttempt { attempt, max_retries, error, backoff_ms, .. } => view! {
                 <div class="chat-card chat-card-retry" data-test="chat-notice-retry">
                     <div class="retry-card-header">
                         <span class="retry-card-icon">"\u{23f3}"</span>
@@ -1623,6 +1637,59 @@ fn ChatNoticeView(
                 </div>
             }.into_any(),
         }}
+    }.into_any()
+}
+
+#[component]
+fn RetrySequenceView(notice: ArcRwSignal<ChatNotice>) -> impl IntoView {
+    let sequence = {
+        let notice = notice.clone();
+        move || {
+            notice.with(|notice| match notice {
+                ChatNotice::RetrySequence { sequence, .. } => Some(sequence.clone()),
+                _ => None,
+            })
+        }
+    };
+    let summary = {
+        let sequence = sequence.clone();
+        move || {
+            sequence().map(|sequence| match sequence.outcome {
+                protocol::RetrySequenceOutcome::Reconnecting => {
+                    match (sequence.attempt, sequence.max_attempts) {
+                        (Some(attempt), Some(max)) => format!("Reconnecting… {attempt}/{max}"),
+                        _ => "Reconnecting…".to_owned(),
+                    }
+                }
+                protocol::RetrySequenceOutcome::Reconnected => "Reconnected".to_owned(),
+                protocol::RetrySequenceOutcome::Failed => "Connection failed".to_owned(),
+                protocol::RetrySequenceOutcome::Unresolved => "Connection unresolved".to_owned(),
+            })
+        }
+    };
+    let recovered = Signal::derive({
+        let sequence = sequence.clone();
+        move || {
+            sequence().is_some_and(|sequence| {
+                sequence.outcome == protocol::RetrySequenceOutcome::Reconnected
+            })
+        }
+    });
+    let open_notice = notice.clone();
+    view! {
+            <details class="flow-retry" data-test="retry-sequence"
+                open=move || notice.with(|notice| matches!(notice, ChatNotice::RetrySequence { expanded: true, .. }))
+                on:toggle=move |event| {
+                    let element = event_target::<web_sys::HtmlDetailsElement>(&event);
+                    open_notice.update(|notice| {
+                        if let ChatNotice::RetrySequence { expanded, .. } = notice { *expanded = element.open(); }
+                    });
+                }>
+                <summary><span aria-hidden="true" class="flow-warning-icon" data-recovered=move || recovered.get().to_string()>{move || if recovered.get() { "✓" } else { "⚠" }}</span><span>{summary}</span></summary>
+                <div class="flow-retry-details">
+                    {move || sequence().map(|sequence| sequence.diagnostics.into_iter().map(|diagnostic| view! { <pre>{diagnostic.raw}</pre> }).collect_view())}
+                </div>
+            </details>
     }
 }
 
@@ -2181,6 +2248,232 @@ mod wasm_tests {
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn flow_retry_sequence_updates_in_place_and_replays_without_losing_details() {
+        use crate::appearance::ChatAppearance;
+        use protocol::{RetryDiagnostic, RetrySequence, RetrySequenceId, RetrySequenceOutcome};
+        ensure_styles_loaded();
+        let container = make_container();
+        let style = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("style")
+            .unwrap();
+        style.set_text_content(Some(include_str!("../../ink-chat.css")));
+        container.append_child(&style).unwrap();
+        let state = AppState::new();
+        state.chat_appearance.set(ChatAppearance::Ink);
+        let bound = ActiveAgentRef {
+            host_id: "retry-host".to_owned(),
+            agent_id: AgentId("retry-agent".to_owned()),
+        };
+        let mounted_bound = bound.clone();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <ChatView tab_id=TabId(20_099) agent_ref=Signal::derive(move || Some(mounted_bound.clone())) is_active=Signal::derive(|| true) /> }
+        });
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &bound.agent_id, event)
+        };
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Continue the request").message,
+        ));
+        let mut sequence = RetrySequence {
+            id: RetrySequenceId("episode-one".to_owned()),
+            request: protocol::ModelTurnId("request-one".to_owned()),
+            revision: 1,
+            attempt: Some(1),
+            max_attempts: Some(5),
+            outcome: RetrySequenceOutcome::Reconnecting,
+            diagnostics: Vec::new(),
+        };
+        for attempt in 1..=3 {
+            let id = protocol::ChatMessageId(format!("diagnostic-{attempt}"));
+            let mut warning = mk_user_msg("Native connection diagnostic").message;
+            warning.sender = MessageSender::Warning;
+            warning.message_id = Some(id.clone());
+            let source = if attempt == 2 {
+                let id = protocol::RetryAttemptId("native-attempt-two".to_owned());
+                dispatch(ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                    id: Some(id.clone()),
+                    attempt: 2,
+                    max_retries: 5,
+                    error: "Native retry diagnostic".to_owned(),
+                    backoff_ms: 250,
+                }));
+                protocol::RetryDiagnosticSource::Attempt(id)
+            } else {
+                dispatch(ChatEvent::MessageAdded(warning));
+                protocol::RetryDiagnosticSource::Message(id)
+            };
+            sequence.revision = attempt;
+            sequence.attempt = Some(attempt);
+            sequence.diagnostics.push(RetryDiagnostic {
+                source,
+                raw: format!(
+                    "native attempt {attempt}: {}",
+                    "raw transport detail ".repeat(12)
+                ),
+            });
+            dispatch(ChatEvent::RetrySequenceUpdated(sequence.clone()));
+            next_tick().await;
+        }
+        let details = container
+            .query_selector("[data-test='retry-sequence']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .unwrap();
+        assert_eq!(
+            container
+                .query_selector_all("[data-test='retry-sequence']")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert!(
+            details
+                .query_selector("summary")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Reconnecting… 3/5")
+        );
+        details.set_open(true);
+        details
+            .dispatch_event(&web_sys::Event::new("toggle").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(details.query_selector_all("pre").unwrap().length(), 3);
+        sequence.revision += 1;
+        sequence.outcome = RetrySequenceOutcome::Reconnected;
+        dispatch(ChatEvent::RetrySequenceUpdated(sequence.clone()));
+        next_tick().await;
+        let updated = container
+            .query_selector("[data-test='retry-sequence']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            updated.is_same_node(Some(details.as_ref())),
+            "live progress preserves the mounted disclosure"
+        );
+        assert!(details.open());
+        assert!(
+            details
+                .query_selector("summary")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Reconnected")
+        );
+        let mut old = sequence.clone();
+        old.revision = 1;
+        old.outcome = RetrySequenceOutcome::Reconnecting;
+        old.diagnostics.truncate(1);
+        state.prepend_history_page(
+            &bound.agent_id,
+            vec![ChatRowHandle::notice(ChatNotice::RetrySequence {
+                sequence: old,
+                expanded: false,
+            })],
+        );
+        dispatch(ChatEvent::RetrySequenceUpdated(sequence.clone()));
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all("[data-test='retry-sequence']")
+                .unwrap()
+                .length(),
+            1
+        );
+        assert!(details.open());
+        assert_eq!(details.query_selector_all("pre").unwrap().length(), 3);
+        assert!(
+            details
+                .query_selector("summary")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Reconnected")
+        );
+        sequence.id = RetrySequenceId("episode-two".to_owned());
+        sequence.outcome = RetrySequenceOutcome::Failed;
+        let id = protocol::ChatMessageId("other-diagnostic".to_owned());
+        let mut error = mk_user_msg("Native terminal failure").message;
+        error.sender = MessageSender::Error;
+        error.message_id = Some(id.clone());
+        dispatch(ChatEvent::MessageAdded(error));
+        sequence.diagnostics = vec![RetryDiagnostic {
+            source: protocol::RetryDiagnosticSource::Message(id),
+            raw: "independent terminal diagnostic".to_owned(),
+        }];
+        dispatch(ChatEvent::RetrySequenceUpdated(sequence.clone()));
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all("[data-test='retry-sequence']")
+                .unwrap()
+                .length(),
+            2,
+            "separate episodes never coalesce even within one request"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Connection failed")
+        );
+        for appearance in [ChatAppearance::Current, ChatAppearance::Notebook] {
+            state.chat_appearance.set(appearance);
+            next_tick().await;
+            assert_eq!(
+                container
+                    .query_selector_all("[data-test='retry-sequence']")
+                    .unwrap()
+                    .length(),
+                0
+            );
+            assert_eq!(
+                container
+                    .query_selector_all(".chat-card-warning")
+                    .unwrap()
+                    .length(),
+                2,
+                "other appearances retain every original warning card"
+            );
+            assert_eq!(
+                container
+                    .query_selector_all("[data-test='chat-notice-retry']")
+                    .unwrap()
+                    .length(),
+                1,
+                "other appearances retain the original retry event kind"
+            );
+        }
+        state.chat_appearance.set(ChatAppearance::Ink);
+        container.style().set_property("width", "320px").unwrap();
+        next_tick().await;
+        next_animation_frame().await;
+        let disclosure = container
+            .query_selector("[data-test='retry-sequence']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .unwrap();
+        assert!(disclosure.open(), "expansion survives appearance changes");
+        assert!(
+            disclosure.scroll_width() <= disclosure.client_width(),
+            "raw details wrap at narrow widths"
+        );
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]
@@ -3530,6 +3823,7 @@ mod wasm_tests {
             message: question_message,
         }));
         dispatch(ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+            id: None,
             attempt: 1,
             max_retries: 3,
             error: "Transport interrupted".to_owned(),
@@ -7229,6 +7523,7 @@ mod wasm_tests {
             &host_id,
             &agent_id,
             ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                id: None,
                 attempt: 1,
                 max_retries: 3,
                 error: "429 Too Many Requests".to_owned(),
@@ -7302,7 +7597,7 @@ mod wasm_tests {
             .dyn_into::<web_sys::HtmlDetailsElement>()
             .unwrap();
         let summary = ink_notice.query_selector("summary").unwrap().unwrap();
-        let error = ink_notice.query_selector("p").unwrap().unwrap();
+        let error = ink_notice.query_selector("pre").unwrap().unwrap();
         assert!(!details.open());
         assert!(
             !summary
@@ -7315,7 +7610,7 @@ mod wasm_tests {
             summary
                 .text_content()
                 .unwrap_or_default()
-                .contains("Attempt 1 of 3")
+                .contains("Retry 1/3")
         );
         // Chrome reports a nonzero descendant rect inside closed details.
         // Test painted text and the enclosing row's space, not that rect.

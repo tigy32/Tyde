@@ -48,6 +48,26 @@ pub(crate) fn ink_row_layouts(
 ) -> HashMap<ChatRowId, InkRowLayout> {
     let is_flow = appearance == crate::appearance::ChatAppearance::Ink;
     let show_reasoning = !is_flow || flow_show_reasoning;
+    let mut retry_messages = std::collections::HashSet::new();
+    let mut retry_attempts = std::collections::HashSet::new();
+    for row in rows {
+        if let ChatRowContent::Notice(notice) = &row.content {
+            notice.with(|notice| {
+                if let crate::state::ChatNotice::RetrySequence { sequence, .. } = notice {
+                    for diagnostic in &sequence.diagnostics {
+                        match &diagnostic.source {
+                            protocol::RetryDiagnosticSource::Message(id) => {
+                                retry_messages.insert(id.clone());
+                            }
+                            protocol::RetryDiagnosticSource::Attempt(id) => {
+                                retry_attempts.insert(id.clone());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
     let mut layouts = HashMap::with_capacity(rows.len());
     let mut stretch_has_byline = false;
     let mut previous_actions = false;
@@ -80,12 +100,18 @@ pub(crate) fn ink_row_layouts(
                 let has_tools = !entry.tool_requests.is_empty();
                 let actions_only =
                     assistant && !has_text && !has_reasoning && !has_images && has_tools;
-                let empty = is_flow
-                    && assistant
-                    && !has_text
-                    && !has_reasoning
-                    && !has_images
-                    && !has_tools;
+                let grouped_diagnostic = is_flow
+                    && message
+                        .message_id
+                        .as_ref()
+                        .is_some_and(|id| retry_messages.contains(id));
+                let empty = grouped_diagnostic
+                    || is_flow
+                        && assistant
+                        && !has_text
+                        && !has_reasoning
+                        && !has_images
+                        && !has_tools;
                 let annotation = !input
                     && matches!(
                         message.sender,
@@ -101,6 +127,16 @@ pub(crate) fn ink_row_layouts(
                 let actions_only = !has_text && !has_reasoning && has_tools;
                 let empty = is_flow && !has_text && !has_reasoning && !has_tools;
                 (false, true, actions_only, false, empty)
+            }
+            ChatRowContent::Notice(notice) if notice.with(|notice| matches!(notice, crate::state::ChatNotice::RetryAttempt { id: Some(id), .. } if retry_attempts.contains(id))) => {
+                (false, false, false, true, is_flow)
+            }
+            ChatRowContent::Notice(notice)
+                if notice.with(|notice| {
+                    matches!(notice, crate::state::ChatNotice::RetrySequence { .. })
+                }) =>
+            {
+                (false, false, false, true, !is_flow)
             }
             ChatRowContent::ContextCompaction(_) | ChatRowContent::Notice(_) => {
                 (false, false, false, false, false)

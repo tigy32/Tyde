@@ -2541,6 +2541,7 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                     });
             });
         }
+        ChatEvent::RetrySequenceUpdated(_) => {}
         ChatEvent::RetryAttempt(data) => {
             state.transient_events.update(|events| {
                 events
@@ -2835,6 +2836,7 @@ impl MobileHistoryReplay {
             | ChatEvent::SlashCommandsChanged(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetrySequenceUpdated(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
             ChatEvent::AgentHandoff(handoff) => {
@@ -3756,6 +3758,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::RestartRecovery { .. } => "RestartRecovery",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
+        ChatEvent::RetrySequenceUpdated(_) => "RetrySequenceUpdated",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
         ChatEvent::Orchestration(_) => "Orchestration",
         ChatEvent::AgentHandoff(_) => "AgentHandoff",

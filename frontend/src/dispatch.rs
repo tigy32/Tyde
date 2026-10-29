@@ -6038,9 +6038,13 @@ impl HistoryReplay {
                     },
                 ));
             }
+            ChatEvent::RetrySequenceUpdated(sequence) => {
+                crate::state::upsert_retry_sequence(&mut self.rows, sequence);
+            }
             ChatEvent::RetryAttempt(data) => {
                 self.rows.push(crate::state::ChatRowHandle::notice(
                     crate::state::ChatNotice::RetryAttempt {
+                        id: data.id,
                         attempt: data.attempt,
                         max_retries: data.max_retries,
                         error: data.error,
@@ -6511,6 +6515,7 @@ pub fn apply_chat_event_from(
                 },
             );
         }
+        ChatEvent::RetrySequenceUpdated(sequence) => state.push_retry_sequence(agent_id, sequence),
         ChatEvent::RetryAttempt(data) => {
             log::warn!(
                 "dispatch chat_event host={} agent_id={} type=retry attempt={} max_retries={} backoff_ms={} error={}",
@@ -6524,6 +6529,7 @@ pub fn apply_chat_event_from(
             state.push_chat_notice(
                 agent_id,
                 ChatNotice::RetryAttempt {
+                    id: data.id,
                     attempt: data.attempt,
                     max_retries: data.max_retries,
                     error: data.error,

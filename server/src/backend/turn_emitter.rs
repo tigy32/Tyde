@@ -489,9 +489,41 @@ impl TurnEmitter {
         self.lock().send_chat(ChatEvent::TaskUpdate(tasks.clone()));
     }
 
+    pub fn retry_sequence(&self, sequence: protocol::RetrySequence) {
+        self.lock()
+            .send_chat(ChatEvent::RetrySequenceUpdated(sequence));
+    }
+
+    pub fn diagnostic_message(
+        &self,
+        mut message: protocol::ChatMessage,
+    ) -> protocol::ChatMessageId {
+        let id = protocol::ChatMessageId(Uuid::new_v4().to_string());
+        message.message_id = Some(id.clone());
+        self.lock().send_chat(ChatEvent::MessageAdded(message));
+        id
+    }
+
+    pub fn identified_retry_attempt(
+        &self,
+        payload: RetryAttemptPayload<'_>,
+    ) -> protocol::RetryAttemptId {
+        let id = protocol::RetryAttemptId(Uuid::new_v4().to_string());
+        self.lock()
+            .send_chat(ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                id: Some(id.clone()),
+                attempt: payload.attempt,
+                max_retries: payload.max_retries,
+                error: payload.error.to_owned(),
+                backoff_ms: payload.backoff_ms,
+            }));
+        id
+    }
+
     pub fn retry_attempt(&self, payload: RetryAttemptPayload<'_>) {
         self.lock()
             .send_chat(ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                id: None,
                 attempt: payload.attempt,
                 max_retries: payload.max_retries,
                 error: payload.error.to_owned(),

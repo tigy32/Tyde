@@ -4062,7 +4062,8 @@ conformance2_scenario!(
         BackendCapability::YieldedCodeCells,
         BackendCapability::BackgroundTasks,
         BackendCapability::ResumeSession,
-        BackendCapability::ForkSession
+        BackendCapability::ForkSession,
+        BackendCapability::TaskUpdates
     ]
 );
 conformance2_scenario!(real_mcp_tool_call, [BackendCapability::StartupMcpServers]);
@@ -5950,6 +5951,256 @@ async fn real_running_command_survives_response_retry<B: Backend>(host: &mut Har
     let follow_up = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&follow_up);
     assert_universal_contract(&[follow_up]);
+}
+
+async fn real_connection_retry_sequences<B: Backend>(host: &mut Harness<B>) {
+    if std::env::var_os("TYDE_REAL_RETRY_ARM").is_none() {
+        let script = host.workspace().join("retry_proxy.py");
+        std::fs::write(&script, include_str!("conformance2/retry_proxy.py"))
+            .expect("write real retry transport fixture");
+        let status = tokio::process::Command::new("python3")
+            .arg(script)
+            .arg(std::env::current_exe().expect("conformance executable"))
+            .arg(&host.test_name)
+            .arg("--sequence")
+            .status()
+            .await
+            .expect("run real retry transport fixture");
+        assert!(status.success(), "real retry transport fixture failed");
+        return;
+    }
+    let arm = std::env::var("TYDE_REAL_RETRY_ARM").expect("retry fixture control path");
+    let prompt = "Reply with three short sentences about trees. Do not use any tools.";
+    let agent = spawn_agent(host, prompt).await;
+    let first = collect_turn(host, &agent, prompt).await;
+    std::fs::write(&arm, "recover").expect("arm a separate retry episode");
+    let second = ask(host, &agent, prompt).await;
+    let source = agent.session_id.clone();
+    host.shutdown().await;
+    std::fs::write(
+        std::env::var("TYDE_REAL_RETRY_FORK").expect("fork fault control"),
+        "fork",
+    )
+    .expect("enable native fork fault phase");
+    std::fs::write(&arm, "recover").expect("arm first fork response fault");
+    // Plan updates cannot yield into background work under shared host load.
+    let fork_prompt = format!(
+        "Before using any tool, write the short sentence Checking now. Then {} Do not repeat the planning action after a reconnect.",
+        plan_prompt(host.backend())
+    );
+    let agent = fork_agent(host, &source, &fork_prompt).await;
+    let forked = collect_turn(host, &agent, &fork_prompt).await;
+    let fork_proof = std::fs::read_to_string(
+        std::env::var("TYDE_REAL_RETRY_FORK_PROOF").expect("native fork proof path"),
+    )
+    .expect("read native fork proof");
+    assert_eq!(
+        fork_proof.lines().filter(|line| *line == "rearm").count(),
+        1,
+        "the second fork fault must follow a real response boundary"
+    );
+    assert_eq!(
+        fork_proof.lines().filter(|line| *line == "raw").count(),
+        0,
+        "the fork must exercise the native Items projection without raw response events"
+    );
+    let fork_sequences: Vec<_> = forked
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::RetrySequenceUpdated(sequence) => Some(sequence),
+            _ => None,
+        })
+        .collect();
+    for event in forked.events() {
+        match event {
+            ChatEvent::TypingStatusChanged(active) => eprintln!("REAL FORK EVENT typing={active}"),
+            ChatEvent::StreamEnd(end) => eprintln!(
+                "REAL FORK EVENT response_chars={} tools={}",
+                end.message.content.len(),
+                end.message.tool_calls.len()
+            ),
+            ChatEvent::ToolRequest(_) => eprintln!("REAL FORK EVENT tool_requested"),
+            ChatEvent::ToolProgress(progress) => {
+                eprintln!("REAL FORK EVENT tool_mode={:?}", progress.execution_mode)
+            }
+            ChatEvent::ToolExecutionCompleted(_) => eprintln!("REAL FORK EVENT tool_completed"),
+            ChatEvent::OperationCancelled(cancelled) => eprintln!(
+                "REAL FORK EVENT cancelled identity={}",
+                cancelled.message == "Stream identity violation"
+            ),
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
+                eprintln!(
+                    "REAL FORK EVENT error identity={}",
+                    message.content.starts_with("Stream identity violation:")
+                )
+            }
+            ChatEvent::RetrySequenceUpdated(sequence) => eprintln!(
+                "REAL FORK EVENT retry={:?} revision={}",
+                sequence.outcome, sequence.revision
+            ),
+            _ => {}
+        }
+    }
+    let fork_starts: Vec<_> = fork_sequences
+        .iter()
+        .filter(|sequence| sequence.revision == 1)
+        .copied()
+        .collect();
+    eprintln!(
+        "REAL FORK RETRY OBSERVATION episodes={} snapshots={}",
+        fork_starts.len(),
+        fork_sequences.len()
+    );
+    assert_eq!(
+        fork_starts.len(),
+        2,
+        "separate response retries in one fork turn must retain distinct episode identities"
+    );
+    assert_ne!(fork_starts[0].id, fork_starts[1].id);
+    assert!(
+        fork_starts[0].request == fork_starts[1].request,
+        "the fixture must exercise multiple responses in one native turn"
+    );
+    for started in fork_starts {
+        assert!(
+            fork_sequences
+                .iter()
+                .any(|sequence| sequence.id == started.id
+                    && sequence.outcome == protocol::RetrySequenceOutcome::Reconnected),
+            "each fork retry must settle at its real response boundary"
+        );
+    }
+    assert_eq!(
+        forked.task_updates().count(),
+        1,
+        "retry recovery must not repeat the native planning action"
+    );
+    std::fs::write(&arm, "exhaust").expect("break the real transport until native retries exhaust");
+    send_prompt(host, &agent, prompt).await;
+    let mut failed = host.turn(prompt);
+    loop {
+        match host.next_backend_event().await {
+            server::backend::BackendEvent::Chat(event) => {
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                failed.events.push(event);
+                if idle {
+                    break;
+                }
+            }
+            server::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
+                failed.model_requests.push(usage)
+            }
+            server::backend::BackendEvent::Compaction(_)
+            | server::backend::BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected backend boundary during native retry exhaustion")
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    for (turn, outcome) in [
+        (&first, protocol::RetrySequenceOutcome::Reconnected),
+        (&second, protocol::RetrySequenceOutcome::Reconnected),
+        (&failed, protocol::RetrySequenceOutcome::Failed),
+    ] {
+        let sequences: Vec<_> = turn
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::RetrySequenceUpdated(sequence) => Some(sequence),
+                _ => None,
+            })
+            .collect();
+        eprintln!("REAL RETRY OBSERVATION outcome={outcome:?} snapshots={} diagnostics={} errors={}", sequences.len(), sequences.last().map_or(0, |sequence| sequence.diagnostics.len()), turn.events().iter().filter(|event| matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error))).count());
+        assert!(
+            sequences.len() >= 2,
+            "real disconnect must expose retry progress and its native outcome"
+        );
+        let initial = sequences[0];
+        assert_eq!(
+            initial.outcome,
+            protocol::RetrySequenceOutcome::Reconnecting
+        );
+        assert!(!initial.diagnostics.is_empty());
+        let settled = sequences.last().expect("native outcome");
+        assert_eq!(
+            settled.id, initial.id,
+            "one retry sequence keeps one identity"
+        );
+        assert_eq!(settled.outcome, outcome);
+        assert!(settled.revision > initial.revision);
+        assert!(
+            &settled.diagnostics[..initial.diagnostics.len()] == initial.diagnostics.as_slice(),
+            "settlement retains every raw diagnostic"
+        );
+        assert!(
+            !ids.contains(&initial.id),
+            "separate requests retain separate retry identities"
+        );
+        if outcome == protocol::RetrySequenceOutcome::Failed {
+            for event in turn.events() {
+                if let ChatEvent::MessageAdded(message) = event
+                    && matches!(message.sender, MessageSender::Error)
+                {
+                    assert!(settled.diagnostics.iter().any(|diagnostic| matches!(&diagnostic.source, protocol::RetryDiagnosticSource::Message(id) if message.message_id.as_ref() == Some(id))), "native exhaustion's terminal error belongs to the same episode, not another Flow row");
+                }
+            }
+        }
+        ids.push(initial.id.clone());
+        assert!(
+            turn.events()
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
+            "native idle remains observable"
+        );
+        for diagnostic in &settled.diagnostics {
+            assert!(
+                turn.events()
+                    .iter()
+                    .any(|event| match (&diagnostic.source, event) {
+                        (
+                            protocol::RetryDiagnosticSource::Message(id),
+                            ChatEvent::MessageAdded(message),
+                        ) => message.message_id.as_ref() == Some(id),
+                        (
+                            protocol::RetryDiagnosticSource::Attempt(id),
+                            ChatEvent::RetryAttempt(attempt),
+                        ) => attempt.id.as_ref() == Some(id),
+                        _ => false,
+                    }),
+                "legacy appearances retain each native diagnostic"
+            );
+        }
+    }
+    std::fs::write(&arm, "close").expect("arm native process exit after a real retry notification");
+    send_prompt(host, &agent, prompt).await;
+    let mut interrupted_id = None;
+    loop {
+        let event = host.next_backend_event().await;
+        if let server::backend::BackendEvent::Chat(ChatEvent::RetrySequenceUpdated(sequence)) =
+            event
+        {
+            match sequence.outcome {
+                protocol::RetrySequenceOutcome::Reconnecting => {
+                    interrupted_id = Some(sequence.id);
+                }
+                protocol::RetrySequenceOutcome::Unresolved => {
+                    assert_eq!(
+                        Some(sequence.id),
+                        interrupted_id,
+                        "transport exit settles the open episode without inventing success"
+                    );
+                    assert!(!sequence.diagnostics.is_empty());
+                    break;
+                }
+                _ => panic!("transport exit must not claim recovery or retry exhaustion"),
+            }
+        }
+    }
+    eprintln!(
+        "REAL RETRY SEQUENCE EVIDENCE episodes={} unresolved=1",
+        ids.len()
+    );
 }
 
 fn excluded_question_prompt<B: Backend>() -> &'static str {
@@ -9891,6 +10142,7 @@ fn describe_event(event: &ChatEvent) -> String {
         ChatEvent::AgentHandoff(_) => "AgentHandoff".to_owned(),
         ChatEvent::RestartRecovery { .. } => "RestartRecovery".to_owned(),
         ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
+        ChatEvent::RetrySequenceUpdated(_) => "RetrySequenceUpdated".to_owned(),
         ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),
         ChatEvent::Orchestration(_) => "Orchestration".to_owned(),
         ChatEvent::ContextCompaction(_) => "ContextCompaction".to_owned(),
@@ -10261,6 +10513,13 @@ conformance2_scenario!(real_interruption, [BackendCapability::Interrupt]);
 conformance2_scenario!(
     real_running_command_survives_response_retry,
     [BackendCapability::YieldsRunningCommands]
+);
+conformance2_scenario!(
+    real_connection_retry_sequences,
+    [
+        BackendCapability::ConnectionRetrySequences,
+        BackendCapability::ForkSession
+    ]
 );
 conformance2_scenario!(real_mid_turn_steering, [BackendCapability::MidTurnSteering]);
 conformance2_scenario!(real_input_origins, []);

@@ -9761,3 +9761,250 @@ async fn close_during_startup_with_deferred_restart_is_not_restored() {
     );
     drop(ready_gate);
 }
+
+#[tokio::test]
+async fn retry_sequence_snapshots_survive_bootstrap_paging_and_restart() {
+    use protocol::{RetrySequence, RetrySequenceId, RetrySequenceOutcome};
+    let mut fixture = Fixture::new().await;
+    let idle = server::backend::mock::MockGateHandle::new();
+    eprintln!("RETRY REPLAY phase=spawn");
+    let mut sequence = RetrySequence {
+        id: RetrySequenceId("retry-episode".to_owned()),
+        request: protocol::ModelTurnId("native-request".to_owned()),
+        revision: 1,
+        attempt: Some(1),
+        max_attempts: Some(5),
+        outcome: RetrySequenceOutcome::Reconnecting,
+        diagnostics: vec![protocol::RetryDiagnostic {
+            source: protocol::RetryDiagnosticSource::Attempt(protocol::RetryAttemptId(
+                "retry-observation".to_owned(),
+            )),
+            raw: "native transport diagnostic".to_owned(),
+        }],
+    };
+    let progress = sequence.clone();
+    sequence.revision = 2;
+    sequence.outcome = RetrySequenceOutcome::Reconnected;
+    let mut unfinished = progress.clone();
+    unfinished.id = RetrySequenceId("unfinished-episode".to_owned());
+    unfinished.request = protocol::ModelTurnId("unfinished-request".to_owned());
+    unfinished.diagnostics = vec![protocol::RetryDiagnostic {
+        source: protocol::RetryDiagnosticSource::Attempt(protocol::RetryAttemptId(
+            "unfinished-observation".to_owned(),
+        )),
+        raw: "unfinished native diagnostic".to_owned(),
+    }];
+    let agent = fixture
+        .spawn_scripted(
+            "retry replay",
+            MockScript::one(
+                MockTurn::chat_events(vec![
+                    ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                        id: Some(protocol::RetryAttemptId("retry-observation".to_owned())),
+                        attempt: 1,
+                        max_retries: 5,
+                        error: "native transport diagnostic".to_owned(),
+                        backoff_ms: 250,
+                    }),
+                    ChatEvent::RetrySequenceUpdated(progress.clone()),
+                    ChatEvent::RetrySequenceUpdated(sequence.clone()),
+                    ChatEvent::RetryAttempt(protocol::RetryAttemptData {
+                        id: Some(protocol::RetryAttemptId(
+                            "unfinished-observation".to_owned(),
+                        )),
+                        attempt: 1,
+                        max_retries: 5,
+                        error: "unfinished native diagnostic".to_owned(),
+                        backoff_ms: 250,
+                    }),
+                    ChatEvent::RetrySequenceUpdated(unfinished.clone()),
+                ])
+                .with_gate_before_idle(&idle),
+            ),
+        )
+        .await;
+    idle.wait_until_entered().await;
+    let mut live = Vec::new();
+    for _ in 0..3 {
+        let event = fixture
+            .next_chat_event_matching(&agent, "retry snapshot", |event| {
+                matches!(event, ChatEvent::RetrySequenceUpdated(_))
+            })
+            .await;
+        if let ChatEvent::RetrySequenceUpdated(sequence) = event {
+            live.push(sequence);
+        }
+    }
+    eprintln!("RETRY REPLAY phase=snapshots-observed count={}", live.len());
+    assert_eq!(live.len(), 3);
+    assert_eq!(live[0], progress);
+    assert_eq!(live[1], sequence);
+    eprintln!("RETRY REPLAY phase=bootstrap");
+    let (mut client, host_bootstrap) = fixture.connect_with_bootstrap().await;
+    let replay_stream = host_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("retry agent advertised to the new client")
+        .instance_stream
+        .clone();
+    let env = expect_raw_event_on_stream(
+        &mut client,
+        &replay_stream,
+        FrameKind::AgentBootstrap,
+        "retry bootstrap",
+    )
+    .await;
+    let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("retry bootstrap");
+    let session = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentStart(start) => start.session_id.clone(),
+            _ => None,
+        })
+        .expect("native session");
+    let replayed: Vec<_> = bootstrap
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::RetrySequenceUpdated(sequence)) => {
+                Some(sequence)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, live);
+    let page = fetch_history_page(
+        &mut client,
+        &replay_stream,
+        agent.new_agent.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    let paged: Vec<_> = page
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::RetrySequenceUpdated(sequence) => Some(sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paged, live);
+    eprintln!("RETRY REPLAY phase=fork-live-source");
+    let (fork, _) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("fork retry context".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: session.clone(),
+                prompt: "fork retry context".to_owned(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await;
+    let inherited = fixture.next_chat_event_matching(&fork, "inherited retry resolves at fork boundary", |event| matches!(event, ChatEvent::RetrySequenceUpdated(sequence) if sequence.id == unfinished.id && sequence.outcome == RetrySequenceOutcome::Unresolved)).await;
+    if let ChatEvent::RetrySequenceUpdated(inherited) = inherited {
+        assert_eq!(inherited.revision, unfinished.revision + 1);
+        assert_eq!(inherited.diagnostics, unfinished.diagnostics);
+    }
+    fixture
+        .next_chat_event_matching(&fork, "fork's own response", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let source_page = fetch_history_page(
+        &mut client,
+        &replay_stream,
+        agent.new_agent.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    let source_latest = source_page
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ChatEvent::RetrySequenceUpdated(sequence) if sequence.id == unfinished.id => {
+                Some(sequence)
+            }
+            _ => None,
+        })
+        .expect("source retry remains independent");
+    assert_eq!(
+        source_latest.outcome,
+        RetrySequenceOutcome::Reconnecting,
+        "fork projection must not settle the live source's episode"
+    );
+    idle.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "retry turn idle", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    eprintln!("RETRY REPLAY phase=restart");
+    let host_bootstrap = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&host_bootstrap, std::slice::from_ref(&session))
+        .await;
+    let restored = &restored[&session];
+    let page = fetch_history_page(
+        &mut fixture.client,
+        &restored.instance_stream,
+        restored.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    let restarted: Vec<_> = page
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::RetrySequenceUpdated(sequence) => Some(sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        &restarted[..live.len()],
+        live.as_slice(),
+        "recovery preserves every original snapshot"
+    );
+    assert_eq!(restarted.len(), live.len() + 1);
+    let recovered = restarted.last().expect("unfinished retry recovery");
+    assert_eq!(recovered.id, unfinished.id);
+    assert_eq!(recovered.revision, unfinished.revision + 1);
+    assert_eq!(recovered.outcome, RetrySequenceOutcome::Unresolved);
+    assert_eq!(recovered.diagnostics, unfinished.diagnostics);
+    let host_bootstrap = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&host_bootstrap, std::slice::from_ref(&session))
+        .await;
+    let restored = &restored[&session];
+    let page = fetch_history_page(
+        &mut fixture.client,
+        &restored.instance_stream,
+        restored.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    let again: Vec<_> = page
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::RetrySequenceUpdated(sequence) => Some(sequence),
+            _ => None,
+        })
+        .collect();
+    eprintln!("RETRY REPLAY phase=restarted snapshots={}", again.len());
+    assert_eq!(
+        again, restarted,
+        "another restart must not duplicate or re-resolve the episode"
+    );
+}

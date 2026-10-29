@@ -9399,6 +9399,7 @@ pub enum ChatEvent {
     TaskUpdate(TaskList),
     OperationCancelled(OperationCancelledData),
     RetryAttempt(RetryAttemptData),
+    RetrySequenceUpdated(RetrySequence),
     Orchestration(OrchestrationEvent),
     ContextCompaction(ContextCompactionTimelineEvent),
 }
@@ -10209,8 +10210,49 @@ pub struct OperationCancelledData {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RetrySequenceId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySequenceOutcome {
+    Reconnecting,
+    Reconnected,
+    Failed,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RetryAttemptId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetryDiagnosticSource {
+    Message(ChatMessageId),
+    Attempt(RetryAttemptId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryDiagnostic {
+    pub source: RetryDiagnosticSource,
+    pub raw: String,
+}
+
+/// Full adapter-owned snapshot. Revisions never discard diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrySequence {
+    pub id: RetrySequenceId,
+    pub request: ModelTurnId,
+    pub revision: u64,
+    pub attempt: Option<u64>,
+    pub max_attempts: Option<u64>,
+    pub outcome: RetrySequenceOutcome,
+    pub diagnostics: Vec<RetryDiagnostic>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryAttemptData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<RetryAttemptId>,
     pub attempt: u64,
     pub max_retries: u64,
     pub error: String,

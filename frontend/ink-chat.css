@@ -1979,3 +1979,58 @@
     font-family: var(--font-sans);
 }
 
+
+/* Flow diagnostics stay attached to their request without another card. */
+.chat-view[data-chat-appearance="ink"] .flow-retry {
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: .923rem;
+}
+.chat-view[data-chat-appearance="ink"] .flow-retry summary {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    cursor: pointer;
+    list-style: none;
+}
+.chat-view[data-chat-appearance="ink"] .flow-retry summary::-webkit-details-marker {
+    display: none;
+}
+.chat-view[data-chat-appearance="ink"] .flow-warning-icon {
+    color: var(--warning);
+}
+.chat-view[data-chat-appearance="ink"] .flow-retry-details pre {
+    margin: 6px 0;
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+}
+.chat-view[data-chat-appearance="ink"] .chat-card-warning {
+    padding: 4px 0;
+    border: 0;
+    background: transparent;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+.chat-view[data-chat-appearance="ink"] .chat-card-warning::before {
+    content: "⚠";
+    color: var(--warning);
+    font-size: .923rem;
+}
+.chat-view[data-chat-appearance="ink"] .chat-card-warning .chat-card-header {
+    display: none;
+}
+
+.chat-view[data-chat-appearance="ink"] .flow-warning-icon[data-recovered="true"] {
+    color: var(--text-tertiary);
+}
+.chat-view[data-chat-appearance="ink"] .flow-retry summary::after {
+    content: "›";
+    color: var(--text-tertiary);
+}
+.chat-view[data-chat-appearance="ink"] .flow-retry[open] > summary::after {
+    transform: rotate(90deg);
+}

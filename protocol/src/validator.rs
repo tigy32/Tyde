@@ -2281,6 +2281,11 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
         ChatEvent::OperationCancelled(data) => {
             format!("event=operation_cancelled message={:?}", data.message)
         }
+        ChatEvent::RetrySequenceUpdated(data) => format!(
+            "event=retry_sequence revision={} diagnostics={}",
+            data.revision,
+            data.diagnostics.len()
+        ),
         ChatEvent::RetryAttempt(data) => {
             format!(
                 "event=retry_attempt attempt={} max={}",

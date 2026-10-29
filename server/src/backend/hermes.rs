@@ -6022,6 +6022,7 @@ impl HermesEventMapper {
                     *attempt > 0 && *max_retries > 0 && *attempt <= *max_retries
                 })
                 .map(|((attempt, max_retries), backoff_ms)| RetryAttemptData {
+                    id: None,
                     attempt,
                     max_retries,
                     error: text.clone(),
