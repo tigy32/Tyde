@@ -2476,6 +2476,494 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     );
 }
 
+fn usage_reset_diagnostic(phase: &str) {
+    let path = std::env::temp_dir().join(format!("tyde-usage-reset-{}.trace", std::process::id()));
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{phase}\n").as_bytes()));
+    if let Err(error) = result {
+        eprintln!("Usage reset diagnostic trace failed: {error}");
+    }
+}
+
+#[tokio::test]
+async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(&mut fixture.client, "reset-root", "before reset").await;
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: before reset",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "reset-child",
+        "child before reset",
+        "/tmp/reset-child",
+    )
+    .await;
+    let grandchild = spawn_user_child(
+        &mut fixture.client,
+        &child.agent_id,
+        "reset-grandchild",
+        "grandchild before reset",
+        "/tmp/reset-grandchild",
+    )
+    .await;
+    let (_, before) = fixture.connect_with_bootstrap().await;
+    let before = before
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .expect("initial tree usage");
+    assert_eq!(before.breakdown.len(), 3);
+    assert_eq!(before.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL * 3);
+    let session = before.root_session_id.clone().expect("root saved session");
+    let child_session = before
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == child.agent_id)
+        .unwrap()
+        .session_id
+        .clone()
+        .unwrap();
+    fixture
+        .mock_by_id(&child.agent_id)
+        .await
+        .enqueue(MockTurn::cancelled_before_typing(
+            "cancelled admitted request",
+        ))
+        .await;
+    fixture
+        .client
+        .send_message(&child.instance_stream, "cancel before typing".into())
+        .await
+        .unwrap();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &child.instance_stream,
+        "admission cancelled before typing",
+        |event| matches!(event, ChatEvent::OperationCancelled(_)),
+    )
+    .await;
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &child.instance_stream,
+        "cancelled admission settled",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    let gate = MockGateHandle::new();
+    let control = fixture.mock_by_id(&grandchild.agent_id).await;
+    control
+        .enqueue(
+            MockTurn::text_with_late_usage("old request completes after reset")
+                .with_gate_before_usage(&gate),
+        )
+        .await;
+    fixture
+        .client
+        .send_message(&grandchild.instance_stream, "in flight".into())
+        .await
+        .unwrap();
+    gate.wait_until_entered().await;
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("reset-starting-child");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("reset-starting-child".into()),
+            custom_agent_id: None,
+            parent_agent_id: Some(root.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/reset-starting-child".into()],
+                prompt: "submitted before reset".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .unwrap();
+    startup_gate.wait_until_entered().await;
+    let starting = expect_new_agent(&mut fixture.client, "starting reset descendant").await;
+    fixture
+        .client
+        .reset_task_usage(&root.instance_stream)
+        .await
+        .unwrap();
+    let reset = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "reset tree",
+        |usage| usage.total.usage.total_tokens == 0 && usage.breakdown.len() == 1,
+    )
+    .await;
+    assert_known_task_status(&reset.total.status);
+    assert_eq!(reset.member_agent_ids.len(), 4);
+    assert!(reset.member_agent_ids.contains(&child.agent_id));
+    assert!(reset.member_agent_ids.contains(&grandchild.agent_id));
+    assert!(reset.member_agent_ids.contains(&starting.agent_id));
+    let (mut observer, other) = fixture.connect_with_bootstrap().await;
+    let other = other
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .unwrap();
+    assert_eq!(other.total, reset.total);
+    assert_eq!(other.breakdown.len(), 1);
+    startup_gate.release_one();
+    let starting_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &starting.instance_stream,
+        "starting child registered after reset",
+    )
+    .await;
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &starting.instance_stream,
+        "mock backend response to: submitted before reset",
+    )
+    .await;
+    gate.release_one();
+    // Reset observation consumed this turn's prefix; the remaining events are metadata and idle.
+    let late = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &grandchild.instance_stream,
+        "excluded late accounting",
+        |event| matches!(event, ChatEvent::MessageMetadataUpdated(_)),
+    )
+    .await;
+    let ChatEvent::MessageMetadataUpdated(late) = late else {
+        unreachable!()
+    };
+    assert_eq!(
+        late.token_usage
+            .unwrap()
+            .request
+            .known_usage()
+            .unwrap()
+            .total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &grandchild.instance_stream,
+        "excluded request settled",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    let (_, replayed) = fixture.connect_with_bootstrap().await;
+    let replayed = replayed
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .unwrap();
+    assert_eq!(
+        replayed.total, reset.total,
+        "late old usage must stay excluded"
+    );
+    assert_eq!(replayed.descendant_count, 0);
+    let starting_session = starting_start.session_id.unwrap();
+    let mut replacement = starting;
+    for _ in 0..2 {
+        fixture
+            .client
+            .close_agent(&replacement.instance_stream)
+            .await
+            .unwrap();
+        expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentClosed,
+            "close reset startup descendant",
+        )
+        .await;
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("reset-startup-reopened".into()),
+                custom_agent_id: None,
+                parent_agent_id: Some(root.agent_id.clone()),
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: starting_session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .unwrap();
+        replacement =
+            expect_new_agent(&mut fixture.client, "reopen excluded startup descendant").await;
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &replacement.instance_stream,
+            "excluded descendant ready",
+        )
+        .await;
+    }
+    fixture
+        .client
+        .close_agent(&replacement.instance_stream)
+        .await
+        .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "close second reset replacement",
+    )
+    .await;
+    let (_, rebound) = fixture.connect_with_bootstrap().await;
+    let rebound = rebound
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .unwrap();
+    assert_eq!(rebound.total.usage.total_tokens, 0);
+    assert_eq!(rebound.descendant_count, 0);
+    fixture
+        .client
+        .send_message(&child.instance_stream, "new child request".into())
+        .await
+        .unwrap();
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "mock backend response to: new child request",
+    )
+    .await;
+    let continued = expect_task_token_usage_matching(
+        &mut observer,
+        &root.agent_id,
+        "continued usage on existing child",
+        |usage| usage.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL,
+    )
+    .await;
+    assert_eq!(continued.descendant_count, 1);
+    assert_eq!(continued.breakdown[1].agent_id, child.agent_id);
+    let restart = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&restart, &[session.clone(), child_session.clone()])
+        .await;
+    let resumed = restored[&session].clone();
+    let resumed_child = restored[&child_session].clone();
+    let (_, durable) = fixture.connect_with_bootstrap().await;
+    let durable = durable
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == resumed.agent_id)
+        .unwrap();
+    assert_eq!(durable.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(durable.descendant_count, 1);
+    fixture
+        .client
+        .send_message(&resumed_child.instance_stream, "after restart".into())
+        .await
+        .unwrap();
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &resumed_child.instance_stream,
+        "mock backend response to: after restart",
+    )
+    .await;
+    let (_, after) = fixture.connect_with_bootstrap().await;
+    let after = after
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == resumed.agent_id)
+        .unwrap();
+    assert_eq!(after.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL * 2);
+    assert_eq!(after.descendant_count, 1);
+    expect_replayed_turn_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        &resumed.agent_id,
+        "before reset",
+    )
+    .await;
+    for before_commit in [false, true] {
+        let (mut second_client, peers) = fixture.connect_with_bootstrap().await;
+        let peer_root = peers
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == resumed.agent_id)
+            .expect("peer root descriptor");
+        let peer_child = peers
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == resumed_child.agent_id)
+            .expect("peer child descriptor");
+        expect_agent_start_on_stream(
+            &mut second_client,
+            &peer_root.instance_stream,
+            "reset peer root subscription",
+        )
+        .await;
+        expect_agent_start_on_stream(
+            &mut second_client,
+            &peer_child.instance_stream,
+            "reset peer child subscription",
+        )
+        .await;
+        eprintln!("Usage reset diagnostic: phase=concurrent-reset before_commit={before_commit}");
+        let publication = if before_commit {
+            fixture
+                .host_for_test()
+                .install_next_usage_reset_capture_test_gate()
+                .await
+        } else {
+            fixture
+                .host_for_test()
+                .install_next_usage_reset_publication_test_gate()
+                .await
+        };
+        fixture
+            .client
+            .reset_task_usage(&resumed.instance_stream)
+            .await
+            .unwrap();
+        tokio::select! {
+            _ = publication.wait_until_entered() => {},
+            rejected = fixture::next_logical_frame_matching_on(&mut fixture.client, "reset failure before gate", |env| env.kind == FrameKind::CommandError && env.parse_payload::<protocol::CommandErrorPayload>().is_ok_and(|error| error.operation == "reset_task_usage")) => {
+                let error: protocol::CommandErrorPayload = rejected.parse_payload().unwrap();
+                panic!("Reset failed before its accounting gate: {}", error.message);
+            }
+        }
+        usage_reset_diagnostic("test:first-reset-held");
+        second_client
+            .send_message(
+                &peer_child.instance_stream,
+                "between concurrent resets".into(),
+            )
+            .await
+            .unwrap();
+        usage_reset_diagnostic("test:peer-request-sent");
+        loop {
+            let event = fixture::next_chat_event_matching_on(
+                &mut second_client,
+                &peer_child.instance_stream,
+                "usage between reset revisions",
+                |_| true,
+            )
+            .await;
+            usage_reset_diagnostic(match &event {
+                ChatEvent::StreamEnd(_) => "test:peer-stream-end",
+                ChatEvent::TypingStatusChanged(true) => "test:peer-typing",
+                ChatEvent::TypingStatusChanged(false) => "test:peer-idle-event",
+                _ => "test:peer-other-event",
+            });
+            // Mock responses prefix configured startup context; identify the new reply by its suffix.
+            if matches!(event, ChatEvent::StreamEnd(end) if end.message.content.ends_with("mock backend response to: between concurrent resets"))
+            {
+                break;
+            }
+        }
+        fixture::next_chat_event_matching_on(
+            &mut second_client,
+            &peer_child.instance_stream,
+            "between-reset request settled",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+        usage_reset_diagnostic("test:peer-request-idle");
+        second_client
+            .reset_task_usage(&peer_root.instance_stream)
+            .await
+            .unwrap();
+        usage_reset_diagnostic("test:peer-reset-sent");
+        second_client
+            .set_agent_name(
+                &peer_root.instance_stream,
+                format!("newer-reset-installed-{before_commit}"),
+            )
+            .await
+            .unwrap();
+        fixture::next_logical_frame_matching_on(
+            &mut second_client,
+            "newer reset committed and published",
+            |env| {
+                env.stream == peer_root.instance_stream
+                    && env.kind == FrameKind::AgentRenamed
+                    && env
+                        .parse_payload::<protocol::AgentRenamedPayload>()
+                        .is_ok_and(|rename| {
+                            rename.name == format!("newer-reset-installed-{before_commit}")
+                        })
+            },
+        )
+        .await;
+        usage_reset_diagnostic("test:peer-reset-published");
+        let (_, newer) = fixture.connect_with_bootstrap().await;
+        assert_eq!(
+            newer
+                .task_token_usages
+                .iter()
+                .find(|usage| usage.root_agent_id == resumed.agent_id)
+                .unwrap()
+                .total
+                .usage
+                .total_tokens,
+            0
+        );
+        usage_reset_diagnostic("test:release-first-reset");
+        publication.release_one();
+        fixture
+            .client
+            .set_agent_name(
+                &resumed.instance_stream,
+                format!("older-reset-installed-{before_commit}"),
+            )
+            .await
+            .unwrap();
+        fixture::next_logical_frame_matching_on(
+            &mut fixture.client,
+            "older reset publication completed",
+            |env| {
+                env.stream == resumed.instance_stream
+                    && env.kind == FrameKind::AgentRenamed
+                    && env
+                        .parse_payload::<protocol::AgentRenamedPayload>()
+                        .is_ok_and(|start| {
+                            start.name == format!("older-reset-installed-{before_commit}")
+                        })
+            },
+        )
+        .await;
+        let (_, ordered) = fixture.connect_with_bootstrap().await;
+        let ordered = ordered
+            .task_token_usages
+            .iter()
+            .find(|usage| usage.root_agent_id == resumed.agent_id)
+            .unwrap();
+        assert_eq!(
+            ordered.total.usage.total_tokens, 0,
+            "old publication must not replace the newest durable reset"
+        );
+    }
+    let restart = fixture.restart_host().await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&session))
+        .await;
+    let (_, durable) = fixture.connect_with_bootstrap().await;
+    let durable = durable
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&session].agent_id)
+        .unwrap();
+    assert_eq!(durable.total.usage.total_tokens, 0);
+    assert_eq!(durable.descendant_count, 0);
+}
+
 #[tokio::test]
 async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     let mut fixture = Fixture::new().await;
@@ -4217,6 +4705,110 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
         usage.total.usage.total_tokens, 49,
         "the required final archive commit must preserve the exact latest native checkpoint"
     );
+    let late = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "native-reset-late",
+            MockScript::one(MockTurn::text_with_late_native_usage(
+                "old native request",
+                &late,
+                71,
+            ))
+            .then(MockTurn::text_without_usage("new native request")),
+        )
+        .await;
+    let reset_root = spawn_token_usage_agent_with_backend(
+        &mut fixture.client,
+        "native-reset-late",
+        "native reset",
+        BackendKind::Codex,
+    )
+    .await;
+    drop(reservation);
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &reset_root.instance_stream,
+        "old native request",
+    )
+    .await;
+    late.wait_until_entered().await;
+    eprintln!("Usage reset native diagnostic: phase=old-request-awaiting-accounting");
+    fixture
+        .client
+        .reset_task_usage(&reset_root.instance_stream)
+        .await
+        .unwrap();
+    let reset = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &reset_root.agent_id,
+        "native reset",
+        |usage| matches!(usage.total.status, TaskTokenUsageStatus::Known),
+    )
+    .await;
+    assert_eq!(reset.total.usage.total_tokens, 0);
+    fixture
+        .client
+        .send_message(&reset_root.instance_stream, "new native input".into())
+        .await
+        .unwrap();
+    fixture
+        .client
+        .set_agent_name(&reset_root.instance_stream, "native-reset-admitted".into())
+        .await
+        .unwrap();
+    fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "new native admission processed",
+        |env| {
+            env.stream == reset_root.instance_stream
+                && env.kind == FrameKind::AgentRenamed
+                && env
+                    .parse_payload::<protocol::AgentRenamedPayload>()
+                    .is_ok_and(|start| start.name == "native-reset-admitted")
+        },
+    )
+    .await;
+    eprintln!("Usage reset native diagnostic: phase=new-request-admitted-before-old-report");
+    let (mut accounting_observer, _) = fixture.connect_with_bootstrap().await;
+    late.release_one();
+    expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &reset_root.instance_stream,
+        "new native request",
+    )
+    .await;
+    let unknown = expect_task_token_usage_matching(&mut accounting_observer, &reset_root.agent_id, "unidentified late ownership stays unavailable", |usage| matches!(&usage.total.status, TaskTokenUsageStatus::Unavailable { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous))).await;
+    assert_eq!(
+        unknown.total.usage.total_tokens, 0,
+        "unidentified old usage must not restore pre-reset tokens"
+    );
+    let session = unknown.root_session_id.unwrap();
+    let discovery =
+        server::backend::mock::MockDiscovery::new(vec![Ok(server::backend::BackendDiscovery {
+            schema: server::backend::codex::CodexBackend::session_settings_schema(),
+            launch_profiles: Vec::new(),
+        })]);
+    let restart = fixture
+        .restart_host_with_runtime_config(move |config| {
+            config
+                .mock_backend_discovery
+                .insert(BackendKind::Codex, discovery);
+        })
+        .await;
+    let restored = fixture
+        .restored_agents(&restart, std::slice::from_ref(&session))
+        .await;
+    let (_, durable) = fixture.connect_with_bootstrap().await;
+    let durable = durable
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored[&session].agent_id)
+        .unwrap();
+    assert_eq!(durable.total.usage.total_tokens, 0);
+    assert!(
+        matches!(&durable.total.status, TaskTokenUsageStatus::Unavailable { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous))
+    );
+    eprintln!("Usage reset native diagnostic: phase=unavailable-attribution-preserved");
 }
 
 /// The agent's exclusive wall-clock account, checked for the invariants every

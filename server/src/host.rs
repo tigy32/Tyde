@@ -899,6 +899,7 @@ pub(crate) struct HostState {
     agent_visibility: AgentVisibilityRegistry,
     spawn_publication_claims: HashMap<AgentId, SpawnOperationTerminalClaim>,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
+    task_usage_resets: Vec<protocol::TaskUsageReset>,
     closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     // Registry ownership survives failed mandatory cleanup; reconnects replay the failure.
     unclaimed_agent_cleanup_failures: HashMap<AgentId, protocol::CommandErrorPayload>,
@@ -982,6 +983,10 @@ pub(crate) struct HostState {
     agent_publication_start_test_gate: Option<state_owner::StartTestGate>,
     #[cfg(feature = "test-support")]
     bootstrap_snapshot_reply_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    usage_reset_publication_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    usage_reset_capture_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     fanout_handoff_test_gate: Option<state_owner::ReplyTestGate>,
     #[cfg(feature = "test-support")]
@@ -2733,6 +2738,30 @@ impl HostHandle {
     }
 
     #[cfg(feature = "test-support")]
+    pub async fn install_next_usage_reset_capture_test_gate(
+        &self,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let shared = gate.shared();
+        self.state
+            .with(move |state| state.usage_reset_capture_test_gate = Some(shared))
+            .await;
+        gate
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn install_next_usage_reset_publication_test_gate(
+        &self,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let shared = gate.shared();
+        self.state
+            .with(move |state| state.usage_reset_publication_test_gate = Some(shared))
+            .await;
+        gate
+    }
+
+    #[cfg(feature = "test-support")]
     pub async fn install_next_bootstrap_snapshot_reply_test_gate(
         &self,
     ) -> InstalledSpawnOperationTestGate {
@@ -3870,21 +3899,21 @@ impl HostHandle {
             .state
             .with(|state| state.bootstrap_snapshot_reply_test_gate.take())
             .await;
-        bootstrap.task_token_usages = match usage_sources {
-            Some((handles, closed, live, sessions)) => {
-                task_token_usage_rollups_from_handles(
+        let (usage_snapshots, usage_live, usage_sessions) = match usage_sources {
+            Some((handles, closed, live, sessions)) => (
+                task_token_usage_snapshots_from_handles(
                     handles,
                     closed,
-                    &live,
-                    &sessions,
                     #[cfg(feature = "test-support")]
                     snapshot_gate,
                 )
-                .await
-            }
-            None => Vec::new(),
+                .await,
+                live,
+                sessions,
+            ),
+            None => (Vec::new(), HashSet::new(), HashMap::new()),
         };
-        attach_learning_accounting(&mut bootstrap.task_token_usages, self.config.usage().await);
+        let learning_usage = self.config.usage().await;
         let bootstrap_agent_ids = bootstrap
             .agents
             .iter()
@@ -3895,6 +3924,8 @@ impl HostHandle {
             .state
             .with(move |state| {
                 let mut deferred_attachments = deferred_attachments;
+                bootstrap.task_token_usages = task_token_usage_rollups_from_snapshots(usage_snapshots, &state.task_usage_resets, &usage_live, &usage_sessions, &learning_usage);
+
                 let advertised = bootstrap_agent_ids.iter().filter(|id| task_usage_agent_is_live(state, id)).cloned().collect();
                 project_task_usage_navigation(&advertised, &mut bootstrap.task_token_usages);
                 let mut payload = serde_json::to_value(&bootstrap)
@@ -10588,19 +10619,153 @@ std::ops::ControlFlow::Continue((
             .state
             .with(|state| task_token_usage_sources_for_state(state))
             .await;
-        let mut payloads = task_token_usage_rollups_from_handles(
+        let snapshots = task_token_usage_snapshots_from_handles(
             handles,
             closed_snapshots,
-            &live_agent_ids,
-            &agent_sessions,
             #[cfg(feature = "test-support")]
             None,
         )
         .await;
-        attach_learning_accounting(&mut payloads, self.config.usage().await);
+        let learning_usage = self.config.usage().await;
         self.state
-            .with(move |state| fan_out_task_token_usages(state, payloads))
+            .with(move |state| {
+                let payloads = task_token_usage_rollups_from_snapshots(
+                    snapshots,
+                    &state.task_usage_resets,
+                    &live_agent_ids,
+                    &agent_sessions,
+                    &learning_usage,
+                );
+                fan_out_task_token_usages(state, payloads)
+            })
             .await
+    }
+
+    pub(crate) async fn reset_task_usage(&self, root_id: AgentId) -> AppResult<()> {
+        const OPERATION: &str = "reset_task_usage";
+        #[cfg(feature = "test-support")]
+        let publication_gate = self
+            .state
+            .with(|state| state.usage_reset_publication_test_gate.take())
+            .await;
+        #[cfg(feature = "test-support")]
+        let capture_gate = self
+            .state
+            .with(|state| state.usage_reset_capture_test_gate.take())
+            .await;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:begin");
+        let (handles, closed, live, sessions) = self
+            .state
+            .with(|state| task_token_usage_sources_for_state(state))
+            .await;
+        let snapshots = task_token_usage_snapshots_from_handles(
+            handles,
+            closed,
+            #[cfg(feature = "test-support")]
+            None,
+        )
+        .await;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:snapshots-read");
+        let rollups = task_token_usage_rollups_from_snapshots(
+            snapshots.clone(),
+            &[],
+            &live,
+            &sessions,
+            &Ok(Vec::new()),
+        );
+        let root = rollups
+            .iter()
+            .find(|usage| usage.root_agent_id == root_id)
+            .ok_or_else(|| {
+                AppError::invalid(OPERATION, "Reset usage requires a live conversation root")
+            })?;
+        if snapshots.iter().any(|snapshot| {
+            root.breakdown
+                .iter()
+                .any(|entry| entry.agent_id == snapshot.start.agent_id)
+                && snapshot.observation == protocol::TaskUsageObservation::Unobserved
+                && !snapshot.accounting.observed
+        }) {
+            #[cfg(feature = "test-support")]
+            usage_reset_diagnostic("server:unobserved-boundary");
+            return Err(AppError::invalid(
+                OPERATION,
+                "Cannot reset usage while an accounting boundary is unavailable",
+            ));
+        }
+        let root_session_id = root.root_session_id.clone().ok_or_else(|| {
+            AppError::invalid(OPERATION, "Wait until the conversation has a saved session")
+        })?;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:boundary-available");
+        let helper_batches = self
+            .config
+            .usage_reset_cutoff()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:helper-cutoff-read");
+        let reset = protocol::TaskUsageReset {
+            revision: 0,
+            helper_batches,
+            root_session_id,
+            cutoffs: root
+                .breakdown
+                .iter()
+                .map(|entry| protocol::TaskUsageResetCutoff {
+                    agent_id: entry.agent_id.clone(),
+                    session_id: entry.session_id.clone(),
+                    generation: snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.start.agent_id == entry.agent_id)
+                        .expect("rollup source exists")
+                        .accounting
+                        .generation,
+                })
+                .collect(),
+        };
+        let store = self
+            .state
+            .with(|state| Arc::clone(&state.session_store))
+            .await;
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = capture_gate {
+            wait_for_spawn_operation_test_gate_inner(&gate).await;
+        }
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:persist-requested");
+        let persisted = reset.clone();
+        let reset = store
+            .read(move |store| store.save_task_usage_reset(persisted))
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = publication_gate {
+            usage_reset_diagnostic("server:publication-held");
+            wait_for_spawn_operation_test_gate_inner(&gate).await;
+        }
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:install-requested");
+        self.state
+            .with(move |state| {
+                let mut reset = reset;
+                for cutoff in &mut reset.cutoffs {
+                    if cutoff.session_id.is_none() {
+                        cutoff.session_id = state.agent_sessions.get(&cutoff.agent_id).cloned();
+                    }
+                }
+                state.task_usage_resets.push(reset);
+                state.task_usage_resets.sort_by_key(|reset| reset.revision);
+            })
+            .await;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:installed");
+        self.fan_out_task_token_usages().await;
+        #[cfg(feature = "test-support")]
+        usage_reset_diagnostic("server:published");
+        Ok(())
     }
 
     pub(crate) async fn backend_native_settings_write(
@@ -15826,6 +15991,13 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                     state
                         .agent_sessions
                         .insert(agent_id.clone(), session_id.clone());
+                    for reset in &mut state.task_usage_resets {
+                        for cutoff in &mut reset.cutoffs {
+                            if cutoff.agent_id == agent_id && cutoff.session_id.is_none() {
+                                cutoff.session_id = Some(session_id.clone());
+                            }
+                        }
+                    }
                     state.registry.notify_session_binding_changed();
                     tracing::debug!(
                         trigger = "session_binding",
@@ -19735,6 +19907,7 @@ fn spawn_host_inner(
     let mobile_access = MobileAccessHandle::new(mobile_access_tx.clone());
     let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
     let (review_ai_spawn_tx, review_ai_spawn_rx) = mpsc::channel::<ReviewAiSpawnRequest>(16);
+    let task_usage_resets = session_store.task_usage_resets()?;
     let closed_agent_usage_snapshots = session_store
         .task_usage_snapshots()?
         .into_iter()
@@ -19878,6 +20051,7 @@ fn spawn_host_inner(
         agent_visibility: AgentVisibilityRegistry::default(),
         spawn_publication_claims: HashMap::new(),
         agent_activity_summaries: HashMap::new(),
+        task_usage_resets,
         closed_agent_usage_snapshots,
         unclaimed_agent_cleanup_failures: HashMap::new(),
         #[cfg(feature = "test-support")]
@@ -19971,6 +20145,10 @@ fn spawn_host_inner(
         agent_publication_start_test_gate: None,
         #[cfg(feature = "test-support")]
         bootstrap_snapshot_reply_test_gate: None,
+        #[cfg(feature = "test-support")]
+        usage_reset_publication_test_gate: None,
+        #[cfg(feature = "test-support")]
+        usage_reset_capture_test_gate: None,
         #[cfg(feature = "test-support")]
         fanout_handoff_test_gate: None,
         #[cfg(feature = "test-support")]
@@ -23859,6 +24037,7 @@ fn same_task_usage_apart_from_horizon(
     next: &TaskTokenUsagePayload,
 ) -> bool {
     let TaskTokenUsagePayload {
+        member_agent_ids,
         helper_usage,
         root_agent_id,
         root_session_id,
@@ -23894,7 +24073,8 @@ fn same_task_usage_apart_from_horizon(
         accounts,
     } = timing;
     let before = &previous.timing;
-    previous.helper_usage == *helper_usage
+    previous.member_agent_ids == *member_agent_ids
+        && previous.helper_usage == *helper_usage
         && previous.root_agent_id == *root_agent_id
         && previous.root_session_id == *root_session_id
         && previous.total == *total
@@ -23970,6 +24150,19 @@ fn same_account_apart_from_horizon(
         })
 }
 
+#[cfg(feature = "test-support")]
+fn usage_reset_diagnostic(phase: &str) {
+    let path = std::env::temp_dir().join(format!("tyde-usage-reset-{}.trace", std::process::id()));
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{phase}\n").as_bytes()));
+    if let Err(error) = result {
+        eprintln!("Usage reset diagnostic trace failed: {error}");
+    }
+}
+
 fn task_token_usage_sources_for_state(
     state: &HostState,
 ) -> (
@@ -24002,13 +24195,11 @@ fn task_token_usage_sources_for_state(
     )
 }
 
-async fn task_token_usage_rollups_from_handles(
+async fn task_token_usage_snapshots_from_handles(
     handles: Vec<AgentHandle>,
     closed_snapshots: Vec<AgentUsageSnapshot>,
-    live_agent_ids: &HashSet<AgentId>,
-    agent_sessions: &HashMap<AgentId, SessionId>,
     #[cfg(feature = "test-support")] mut snapshot_gate: Option<Arc<SpawnOperationTestGateInner>>,
-) -> Vec<TaskTokenUsagePayload> {
+) -> Vec<AgentUsageSnapshot> {
     let mut snapshots = Vec::new();
     for handle in handles {
         snapshots.push(
@@ -24021,7 +24212,7 @@ async fn task_token_usage_rollups_from_handles(
         );
     }
     snapshots.extend(closed_snapshots);
-    task_token_usage_rollups_from_snapshots(snapshots, live_agent_ids, agent_sessions)
+    snapshots
 }
 
 async fn read_agent_usage_snapshot_or_unavailable(
@@ -24040,6 +24231,7 @@ async fn read_agent_usage_snapshot_or_unavailable(
 
 fn unavailable_agent_usage_snapshot(start: AgentStartPayload) -> AgentUsageSnapshot {
     AgentUsageSnapshot {
+        accounting: Default::default(),
         observation: protocol::TaskUsageObservation::Unobserved,
         native_usage: None,
         timing: Default::default(),
@@ -24055,8 +24247,10 @@ fn unavailable_agent_usage_snapshot(start: AgentStartPayload) -> AgentUsageSnaps
 
 fn task_token_usage_rollups_from_snapshots(
     snapshots: Vec<AgentUsageSnapshot>,
+    resets: &[protocol::TaskUsageReset],
     live_agent_ids: &HashSet<AgentId>,
     agent_sessions: &HashMap<AgentId, SessionId>,
+    learning_usage: &Result<Vec<protocol::LearningUsage>, String>,
 ) -> Vec<TaskTokenUsagePayload> {
     let live_sessions = snapshots
         .iter()
@@ -24183,6 +24377,8 @@ fn task_token_usage_rollups_from_snapshots(
         .filter_map(|root_id| {
             task_token_usage_rollup_for_root(
                 &root_id,
+                resets,
+                learning_usage,
                 &snapshots_by_id,
                 &children_by_parent,
                 agent_sessions,
@@ -24193,6 +24389,8 @@ fn task_token_usage_rollups_from_snapshots(
 
 fn task_token_usage_rollup_for_root(
     root_id: &AgentId,
+    resets: &[protocol::TaskUsageReset],
+    learning_usage: &Result<Vec<protocol::LearningUsage>, String>,
     snapshots_by_id: &HashMap<AgentId, AgentUsageSnapshot>,
     children_by_parent: &HashMap<AgentId, Vec<AgentId>>,
     agent_sessions: &HashMap<AgentId, SessionId>,
@@ -24210,12 +24408,131 @@ fn task_token_usage_rollup_for_root(
         &mut ordered,
     );
 
+    let member_agent_ids = ordered.iter().map(|entry| entry.agent_id.clone()).collect();
+    let reset = resets.iter().rev().find(|reset| {
+        Some(&reset.root_session_id) == agent_session_id(&root.start, agent_sessions).as_ref()
+    });
+    let helper_usage = match learning_usage {
+        Ok(usage) => usage
+            .iter()
+            .filter(|usage| {
+                reset.is_none_or(|reset| !reset.helper_batches.contains(&usage.batch_id))
+                    && ordered.iter().any(|entry| {
+                        usage.origin_agent_ids.contains(&entry.agent_id)
+                            || entry
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|session| usage.origin_session_ids.contains(session))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+        Err(reason) => {
+            tracing::error!(reason = %reason, "Analyzer accounting unavailable; task coverage is incomplete");
+            Vec::new()
+        }
+    };
+    if let Some(reset) = reset {
+        ordered.retain_mut(|entry| {
+            let Some(cutoff) = reset.cutoffs.iter().find(|cutoff| {
+                cutoff.agent_id == entry.agent_id
+                    || cutoff
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|session| entry.session_id.as_ref() == Some(session))
+            }) else {
+                return true;
+            };
+            let snapshot = &snapshots_by_id[&entry.agent_id];
+            if snapshot.observation == protocol::TaskUsageObservation::Unobserved
+                && !snapshot.accounting.observed
+            {
+                return true;
+            }
+
+            let sources = snapshot
+                .accounting
+                .entries
+                .iter()
+                .filter(|(_, generation, _)| *generation > cutoff.generation)
+                .map(|(source, _, usage)| {
+                    if matches!(source, protocol::TaskUsageSource::EventSeq(_)) || matches!(source, protocol::TaskUsageSource::ModelRequest(request) if snapshot.accounting.unattributed_turns.contains(&request.turn_id)) {
+                        TaskTokenUsageScope::Unavailable { reason: TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous }
+                    } else {
+                        usage.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let contributing = snapshot.accounting.generation > cutoff.generation;
+            entry.usage = if sources.is_empty() && !contributing {
+                TaskTokenUsageScope::Known {
+                    usage: Box::new(TaskTokenUsageAmount::zero()),
+                }
+            } else if sources.is_empty() {
+                TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+                }
+            } else {
+                let aggregate = aggregate_task_token_usage(sources.iter());
+                match aggregate.status {
+                    TaskTokenUsageStatus::Known => TaskTokenUsageScope::Known {
+                        usage: Box::new(aggregate.usage),
+                    },
+                    TaskTokenUsageStatus::Partial {
+                        unavailable_count,
+                        reasons,
+                    } => TaskTokenUsageScope::Partial {
+                        usage: Box::new(aggregate.usage),
+                        unavailable_count,
+                        reasons,
+                    },
+                    TaskTokenUsageStatus::Unavailable { reasons, .. } => {
+                        TaskTokenUsageScope::Unavailable { reason: reasons[0] }
+                    }
+                }
+            };
+            if contributing {
+                let reasons = match &snapshot.usage {
+                    TaskTokenUsageScope::Partial { reasons, .. } => reasons.clone(),
+                    TaskTokenUsageScope::Unavailable { reason } => vec![*reason],
+                    TaskTokenUsageScope::Known { .. } => Vec::new(),
+                };
+                for reason in reasons.into_iter().filter(|reason| {
+                    matches!(
+                        reason,
+                        TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete
+                            | TaskTokenUsageUnavailableReason::ObservationInterrupted
+                            | TaskTokenUsageUnavailableReason::SharedSessionAccounting
+                            | TaskTokenUsageUnavailableReason::AgentUnavailable
+                    )
+                }) {
+                    entry.usage = if reason == TaskTokenUsageUnavailableReason::SharedSessionAccounting {
+                        TaskTokenUsageScope::Unavailable { reason }
+                    } else {
+                        entry.usage.clone().with_incomplete_reason(reason)
+                    };
+                }
+            }
+            entry.agent_id == *root_id || contributing
+        });
+    }
+
     let descendant_count = ordered.len().saturating_sub(1).min(u32::MAX as usize) as u32;
-    let total = aggregate_task_token_usage(ordered.iter().map(|entry| &entry.usage));
+    let helper_error = TaskTokenUsageScope::Unavailable {
+        reason: TaskTokenUsageUnavailableReason::HelperAccountingUnavailable,
+    };
+    let total = aggregate_task_token_usage(
+        ordered
+            .iter()
+            .map(|entry| &entry.usage)
+            .chain(helper_usage.iter().map(|usage| &usage.usage))
+            .chain(learning_usage.is_err().then_some(&helper_error)),
+    );
     let descendant_usage =
         aggregate_task_token_usage(ordered.iter().skip(1).map(|entry| &entry.usage));
     Some(TaskTokenUsagePayload {
-        helper_usage: Vec::new(),
+        member_agent_ids,
+        helper_usage: helper_usage.clone(),
         root_agent_id: root.start.agent_id.clone(),
         root_session_id: agent_session_id(&root.start, agent_sessions),
         total,
@@ -24226,7 +24543,7 @@ fn task_token_usage_rollup_for_root(
         ),
         descendant_usage,
         descendant_count,
-        backends: task_backend_rollups(&ordered, &[]),
+        backends: task_backend_rollups(&ordered, &helper_usage),
         timing: task_timing_rollup(&ordered, snapshots_by_id),
         breakdown: ordered,
     })
@@ -27203,61 +27520,5 @@ fn spawn_learning_projection(
                     Err(_) => tracing::error!("Cannot start learning projection runtime"),
                 }
             });
-    }
-}
-
-fn attach_learning_usage(
-    payloads: &mut [TaskTokenUsagePayload],
-    usage: &[protocol::LearningUsage],
-) {
-    for payload in payloads {
-        payload.helper_usage = usage
-            .iter()
-            .filter(|usage| {
-                usage
-                    .origin_agent_ids
-                    .iter()
-                    .any(|id| payload.breakdown.iter().any(|entry| &entry.agent_id == id))
-                    || usage.origin_session_ids.iter().any(|id| {
-                        payload
-                            .breakdown
-                            .iter()
-                            .any(|entry| entry.session_id.as_ref() == Some(id))
-                    })
-            })
-            .cloned()
-            .collect();
-        payload.total = aggregate_task_token_usage(
-            payload
-                .breakdown
-                .iter()
-                .map(|entry| &entry.usage)
-                .chain(payload.helper_usage.iter().map(|usage| &usage.usage)),
-        );
-        payload.backends = task_backend_rollups(&payload.breakdown, &payload.helper_usage);
-    }
-}
-
-fn attach_learning_accounting(
-    payloads: &mut [TaskTokenUsagePayload],
-    result: Result<Vec<protocol::LearningUsage>, String>,
-) {
-    match result {
-        Ok(usage) => attach_learning_usage(payloads, &usage),
-        Err(reason) => {
-            tracing::error!(reason = %reason, "Analyzer accounting unavailable; publishing explicitly incomplete totals");
-            for payload in payloads {
-                let unknown = TaskTokenUsageScope::Unavailable {
-                    reason: TaskTokenUsageUnavailableReason::HelperAccountingUnavailable,
-                };
-                payload.total = aggregate_task_token_usage(
-                    payload
-                        .breakdown
-                        .iter()
-                        .map(|entry| &entry.usage)
-                        .chain(std::iter::once(&unknown)),
-                );
-            }
-        }
     }
 }

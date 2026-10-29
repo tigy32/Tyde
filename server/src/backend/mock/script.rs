@@ -685,6 +685,15 @@ impl MockTurn {
         ))
     }
 
+    pub fn with_gate_before_usage(mut self, gate: &MockGateHandle) -> Self {
+        let MockTurnBody::Steps(steps) = &mut self.body else {
+            panic!("usage gate requires a scripted turn");
+        };
+        let position = steps.iter().position(|step| matches!(step, MockStep::Emit(event) if matches!(&**event, BackendEvent::Chat(protocol::ChatEvent::MessageMetadataUpdated(_))))).expect("late usage metadata");
+        steps.insert(position, MockStep::Gate(gate.gate()));
+        self
+    }
+
     pub fn text_with_context_250k(text: impl Into<String>) -> Self {
         Self::done(text_steps(
             text.into(),
@@ -1134,6 +1143,13 @@ impl MockTurn {
         ];
         steps.extend(text_steps(text.into(), TextShape::default()));
         Self::done(steps)
+    }
+
+    pub fn cancelled_before_typing(message: impl Into<String>) -> Self {
+        Self::done(vec![
+            MockStep::emit(emit::cancelled(message.into())),
+            MockStep::emit(emit::typing(false)),
+        ])
     }
 
     pub fn cancelled(message: impl Into<String>) -> Self {

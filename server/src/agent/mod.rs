@@ -9,18 +9,18 @@ use protocol::{
     AgentActivity, AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary,
     AgentBootstrapEvent, AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput,
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
-    CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
-    CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
+    AgentStartPayload, BackendKind, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
+    CompactionMutation, CompactionObservationId, CompactionOperationId, CompactionStage,
+    CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
-    MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
-    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SUPERVISOR_MESSAGE_PREFIX,
-    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues,
-    SessionSummaryCountUpdatedPayload, SpawnCostHint, StreamStartData, StreamTextDeltaData,
-    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
-    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
+    MessageSender, MessageTokenUsage, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
+    QueuedMessagesPayload, ReviewErrorContext, SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload,
+    SessionId, SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
+    SpawnCostHint, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
+    ToolRequestType,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -105,6 +105,7 @@ struct AgentEventLog {
     timing: timing::TimingTracker,
     own_usage: Option<(TaskTokenUsageScope, Option<String>)>,
     native_usage: Option<ModelRequestTokenUsage>,
+    accounting: protocol::TaskUsageAccounting,
     parent_session_id: Option<SessionId>,
     entries: Vec<Envelope>,
     message_starts: Vec<usize>,
@@ -968,6 +969,7 @@ pub(crate) struct AgentHandle {
     diagnostics: ActorDiagnostics,
     actor_status: registry::AgentStatusHandle,
     startup_completion: watch::Receiver<Option<Result<SessionId, StartupFailure>>>,
+    initial_usage_generation: u64,
     #[cfg(feature = "test-support")]
     resume_readiness_test_gate: Option<ResumeReadinessTestGate>,
     tx: mpsc::UnboundedSender<AgentCommand>,
@@ -1163,13 +1165,7 @@ fn detach_agent_project(
     current_start.clone()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TokenUsageSource {
-    Message(ChatMessageId),
-    EventSeq(u64),
-    ModelRequest(ModelRequestId),
-    Generation(u64),
-}
+use protocol::TaskUsageSource as TokenUsageSource;
 
 use crate::backend::TokenUsageTrackingMode;
 
@@ -1197,6 +1193,9 @@ struct AgentActivityStatsTracker {
     message_generations: HashMap<TokenUsageSource, (u64, u64)>,
     latest_turn_source: HashMap<u64, u64>,
     generation: u64,
+    native_turn_generations: HashMap<protocol::ModelTurnId, u64>,
+    unattributed_native_turns: HashSet<protocol::ModelTurnId>,
+    historical_native_ownership_incomplete: bool,
     typing: bool,
     active_reasoning: String,
     latest_model: Option<String>,
@@ -1217,6 +1216,66 @@ impl AgentActivityStatsTracker {
 
     fn snapshot(&self) -> AgentActivityStats {
         self.stats.clone()
+    }
+
+    fn accounting_snapshot(&self) -> protocol::TaskUsageAccounting {
+        let mut accounting = protocol::TaskUsageAccounting {
+            historical_native_ownership_incomplete: self.historical_native_ownership_incomplete,
+            unattributed_turns: self.unattributed_native_turns.iter().cloned().collect(),
+            observed: true,
+            pending_submission: false,
+            generation: self.generation,
+            entries: self
+                .token_usage_by_source
+                .iter()
+                .map(|(source, usage)| {
+                    let generation = match source {
+                        TokenUsageSource::Generation(generation) => *generation,
+                        TokenUsageSource::ModelRequest(request) => {
+                            self.native_turn_generations[&request.turn_id]
+                        }
+                        _ => self.message_generations[source].0,
+                    };
+                    (source.clone(), generation, usage.clone())
+                })
+                .collect(),
+            messages: self
+                .message_generations
+                .iter()
+                .map(|(source, (generation, position))| (source.clone(), *generation, *position))
+                .collect(),
+            turns: self
+                .native_turn_generations
+                .iter()
+                .map(|(turn, generation)| (turn.clone(), *generation))
+                .collect(),
+        };
+        complete_accounting_coverage(&mut accounting);
+        accounting
+    }
+
+    fn restore_accounting(&mut self, accounting: protocol::TaskUsageAccounting) {
+        self.historical_native_ownership_incomplete |=
+            accounting.historical_native_ownership_incomplete;
+        self.generation = self.generation.max(accounting.generation);
+        self.message_generations.extend(
+            accounting
+                .messages
+                .into_iter()
+                .map(|(source, generation, position)| (source, (generation, position))),
+        );
+        self.native_turn_generations.extend(accounting.turns);
+        self.unattributed_native_turns
+            .extend(accounting.unattributed_turns);
+        if self.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+            self.token_usage_by_source.extend(
+                accounting
+                    .entries
+                    .into_iter()
+                    .filter(|(source, _, _)| !matches!(source, TokenUsageSource::Generation(_)))
+                    .map(|(source, _, usage)| (source, usage)),
+            );
+        }
     }
 
     fn task_usage_amount(&self, reported_usage: &TokenUsage) -> TaskTokenUsageAmount {
@@ -1387,16 +1446,13 @@ impl AgentActivityStatsTracker {
                     self.stats.source_through_seq = Some(source_seq);
                 }
             }
-            ChatEvent::TypingStatusChanged(typing)
-                if self.token_usage_tracking_mode == TokenUsageTrackingMode::Messages =>
-            {
+            ChatEvent::TypingStatusChanged(typing) => {
                 if *typing && !self.typing {
                     self.generation = self.generation.saturating_add(1);
                 }
                 self.typing = *typing;
             }
-            ChatEvent::TypingStatusChanged(_)
-            | ChatEvent::ToolProgress(_)
+            ChatEvent::ToolProgress(_)
             | ChatEvent::ToolExecutionCompleted(_)
             | ChatEvent::GoalCapabilities(_)
             | ChatEvent::GoalChanged(_)
@@ -1430,6 +1486,30 @@ impl AgentActivityStatsTracker {
         source_seq: u64,
     ) -> bool {
         let previous = self.stats.clone();
+        if !self
+            .native_turn_generations
+            .contains_key(&usage.request_id.turn_id)
+        {
+            let reported = self
+                .native_turn_generations
+                .iter()
+                .filter(|(turn, _)| !self.unattributed_native_turns.contains(*turn))
+                .map(|(_, generation)| *generation)
+                .collect::<HashSet<_>>();
+            let ambiguous = self.historical_native_ownership_incomplete
+                || (1..self.generation).any(|generation| !reported.contains(&generation));
+            if ambiguous {
+                self.unattributed_native_turns
+                    .insert(usage.request_id.turn_id.clone());
+            }
+            tracing::debug!(
+                ambiguous,
+                admission_generation = self.generation,
+                "Observed native accounting ownership"
+            );
+            self.native_turn_generations
+                .insert(usage.request_id.turn_id.clone(), self.generation);
+        }
         let mut recorded = false;
 
         // Token accounting belongs to whichever mode the backend reports in. A
@@ -1661,6 +1741,25 @@ impl AgentActivityStatsTracker {
                 .values()
                 .chain(self.provisional_request_usage_by_source.values()),
         );
+    }
+}
+
+fn complete_accounting_coverage(accounting: &mut protocol::TaskUsageAccounting) {
+    let reported = accounting
+        .entries
+        .iter()
+        .map(|(_, generation, _)| *generation)
+        .collect::<HashSet<_>>();
+    for generation in 1..=accounting.generation {
+        if !reported.contains(&generation) {
+            accounting.entries.push((
+                TokenUsageSource::Generation(generation),
+                generation,
+                TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
+                },
+            ));
+        }
     }
 }
 
@@ -2451,6 +2550,12 @@ impl AgentHandle {
         };
         if let Some(reason) = unavailable {
             return Some(AgentUsageSnapshot {
+                accounting: protocol::TaskUsageAccounting {
+                    observed: reason == TaskTokenUsageUnavailableReason::AgentStarting
+                        && self.initial_usage_generation > 0,
+                    generation: self.initial_usage_generation,
+                    ..Default::default()
+                },
                 observation: protocol::TaskUsageObservation::Unobserved,
                 native_usage: None,
                 navigation: protocol::TaskUsageNavigation::LiveAgent,
@@ -3824,6 +3929,7 @@ pub(crate) fn spawn_agent_actor(
         .remove(&start.name);
     #[cfg(feature = "test-support")]
     let actor_resume_readiness_test_gate = resume_readiness_test_gate.clone();
+    let initial_usage_generation = u64::from(request.resume_session_id.is_none());
     let actor = async move {
         let ResolvedSpawnRequest {
             parent_session_id,
@@ -3903,6 +4009,9 @@ pub(crate) fn spawn_agent_actor(
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(backend_kind);
+        activity_stats.generation = initial_usage_generation;
+        event_log.accounting = activity_stats.accounting_snapshot();
+        event_log.accounting.pending_submission = initial_usage_generation > 0;
         event_log.own_usage = Some(activity_stats.usage_snapshot());
         let mut activity_event_seq = 0_u64;
         let mut current_session_id = resume_session_id.clone();
@@ -4046,13 +4155,21 @@ pub(crate) fn spawn_agent_actor(
                                 record.accounting_history_incomplete,
                                 record.task_accounting_source,
                                 record.accounting_session_shared,
+                                record.task_usage_accounting,
                             )
                         })
                         .ok_or_else(|| "Task accounting session is missing".to_owned())
                 })
                 .await
             {
-                Ok((incomplete, source, shared)) => {
+                Ok((incomplete, source, shared, accounting)) => {
+                    if let Some(accounting) = accounting {
+                        activity_stats.message_generations.extend(
+                            accounting.messages.into_iter().map(
+                                |(source, generation, position)| (source, (generation, position)),
+                            ),
+                        );
+                    }
                     activity_stats.accounting_session_shared |= shared;
                     activity_stats.accounting_restore_incomplete |= incomplete;
                     resume_uses_authoritative_transcript |= source
@@ -4134,6 +4251,33 @@ pub(crate) fn spawn_agent_actor(
                         agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal, fatal: false,
                         message: "Stored task accounting could not be loaded; usage coverage is unavailable.".to_owned(),
                     });
+                }
+            }
+        }
+        if let Some(session) = resume_session_id.as_ref() {
+            let id = session.clone();
+            match session_store.read(move |store| store.get_result(&id)).await {
+                Ok(Some(record)) => {
+                    activity_stats.generation = activity_stats
+                        .generation
+                        .max(record.task_usage_generation_floor);
+                    if let Some(accounting) = record.task_usage_accounting {
+                        activity_stats.restore_accounting(accounting);
+                    } else if activity_stats.token_usage_tracking_mode
+                        == TokenUsageTrackingMode::ModelRequests
+                    {
+                        activity_stats.historical_native_ownership_incomplete = true;
+                    }
+                    event_log.accounting = activity_stats.accounting_snapshot();
+                }
+                Ok(None) => {
+                    early_accounting_error =
+                        Some("Saved request accounting session is missing".to_owned());
+                    event_log.accounting_storage_failed = true;
+                }
+                Err(error) => {
+                    early_accounting_error = Some(error);
+                    event_log.accounting_storage_failed = true;
                 }
             }
         }
@@ -7815,9 +7959,9 @@ pub(crate) fn spawn_agent_actor(
                         let outcome = backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
-                            .send_with_outcome(AgentInput::SendMessage(
+                            .submit_with_accounting(AgentInput::SendMessage(
                                 queued.clone().into_send_payload(),
-                            ))
+                            ), &mut event_log.accounting)
                             .await;
                         match outcome {
                             SendOutcome::Busy(_) => {
@@ -8219,7 +8363,7 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                             match backend
-                                .send_with_outcome(AgentInput::SendMessage(payload.clone()))
+                                .submit_with_accounting(AgentInput::SendMessage(payload.clone()), &mut event_log.accounting)
                                 .await
                             {
                                 SendOutcome::Accepted => {
@@ -8786,7 +8930,7 @@ pub(crate) fn spawn_agent_actor(
                                             .as_ref()
                                             .expect("backend must exist while actor is running");
                                         let outcome = backend_ref
-                                            .send_with_outcome(AgentInput::SendMessage(msg))
+                                            .submit_with_accounting(AgentInput::SendMessage(msg), &mut event_log.accounting)
                                             .await;
                                         if let SendOutcome::Busy(input) = outcome {
                                             if redirect == RunningTurnRedirect::Interrupt && !control_redirect {
@@ -9495,9 +9639,9 @@ pub(crate) fn spawn_agent_actor(
                                     let outcome = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
-                                        .send_with_outcome(AgentInput::SendMessage(
+                                        .submit_with_accounting(AgentInput::SendMessage(
                                             queued.clone().into_send_payload(),
-                                        ))
+                                        ), &mut event_log.accounting)
                                         .await;
                                     match outcome {
                                         SendOutcome::Busy(_) => {
@@ -9632,7 +9776,7 @@ pub(crate) fn spawn_agent_actor(
                                     {
                                         Some(error)
                                     } else {
-                                        match backend.as_ref().expect("running actor has backend").send_with_outcome(AgentInput::GoalControl(control)).await {
+                                        match backend.as_ref().expect("running actor has backend").submit_with_accounting(AgentInput::GoalControl(control), &mut event_log.accounting).await {
                                             SendOutcome::Accepted => None,
                                             SendOutcome::Busy(_) => Some("Native goal control could not be delivered while busy".to_owned()),
                                             SendOutcome::Closed => Some("Backend closed before accepting native goal control".to_owned()),
@@ -10672,9 +10816,9 @@ pub(crate) fn spawn_agent_actor(
                             let outcome = backend
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
-                                .send_with_outcome(AgentInput::SendMessage(
+                                .submit_with_accounting(AgentInput::SendMessage(
                                     internal_compaction_input(summary_prompt),
-                                ))
+                                ), &mut event_log.accounting)
                                 .await;
                             if !matches!(outcome, SendOutcome::Accepted) {
                                 let backend_busy = matches!(outcome, SendOutcome::Busy(_));
@@ -10757,9 +10901,9 @@ pub(crate) fn spawn_agent_actor(
                             let outcome = backend
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
-                                .send_with_outcome(AgentInput::SendMessage(
+                                .submit_with_accounting(AgentInput::SendMessage(
                                     internal_compaction_input(summary_prompt),
-                                ))
+                                ), &mut event_log.accounting)
                                 .await;
                             if !matches!(outcome, SendOutcome::Accepted) {
                                 // A compaction prompt is not a user message: on a
@@ -11447,6 +11591,7 @@ pub(crate) fn spawn_agent_actor(
             diagnostics,
             actor_status,
             startup_completion,
+            initial_usage_generation,
             #[cfg(feature = "test-support")]
             resume_readiness_test_gate,
             tx,
@@ -11565,6 +11710,9 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
+        activity_stats.generation = 1;
+        event_log.accounting = activity_stats.accounting_snapshot();
+        event_log.accounting.pending_submission = true;
         event_log.own_usage = Some(activity_stats.usage_snapshot());
         let mut activity_event_seq = 0_u64;
         let mut current_start = start;
@@ -12315,6 +12463,7 @@ pub(crate) fn spawn_relay_agent_actor(
         diagnostics,
         actor_status,
         startup_completion,
+        initial_usage_generation: 1,
         #[cfg(feature = "test-support")]
         resume_readiness_test_gate: None,
         tx,
@@ -15318,9 +15467,11 @@ async fn persist_model_request_checkpoint(
     subscribers: &mut Vec<Stream>,
 ) {
     event_log.native_usage = Some(usage.clone());
+    let accounting = event_log.accounting.clone();
     if let Err(error) = store
         .update(session, move |record| {
-            record.model_request_usage = Some(usage)
+            record.model_request_usage = Some(usage);
+            record.task_usage_accounting = Some(accounting);
         })
         .await
     {
@@ -15430,9 +15581,22 @@ fn observe_actor_chat(
             | ChatEvent::StreamStart(_)
             | ChatEvent::TypingStatusChanged(_)
     );
+    tracker.generation = tracker.generation.max(event_log.accounting.generation);
+    if matches!(event, ChatEvent::TypingStatusChanged(true))
+        && event_log.accounting.pending_submission
+    {
+        tracker.typing = true;
+        event_log.accounting.pending_submission = false;
+    }
+    if matches!(event, ChatEvent::TypingStatusChanged(false)) {
+        event_log.accounting.pending_submission = false;
+    }
     let changed = tracker.observe_chat_event(event, source_seq, text);
     if accounting {
         event_log.own_usage = Some(tracker.usage_snapshot());
+        let pending_submission = event_log.accounting.pending_submission;
+        event_log.accounting = tracker.accounting_snapshot();
+        event_log.accounting.pending_submission = pending_submission;
     }
     changed
 }
@@ -15442,8 +15606,12 @@ fn observe_actor_accounting(
     event_log: &mut AgentEventLog,
     observe: impl FnOnce(&mut AgentActivityStatsTracker) -> bool,
 ) -> bool {
+    tracker.generation = tracker.generation.max(event_log.accounting.generation);
     let changed = observe(tracker);
     event_log.own_usage = Some(tracker.usage_snapshot());
+    let pending_submission = event_log.accounting.pending_submission;
+    event_log.accounting = tracker.accounting_snapshot();
+    event_log.accounting.pending_submission = pending_submission;
     changed
 }
 
@@ -15633,7 +15801,10 @@ async fn send_initial_follow_up_or_park(
         .backend
         .as_ref()
         .expect("backend must exist after successful startup")
-        .send_with_outcome(AgentInput::SendMessage(input))
+        .submit_with_accounting(
+            AgentInput::SendMessage(input),
+            &mut context.event_log.accounting,
+        )
         .await
     {
         SendOutcome::Accepted => {
@@ -16391,6 +16562,12 @@ fn agent_usage_snapshot_from_tracker(
         }
     );
     AgentUsageSnapshot {
+        accounting: {
+            let mut accounting = tracker.accounting_snapshot();
+            accounting.generation = accounting.generation.max(event_log.accounting.generation);
+            complete_accounting_coverage(&mut accounting);
+            accounting
+        },
         observation: protocol::TaskUsageObservation::Live,
         native_usage: event_log.native_usage.clone(),
         timing: if shared {
@@ -16429,6 +16606,7 @@ fn agent_usage_snapshot_from_log(
         }
     );
     AgentUsageSnapshot {
+        accounting: event_log.accounting.clone(),
         observation: protocol::TaskUsageObservation::Live,
         native_usage: event_log.native_usage.clone(),
         timing: if shared {
@@ -16983,7 +17161,10 @@ async fn dispatch_queued_message(
     *context.idle_transition_armed = false;
     match context
         .backend
-        .send_with_outcome(AgentInput::SendMessage(queued.clone().into_send_payload()))
+        .submit_with_accounting(
+            AgentInput::SendMessage(queued.clone().into_send_payload()),
+            &mut context.event_log.accounting,
+        )
         .await
     {
         SendOutcome::Accepted => {

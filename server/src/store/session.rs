@@ -151,6 +151,10 @@ pub(crate) enum TaskAccountingSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     #[serde(default)]
+    pub task_usage_generation_floor: u64,
+    #[serde(default)]
+    pub task_usage_accounting: Option<protocol::TaskUsageAccounting>,
+    #[serde(default)]
     pub(crate) task_accounting_source: Option<TaskAccountingSource>,
     #[serde(default)]
     pub task_timing: protocol::AgentTimingTrace,
@@ -293,6 +297,7 @@ impl SessionStore {
         transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS startup_reservations (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS task_usage_resets (id INTEGER PRIMARY KEY, record TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS task_usage_archive (agent_id TEXT PRIMARY KEY NOT NULL, session_id TEXT UNIQUE, record TEXT NOT NULL);",
             )
             .map_err(sql_error)?;
@@ -395,6 +400,8 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    task_usage_generation_floor: 0,
+                    task_usage_accounting: None,
                     task_accounting_source: None,
                     task_timing: Default::default(),
                     accounting_history_incomplete: false,
@@ -687,6 +694,119 @@ impl SessionStore {
         })
     }
 
+    pub(crate) fn task_usage_resets(&self) -> Result<Vec<protocol::TaskUsageReset>, String> {
+        let connection = self.reader()?;
+        let mut query = connection
+            .prepare("SELECT id, record FROM task_usage_resets ORDER BY id")
+            .map_err(sql_error)?;
+        query
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?
+            .map(|row| {
+                let (revision, json) = row.map_err(sql_error)?;
+                let mut reset: protocol::TaskUsageReset = serde_json::from_str(&json)
+                    .map_err(|error| format!("Cannot decode usage reset: {error}"))?;
+                reset.revision = revision
+                    .try_into()
+                    .map_err(|_| "Usage reset revision is invalid".to_owned())?;
+                Ok(reset)
+            })
+            .collect()
+    }
+
+    pub(crate) fn save_task_usage_reset(
+        &self,
+        mut reset: protocol::TaskUsageReset,
+    ) -> Result<protocol::TaskUsageReset, String> {
+        self.reservation_transaction(move |transaction| {
+            // Actor snapshots can arrive out of order; committed exclusions never move backwards.
+            let mut query = transaction
+                .prepare("SELECT record FROM task_usage_resets ORDER BY id DESC")
+                .map_err(sql_error)?;
+            let records = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?;
+            for record in records {
+                let previous: protocol::TaskUsageReset =
+                    serde_json::from_str(&record.map_err(sql_error)?)
+                        .map_err(|error| format!("Cannot decode usage reset: {error}"))?;
+                if previous.root_session_id != reset.root_session_id {
+                    continue;
+                }
+                for prior in previous.cutoffs {
+                    if let Some(cutoff) = reset.cutoffs.iter_mut().find(|cutoff| {
+                        cutoff.agent_id == prior.agent_id
+                            || cutoff
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|session| prior.session_id.as_ref() == Some(session))
+                    }) {
+                        cutoff.generation = cutoff.generation.max(prior.generation);
+                        if cutoff.session_id.is_none() {
+                            cutoff.session_id = prior.session_id;
+                        }
+                    } else {
+                        reset.cutoffs.push(prior);
+                    }
+                }
+                for batch in previous.helper_batches {
+                    if !reset.helper_batches.contains(&batch) {
+                        reset.helper_batches.push(batch);
+                    }
+                }
+                break;
+            }
+            for cutoff in &mut reset.cutoffs {
+                if cutoff.session_id.is_none() {
+                    let archived = transaction
+                        .query_row(
+                            "SELECT record FROM task_usage_archive WHERE agent_id=?1",
+                            [&cutoff.agent_id.0],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(sql_error)?;
+                    if let Some(json) = archived {
+                        let snapshot: protocol::TaskAgentUsageSnapshot =
+                            serde_json::from_str(&json).map_err(|error| {
+                                format!("Cannot decode task accounting archive: {error}")
+                            })?;
+                        cutoff.session_id = snapshot.start.session_id;
+                    }
+                }
+                if let Some(session) = &cutoff.session_id {
+                    let original = read_raw_records(transaction, &[session])?;
+                    let mut records = decode_records(&original)?;
+                    if let Some(record) = records.get_mut(&session.0) {
+                        record.task_usage_generation_floor =
+                            record.task_usage_generation_floor.max(cutoff.generation);
+                    }
+                    write_records(transaction, &original, records)?;
+                }
+            }
+            let json = serde_json::to_string(&reset)
+                .map_err(|error| format!("Cannot encode usage reset: {error}"))?;
+            transaction
+                .execute("INSERT INTO task_usage_resets(record) VALUES (?1)", [json])
+                .map_err(sql_error)?;
+            reset.revision = transaction
+                .last_insert_rowid()
+                .try_into()
+                .map_err(|_| "Usage reset revision is invalid".to_owned())?;
+            let json = serde_json::to_string(&reset)
+                .map_err(|error| format!("Cannot encode usage reset: {error}"))?;
+            transaction
+                .execute(
+                    "UPDATE task_usage_resets SET record=?1 WHERE id=?2",
+                    params![json, transaction.last_insert_rowid()],
+                )
+                .map_err(sql_error)?;
+            Ok((reset, true))
+        })
+    }
+
     pub(crate) fn task_usage_snapshots(
         &self,
     ) -> Result<Vec<protocol::TaskAgentUsageSnapshot>, String> {
@@ -752,6 +872,24 @@ impl SessionStore {
     ) -> Result<(), String> {
         self.reservation_transaction(move |transaction| {
             if let Some(session) = snapshot.start.session_id.as_ref() {
+                let mut query = transaction.prepare("SELECT id, record FROM task_usage_resets ORDER BY id").map_err(sql_error)?;
+                let resets = query.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(sql_error)?.collect::<Result<Vec<_>, _>>().map_err(sql_error)?;
+                let mut generation_floor = 0;
+                for (id, json) in resets {
+                    let mut reset: protocol::TaskUsageReset = serde_json::from_str(&json).map_err(|error| format!("Cannot decode usage reset: {error}"))?;
+                    let mut changed = false;
+                    for cutoff in &mut reset.cutoffs {
+                        if cutoff.agent_id == snapshot.start.agent_id && cutoff.session_id.is_none() {
+                            cutoff.session_id = Some(session.clone());
+                            generation_floor = generation_floor.max(cutoff.generation);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let json = serde_json::to_string(&reset).map_err(|error| format!("Cannot encode usage reset: {error}"))?;
+                        transaction.execute("UPDATE task_usage_resets SET record=?1 WHERE id=?2", params![json, id]).map_err(sql_error)?;
+                    }
+                }
                 let original = read_raw_records(transaction, &[session])?;
                 let mut records = decode_records(&original)?;
                 if let Some(record) = records.get_mut(&session.0) {
@@ -760,6 +898,8 @@ impl SessionStore {
                         snapshot.usage = protocol::TaskTokenUsageScope::Unavailable { reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting };
                         snapshot.timing = Default::default();
                     }
+                    record.task_usage_generation_floor = record.task_usage_generation_floor.max(generation_floor);
+                    record.task_usage_accounting = Some(snapshot.accounting.clone());
                     record.task_timing = snapshot.timing.clone();
                     if let Some(usage) = snapshot.native_usage.as_ref() { record.model_request_usage = Some(usage.clone()); }
                     record.accounting_history_incomplete |= match &snapshot.usage {

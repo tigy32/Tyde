@@ -804,6 +804,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SetAgentName
         | FrameKind::SetAgentTydePermissions
         | FrameKind::AgentCompact
+        | FrameKind::ResetTaskUsage
         | FrameKind::Interrupt
         | FrameKind::CloseAgent
         | FrameKind::BackendSetupRefresh

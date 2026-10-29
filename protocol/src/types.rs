@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 93;
+pub const PROTOCOL_VERSION: u32 = 94;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1044,6 +1044,7 @@ pub enum FrameKind {
     SetAgentName,
     SetAgentTydePermissions,
     AgentCompact,
+    ResetTaskUsage,
     Interrupt,
     CloseAgent,
     BackendSetupRefresh,
@@ -1274,6 +1275,7 @@ impl fmt::Display for FrameKind {
             Self::SetAgentName => f.write_str("set_agent_name"),
             Self::SetAgentTydePermissions => f.write_str("set_agent_tyde_permissions"),
             Self::AgentCompact => f.write_str("agent_compact"),
+            Self::ResetTaskUsage => f.write_str("reset_task_usage"),
             Self::Interrupt => f.write_str("interrupt"),
             Self::CloseAgent => f.write_str("close_agent"),
             Self::BackendSetupRefresh => f.write_str("backend_setup_refresh"),
@@ -4746,6 +4748,7 @@ pub struct AgentActivityStatsPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTokenUsagePayload {
+    pub member_agent_ids: Vec<AgentId>,
     #[serde(default)]
     pub helper_usage: Vec<crate::LearningUsage>,
     pub root_agent_id: AgentId,
@@ -4781,6 +4784,8 @@ pub enum TaskUsageObservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAgentUsageSnapshot {
     #[serde(default)]
+    pub accounting: TaskUsageAccounting,
+    #[serde(default)]
     pub observation: TaskUsageObservation,
     #[serde(default)]
     pub native_usage: Option<ModelRequestTokenUsage>,
@@ -4791,6 +4796,49 @@ pub struct TaskAgentUsageSnapshot {
     pub parent_session_id: Option<SessionId>,
     pub timing: AgentTimingTrace,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TaskUsageSource {
+    Message(ChatMessageId),
+    EventSeq(u64),
+    ModelRequest(ModelRequestId),
+    Generation(u64),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskUsageAccounting {
+    #[serde(default)]
+    pub historical_native_ownership_incomplete: bool,
+    #[serde(default)]
+    pub unattributed_turns: Vec<ModelTurnId>,
+    #[serde(default)]
+    pub observed: bool,
+    #[serde(default)]
+    pub pending_submission: bool,
+    pub generation: u64,
+    pub entries: Vec<(TaskUsageSource, u64, TaskTokenUsageScope)>,
+    pub messages: Vec<(TaskUsageSource, u64, u64)>,
+    pub turns: Vec<(ModelTurnId, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskUsageResetCutoff {
+    pub agent_id: AgentId,
+    pub session_id: Option<SessionId>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskUsageReset {
+    #[serde(default)]
+    pub revision: u64,
+    pub helper_batches: Vec<crate::LearningChangeId>,
+    pub root_session_id: SessionId,
+    pub cutoffs: Vec<TaskUsageResetCutoff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetTaskUsagePayload {}
 
 /// Rollups are backend-scoped, never allocations to the latest selected model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

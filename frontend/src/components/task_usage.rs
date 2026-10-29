@@ -148,8 +148,20 @@ pub(super) fn TaskUsagePopup(
             role="dialog" aria-label="Task usage" aria-modal="false">
             <header class="task-usage-heading">
                 <h2 node_ref=heading tabindex="-1">"Task usage"</h2>
-                <span class="task-usage-count" title="Current root agent and retained descendants">{move || rollup.get().map(|payload| format!("{} agent{}", payload.breakdown.len(), if payload.breakdown.len() == 1 { "" } else { "s" }))}</span>
+                <span class="task-usage-count" title="Agents in this usage scope">{move || rollup.get().map(|payload| format!("{} agent{}", payload.breakdown.len(), if payload.breakdown.len() == 1 { "" } else { "s" }))}</span>
                 {move || rollup.get().and_then(|payload| usage_coverage(&payload.total).map(|detail| view! { <UsageInfo label=if matches!(payload.total.status, TaskTokenUsageStatus::Unavailable { .. }) { "Unreported" } else { "Unreported scopes" }.to_owned() detail=detail /> }))}
+                <button class="task-usage-reset" on:click=move |_| {
+                    let Some((host, _)) = binding.get_untracked() else { return; };
+                    let Some(payload) = rollup.get_untracked() else { return; };
+                    let stream = state.get_value().agents.with_untracked(|agents| agents.iter().find(|agent| agent.host_id == host && agent.agent_id == payload.root_agent_id).map(|agent| agent.instance_stream.clone()));
+                    let Some(stream) = stream else {
+                        crate::components::header::report_user_error("Conversation is no longer available".to_owned());
+                        return;
+                    };
+                    leptos::task::spawn_local(async move {
+                        let _ = crate::send::send_frame(&host, stream, protocol::FrameKind::ResetTaskUsage, &protocol::ResetTaskUsagePayload {}).await;
+                    });
+                }>"Reset usage"</button>
                 <Show when=move || !expanded.get()>
                     <button class="task-usage-expand" aria-label="Expand task usage" title="Expand task usage" on:click=move |_| expanded.set(true)>"↗"</button>
                 </Show>
@@ -223,7 +235,7 @@ pub(super) fn TaskUsagePopup(
                             let selected = backend_filter.get(); let text = query.get().to_lowercase(); let flat_view = flat.get();
                             let collapsed_ids = collapsed.get(); let mut hidden_depth = None;
                             let mut shown = 0;
-                            let rows = payload.breakdown.iter().filter_map(|entry| {
+                            let rows = payload.breakdown.iter().enumerate().filter_map(|(index, entry)| {
                                 if !flat_view && selected.is_none() && text.is_empty() {
                                     if hidden_depth.is_some_and(|depth| entry.depth > depth) { return None; }
                                     hidden_depth = collapsed_ids.contains(&entry.agent_id).then_some(entry.depth);
@@ -231,7 +243,7 @@ pub(super) fn TaskUsagePopup(
                                 if selected.is_some_and(|kind| kind != entry.backend_kind) || !entry.name.to_lowercase().contains(&text) { return None; }
                                 shown += 1;
                                 let id = entry.agent_id.clone(); let toggle_id = id.clone(); let collapsed_now = collapsed_ids.contains(&id);
-                                let has_children = payload.breakdown.iter().any(|other| other.parent_agent_id.as_ref() == Some(&id));
+                                let has_children = payload.breakdown.get(index + 1).is_some_and(|next| next.depth > entry.depth);
                                 let detail_id = id.clone();
                                 let can_open = navigation_entry_capable(&entry.navigation);
                                 let host = binding.get().map(|(host, _)| host); let navigation_entry = entry.clone(); let navigation_state = state.get_value();

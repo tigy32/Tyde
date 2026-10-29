@@ -1373,6 +1373,17 @@ impl ProtocolValidator {
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}
             FrameKind::SetSessionSettings => {}
+            FrameKind::ResetTaskUsage => {
+                let _: crate::ResetTaskUsagePayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse ResetTaskUsage payload: {error}"),
+                        )
+                    })?;
+            }
             FrameKind::AgentCompact => {
                 let _: AgentCompactPayload = envelope.parse_payload().map_err(|error| {
                     build_violation(

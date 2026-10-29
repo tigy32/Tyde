@@ -50,6 +50,9 @@ enum Command {
     WorkerStopped {
         scope: SteeringScope,
     },
+    ReadUsageResetCutoff {
+        reply: oneshot::Sender<Result<Vec<LearningChangeId>, String>>,
+    },
     ReadUsage {
         reply: oneshot::Sender<Result<Vec<LearningUsage>, String>>,
     },
@@ -224,6 +227,10 @@ impl ConfigHandle {
     pub(crate) async fn action(&self, action: SelfImprovementAction) -> Result<(), String> {
         self.call(|reply| Command::Action { action, reply }).await
     }
+    pub(crate) async fn usage_reset_cutoff(&self) -> Result<Vec<LearningChangeId>, String> {
+        self.call(|reply| Command::ReadUsageResetCutoff { reply })
+            .await
+    }
     pub(crate) async fn usage(&self) -> Result<Vec<LearningUsage>, String> {
         self.call(|reply| Command::ReadUsage { reply }).await
     }
@@ -325,6 +332,19 @@ impl ConfigActor {
                 }
                 Command::WorkerStopped { scope } => {
                     self.workers.retain(|worker| worker.scope != scope);
+                }
+                Command::ReadUsageResetCutoff { reply } => {
+                    let ids =
+                        self.journal
+                            .usage
+                            .iter()
+                            .map(|usage| usage.batch_id.clone())
+                            .chain(self.journal.jobs.iter().filter_map(|job| {
+                                job.active.as_ref().map(|batch| batch.id.clone())
+                            }))
+                            .collect();
+                    let _ = reply.send(Ok(ids));
+                    continue;
                 }
                 Command::ReadUsage { reply } => {
                     let _ = reply.send(Ok(self.journal.usage.clone()));

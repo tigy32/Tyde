@@ -1203,6 +1203,23 @@ impl Connection {
             .await
     }
 
+    pub async fn reset_task_usage(&mut self, stream: &StreamPath) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("reset_task_usage requires an open agent stream");
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ResetTaskUsage,
+            seq,
+            &protocol::ResetTaskUsagePayload {},
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn compact_agent(
         &mut self,
         stream: &StreamPath,

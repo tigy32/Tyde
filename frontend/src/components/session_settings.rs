@@ -618,30 +618,17 @@ pub(crate) fn session_settings_views(
         })
     };
 
-    // Server rollup for the active agent's whole task (root + sub-agents). This
-    // is the single authoritative token-usage source for the footer; the
-    // frontend never sums chat rows. The rollup is keyed by root agent, so when
-    // the active agent is a root we hit it directly; when it's a selected
-    // sub-agent we fall back to the same-host rollup whose breakdown contains
-    // it, so the footer always reflects the task-wide total. `has_task_rollup`
-    // is the deduped presence bit the outer view keys off — payload-content
-    // changes must not recreate the header (that would reset the display's
-    // open/hover state every server tick).
+    // Membership is server-owned and independent of the contributing rows.
+    // Resetting a task must not remove the usage surface from a child chat.
     let task_rollup = {
         let state = state.clone();
         Memo::new(move |_| -> Option<TaskTokenUsagePayload> {
             let agent_ref = agent_ref.get()?;
             state.task_token_usage.with(|map| {
-                if let Some(payload) = map.get(&agent_ref) {
-                    return Some(payload.clone());
-                }
                 map.iter()
                     .find(|(key, payload)| {
                         key.host_id == agent_ref.host_id
-                            && payload
-                                .breakdown
-                                .iter()
-                                .any(|entry| entry.agent_id == agent_ref.agent_id)
+                            && payload.member_agent_ids.contains(&agent_ref.agent_id)
                     })
                     .map(|(_, payload)| payload.clone())
             })
@@ -2214,6 +2201,11 @@ mod wasm_tests {
     /// reported usage, so the task total is Partial.
     fn partial_rollup(root: &str, root_in: u64, root_out: u64) -> TaskTokenUsagePayload {
         TaskTokenUsagePayload {
+            member_agent_ids: vec![
+                AgentId(root.to_owned()),
+                AgentId("child-a".into()),
+                AgentId("child-b".into()),
+            ],
             helper_usage: Vec::new(),
             timing: Default::default(),
             backends: vec![protocol::TaskBackendUsage {
@@ -2354,6 +2346,127 @@ mod wasm_tests {
                 .length(),
             1,
             "there must be exactly one task usage display, not two"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn reset_usage_sends_one_action_and_renders_only_server_accounting() {
+        install_send_stub();
+        let container = make_container();
+        let state = make_state_with_active_agent("h-reset", "child-a");
+        state.agents.update(|agents| {
+            let mut root = agents[0].clone();
+            root.agent_id = AgentId("root".into());
+            root.instance_stream = StreamPath("/agent/root/inst".into());
+            agents.push(root);
+        });
+        let before = partial_rollup("root", 500, 100);
+        dispatch_task_usage(&state, "h-reset", 0, &before);
+        let _handle = mount_bar(&container, state.clone());
+        next_tick().await;
+        query(&container, ".session-task-toggle").unwrap().click();
+        next_tick().await;
+        let buttons = container.query_selector_all("button").unwrap();
+        let resets = (0..buttons.length())
+            .filter_map(|index| buttons.item(index))
+            .filter(|button| button.text_content().as_deref() == Some("Reset usage"))
+            .collect::<Vec<_>>();
+        assert_eq!(resets.len(), 1, "one discoverable reset action");
+        resets[0].clone().dyn_into::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        crate::send::settle_stream("h-reset", &StreamPath("/agent/root/inst".into())).await;
+        assert_eq!(captured_frames("reset_task_usage").len(), 1);
+        assert!(
+            query(&container, ".session-task-toggle")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("↑1.5K"),
+            "the click alone must not clear accounting"
+        );
+        let mut reset = before.clone();
+        let zero = TaskTokenUsageAggregate {
+            usage: protocol::TaskTokenUsageAmount::zero(),
+            status: TaskTokenUsageStatus::Known,
+        };
+        reset.total = zero.clone();
+        reset.self_usage = TaskTokenUsageScope::Known {
+            usage: Box::new(zero.usage.clone()),
+        };
+        reset.descendant_usage = zero.clone();
+        reset.descendant_count = 0;
+        reset.breakdown.truncate(1);
+        reset.breakdown[0].usage = reset.self_usage.clone();
+        reset.backends.truncate(1);
+        reset.backends[0].agent_count = 1;
+        reset.backends[0].total = zero;
+        dispatch_task_usage(&state, "h-reset", 1, &reset);
+        next_tick().await;
+        let badge = query(&container, ".session-task-toggle").unwrap();
+        assert!(badge.text_content().unwrap().contains("↑0"));
+        assert!(!badge.text_content().unwrap().contains("including"));
+        assert!(
+            query(&container, ".session-task-popover")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("1 agent")
+        );
+        dispatch_task_usage(&state, "h-reset", 2, &partial_rollup("root", 1500, 200));
+        next_tick().await;
+        assert!(badge.text_content().unwrap().contains("↑2.5K"));
+        assert!(badge.text_content().unwrap().contains("including 3 agents"));
+        assert!(
+            query(&container, ".session-task-popover")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Unreported")
+        );
+        let mut sparse = partial_rollup("root", 1500, 200);
+        sparse
+            .breakdown
+            .retain(|entry| entry.agent_id.0 != "child-a");
+        sparse.breakdown[1].parent_agent_id = Some(AgentId("child-a".into()));
+        sparse.breakdown[1].depth = 2;
+        sparse.breakdown[1].usage = known_scope(100, 20);
+        sparse.descendant_count = 1;
+        sparse.descendant_usage = TaskTokenUsageAggregate {
+            usage: known_amount(100, 20),
+            status: TaskTokenUsageStatus::Known,
+        };
+        sparse.total = TaskTokenUsageAggregate {
+            usage: known_amount(1600, 220),
+            status: TaskTokenUsageStatus::Known,
+        };
+        sparse.backends[0].total = sparse.total.clone();
+        sparse.backends[0].agent_count = 2;
+        sparse.backends[0].reporting_agent_count = 2;
+        sparse.backends[0].incomplete_agent_count = 0;
+        dispatch_task_usage(&state, "h-reset", 3, &sparse);
+        next_tick().await;
+        expand_usage(&container, "Agents").await;
+        query(&container, "[aria-label='Collapse Root']")
+            .expect("root still groups contributing grandchildren")
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            1
+        );
+        query(&container, "[aria-label='Expand Root']")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-row")
+                .unwrap()
+                .length(),
+            2
         );
     }
 

@@ -870,6 +870,12 @@ pub(crate) async fn route_client_envelope(
                     }
                 }
             }
+            FrameKind::ResetTaskUsage => {
+                let agent_id = parse_agent_id(&envelope.stream)?;
+                let _: protocol::ResetTaskUsagePayload =
+                    parse_payload(&envelope, "reset_task_usage")?;
+                host.reset_task_usage(agent_id).await?;
+            }
             FrameKind::AgentCompact => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;

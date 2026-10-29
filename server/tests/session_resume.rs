@@ -912,6 +912,51 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
             .skip(1)
             .all(|entry| entry.usage.reported_usage().is_none())
     );
+    fixture
+        .client
+        .reset_task_usage(&restored_parent.instance_stream)
+        .await
+        .expect("reset shared task scope");
+    fixture::next_frame_matching_on(&mut fixture.client, "shared task reset", |env| {
+        env.kind == FrameKind::TaskTokenUsage
+            && env
+                .parse_payload::<protocol::TaskTokenUsagePayload>()
+                .is_ok_and(|usage| {
+                    usage.root_agent_id == restored_parent.agent_id
+                        && usage.total.usage.total_tokens == 0
+                        && usage.descendant_count == 0
+                })
+    })
+    .await;
+    let shared_child = &restored_by_session[&session];
+    fixture
+        .client
+        .send_message(&shared_child.instance_stream, "shared after reset".into())
+        .await
+        .unwrap();
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &shared_child.instance_stream,
+        "mock backend response to: shared after reset",
+    )
+    .await;
+    let (_, scoped) = fixture.connect_with_bootstrap().await;
+    let scoped = scoped
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == restored_parent.agent_id)
+        .unwrap();
+    assert_eq!(
+        scoped.total.usage.total_tokens, 0,
+        "unowned shared-session tokens are not a lower bound"
+    );
+    assert_eq!(scoped.descendant_count, 1);
+    assert!(matches!(
+        &scoped.breakdown[1].usage,
+        protocol::TaskTokenUsageScope::Unavailable {
+            reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting
+        }
+    ));
 }
 
 /// A close decides which of its sessions no other card owns, then writes that

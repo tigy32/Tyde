@@ -23,6 +23,21 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
         &'a self,
         input: AgentInput,
     ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>>;
+    fn submit_with_accounting<'a>(
+        &'a self,
+        input: AgentInput,
+        accounting: &'a mut protocol::TaskUsageAccounting,
+    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let starts_request = matches!(&input, AgentInput::SendMessage(message) if message.tool_response.is_none());
+            let outcome = self.send_with_outcome(input).await;
+            if starts_request && matches!(outcome, SendOutcome::Accepted) {
+                accounting.generation = accounting.generation.saturating_add(1);
+                accounting.pending_submission = true;
+            }
+            outcome
+        })
+    }
     fn update_session_settings<'a>(
         &'a mut self,
         payload: protocol::SetSessionSettingsPayload,

@@ -17741,7 +17741,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
     padding: 10px 16px;
     border-bottom: 1px solid var(--border-primary);
 }
-.task-usage-heading { gap: 10px; padding: 8px 14px; flex-wrap: nowrap; }
+.task-usage-heading { gap: 10px; padding: 8px 14px; }
+.task-usage-reset { white-space: nowrap; }
 .task-usage-heading h2 { margin: 0; font-size: 1rem; }
 .task-usage-count { color: var(--text-tertiary); font-size: .9rem; white-space: nowrap; }
 .task-usage-heading .task-usage-expand, .task-usage-heading .task-usage-close { font-size: 1.2rem; line-height: 1; }
