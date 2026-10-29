@@ -1161,7 +1161,7 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-send']")
             .unwrap()
             .expect("the composer retains its primary action");
-        assert_eq!(primary.text_content().as_deref(), Some("Queue"));
+        assert_eq!(primary.text_content().as_deref(), Some("Send"));
         container
             .query_selector("[data-mobile-test='chat-send-menu-toggle']")
             .unwrap()

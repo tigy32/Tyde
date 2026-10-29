@@ -110,6 +110,35 @@ async fn human(
         .await
         .expect("send real human protocol input");
 }
+async fn author_delivery_error(
+    fixture: &mut Fixture,
+    agent: &TestAgent,
+    id: &str,
+) -> AgentErrorPayload {
+    let frame = next_frame_matching_on(
+        &mut fixture.client,
+        "existing human action delivery outcome",
+        |frame| match frame.kind {
+            FrameKind::AgentError => frame.stream == agent.stream,
+            FrameKind::HumanInputStatus => frame
+                .parse_payload::<HumanInputStatusPayload>()
+                .is_ok_and(|status| {
+                    status.agent_id == agent.new_agent.agent_id && status.id.0 == id
+                }),
+            _ => false,
+        },
+    )
+    .await;
+    assert_eq!(
+        frame.kind,
+        FrameKind::AgentError,
+        "Send and Steer must preserve the client-visible agent error channel"
+    );
+    let error: AgentErrorPayload = frame.parse_payload().expect("agent delivery error");
+    assert_eq!(error.agent_id, agent.new_agent.agent_id);
+    assert!(!error.fatal, "input delivery must not terminate its author");
+    error
+}
 fn assert_healthy_learning(state: &SelfImprovementState) {
     for scope in &state.scopes {
         assert!(
@@ -697,26 +726,18 @@ async fn rejected_author_input_does_not_consume_identity_or_start_learning() {
         config(LearningMode::Automatic),
     )
     .await;
-    human(
-        &mut fixture,
-        &rejected,
-        "retry-after-rejection",
-        HumanInputAction::Send,
-        "For future work, keep changes focused.",
-    )
-    .await;
-    next_frame_matching_on(
-        &mut fixture.client,
-        "human author admission rejection",
-        |frame| {
-            frame.stream == rejected.stream
-                && frame.kind == FrameKind::AgentError
-                && frame
-                    .parse_payload::<AgentErrorPayload>()
-                    .is_ok_and(|error| !error.fatal)
-        },
-    )
-    .await;
+    for action in [HumanInputAction::Send, HumanInputAction::Steer] {
+        human(
+            &mut fixture,
+            &rejected,
+            "retry-after-rejection",
+            action,
+            "For future work, keep changes focused.",
+        )
+        .await;
+        let refused = author_delivery_error(&mut fixture, &rejected, "retry-after-rejection").await;
+        assert!(!refused.message.is_empty());
+    }
     human(
         &mut fixture,
         &live,
@@ -976,6 +997,49 @@ async fn journal_failure_and_replay_preserve_author_once_and_accounting_failure_
             }),
         "An unavailable analyzer accounting source must never be published as a complete author-only total"
     );
+    for (id, action, message) in [
+        (
+            "accepted-with-send-warning",
+            HumanInputAction::Send,
+            "Send once with learning unavailable",
+        ),
+        (
+            "accepted-with-steer-warning",
+            HumanInputAction::Steer,
+            "Steer once with learning unavailable",
+        ),
+    ] {
+        human(&mut fixture, &author, id, action, message).await;
+        let warning = author_delivery_error(&mut fixture, &author, id).await;
+        assert!(warning.message.contains("The author accepted this input"));
+        assert!(warning.message.contains("learning is unavailable"));
+        assert!(warning.message.contains("Do not resend the author input"));
+        fixture::next_chat_event_matching_on(
+            &mut observer,
+            &stream,
+            "accepted input completes despite unavailable learning",
+            |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content.contains(message)),
+        )
+        .await;
+        fixture::next_chat_event_matching_on(
+            &mut observer,
+            &stream,
+            "author settles after accepted input warning",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+        let requests = fixture.mock(&author).await.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    matches!(request, server::backend::mock::MockRequest::Input(input) if input.message == message)
+                })
+                .count(),
+            1,
+            "a learning warning must not duplicate accepted author input"
+        );
+    }
 }
 
 #[tokio::test]

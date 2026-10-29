@@ -16,6 +16,7 @@ use crate::state::{
 };
 
 const FIXTURE_QUERY_KEY: &str = "tyde-fixture";
+const FIXTURE_CONNECTION_INSTANCE_ID: u64 = 1;
 
 thread_local! {
     static NEXT_SUBMISSION_ID: Cell<u64> = const { Cell::new(1) };
@@ -69,7 +70,7 @@ pub fn capture_send(line: &str) -> Accepted {
         LocalSubmissionId(id)
     });
     Accepted {
-        connection_instance_id: 1,
+        connection_instance_id: FIXTURE_CONNECTION_INSTANCE_ID,
         local_submission_id,
     }
 }
@@ -113,6 +114,11 @@ pub fn seed_state(state: &AppState) {
             },
         );
     });
+    if name != "disconnected" {
+        state.active_connection_instance_ids.update(|connections| {
+            connections.insert(host.clone(), FIXTURE_CONNECTION_INSTANCE_ID);
+        });
+    }
     state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
         round_trips.insert(host.clone(), 47);
     });
@@ -291,63 +297,6 @@ pub fn seed_state(state: &AppState) {
         js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_ENVELOPE__".into())
             .expect("remove fixture event hook");
         drop(envelope.take());
-    });
-
-    let probe_state = state.clone();
-    let probe_host = host.clone();
-    let sequence = Cell::new(0_u64);
-    let activity = wasm_bindgen::closure::Closure::<dyn Fn(bool)>::new(move |thinking| {
-        let owner = probe_state
-            .active_agent
-            .get_untracked()
-            .expect("fixture agent")
-            .as_agent_ref();
-        let seq = sequence.get();
-        sequence.set(seq + 1);
-        crate::dispatch::dispatch_envelope(
-            &probe_state,
-            &probe_host,
-            protocol::Envelope::from_payload(
-                StreamPath("/agent/fixture-agent/fixture".to_owned()),
-                protocol::FrameKind::AgentActivityChanged,
-                seq,
-                &protocol::AgentActivityChangedPayload {
-                    activity: if thinking {
-                        protocol::AgentActivity::Thinking
-                    } else {
-                        protocol::AgentActivity::Idle
-                    },
-                },
-            )
-            .expect("fixture activity"),
-        );
-        crate::dispatch::apply_chat_event(
-            &probe_state,
-            &owner,
-            protocol::ChatEvent::StreamStart(protocol::StreamStartData {
-                agent: "fixture".to_owned(),
-                model: None,
-            }),
-        );
-        crate::dispatch::apply_chat_event(
-            &probe_state,
-            &owner,
-            protocol::ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
-                text: "Streaming fixture output".to_owned(),
-            }),
-        );
-    });
-    js_sys::Reflect::set(
-        &js_sys::global(),
-        &"__TYDE_FIXTURE_ACTIVITY__".into(),
-        activity.as_ref(),
-    )
-    .expect("fixture hook");
-    let activity = send_wrapper::SendWrapper::new(activity);
-    on_cleanup(move || {
-        js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_ACTIVITY__".into())
-            .expect("remove fixture hook");
-        drop(activity.take());
     });
 
     let navigation_state = state.clone();

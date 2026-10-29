@@ -198,6 +198,8 @@ fn copy_queued_draft(text: String, status: RwSignal<&'static str>) {
 /// splitting them into a seven-argument call is what invites a caller to pass
 /// the host of one message with the text of another.
 struct OutboundSubmission {
+    human_input_id: protocol::HumanInputId,
+    action: protocol::HumanInputAction,
     local_host_id: LocalHostId,
     target: SubmissionTarget,
     text: String,
@@ -1163,10 +1165,9 @@ pub(super) fn NewChatOptions() -> impl IntoView {
 
 /// Mobile chat composer.
 ///
-/// Primary button label follows the state matrix: "Send" when idle, "Queue"
-/// when a turn is running and there is draft text, "Cancel" when running with
-/// an empty composer. The only persistent actions are that primary button and
-/// its caret. Photos, speech, and state-specific secondary actions live in the
+/// The primary sends the draft, cancelling the current turn when busy, or
+/// cancels without sending when the running composer's draft is empty.
+/// The only persistent actions are that primary button and its caret. Photos, speech, and state-specific secondary actions live in the
 /// shared menu so the textarea keeps the width of the capsule.
 #[component]
 pub fn ChatInput() -> impl IntoView {
@@ -1182,7 +1183,7 @@ pub fn ChatInput() -> impl IntoView {
 
     let do_send = {
         let state = state.clone();
-        move || {
+        move |action: protocol::HumanInputAction| {
             // The composer now *keeps* the user's text for the whole in-flight
             // window — that is the entire point of the fix. It also means the old
             // double-send guard is gone: clearing the box early used to make a
@@ -1237,6 +1238,7 @@ pub fn ChatInput() -> impl IntoView {
                 return;
             }
 
+            let human_input_id = protocol::HumanInputId(uuid::Uuid::new_v4().to_string());
             composer.begin();
             spawn_local(async move {
                 // The composer still holds the text through this await. It is
@@ -1244,16 +1246,22 @@ pub fn ChatInput() -> impl IntoView {
                 // record has taken custody.
                 let (target, outcome) = match active_target {
                     Some((active, stream)) => {
-                        let payload = protocol::SendMessagePayload {
-                            message: text.clone(),
-                            images: (!images.is_empty()).then(|| images.clone()),
-                            origin: None,
-                            tool_response: None,
+                        let payload = protocol::HumanInputPayload {
+                            id: human_input_id.clone(),
+                            action,
+                            input: protocol::SendMessagePayload {
+                                message: text.clone(),
+                                images: (!images.is_empty()).then(|| images.clone()),
+                                origin: None,
+                                tool_response: None,
+                            },
                         };
-                        let outcome = crate::send::send_frame(
+                        if action == protocol::HumanInputAction::InterruptAndSend {
+                            state.begin_human_admission(&active.as_agent_ref(), &human_input_id);
+                        }
+                        let outcome = crate::send::send_composer_input(
                             &active.local_host_id,
                             stream,
-                            protocol::FrameKind::SendMessage,
                             &payload,
                         )
                         .await;
@@ -1273,6 +1281,8 @@ pub fn ChatInput() -> impl IntoView {
                     &state,
                     composer,
                     OutboundSubmission {
+                        human_input_id,
+                        action,
                         local_host_id: host,
                         target,
                         text,
@@ -1288,7 +1298,7 @@ pub fn ChatInput() -> impl IntoView {
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
         if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
-            send_for_key();
+            send_for_key(protocol::HumanInputAction::InterruptAndSend);
         }
     };
 
@@ -1406,6 +1416,8 @@ pub fn ChatInput() -> impl IntoView {
                     &state,
                     composer,
                     OutboundSubmission {
+                        human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                        action: protocol::HumanInputAction::Steer,
                         local_host_id: host,
                         target: SubmissionTarget::Agent(active.as_agent_ref()),
                         text,
@@ -1496,6 +1508,8 @@ pub fn ChatInput() -> impl IntoView {
                     &state,
                     composer,
                     OutboundSubmission {
+                        human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                        action: protocol::HumanInputAction::Send,
                         local_host_id: host,
                         target: SubmissionTarget::NewChat,
                         text,
@@ -2014,7 +2028,6 @@ pub fn ChatInput() -> impl IntoView {
                         aria-label={move || {
                             if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
                             else if can_cancel.get() && !has_input.get() { "Cancel current turn" }
-                            else if is_steer.get() { "Queue message" }
                             else { "Send message" }
                         }}
                         title=move || {
@@ -2031,7 +2044,7 @@ pub fn ChatInput() -> impl IntoView {
                                 if can_cancel.get_untracked() && !has_input.get_untracked() {
                                     do_interrupt();
                                 } else {
-                                    do_send();
+                                    do_send(protocol::HumanInputAction::InterruptAndSend);
                                 }
                             }
                         }
@@ -2052,7 +2065,6 @@ pub fn ChatInput() -> impl IntoView {
                         {move || {
                             if is_terminated.get() { "Terminated" }
                             else if can_cancel.get() && !has_input.get() { "Cancel" }
-                            else if is_steer.get() { "Queue" }
                             else { "Send" }
                         }}
                     </button>
@@ -2075,6 +2087,7 @@ pub fn ChatInput() -> impl IntoView {
                         }
                         let on_btw = btw_for_menu.clone();
                         let on_steer = steer_for_menu.clone();
+                        let on_queue = send_for_menu.clone();
                         let on_cancel = interrupt_for_menu.clone();
                         let show_steer = is_steer.get();
                         let show_btw = can_btw.get();
@@ -2116,6 +2129,18 @@ pub fn ChatInput() -> impl IntoView {
                                 <Show when=move || can_set_goal.get()>
                                     <button type="button" class="chat-send-menu-item" role="menuitem" data-mobile-test="chat-send-menu-goal" on:click=move |_| { menu_open.set(false); on_goal.run(()); }>"Send as goal"</button>
                                 </Show>
+                                {show_steer.then(|| view! {
+                                    <button
+                                        type="button"
+                                        class="chat-send-menu-item"
+                                        role="menuitem"
+                                        data-mobile-test="chat-send-menu-queue"
+                                        disabled=move || loading_photos.get() || submitting.get()
+                                        on:click=move |_| { menu_open.set(false); on_queue(protocol::HumanInputAction::Send); }
+                                    >
+                                        "Queue"
+                                    </button>
+                                })}
                                 {show_steer.then(|| view! {
                                     <button
                                         type="button"
@@ -2195,7 +2220,7 @@ fn report_send_error(state: &AppState, message: String) {
 /// Settle one outbound user submission.
 ///
 /// **On admission the text and images move into a recovery record and the
-/// composer is cleared in the same synchronous step.** There is never a state in
+/// unchanged composer is cleared in the same synchronous step.** There is never a state in
 /// which the user's input exists in neither place. That window was the bug: the
 /// composer used to be cleared *before* the send was awaited, so a send that
 /// never settled destroyed the text silently — no holder, no error, nothing.
@@ -2214,6 +2239,8 @@ fn settle_submission(
     outcome: Result<Accepted, SendFrameError>,
 ) {
     let OutboundSubmission {
+        human_input_id,
+        action,
         local_host_id,
         target,
         text,
@@ -2221,7 +2248,20 @@ fn settle_submission(
     } = submission;
     match outcome {
         Ok(accepted) => {
+            let same_target = match &target {
+                SubmissionTarget::NewChat => state.active_agent.get_untracked().is_none(),
+                SubmissionTarget::Agent(owner) => state
+                    .active_agent
+                    .get_untracked()
+                    .is_some_and(|active| active.as_agent_ref() == *owner),
+            };
+            let unchanged = same_target
+                && state.chat_input.get_untracked().trim() == text
+                && composer.image_payload() == images;
             state.hold_submission(PendingSubmission {
+                human_input_id,
+                failure_reason: None,
+                action,
                 local_submission_id: accepted.local_submission_id,
                 // A fresh logical submission: the user just made this one.
                 origin: state.mint_submission_origin(),
@@ -2236,10 +2276,15 @@ fn settle_submission(
                 tool_response: None,
                 state: PendingSubmissionState::QueuedLocally,
             });
-            composer.clear(state);
+            if unchanged {
+                composer.clear(state);
+            }
             composer.announcement.set(QUEUED_ANNOUNCEMENT.to_owned());
         }
         Err(error) => {
+            if let SubmissionTarget::Agent(agent) = &target {
+                state.cancel_human_admission(agent, &human_input_id);
+            }
             // The composer still holds the text — nothing moved, nothing to
             // restore. Say exactly why it did not go.
             composer.announcement.set(String::new());
@@ -2384,6 +2429,8 @@ mod wasm_tests {
             &state,
             composer,
             OutboundSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                action: protocol::HumanInputAction::Send,
                 local_host_id: host.clone(),
                 target: SubmissionTarget::NewChat,
                 text: "ship it".to_owned(),
@@ -2444,6 +2491,8 @@ mod wasm_tests {
             &state,
             composer,
             OutboundSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                action: protocol::HumanInputAction::Send,
                 local_host_id: host,
                 target: SubmissionTarget::NewChat,
                 text: String::new(),
@@ -2483,6 +2532,8 @@ mod wasm_tests {
             &state,
             composer,
             OutboundSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                action: protocol::HumanInputAction::Send,
                 local_host_id: host,
                 target: SubmissionTarget::NewChat,
                 text: "ship it".to_owned(),
@@ -3526,6 +3577,7 @@ mod wasm_tests {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
         let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, &host);
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
             let state = mount_state;
@@ -3551,11 +3603,21 @@ mod wasm_tests {
                 local_host_id: host_for_mount.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             }));
+            let agent_ref = state.active_agent.get_untracked().unwrap().as_agent_ref();
             provide_context(state);
-            view! { <ChatInput /> }
+            view! { <ChatInput /> <crate::components::pending_submissions::AgentPendingSubmissions agent_ref=agent_ref /> }
         });
         next_tick().await;
 
+        state.agent_turn_active.update(|turns| {
+            turns.insert(
+                AgentRef {
+                    local_host_id: host.clone(),
+                    agent_id: AgentId("agent-1".to_owned()),
+                },
+                true,
+            );
+        });
         type_text(&container, "run the tests");
         next_tick().await;
 
@@ -3577,6 +3639,100 @@ mod wasm_tests {
             crate::bridge::test_send_attempts(),
             1,
             "an impatient double-tap must not send the message twice"
+        );
+        let lines = crate::bridge::test_sent_lines();
+        let envelope: protocol::Envelope = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(envelope.kind, protocol::FrameKind::HumanInput);
+        let payload: protocol::HumanInputPayload = envelope.parse_payload().unwrap();
+        assert_eq!(payload.action, protocol::HumanInputAction::InterruptAndSend);
+        assert_eq!(payload.input.message, "run the tests");
+        let outcomes = crate::app::listen_submission_outcomes(&state)
+            .await
+            .expect("register the production transport-outcome listener");
+        let composer = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        type_text(&container, "keep this newer draft");
+        crate::bridge::test_resolve_next_send();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(composer.value(), "keep this newer draft");
+        // The socket taking the frame is not actor admission: the message stays
+        // held, silently, until the actor's verdict arrives.
+        crate::bridge::test_emit_send_outcome(
+            &host,
+            1,
+            crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pending-submission']")
+                .unwrap()
+                .is_none()
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/host-1".to_owned()),
+                protocol::FrameKind::HumanInputStatus,
+                0,
+                &protocol::HumanInputStatusPayload {
+                    agent_id: protocol::AgentId("agent-1".to_owned()),
+                    id: payload.id.clone(),
+                    status: protocol::HumanInputStatus::Refused {
+                        reason: "agent is continuing the turn a host restart interrupted"
+                            .to_owned(),
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let recovery = container
+            .query_selector("[data-mobile-test='pending-submission']")
+            .unwrap()
+            .expect("socket acknowledgement cannot release actor-admission custody");
+        let visible = recovery.text_content().unwrap();
+        assert!(visible.contains("run the tests"));
+        assert!(visible.contains("a host restart interrupted"));
+        assert!(visible.contains("Not sent"));
+        assert_eq!(composer.value(), "keep this newer draft");
+        // A late socket fact cannot retire the actor-refused message either.
+        crate::bridge::test_emit_send_outcome(
+            &host,
+            1,
+            crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pending-submission']")
+                .unwrap()
+                .is_some_and(|card| card.text_content().unwrap().contains("run the tests"))
+        );
+        open_menu(&container).await;
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-queue']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let lines = crate::bridge::test_sent_lines();
+        let queued: protocol::Envelope = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(queued.kind, protocol::FrameKind::SendMessage);
+        assert_eq!(
+            queued
+                .parse_payload::<protocol::SendMessagePayload>()
+                .unwrap()
+                .message,
+            "keep this newer draft"
         );
         crate::bridge::test_resolve_next_send();
         next_tick().await;
@@ -3670,9 +3826,12 @@ mod wasm_tests {
                 assert_eq!(frames.len(), attempts_before + 1);
                 let frame: serde_json::Value =
                     serde_json::from_str(frames.last().unwrap()).unwrap();
-                assert_eq!(frame["kind"], "send_message");
+                assert_eq!(frame["kind"], "human_input");
+                let human: protocol::HumanInputPayload =
+                    serde_json::from_value(frame["payload"].clone()).unwrap();
+                assert_eq!(human.action, protocol::HumanInputAction::InterruptAndSend);
                 assert!(
-                    frame["payload"]["message"] == expected,
+                    human.input.message == expected,
                     "the final observed replacement is submitted"
                 );
                 crate::bridge::test_resolve_next_send();
@@ -3713,6 +3872,7 @@ mod wasm_tests {
             );
             drop(rejection_guard);
         }
+        outcomes.remove();
         drop(_h);
         container.remove();
     }
@@ -4473,9 +4633,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Cancel".
+    // Primary "Send" enabled; caret enabled; dropdown has "Steer", "Cancel".
     #[wasm_bindgen_test]
-    async fn thinking_input_no_session_queue_primary_steer_cancel_menu() {
+    async fn thinking_input_no_session_send_primary_queue_steer_cancel_menu() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -4503,10 +4663,10 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(
             p.text_content().unwrap_or_default().trim(),
-            "Queue",
-            "primary must be Queue when thinking with draft"
+            "Send",
+            "primary must remain Send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+        assert!(!p.has_attribute("disabled"), "Send must be enabled");
 
         assert!(
             container
@@ -4521,6 +4681,7 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec![
                 "Add photos".to_owned(),
+                "Queue".to_owned(),
                 "Steer".to_owned(),
                 "Cancel".to_owned()
             ],
@@ -4863,9 +5024,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
+    // Primary "Send" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
-    async fn thinking_input_with_session_queue_primary_full_menu() {
+    async fn thinking_input_with_session_send_primary_full_menu() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -4910,10 +5071,10 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(
             p.text_content().unwrap_or_default().trim(),
-            "Queue",
-            "primary must be Queue when thinking with draft"
+            "Send",
+            "primary must remain Send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+        assert!(!p.has_attribute("disabled"), "Send must be enabled");
 
         let c = caret(&container);
         assert!(!c.has_attribute("disabled"), "caret must be enabled");
@@ -4923,6 +5084,7 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec![
                 "Add photos".to_owned(),
+                "Queue".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
                 "Cancel".to_owned(),

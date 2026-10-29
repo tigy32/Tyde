@@ -94,6 +94,10 @@ thread_local! {
     static TEST_SEND_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The connection instance every test-seam send is accepted on.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub const TEST_CONNECTION_INSTANCE_ID: u64 = 1;
+
 #[cfg(all(test, target_arch = "wasm32"))]
 pub struct TestSendGuard {
     generation: u64,
@@ -162,9 +166,25 @@ pub fn test_resolve_next_send() {
         };
         let (reply, local_submission_id) = replies.remove(0);
         let _ = reply.send(Ok(Accepted {
-            connection_instance_id: 1,
+            connection_instance_id: TEST_CONNECTION_INSTANCE_ID,
             local_submission_id,
         }));
+    });
+}
+
+/// Reports a transport outcome for the `attempt`th test-seam send through the
+/// production outcome listeners.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub fn test_emit_send_outcome(
+    local_host_id: &LocalHostId,
+    attempt: usize,
+    outcome: SubmissionTransportOutcome,
+) {
+    emit_submission_transport_outcome(SubmissionTransportOutcomeEvent {
+        local_host_id: local_host_id.clone(),
+        connection_instance_id: TEST_CONNECTION_INSTANCE_ID,
+        local_submission_id: LocalSubmissionId(attempt as u64),
+        outcome,
     });
 }
 
@@ -196,7 +216,7 @@ fn test_send_action(line: &str) -> Option<TestSendAction> {
             *attempts += 1;
             lines.push(line.to_owned());
             Some(TestSendAction::Immediate(Ok(Accepted {
-                connection_instance_id: 1,
+                connection_instance_id: TEST_CONNECTION_INSTANCE_ID,
                 local_submission_id: LocalSubmissionId(*attempts as u64),
             })))
         }

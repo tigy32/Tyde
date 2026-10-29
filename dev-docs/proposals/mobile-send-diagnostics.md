@@ -47,11 +47,11 @@ Two existing inline mounted wasm flows are extended (no new unit tests):
   disabled button.
 - `app.rs`, `one_chat_mount_preserves_transcript_and_composer_draft`: actual
   AppSurface in a 393x852 iframe with production Tyde and vendored shell styles.
-  Thirty wrap/newline/capped-height/shrink contacts at requested 0/50/250 ms,
-  both after input and with input between down/up. Actual elapsed times through
-  release must be below 300 ms, not just the requested timer. Assert geometry,
-  max-height/internal scroll, native draft equality, stable connected primary,
-  enabled state, current-center and original-contact hit tests, one correct
+  Wrap/newline/capped-height/shrink contacts, both after input and with input
+  between down/up, checked before and after the reactive flush rather than
+  against host speed. Assert geometry, max-height/internal scroll, native
+  draft equality, stable connected primary, enabled state, current-center and
+  original-contact hit tests, one correct
   SendMessage and clear after local admission. Typed AgentActivityChanged
   envelopes plus StreamStart/StreamDelta reducer events cross contact edges;
   Thinking/Idle render Queue/Send without Interrupt even with streaming text.
@@ -88,18 +88,19 @@ route in our setup**, not that every possible device service lacks one.
 
 ## Real WebKit and physical-device scope
 
-The existing Playwright FixtureApp harness now mounts the actual Tyde composer
-in real WebKit through the canonical `./dev.sh check` wasm stage. A dedicated
-project disables retained screenshots, traces and video (one ephemeral browser
-screenshot exercises disk output preflight). A successful fixture build is
-required before starting its server, so a failed build cannot serve stale assets. Typed fixture activity events
-and stream reducer events exercise UI behavior above the backend boundary.
-Programmatic composing inputs, replacement across contact, running/idle changes,
-0/50/250 ms grow/shrink contacts, stable button and center/original-point hits,
-and menu interception passed before device allocation. These are synthetic DOM
-contacts, not native dictation or native click-delivery evidence. Timing
-assertions require measured elapsed time below 300 ms. The preflight full check
-is `target/dev-check-logs/run-20260926T184502Z-4184903`.
+The Playwright FixtureApp harness once mounted the actual Tyde composer in
+real WebKit for programmatic composing inputs, replacement across contact,
+running/idle changes, grow/shrink contacts, stable button and
+center/original-point hits, and menu interception. Those were synthetic DOM
+contacts, not native dictation or native click-delivery evidence. That second
+automated composer harness was removed. Its contracts now live in mounted
+wasm flows that run in headless Chrome rather than WebKit: composition and
+replacement payloads in `chat_input.rs`; and, in the `app.rs` flow
+`one_chat_mount_preserves_transcript_and_composer_draft`, grow/shrink contacts
+that keep the same Send node under its center and original-point hits, plus
+the open menu's backdrop taking the Send point until it closes. The preflight
+full check for the removed probe was
+`target/dev-check-logs/run-20260926T184502Z-4184903`.
 
 The one authorized BEFORE allocation used the packaged actual Tyde fixture.
 It verified standalone mode and reached composer focus, but failed harness
@@ -149,11 +150,11 @@ Stop/Start clicks and the existing full export flow. This red/green is for the
 new diagnostic UI defect, not the original Send report. No native after-run is
 authorized, so local WebKit green must not be labeled a native after result.
 
-The screenshot-destination defect from the prior run did not recur. The shared
-`tools/devicefarm-output.mjs` writer creates the nested destination before every
-write. Both canonical WebKit and the manual package preflight actually write and
-read back an image through that path from an absent directory; scheduling rejects
-packages without the successful preflight. The new keyboard screenshot was
+The screenshot-destination defect from the prior run did not recur. The
+manual package preflight wrote and read back an image from an absent
+directory before scheduling, and scheduling rejected packages without that
+preflight. Its shared writer left the repository with the canonical WebKit
+probe that also used it. The new keyboard screenshot was
 successfully created on-device. The manual harness source is retained separately
 in the review evidence bundle; it is not an alternate Tyde validation entry.
 

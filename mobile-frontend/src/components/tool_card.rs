@@ -1658,6 +1658,9 @@ fn hold_reply(
 ) -> SubmissionOriginId {
     let origin = state.mint_submission_origin();
     state.hold_submission(crate::state::PendingSubmission {
+        human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+        failure_reason: None,
+        action: protocol::HumanInputAction::Send,
         local_submission_id: accepted.local_submission_id,
         // The card keeps *this*, not the attempt id, so it still recognises its own
         // reply after a deliberate resend replaces the record underneath it.
@@ -3068,6 +3071,9 @@ mod wasm_tests {
         let host = LocalHostId("host-1".to_owned());
         for id in 0..crate::state::MAX_PENDING_SUBMISSIONS_PER_HOST as u64 {
             state.hold_submission(crate::state::PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: crate::bridge::LocalSubmissionId(10_000 + id),
                 origin: crate::state::SubmissionOriginId(10_000 + id),
                 local_host_id: host.clone(),
@@ -3284,6 +3290,9 @@ mod wasm_tests {
         for id in 0..300u64 {
             let attempt = crate::bridge::LocalSubmissionId(50_000 + id);
             state.hold_submission(crate::state::PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: attempt,
                 origin: crate::state::SubmissionOriginId(50_000 + id),
                 local_host_id: host.clone(),
@@ -3364,6 +3373,9 @@ mod wasm_tests {
         // The user hits Send again. A new transport attempt supersedes the old one,
         // inheriting the same logical identity.
         state.hold_submission(crate::state::PendingSubmission {
+            human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+            failure_reason: None,
+            action: protocol::HumanInputAction::Send,
             local_submission_id: crate::bridge::LocalSubmissionId(777),
             origin: original.origin,
             local_host_id: original.local_host_id.clone(),

@@ -115,8 +115,9 @@ impl std::error::Error for InvalidationRejected {}
 
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) use web::{
-    TestSendGuard, test_capture_sends, test_clean_sends, test_defer_sends, test_reject_sends,
-    test_resolve_next_send, test_send_attempts, test_sent_lines,
+    TEST_CONNECTION_INSTANCE_ID, TestSendGuard, test_capture_sends, test_clean_sends,
+    test_defer_sends, test_emit_send_outcome, test_reject_sends, test_resolve_next_send,
+    test_send_attempts, test_sent_lines,
 };
 
 use crate::state::{

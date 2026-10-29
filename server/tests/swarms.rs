@@ -2568,6 +2568,192 @@ async fn constraint_and_workspace_errors_start_no_work_and_preserve_the_draft() 
     );
 }
 
+async fn human_input_settles(
+    client: &mut client::Connection,
+    stream: &protocol::StreamPath,
+    input: &protocol::HumanInputPayload,
+    phase: &str,
+) -> protocol::HumanInputStatus {
+    if let Err(error) = client.human_input(stream, input.clone()).await {
+        panic!(
+            "human input write failed during {phase}: {}",
+            frame_error_context(&error)
+        );
+    }
+    loop {
+        let event = client_event(client, phase).await;
+        if event.kind != FrameKind::HumanInputStatus {
+            continue;
+        }
+        let status: protocol::HumanInputStatusPayload =
+            serde_json::from_value(event.payload).expect("typed human input status");
+        if status.id == input.id {
+            return status.status;
+        }
+    }
+}
+
+#[tokio::test]
+async fn private_cancel_and_send_settles_once_across_busy_and_idle_retries() {
+    let mut scenario = Scenario::new().await;
+    let draft = scenario.generate(scenario.constraints(1)).await;
+    let private_gate = MockGateHandle::new();
+    let bookkeeping_gate = MockGateHandle::new();
+    let _reservation = scenario
+        .fixture
+        .reserve_mock_launches(vec![(
+            draft.members[0].name.clone(),
+            MockScript::one(MockTurn::text("Briefing read"))
+                .then(MockTurn::gated_text(
+                    "Private cancel-and-send turn",
+                    &private_gate,
+                ))
+                .then(MockTurn::gated_text(
+                    "Turn whose swarm bookkeeping failed",
+                    &bookkeeping_gate,
+                )),
+        )])
+        .await;
+    let launched = scenario.launch(&draft).await;
+    let live = scenario
+        .open_request(
+            &launched.id,
+            "Review the project and publish useful findings",
+        )
+        .await
+        .1;
+    let member = live.members[0].spec.id.clone();
+    let agent = live.members[0]
+        .agent_id
+        .clone()
+        .expect("live private-chat member");
+    let control = scenario.fixture.mock_by_id(&agent).await;
+    let executed_before = request_count(&control.requests().await);
+    let (mut client, bootstrap) = scenario.fixture.connect_with_bootstrap().await;
+    let stream = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent)
+        .expect("member stream on its own protocol connection")
+        .instance_stream
+        .clone();
+    let input = protocol::HumanInputPayload {
+        id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+        action: protocol::HumanInputAction::InterruptAndSend,
+        input: protocol::SendMessagePayload {
+            message: "Cancel the current turn and handle this once".to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    };
+    let accepted = |status: &protocol::HumanInputStatus| {
+        matches!(
+            status,
+            protocol::HumanInputStatus::Accepted { warning: None }
+        )
+    };
+
+    // Retries must be settled by the member's own custody, not the learning
+    // journal: obstruct the journal's real transaction file so it never
+    // records the input.
+    std::fs::create_dir(
+        scenario
+            .fixture
+            .session_store_path()
+            .with_file_name("self-improvement.json.tmp"),
+    )
+    .expect("make learning journal transaction unwritable as a file");
+
+    let first =
+        human_input_settles(&mut client, &stream, &input, "idle private cancel-and-send").await;
+    assert!(
+        accepted(&first),
+        "an idle member accepts private cancel-and-send: {first:?}"
+    );
+    scenario
+        .wait_mock_turn(&private_gate, "private cancel-and-send turn running")
+        .await;
+    let busy_retry = human_input_settles(
+        &mut client,
+        &stream,
+        &input,
+        "same input retried while its turn runs",
+    )
+    .await;
+    assert!(
+        accepted(&busy_retry),
+        "a retry of accepted input must not report Not sent while its turn runs: {busy_retry:?}"
+    );
+    scenario
+        .swarm(&live.id, |swarm| {
+            swarm.members.iter().any(|candidate| {
+                candidate.spec.id == member
+                    && candidate.runtime_status == Some(AgentControlStatus::Thinking)
+            })
+        })
+        .await;
+    private_gate.release_one();
+    scenario
+        .swarm(&live.id, |swarm| {
+            swarm.members.iter().any(|candidate| {
+                candidate.spec.id == member
+                    && candidate.state == SwarmMemberState::Live
+                    && candidate.runtime_status == Some(AgentControlStatus::Idle)
+            })
+        })
+        .await;
+    let idle_retry = human_input_settles(
+        &mut client,
+        &stream,
+        &input,
+        "same input retried after its turn settled",
+    )
+    .await;
+    assert!(
+        accepted(&idle_retry),
+        "an idle retry of accepted input settles as accepted: {idle_retry:?}"
+    );
+    assert_eq!(
+        request_count(&control.requests().await),
+        executed_before + 1,
+        "retries of one cancel-and-send identity must execute it exactly once"
+    );
+
+    scenario.fixture.fail_next_swarm_completion().await;
+    let failed_bookkeeping = protocol::HumanInputPayload {
+        id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+        ..input.clone()
+    };
+    let settled = human_input_settles(
+        &mut client,
+        &stream,
+        &failed_bookkeeping,
+        "cancel-and-send whose swarm bookkeeping fails",
+    )
+    .await;
+    assert!(
+        matches!(
+            &settled,
+            protocol::HumanInputStatus::Accepted { warning: Some(warning) }
+                if warning.contains("Swarm bookkeeping failed") && warning.contains("Do not resend")
+        ),
+        "input the agent accepted stays accepted when later swarm bookkeeping fails: {settled:?}"
+    );
+    scenario
+        .wait_mock_turn(
+            &bookkeeping_gate,
+            "accepted input runs despite bookkeeping failure",
+        )
+        .await;
+    assert_eq!(
+        request_count(&control.requests().await),
+        executed_before + 2,
+        "an accepted input executes once even when its swarm bookkeeping fails"
+    );
+    bookkeeping_gate.release_one();
+}
+
 #[tokio::test]
 async fn durable_boards_route_only_typed_mentions_and_page_old_thread_activity() {
     let mut scenario = Scenario::new().await;

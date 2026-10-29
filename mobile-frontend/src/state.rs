@@ -251,16 +251,16 @@ pub enum SubmissionTarget {
 
 /// Resting state of a recovery record.
 ///
-/// `TransportAcknowledged` is deliberately not representable here: it *retires*
-/// the record. A record can therefore never rest in a state that claims
-/// delivery.
+/// Neither a socket acknowledgement nor a pending record claims actor admission.
+/// Atomic human input retains custody until its typed server outcome arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingSubmissionState {
     /// Admitted to this connection's bounded outbound queue. Held **silently** —
     /// no banner, no artifact, no announcement. The happy path is
     /// indistinguishable from having no recovery model at all.
     QueuedLocally,
-    /// Definitely not transmitted. Safe to send again with zero duplicate risk.
+    /// Transport did not transmit it, or the actor explicitly refused it.
+    /// The prompt was not admitted and can safely be offered again.
     NotSent,
     /// May or may not have reached the host. Persists until the user explicitly
     /// resolves it.
@@ -289,6 +289,9 @@ impl PendingSubmissionState {
 /// composer draft has always been dropped.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingSubmission {
+    pub human_input_id: protocol::HumanInputId,
+    pub failure_reason: Option<String>,
+    pub action: protocol::HumanInputAction,
     pub local_submission_id: LocalSubmissionId,
     /// The logical submission this attempt belongs to. A deliberate resend mints
     /// a new `local_submission_id` and **inherits** this, so the UI that created
@@ -297,7 +300,7 @@ pub struct PendingSubmission {
     pub local_host_id: LocalHostId,
     /// The connection instance that admitted the frame. A transport outcome
     /// reported by a *different* instance can never mutate this record, and a
-    /// resend is only ever offered once the admitting connection is gone.
+    /// uncertain resend requires a new connection; explicit actor refusal does not.
     pub connection_instance_id: u64,
     pub target: SubmissionTarget,
     pub text: String,
@@ -370,12 +373,15 @@ impl PendingSubmission {
             None => String::new(),
         }
     }
-    /// A resend is only ever offered on a genuinely new connection: the one that
-    /// admitted this frame is gone, and the client never replays intent across
-    /// connections on its own.
+    /// Unknown transport needs a new connection; explicit actor refusal can be
+    /// retried on the same connection. Nothing is replayed automatically.
     pub fn can_resend_on(&self, current_connection_instance_id: Option<u64>) -> bool {
         match current_connection_instance_id {
-            Some(current) => current != self.connection_instance_id,
+            Some(current) => {
+                current != self.connection_instance_id
+                    || (self.state == PendingSubmissionState::NotSent
+                        && self.failure_reason.is_some())
+            }
             None => false,
         }
     }
@@ -391,7 +397,10 @@ impl PendingSubmission {
     }
 
     /// What the client actually knows, in the user's terms.
-    pub fn state_detail(&self) -> &'static str {
+    pub fn state_detail(&self) -> &str {
+        if let Some(reason) = &self.failure_reason {
+            return reason;
+        }
         match self.state {
             PendingSubmissionState::QueuedLocally => "This message is still queued to go out.",
             PendingSubmissionState::NotSent => {
@@ -427,7 +436,7 @@ pub fn wire_images(images: &[protocol::ImageData]) -> Option<Vec<protocol::Image
 /// submission is *unresolved*, not safe — it can still come back `NotSent` or
 /// `DeliveryUnknown`, and its record is the only holder of the text the user would
 /// then need back. A record leaves the store by exactly three routes:
-/// `TransportAcknowledged` retires it, the user withdraws it, or the host is
+/// Transport/server admission retires it, the user withdraws it, or the host is
 /// forgotten. Going transiently one over the cap (a resend holds its replacement
 /// before retiring the attempt it supersedes) is strictly better than losing a
 /// message, so [`AppState::hold_submission`] inserts unconditionally.
@@ -995,9 +1004,12 @@ pub struct AppState {
     /// Outbound submissions the client is holding on the user's behalf, keyed by
     /// the connection layer's [`LocalSubmissionId`] — one entry per *transport
     /// attempt*. Bounded, in-memory, and non-persistent. Records are held silently
-    /// while `QueuedLocally` and are surfaced only on a transport failure;
-    /// `TransportAcknowledged` removes them.
+    /// while `QueuedLocally` and surface on transport failure or actor refusal.
+    /// Atomic human input is retired only by typed server admission.
     pub pending_submissions: RwSignal<HashMap<LocalSubmissionId, PendingSubmission>>,
+    // Buffers a server admission event only until local transport admission settles.
+    pub in_flight_human_admissions:
+        RwSignal<HashMap<(AgentRef, protocol::HumanInputId), Option<protocol::HumanInputStatus>>>,
     /// Logical submissions the user took back, so the UI that created one can
     /// still say what became of it after its record is gone.
     ///
@@ -1191,6 +1203,7 @@ impl AppState {
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             pending_submissions: RwSignal::new(HashMap::new()),
+            in_flight_human_admissions: RwSignal::new(HashMap::new()),
             withdrawn_submissions: RwSignal::new(HashMap::new()),
             next_submission_origin: RwSignal::new(0),
             task_lists: RwSignal::new(HashMap::new()),
@@ -1483,21 +1496,127 @@ impl AppState {
     /// *before* admission; by the time we are here the frame is already gone and
     /// refusing to hold its text would simply lose it.
     ///
-    /// A record leaves this store by exactly three routes: `TransportAcknowledged`
-    /// retires it, the user discards it, or the host is forgotten.
+    /// Records retire on transport/server admission, explicit withdrawal, or
+    /// forgetting their host.
     pub fn hold_submission(&self, submission: PendingSubmission) {
+        let admission = match &submission.target {
+            SubmissionTarget::Agent(agent)
+                if submission.action == protocol::HumanInputAction::InterruptAndSend =>
+            {
+                let key = (agent.clone(), submission.human_input_id.clone());
+                self.in_flight_human_admissions
+                    .try_update(|pending| pending.remove(&key))
+                    .flatten()
+                    .flatten()
+                    .map(|status| (agent.clone(), submission.human_input_id.clone(), status))
+            }
+            _ => None,
+        };
         self.pending_submissions.update(|records| {
             records.insert(submission.local_submission_id, submission);
+        });
+        if let Some((agent, id, status)) = admission {
+            self.apply_human_input_status(
+                &agent,
+                protocol::HumanInputStatusPayload {
+                    agent_id: agent.agent_id.clone(),
+                    id,
+                    status,
+                },
+            );
+        }
+    }
+
+    pub fn begin_human_admission(&self, agent: &AgentRef, id: &protocol::HumanInputId) {
+        self.in_flight_human_admissions.update(|pending| {
+            pending.insert((agent.clone(), id.clone()), None);
+        });
+    }
+
+    pub fn cancel_human_admission(&self, agent: &AgentRef, id: &protocol::HumanInputId) {
+        self.in_flight_human_admissions.update(|pending| {
+            pending.remove(&(agent.clone(), id.clone()));
+        });
+    }
+
+    pub fn apply_human_input_status(
+        &self,
+        agent: &AgentRef,
+        payload: protocol::HumanInputStatusPayload,
+    ) {
+        if let protocol::HumanInputStatus::Accepted {
+            warning: Some(message),
+        } = &payload.status
+        {
+            self.mobile_shell_error.set(Some(MobileShellError {
+                code: protocol::MobileAccessErrorCode::TransportFailed,
+                message: message.clone(),
+            }));
+        }
+        let key = (agent.clone(), payload.id.clone());
+        if self
+            .in_flight_human_admissions
+            .with_untracked(|pending| pending.contains_key(&key))
+        {
+            self.in_flight_human_admissions.update(|pending| {
+                pending.insert(key, Some(payload.status));
+            });
+            return;
+        }
+        self.pending_submissions.update(|records| {
+            records.retain(|_, record| {
+                if record.target != SubmissionTarget::Agent(agent.clone())
+                    || record.human_input_id != payload.id
+                {
+                    return true;
+                }
+                match &payload.status {
+                    protocol::HumanInputStatus::Accepted { .. } => return false,
+                    protocol::HumanInputStatus::Refused { reason } => {
+                        record.state = PendingSubmissionState::NotSent;
+                        record.failure_reason = Some(reason.clone());
+                    }
+                    protocol::HumanInputStatus::Unconfirmed { reason } => {
+                        record.state = PendingSubmissionState::DeliveryUnknown;
+                        record.failure_reason = Some(reason.clone());
+                    }
+                }
+                true
+            });
+        });
+    }
+
+    pub fn disconnect_human_admissions(&self, host: &LocalHostId) {
+        let reason =
+            "The connection closed before the server confirmed whether this message was accepted.";
+        self.in_flight_human_admissions.update(|pending| {
+            for ((agent, _), status) in pending.iter_mut() {
+                if agent.local_host_id == *host && status.is_none() {
+                    *status = Some(protocol::HumanInputStatus::Unconfirmed {
+                        reason: reason.to_owned(),
+                    });
+                }
+            }
+        });
+        self.pending_submissions.update(|records| {
+            for record in records.values_mut() {
+                if record.local_host_id == *host
+                    && record.action == protocol::HumanInputAction::InterruptAndSend
+                    && matches!(record.target, SubmissionTarget::Agent(_))
+                    && record.state == PendingSubmissionState::QueuedLocally
+                {
+                    record.state = PendingSubmissionState::DeliveryUnknown;
+                    record.failure_reason = Some(reason.to_owned());
+                }
+            }
         });
     }
 
     /// Apply a transport fact reported by the connection layer for one
     /// submission.
     ///
-    /// `TransportAcknowledged` **retires the record silently** — no dismissal, no
-    /// accumulation, no announcement. It is a transport fact only: it does not
-    /// claim the host received or applied the frame, and the record is not kept
-    /// around pretending otherwise.
+    /// A socket acknowledgement retires legacy transport-only records, but not
+    /// atomic human input: its actor-admission event alone releases custody.
     ///
     /// An outcome from a connection instance other than the one that admitted
     /// the frame is ignored: a dead connection cannot speak for a live one's
@@ -1529,6 +1648,9 @@ impl AppState {
                 );
                 return;
             }
+            if record.failure_reason.is_some() {
+                return;
+            }
             match outcome {
                 SubmissionTransportOutcome::QueuedLocally => {
                     record.state = PendingSubmissionState::QueuedLocally;
@@ -1540,7 +1662,11 @@ impl AppState {
                     record.state = PendingSubmissionState::DeliveryUnknown;
                 }
                 SubmissionTransportOutcome::TransportAcknowledged => {
-                    records.remove(&local_submission_id);
+                    if record.action != protocol::HumanInputAction::InterruptAndSend
+                        || !matches!(record.target, SubmissionTarget::Agent(_))
+                    {
+                        records.remove(&local_submission_id);
+                    }
                 }
             }
         });
@@ -1984,6 +2110,9 @@ impl AppState {
         // do this — the records are exactly what the user recovers from.
         self.pending_submissions.update(|m| {
             m.retain(|_, record| record.local_host_id != *host);
+        });
+        self.in_flight_human_admissions.update(|pending| {
+            pending.retain(|(agent, _), _| agent.local_host_id != *host);
         });
         // …and it is the one point at which a withdrawal tombstone can safely go.
         //

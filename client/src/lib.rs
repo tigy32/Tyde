@@ -1589,6 +1589,10 @@ impl Connection {
                     let _: protocol::SelfImprovementState =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::HumanInputStatus => {
+                    let _: protocol::HumanInputStatusPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::MobileAccessState => {
                     let _: MobileAccessStatePayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;

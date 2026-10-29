@@ -258,6 +258,7 @@ struct InitialFollowUpContext<'a> {
     pending_inputs: &'a mut VecDeque<AgentInput>,
     held_controls: &'a mut VecDeque<HeldControlDelivery>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
+    accepted_human_inputs: &'a HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
 }
 
 struct QueueDispatchTerminalContext<'a> {
@@ -283,6 +284,7 @@ struct QueueDispatchTerminalContext<'a> {
     open_tool_call_ids: &'a mut HashSet<String>,
     pending_tool_response_ids: &'a mut HashSet<String>,
     active_agent_await_ids: &'a mut HashSet<String>,
+    accepted_human_inputs: &'a HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
 }
 
 struct AgentNameChangeContext<'a> {
@@ -504,6 +506,13 @@ enum AgentCommand {
         redirect: RunningTurnRedirect,
         human: Option<HumanDelivery>,
         reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    },
+    /// Whether this actor accepted a human input identity. Answered in mailbox
+    /// order, after every earlier delivery has settled.
+    HumanInputAccepted {
+        id: protocol::HumanInputId,
+        config: crate::self_improvement::ConfigHandle,
+        reply: oneshot::Sender<Result<bool, String>>,
     },
     Compact {
         summary_prompt: String,
@@ -1859,10 +1868,19 @@ impl AgentHandle {
     pub(crate) fn enqueue_swarm_message(
         &self,
         payload: SendMessagePayload,
+        human: Option<(
+            protocol::HumanInputId,
+            crate::self_improvement::ConfigHandle,
+        )>,
     ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
         self.enqueue_delivery(
             AgentInput::SendMessage(payload),
             RunningTurnRedirect::IdleOnly,
+            human.map(|(id, config)| HumanDelivery {
+                id,
+                action: protocol::HumanInputAction::InterruptAndSend,
+                config,
+            }),
         )
     }
 
@@ -1873,6 +1891,7 @@ impl AgentHandle {
         self.enqueue_delivery(
             AgentInput::SteerMessage(payload),
             RunningTurnRedirect::SwarmWake,
+            None,
         )
     }
 
@@ -1883,6 +1902,7 @@ impl AgentHandle {
         self.enqueue_delivery(
             AgentInput::SendMessage(payload),
             RunningTurnRedirect::SteerElseInterrupt,
+            None,
         )
     }
 
@@ -1942,7 +1962,7 @@ impl AgentHandle {
         redirect: RunningTurnRedirect,
     ) -> Result<(), String> {
         let receipt = self
-            .enqueue_delivery(input, redirect)
+            .enqueue_delivery(input, redirect, None)
             .map_err(|error| error.to_string())?;
         receipt.wait().await.map_err(|error| error.to_string())
     }
@@ -1951,14 +1971,20 @@ impl AgentHandle {
         &self,
         input: AgentInput,
         id: protocol::HumanInputId,
+        action: protocol::HumanInputAction,
         config: crate::self_improvement::ConfigHandle,
     ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
         let (reply, receipt) = oneshot::channel();
         self.tx
             .send(AgentCommand::DeliverMessage {
                 input,
-                redirect: RunningTurnRedirect::SteerElseInterrupt,
-                human: Some(HumanDelivery { id, config }),
+                redirect: match action {
+                    protocol::HumanInputAction::InterruptAndSend => RunningTurnRedirect::Interrupt,
+                    protocol::HumanInputAction::Send | protocol::HumanInputAction::Steer => {
+                        RunningTurnRedirect::SteerElseInterrupt
+                    }
+                },
+                human: Some(HumanDelivery { id, action, config }),
                 reply,
             })
             .map_err(|_| {
@@ -1984,6 +2010,7 @@ impl AgentHandle {
         &self,
         input: AgentInput,
         redirect: RunningTurnRedirect,
+        human: Option<HumanDelivery>,
     ) -> Result<AgentDeliveryReceipt, AgentDeliveryFailure> {
         if self.is_closing() {
             return Err(AgentDeliveryFailure::Rejected(
@@ -1995,7 +2022,7 @@ impl AgentHandle {
             .send(AgentCommand::DeliverMessage {
                 input,
                 redirect,
-                human: None,
+                human,
                 reply,
             })
             .map_err(|_| {
@@ -2291,6 +2318,20 @@ impl AgentHandle {
         result
             .await
             .map_err(|_| "Tychat delivery was not acknowledged".to_owned())?
+    }
+
+    pub(crate) async fn human_input_accepted(
+        &self,
+        id: protocol::HumanInputId,
+        config: crate::self_improvement::ConfigHandle,
+    ) -> Result<bool, String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::HumanInputAccepted { id, config, reply })
+            .map_err(|_| "Agent mailbox is closed".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Agent stopped before answering".to_owned())?
     }
 
     pub(crate) async fn send_tychat(&self, text: String) -> Result<(), String> {
@@ -4506,6 +4547,10 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::TychatSend { reply, .. } => {
                             let _ = reply.send(Err("Tychat agent is starting".into()));
                         }
+                        AgentCommand::HumanInputAccepted { id, config, reply } => {
+                            let _ = reply.send(Ok(accepted_human_inputs.contains_key(&id)
+                                || config.human_was_seen(&id)));
+                        }
                         AgentCommand::DeliverMessage {
                             input,
                             redirect,
@@ -4692,6 +4737,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut held_controls,
                     &mut rx,
                     &status_handle,
+                    &accepted_human_inputs,
                 )
                 .await;
                 return;
@@ -4871,6 +4917,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut held_controls,
                     &mut rx,
                     &status_handle,
+                    &accepted_human_inputs,
                 )
                 .await;
                 return;
@@ -5086,6 +5133,7 @@ pub(crate) fn spawn_agent_actor(
                 &mut held_controls,
                 &mut rx,
                 &status_handle,
+                &accepted_human_inputs,
             )
             .await;
             return;
@@ -5220,6 +5268,7 @@ pub(crate) fn spawn_agent_actor(
                     pending_inputs: &mut pending_inputs,
                     held_controls: &mut held_controls,
                     rx: &mut rx,
+                    accepted_human_inputs: &accepted_human_inputs,
                 },
             )
             .await
@@ -5270,6 +5319,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut held_controls,
                     &mut rx,
                     &status_handle,
+                    &accepted_human_inputs,
                 )
                 .await;
                 return;
@@ -5781,6 +5831,7 @@ pub(crate) fn spawn_agent_actor(
                                 open_tool_call_ids: &mut open_tool_call_ids,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
                                 active_agent_await_ids: &mut active_agent_await_ids,
+                                accepted_human_inputs: &accepted_human_inputs,
                             })
                             .await;
                             return;
@@ -6188,6 +6239,7 @@ pub(crate) fn spawn_agent_actor(
                             pending_inputs: &mut pending_inputs,
                             held_controls: &mut held_controls,
                             rx: &mut rx,
+                            accepted_human_inputs: &accepted_human_inputs,
                         },
                     )
                     .await
@@ -6397,6 +6449,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut held_controls,
                                 &mut rx,
                                 &status_handle,
+                                &accepted_human_inputs,
                             )
                             .await;
                             return;
@@ -6481,6 +6534,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut held_controls,
                             &mut rx,
                             &status_handle,
+                            &accepted_human_inputs,
                         )
                         .await;
                         return;
@@ -6816,6 +6870,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
+                                                &accepted_human_inputs,
                                             )
                                             .await;
                                             return;
@@ -6855,6 +6910,7 @@ pub(crate) fn spawn_agent_actor(
                                                 pending_inputs: &mut pending_inputs,
                                                 held_controls: &mut held_controls,
                                                 rx: &mut rx,
+                                                accepted_human_inputs: &accepted_human_inputs,
                                             },
                                         )
                                         .await
@@ -6966,6 +7022,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut held_controls,
                                         &mut rx,
                                         &status_handle,
+                                        &accepted_human_inputs,
                                     )
                                     .await;
                                     return;
@@ -7833,6 +7890,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut held_controls,
                                     &mut rx,
                                     &status_handle,
+                                    &accepted_human_inputs,
                                 )
                                 .await;
                                 return;
@@ -7904,6 +7962,10 @@ pub(crate) fn spawn_agent_actor(
                             reply,
                         } => {
 
+                            control_redirect = is_agent_control_redirect(&input, delivery_redirect, &human);
+                            // A retried human input that was already admitted settles
+                            // as admitted before any idle-only busy refusal.
+                            let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             let refused = match delivery_redirect {
                                 RunningTurnRedirect::IdleOnly => in_turn || resume_replay_gate_pending || usage_paused || !queue.is_empty(),
                                 RunningTurnRedirect::SwarmWake => resume_replay_gate_pending || usage_paused || !queue.is_empty(),
@@ -7913,17 +7975,23 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err(AgentDeliveryFailure::Busy));
                                 continue;
                             }
-                            control_redirect = is_agent_control_redirect(&input, delivery_redirect, &human);
-                            let Some(reply) = prepare_delivery_ack(reply, human, &input, &current_start, latest_output.output(), &mut accepted_human_inputs) else { continue; };
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
                             tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn, control_redirect,
                                 pending_move = scheduled_project_move.is_some(), "actor received acknowledged delivery");
                             AgentCommand::SendInput(input)
                         }
+                        AgentCommand::HumanInputAccepted { id, config, reply } => {
+                            let _ = reply.send(Ok(accepted_human_inputs.contains_key(&id) || config.human_was_seen(&id)));
+                            continue;
+                        }
                         command => command,
                     };
                     match command {
+                        AgentCommand::HumanInputAccepted { reply, .. } => {
+                            // Answered during normalization above; fail closed.
+                            let _ = reply.send(Err("Human input acceptance was not answered".to_owned()));
+                        }
                         AgentCommand::TychatSend { text, reply } => {
                             let result = async {
                                 if current_start.origin != protocol::AgentOrigin::Tychat {
@@ -8194,8 +8262,12 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::SendInput(input) => {
 
                             if resume_replay_gate_pending {
-                                if control_redirect {
-                                    reject_agent_delivery(delivery_ack.take(), DELIVERY_REJECTED_REPLAY);
+                                if control_redirect || redirect == RunningTurnRedirect::Interrupt {
+                                    if let Some(reply) = delivery_ack.take() {
+                                        let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                                            DELIVERY_REJECTED_REPLAY.to_owned(),
+                                        )));
+                                    }
                                     continue;
                                 }
                                 // Accepted, not rejected: the resume barrier is
@@ -8310,7 +8382,9 @@ pub(crate) fn spawn_agent_actor(
                                             && !(redirect == RunningTurnRedirect::Interrupt
                                                 && !pending_tool_response_ids.is_empty()))
                                         || usage_paused
-                                        || (context_compaction.is_some() && !control_redirect) =>
+                                        || (context_compaction.is_some()
+                                            && !control_redirect
+                                            && redirect != RunningTurnRedirect::Interrupt) =>
                                 {
                                     tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn,
                                         usage_paused, context_compaction = context_compaction.is_some(),
@@ -8625,15 +8699,28 @@ pub(crate) fn spawn_agent_actor(
                                                 "queued review-origin bundle"
                                             );
                                         }
-                                        update_queued_messages_snapshot(
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &queue,
-                                            &session_store,
-                                            &status_handle,
-                                        )
-                                        .await;
+                                        if redirect == RunningTurnRedirect::Interrupt && !control_redirect {
+                                            if let Err(error) = admit_human_queued_message(
+                                                &canonical_stream, &mut event_log, &mut subscribers,
+                                                &mut queue, &queued_message_id, &status_handle,
+                                            ).await {
+                                                if let Some(reply) = delivery_ack.take() {
+                                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(format!(
+                                                        "The new prompt was not queued: {error}"
+                                                    ))));
+                                                }
+                                                continue;
+                                            }
+                                        } else {
+                                            update_queued_messages_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &queue,
+                                                &session_store,
+                                                &status_handle,
+                                            ).await;
+                                        }
                                         if let Some(reply) = delivery_ack.take() {
                                             // Queued behind the open turn counts
                                             // as accepted. Mark active first:
@@ -8684,6 +8771,14 @@ pub(crate) fn spawn_agent_actor(
                                             .send_with_outcome(AgentInput::SendMessage(msg))
                                             .await;
                                         if let SendOutcome::Busy(input) = outcome {
+                                            if redirect == RunningTurnRedirect::Interrupt && !control_redirect {
+                                                if let Some(reply) = delivery_ack.take() {
+                                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(
+                                                        "The backend became busy before admission; the new prompt was not delivered or queued".to_owned(),
+                                                    )));
+                                                }
+                                                continue;
+                                            }
                                             if matches!(
                                                 redirect,
                                                 RunningTurnRedirect::IdleOnly
@@ -8841,6 +8936,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
+                                                &accepted_human_inputs,
                                             )
                                             .await;
                                             return;
@@ -8971,21 +9067,16 @@ pub(crate) fn spawn_agent_actor(
                                             }
                                             continue;
                                         }
-                                        if control_redirect
+                                        if (control_redirect || redirect == RunningTurnRedirect::Interrupt)
                                             && let Some(reply) = delivery_ack.take()
                                         {
-                                            match redirect_admission {
-                                                registry::DispatchAdmission::RecoveryPending => {
-                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_RECOVERY_PENDING);
-                                                }
-                                                registry::DispatchAdmission::HostStopping => {
-                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_HOST_STOPPING);
-                                                }
+                                            let reason = match redirect_admission {
+                                                registry::DispatchAdmission::RecoveryPending => DELIVERY_REJECTED_RECOVERY_PENDING,
+                                                registry::DispatchAdmission::HostStopping => DELIVERY_REJECTED_HOST_STOPPING,
                                                 registry::DispatchAdmission::Admitted
-                                                | registry::DispatchAdmission::Unrecorded => {
-                                                    reject_agent_delivery(Some(reply), DELIVERY_REJECTED_UNRECORDED);
-                                                }
-                                            }
+                                                | registry::DispatchAdmission::Unrecorded => DELIVERY_REJECTED_UNRECORDED,
+                                            };
+                                            let _ = reply.send(Err(AgentDeliveryFailure::Rejected(reason.to_owned())));
                                             continue;
                                         }
                                         let sequence = next_queue_sequence;
@@ -9124,16 +9215,33 @@ pub(crate) fn spawn_agent_actor(
                                             sequence,
                                             entry: queued_entry_from_send_payload(payload),
                                         };
+                                        let queued_message_id = queued.entry.id.clone();
                                         queue.push_front(queued);
-                                        update_queued_messages_snapshot(
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &queue,
-                                            &session_store,
-                                            &status_handle,
-                                        )
-                                        .await;
+                                        if redirect == RunningTurnRedirect::Interrupt {
+                                            if let Err(error) = admit_human_queued_message(
+                                                &canonical_stream, &mut event_log, &mut subscribers,
+                                                &mut queue, &queued_message_id, &status_handle,
+                                            ).await {
+                                                // Nothing has changed yet: the
+                                                // running turn is interrupted only
+                                                // once the prompt is durably queued.
+                                                if let Some(reply) = delivery_ack.take() {
+                                                    let _ = reply.send(Err(AgentDeliveryFailure::Rejected(format!(
+                                                        "The new prompt was not queued, and the running turn was left alone: {error}"
+                                                    ))));
+                                                }
+                                                continue;
+                                            }
+                                        } else {
+                                            update_queued_messages_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &queue,
+                                                &session_store,
+                                                &status_handle,
+                                            ).await;
+                                        }
                                         if let Some(reply) = delivery_ack.take() {
                                             if reply.is_control() && in_turn { mark_agent_turn_active(&status_handle).await; }
                                             let _ = reply.send(Ok(()));
@@ -9458,6 +9566,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut held_controls,
                                                 &mut rx,
                                                 &status_handle,
+                                                &accepted_human_inputs,
                                             )
                                             .await;
                                             return;
@@ -10267,6 +10376,7 @@ pub(crate) fn spawn_agent_actor(
                                         open_tool_call_ids: &mut open_tool_call_ids,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
+                                        accepted_human_inputs: &accepted_human_inputs,
                                     },
                                 )
                                 .await;
@@ -10463,6 +10573,7 @@ pub(crate) fn spawn_agent_actor(
                                             pending_tool_response_ids:
                                                 &mut pending_tool_response_ids,
                                             active_agent_await_ids: &mut active_agent_await_ids,
+                                            accepted_human_inputs: &accepted_human_inputs,
                                         },
                                     )
                                     .await;
@@ -11098,6 +11209,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut held_controls,
                                 &mut rx,
                                 &status_handle,
+                                &accepted_human_inputs,
                             )
                             .await;
                             return;
@@ -11895,6 +12007,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::TychatDeliver { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::TychatSettings { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
             AgentCommand::TychatSend { reply, .. } => { let _ = reply.send(Err("Tychat agent is not running".into())); }
+            AgentCommand::HumanInputAccepted { id, config, reply } => { let _ = reply.send(Ok(config.human_was_seen(&id))); }
             AgentCommand::DeliverMessage { human, reply, .. } => {
                             if human.is_some() {
                                 let payload = relay_input_rejected_payload(&current_start.agent_id);
@@ -12468,13 +12581,18 @@ pub(crate) enum AgentDeliveryFailure {
     Busy,
     Rejected(String),
     Reported(String),
+    AcceptedWithWarning(String),
+    Unconfirmed(String),
 }
 
 impl std::fmt::Display for AgentDeliveryFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => formatter.write_str("Swarm delivery deferred: member is busy"),
-            Self::Rejected(message) | Self::Reported(message) => formatter.write_str(message),
+            Self::Rejected(message)
+            | Self::Reported(message)
+            | Self::AcceptedWithWarning(message)
+            | Self::Unconfirmed(message) => formatter.write_str(message),
         }
     }
 }
@@ -12484,7 +12602,7 @@ pub(crate) struct AgentDeliveryReceipt(oneshot::Receiver<Result<(), AgentDeliver
 impl AgentDeliveryReceipt {
     pub(crate) async fn wait(self) -> Result<(), AgentDeliveryFailure> {
         self.0.await.unwrap_or_else(|_| {
-            Err(AgentDeliveryFailure::Rejected(
+            Err(AgentDeliveryFailure::Unconfirmed(
                 DELIVERY_NOT_ACKNOWLEDGED.to_owned(),
             ))
         })
@@ -12561,6 +12679,7 @@ async fn apply_agent_tyde_permissions(
 
 struct HumanDelivery {
     id: protocol::HumanInputId,
+    action: protocol::HumanInputAction,
     config: crate::self_improvement::ConfigHandle,
 }
 
@@ -12588,11 +12707,37 @@ impl DeliveryAcknowledgement<'_> {
                 .accepted
                 .insert(human.input.id.clone(), human.input.clone());
             if let Err(reason) = human.config.record_accepted_human(human.input) {
-                return self.reply.send(Err(AgentDeliveryFailure::Rejected(format!("The author accepted this input, but learning is unavailable: {reason}. Do not resend the author input."))));
+                return self.reply.send(Err(AgentDeliveryFailure::AcceptedWithWarning(format!("The author accepted this input, but learning is unavailable: {reason}. Do not resend the author input."))));
             }
         }
         self.reply.send(result)
     }
+}
+
+/// Answers a retry of a human input this actor already accepted, so a
+/// resent identity settles as accepted instead of running again or being
+/// refused. Returns the delivery when the identity is new.
+fn new_human_delivery(
+    reply: oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    human: HumanDelivery,
+    accepted: &HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
+) -> Option<(
+    oneshot::Sender<Result<(), AgentDeliveryFailure>>,
+    HumanDelivery,
+)> {
+    if let Some(previous) = accepted.get(&human.id) {
+        let result = human
+            .config
+            .record_accepted_human(previous.clone())
+            .map_err(AgentDeliveryFailure::AcceptedWithWarning);
+        let _ = reply.send(result);
+        return None;
+    }
+    if human.config.human_was_seen(&human.id) {
+        let _ = reply.send(Ok(()));
+        return None;
+    }
+    Some((reply, human))
 }
 
 fn prepare_delivery_ack<'a>(
@@ -12606,26 +12751,19 @@ fn prepare_delivery_ack<'a>(
     let Some(human) = human else {
         return Some(DeliveryAcknowledgement { reply, human: None });
     };
-    if let Some(previous) = accepted.get(&human.id) {
-        let result = human
-            .config
-            .record_accepted_human(previous.clone())
-            .map_err(AgentDeliveryFailure::Rejected);
-        let _ = reply.send(result);
-        return None;
-    }
-    if human.config.human_was_seen(&human.id) {
-        let _ = reply.send(Ok(()));
-        return None;
-    }
+    let (reply, human) = new_human_delivery(reply, human, accepted)?;
     let (message, source) = match input {
         AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload) => {
             let source = if payload.tool_response.is_some() {
                 protocol::HumanInputSource::AskUserAnswer
-            } else if matches!(input, AgentInput::SteerMessage(_)) {
-                protocol::HumanInputSource::Steering
             } else {
-                protocol::HumanInputSource::Chat
+                match human.action {
+                    protocol::HumanInputAction::Steer => protocol::HumanInputSource::Steering,
+                    protocol::HumanInputAction::Send
+                    | protocol::HumanInputAction::InterruptAndSend => {
+                        protocol::HumanInputSource::Chat
+                    }
+                }
             };
             let text = match &payload.tool_response {
                 Some(protocol::SendMessageToolResponse::AskUserQuestion { answer, .. }) => {
@@ -13223,6 +13361,7 @@ async fn park_terminal_agent(
     held_controls: &mut VecDeque<HeldControlDelivery>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
     status_handle: &registry::AgentStatusHandle,
+    accepted_human_inputs: &HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
 ) {
     reject_held_agent_controls(held_controls, DELIVERY_REJECTED_TERMINAL);
     event_log.timing.interrupt();
@@ -13443,8 +13582,17 @@ async fn park_terminal_agent(
             AgentCommand::TychatSend { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
             }
+            AgentCommand::HumanInputAccepted { id, config, reply } => {
+                let _ = reply.send(Ok(
+                    accepted_human_inputs.contains_key(&id) || config.human_was_seen(&id)
+                ));
+            }
             AgentCommand::DeliverMessage { human, reply, .. } => {
-                if human.is_some() {
+                if let Some(human) = human {
+                    let Some((reply, _)) = new_human_delivery(reply, human, accepted_human_inputs)
+                    else {
+                        continue;
+                    };
                     let payload = terminal_input_rejected_payload(&current_start.agent_id);
                     append_event(
                         &format!("/agent/{}", current_start.agent_id),
@@ -13730,6 +13878,9 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::TychatSend { reply, .. } => {
                 let _ = reply.send(Err("Tychat agent is not running".into()));
+            }
+            AgentCommand::HumanInputAccepted { id, config, reply } => {
+                let _ = reply.send(Ok(config.human_was_seen(&id)));
             }
             AgentCommand::DeliverMessage { human, reply, .. } => {
                 if human.is_some() {
@@ -15554,6 +15705,7 @@ async fn send_initial_follow_up_or_park(
         context.held_controls,
         context.rx,
         context.status_handle,
+        context.accepted_human_inputs,
     )
     .await;
     InitialFollowUpDispatch::Terminated
@@ -15617,6 +15769,7 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
         context.held_controls,
         context.rx,
         context.status_handle,
+        context.accepted_human_inputs,
     )
     .await;
 }
@@ -16415,6 +16568,31 @@ fn cap_activity_text(text: &str, max_chars: usize) -> String {
         .collect()
 }
 
+async fn admit_human_queued_message(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    queue: &mut VecDeque<SequencedQueuedMessage>,
+    inserted_id: &QueuedMessageId,
+    status_handle: &registry::AgentStatusHandle,
+) -> Result<(), String> {
+    let messages = queue.iter().map(|queued| queued.entry.clone()).collect();
+    if let Err(error) = status_handle.persist_queued_messages(messages).await {
+        queue.retain(|queued| queued.entry.id != *inserted_id);
+        tracing::warn!("Human input queue admission refused before durable custody");
+        return Err(error);
+    }
+    publish_queued_messages_snapshot(
+        canonical_stream,
+        event_log,
+        subscribers,
+        queue,
+        status_handle,
+    )
+    .await;
+    Ok(())
+}
+
 async fn update_queued_messages_snapshot(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
@@ -16423,22 +16601,13 @@ async fn update_queued_messages_snapshot(
     session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
 ) {
-    // The single funnel for queue changes, so the status flag cannot drift from
-    // the queue it describes.
-    let queued = !queue.is_empty();
-    status_handle
-        .update(|status| status.has_queued_messages = queued)
-        .await;
-    let payload = QueuedMessagesPayload {
-        messages: queue.iter().map(|queued| queued.entry.clone()).collect(),
-    };
     if let Some(session_id) = event_log.iter().find_map(|event| {
         (event.kind == FrameKind::AgentStart)
             .then(|| event.parse_payload::<AgentStartPayload>().ok())
             .flatten()
             .and_then(|start| start.session_id)
     }) {
-        let messages = payload.messages.clone();
+        let messages = queue.iter().map(|queued| queued.entry.clone()).collect();
         let persist_id = session_id.clone();
         if let Err(error) = run_session_store_io(session_store, move |store| {
             store.update(&persist_id, |record| record.queued_messages = messages)
@@ -16448,6 +16617,30 @@ async fn update_queued_messages_snapshot(
             tracing::error!(%session_id, %error, "failed to persist queued messages");
         }
     }
+    publish_queued_messages_snapshot(
+        canonical_stream,
+        event_log,
+        subscribers,
+        queue,
+        status_handle,
+    )
+    .await;
+}
+
+async fn publish_queued_messages_snapshot(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    queue: &VecDeque<SequencedQueuedMessage>,
+    status_handle: &registry::AgentStatusHandle,
+) {
+    let queued = !queue.is_empty();
+    status_handle
+        .update(|status| status.has_queued_messages = queued)
+        .await;
+    let payload = QueuedMessagesPayload {
+        messages: queue.iter().map(|queued| queued.entry.clone()).collect(),
+    };
     let value =
         serde_json::to_value(&payload).expect("failed to serialize queued messages payload");
 

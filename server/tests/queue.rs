@@ -178,6 +178,38 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         "queued while ExitPlanMode is pending"
     );
 
+    fixture
+        .client
+        .human_input(
+            &agent.stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("invalid-interrupt-approval".to_owned()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: SendMessagePayload {
+                    message: String::new(),
+                    images: None,
+                    origin: None,
+                    tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                        tool_call_id: request.tool_call_id.clone(),
+                        decision: protocol::ExitPlanModeDecision::Approve,
+                        feedback: None,
+                    }),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let rejection = fixture
+        .next_frame_matching("reject interrupting approval", |env| {
+            env.kind == FrameKind::CommandError
+        })
+        .await
+        .parse_payload::<protocol::CommandErrorPayload>()
+        .unwrap();
+    assert_eq!(rejection.request_kind, FrameKind::HumanInput);
+    assert!(rejection.message.contains("cannot carry a tool response"));
+    assert!(!rejection.fatal);
+
     fixture.approve_exit_plan_mode(&agent, &request).await;
 
     let approval_turn = fixture.finish_turn(&agent).await;
@@ -1369,6 +1401,609 @@ async fn steer_and_send_now_use_distinct_delivery_modes() {
         "an idle steer must be delivered as an ordinary send"
     );
     mock.assert_clean().await;
+}
+
+#[tokio::test]
+async fn human_interrupt_and_send_preserves_queue_and_stop_boundaries() {
+    const REJECT_QUEUE_GROWTH: &str = "CREATE TRIGGER reject_mobile_queue_growth BEFORE UPDATE OF record ON sessions
+         WHEN json_array_length(NEW.record, '$.queued_messages') > json_array_length(OLD.record, '$.queued_messages')
+         BEGIN SELECT RAISE(ABORT, 'injected queued-message persistence failure'); END;";
+    async fn admitted_queue(
+        fixture: &mut Fixture,
+        agent: &TestAgent,
+        id: &protocol::HumanInputId,
+        count: usize,
+    ) -> QueuedMessagesPayload {
+        let mut queued = None;
+        let mut admitted = false;
+        // Queue snapshots and custody statuses use different output lanes.
+        fixture
+            .next_frame_matching("human admission and queue snapshot", |env| {
+                if env.kind == FrameKind::HumanInputStatus {
+                    let status: protocol::HumanInputStatusPayload = env.parse_payload().unwrap();
+                    if status.id == *id {
+                        assert!(status.agent_id == agent.new_agent.agent_id);
+                        assert!(matches!(
+                            status.status,
+                            protocol::HumanInputStatus::Accepted { warning: None }
+                        ));
+                        admitted = true;
+                    }
+                } else if env.kind == FrameKind::QueuedMessages && env.stream == agent.stream {
+                    let snapshot: QueuedMessagesPayload = env.parse_payload().unwrap();
+                    if snapshot.messages.len() == count {
+                        queued = Some(snapshot);
+                    }
+                }
+                admitted && queued.is_some()
+            })
+            .await;
+        queued.expect("both typed admission and queue snapshot observed")
+    }
+    let mut fixture = Fixture::new().await;
+    let stop = MockGateHandle::new();
+    let startup = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("mobile-default-send");
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "mobile-default-send",
+            MockScript::one(MockTurn::held_text("initial reply"))
+                .then(MockTurn::held_text("replacement reply"))
+                .then(MockTurn::text("after Stop reply"))
+                .then(MockTurn::text("starting reply"))
+                .then(MockTurn::text("queued A reply"))
+                .then(MockTurn::text("queued B reply"))
+                .then(MockTurn::text("idle reply"))
+                .then(MockTurn::text("paused queue reply"))
+                .then(MockTurn::text("persisted retry reply"))
+                .with_user_bubbles()
+                .with_mid_turn_steering()
+                .with_native_child_idle_gate(&stop),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("mobile-default-send".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "scripted launch".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .unwrap();
+    startup.wait_until_entered().await;
+    let new_agent: protocol::NewAgentPayload = fixture
+        .next_frame_matching("advertised starting agent", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    let agent = TestAgent {
+        stream: new_agent.instance_stream.clone(),
+        new_agent,
+    };
+    let startup_input = protocol::HumanInputPayload {
+        id: protocol::HumanInputId("mobile-starting".to_owned()),
+        action: protocol::HumanInputAction::InterruptAndSend,
+        input: SendMessagePayload {
+            images: Some(vec![ImageData {
+                media_type: "image/png".to_owned(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned(),
+            }]),
+            ..steer_payload("send while starting")
+        },
+    };
+    // A starting agent has no turn to interrupt: Send is held for dispatch,
+    // and a resend of the held identity settles without a second copy.
+    for attempt in ["starting send held", "starting resend settles once"] {
+        fixture
+            .client
+            .human_input(&agent.stream, startup_input.clone())
+            .await
+            .unwrap();
+        let held = fixture
+            .next_frame_matching(attempt, |env| {
+                matches!(
+                    env.kind,
+                    FrameKind::HumanInputStatus | FrameKind::AgentError
+                )
+            })
+            .await;
+        assert_eq!(
+            held.kind,
+            FrameKind::HumanInputStatus,
+            "actor custody must settle by typed operation identity, not an uncorrelated error"
+        );
+        let held: protocol::HumanInputStatusPayload = held.parse_payload().unwrap();
+        assert_eq!(held.id, startup_input.id);
+        assert_eq!(held.agent_id, agent.new_agent.agent_id);
+        assert!(
+            matches!(
+                held.status,
+                protocol::HumanInputStatus::Accepted { warning: None }
+            ),
+            "{attempt}: {:?}",
+            held.status
+        );
+    }
+    startup.release_one();
+    let started: protocol::AgentStartPayload = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "started mobile composer agent",
+        |env| env.stream == agent.stream && env.kind == FrameKind::AgentStart,
+    )
+    .await
+    .parse_payload()
+    .unwrap();
+    let session_id = started
+        .session_id
+        .expect("started agent has a durable session");
+    fixture.next_chat_event_matching(&agent, "initial held turn", |event| {
+        matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "initial reply")
+    }).await;
+    drop(reservation);
+    let mock = fixture.mock(&agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "queued A".to_owned())
+        .await
+        .unwrap();
+    let original = fixture.expect_queued_messages(&agent, 2).await;
+    assert_eq!(original.messages[0].message, startup_input.input.message);
+    assert_eq!(
+        Some(&original.messages[0].images),
+        startup_input.input.images.as_ref(),
+        "the held starting Send keeps its image"
+    );
+    assert_eq!(original.messages[1].message, "queued A");
+    let replacement = protocol::HumanInputPayload {
+        id: protocol::HumanInputId("mobile-replacement".to_owned()),
+        action: protocol::HumanInputAction::InterruptAndSend,
+        input: steer_payload("replace the current turn"),
+    };
+    fixture
+        .client
+        .human_input(&agent.stream, replacement.clone())
+        .await
+        .unwrap();
+    stop.wait_until_entered().await;
+    let admitted = admitted_queue(&mut fixture, &agent, &replacement.id, 3).await;
+    assert_eq!(admitted.messages[0].message, replacement.input.message);
+    assert_eq!(
+        admitted.messages[1..],
+        original.messages[..],
+        "human queue identity and content survive"
+    );
+    stop.release_one();
+    let mut cancelled = false;
+    fixture
+        .next_chat_event_matching(&agent, "replacement visible after cancellation", |event| {
+            if matches!(event, ChatEvent::OperationCancelled(_)) {
+                cancelled = true;
+            }
+            if is_user_message(event, &replacement.input.message) {
+                assert!(
+                    cancelled,
+                    "cancel must precede new prompt delivery even with native steering"
+                );
+                return true;
+            }
+            false
+        })
+        .await;
+    fixture.next_chat_event_matching(&agent, "replacement held turn", |event| {
+        matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "replacement reply")
+    }).await;
+    // Replaying an already accepted human operation must not cancel its successor.
+    fixture
+        .client
+        .human_input(&agent.stream, replacement)
+        .await
+        .unwrap();
+    fixture
+        .client
+        .send_message(&agent.stream, "queued B".to_owned())
+        .await
+        .unwrap();
+    let queued = fixture
+        .next_frame_matching("duplicate input preserves the replacement turn", |env| {
+            if env.stream != agent.stream {
+                return false;
+            }
+            if env.kind == FrameKind::ChatEvent {
+                let event = env.parse_payload::<ChatEvent>().unwrap();
+                assert!(
+                    !matches!(event, ChatEvent::OperationCancelled(_)),
+                    "duplicate input must not cancel the replacement"
+                );
+                assert!(
+                    !is_user_message(&event, "replace the current turn"),
+                    "duplicate input must not be redelivered"
+                );
+            }
+            env.kind == FrameKind::QueuedMessages
+                && env
+                    .parse_payload::<QueuedMessagesPayload>()
+                    .is_ok_and(|queue| {
+                        queue.messages.len() == 3 && queue.messages[2].message == "queued B"
+                    })
+        })
+        .await
+        .parse_payload::<QueuedMessagesPayload>()
+        .unwrap();
+    assert_eq!(queued.messages[..2], original.messages[..]);
+    assert_eq!(queued.messages[2].message, "queued B");
+
+    // A queue write that fails mid-turn refuses before anything changes: the
+    // running turn is interrupted only once the new prompt is durable.
+    let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+        &fixture.session_store_path(),
+    ))
+    .unwrap();
+    database.execute_batch(REJECT_QUEUE_GROWTH).unwrap();
+    let interrupts_before = mock.unawaited_interrupt_requests();
+    let turn_write_refusal = protocol::HumanInputPayload {
+        id: protocol::HumanInputId("mobile-turn-write-refusal".to_owned()),
+        action: protocol::HumanInputAction::InterruptAndSend,
+        input: steer_payload("refused without cancelling the turn"),
+    };
+    fixture
+        .client
+        .human_input(&agent.stream, turn_write_refusal.clone())
+        .await
+        .unwrap();
+    let refused: protocol::HumanInputStatusPayload = fixture
+        .next_frame_matching("mid-turn queue persistence verdict", |env| {
+            env.kind == FrameKind::HumanInputStatus
+                && env
+                    .parse_payload::<protocol::HumanInputStatusPayload>()
+                    .is_ok_and(|status| status.id == turn_write_refusal.id)
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert!(
+        matches!(&refused.status, protocol::HumanInputStatus::Refused { reason }
+            if reason.contains("left alone") && reason.contains("injected queued-message persistence failure")),
+        "{:?}",
+        refused.status
+    );
+    assert_eq!(
+        mock.unawaited_interrupt_requests(),
+        interrupts_before,
+        "a refused InterruptAndSend must not cancel the running turn"
+    );
+    database
+        .execute_batch("DROP TRIGGER reject_mobile_queue_growth;")
+        .unwrap();
+    drop(database);
+
+    // A prior Stop is fenced to its own turn; the new prompt starts only after idle.
+    fixture.client.interrupt(&agent.stream).await.unwrap();
+    stop.wait_until_entered().await;
+    fixture
+        .client
+        .human_input(
+            &agent.stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("mobile-after-stop".to_owned()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: steer_payload("new prompt after Stop"),
+            },
+        )
+        .await
+        .unwrap();
+    let queued_after_stop = fixture.expect_queued_messages(&agent, 4).await;
+    assert_eq!(
+        queued_after_stop.messages[0].message,
+        "new prompt after Stop"
+    );
+    assert_eq!(&queued_after_stop.messages[1..], queued.messages.as_slice());
+    stop.release_one();
+    let mut delivered = Vec::new();
+    fixture
+        .next_chat_event_matching(&agent, "queued work drains after replacement", |event| {
+            match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, protocol::MessageSender::User) =>
+                {
+                    delivered.push(message.content.clone());
+                }
+                ChatEvent::StreamEnd(end) if end.message.content == "queued B reply" => {
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        })
+        .await;
+    assert_eq!(
+        delivered,
+        [
+            "new prompt after Stop",
+            "send while starting",
+            "queued A",
+            "queued B"
+        ],
+        "the held starting Send runs exactly once"
+    );
+    fixture
+        .next_chat_event_matching(&agent, "queued work idle", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    fixture
+        .client
+        .human_input(
+            &agent.stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("mobile-idle".to_owned()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: steer_payload("send while idle"),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .next_chat_event_matching(&agent, "idle send response", |event| {
+            assert!(
+                !matches!(event, ChatEvent::OperationCancelled(_)),
+                "idle send must not cancel"
+            );
+            matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "idle reply")
+        })
+        .await;
+    fixture
+        .next_chat_event_matching(&agent, "idle send settled", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let setting = fixture
+        .client
+        .replace_setting("/usage_limits/enabled", true, false)
+        .await
+        .unwrap();
+    fixture::expect_settings_write_applied(
+        &mut fixture.client,
+        &setting,
+        "enable usage admission hold",
+    )
+    .await;
+    let quota = |used_percent| protocol::BackendCapacityState::Known {
+        report: protocol::CapacityReport {
+            source: protocol::CapacitySource::ClaudeControlUsage,
+            observed_at_ms: None,
+            plan: None,
+            coverage: protocol::CapacityCoverage::AllVendorBuckets,
+            buckets: vec![protocol::CapacityBucket {
+                id: protocol::CapacityBucketId::Claude {
+                    limit: protocol::ClaudeLimitType::FiveHour,
+                },
+                label: "Five hour".to_owned(),
+                measure: protocol::CapacityMeasure::UsedPercent {
+                    used_percent,
+                    remaining_percent: 100 - used_percent,
+                    provenance: protocol::ValueProvenance {
+                        vendor_reported: true,
+                    },
+                },
+                scope: protocol::CapacityScope::Account,
+                window: protocol::CapacityWindow::Rolling {
+                    duration_minutes: 300,
+                },
+                reset: protocol::CapacityReset::NotReported,
+                status: None,
+            }],
+        },
+    };
+    fixture
+        .host_for_test()
+        .record_backend_capacity_for_test(BackendKind::Claude, quota(95))
+        .await;
+    fixture
+        .next_frame_matching("authoritative usage pause", |env| {
+            env.stream == agent.stream
+                && env.kind == FrameKind::AgentActivityStats
+                && env
+                    .parse_payload::<protocol::AgentActivityStatsPayload>()
+                    .is_ok_and(|stats| stats.stats.usage_limit_pause.is_some())
+        })
+        .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "keep the existing paused queue".to_owned())
+        .await
+        .unwrap();
+    // Match by content: the held starting Send left an earlier one-entry
+    // snapshot in the logical frame buffer.
+    let paused_queue: QueuedMessagesPayload = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "paused queue snapshot",
+        |env| {
+            env.stream == agent.stream
+                && env.kind == FrameKind::QueuedMessages
+                && env
+                    .parse_payload::<QueuedMessagesPayload>()
+                    .is_ok_and(|queue| {
+                        queue.messages.len() == 1
+                            && queue.messages[0].message == "keep the existing paused queue"
+                    })
+        },
+    )
+    .await
+    .parse_payload()
+    .unwrap();
+    let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+        &fixture.session_store_path(),
+    ))
+    .unwrap();
+    database.execute_batch(REJECT_QUEUE_GROWTH).unwrap();
+    let paused_input = protocol::HumanInputPayload {
+        id: protocol::HumanInputId("mobile-queue-write-refusal".to_owned()),
+        action: protocol::HumanInputAction::InterruptAndSend,
+        input: SendMessagePayload {
+            images: startup_input.input.images.clone(),
+            ..steer_payload("retain this text and image after persistence failure")
+        },
+    };
+    fixture
+        .client
+        .human_input(&agent.stream, paused_input.clone())
+        .await
+        .unwrap();
+    let refused: protocol::HumanInputStatusPayload = fixture
+        .next_frame_matching(
+            "correlated queue persistence verdict after successful transport",
+            |env| {
+                env.kind == FrameKind::HumanInputStatus
+                    && env
+                        .parse_payload::<protocol::HumanInputStatusPayload>()
+                        .is_ok_and(|status| status.id == paused_input.id)
+            },
+        )
+        .await
+        .parse_payload()
+        .unwrap();
+    assert_eq!(refused.agent_id, agent.new_agent.agent_id);
+    assert!(
+        matches!(refused.status, protocol::HumanInputStatus::Refused { reason }
+        if reason.contains("not queued") && reason.contains("injected queued-message persistence failure")),
+        "a failed queue write must refuse custody, never emit Accepted"
+    );
+    let persisted: String = database
+        .query_row(
+            "SELECT json_extract(record, '$.queued_messages') FROM sessions WHERE id=?1",
+            [&session_id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let persisted: Vec<protocol::QueuedMessageEntry> = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(
+        persisted, paused_queue.messages,
+        "the failed write preserves the prior durable human queue"
+    );
+    database
+        .execute_batch("DROP TRIGGER reject_mobile_queue_growth;")
+        .unwrap();
+    drop(database);
+    fixture
+        .client
+        .human_input(&agent.stream, paused_input.clone())
+        .await
+        .unwrap();
+    let retried = admitted_queue(&mut fixture, &agent, &paused_input.id, 2).await;
+    assert_eq!(retried.messages[0], paused_queue.messages[0]);
+    assert_eq!(retried.messages[1].message, paused_input.input.message);
+    assert_eq!(
+        retried.messages[1].images,
+        paused_input.input.images.clone().unwrap()
+    );
+    fixture
+        .host_for_test()
+        .record_backend_capacity_for_test(BackendKind::Claude, quota(1))
+        .await;
+    let mut resumed_messages = Vec::new();
+    fixture.next_chat_event_matching(&agent, "persisted paused work drains in order", |event| {
+        if let ChatEvent::MessageAdded(message) = event
+            && matches!(message.sender, protocol::MessageSender::User)
+        {
+            resumed_messages.push(message.content.clone());
+        }
+        matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "persisted retry reply")
+    }).await;
+    assert_eq!(
+        resumed_messages,
+        [
+            "keep the existing paused queue",
+            &paused_input.input.message
+        ]
+    );
+    fixture
+        .next_chat_event_matching(&agent, "persisted retry settled", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    mock.assert_clean().await;
+    mock.close_stream().await;
+    fixture
+        .next_frame_matching("backend termination", |env| {
+            env.stream == agent.stream
+                && env.kind == FrameKind::AgentError
+                && env
+                    .parse_payload::<AgentErrorPayload>()
+                    .is_ok_and(|error| error.fatal)
+        })
+        .await;
+    fixture
+        .client
+        .human_input(
+            &agent.stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("mobile-terminal".to_owned()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: steer_payload("cannot deliver to a terminal actor"),
+            },
+        )
+        .await
+        .unwrap();
+    let rejection: protocol::HumanInputStatusPayload = fixture
+        .next_frame_matching("terminal delivery refused with custody identity", |env| {
+            env.kind == FrameKind::HumanInputStatus
+                && env
+                    .parse_payload::<protocol::HumanInputStatusPayload>()
+                    .is_ok_and(|status| status.id.0 == "mobile-terminal")
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert_eq!(rejection.agent_id, agent.new_agent.agent_id);
+    assert!(
+        matches!(rejection.status, protocol::HumanInputStatus::Refused { reason } if reason.contains("not running"))
+    );
+    // A reconnecting client resends an input the agent ran before it stopped.
+    fixture
+        .client
+        .human_input(
+            &agent.stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("mobile-idle".to_owned()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: steer_payload("send while idle"),
+            },
+        )
+        .await
+        .unwrap();
+    let resent: protocol::HumanInputStatusPayload = fixture
+        .next_frame_matching("resent executed input settles", |env| {
+            env.kind == FrameKind::HumanInputStatus
+                && env
+                    .parse_payload::<protocol::HumanInputStatusPayload>()
+                    .is_ok_and(|status| status.id.0 == "mobile-idle")
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert!(
+        matches!(
+            resent.status,
+            protocol::HumanInputStatus::Accepted { warning: None }
+        ),
+        "a stopped agent still owns the input it ran, not a refusal: {:?}",
+        resent.status
+    );
 }
 
 /// A backend that cannot take input mid-turn still honours a steer: the server

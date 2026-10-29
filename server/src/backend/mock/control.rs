@@ -185,6 +185,13 @@ impl MockControl {
             .forget();
     }
 
+    /// Interrupt requests recorded and not yet awaited. Each is recorded before
+    /// `interrupt()` returns, so any server reply sent after that call is
+    /// ordered behind it.
+    pub fn unawaited_interrupt_requests(&self) -> usize {
+        self.interrupt_requests.available_permits()
+    }
+
     pub(super) fn record_compaction_attempt(&self) {
         self.compaction_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

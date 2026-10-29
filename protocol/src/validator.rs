@@ -901,6 +901,7 @@ impl ProtocolValidator {
                 parse_host_payload::<CustomAgentDeletePayload>(self, envelope, "CustomAgentDelete")
             }
             FrameKind::SelfImprovementAction => parse_host_payload::<crate::SelfImprovementAction>(self, envelope, "SelfImprovementAction"),
+            FrameKind::HumanInputStatus => parse_host_payload::<crate::HumanInputStatusPayload>(self, envelope, "HumanInputStatus"),
             FrameKind::SelfImprovementNotify => parse_host_payload::<crate::SelfImprovementState>(self, envelope, "SelfImprovementNotify"),
             FrameKind::SteeringUpsert => {
                 parse_host_payload::<SteeringUpsertPayload>(self, envelope, "SteeringUpsert")

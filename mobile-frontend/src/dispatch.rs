@@ -724,6 +724,24 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 }
             }
         }
+        FrameKind::HumanInputStatus => {
+            match envelope.parse_payload::<protocol::HumanInputStatusPayload>() {
+                Ok(payload) => {
+                    let agent = AgentRef {
+                        local_host_id: host.clone(),
+                        agent_id: payload.agent_id.clone(),
+                    };
+                    state.apply_human_input_status(&agent, payload);
+                }
+                Err(error) => report_protocol_error(
+                    state,
+                    host,
+                    bridge::ConnectionInvalidation::ProtocolViolation {
+                        message: format!("Invalid human input admission event: {error}"),
+                    },
+                ),
+            }
+        }
         FrameKind::AgentError => {
             if let Ok(payload) = envelope.parse_payload::<AgentErrorPayload>() {
                 let agent_ref = AgentRef {

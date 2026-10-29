@@ -917,6 +917,17 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn fail_next_swarm_completion(&self) {
+        assert!(
+            self.host
+                .fail_next_swarm_completion_for_test()
+                .await
+                .is_ok(),
+            "install a write failure for the next swarm round completion"
+        );
+    }
+
+    #[allow(dead_code)]
     pub fn install_restart_stop_test_gate(&self) -> server::InstalledSpawnOperationTestGate {
         self.host.install_restart_stop_test_gate()
     }

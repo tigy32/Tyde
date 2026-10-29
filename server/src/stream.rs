@@ -778,6 +778,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::Welcome
         | FrameKind::Reject
         | FrameKind::HumanInput
+        | FrameKind::HumanInputStatus
         | FrameKind::SelfImprovementAction
         | FrameKind::SettingsWrite
         | FrameKind::BackendNativeSettingsWrite

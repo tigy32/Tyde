@@ -24,6 +24,8 @@ type SwarmCommitReply<T> = oneshot::Sender<Result<SwarmCommit<T>, SwarmFailure>>
 enum Command {
     #[cfg(feature = "test-support")]
     FailNextDirectorySync(oneshot::Sender<Result<(), SwarmFailure>>),
+    #[cfg(feature = "test-support")]
+    FailNextCompletion(oneshot::Sender<Result<(), SwarmFailure>>),
     PrivateAdmission(AgentId, bool, SwarmCommitReply<PrivateAdmissionOutcome>),
     Snapshot(oneshot::Sender<Result<SwarmStoreSnapshot, SwarmFailure>>),
     ReadImage(
@@ -112,6 +114,11 @@ impl SwarmRegistryHandle {
                     #[cfg(feature = "test-support")]
                     Command::FailNextDirectorySync(reply) => {
                         actor.fail_directory_sync = true;
+                        let _ = reply.send(Ok(()));
+                    }
+                    #[cfg(feature = "test-support")]
+                    Command::FailNextCompletion(reply) => {
+                        actor.fail_completion = true;
                         let _ = reply.send(Ok(()));
                     }
                     Command::PrivateAdmission(agent, starts_turn, reply) => {
@@ -272,6 +279,14 @@ impl SwarmRegistryHandle {
                         let _ = reply.send(result);
                     }
                     Command::Complete(batch, result, reply) => {
+                        #[cfg(feature = "test-support")]
+                        if std::mem::take(&mut actor.fail_completion) {
+                            let _ = reply.send(Err(failure(
+                                SwarmErrorCode::Storage,
+                                "Injected swarm completion write failure",
+                            )));
+                            continue;
+                        }
                         let result = actor.transaction(|file| complete(file, batch, result));
                         let _ = reply.send(result);
                     }
@@ -374,6 +389,10 @@ impl SwarmRegistryHandle {
     #[cfg(feature = "test-support")]
     pub(crate) async fn fail_next_directory_sync(&self) -> Result<(), SwarmFailure> {
         self.request(Command::FailNextDirectorySync).await
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn fail_next_completion(&self) -> Result<(), SwarmFailure> {
+        self.request(Command::FailNextCompletion).await
     }
     pub(crate) async fn wait_stopped(&self) {
         self.terminated.cancelled().await;
@@ -668,6 +687,8 @@ struct Actor {
     file: Result<SwarmStoreSnapshot, SwarmFailure>,
     #[cfg(feature = "test-support")]
     fail_directory_sync: bool,
+    #[cfg(feature = "test-support")]
+    fail_completion: bool,
 }
 impl Actor {
     fn load(
@@ -784,6 +805,8 @@ impl Actor {
             file,
             #[cfg(feature = "test-support")]
             fail_directory_sync: false,
+            #[cfg(feature = "test-support")]
+            fail_completion: false,
         };
         if actor.path.exists()
             && actor.file.is_ok()

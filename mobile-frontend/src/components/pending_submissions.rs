@@ -97,8 +97,8 @@ fn target_is_terminated(state: &AppState, record: &PendingSubmission) -> bool {
     })
 }
 
-/// A resend is only offered on a connection that is not the one that swallowed
-/// the original — and only when the target can still receive it.
+/// An uncertain transport requires a new connection. An explicit actor refusal
+/// permits retry on the same live connection.
 ///
 /// A new connection is what makes a resend meaningful, but it does not revive a
 /// dead agent: reconnecting to the host does not bring back an actor that
@@ -169,11 +169,17 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
                 // resend an empty chat message and leave the agent still waiting.
                 tool_response: record.tool_response.clone(),
             };
-            crate::send::send_frame(
+            if record.action == protocol::HumanInputAction::InterruptAndSend {
+                state.begin_human_admission(agent_ref, &record.human_input_id);
+            }
+            crate::send::send_composer_input(
                 &agent_ref.local_host_id,
                 stream,
-                protocol::FrameKind::SendMessage,
-                &payload,
+                &protocol::HumanInputPayload {
+                    id: record.human_input_id.clone(),
+                    action: record.action,
+                    input: payload,
+                },
             )
             .await
         }
@@ -181,7 +187,11 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
 
     match outcome {
         Ok(accepted) => {
+            state.retire_submission_attempt(record.local_submission_id);
             state.hold_submission(PendingSubmission {
+                human_input_id: record.human_input_id.clone(),
+                failure_reason: None,
+                action: record.action,
                 local_submission_id: accepted.local_submission_id,
                 // **Inherited, not minted.** This is the same logical message the
                 // user sent; only the transport attempt is new. The tool card that
@@ -198,12 +208,13 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
                 tool_response: record.tool_response.clone(),
                 state: PendingSubmissionState::QueuedLocally,
             });
-            // Retire the superseded *attempt* — not the lineage. The message is
-            // still very much in play, so this must not tell the originating card
-            // that the user withdrew it.
-            state.retire_submission_attempt(record.local_submission_id);
         }
-        Err(error) => shell_error(state, format!("Could not send again: {error}")),
+        Err(error) => {
+            if let SubmissionTarget::Agent(agent) = &record.target {
+                state.cancel_human_admission(agent, &record.human_input_id);
+            }
+            shell_error(state, format!("Could not send again: {error}"));
+        }
     }
 }
 
@@ -379,7 +390,11 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
     };
 
     let label = move || record().map(|r| r.state_label()).unwrap_or_default();
-    let detail = move || record().map(|r| r.state_detail()).unwrap_or_default();
+    let detail = move || {
+        record()
+            .map(|r| r.state_detail().to_owned())
+            .unwrap_or_default()
+    };
     // `display_text`, not `text`: a plan decision's message body is empty — the
     // payload *is* the decision — so rendering `text` would show the user a blank
     // box and tell them nothing about what they are recovering.
@@ -465,8 +480,8 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
                     }}
                 </button>
                 // Resend is last, distinctly labelled, never styled as the
-                // default action, disabled until a genuinely new connection
-                // exists, and never automatic.
+                // default action, gated on known refusal or a new connection,
+                // and never automatic.
                 <button
                     type="button"
                     class="pending-submission-action pending-submission-resend"
@@ -674,6 +689,9 @@ mod wasm_tests {
             // own id, so the fixture cannot seed a key that disagrees with the record
             // it holds — which is exactly what the hand-rolled insert had done.
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN),
                 local_host_id: host,
@@ -852,6 +870,9 @@ mod wasm_tests {
                 (2u64, PendingSubmissionState::DeliveryUnknown),
             ] {
                 state.hold_submission(PendingSubmission {
+                    human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                    failure_reason: None,
+                    action: protocol::HumanInputAction::Send,
                     local_submission_id: LocalSubmissionId(FIXTURE_ID + id),
                     origin: SubmissionOriginId(FIXTURE_ORIGIN + id),
                     local_host_id: host.clone(),
@@ -967,6 +988,9 @@ mod wasm_tests {
                 review_recipient: false,
             }]);
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 2),
                 local_host_id: host,
@@ -1281,6 +1305,9 @@ mod wasm_tests {
             let host = LocalHostId(HOST.to_owned());
             state.active_local_host_id.set(Some(host.clone()));
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 2),
                 local_host_id: host,
@@ -1329,6 +1356,9 @@ mod wasm_tests {
             let host = LocalHostId(HOST.to_owned());
             state.active_local_host_id.set(Some(host.clone()));
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 3),
                 local_host_id: host,
@@ -1384,103 +1414,313 @@ mod wasm_tests {
     /// always right; it was the serialization that lost them.
     #[wasm_bindgen_test]
     async fn an_agent_resend_serializes_the_held_images_onto_the_wire() {
-        let _guard = crate::bridge::test_capture_sends();
-        let container = make_container();
-        let agent_ref = AgentRef {
-            local_host_id: LocalHostId(HOST.to_owned()),
-            agent_id: protocol::AgentId("agent-1".to_owned()),
-        };
-        let agent_for_mount = agent_ref.clone();
-        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let handle_for_mount = handle.clone();
-        let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            let host = LocalHostId(HOST.to_owned());
-            state.active_local_host_id.set(Some(host.clone()));
-            // A *new* connection instance, so the resend is offered at all.
-            state.active_connection_instance_ids.update(|m| {
-                m.insert(host.clone(), 8);
-            });
-            state.agents.set(vec![crate::state::AgentInfo {
-                local_host_id: host.clone(),
+        for action in [
+            protocol::HumanInputAction::Send,
+            protocol::HumanInputAction::InterruptAndSend,
+        ] {
+            let _guard = crate::bridge::test_capture_sends();
+            let held_images = vec![
+                protocol::ImageData {
+                    media_type: "image/png".to_owned(),
+                    data: "AAAA".to_owned(),
+                },
+                protocol::ImageData {
+                    media_type: "image/jpeg".to_owned(),
+                    data: "BBBB".to_owned(),
+                },
+            ];
+            let images_for_mount = held_images.clone();
+            let container = make_container();
+            let agent_ref = AgentRef {
+                local_host_id: LocalHostId(HOST.to_owned()),
                 agent_id: protocol::AgentId("agent-1".to_owned()),
-                name: "Agent".to_owned(),
-                origin: protocol::AgentOrigin::User,
-                backend_kind: protocol::BackendKind::Claude,
-                workspace_roots: Vec::new(),
-                project_id: None,
-                parent_agent_id: None,
-                session_id: None,
-                custom_agent_id: None,
-                created_at_ms: 0,
-                instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
-                started: true,
-                fatal_error: None,
-                review_recipient: false,
-            }]);
-            state.hold_submission(PendingSubmission {
-                local_submission_id: LocalSubmissionId(FIXTURE_ID),
-                origin: SubmissionOriginId(FIXTURE_ORIGIN + 1),
-                local_host_id: host,
-                connection_instance_id: 7,
-                target: SubmissionTarget::Agent(agent_for_mount.clone()),
-                text: "look at this".to_owned(),
-                images: vec![
-                    protocol::ImageData {
-                        media_type: "image/png".to_owned(),
-                        data: "AAAA".to_owned(),
-                    },
-                    protocol::ImageData {
-                        media_type: "image/jpeg".to_owned(),
-                        data: "BBBB".to_owned(),
-                    },
-                ],
-                tool_response: None,
-                state: PendingSubmissionState::DeliveryUnknown,
+            };
+            let agent_for_mount = agent_ref.clone();
+            let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+            let handle_for_mount = handle.clone();
+            let _h = mount_to(container.clone(), move || {
+                let state = AppState::new();
+                let host = LocalHostId(HOST.to_owned());
+                crate::dispatch::prime_host_for_tests(&state, &host);
+                state.active_local_host_id.set(Some(host.clone()));
+                // A *new* connection instance, so the resend is offered at all.
+                state.active_connection_instance_ids.update(|m| {
+                    m.insert(host.clone(), 8);
+                });
+                state.agents.set(vec![crate::state::AgentInfo {
+                    local_host_id: host.clone(),
+                    agent_id: protocol::AgentId("agent-1".to_owned()),
+                    name: "Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Claude,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    custom_agent_id: None,
+                    created_at_ms: 0,
+                    instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
+                    started: true,
+                    fatal_error: None,
+                    review_recipient: false,
+                }]);
+                state.hold_submission(PendingSubmission {
+                    human_input_id: protocol::HumanInputId("recover-original-operation".to_owned()),
+                    failure_reason: None,
+                    action,
+                    local_submission_id: LocalSubmissionId(FIXTURE_ID),
+                    origin: SubmissionOriginId(FIXTURE_ORIGIN + 1),
+                    local_host_id: host,
+                    connection_instance_id: 7,
+                    target: SubmissionTarget::Agent(agent_for_mount.clone()),
+                    text: "look at this".to_owned(),
+                    images: images_for_mount,
+                    tool_response: None,
+                    state: PendingSubmissionState::DeliveryUnknown,
+                });
+                state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                    local_host_id: agent_for_mount.local_host_id.clone(),
+                    agent_id: agent_for_mount.agent_id.clone(),
+                }));
+                *handle_for_mount.borrow_mut() = Some(state.clone());
+                provide_context(state);
+                view! {
+                    <crate::components::chat_input::ChatInput />
+                    <AgentPendingSubmissions agent_ref=agent_for_mount.clone() />
+                }
             });
-            *handle_for_mount.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! { <AgentPendingSubmissions agent_ref=agent_for_mount.clone() /> }
-        });
-        next_tick().await;
-        let state = handle.borrow().as_ref().unwrap().clone();
+            next_tick().await;
+            let state = handle.borrow().as_ref().unwrap().clone();
 
-        let resend: HtmlElement = find(&container, "pending-submission-resend")
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        resend.click();
-        next_tick().await;
-        next_tick().await;
+            let resend: HtmlElement = find(&container, "pending-submission-resend")
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            resend.click();
+            next_tick().await;
+            next_tick().await;
 
-        let lines = crate::bridge::test_sent_lines();
-        assert_eq!(lines.len(), 1, "exactly one frame must go out");
-        let frame: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        let images = frame
-            .pointer("/payload/images")
-            .expect("the held images must be serialized — they were being dropped entirely");
-        let images = images.as_array().expect("images must be a list");
-        assert_eq!(images.len(), 2, "every held image must be on the wire");
-        assert_eq!(images[0]["media_type"], "image/png");
-        assert_eq!(images[0]["data"], "AAAA");
-        assert_eq!(images[1]["media_type"], "image/jpeg");
-        assert_eq!(images[1]["data"], "BBBB");
-        assert_eq!(
-            frame.pointer("/payload/message").and_then(|m| m.as_str()),
-            Some("look at this"),
-            "and the text must still be the same message"
-        );
+            let lines = crate::bridge::test_sent_lines();
+            assert_eq!(lines.len(), 1, "exactly one frame must go out");
+            let frame: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            let payload = match action {
+                protocol::HumanInputAction::InterruptAndSend => {
+                    assert_eq!(frame["kind"], "human_input");
+                    let human: protocol::HumanInputPayload =
+                        serde_json::from_value(frame["payload"].clone()).unwrap();
+                    assert_eq!(human.action, action);
+                    assert_eq!(human.id.0, "recover-original-operation");
+                    serde_json::to_value(human.input).unwrap()
+                }
+                protocol::HumanInputAction::Send => {
+                    assert_eq!(frame["kind"], "send_message");
+                    frame["payload"].clone()
+                }
+                protocol::HumanInputAction::Steer => unreachable!(),
+            };
+            let images = payload
+                .pointer("/images")
+                .expect("the held images must be serialized — they were being dropped entirely");
+            let images = images.as_array().expect("images must be a list");
+            assert_eq!(images.len(), 2, "every held image must be on the wire");
+            assert_eq!(images[0]["media_type"], "image/png");
+            assert_eq!(images[0]["data"], "AAAA");
+            assert_eq!(images[1]["media_type"], "image/jpeg");
+            assert_eq!(images[1]["data"], "BBBB");
+            assert_eq!(
+                payload.pointer("/message").and_then(|m| m.as_str()),
+                Some("look at this"),
+                "and the text must still be the same message"
+            );
 
-        // The record kept its images too, so a *second* failure is still recoverable.
-        let replacement = state
-            .pending_submissions
-            .get_untracked()
-            .values()
-            .next()
-            .cloned()
-            .unwrap();
-        assert_eq!(replacement.images.len(), 2);
+            // A second failure stays recoverable, images included. Outcomes reach
+            // the held record only through the production listener.
+            let outcomes = crate::app::listen_submission_outcomes(&state)
+                .await
+                .expect("register the production transport-outcome listener");
+            let host = agent_ref.local_host_id.clone();
+            let resend_again = || {
+                find(&container, "pending-submission-resend")
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click()
+            };
+            if action == protocol::HumanInputAction::Send {
+                crate::bridge::test_emit_send_outcome(
+                    &host,
+                    1,
+                    crate::bridge::SubmissionTransportOutcome::DeliveryUnknown,
+                );
+                next_tick().await;
+                let card = find(&container, "pending-submission")
+                    .expect("an unknown delivery stays recoverable");
+                assert!(card.text_content().unwrap().contains("look at this"));
+                resend_again();
+                next_tick().await;
+                next_tick().await;
+                let lines = crate::bridge::test_sent_lines();
+                assert_eq!(lines.len(), 2);
+                let retried: protocol::Envelope = serde_json::from_str(&lines[1]).unwrap();
+                assert_eq!(retried.kind, protocol::FrameKind::SendMessage);
+                let retried: protocol::SendMessagePayload = retried.parse_payload().unwrap();
+                assert_eq!(retried.images.as_ref(), Some(&held_images));
+            } else {
+                let composer: web_sys::HtmlTextAreaElement =
+                    find(&container, "chat-input").unwrap().dyn_into().unwrap();
+                composer.set_value("newer draft stays");
+                composer
+                    .dispatch_event(&web_sys::Event::new("input").unwrap())
+                    .unwrap();
+                state.active_connection_instance_ids.update(|connections| {
+                    connections.insert(host.clone(), crate::bridge::TEST_CONNECTION_INSTANCE_ID);
+                });
+                crate::bridge::test_emit_send_outcome(
+                    &host,
+                    1,
+                    crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
+                );
+                next_tick().await;
+                assert!(find(&container, "pending-submission").is_none());
+                let original = protocol::HumanInputId("recover-original-operation".to_owned());
+                for (seq, reason) in [
+                    "The new prompt was not queued, and the running turn was left alone: injected queued-message persistence failure",
+                    "agent session history is replaying; the message was not delivered",
+                    "Tyde is restarting; answer again after the host restarts",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    crate::dispatch::dispatch_envelope(
+                        &state,
+                        &host,
+                        protocol::Envelope::from_payload(
+                            protocol::StreamPath(format!("/host/{HOST}")),
+                            protocol::FrameKind::HumanInputStatus,
+                            seq as u64,
+                            &protocol::HumanInputStatusPayload {
+                                agent_id: agent_ref.agent_id.clone(),
+                                id: original.clone(),
+                                status: protocol::HumanInputStatus::Refused {
+                                    reason: reason.to_owned(),
+                                },
+                            },
+                        )
+                        .unwrap(),
+                    );
+                    next_tick().await;
+                    let card = find(&container, "pending-submission")
+                        .expect("socket acknowledgement cannot release actor-admission custody");
+                    let visible = card.text_content().unwrap();
+                    assert!(visible.contains("look at this"));
+                    assert!(visible.contains(reason));
+                    assert!(
+                        !find(&container, "pending-submission-resend")
+                            .unwrap()
+                            .has_attribute("disabled"),
+                        "an explicit actor refusal permits a deliberate same-connection retry"
+                    );
+                    assert_eq!(composer.value(), "newer draft stays");
+                }
+                let _retry_guard = crate::bridge::test_defer_sends();
+                resend_again();
+                next_tick().await;
+                next_tick().await;
+                let lines = crate::bridge::test_sent_lines();
+                assert_eq!(lines.len(), 1);
+                let retried: protocol::Envelope = serde_json::from_str(&lines[0]).unwrap();
+                assert_eq!(retried.kind, protocol::FrameKind::HumanInput);
+                let retried: protocol::HumanInputPayload = retried.parse_payload().unwrap();
+                assert_eq!(retried.id, original);
+                assert_eq!(retried.input.images.as_ref(), Some(&held_images));
+                assert_eq!(retried.action, protocol::HumanInputAction::InterruptAndSend);
+                crate::dispatch::dispatch_envelope(
+                    &state,
+                    &host,
+                    protocol::Envelope::from_payload(
+                        protocol::StreamPath(format!("/host/{HOST}")),
+                        protocol::FrameKind::HumanInputStatus,
+                        3,
+                        &protocol::HumanInputStatusPayload {
+                            agent_id: agent_ref.agent_id.clone(),
+                            id: retried.id,
+                            status: protocol::HumanInputStatus::Accepted { warning: None },
+                        },
+                    )
+                    .unwrap(),
+                );
+                next_tick().await;
+                assert!(
+                    find(&container, "pending-submission").is_some(),
+                    "the old holder survives while the transport attempt is unsettled"
+                );
+                crate::bridge::test_resolve_next_send();
+                next_tick().await;
+                next_tick().await;
+                assert!(
+                    find(&container, "agent-pending-submissions").is_none(),
+                    "only authoritative actor admission releases custody"
+                );
+                assert_eq!(composer.value(), "newer draft stays");
+
+                // A reconnect that replaces the protocol session without a
+                // Disconnected status must still surface the unconfirmed send.
+                state.agent_turn_active.update(|turns| {
+                    turns.insert(agent_ref.clone(), true);
+                });
+                next_tick().await;
+                find(&container, "chat-send")
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                let lines = crate::bridge::test_sent_lines();
+                let sent: protocol::Envelope = serde_json::from_str(&lines[1]).unwrap();
+                assert_eq!(
+                    sent.parse_payload::<protocol::HumanInputPayload>()
+                        .unwrap()
+                        .action,
+                    protocol::HumanInputAction::InterruptAndSend
+                );
+                crate::bridge::test_resolve_next_send();
+                next_tick().await;
+                next_tick().await;
+                crate::bridge::test_emit_send_outcome(
+                    &host,
+                    2,
+                    crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
+                );
+                next_tick().await;
+                assert!(find(&container, "pending-submission").is_none());
+                assert_eq!(composer.value(), "");
+                crate::app::apply_connection_status(
+                    &state,
+                    host.clone(),
+                    crate::state::PairedHostConnectionStatus::Connecting,
+                    None,
+                );
+                crate::app::apply_connection_status(
+                    &state,
+                    host.clone(),
+                    crate::state::PairedHostConnectionStatus::Connected,
+                    Some(crate::bridge::TEST_CONNECTION_INSTANCE_ID + 1),
+                );
+                next_tick().await;
+                let card = find(&container, "pending-submission")
+                    .expect("a replaced session cannot deliver the owed admission status");
+                let visible = card.text_content().unwrap();
+                assert!(visible.contains("newer draft stays"));
+                assert!(visible.contains("May not have been received"));
+                assert!(
+                    !find(&container, "pending-submission-resend")
+                        .unwrap()
+                        .has_attribute("disabled")
+                );
+            }
+            outcomes.remove();
+        }
     }
 
     /// A record with no images must serialize as an *absent* field, not an empty
@@ -1520,6 +1760,9 @@ mod wasm_tests {
                 review_recipient: false,
             }]);
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 1),
                 local_host_id: host,
@@ -1568,6 +1811,9 @@ mod wasm_tests {
             let host = LocalHostId(HOST.to_owned());
             state.active_local_host_id.set(Some(host.clone()));
             state.hold_submission(PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                failure_reason: None,
+                action: protocol::HumanInputAction::Send,
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 4),
                 local_host_id: host,

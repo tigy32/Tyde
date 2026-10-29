@@ -13,11 +13,49 @@ fn fail(code: SwarmErrorCode, message: impl Into<String>) -> SwarmFailure {
     }
 }
 
+/// A swarm-private input the member's actor received: its delivery verdict
+/// and, separately, whether the swarm bookkeeping after it succeeded.
+pub(crate) struct SwarmPrivateSettlement {
+    pub(crate) delivery: Result<(), crate::agent::AgentDeliveryFailure>,
+    pub(crate) bookkeeping: Result<(), SwarmFailure>,
+}
+
+impl SwarmPrivateSettlement {
+    /// The combined verdict for callers that report one error.
+    pub(crate) fn into_result(self) -> Result<(), SwarmFailure> {
+        self.bookkeeping?;
+        self.delivery.map_err(delivery_failure)
+    }
+}
+
+struct AdmittedPrivateInput {
+    registry: crate::swarm_registry::SwarmRegistryHandle,
+    session: protocol::SessionId,
+    batch: Option<SwarmDispatch>,
+    receipt: Result<crate::agent::AgentDeliveryReceipt, crate::agent::AgentDeliveryFailure>,
+}
+
+/// An identified input whose custody its member's actor must settle; a
+/// `refusal` stands only if the actor never accepted the input.
+struct ActorSettlement {
+    handle: crate::agent::AgentHandle,
+    id: protocol::HumanInputId,
+    config: crate::self_improvement::ConfigHandle,
+    refusal: Option<SwarmFailure>,
+}
+
+enum PrivateAdmission {
+    Admitted(Box<AdmittedPrivateInput>),
+    SettleByActor(Box<ActorSettlement>),
+}
+
 fn delivery_failure(error: crate::agent::AgentDeliveryFailure) -> SwarmFailure {
     let code = match &error {
         crate::agent::AgentDeliveryFailure::Busy => SwarmErrorCode::Busy,
         crate::agent::AgentDeliveryFailure::Rejected(_)
-        | crate::agent::AgentDeliveryFailure::Reported(_) => SwarmErrorCode::Lifecycle,
+        | crate::agent::AgentDeliveryFailure::Reported(_)
+        | crate::agent::AgentDeliveryFailure::AcceptedWithWarning(_)
+        | crate::agent::AgentDeliveryFailure::Unconfirmed(_) => SwarmErrorCode::Lifecycle,
     };
     fail(code, error.to_string())
 }
@@ -323,6 +361,14 @@ impl HostHandle {
         }
     }
     #[cfg(feature = "test-support")]
+    pub async fn fail_next_swarm_completion_for_test(&self) -> Result<(), SwarmFailure> {
+        self.state
+            .with_async(move |state| {
+                Box::pin(async move { state.swarm_registry.fail_next_completion().await })
+            })
+            .await
+    }
+    #[cfg(feature = "test-support")]
     pub async fn install_swarm_admission_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         {
@@ -625,15 +671,28 @@ impl HostHandle {
         self.schedule_swarm_dispatch().await;
         Ok(outcome)
     }
+    /// Delivers private human input to a swarm member.
+    ///
+    /// `Err` means the member never received the input. Once the actor holds
+    /// it, the settlement keeps the actor's delivery verdict apart from the
+    /// swarm bookkeeping that follows, so a bookkeeping failure cannot relabel
+    /// an accepted input as refused. `human_id` carries the identity of an
+    /// atomic cancel-and-send: the member's actor, not swarm admission, settles
+    /// a retry of an input it already accepted, before admission opens a round
+    /// and again after admission or the member's lifecycle refuses one.
     pub(crate) async fn deliver_swarm_private_input(
         &self,
         agent: &AgentId,
         input: &AgentInput,
-    ) -> Result<bool, SwarmFailure> {
-        let (registry, session, batch, receipt) = {
+        human_id: Option<protocol::HumanInputId>,
+    ) -> Result<Option<SwarmPrivateSettlement>, SwarmFailure> {
+        let mut settled_by_actor = false;
+        let (registry, session, batch, receipt) = loop {
             let agent = agent.to_owned();
             let input = input.to_owned();
-            match self.state.with_async(move |state| Box::pin(async move {
+            let config = self.config.clone();
+            let human_id = human_id.clone();
+            let admission = match self.state.with_async(move |state| Box::pin(async move {
 let agent = &agent;
 let input = &input;
 
@@ -644,7 +703,7 @@ let input = &input;
                 .iter()
                 .any(|member| member.agent_id.as_ref() == Some(agent))
         }) {
-            return Ok(std::ops::ControlFlow::Break(Ok(false)));
+            return Ok(std::ops::ControlFlow::Break(Ok(None)));
         }
         let payload = match input {
             AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload) => payload.clone(),
@@ -665,7 +724,7 @@ let input = &input;
             }
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
-            | AgentInput::CancelQueuedMessage(_) => return Ok(std::ops::ControlFlow::Break(Ok(false))),
+            | AgentInput::CancelQueuedMessage(_) => return Ok(std::ops::ControlFlow::Break(Ok(None))),
         };
         let handle = state.registry.agent_handle(agent).ok_or_else(|| {
             fail(
@@ -681,10 +740,27 @@ let input = &input;
         })?;
         let status = status_handle.current();
         if status.terminated || handle.is_closing() {
-            return Ok(std::ops::ControlFlow::Break(Err(fail(
+            let refusal = fail(
                 SwarmErrorCode::Lifecycle,
                 "Swarm member runtime is no longer accepting private execution",
-            ))));
+            );
+            return Ok(match &human_id {
+                Some(id) => std::ops::ControlFlow::Continue(PrivateAdmission::SettleByActor(Box::new(ActorSettlement {
+                    handle,
+                    id: id.clone(),
+                    config,
+                    refusal: Some(refusal),
+                }))),
+                None => std::ops::ControlFlow::Break(Err(refusal)),
+            });
+        }
+        if let Some(id) = &human_id && !settled_by_actor {
+            return Ok(std::ops::ControlFlow::Continue(PrivateAdmission::SettleByActor(Box::new(ActorSettlement {
+                handle,
+                id: id.clone(),
+                config,
+                refusal: None,
+            }))));
         }
         let events = registry
             .status(
@@ -703,9 +779,20 @@ let input = &input;
             )
         })?;
         let starts_turn = payload.tool_response.is_none();
-        let (batch, events) = registry
-            .private_admission(agent.clone(), starts_turn)
-            .await?;
+        let (batch, events) = match registry.private_admission(agent.clone(), starts_turn).await {
+            Ok(admitted) => admitted,
+            Err(refusal) => match &human_id {
+                Some(id) => {
+                    return Ok(std::ops::ControlFlow::Continue(PrivateAdmission::SettleByActor(Box::new(ActorSettlement {
+                        handle,
+                        id: id.clone(),
+                        config,
+                        refusal: Some(refusal),
+                    }))));
+                }
+                None => return Err(refusal),
+            },
+        };
         fan_out_swarm_events_locked(state, events);
         let permitted = registry.snapshot().await?.swarms.iter().any(|swarm| {
             swarm.recovery_requirement == protocol::SwarmRecoveryRequirement::None
@@ -723,30 +810,78 @@ let input = &input;
                 let events = registry.defer(batch).await?;
                 fan_out_swarm_events_locked(state, events);
             }
-            return Ok(std::ops::ControlFlow::Break(Err(fail(
+            let refusal = fail(
                 SwarmErrorCode::Conflict,
                 "Committed swarm admission requires attention before execution",
-            ))));
+            );
+            return Ok(match &human_id {
+                Some(id) => std::ops::ControlFlow::Continue(PrivateAdmission::SettleByActor(Box::new(ActorSettlement {
+                    handle,
+                    id: id.clone(),
+                    config,
+                    refusal: Some(refusal),
+                }))),
+                None => std::ops::ControlFlow::Break(Err(refusal)),
+            });
         }
         // Enqueue under the admission lock; native acknowledgement must not
         // hold unrelated host commands or Pause behind provider IO.
         let receipt = if starts_turn {
-            handle.enqueue_swarm_message(payload)
+            handle.enqueue_swarm_message(payload, human_id.map(|id| (id, config)))
         } else {
             handle.enqueue_message(payload)
         };
 
-Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue((registry, session, batch, receipt,)))
+Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(PrivateAdmission::Admitted(Box::new(AdmittedPrivateInput { registry, session, batch, receipt }))))
 
-})).await? { std::ops::ControlFlow::Break(result) => return result, std::ops::ControlFlow::Continue(value) => value }
+})).await? { std::ops::ControlFlow::Break(result) => return result, std::ops::ControlFlow::Continue(admission) => admission };
+            let ActorSettlement {
+                handle,
+                id,
+                config,
+                refusal,
+            } = match admission {
+                PrivateAdmission::Admitted(admitted) => {
+                    let AdmittedPrivateInput {
+                        registry,
+                        session,
+                        batch,
+                        receipt,
+                    } = *admitted;
+                    break (registry, session, batch, receipt);
+                }
+                PrivateAdmission::SettleByActor(settlement) => *settlement,
+            };
+            // Mailbox order makes this answer cover every attempt enqueued
+            // before it, including one still holding the member's round.
+            let delivery = match handle.human_input_accepted(id, config).await {
+                Ok(true) => Ok(()),
+                Ok(false) => match refusal {
+                    Some(refusal) => return Err(refusal),
+                    None => {
+                        settled_by_actor = true;
+                        continue;
+                    }
+                },
+                Err(reason) => Err(crate::agent::AgentDeliveryFailure::Unconfirmed(format!(
+                    "Cannot confirm whether the agent already accepted this input: {reason}"
+                ))),
+            };
+            return Ok(Some(SwarmPrivateSettlement {
+                delivery,
+                bookkeeping: Ok(()),
+            }));
         };
 
         let delivered = match receipt {
             Ok(receipt) => receipt.wait().await,
             Err(error) => Err(error),
         };
-        {
-            let delivery_succeeded = delivered.is_ok();
+        let bookkeeping = {
+            let delivery_succeeded = matches!(
+                delivered,
+                Ok(()) | Err(crate::agent::AgentDeliveryFailure::AcceptedWithWarning(_))
+            );
             let agent = agent.to_owned();
             self.state
                 .with_async(move |state| {
@@ -776,11 +911,15 @@ Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue((registry, session, batch,
                         Ok::<_, SwarmFailure>(())
                     })
                 })
-                .await?
+                .await
+        };
+        if bookkeeping.is_ok() {
+            self.schedule_swarm_dispatch().await;
         }
-        self.schedule_swarm_dispatch().await;
-        delivered.map_err(delivery_failure)?;
-        Ok(true)
+        Ok(Some(SwarmPrivateSettlement {
+            delivery: delivered,
+            bookkeeping,
+        }))
     }
     async fn validate_swarm_constraints(
         &self,

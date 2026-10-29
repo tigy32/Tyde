@@ -86,6 +86,24 @@ pub async fn send_frame<T: Serialize>(
     Ok(accepted)
 }
 
+pub async fn send_composer_input(
+    host: &LocalHostId,
+    stream: StreamPath,
+    payload: &protocol::HumanInputPayload,
+) -> Result<Accepted, SendFrameError> {
+    match payload.action {
+        protocol::HumanInputAction::Send => {
+            send_frame(host, stream, FrameKind::SendMessage, &payload.input).await
+        }
+        protocol::HumanInputAction::Steer => {
+            send_frame(host, stream, FrameKind::SteerMessage, &payload.input).await
+        }
+        protocol::HumanInputAction::InterruptAndSend => {
+            send_frame(host, stream, FrameKind::HumanInput, payload).await
+        }
+    }
+}
+
 pub async fn send_binary_frame<T: Serialize>(
     host: &LocalHostId,
     stream: StreamPath,

@@ -27,7 +27,23 @@ pub struct HumanInputPayload {
 pub enum HumanInputAction {
     Send,
     Steer,
+    InterruptAndSend,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HumanInputStatusPayload {
+    pub agent_id: AgentId,
+    pub id: HumanInputId,
+    pub status: HumanInputStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HumanInputStatus {
+    Accepted { warning: Option<String> },
+    Refused { reason: String },
+    Unconfirmed { reason: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptedHumanInput {
     pub id: HumanInputId,

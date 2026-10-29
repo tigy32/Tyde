@@ -541,26 +541,10 @@ fn install_event_listeners(state: AppState) {
             .await,
         );
 
-        let state_submission = state.clone();
         register_listener(
             &state,
             "submission-transport-outcome",
-            bridge::listen_submission_transport_outcome(move |event| {
-                log::info!(
-                    "submission_transport_outcome host={} connection_instance_id={} \
-                     local_submission_id={} outcome={:?}",
-                    event.local_host_id,
-                    event.connection_instance_id,
-                    event.local_submission_id.0,
-                    event.outcome
-                );
-                state_submission.apply_submission_outcome(
-                    event.local_submission_id,
-                    event.connection_instance_id,
-                    event.outcome,
-                );
-            })
-            .await,
+            listen_submission_outcomes(&state).await,
         );
 
         // Resolve selection before transport status replay can start any handshake.
@@ -760,6 +744,29 @@ fn ack_host_line_delivery(host: LocalHostId, delivery_id: u64) {
     });
 }
 
+/// Applies each transport outcome the bridge reports to its held submission.
+pub(crate) async fn listen_submission_outcomes(
+    state: &AppState,
+) -> Result<bridge::UnlistenHandle, String> {
+    let state = state.clone();
+    bridge::listen_submission_transport_outcome(move |event| {
+        log::info!(
+            "submission_transport_outcome host={} connection_instance_id={} \
+             local_submission_id={} outcome={:?}",
+            event.local_host_id,
+            event.connection_instance_id,
+            event.local_submission_id.0,
+            event.outcome
+        );
+        state.apply_submission_outcome(
+            event.local_submission_id,
+            event.connection_instance_id,
+            event.outcome,
+        );
+    })
+    .await
+}
+
 /// Either forgets the unlisten handle (success) or routes the registration
 /// failure into `mobile_shell_error` so the user sees it. Phase C HIGH 4.
 fn register_listener(
@@ -838,7 +845,7 @@ pub fn apply_paired_hosts_list(state: &AppState, hosts: Vec<PairedHostSummary>) 
     }
 }
 
-fn apply_connection_status(
+pub(crate) fn apply_connection_status(
     state: &AppState,
     host: LocalHostId,
     status: PairedHostConnectionStatus,
@@ -902,6 +909,10 @@ fn apply_connection_status(
                 return;
             }
 
+            // Statuses owed to a replaced protocol session went to its socket.
+            if state.host_stream_untracked(&host).is_some() {
+                state.disconnect_human_admissions(&host);
+            }
             state.connection_statuses.update(|m| {
                 m.insert(host.clone(), ConnectionStatus::Bootstrapping);
             });
@@ -1032,6 +1043,7 @@ fn apply_host_error(state: &AppState, host: LocalHostId, message: String) {
 }
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
+    state.disconnect_human_admissions(host);
     // A terminal rejection remains the sticky handshake verdict, even when
     // that rejected socket closes. A Welcome is authority only while live.
     state.host_releases.update(|m| {
@@ -1376,6 +1388,9 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(loader_preparations(), 0, "voice recovery must defer");
         state.hold_submission(crate::state::PendingSubmission {
+            human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+            failure_reason: None,
+            action: protocol::HumanInputAction::Send,
             local_submission_id: bridge::LocalSubmissionId(9999),
             origin: state.mint_submission_origin(),
             local_host_id: host.clone(),
@@ -2298,9 +2313,18 @@ mod wasm_tests {
                 let lines = crate::bridge::test_sent_lines();
                 assert_eq!(lines.len(), attempts_before + 1);
                 let sent: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-                assert_eq!(sent["kind"], "send_message");
+                // Send now carries one typed cancel-and-deliver operation; the
+                // original resized draft must survive inside that operation.
+                assert_eq!(sent["kind"], "human_input");
+                let submission: protocol::HumanInputPayload =
+                    serde_json::from_value(sent["payload"].clone()).unwrap();
+                assert_eq!(
+                    submission.action,
+                    protocol::HumanInputAction::InterruptAndSend
+                );
+                assert!(!submission.id.0.is_empty());
                 assert!(
-                    sent["payload"]["message"] == draft.trim(),
+                    submission.input.message == draft.trim(),
                     "resized draft reaches local admission"
                 );
                 crate::bridge::test_resolve_next_send();
@@ -2379,14 +2403,7 @@ mod wasm_tests {
                         .map(|element| element.as_ref())
                 )
             );
-            assert_eq!(
-                send.text_content().unwrap().trim(),
-                if activity == protocol::AgentActivity::Thinking {
-                    "Queue"
-                } else {
-                    "Send"
-                }
-            );
+            assert_eq!(send.text_content().unwrap().trim(), "Send");
             assert!(!send.has_attribute("disabled"));
             assert!(reachable() && send.contains(Some(&hit_at(point))));
             let ring = container
@@ -2412,10 +2429,16 @@ mod wasm_tests {
             let lines = crate::bridge::test_sent_lines();
             assert_eq!(lines.len(), attempts_before + 1);
             let sent: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert_eq!(sent["kind"], "human_input");
+            let submission: protocol::HumanInputPayload =
+                serde_json::from_value(sent["payload"].clone()).unwrap();
             assert_eq!(
-                sent["kind"], "send_message",
-                "lifecycle must not turn a draft tap into Interrupt"
+                submission.action,
+                protocol::HumanInputAction::InterruptAndSend,
+                "lifecycle must not change the single cancel-and-deliver operation"
             );
+            assert!(!submission.id.0.is_empty());
+            assert_eq!(submission.input.message, "preserved draft");
             crate::bridge::test_resolve_next_send();
             next_tick().await;
             next_tick().await;
@@ -2428,7 +2451,7 @@ mod wasm_tests {
                 .unwrap();
             next_tick().await;
             wasm_bindgen_test::console_log!(
-                "LIFECYCLE_CONTACT activity={:?} node_same=true center_hit=true original_hit=true send_message=1",
+                "LIFECYCLE_CONTACT activity={:?} node_same=true center_hit=true original_hit=true human_input=1",
                 activity
             );
         }
@@ -3184,6 +3207,9 @@ mod wasm_tests {
         // is on its way to the agent — so a disconnect must not take it.
         let discarded = crate::state::SubmissionOriginId(999);
         state.hold_submission(crate::state::PendingSubmission {
+            human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+            failure_reason: None,
+            action: protocol::HumanInputAction::Send,
             local_submission_id: crate::bridge::LocalSubmissionId(99),
             origin: discarded,
             local_host_id: host.clone(),
@@ -3202,6 +3228,9 @@ mod wasm_tests {
         // A message that was in flight when the link died — it must survive, because
         // its record is the only holder of the user's text.
         state.hold_submission(crate::state::PendingSubmission {
+            human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+            failure_reason: None,
+            action: protocol::HumanInputAction::Send,
             local_submission_id: crate::bridge::LocalSubmissionId(1),
             origin: state.mint_submission_origin(),
             local_host_id: host.clone(),

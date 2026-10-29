@@ -650,20 +650,53 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: protocol::HumanInputPayload = parse_payload(&envelope, "human_input")?;
-                if !matches!(
-                    payload.input.origin,
-                    None | Some(protocol::MessageOrigin::User)
-                ) {
-                    return Err(AppError::invalid(
-                        "human_input",
-                        "human input cannot claim server or agent provenance",
-                    ));
-                }
-                ensure_non_empty("human_input", "id", &payload.id.0)?;
-                validate_message_images("human_input", payload.input.images.as_deref())?;
-                let input = match payload.action {
-                    protocol::HumanInputAction::Send => AgentInput::SendMessage(payload.input),
-                    protocol::HumanInputAction::Steer => AgentInput::SteerMessage(payload.input),
+                let id = payload.id.clone();
+                let action = payload.action;
+                let input = (|| {
+                    if !matches!(
+                        payload.input.origin,
+                        None | Some(protocol::MessageOrigin::User)
+                    ) {
+                        return Err(AppError::invalid(
+                            "human_input",
+                            "human input cannot claim server or agent provenance",
+                        ));
+                    }
+                    ensure_non_empty("human_input", "id", &payload.id.0)?;
+                    validate_message_images("human_input", payload.input.images.as_deref())?;
+                    match action {
+                        protocol::HumanInputAction::Send => {
+                            Ok(AgentInput::SendMessage(payload.input))
+                        }
+                        protocol::HumanInputAction::Steer => {
+                            Ok(AgentInput::SteerMessage(payload.input))
+                        }
+                        protocol::HumanInputAction::InterruptAndSend => {
+                            if payload.input.tool_response.is_some() {
+                                return Err(AppError::invalid(
+                                    "human_input",
+                                    "interrupt-and-send cannot carry a tool response",
+                                ));
+                            }
+                            Ok(AgentInput::SteerMessage(payload.input))
+                        }
+                    }
+                })();
+                let input = match input {
+                    Ok(input) => input,
+                    Err(error) => {
+                        if action == protocol::HumanInputAction::InterruptAndSend {
+                            send_human_input_status(
+                                host_output_stream,
+                                agent_id,
+                                id,
+                                protocol::HumanInputStatus::Refused {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        return Err(error);
+                    }
                 };
                 deliver_agent_input(
                     host,
@@ -671,7 +704,7 @@ pub(crate) async fn route_client_envelope(
                     input,
                     stream_path,
                     host_output_stream,
-                    Some(payload.id),
+                    Some((id, action)),
                 )
                 .await;
             }
@@ -1855,27 +1888,60 @@ async fn deliver_agent_input(
     input: AgentInput,
     stream_path: StreamPath,
     host_output_stream: &Stream,
-    human_id: Option<protocol::HumanInputId>,
+    human: Option<(protocol::HumanInputId, protocol::HumanInputAction)>,
 ) {
-    match host.deliver_swarm_private_input(&agent_id, &input).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            let stream = host_output_stream.with_path(stream_path);
-            let payload = AgentErrorPayload {
-                agent_id,
-                code: AgentErrorCode::Unsupported,
-                message: error.message,
-                fatal: false,
-            };
-            match serde_json::to_value(payload) {
-                Ok(value) => {
-                    let _ = stream.send_value(FrameKind::AgentError, value);
+    // Atomic mobile input transfers custody by typed status. Existing Send/Steer
+    // consumers render AgentError, so their refusals and warnings must stay there.
+    let status_id = human.as_ref().and_then(|(id, action)| match action {
+        protocol::HumanInputAction::InterruptAndSend => Some(id.clone()),
+        protocol::HumanInputAction::Send | protocol::HumanInputAction::Steer => None,
+    });
+    match host
+        .deliver_swarm_private_input(&agent_id, &input, status_id.clone())
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(settlement)) => {
+            if let Some(id) = status_id {
+                let mut status = human_input_status(&settlement.delivery);
+                if let Err(error) = &settlement.bookkeeping {
+                    let bookkeeping = format!("Swarm bookkeeping failed: {}.", error.message);
+                    match &mut status {
+                        protocol::HumanInputStatus::Accepted { warning } => {
+                            let bookkeeping = format!("{bookkeeping} Do not resend this input.");
+                            *warning = Some(match warning.take() {
+                                Some(existing) => format!("{existing} {bookkeeping}"),
+                                None => bookkeeping,
+                            });
+                        }
+                        protocol::HumanInputStatus::Refused { reason }
+                        | protocol::HumanInputStatus::Unconfirmed { reason } => {
+                            reason.push(' ');
+                            reason.push_str(&bookkeeping);
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(%error, "Cannot encode swarm private-input rejection")
-                }
+                send_human_input_status(host_output_stream, agent_id, id, status);
+                return;
             }
+            if let Err(error) = settlement.into_result() {
+                send_swarm_private_rejection(host_output_stream, stream_path, agent_id, error);
+            }
+            return;
+        }
+        Err(error) => {
+            if let Some(id) = status_id {
+                send_human_input_status(
+                    host_output_stream,
+                    agent_id,
+                    id,
+                    protocol::HumanInputStatus::Refused {
+                        reason: error.message,
+                    },
+                );
+                return;
+            }
+            send_swarm_private_rejection(host_output_stream, stream_path, agent_id, error);
             return;
         }
     }
@@ -1886,15 +1952,28 @@ async fn deliver_agent_input(
                 AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload)
                     if matches!(payload.origin, None | Some(protocol::MessageOrigin::User))
             ) {
-                let id = human_id
-                    .unwrap_or_else(|| protocol::HumanInputId(uuid::Uuid::new_v4().to_string()));
-                let receipt = agent.enqueue_human_input(input, id, host.config.clone());
+                let (id, action) = human.unwrap_or_else(|| {
+                    (
+                        protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+                        match &input {
+                            AgentInput::SteerMessage(_) => protocol::HumanInputAction::Steer,
+                            _ => protocol::HumanInputAction::Send,
+                        },
+                    )
+                });
+                let receipt = agent.enqueue_human_input(input, id, action, host.config.clone());
                 let stream = host_output_stream.with_path(stream_path);
+                let status_stream = host_output_stream.clone();
                 tokio::spawn(async move {
                     let result = match receipt {
                         Ok(receipt) => receipt.wait().await,
                         Err(error) => Err(error),
                     };
+                    if let Some(id) = status_id {
+                        let status = human_input_status(&result);
+                        send_human_input_status(&status_stream, agent_id, id, status);
+                        return;
+                    }
                     if let Err(error) = result {
                         if matches!(error, crate::agent::AgentDeliveryFailure::Reported(_)) {
                             return;
@@ -1924,7 +2003,87 @@ async fn deliver_agent_input(
         None => AgentUnavailable::NotRunning,
     };
     let stream = host_output_stream.with_path(stream_path);
+    if let Some(id) = status_id {
+        send_human_input_status(
+            host_output_stream,
+            agent_id,
+            id,
+            protocol::HumanInputStatus::Refused {
+                reason: reason.message().to_owned(),
+            },
+        );
+        return;
+    }
     send_agent_unavailable_error(stream, agent_id, reason).await;
+}
+
+fn send_swarm_private_rejection(
+    host_output_stream: &Stream,
+    stream_path: StreamPath,
+    agent_id: AgentId,
+    error: protocol::SwarmFailure,
+) {
+    let payload = AgentErrorPayload {
+        agent_id,
+        code: AgentErrorCode::Unsupported,
+        message: error.message,
+        fatal: false,
+    };
+    match serde_json::to_value(payload) {
+        Ok(value) => {
+            let _ = host_output_stream
+                .with_path(stream_path)
+                .send_value(FrameKind::AgentError, value);
+        }
+        Err(error) => {
+            tracing::error!(%error, "Cannot encode swarm private-input rejection")
+        }
+    }
+}
+
+/// The custody verdict a human input's actor delivery result reports.
+fn human_input_status(
+    result: &Result<(), crate::agent::AgentDeliveryFailure>,
+) -> protocol::HumanInputStatus {
+    use crate::agent::AgentDeliveryFailure;
+    match result {
+        Ok(()) => protocol::HumanInputStatus::Accepted { warning: None },
+        Err(AgentDeliveryFailure::AcceptedWithWarning(reason)) => {
+            protocol::HumanInputStatus::Accepted {
+                warning: Some(reason.clone()),
+            }
+        }
+        Err(AgentDeliveryFailure::Unconfirmed(reason)) => protocol::HumanInputStatus::Unconfirmed {
+            reason: reason.clone(),
+        },
+        Err(error) => protocol::HumanInputStatus::Refused {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn send_human_input_status(
+    stream: &Stream,
+    agent_id: AgentId,
+    id: protocol::HumanInputId,
+    status: protocol::HumanInputStatus,
+) {
+    tracing::info!(
+        accepted = matches!(status, protocol::HumanInputStatus::Accepted { .. }),
+        unconfirmed = matches!(status, protocol::HumanInputStatus::Unconfirmed { .. }),
+        "Human input actor admission settled"
+    );
+    let payload = protocol::HumanInputStatusPayload {
+        agent_id,
+        id,
+        status,
+    };
+    match serde_json::to_value(payload) {
+        Ok(value) => {
+            let _ = stream.send_value(FrameKind::HumanInputStatus, value);
+        }
+        Err(error) => tracing::error!(%error, "Cannot encode human input custody status"),
+    }
 }
 
 /// Why the router could not hand an agent frame to its actor.

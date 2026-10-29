@@ -155,6 +155,7 @@ pub enum HostEvent {
     CustomAgentNotify(CustomAgentNotifyPayload),
     SteeringNotify(SteeringNotifyPayload),
     SelfImprovementNotify(protocol::SelfImprovementState),
+    HumanInputStatus(protocol::HumanInputStatusPayload),
     SkillNotify(SkillNotifyPayload),
     McpServerNotify(McpServerNotifyPayload),
     TychatState(protocol::TychatStatePayload),
@@ -1135,6 +1136,14 @@ async fn handle_host_envelope(
             let _ = host_tx
                 .send(HostEvent::SelfImprovementNotify(payload))
                 .await;
+            true
+        }
+        FrameKind::HumanInputStatus => {
+            let payload: protocol::HumanInputStatusPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(error) => return Err(ClientError::InvalidPayload(error)),
+            };
+            let _ = host_tx.send(HostEvent::HumanInputStatus(payload)).await;
             true
         }
         FrameKind::SteeringNotify => {

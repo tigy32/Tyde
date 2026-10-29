@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 92;
+pub const PROTOCOL_VERSION: u32 = 93;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1064,6 +1064,7 @@ pub enum FrameKind {
     CustomAgentDelete,
     SteeringUpsert,
     HumanInput,
+    HumanInputStatus,
     SelfImprovementAction,
     SelfImprovementNotify,
     SteeringDelete,
@@ -1291,6 +1292,7 @@ impl fmt::Display for FrameKind {
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
             Self::HumanInput => f.write_str("human_input"),
+            Self::HumanInputStatus => f.write_str("human_input_status"),
             Self::SelfImprovementAction => f.write_str("self_improvement_action"),
             Self::SelfImprovementNotify => f.write_str("self_improvement_notify"),
             Self::SteeringUpsert => f.write_str("steering_upsert"),
