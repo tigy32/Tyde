@@ -82,6 +82,8 @@ extern "C" {
     fn diagnostic_end(id: f64, outcome: &str);
     #[wasm_bindgen(js_name = diagnosticSetFrame)]
     fn diagnostic_set_frame(id: f64, frame: &str);
+    #[wasm_bindgen(js_name = diagnosticSetItems)]
+    fn diagnostic_set_items(id: f64, items: usize);
     #[wasm_bindgen(js_name = createLocalMonitor)]
     fn create_local_monitor(env: &JsValue, tick: &JsValue, reset: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = localMonitorNow)]
@@ -245,6 +247,58 @@ fn emit_local(diagnostic: FrontendDiagnostic) {
             }
         }
     });
+}
+
+// These projections are observed only during an explicit Debug capture, never
+// by the automatic local monitor. Keep labels code-defined and counts numeric.
+pub(crate) enum ChatProjection {
+    Rows,
+    ContextBreakdown,
+    ContextReported,
+    InkLayout,
+    VirtualWindow,
+    TabBinding,
+}
+
+pub(crate) struct CaptureSpan {
+    id: f64,
+    items: usize,
+}
+
+impl CaptureSpan {
+    pub(crate) fn new(projection: ChatProjection) -> Self {
+        let id = if diagnostic_enabled() {
+            let label = match projection {
+                ChatProjection::Rows => "chat_row_projection",
+                ChatProjection::ContextBreakdown => "chat_context_scan",
+                ChatProjection::ContextReported => "chat_context_reported_scan",
+                ChatProjection::InkLayout => "chat_ink_layout",
+                ChatProjection::VirtualWindow => "chat_virtual_window",
+                ChatProjection::TabBinding => "chat_tab_binding",
+            };
+            diagnostic_begin(label, "", 0, 0, false)
+        } else {
+            0.0
+        };
+        Self { id, items: 0 }
+    }
+
+    pub(crate) fn items(&mut self, items: usize) {
+        self.items = items;
+    }
+
+    pub(crate) fn visit(&mut self) {
+        self.items += 1;
+    }
+}
+
+impl Drop for CaptureSpan {
+    fn drop(&mut self) {
+        if self.id != 0.0 {
+            diagnostic_set_items(self.id, self.items);
+            diagnostic_end(self.id, "scope_end");
+        }
+    }
 }
 
 // Detail is restricted to code-defined command names or the protocol FrameKind;
@@ -519,6 +573,12 @@ export function localMonitorTestCall(env, method, amount) { return env[method](a
     impl Capture {
         pub(crate) fn new() -> Self {
             Self::with_observer(false)
+        }
+
+        pub(crate) fn browser() -> Self {
+            let env: JsValue = web_sys::window().unwrap().into();
+            let recorder = install_test_diagnostics(&env);
+            Self { env, recorder }
         }
 
         pub(crate) fn with_observer(browser_observer: bool) -> Self {

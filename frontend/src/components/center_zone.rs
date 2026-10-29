@@ -957,6 +957,10 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                         // Chat" tabs without remounting the ChatView.
                         let agent_ref_signal: Signal<Option<ActiveAgentRef>> =
                             Signal::derive(move || {
+                                let mut span = crate::perf::CaptureSpan::new(
+                                    crate::perf::ChatProjection::TabBinding,
+                                );
+                                span.items(1);
                                 state.center_zone.with(|center_zone| {
                                     match center_zone.tab(tab_id).map(|tab| &tab.content) {
                                         Some(TabContent::Chat { agent_ref, .. }) => agent_ref.clone(),

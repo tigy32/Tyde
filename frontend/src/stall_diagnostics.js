@@ -65,6 +65,10 @@ export function createRecorder(env) {
         const row = capture?.running && capture.active.get(id);
         if (row) row.detail = frame;
     }
+    function setItems(id, items) {
+        const row = capture?.running && capture.active.get(id);
+        if (row) row.items = items;
+    }
     function stop() {
         const c = capture;
         if (!c?.running) return;
@@ -190,7 +194,7 @@ export function createRecorder(env) {
         c.frame = env.requestAnimationFrame(frame);
         return {schema: 1, running: true};
     }
-    return {begin, end, setFrame, start, stop, snapshot, enabled: () => capture?.running === true,
+    return {begin, end, setFrame, setItems, start, stop, snapshot, enabled: () => capture?.running === true,
         export: () => JSON.stringify(snapshot()),
         clear() { stop(); capture = null; }};
 }
@@ -207,6 +211,8 @@ export function diagnosticBegin(operation, detail, bytes, items, waiting) {
 }
 export function diagnosticEnd(id, outcome) { if (id) recorder.end(id, outcome); }
 export function diagnosticSetFrame(id, frame) { if (id) recorder.setFrame(id, frame); }
+
+export function diagnosticSetItems(id, items) { if (id) recorder.setItems(id, items); }
 
 // The DOM tests inject a clock and explicit scheduler events, not real delays.
 export function installTestDiagnostics(env) {

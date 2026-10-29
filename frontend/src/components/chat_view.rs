@@ -17,6 +17,7 @@ use crate::components::ink_transcript::{InkGap, InkRowLayout, ink_row_layouts};
 use crate::components::orchestration_view::OrchestrationView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
+use crate::perf::{CaptureSpan, ChatProjection};
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AppState, ChatNotice, ChatRowContent, ChatRowHandle, ChatRowId,
@@ -177,6 +178,7 @@ pub fn ChatView(
     });
 
     let row_handles = move || -> Vec<ChatRowHandle> {
+        let mut span = CaptureSpan::new(ChatProjection::Rows);
         let Some(id) = active_agent_id() else {
             return Vec::new();
         };
@@ -193,6 +195,7 @@ pub fn ChatView(
                 },
             );
         }
+        span.items(rows.len());
         rows
     };
 
@@ -204,7 +207,10 @@ pub fn ChatView(
             return None;
         }
         active_agent_id()?;
-        Some(Arc::new(ink_row_layouts(&row_handles())))
+        let mut span = CaptureSpan::new(ChatProjection::InkLayout);
+        let rows = row_handles();
+        span.items(rows.len());
+        Some(Arc::new(ink_row_layouts(&rows)))
     });
 
     let prior_history: Signal<Option<crate::state::SessionHistoryState>> =
@@ -368,9 +374,11 @@ pub fn ChatView(
             });
         }
 
+        let mut span = CaptureSpan::new(ChatProjection::ContextBreakdown);
         state.chat_rows.with(|rows_by_agent| {
             let rows = rows_by_agent.get(&active.agent_id)?;
             for row in rows.iter().rev() {
+                span.visit();
                 let Some(row_entry) = row.message_entry() else {
                     continue;
                 };
@@ -401,9 +409,11 @@ pub fn ChatView(
         let Some(active) = agent_ref.get() else {
             return false;
         };
+        let mut span = CaptureSpan::new(ChatProjection::ContextReported);
         state.chat_rows.with(|rows_by_agent| {
             rows_by_agent.get(&active.agent_id).is_some_and(|rows| {
                 rows.iter().any(|row| {
+                    span.visit();
                     row.message_entry()
                         .is_some_and(|entry| entry.get().message.context_breakdown.is_some())
                 })
@@ -762,6 +772,7 @@ pub fn ChatView(
     // `VIRT_OVERSCAN` rows of buffer in each direction so a row at the
     // edge isn't visibly missing while it's being measured.
     let visible_window: Memo<VirtualWindow> = Memo::new(move |_| {
+        let mut span = CaptureSpan::new(ChatProjection::VirtualWindow);
         let _ = heights_version.get();
         let st = scroll_top_sig.get();
         let vp = viewport_height_sig.get();
@@ -769,6 +780,7 @@ pub fn ChatView(
         let row_gap = if layouts.is_some() { 0.0 } else { ROW_GAP_PX };
         let rows = row_handles();
         let n = rows.len();
+        span.items(n);
         if n == 0 {
             return VirtualWindow::EMPTY;
         }
@@ -4594,92 +4606,225 @@ mod wasm_tests {
         );
     }
 
-    /// With a long transcript the windowed `<For>` should mount only a
-    /// small fraction of the rows. Asserts on what the user *can't*
-    /// perceive: rows whose offsets are far below the viewport never
-    /// hit the DOM, so the bottom spacer reserves their estimated
-    /// height instead. This is the load-bearing assertion for the
-    /// "1600-message chats are slow" fix — if it regresses, every
-    /// future signal touch on the chat will scale linearly with
-    /// transcript length again.
     #[wasm_bindgen_test]
     async fn windowed_list_does_not_mount_all_rows_for_long_transcript() {
+        use crate::components::center_zone::CenterZone;
+        use crate::perf::diagnostic_tests::Capture;
+        use crate::state::TabContent;
+
         ensure_styles_loaded();
-
-        let agent_id = AgentId("agent-virt".to_owned());
-        let host_id = "host-virt".to_owned();
-        let tab_id = TabId(10_002);
-        // 200 rows is well above the viewport / overscan budget at any
-        // row height — this confirms windowing engaged, not just that
-        // the test container happened to be too small.
+        let capture = Capture::browser();
+        capture.start();
+        capture.stop();
+        let disabled = capture.export();
         let total_rows = 200usize;
-
-        let container = make_container();
-        let agent_id_for_mount = agent_id.clone();
-        let host_id_for_mount = host_id.clone();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            let bound = ActiveAgentRef {
-                host_id: host_id_for_mount.clone(),
-                agent_id: agent_id_for_mount.clone(),
-            };
-            let rows: Vec<ChatRowHandle> = (0..total_rows)
-                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("msg {i}"))))
-                .collect();
-            state.chat_rows.update(|m| {
-                m.insert(agent_id_for_mount.clone(), rows);
-            });
-            // This test owns a top-anchored viewport, so seed that user intent
-            // before mounting. Waiting for sticky-bottom and then scrolling
-            // raced its deferred mount callback under full-suite load.
-            state.save_tab_scroll_state(
-                tab_id,
-                TabScrollState {
-                    scroll_top: 0,
-                    scroll_height: 40_000,
-                    client_height: 600,
-                    user_scrolled_up: true,
-                },
+        let agent_id = AgentId("agent-virt-private".to_owned());
+        let host_id = "host-virt-private".to_owned();
+        let state = AppState::new();
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Current);
+        state
+            .agents
+            .set(vec![make_target_agent(&host_id, &agent_id.0, None)]);
+        state.chat_rows.update(|m| {
+            m.insert(
+                agent_id.clone(),
+                (0..total_rows)
+                    .map(|i| {
+                        ChatRowHandle::new(mk_user_msg(&format!(
+                            "private diagnostic fixture {i} {}",
+                            "generated payload ".repeat(64)
+                        )))
+                    })
+                    .collect(),
             );
-            provide_context(state);
-            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
-            let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
         });
-
+        let tab_id = state
+            .open_tab(
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id,
+                    agent_id: agent_id.clone(),
+                }),
+                "Long chat".to_owned(),
+                true,
+            )
+            .unwrap();
+        state.bump_tab_lru(tab_id);
+        state.save_tab_scroll_state(
+            tab_id,
+            TabScrollState {
+                scroll_top: 0,
+                scroll_height: 40_000,
+                client_height: 600,
+                user_scrolled_up: true,
+            },
+        );
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <CenterZone /> }
+        });
         next_tick().await;
-        // Second tick lets the viewport ResizeObserver and per-row
-        // ResizeObservers fire so the visible-window Memo recomputes
-        // against measured heights rather than the 200px estimate.
+        next_animation_frame().await;
         next_tick().await;
+        assert_eq!(
+            capture.export(),
+            disabled,
+            "projections must not start a capture"
+        );
 
         let mounted = message_rows(&container);
-        assert!(
-            !mounted.is_empty(),
-            "expected the windowed list to mount at least one row"
-        );
+        assert!(!mounted.is_empty(), "the transcript must render");
         assert!(
             mounted.len() < total_rows,
-            "windowing did not engage: mounted {} of {} rows",
-            mounted.len(),
-            total_rows,
+            "windowing must leave offscreen rows unmounted"
         );
-
-        // The bottom spacer should reserve nonzero height representing
-        // the unmounted suffix of the transcript. If the spacer is
-        // missing or zero-height, scrollbar geometry no longer
-        // matches reality and the user can't scroll into the
-        // unmounted rows.
-        let spacer = container
+        let first = mounted[0].clone();
+        let spacer: HtmlElement = container
             .query_selector(".virt-spacer-bottom")
             .unwrap()
-            .expect("bottom spacer must be present in the DOM");
-        let spacer_html: HtmlElement = spacer.dyn_into().unwrap();
-        let height = spacer_html.get_bounding_client_rect().height();
+            .unwrap()
+            .dyn_into()
+            .unwrap();
         assert!(
-            height > 0.0,
-            "bottom spacer must reserve geometry for unmounted rows; got {height}px"
+            spacer.get_bounding_client_rect().height() > 0.0,
+            "the spacer must reserve geometry for unmounted rows"
         );
+
+        capture.start();
+        let other = state
+            .open_tab(TabContent::empty_chat(), "Other".to_owned(), true)
+            .unwrap();
+        state.bump_tab_lru(other);
+        state.chat_rows.update(|rows| {
+            rows.insert(AgentId("unrelated-private".into()), Vec::new());
+        });
+        next_tick().await;
+        next_tick().await;
+        let current = capture.export();
+        let records = current["records"].as_array().unwrap();
+        for operation in [
+            "chat_row_projection",
+            "chat_context_scan",
+            "chat_context_reported_scan",
+            "chat_virtual_window",
+        ] {
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r["operation"] == operation && r["items"] == total_rows),
+                "missing long-transcript attribution for {operation}"
+            );
+        }
+        assert!(records.iter().any(|r| r["operation"] == "chat_tab_binding"));
+        assert!(
+            !records.iter().any(|r| r["operation"] == "chat_ink_layout"),
+            "Default appearance must not claim Ink layout work"
+        );
+        assert!(
+            first.is_connected(),
+            "the hidden hot tab must remain mounted"
+        );
+        let hidden = first.closest("[role='tabpanel']").unwrap().unwrap();
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&hidden)
+                .unwrap()
+                .unwrap()
+                .get_property_value("display")
+                .unwrap(),
+            "none"
+        );
+        let encoded = current.to_string();
+        for private in [
+            "private diagnostic fixture",
+            "generated payload",
+            "agent-virt-private",
+            "host-virt-private",
+            "unrelated-private",
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "capture must not retain fixture content or identifiers"
+            );
+        }
+        assert_eq!(current["loss"]["recordsOverwritten"], 0);
+        assert_eq!(current["loss"]["activeDropped"], 0);
+        assert!(current["active"].as_array().unwrap().is_empty());
+
+        capture.start();
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        next_tick().await;
+        next_tick().await;
+        let ink = capture.export();
+        let ink_records = ink["records"].as_array().unwrap();
+        let layout = ink_records
+            .iter()
+            .find(|r| r["operation"] == "chat_ink_layout" && r["items"] == total_rows)
+            .expect("Ink must attribute the loaded history layout");
+        assert!(
+            ink_records
+                .iter()
+                .any(|r| r["operation"] == "chat_row_projection" && r["parent"] == layout["id"]),
+            "nested projection must preserve capture-local parent correlation"
+        );
+
+        capture.start();
+        state
+            .agents
+            .update(|agents| agents[0].backend_kind = BackendKind::Codex);
+        state.chat_rows.update(|rows| {
+            rows.remove(&AgentId("unrelated-private".into()));
+        });
+        next_tick().await;
+        next_tick().await;
+        capture.stop();
+        let codex = capture.export();
+        let records = codex["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|r| r["operation"] == "chat_virtual_window" && r["items"] == total_rows)
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| r["operation"] == "chat_context_scan"),
+            "Codex must continue to bypass the transcript context-breakdown scan"
+        );
+        // The pinned browser runner streams result output, not successful-test console logs.
+        let output = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("output")
+            .expect("canonical browser result output is present");
+        let mut result_text = output.text_content().unwrap();
+        for (appearance, observation) in [
+            ("default", &current),
+            ("flow", &ink),
+            ("codex-flow", &codex),
+        ] {
+            result_text.push_str(&format!(
+                "UI_PROJECTION_CAPTURE {appearance} {observation}\n"
+            ));
+        }
+        output.set_text_content(Some(&result_text));
+        state.rename_tab_label(other, "Renamed".into());
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            capture.export(),
+            codex,
+            "stopped captures must remain immutable"
+        );
+        drop(handle);
+        container.remove();
     }
 
     /// Prior history is represented by a server-owned indicator, not by rows

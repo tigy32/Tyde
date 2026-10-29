@@ -49,8 +49,8 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   No other details or arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
   `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
-  Reactive rendering, layout and paint after a frame is dispatched are not
-  instrumented: they appear only as interval beyond `longest_work`.
+  Deferred chat projections, browser layout and paint do not feed this
+  aggregate. Explicit captures below additionally name selected projections.
   `focused` is `document.hasFocus()` at callback time, not a focus history.
   `longest_work:null` means no qualifying completed span was retained for that
   sampling window, not that the UI did no work. Pending calls are counted at
@@ -140,7 +140,33 @@ bridge wait initiated by that work.
   highlighting, highlight worker submission/callback. Nested durations must not
   be added together. Host receive spans acquire their typed frame kind after
   parsing; dispatch spans identify the frame from the start. Neither identifies
-  subsequent deferred reactive rendering or browser layout/paint.
+  subsequent deferred reactive rendering or browser layout/paint. The following
+  capture-only spans measure selected deferred chat work separately:
+
+  | Capture-only `operation` | `items` |
+  |---|---|
+  | `chat_tab_binding` | 1 tab-to-agent lookup |
+  | `chat_row_projection` | projected loaded row handles, including streaming row |
+  | `chat_context_scan` | rows actually visited in the reverse context-breakdown scan |
+  | `chat_context_reported_scan` | rows actually visited in the ever-reported scan |
+  | `chat_ink_layout` | loaded rows supplied to stretch layout |
+  | `chat_virtual_window` | loaded rows supplied to viewport/spacer calculation |
+
+  These spans wrap the actual existing work, including full-entry clones in
+  context scans. Counts are not persisted session size, mounted DOM rows,
+  exact loop iterations in the window calculation, or bytes cloned. All have
+  `bytes:0` and empty detail; neither bodies nor identifiers are inspected for
+  diagnostics. The reverse context-breakdown scan remains bypassed for Codex's
+  typed stats. Stretch layout runs only for Flow/Notebook, not Default. Hidden
+  hot-set chats can still execute projections; visibility alone does not imply
+  suspension. No extra signal subscriptions or transcript scans are added.
+
+  Compare these intervals to typed receive/dispatch records and frame gaps on
+  the same monotonic timeline. Synchronous nesting retains capture-local
+  `parent` ordinals. Deferred work has no invented parent frame or protocol
+  request correlation; nearby events alone do not establish which caused it.
+  Nested durations overlap. A large layout/window span narrows an application
+  hotspot; time outside named spans remains unattributed, not a CPU sample.
 - `async_wait`: bridge invocation-to-settlement interval. It includes transport,
   native/server/remote work **and** delayed delivery back to the client. It is
   not UI-thread blocking time or proof of a slow server. Pending intervals are
@@ -188,8 +214,9 @@ pending remote work cannot hide synchronous UI spans). Each incident retains at 
 records are not proof that no work occurred. Export serializes only this bounded
 state, on explicit request. There is no per-record console/network/disk output,
 DOM traversal, stack capture, payload serialization, mutation observer or global
-function patching. While detailed capture is disabled, call sites still update the automatic
-local aggregate described above.
+function patching. While detailed capture is disabled, the original UiSpan call
+sites still update the automatic local aggregate described above. The new chat
+projection call sites never feed that aggregate and retain nothing off-capture.
 
 Records contain only fixed operation/command names, protocol FrameKind names,
 times, numeric sizes/counts, coarse outcome and visibility. No argument values,
@@ -199,3 +226,27 @@ export: some contain file paths. Existing server tracing and agent timing do
 not measure the browser thread. The unlanded responsiveness-audit workbench has
 additional specialized debug/test harnesses; those are not prerequisites for
 this recorder and are not represented as shipped capabilities.
+
+## Long-session reproduction bounds
+
+The mounted Chrome long-transcript flow exercises 200 generated payload rows,
+window/spacer geometry, an unrelated tab and chat-row-map mutation, a hidden
+hot tab, Default/Flow branches, and the Codex context-scan bypass. It checks
+record presence, counts, nesting, privacy, loss and off/stopped behavior, never
+elapsed-time or host-speed thresholds. The fixture appends only its three
+bounded `UI_PROJECTION_CAPTURE` exports to the pinned browser runner's result
+output, which the canonical stage retains even on success; ordinary successful
+test console remains captured. Exports use the real browser performance clock;
+timings are observations of this generated Linux/Chrome fixture, not pass/fail
+requirements or CPU samples. It is UI-boundary coverage, not a real
+provider or macOS reproduction.
+
+A fresh real instance initially receives a server-selected history tail, not
+an entire old session. Loaded projection counts in a capture, not session age
+or persisted message count, establish which condition was actually exercised.
+The disposable dev-instance API currently has no history-seed/replay input.
+Do not inject frontend events, copy primary stores or synthesize transcript
+files to claim a real-server long-session reproduction. Retain explicit local
+capture exports with their exact client source/build and operation scope; no
+upload or automatic disk sink is added. These diagnostics cannot retrospectively
+explain earlier Mac timer gaps or establish that any candidate is their cause.
