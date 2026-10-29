@@ -9,7 +9,6 @@ use protocol::{
 
 #[derive(Default)]
 pub(super) struct OwnRequestUsage {
-    pub path: Option<String>,
     offset: usize,
     event_owner: Option<String>,
     responses: HashMap<String, NativeRequest>,

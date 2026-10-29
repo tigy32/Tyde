@@ -53,6 +53,7 @@ pub struct MockScript {
     pub(super) native_child_idle_gate: Option<MockGate>,
     /// Parks every follow-up message before the provider accepts it.
     pub(super) send_gate: Option<MockGate>,
+    pub(super) workspace_relocation_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
     /// Advertised as the session's slash-command set before the launch turn.
     pub(super) slash_commands: Option<Vec<SlashCommand>>,
@@ -163,6 +164,11 @@ impl MockScript {
 
     pub fn with_native_child_idle_gate(mut self, gate: &MockGateHandle) -> Self {
         self.native_child_idle_gate = Some(gate.gate());
+        self
+    }
+
+    pub fn with_workspace_relocation_gate(mut self, gate: &MockGateHandle) -> Self {
+        self.workspace_relocation_gate = Some(gate.gate());
         self
     }
 
@@ -657,6 +663,59 @@ impl MockTurn {
                 ..TextShape::default()
             },
         ))
+    }
+
+    pub fn with_late_native_child(self, gate: &MockGateHandle) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: Some(gate.gate()),
+            emit_timing_tool: false,
+            usage: MockNativeChildUsage::Split,
+            name: "late helper".into(),
+            prompt: "Native result".into(),
+            lifecycle: MockChildLifecycle::ReportBeforeRegistration,
+            grandchild: None,
+        })])
+    }
+
+    pub fn with_native_child_after_entry_begins(self, gate: &MockGateHandle) -> Self {
+        self.with_appended_steps(vec![MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: Some(gate.gate()),
+            emit_timing_tool: false,
+            usage: MockNativeChildUsage::Split,
+            name: "entry-race helper".into(),
+            prompt: "Native entry-race result".into(),
+            lifecycle: MockChildLifecycle::PublishAfterGate,
+            grandchild: None,
+        })])
+    }
+
+    /// Holds the turn at the gate before any child exists, then spawns a
+    /// retained backend-native child before going idle.
+    pub fn gated_text_then_native_child(
+        text: impl Into<String>,
+        child_name: impl Into<String>,
+        child_prompt: impl Into<String>,
+        gate: &MockGateHandle,
+    ) -> Self {
+        let mut steps = text_steps(
+            text.into(),
+            TextShape {
+                gate: Some(gate.gate()),
+                ..TextShape::default()
+            },
+        );
+        let idle = steps.pop().expect("text turn ends idle");
+        steps.push(MockStep::SpawnNativeChild(MockNativeChild {
+            registration_gate: None,
+            usage: MockNativeChildUsage::Split,
+            emit_timing_tool: false,
+            name: child_name.into(),
+            prompt: child_prompt.into(),
+            grandchild: None,
+            lifecycle: MockChildLifecycle::ReportAndRetain,
+        }));
+        steps.push(idle);
+        Self::done(steps)
     }
 
     /// One delta per character, the way Codex actually streams.
@@ -1750,6 +1809,11 @@ pub(super) struct MockNativeGrandchild {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MockChildLifecycle {
     CompleteAndRetain,
+    /// Completes the parent's spawn tool too, as real providers do once the
+    /// child finishes, so only the retained stream remains.
+    ReportAndRetain,
+    ReportBeforeRegistration,
+    PublishAfterGate,
     CompleteAndDrop,
     LiveUntilInterrupt,
 }

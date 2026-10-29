@@ -1397,6 +1397,76 @@ impl<B: Backend> Harness<B> {
         }
     }
 
+    pub async fn collect_rejected_child_failure(&mut self) -> bool {
+        let mut idle = false;
+        let mut failed = false;
+        loop {
+            let Some(event) = self
+                .events
+                .as_mut()
+                .expect("backend event stream")
+                .recv_backend()
+                .await
+            else {
+                assert!(
+                    failed,
+                    "child registration failure must be visible before EOF"
+                );
+                return true;
+            };
+            if let BackendEvent::Chat(event) = event {
+                match event {
+                    ChatEvent::TypingStatusChanged(active) => idle = !active,
+                    ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Error) =>
+                    {
+                        failed = true
+                    }
+                    ChatEvent::ToolExecutionCompleted(completed)
+                        if matches!(completed.outcome, ToolExecutionOutcome::Failed { .. }) =>
+                    {
+                        failed = true
+                    }
+                    _ => {}
+                }
+                if failed && idle && self.observer.child_registration_rejection_consumed() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    pub async fn collect_until_backend_error(&mut self) -> Vec<ChatEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = self.next_backend_event().await;
+            if let BackendEvent::Chat(event) = event {
+                let failed = matches!(&event, ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error));
+                collected.push(event);
+                if failed {
+                    return collected;
+                }
+            }
+        }
+    }
+
+    pub async fn collect_until_backend_closed(&mut self) -> Vec<ChatEvent> {
+        let mut collected = Vec::new();
+        while let Some(event) = self
+            .events
+            .as_mut()
+            .expect("backend event stream")
+            .recv_backend()
+            .await
+        {
+            if let BackendEvent::Chat(event) = event {
+                collected.push(event);
+            }
+        }
+        collected
+    }
+
     pub async fn next_backend_event(&mut self) -> BackendEvent {
         self.events
             .as_mut()
@@ -1922,7 +1992,11 @@ pub async fn install_skill<B: Backend>(
 pub struct Observer {
     capacity: std::sync::Mutex<Vec<(BackendKind, protocol::BackendCapacityState)>>,
     pub children: std::sync::Arc<std::sync::Mutex<Vec<ChildObservation>>>,
+    child_closers: std::sync::Arc<
+        std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>>,
+    >,
     parent_agent_id: Option<protocol::AgentId>,
+    reject_next_registration: std::sync::Arc<std::sync::atomic::AtomicBool>,
     changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
@@ -1938,6 +2012,104 @@ pub struct ChildObservation {
     pub events: Vec<ChatEvent>,
     pub model_requests: Vec<ModelRequestTokenUsage>,
     pub total_usage: Vec<u64>,
+}
+
+impl Observer {
+    pub fn reject_next_child_registration(&self) {
+        self.reject_next_registration
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn child_registration_rejection_consumed(&self) -> bool {
+        !self
+            .reject_next_registration
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn completed_child_command(
+        &self,
+        session: &SessionId,
+        first_observation: usize,
+        command_fragment: &str,
+    ) -> Vec<ChildObservation> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let children = self
+                .children
+                .lock()
+                .expect("native child observations")
+                .clone();
+            let completed = children.iter().skip(first_observation).any(|child| {
+                child.session_id_hint.as_ref() == Some(session)
+                    && child.events.iter().any(|event| match event {
+                        ChatEvent::ToolRequest(request) => {
+                            matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+                                if command.contains(command_fragment))
+                                && child.events.iter().any(|event| matches!(event,
+                                    ChatEvent::ToolExecutionCompleted(completed)
+                                        if completed.tool_call_id == request.tool_call_id
+                                            && matches!(completed.outcome, ToolExecutionOutcome::Succeeded { .. })))
+                        }
+                        _ => false,
+                    })
+                    && child.events.iter().rev().find_map(|event| match event {
+                        ChatEvent::TypingStatusChanged(typing) => Some(!typing),
+                        _ => None,
+                    }) == Some(true)
+            });
+            if completed {
+                return children;
+            }
+            changed.await;
+        }
+    }
+
+    pub async fn completed_children(&self, count: usize) -> Vec<ChildObservation> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let children = self
+                .children
+                .lock()
+                .expect("native child observations")
+                .clone();
+            if children.len() >= count
+                && children.iter().all(|child| {
+                    child.events.iter().rev().find_map(|event| match event {
+                        ChatEvent::TypingStatusChanged(typing) => Some(!typing),
+                        _ => None,
+                    }) == Some(true)
+                })
+            {
+                assert_eq!(
+                    children.len(),
+                    count,
+                    "the scenario must create exactly its requested native children"
+                );
+                return children;
+            }
+            changed.await;
+        }
+    }
+
+    pub async fn close_child_subscriptions(&self) {
+        let closers = std::mem::take(
+            &mut *self
+                .child_closers
+                .lock()
+                .expect("child subscription controls"),
+        );
+        for close in closers {
+            let (finished, completion) = tokio::sync::oneshot::channel();
+            close
+                .send(finished)
+                .unwrap_or_else(|_| panic!("child subscription ended before explicit close"));
+            completion.await.expect("child subscription teardown");
+        }
+    }
 }
 
 impl server::backend::SubAgentEmitter for Observer {
@@ -1963,6 +2135,15 @@ impl server::backend::SubAgentEmitter for Observer {
         >,
     > {
         Box::pin(async move {
+            if self
+                .reject_next_registration
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                eprintln!("REAL NATIVE RELAY host registration rejected=true");
+                return Err(
+                    "native child host registration rejected by conformance consumer".to_owned(),
+                );
+            }
             if let Some(parent) = &self.parent_agent_id {
                 loop {
                     let changed = self.changed.notified();
@@ -1997,11 +2178,21 @@ impl server::backend::SubAgentEmitter for Observer {
                 });
                 index
             };
+            let (close, mut closing) =
+                tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+            self.child_closers
+                .lock()
+                .expect("child subscription controls")
+                .push(close);
             let children = self.children.clone();
             let changed = self.changed.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
+                        Ok(closed) = &mut closing => {
+                            drop(event_rx); drop(model_usage_rx); drop(total_usage_rx); drop(name_update_rx);
+                            let _ = closed.send(()); return;
+                        }
                         Some(event) = event_rx.recv() => children.lock().expect("child observations")[index].events.push(event),
                         Some(usage) = model_usage_rx.recv() => children.lock().expect("child observations")[index].model_requests.push(usage),
                         Some(usage) = total_usage_rx.recv() => children.lock().expect("child observations")[index].total_usage.push(usage),
@@ -2020,7 +2211,9 @@ impl server::backend::SubAgentEmitter for Observer {
                 subagent_emitter: Some(std::sync::Arc::new(Self {
                     capacity: Default::default(),
                     children: self.children.clone(),
+                    child_closers: self.child_closers.clone(),
                     parent_agent_id: Some(id),
+                    reject_next_registration: self.reject_next_registration.clone(),
                     changed: self.changed.clone(),
                 })),
             })
@@ -2909,6 +3102,7 @@ pub async fn relocate_workspace_when_ready<B: Backend>(
     roots: Vec<String>,
 ) -> Vec<ChatEvent> {
     let mut events = Vec::new();
+    let mut wake = host.backend_ref().workspace_relocation_wake();
     loop {
         match set_workspace_roots(host, roots.clone()).await {
             Ok(()) => return events,
@@ -2920,14 +3114,16 @@ pub async fn relocate_workspace_when_ready<B: Backend>(
                 panic!("workspace relocation reported an unknown mutation outcome")
             }
         }
-        match host
-            .events
-            .as_mut()
-            .expect("live backend stream")
-            .recv_backend()
-            .await
-            .expect("backend stayed open while relocation was pending")
-        {
+        let event = tokio::select! {
+            event = host.events.as_mut().expect("live backend stream").recv_backend() => event,
+            result = async {
+                match &mut wake { Some(wake) => wake.changed().await, None => std::future::pending().await }
+            } => {
+                result.expect("native readiness owner stayed open");
+                continue;
+            }
+        }.expect("backend stayed open while relocation was pending");
+        match event {
             BackendEvent::Chat(event) => events.push(event),
             BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
             BackendEvent::ResumeReplayComplete(_) => panic!("unexpected resume during relocation"),

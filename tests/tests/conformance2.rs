@@ -199,7 +199,9 @@ macro_rules! conformance2_scenario {
             provider!(
                 opencode,
                 server::backend::opencode::OpencodeBackend,
-                if matches!(stringify!($scenario), "real_image_input" | "real_image_input_history" | "real_mcp_image_result" | "real_mcp_image_lifecycle" | "real_mcp_image_text_fidelity") {
+                if let Ok(model) = std::env::var("TYDE_OPENCODE_TEST_MODEL") {
+                    Profile::new(&[&model], &[("model", &model), ("mode", "build")])
+                } else if matches!(stringify!($scenario), "real_image_input" | "real_image_input_history" | "real_mcp_image_result" | "real_mcp_image_lifecycle" | "real_mcp_image_text_fidelity") {
                     // Big Pickle, the default, declares no image input.
                     Profile::new(
                         &["opencode/mimo-v2.6-flash-free"],
@@ -4383,6 +4385,556 @@ async fn real_workspace_move_after_background_completion<B: Backend>(host: &mut 
     );
     assert_no_error_message(&relocated.label(), relocated.events());
     assert_clean_close(host, &agent).await;
+}
+
+conformance2_scenario!(
+    real_workspace_move_after_native_children,
+    [
+        BackendCapability::Subagents,
+        BackendCapability::SetWorkspaceRoots
+    ]
+);
+
+/// Native children that finished normally may be retained for follow-up
+/// routing, but they are not outstanding work: once the parent is idle,
+/// relocation must be admitted (or followed by the event that admits it).
+async fn real_workspace_move_after_native_children<B: Backend>(host: &mut Harness<B>) {
+    let workspace = host.workspace().to_path_buf();
+    let first = unique_payload();
+    let second = unique_payload();
+    let prompt = subagent_prompt(host.backend(), &workspace, &first, &second);
+    let agent = spawn_agent(host, &prompt).await;
+    let delegated =
+        collect_native_subagent_turn(host, &agent, &prompt, &[first.as_str(), second.as_str()])
+            .await;
+    assert_universal_contract(std::slice::from_ref(&delegated));
+    assert!(
+        std::fs::read_to_string(workspace.join(HELLO_FILE))
+            .is_ok_and(|content| content.contains(&first)),
+        "the first native child must write its initial payload"
+    );
+    let second_contents = std::fs::read_to_string(workspace.join(BG_FILE)).ok();
+    assert!(
+        second_contents
+            .as_deref()
+            .is_some_and(|contents| contents.contains(&second)),
+        "{}: the second native child did not write its initial payload",
+        delegated.label()
+    );
+    let spawns = delegated
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::AgentSpawn { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        !spawns.is_empty(),
+        "{}: no normalized AgentSpawn among {} requests",
+        delegated.label(),
+        delegated.tool_requests().count()
+    );
+    for request in spawns {
+        let completion = delegated
+            .tool_completions()
+            .find(|completion| completion.tool_call_id == request.tool_call_id)
+            .expect("universal contract already proved every spawn completed");
+        assert!(
+            matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
+            "{}: relocation requires normally completed native children",
+            delegated.label()
+        );
+    }
+
+    let destination = tempfile::tempdir().expect("relocation destination");
+    let roots = vec![destination.path().to_str().unwrap().to_owned()];
+    let settled = relocate_workspace_when_ready(host, roots).await;
+    assert_no_error_message("native child relocation", &settled);
+    assert!(
+        host.backend_ref().session_id() == agent.session_id,
+        "native child relocation must preserve the owning conversation identity"
+    );
+    let relocated = ask_until_marker_and_idle(
+        host,
+        &agent,
+        "In the current runtime default working directory, write relocation-ready.txt using a \
+         relative filename. Put only the first line of your previous reply in that file. Do it \
+         yourself without delegating, do not change directory, and do not set an explicit tool \
+         cwd. Reply with TYDE_RELOCATED_AFTER_CHILDREN.",
+        "TYDE_RELOCATED_AFTER_CHILDREN",
+    )
+    .await;
+    assert_final_text_contains(&relocated, "TYDE_RELOCATED_AFTER_CHILDREN");
+    assert_no_error_message(&relocated.label(), relocated.events());
+    let actual = std::fs::read_to_string(destination.path().join("relocation-ready.txt"))
+        .expect("native tools wrote in the relocated workspace");
+    assert!(
+        actual.trim() == first,
+        "relocation did not preserve the delegated conversation; bytes={}",
+        actual.trim().len()
+    );
+    assert!(
+        !workspace.join("relocation-ready.txt").exists(),
+        "native tools must not retain the original cwd"
+    );
+    // Recoverable child errors retain their provider; a fatal EOF owes a
+    // native custody witness as well as closed input admission.
+    let native_pid = host.backend_ref().native_process_id_for_test().await;
+    host.observer.reject_next_child_registration();
+    let prompt = subagent_prompt(
+        host.backend(),
+        destination.path(),
+        &unique_payload(),
+        &unique_payload(),
+    );
+    let prompt = format!(
+        "{prompt} If native delegation fails, do not retry or replace it. Report the failure and finish your turn."
+    );
+    send_prompt(host, &agent, &prompt).await;
+    let eof = host.collect_rejected_child_failure().await;
+    assert!(
+        host.observer.child_registration_rejection_consumed(),
+        "real native child reached its rejecting host consumer"
+    );
+    let prompt = "Use your own native shell tool exactly once to run `printf visible > native-failure-recovery.txt` in the current default cwd, without cd, explicit cwd or delegation. Then reply NATIVE_FAILURE_RECOVERED.";
+    match try_send_prompt(host, &agent, prompt).await {
+        server::backend::SendOutcome::Closed => {
+            host.collect_until_backend_closed().await;
+            let pid = native_pid.expect(
+                "a backend exposing fatal child EOF must provide native-process custody evidence",
+            );
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "fatal child EOF must follow authoritative native process reaping"
+            );
+        }
+        server::backend::SendOutcome::Accepted => {
+            assert!(
+                !eof,
+                "a failed output stream must never admit invisible native work"
+            );
+            let recovered = collect_turn(host, &agent, prompt).await;
+            assert_final_text_contains(&recovered, "NATIVE_FAILURE_RECOVERED");
+            assert_no_error_message(
+                "visible recovery after nonfatal child failure",
+                recovered.events(),
+            );
+            assert!(
+                destination
+                    .path()
+                    .join("native-failure-recovery.txt")
+                    .is_file()
+                    && !workspace.join("native-failure-recovery.txt").exists(),
+                "a recoverable child error must retain visible destination execution"
+            );
+        }
+        server::backend::SendOutcome::Busy(_) => {
+            panic!("child registration failure did not settle admission (Busy)")
+        }
+    }
+    host.shutdown().await;
+}
+
+conformance2_scenario!(
+    real_retained_child_relocation_followup,
+    [
+        BackendCapability::RetainedNativeSubagentSessions,
+        BackendCapability::SetWorkspaceRoots
+    ]
+);
+
+async fn real_retained_child_relocation_followup<B: Backend>(host: &mut Harness<B>) {
+    let workspace = host.workspace().to_path_buf();
+    let first = unique_payload();
+    let second = unique_payload();
+    let prompt = subagent_prompt(host.backend(), &workspace, &first, &second);
+    let parent = spawn_agent(host, &prompt).await;
+    let mut actor_wake = host.backend_ref().workspace_relocation_wake();
+    eprintln!(
+        "REAL RETAINED RELOCATION initial_wake_available={}",
+        actor_wake.is_some()
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=delegation");
+    let delegated = collect_native_subagent_turn(host, &parent, &prompt, &[&first, &second]).await;
+    assert_universal_contract(std::slice::from_ref(&delegated));
+    let children = host.observer.completed_children(2).await;
+    let child = children.iter().find(|child| child.events.iter().any(|event| matches!(event,
+        ChatEvent::ToolRequest(request) if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains(HELLO_FILE)))))
+        .expect("first task has an attributed native child command");
+    assert!(child.events.iter().any(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completed) if matches!(&completed.outcome,
+            ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::RunCommand { stdout, exit_code: 0, .. } } if stdout.contains(&first)))), "the first native child must actually read back its initial task payload");
+    let session = child
+        .session_id_hint
+        .clone()
+        .expect("retained native child session identity");
+    let original_relay = child.id.clone();
+    let original_sessions = children
+        .iter()
+        .map(|child| {
+            child
+                .session_id_hint
+                .clone()
+                .expect("native session identity")
+        })
+        .collect::<Vec<_>>();
+    let mut native_wake = host
+        .backend_ref()
+        .workspace_relocation_wake()
+        .expect("retained native sessions provide an authoritative readiness wake");
+    eprintln!("REAL RETAINED RELOCATION phase=closing native relay");
+    host.observer.close_child_subscriptions().await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("native command completion barrier");
+    let port = listener
+        .local_addr()
+        .expect("native barrier address")
+        .port();
+    let command = format!(
+        "python3 -c \"import socket,pathlib; s=socket.create_connection(('127.0.0.1',{port})); s.sendall(b'ready'); assert s.makefile('rb').read(7)==b'release'; pathlib.Path('{}/child-finished.txt').write_text('finished')\"",
+        workspace.display()
+    );
+    let native_send = match host.backend() {
+        BackendKind::Codex => "Use the native follow-up-task operation to START A NEW TURN",
+        BackendKind::Grok => "Use native send_subagent_message with delivery=queue",
+        _ => "Use the native completed-child follow-up operation",
+    };
+    let followup = format!(
+        "{native_send} on your SAME existing native child that wrote {HELLO_FILE}, not merely a steering message, with this follow-up: Run exactly `{command}` as one foreground shell command and wait for it to exit, then reply CHILD_FINISHED. Do not spawn another child, cancel, close, or wait for this child in the parent. After sending the message, the parent must immediately reply PARENT_FOLLOWUP_STARTED while the child is still running."
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=starting native follow-up");
+    let launched = ask(host, &parent, &followup).await;
+    assert_final_text_contains(&launched, "PARENT_FOLLOWUP_STARTED");
+    assert_no_error_message("native follow-up launch", launched.events());
+    assert!(
+        launched
+            .tool_requests()
+            .all(|request| !matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })),
+        "a retained-child follow-up must not spawn or masquerade as another child"
+    );
+    assert!(
+        launched.tool_requests().all(|request| launched
+            .tool_completions()
+            .any(|completed| completed.tool_call_id == request.tool_call_id)),
+        "native follow-up delivery must complete its parent admission card while the child runs"
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=awaiting native command start");
+    let (mut barrier, _) = listener
+        .accept()
+        .await
+        .expect("real native child command connected");
+    let mut ready = [0; 5];
+    barrier
+        .read_exact(&mut ready)
+        .await
+        .expect("native child started handshake");
+    assert_eq!(&ready, b"ready");
+
+    assert!(
+        !workspace.join("child-finished.txt").exists(),
+        "native child must still be held on its command-completion barrier"
+    );
+    let destination = tempfile::tempdir().expect("native follow-up destination");
+    let roots = vec![
+        destination
+            .path()
+            .to_str()
+            .expect("destination path")
+            .to_owned(),
+    ];
+    assert!(
+        matches!(
+            set_workspace_roots(host, roots.clone()).await,
+            Err(server::backend::WorkspaceRelocationError::Busy)
+        ),
+        "a real running retained child must block relocation without mutation"
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=running child blocked relocation");
+    native_wake.borrow_and_update();
+    barrier
+        .write_all(b"release")
+        .await
+        .expect("release real native child command");
+    eprintln!("REAL RETAINED RELOCATION phase=awaiting native completion wake");
+    native_wake
+        .changed()
+        .await
+        .expect("authoritative native completion wake");
+    // The source-cwd oracle runs after releasing the held child command:
+    // providers need not execute two foreground terminals concurrently.
+    let unchanged = ask_until_marker_and_idle(host, &parent,
+        "Use your own native shell tool exactly once to run `printf source > retained-admission-source.txt` in the runtime default cwd. Do not change directory, set an explicit cwd, delegate, or wait for the running child. Then reply ROOT_STILL_IN_SOURCE.",
+        "ROOT_STILL_IN_SOURCE").await;
+    assert_no_error_message("busy relocation keeps source workspace", unchanged.events());
+    assert!(
+        workspace.join("retained-admission-source.txt").is_file()
+            && !destination
+                .path()
+                .join("retained-admission-source.txt")
+                .exists(),
+        "Busy must leave the owning runtime workspace unchanged"
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=applying native relocation");
+    let settled = relocate_workspace_when_ready(host, roots).await;
+    assert_no_error_message("running native child relocation", &settled);
+    assert!(
+        host.backend_ref().session_id() == parent.session_id,
+        "retained native child relocation must preserve its owning conversation identity"
+    );
+    assert!(
+        workspace.join("child-finished.txt").exists(),
+        "relocation must wait for the native child command to finish"
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=closing native relay");
+    host.observer.close_child_subscriptions().await;
+    let first_destination_observation = host
+        .observer
+        .children
+        .lock()
+        .expect("native child observations")
+        .len();
+    let prompt = format!(
+        "{native_send} on the SAME original native child that wrote {HELLO_FILE}, with this follow-up: Use your native shell/terminal tool exactly once, in its current runtime default working directory, to write retained-child-result.txt using only a relative filename, containing only the single synthetic task payload TOKEN from your INITIAL task (the TYDE_PAYLOAD_ prefix and its uppercase letters/digits). Use printf %s with that remembered token as its argument; do not include a newline, literal backslash-n suffix, quotes, or other text in the file. Do not use cd or set an explicit tool cwd. Do not spawn any new child. The parent must wait for that same child's actual completion, then reply RETAINED_CHILD_RELOCATED."
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=starting destination follow-up");
+    let moved = ask_until_marker_and_idle(host, &parent, &prompt, "RETAINED_CHILD_RELOCATED").await;
+    assert_no_error_message("relocated native follow-up", moved.events());
+    assert!(
+        moved
+            .tool_requests()
+            .all(|request| !matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })),
+        "destination follow-up must reuse its owned native child without replacement"
+    );
+    let observed = host
+        .observer
+        .completed_child_command(
+            &session,
+            first_destination_observation,
+            "retained-child-result.txt",
+        )
+        .await;
+    let actual = std::fs::read_to_string(destination.path().join("retained-child-result.txt"))
+        .expect("same native child executed in destination");
+    assert!(
+        actual.trim() == first,
+        "native child must retain its original conversation payload; output_bytes={}",
+        actual.len()
+    );
+    assert!(
+        !workspace.join("retained-child-result.txt").exists(),
+        "native follow-up must not execute in the source workspace"
+    );
+    assert!(
+        observed.iter().all(|child| child
+            .session_id_hint
+            .as_ref()
+            .is_some_and(|id| original_sessions.contains(id))),
+        "follow-ups must reuse original native sessions, not spawn replacements"
+    );
+    let destination_commands = observed
+        .iter()
+        .skip(first_destination_observation)
+        .filter(|child| {
+            child.id != original_relay && child.session_id_hint.as_ref() == Some(&session)
+        })
+        .flat_map(|child| &child.events)
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request) => match &request.tool_type {
+                ToolRequestType::RunCommand { command, .. }
+                    if command.contains("retained-child-result.txt") =>
+                {
+                    Some(command)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destination_commands.len(),
+        1,
+        "the same native child must execute exactly once on a visible reactivated relay"
+    );
+    assert!(
+        !destination_commands[0].contains(destination.path().to_str().unwrap()),
+        "destination execution must use the native runtime cwd, not an injected destination path"
+    );
+    let reopened = observed
+        .iter()
+        .skip(first_destination_observation)
+        .find(|entry| entry.session_id_hint.as_ref() == Some(&session))
+        .expect("visible original-child relay after relocation");
+    let rebound_progress = moved.events().iter().any(|event| matches!(event,
+        ChatEvent::ToolProgress(progress) if progress.tool_call_id == child.tool_use_id
+            && matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(link) if link.agent_id == reopened.id)));
+    eprintln!("REAL RETAINED RELOCATION reopened_parent_progress={rebound_progress}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second native completion barrier");
+    let port = listener
+        .local_addr()
+        .expect("second barrier address")
+        .port();
+    let command = format!(
+        "python3 -c \"import socket,pathlib,os; pathlib.Path('retained-second-start.cwd').write_text(os.getcwd()); s=socket.create_connection(('127.0.0.1',{port})); s.sendall(b'ready'); assert s.makefile('rb').read(7)==b'release'; pathlib.Path('retained-second-finished.txt').write_text('finished')\""
+    );
+    let prompt = format!(
+        "{native_send} on the SAME original native child that wrote {HELLO_FILE}, with this new follow-up: Run exactly `{command}` as one foreground shell command and wait for it to exit, then reply SECOND_CHILD_FINISHED. Do not spawn another child, close, cancel, or wait for it in the parent. After delivery the parent must immediately reply SECOND_CHILD_STARTED while the child is still running."
+    );
+    let launched = ask_until_marker_and_idle(host, &parent, &prompt, "SECOND_CHILD_STARTED").await;
+    assert_no_error_message("post-reactivation retained child launch", launched.events());
+    assert!(launched.events().iter().any(|event| matches!(event,
+        ChatEvent::ToolProgress(progress) if progress.tool_call_id == child.tool_use_id
+            && matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(link) if link.agent_id == reopened.id && !link.completed && link.status == protocol::SubAgentProgressStatus::Running))),
+        "every retained native turn must publish its actual Running state on the original spawn link");
+    assert!(
+        launched
+            .tool_requests()
+            .all(|request| !matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })),
+        "the post-reactivation turn must reuse its original child"
+    );
+    let (mut barrier, _) = listener
+        .accept()
+        .await
+        .expect("reactivated child command connected");
+    barrier
+        .read_exact(&mut ready)
+        .await
+        .expect("second native command handshake");
+    assert_eq!(&ready, b"ready");
+    assert!(
+        matches!(
+            set_workspace_roots(host, vec![workspace.to_string_lossy().into_owned()]).await,
+            Err(server::backend::WorkspaceRelocationError::Busy)
+        ),
+        "running child after reactivation blocks reverse relocation"
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.path().join("retained-second-start.cwd"))
+            .expect("actual held child cwd"),
+        destination.path().to_string_lossy()
+    );
+    if let Some(wake) = actor_wake.as_mut() {
+        wake.borrow_and_update();
+    }
+    barrier
+        .write_all(b"release")
+        .await
+        .expect("release post-reactivation child command");
+    host.observer
+        .completed_child_command(
+            &session,
+            first_destination_observation,
+            "retained-second-finished.txt",
+        )
+        .await;
+    eprintln!("REAL RETAINED RELOCATION phase=reactivated child actually completed");
+    actor_wake
+        .as_mut()
+        .expect("readiness subscription must exist when Backend returns, before its first turn")
+        .changed()
+        .await
+        .expect("original actor subscription receives authoritative completion");
+    let settled =
+        relocate_workspace_when_ready(host, vec![workspace.to_string_lossy().into_owned()]).await;
+    assert_no_error_message("automatic post-reactivation reverse relocation", &settled);
+    assert!(
+        host.backend_ref().session_id() == parent.session_id,
+        "reverse entry preserves owning conversation"
+    );
+    let prompt = format!(
+        "Use your own native shell tool exactly once to run `printf reverse > retained-reverse-result.txt` in the runtime default cwd. Also {native_send} on the SAME original native child that wrote {HELLO_FILE}, telling it to run exactly `printf reverse-child > retained-reverse-child.txt` once in its current runtime default cwd, using the relative filename only. Neither agent may change directory or set explicit cwd. Do not spawn a replacement child. Wait for that child's completion, then reply REVERSE_ENTRY_EXECUTED."
+    );
+    let executed =
+        ask_until_marker_and_idle(host, &parent, &prompt, "REVERSE_ENTRY_EXECUTED").await;
+    host.observer
+        .completed_child_command(
+            &session,
+            first_destination_observation,
+            "retained-reverse-child.txt",
+        )
+        .await;
+    assert!(
+        workspace.join("retained-reverse-child.txt").is_file()
+            && !destination
+                .path()
+                .join("retained-reverse-child.txt")
+                .exists(),
+        "same native child also executes in the reverse destination"
+    );
+    assert_no_error_message("reverse destination execution", executed.events());
+    assert!(
+        workspace.join("retained-reverse-result.txt").is_file()
+            && !destination
+                .path()
+                .join("retained-reverse-result.txt")
+                .exists(),
+        "reverse entry uses its actual destination"
+    );
+    assert_eq!(executed.tool_requests().filter(|request| matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. } if command.contains("retained-reverse-result.txt"))).count(), 1, "reverse destination command executes exactly once");
+    assert!(
+        rebound_progress,
+        "reactivation must republish the original spawn link to its visible new relay"
+    );
+    eprintln!("REAL RETAINED RELOCATION phase=host relay reactivation rejection");
+    let native_group = host
+        .backend_ref()
+        .native_process_id_for_test()
+        .await
+        .expect("real native owner identity");
+    host.observer.close_child_subscriptions().await;
+    let observations_before_rejection = observed.len();
+    host.observer.reject_next_child_registration();
+    let failed_followup = format!(
+        "{native_send} on the SAME original native child that wrote {HELLO_FILE}, with this follow-up: Use your native shell tool to run `printf child-followup` once. Do not spawn a replacement or wait in the parent."
+    );
+    send_prompt(host, &parent, &failed_followup).await;
+    let failed_events = host.collect_until_backend_error().await;
+    assert!(
+        host.observer.child_registration_rejection_consumed(),
+        "the actual native follow-up must attempt to reactivate its closed host relay"
+    );
+    assert!(
+        failed_events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::MessageAdded(message)
+        if matches!(message.sender, MessageSender::Error))),
+        "a failed native relay registration must visibly fail its owning session"
+    );
+    assert!(
+        matches!(
+            try_send_prompt(host, &parent, "Do not execute any commands").await,
+            SendOutcome::Closed
+        ),
+        "a failed native relay must not admit invisible follow-up execution"
+    );
+    assert!(
+        matches!(
+            set_workspace_roots(host, vec![workspace.to_string_lossy().into_owned()]).await,
+            Err(server::backend::WorkspaceRelocationError::Rejected(_))
+        ),
+        "a failed native relay must reject relocation, not report normal readiness or wait forever"
+    );
+    assert_eq!(
+        host.observer
+            .children
+            .lock()
+            .expect("native child observations")
+            .len(),
+        observations_before_rejection,
+        "a failed reactivation must not create a replacement native relay"
+    );
+    host.collect_until_backend_closed().await;
+    assert!(
+        running_group_members(i32::try_from(native_group).expect("native pid range"))
+            .await
+            .is_empty(),
+        "fatal backend EOF must follow native runtime teardown, not merely close its output projection"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{native_group}")).exists(),
+        "fatal backend EOF must follow authoritative native process reaping"
+    );
+    host.shutdown().await;
 }
 
 /// A foreground command that outlives its timeout keeps running in the
@@ -16495,7 +17047,7 @@ async fn real_native_child_followup_snapshot<B: Backend>(host: &mut Harness<B>) 
     let second = unique_payload();
     let parent = unique_payload();
     let command = format!(
-        "printf 'ready\\n' > {}; head -n 1 {} >/dev/null; printf '{second}\\n' > {}",
+        "printf ready > {}; head -n 1 {} >/dev/null; printf '{second}\\n' > {}",
         directory.join("b-started.fifo").display(),
         directory.join("b-release.fifo").display(),
         directory.join("b-proof.txt").display(),

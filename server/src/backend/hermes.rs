@@ -2081,30 +2081,37 @@ impl Backend for HermesBackend {
         }
     }
 
-    async fn set_workspace_roots(
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        if !self.workspace_is_local {
-            return Err(super::WorkspaceRelocationError::Rejected(
-                "Hermes workspace relocation is currently supported only for local sessions"
-                    .to_owned(),
-            ));
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        let workspace_is_local = self.workspace_is_local;
+        let command_tx = self.command_tx.clone();
+        async move {
+            if !workspace_is_local {
+                return Err(super::WorkspaceRelocationError::Rejected(
+                    "Hermes workspace relocation is currently supported only for local sessions"
+                        .to_owned(),
+                ));
+            }
+            let roots = super::validate_local_workspace_roots(workspace_roots)
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            let (reply, result) = oneshot::channel();
+            command_tx
+                .send(HermesBackendCommand::SetWorkspaceRoots(roots, reply))
+                .map_err(|_| {
+                    super::WorkspaceRelocationError::Rejected(
+                        "Hermes session has closed".to_owned(),
+                    )
+                })?;
+            result.await.map_err(|_| {
+                super::WorkspaceRelocationError::OutcomeUnknown(
+                    "Hermes closed while changing workspace roots; provider outcome is unknown"
+                        .to_owned(),
+                )
+            })?
         }
-        let roots = super::validate_local_workspace_roots(workspace_roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
-        let (reply, result) = oneshot::channel();
-        self.command_tx
-            .send(HermesBackendCommand::SetWorkspaceRoots(roots, reply))
-            .map_err(|_| {
-                super::WorkspaceRelocationError::Rejected("Hermes session has closed".to_owned())
-            })?;
-        result.await.map_err(|_| {
-            super::WorkspaceRelocationError::OutcomeUnknown(
-                "Hermes closed while changing workspace roots; provider outcome is unknown"
-                    .to_owned(),
-            )
-        })?
     }
 
     async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {

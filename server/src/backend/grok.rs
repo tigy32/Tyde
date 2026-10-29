@@ -36,6 +36,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::McpErrorResults,
         BackendCapability::AgentControlTools,
         BackendCapability::Subagents,
+        BackendCapability::RetainedNativeSubagentSessions,
         BackendCapability::TurnUsageReported,
         BackendCapability::CumulativeUsageReported,
         BackendCapability::ModelRequestUsageReported,
@@ -113,7 +114,7 @@ fn link_workspace_session(
     linked.map_err(|error| {
         format!("Cannot alias Grok conversation into destination scope: {error}")
     })?;
-    tracing::info!(%session_id, source = %source.display(), alias = %alias.display(), "Linked Grok conversation into destination workspace scope");
+    tracing::info!("Linked Grok conversation into destination workspace scope");
     Ok(source)
 }
 
@@ -194,6 +195,38 @@ pub(crate) async fn relocate_workspace_session(
         }
         updates.push((path, before, after));
     }
+    let attempts = source.join("subagents");
+    if attempts.exists() {
+        let mut directories = vec![attempts];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory)
+                .map_err(|error| format!("Cannot read Grok native child attempts: {error}"))?
+            {
+                let entry = entry
+                    .map_err(|error| format!("Cannot read Grok native child attempt: {error}"))?;
+                let kind = entry.file_type().map_err(|error| {
+                    format!("Cannot inspect Grok native child attempt: {error}")
+                })?;
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                } else if entry.file_name() == "meta.json" {
+                    let path = entry.path();
+                    let before: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
+                            format!("Cannot read Grok native child workspace: {error}")
+                        })?)
+                        .map_err(|error| format!("Invalid Grok native child workspace: {error}"))?;
+                    if before.get("child_cwd").and_then(serde_json::Value::as_str) != Some(previous)
+                    {
+                        return Err("Grok native child attempt has a different workspace; refusing stale relocation".to_owned());
+                    }
+                    let mut after = before.clone();
+                    after["child_cwd"] = serde_json::json!(destination);
+                    updates.push((path, before, after));
+                }
+            }
+        }
+    }
     for (index, (path, _, after)) in updates.iter().enumerate() {
         if let Err(error) = write_json(path, after) {
             for (path, before, _) in &updates[..index] {
@@ -202,7 +235,9 @@ pub(crate) async fn relocate_workspace_session(
             return Err(error);
         }
     }
-    tracing::info!(%session_id, %destination, "Relocated Grok native summary and prompt workspace without rewriting conversation history");
+    tracing::info!(
+        "Relocated Grok native summary and prompt workspace without rewriting conversation history"
+    );
     Ok(())
 }
 
@@ -438,11 +473,21 @@ impl crate::backend::Backend for GrokBackend {
         self.0.update_session_settings(payload).await
     }
 
-    async fn set_workspace_roots(
+    #[cfg(feature = "test-support")]
+    async fn native_process_id_for_test(&self) -> Result<u32, String> {
+        self.0.native_process_id_for_test().await
+    }
+
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.0.workspace_relocation_wake()
+    }
+
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        self.0.set_workspace_roots(workspace_roots).await
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        self.0.set_workspace_roots(workspace_roots)
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

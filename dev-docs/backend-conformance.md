@@ -97,6 +97,129 @@ Hermes can emit a null final text on a cancelled native
 continuation; it is absent text, not malformed prose. Real failed or empty
 successful responses retain their existing error reporting.
 
+Codex and ACP (Grok) retain native children for later follow-ups. A retained
+conversation is not outstanding work. Actual native turns, tools, registration,
+and pending completion delivery still block relocation. Native completion
+notifies the owner's readiness watch, so scheduled entry does not depend on
+another parent message or a periodic retry.
+
+The host moves native descendants with their owning conversation. Independent
+Tyde child agents still block a move. Native registration and project commit
+share the owner's canonical project watch. Registration already in progress
+blocks entry; registration after provider commit binds to the destination.
+Relocation is an owned operation polled alongside parent events and publication
+requests, never an actor-blocking await. Native registration settles before
+subtree publication. A readiness epoch preserves completion arriving before a
+Busy reply, without periodic retries.
+`native_children_follow_entry_and_preserve_held_input` exercises scheduled entry
+with late registration and exactly-once held input.
+`immediate_entry_waits_for_native_registration_publication` holds native
+registration at publication and requires immediate entry to reject without
+mutation, then succeed after publication. Its inverse ordering starts provider
+entry first, then publishes a new native tool and registers its child while
+entry is pending. That callback must finish before provider entry is released;
+a Busy response after completion must not lose the wake. Both orders preserve
+subtree project binding and exactly-once queued input.
+
+Codex v2 rejects direct child `thread/settings/update`. The adapter checks the
+authoritative loaded-thread inventory and native status, then unsubscribes only
+idle children, deepest first. Native zero idle-retention policy and an actual
+`thread/closed` event establish runtime unload without archiving conversation
+history. The RPC reader delivers that closure to the waiting relocation owner,
+so its own notification queue cannot deadlock it. Native follow-up resumes the
+same thread under the relocated owner. Readiness subscriptions exist before
+Backend return, independently of later runtime handle publication. Every native
+follow-up publishes Running/Completed progress on its original spawn link. Native child tools belong to the child's pending-tool set,
+not the root's. Accounting reads the current native rollout path after resume.
+Grok closes idle native sessions and reloads them in the same engine, preserving
+the native owned-child map. Replacing that engine loses ownership even when its
+transcripts survive. Root, child and native attempt workspace metadata move
+together, with one aliased native transcript rather than divergent copies.
+Closed downstream relays reactivate on actual native work under the same native
+conversation identity and original spawn attribution; closing a view never
+cancels provider work to make entry ready. Failed host relay reactivation closes
+the affected owning backend stream and rejects further input and relocation;
+it never keeps executing follow-ups invisibly. The retained-child case injects
+that consumer-registration failure only after its successful real-provider
+running-child, identity, attribution and destination-execution flow.
+
+Claude fences the successful empty native `set_cwd` result before accepting
+the next turn only when the control confirms an actual cwd change. Native
+no-op and rejection responses have no terminal to await; real error results
+remain on the normal error/output path. Grok uses its actual native
+spawn tool identity and enables native child messaging. Antigravity registers
+from authoritative child metadata and waits for native executor completion in
+the child's trajectory database, not a nonexistent CLI child JSONL log.
+Known failed native terminals publish failed child progress and settle work;
+missing canonical metadata or unreadable projection closes the affected
+session explicitly rather than inventing idle or leaving queued entry stuck.
+
+The exact historical introduction points are `40e613f5` (v0.9.3-beta.8,
+retained-child gate), `efbc7646` (v0.9.5-beta.14, Busy waits for a new backend
+event), and `a5434a4e` (v0.9.5-beta.23, ACP transcript gate). This is not a
+blanket regression claim for every release after beta.6.
+
+`real_workspace_move_after_native_children` completes two real native children,
+moves the idle parent through the production busy/event loop, and requires a
+relative destination write containing delegated context. Every backend declaring
+`Subagents` and `SetWorkspaceRoots` is eligible: Claude, Codex, Hermes, Grok,
+OpenCode and Antigravity. Its consumer-registration rejection tail requires
+visible failure followed by either real visible destination recovery or terminal
+EOF with closed admission and a reaped native process. Setup, collection and
+assertions remain identical across providers.
+
+Antigravity latches native-child projection failure in its state actor, stops
+admission and tears down the native process before closing output. A closed
+projection is not a closed backend. Its turn-state transitions precede their
+published idle/cancellation events.
+
+`real_retained_child_relocation_followup` additionally requires
+`RetainedNativeSubagentSessions` (Codex and Grok). It closes downstream relays,
+starts another real turn in the original child, holds a real command on an
+explicit socket event, requires Busy without mutation, releases that command,
+and waits for an authoritative readiness wake. After entry it closes the relay
+again and requires a same-identity native follow-up, visible reactivation,
+original context, and exactly-once relative execution in the destination. It
+then holds another genuine child command AFTER reactivation, requires reverse
+entry to block, and uses the original startup subscription for completion wake.
+Both parent and original child must execute relatively in the reverse destination.
+A replacement spawn is a failure, not a substitute for native follow-up. Setup,
+event collection and assertions are identical across eligible providers; only
+reliability prompts differ.
+
+Original 2026-10-29 receipts, preserved as historical evidence rather than an
+acceptance result:
+
+| Backend | Original evidence |
+| --- | --- |
+| Codex | RED: Busy with two completed retained children and otherwise idle admission; GREEN after the original readiness fix |
+| OpenCode | RED: hung until the per-test guard; GREEN after readiness fix |
+| Hermes | PASS |
+| Claude | Two passes, one wrong-turn attribution failure after native cwd metadata |
+| Grok | Setup failure: native spawn normalized as Other |
+| Antigravity | Setup failure: native child metadata/log projection |
+
+Recovery receipts and qualified native protocol probes are preserved privately
+under `/home/tyggs/tyde-evidence/native-child-relocation-recovery-20261030/`.
+Raw native identifiers and wire transcripts are mode 0600. Setup failures and
+capability-ineligible wrappers are never counted as backend passes. Historical
+RED/GREEN results do not establish the expanded follow-up/running-child contract.
+
+Recovery coverage: the completed-child case passed all six eligible providers
+in `conformance-final-contract13.log`. The retained-child case passed Codex and
+Grok in `conformance-settled-source-oracle14.log`, including owner/native-child
+identity, actual Busy source cwd, completion wake, exact destination content,
+exactly one child command and visible relay reactivation. Run13's Grok retained
+case hung because an extra source-cwd probe awaited a second foreground terminal
+while the first was deliberately held; run14 retains the same cwd assertion
+after releasing the child and before any successful move. No assertion was
+loosened, no timeout extended, and the failed receipt remains preserved.
+The configured review also found Claude's no-op control fence regression:
+`real_multiple_workspace_relocation` reached the additional-roots-only update
+and timed out with the broken fence in run15, then passed in run17 after
+inspecting `changed` before awaiting. The same scoped run17 passed the
+completed-child case on Claude and Antigravity after review fixes.
+
 `real_workspace_move_after_background_completion` runs the same real command,
 foreground overlap, busy rejection, completion-card and relocated-relative-write
 oracles for every backend declaring `BackgroundTasks` and `SetWorkspaceRoots`:

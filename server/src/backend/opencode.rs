@@ -359,11 +359,16 @@ impl crate::backend::Backend for OpencodeBackend {
         self.0.update_session_settings(payload).await
     }
 
-    async fn set_workspace_roots(
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.0.workspace_relocation_wake()
+    }
+
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        self.0.set_workspace_roots(workspace_roots).await
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        self.0.set_workspace_roots(workspace_roots)
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

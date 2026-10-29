@@ -1758,6 +1758,23 @@ pub trait Backend: Send + Sync + 'static {
         std::future::ready(None)
     }
 
+    #[cfg(feature = "test-support")]
+    fn native_process_id_for_test(
+        &self,
+    ) -> impl std::future::Future<Output = Result<u32, String>> + Send {
+        std::future::ready(Err(
+            "Backend exposes no native process observation".to_owned()
+        ))
+    }
+
+    /// Backend-owned native activity can settle without a parent chat event.
+    /// This wake only permits another admission attempt; it never asserts idle.
+    /// Owners capture it once when the Backend is returned, so it must already
+    /// exist then, independently of later native runtime handle publication.
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
+
     /// Replace an idle session's workspace without starting a turn or losing
     /// its conversation. The first root is the default working directory.
     /// Callers must serialize this with input, settings, and compaction, and
@@ -1767,13 +1784,20 @@ pub trait Backend: Send + Sync + 'static {
     /// Unsupported root sets must be rejected, never truncated. A transport
     /// failure can leave the provider's outcome unknown; callers must not
     /// assume that every error means the provider rolled back the operation.
-    /// Busy and Rejected guarantee no workspace mutation. A scheduled move
-    /// retains its reservation on Busy and retries after backend events;
-    /// OutcomeUnknown requires reconciliation before the actor can continue.
+    /// Busy and Rejected guarantee no workspace mutation. Busy is only for
+    /// the session's own work or a running native child; idle children kept
+    /// for follow-up must not block. A scheduled move retains its reservation
+    /// on Busy and retries after backend events; OutcomeUnknown requires
+    /// reconciliation before the actor can continue.
+    ///
+    /// The operation must own its handles so the actor can service native
+    /// publication callbacks while polling it. Constructing the future must
+    /// not start a move: callers may prepare an unpolled rollback operation.
     fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + 'static
+    {
         async move {
             Err(WorkspaceRelocationError::Rejected(format!(
                 "This backend does not support changing workspace roots to {workspace_roots:?}"

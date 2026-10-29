@@ -876,7 +876,11 @@ Tyde moves the backend workspace and saved conversation together, emits the
 canonical project assignment to clients, then continues automatically. Reviews
 follow that assignment, never the shell directory. Coordinators create only
 and spawn workers with the returned project id. Team, workflow, and swarm
-members cannot move independently, and children must be closed before moving.
+members cannot move independently. Independent Tyde children must be closed
+before moving; backend-native descendants follow their owning conversation.
+Native registration and active child work defer entry until authoritative
+completion. Completed retained native children do not block entry, and native
+follow-ups retain their conversation and attribution in the destination.
 
 Creation accepts an optional `base_ref`. When omitted, every parent root uses
 its current `HEAD`. Before any worktree is added, the server resolves the base

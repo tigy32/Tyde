@@ -401,6 +401,11 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
 /// inventing an empty diff.
 pub fn tool_request_type(tool_name: &str, args: &Value, enriched: bool) -> ToolRequestType {
     match tool_name {
+        "invoke_subagent" => ToolRequestType::AgentSpawn {
+            prompt: arg_str(args, "Prompt"),
+            name: arg_str(args, "Role"),
+            execution_mode: AgentExecutionMode::Background,
+        },
         // Every MCP call arrives as one dispatcher tool. Unwrapping it is the
         // whole job here: the card, and the shared agent-control projection in
         // `EventStream`, both key off the tool the model actually reached for.

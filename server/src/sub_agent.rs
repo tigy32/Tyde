@@ -68,14 +68,23 @@ impl std::fmt::Debug for dyn SubAgentEmitter {
     }
 }
 
-pub(crate) type HostSubAgentSpawnTx = mpsc::UnboundedSender<HostSubAgentSpawnRequest>;
-pub(crate) type HostSubAgentSpawnRx = mpsc::UnboundedReceiver<HostSubAgentSpawnRequest>;
+pub(crate) type HostSubAgentSpawnTx = mpsc::UnboundedSender<HostSubAgentCommand>;
+pub(crate) type HostSubAgentSpawnRx = mpsc::UnboundedReceiver<HostSubAgentCommand>;
+
+pub(crate) enum HostSubAgentCommand {
+    Spawn(Box<HostSubAgentSpawnRequest>),
+    ProjectChanged {
+        parent: AgentId,
+        project_id: Option<protocol::ProjectId>,
+        roots: Vec<String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
 
 pub(crate) struct HostSubAgentSpawnRequest {
     pub spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: crate::host::HostCapacityTx,
     pub parent_agent_id: AgentId,
-    pub workspace_roots: Vec<String>,
     pub tool_use_id: String,
     pub name: String,
     pub description: String,

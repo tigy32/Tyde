@@ -584,6 +584,7 @@ impl ClaudeSession {
                 runtime: None,
                 control_waiters: HashMap::new(),
                 workspace_relocation_in_flight: false,
+                workspace_cwd_result: None,
                 spawns_reserved: 0,
                 caller_turn_jobs: 0,
             },
@@ -830,6 +831,7 @@ struct ClaudeState {
     /// finished the CLI exchange. `set_cwd` ends with an empty `result` frame,
     /// so a user or compaction turn admitted meanwhile would be closed by it.
     workspace_relocation_in_flight: bool,
+    workspace_cwd_result: Option<oneshot::Sender<Result<(), String>>>,
     /// Process starts admitted but not yet installed or abandoned. Turn jobs
     /// are not admitted meanwhile, because the reader that must order them
     /// exists before its runtime is reachable.
@@ -906,6 +908,7 @@ impl Default for ClaudeState {
             runtime: None,
             control_waiters: HashMap::new(),
             workspace_relocation_in_flight: false,
+            workspace_cwd_result: None,
             spawns_reserved: 0,
             caller_turn_jobs: 0,
         }
@@ -1130,8 +1133,10 @@ struct ClaudeWorkspaceRelocation {
 
 impl Drop for ClaudeWorkspaceRelocation {
     fn drop(&mut self) {
-        self.state
-            .apply(|state, _| state.workspace_relocation_in_flight = false);
+        self.state.apply(|state, _| {
+            state.workspace_relocation_in_flight = false;
+            state.workspace_cwd_result = None;
+        });
     }
 }
 
@@ -7715,6 +7720,33 @@ async fn read_claude_stdout_persistent(
                 "Claude frame during workspace relocation"
             );
         }
+        if value.get("type").and_then(Value::as_str) == Some("result")
+            && let Some(completion) = inner
+                .state
+                .with(|state| state.workspace_cwd_result.take())
+                .await
+        {
+            let empty_success = value.get("subtype").and_then(Value::as_str) == Some("success")
+                && value.get("is_error").and_then(Value::as_bool) == Some(false)
+                && extract_result_error(&value).is_none()
+                && value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.trim().is_empty());
+            tracing::info!(empty_success, "Claude workspace control terminal received");
+            let outcome = if empty_success {
+                Ok(())
+            } else {
+                Err(
+                    "Claude emitted a non-metadata result during a workspace control exchange"
+                        .to_owned(),
+                )
+            };
+            let _ = completion.send(outcome);
+            if empty_success {
+                continue;
+            }
+        }
         // Control *responses* are the only inbound traffic that must flow
         // before verification: the `initialize` handshake Tyde itself issued is
         // answered this way, and blocking it would stall the CLI before it
@@ -8204,6 +8236,12 @@ async fn read_claude_stdout_persistent(
             .complete_active_turn_with_outcome(turn_id, outcome)
             .await;
     }
+    inner
+        .state
+        .with(|state| {
+            state.workspace_cwd_result = None;
+        })
+        .await;
     // Jobs queued behind the exit run here, still ordered after it; once the
     // queue is closed, later jobs run on their callers.
     turn_jobs.close();
@@ -9134,6 +9172,7 @@ async fn fail_pending_control_waiters(inner: &ClaudeInner, process_generation: u
 async fn relocate_claude_workspace(
     inner: &ClaudeInner,
     roots: &[String],
+    cwd_result: oneshot::Receiver<Result<(), String>>,
 ) -> Result<(), super::WorkspaceRelocationError> {
     let host_cwd = &roots[0];
     let cwd = tyde_process_env::launch::WorkspacePath::host(host_cwd)
@@ -9152,7 +9191,7 @@ async fn relocate_claude_workspace(
                     "trust_accepted": true, "trusted_directory": cwd,
                 },
             }),
-            Some(CLAUDE_CONTROL_RESPONSE_TIMEOUT),
+            None,
         )
         .await
         .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
@@ -9162,6 +9201,27 @@ async fn relocate_claude_workspace(
     );
     match response.get("status").and_then(Value::as_str) {
         Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
+            match response.get("changed").and_then(Value::as_bool) {
+                Some(true) => cwd_result
+                    .await
+                    .map_err(|_| {
+                        super::WorkspaceRelocationError::OutcomeUnknown(
+                            "Claude exited before its workspace control terminal".to_owned(),
+                        )
+                    })?
+                    .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?,
+                Some(false) => {
+                    inner
+                        .state
+                        .with(|state| state.workspace_cwd_result = None)
+                        .await;
+                }
+                None => {
+                    return Err(super::WorkspaceRelocationError::OutcomeUnknown(
+                        "Claude omitted its workspace mutation outcome".to_owned(),
+                    ));
+                }
+            }
             let workspace_root = host_cwd.clone();
             inner
                 .state
@@ -9201,7 +9261,7 @@ async fn relocate_claude_workspace(
                     "permissions": {"additionalDirectories": super::execution_workspace_roots(&roots[1..]).map_err(super::WorkspaceRelocationError::Rejected)?}
                 }}
             }),
-            Some(CLAUDE_CONTROL_RESPONSE_TIMEOUT),
+            None,
         )
         .await
         .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
@@ -17540,108 +17600,116 @@ impl Backend for ClaudeBackend {
         }
     }
 
-    async fn set_workspace_roots(
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        let roots = super::validate_local_workspace_roots(workspace_roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
         let handle = self
             .command_handle
             .lock()
             .expect("Claude command handle slot poisoned")
-            .clone()
-            .ok_or_else(|| {
+            .clone();
+        async move {
+            let roots = super::validate_local_workspace_roots(workspace_roots)
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            let handle = handle.ok_or_else(|| {
                 super::WorkspaceRelocationError::Rejected("Claude session is not ready".to_owned())
             })?;
-        let inner = &handle.inner;
-        // Admitted between stdout frames, so no frame handling interleaves
-        // with the busy check.
-        let relocation = inner
-            .run_turn_transition(|state: &mut ClaudeState, inner: &Arc<ClaudeInner>| {
-                if state.ssh_host.is_some() || state.ephemeral {
-                    return Err(super::WorkspaceRelocationError::Rejected(
-                        "Claude workspace relocation requires a persistent local session"
-                            .to_owned(),
-                    ));
-                }
-                // The CLI wake latch permits late output; it is not outstanding work.
-                if state.closing
-                    || state.workspace_relocation_in_flight
-                    || state.active_turn.is_some()
-                    || state.pending_compaction.is_some()
-                    || inner
-                        .typing_active
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    || inner
-                        .background_work_active
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    || !inner
-                        .native_subagent_tasks
-                        .lock()
-                        .expect("Claude native task mutex poisoned")
-                        .is_empty()
-                {
-                    tracing::info!(
-                        closing = state.closing,
-                        relocating = state.workspace_relocation_in_flight,
-                        active_turn = state.active_turn.is_some(),
-                        pending_outcome = state
-                            .active_turn
-                            .as_ref()
-                            .is_some_and(|turn| turn.outcome_tx.is_some()),
-                        compaction = state.pending_compaction.is_some(),
-                        typing = inner
+            let inner = &handle.inner;
+            // Admitted between stdout frames, so no frame handling interleaves
+            // with the busy check.
+            let (relocation, cwd_result) = inner
+                .run_turn_transition(|state: &mut ClaudeState, inner: &Arc<ClaudeInner>| {
+                    if state.ssh_host.is_some() || state.ephemeral {
+                        return Err(super::WorkspaceRelocationError::Rejected(
+                            "Claude workspace relocation requires a persistent local session"
+                                .to_owned(),
+                        ));
+                    }
+                    // The CLI wake latch permits late output; it is not outstanding work.
+                    if state.closing
+                        || state.workspace_relocation_in_flight
+                        || state.active_turn.is_some()
+                        || state.pending_compaction.is_some()
+                        || inner
                             .typing_active
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        background = inner
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        || inner
                             .background_work_active
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        cli_wake = inner
-                            .pending_cli_wake
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        native_tasks = inner
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        || !inner
                             .native_subagent_tasks
                             .lock()
                             .expect("Claude native task mutex poisoned")
-                            .len(),
-                        "Deferring Claude workspace relocation until native work settles"
-                    );
-                    return Err(super::WorkspaceRelocationError::Busy);
-                }
-                // Admitted: from here the CLI exchange belongs to its
-                // owner task, so dropping this caller cannot strand a
-                // half-applied `set_cwd`.
-                state.workspace_relocation_in_flight = true;
-                Ok(ClaudeWorkspaceRelocation {
-                    state: inner.state.clone(),
+                            .is_empty()
+                    {
+                        tracing::info!(
+                            closing = state.closing,
+                            relocating = state.workspace_relocation_in_flight,
+                            active_turn = state.active_turn.is_some(),
+                            pending_outcome = state
+                                .active_turn
+                                .as_ref()
+                                .is_some_and(|turn| turn.outcome_tx.is_some()),
+                            compaction = state.pending_compaction.is_some(),
+                            typing = inner
+                                .typing_active
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            background = inner
+                                .background_work_active
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            cli_wake = inner
+                                .pending_cli_wake
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            native_tasks = inner
+                                .native_subagent_tasks
+                                .lock()
+                                .expect("Claude native task mutex poisoned")
+                                .len(),
+                            "Deferring Claude workspace relocation until native work settles"
+                        );
+                        return Err(super::WorkspaceRelocationError::Busy);
+                    }
+                    // Admitted: from here the CLI exchange belongs to its
+                    // owner task, so dropping this caller cannot strand a
+                    // half-applied `set_cwd`.
+                    state.workspace_relocation_in_flight = true;
+                    let (finished, completion) = oneshot::channel();
+                    state.workspace_cwd_result = Some(finished);
+                    Ok((
+                        ClaudeWorkspaceRelocation {
+                            state: inner.state.clone(),
+                        },
+                        completion,
+                    ))
                 })
-            })
-            .await?;
-        let inner = Arc::clone(inner);
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        crate::backend::subprocess::spawn(async move {
-            let outcome = relocate_claude_workspace(&inner, &roots).await;
-            // Released before the caller wakes, so its immediate rollback of an
-            // unknown outcome is admitted rather than refused as busy.
-            drop(relocation);
-            if let Err(Err(error)) = outcome_tx.send(outcome) {
-                tracing::warn!(
-                    outcome = error.kind(),
-                    "Claude workspace relocation failed with no caller waiting"
-                );
-                inner.emit_error(&format!(
+                .await?;
+            let inner = Arc::clone(inner);
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            crate::backend::subprocess::spawn(async move {
+                let outcome = relocate_claude_workspace(&inner, &roots, cwd_result).await;
+                // Released before the caller wakes, so its immediate rollback of an
+                // unknown outcome is admitted rather than refused as busy.
+                drop(relocation);
+                if let Err(Err(error)) = outcome_tx.send(outcome) {
+                    tracing::warn!(
+                        outcome = error.kind(),
+                        "Claude workspace relocation failed with no caller waiting"
+                    );
+                    inner.emit_error(&format!(
                     "Claude could not finish changing workspace roots ({}) after the request was \
                      abandoned; reopen the saved conversation before continuing.",
                     error.kind()
                 ));
-            }
-        });
-        outcome_rx.await.map_err(|_| {
-            super::WorkspaceRelocationError::OutcomeUnknown(
-                "Claude workspace relocation task ended without an outcome".to_owned(),
-            )
-        })?
+                }
+            });
+            outcome_rx.await.map_err(|_| {
+                super::WorkspaceRelocationError::OutcomeUnknown(
+                    "Claude workspace relocation task ended without an outcome".to_owned(),
+                )
+            })?
+        }
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

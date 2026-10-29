@@ -137,6 +137,8 @@ exhaustive_capabilities! {
     // and outcome; any completed installation is attested on the same ledger.
     DurableCompactionLedger,
     Subagents,
+    // Native children retain routable provider session IDs across completed turns.
+    RetainedNativeSubagentSessions,
     NativeSubagentHierarchy,
     ExcludeAgentDelegation,
     EnforcedReadOnly,
@@ -304,6 +306,10 @@ impl BackendCapabilities {
         )?;
         self.require(
             BackendCapability::ForegroundSubagents,
+            BackendCapability::Subagents,
+        )?;
+        self.require(
+            BackendCapability::RetainedNativeSubagentSessions,
             BackendCapability::Subagents,
         )?;
         self.require(

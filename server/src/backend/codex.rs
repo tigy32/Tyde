@@ -313,6 +313,9 @@ impl CodexCommandHandle {
         self.inner
             .state
             .with_after_relocation(move |state| {
+                if state.transport_closed {
+                    return SendOutcome::Closed;
+                }
                 if state.root_turn_owns_typing() || state.pending_compaction.is_some() {
                     return SendOutcome::Busy(AgentInput::SendMessage(payload));
                 }
@@ -1732,13 +1735,21 @@ impl CodexSelectedSkillContext<'_> {
     }
 }
 
+struct CodexSessionForkOptions<'a> {
+    access_mode: BackendAccessMode,
+    skills: CodexSelectedSkillContext<'a>,
+    relocation_wake: tokio::sync::watch::Sender<()>,
+}
+
 struct CodexThreadResources {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     steering_tempfile: Option<PathBuf>,
     skill_projection: Option<CodexSkillProjection>,
     skill_setup: CodexSkillSetup,
 }
 
 struct CodexSessionSpawnOptions<'a> {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     ephemeral: bool,
     access_mode: BackendAccessMode,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
@@ -1763,6 +1774,7 @@ impl CodexSession {
             startup_mcp_servers,
             steering_content,
             CodexSessionSpawnOptions {
+                relocation_wake: tokio::sync::watch::channel(()).0,
                 ephemeral: false,
                 access_mode,
                 subagent_emitter: None,
@@ -1789,6 +1801,7 @@ impl CodexSession {
             startup_mcp_servers,
             steering_content,
             CodexSessionSpawnOptions {
+                relocation_wake: tokio::sync::watch::channel(()).0,
                 ephemeral: true,
                 access_mode,
                 subagent_emitter: None,
@@ -1815,6 +1828,7 @@ impl CodexSession {
             startup_mcp_servers,
             steering_content,
             CodexSessionSpawnOptions {
+                relocation_wake: tokio::sync::watch::channel(()).0,
                 ephemeral: true,
                 access_mode,
                 subagent_emitter: None,
@@ -1836,6 +1850,7 @@ impl CodexSession {
         options: CodexSessionSpawnOptions<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let CodexSessionSpawnOptions {
+            relocation_wake,
             ephemeral,
             access_mode,
             subagent_emitter,
@@ -2073,6 +2088,7 @@ impl CodexSession {
             rpc,
             inbound_rx,
             CodexThreadResources {
+                relocation_wake,
                 steering_tempfile,
                 skill_projection,
                 skill_setup,
@@ -2112,9 +2128,12 @@ impl CodexSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
-            access_mode,
             from_thread_id,
-            CodexSelectedSkillContext::empty(),
+            CodexSessionForkOptions {
+                access_mode,
+                skills: CodexSelectedSkillContext::empty(),
+                relocation_wake: tokio::sync::watch::channel(()).0,
+            },
         )
         .await
     }
@@ -2124,16 +2143,20 @@ impl CodexSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
         from_thread_id: &str,
-        selected_skill_context: CodexSelectedSkillContext<'_>,
+        options: CodexSessionForkOptions<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let CodexSessionForkOptions {
+            access_mode,
+            skills,
+            relocation_wake,
+        } = options;
         let CodexSelectedSkillContext {
             skills: selected_skills,
             selection: skill_selection,
             installed_provider_version,
             excluded_tool_categories,
-        } = selected_skill_context;
+        } = skills;
         let mut skill_notices: Vec<String> = Vec::new();
         let mut selected_skills = selected_skills;
         if let Some(notice) =
@@ -2299,6 +2322,7 @@ impl CodexSession {
             rpc,
             inbound_rx,
             CodexThreadResources {
+                relocation_wake,
                 steering_tempfile,
                 skill_projection,
                 skill_setup,
@@ -2326,6 +2350,7 @@ impl CodexSession {
         subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let CodexThreadResources {
+            relocation_wake,
             steering_tempfile,
             skill_projection,
             skill_setup,
@@ -2380,6 +2405,7 @@ impl CodexSession {
             subagent_emitter,
         );
         let inner = Arc::new(CodexInner {
+            relocation_wake,
             launch_cwd: config.cwd,
             rpc,
             emitter,
@@ -4364,9 +4390,11 @@ struct CodexTurnTokenUsage {
 }
 
 struct CodexSubAgentStream {
+    relay_events: mpsc::UnboundedSender<ChatEvent>,
     emitter: Arc<TurnEmitter>,
     agent_id: protocol::AgentId,
     spawn_item_id: String,
+    progress_tool_call_id: String,
     activity_item_id: Option<String>,
     agent_path: String,
     agent_name: String,
@@ -4393,6 +4421,7 @@ struct CodexSubAgentStream {
     terminated_turns: VecDeque<TerminatedCodexTurn>,
     terminated_turn_awaiting_replacement: Option<String>,
     pending_spawn_terminal_status: Option<String>,
+    native_work_started: bool,
     background_work_failed: bool,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
@@ -4402,6 +4431,14 @@ struct CodexSubAgentStream {
 }
 
 impl CodexSubAgentStream {
+    /// Children are retained after their turns for follow-up routing; only
+    /// a spawn whose native turn has not begun or a live turn is running.
+    fn has_running_native_work(&self) -> bool {
+        !self.native_work_started
+            || self.active_turn_id.is_some()
+            || self.current_message_id.is_some()
+    }
+
     fn has_replaceable_provider_reservation(&self) -> bool {
         self.current_message_id.is_some()
             && self.current_generated_identity.is_none()
@@ -5173,6 +5210,7 @@ impl Drop for CodexWorkspaceRelocation {
 }
 
 struct CodexInner {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     launch_cwd: String,
     rpc: CodexRpc,
     emitter: Arc<TurnEmitter>,
@@ -5185,6 +5223,12 @@ impl CodexInner {
         &self,
         roots: Vec<String>,
     ) -> Result<(), super::WorkspaceRelocationError> {
+        if self.state.with(|state| state.transport_closed).await {
+            return Err(super::WorkspaceRelocationError::Rejected(
+                "Codex native event stream is closed".to_owned(),
+            ));
+        }
+
         // Armed before the admitting transition so a cancellation after it
         // runs, but before its reply arrives, still ends the relocation.
         let relocation = CodexWorkspaceRelocation {
@@ -5200,6 +5244,7 @@ impl CodexInner {
                     pending_tools = state.pending_tool_call_ids.len(), background_commands = state.background_commands.len(),
                     outstanding_commands = state.outstanding_command_executions.len(), pending_wakes = state.pending_background_wakes.len(),
                     wake_in_flight = state.background_wake_request_in_flight, native_children = state.subagent_streams.len(),
+                    running_children = state.subagent_streams.values().filter(|stream| stream.has_running_native_work()).count(),
                     pending_spawns = state.pending_subagent_spawns.len(), "Codex relocation admission state");
                 if state.active_turn_id.is_some()
                     || state.awaiting_root_turn_start
@@ -5210,8 +5255,12 @@ impl CodexInner {
                     || !state.outstanding_command_executions.is_empty()
                     || !state.pending_background_wakes.is_empty()
                     || state.background_wake_request_in_flight
-                    || !state.subagent_streams.is_empty()
+                    || state
+                        .subagent_streams
+                        .values()
+                        .any(CodexSubAgentStream::has_running_native_work)
                     || !state.pending_subagent_spawns.is_empty()
+                    || !state.registering_subagent_threads.is_empty()
                 {
                     tracing::info!(
                         active_turn = state.active_turn_id.is_some(),
@@ -5224,7 +5273,13 @@ impl CodexInner {
                         pending_wakes = state.pending_background_wakes.len(),
                         wake_in_flight = state.background_wake_request_in_flight,
                         native_children = state.subagent_streams.len(),
+                        running_children = state
+                            .subagent_streams
+                            .values()
+                            .filter(|stream| stream.has_running_native_work())
+                            .count(),
                         pending_spawns = state.pending_subagent_spawns.len(),
+                        registering_children = state.registering_subagent_threads.len(),
                         "Deferring Codex workspace relocation until native work settles"
                     );
                     return None;
@@ -5234,6 +5289,75 @@ impl CodexInner {
             })
             .await
             .ok_or(super::WorkspaceRelocationError::Busy)?;
+        let loaded = self
+            .rpc
+            .request("thread/loaded/list", json!({}))
+            .await
+            .map_err(super::WorkspaceRelocationError::Rejected)?;
+        let loaded = loaded
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                super::WorkspaceRelocationError::Rejected(
+                    "Codex loaded-thread inventory omitted data".to_owned(),
+                )
+            })?;
+        let mut children = Vec::new();
+        let mut parent_loaded = false;
+        for id in loaded {
+            let id = id.as_str().ok_or_else(|| {
+                super::WorkspaceRelocationError::Rejected(
+                    "Codex loaded-thread inventory contained an invalid identity".to_owned(),
+                )
+            })?;
+            if id == thread_id {
+                parent_loaded = true;
+                continue;
+            }
+            let snapshot = self
+                .rpc
+                .request(
+                    "thread/read",
+                    json!({"threadId": id, "includeTurns": false}),
+                )
+                .await
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            match snapshot
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+            {
+                Some("active") => return Err(super::WorkspaceRelocationError::Busy),
+                Some("notLoaded") => continue,
+                Some("idle") => {}
+                _ => {
+                    return Err(super::WorkspaceRelocationError::Rejected(
+                        "Codex native child has no relocatable runtime status".to_owned(),
+                    ));
+                }
+            }
+            let depth = snapshot
+                .pointer("/thread/source/subAgent/thread_spawn/depth")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    super::WorkspaceRelocationError::Rejected(
+                        "Codex loaded child omitted native ancestry".to_owned(),
+                    )
+                })?;
+            children.push((depth, id.to_owned()));
+        }
+        if !parent_loaded {
+            return Err(super::WorkspaceRelocationError::Rejected(
+                "Codex relocation parent is not loaded".to_owned(),
+            ));
+        }
+        children.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
+        tracing::info!(target: "tyde_project_entry_diagnostic", loaded_children = children.len(), "Codex native idle runtime unload plan");
+        for (_, child) in children {
+            self.rpc
+                .unload_idle_thread(&child)
+                .await
+                .map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
+        }
         tracing::info!(?roots, "Changing Codex workspace roots");
         tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native thread/settings/update dispatch");
         let execution_roots = super::execution_workspace_roots(&roots)
@@ -8771,15 +8895,43 @@ impl CodexInner {
     }
 
     async fn track_tool_requests(&self, tool_call_ids: impl IntoIterator<Item = String>) {
+        let thread_id = self.state.with(|state| state.thread_id.clone()).await;
+        self.track_tool_requests_for_thread(&thread_id, tool_call_ids)
+            .await;
+    }
+
+    async fn track_tool_requests_for_thread(
+        &self,
+        thread_id: &str,
+        tool_call_ids: impl IntoIterator<Item = String>,
+    ) {
+        let thread_id = thread_id.to_owned();
         let tool_call_ids = tool_call_ids.into_iter().collect::<Vec<_>>();
-        self.state
+        let known = self
+            .state
             .with(move |state| {
-                for tool_call_id in tool_call_ids {
-                    state.cancelled_tool_call_ids.remove(&tool_call_id);
-                    state.pending_tool_call_ids.insert(tool_call_id);
+                if thread_id == state.thread_id {
+                    for tool_call_id in tool_call_ids {
+                        state.cancelled_tool_call_ids.remove(&tool_call_id);
+                        state.pending_tool_call_ids.insert(tool_call_id);
+                    }
+                } else if let Some(child) = state.subagent_streams.get_mut(&thread_id) {
+                    for tool_call_id in tool_call_ids {
+                        child.pending_tool_call_ids.insert(tool_call_id.clone());
+                        if !child.current_tool_call_ids.contains(&tool_call_id) {
+                            child.current_tool_call_ids.push(tool_call_id);
+                        }
+                    }
+                } else {
+                    return false;
                 }
+                true
             })
-            .await
+            .await;
+        if !known {
+            self.emitter
+                .backend_error("Codex execution tool has no registered native owner");
+        }
     }
 
     async fn suppress_cancelled_tool_completion(&self, tool_call_id: &str) -> bool {
@@ -10261,8 +10413,11 @@ impl CodexInner {
                     let tool_call_id = self
                         .tool_call_started_id(params, provider_item_id, "run_command")
                         .await;
-                    self.track_tool_requests(std::iter::once(tool_call_id.clone()))
-                        .await;
+                    self.track_tool_requests_for_thread(
+                        &thread_id,
+                        std::iter::once(tool_call_id.clone()),
+                    )
+                    .await;
                     self.emit_tool_request_for_thread(
                         &thread_id,
                         &tool_call_id,
@@ -10296,8 +10451,11 @@ impl CodexInner {
                     let item_id = self
                         .tool_call_started_id(params, provider_item_id, tool_name)
                         .await;
-                    self.track_tool_requests(std::iter::once(item_id.clone()))
-                        .await;
+                    self.track_tool_requests_for_thread(
+                        &thread_id,
+                        std::iter::once(item_id.clone()),
+                    )
+                    .await;
                     self.emit_tool_request_for_thread(
                         &thread_id,
                         &item_id,
@@ -11028,6 +11186,12 @@ impl CodexInner {
                     .await;
                     if thread_id == self.state.with(|state| state.thread_id.clone()).await {
                         self.mark_tool_completed(&tool_call_id).await;
+                    } else {
+                        self.complete_subagent_tool_calls(
+                            &thread_id,
+                            std::slice::from_ref(&tool_call_id),
+                        )
+                        .await;
                     }
                 }
                 if thread_id == self.state.with(|state| state.thread_id.clone()).await {
@@ -11637,6 +11801,15 @@ impl CodexInner {
     }
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
+        if method == "thread/status/changed" {
+            if matches!(
+                params.pointer("/status/type").and_then(Value::as_str),
+                Some("idle" | "notLoaded")
+            ) {
+                self.relocation_wake.send_replace(());
+            }
+            return;
+        }
         if method == "thread/goal/updated" || method == "thread/goal/cleared" {
             let thread_id = self.state.with(move |state| state.thread_id.clone()).await;
             if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str()) {
@@ -12463,36 +12636,27 @@ impl CodexInner {
                     Arc::clone(&stream.emitter)
                 };
                 let usage = state.own_request_usage.get(&owner);
-                let path = usage.and_then(|usage| usage.path.clone());
                 let offset = usage.map_or(0, usage::OwnRequestUsage::offset);
-                Some((emitter, path, offset))
+                Some((emitter, offset))
             })
             .await;
-        let Some((emitter, path, offset)) = target else {
+        let Some((emitter, offset)) = target else {
             return Ok(());
         };
-        let path = match path {
-            Some(path) => path,
-            None => {
-                let response = self
-                    .rpc
-                    .request(
-                        "thread/read",
-                        json!({
-                            "threadId": thread_id,
-                            "includeTurns": false,
-                        }),
-                    )
-                    .await
-                    .map_err(|_| "Codex native accounting thread/read failed")?;
-                response
-                    .pointer("/thread/path")
-                    .and_then(Value::as_str)
-                    .ok_or("Codex native accounting requires a materialized thread path")?
-                    .to_owned()
-            }
-        };
-        let bytes = self.rpc.read_native_usage(&path, offset).await?;
+        // Native archive/resume moves the same rollout between store directories.
+        let response = self
+            .rpc
+            .request(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            )
+            .await
+            .map_err(|_| "Codex native accounting thread/read failed")?;
+        let path = response
+            .pointer("/thread/path")
+            .and_then(Value::as_str)
+            .ok_or("Codex native accounting requires a materialized thread path")?;
+        let bytes = self.rpc.read_native_usage(path, offset).await?;
         let context = params.and_then(|params| {
             let raw = extract_turn_token_usage_value(params)?;
             let normalized = normalize_token_usage_with_envelope(raw, Some(params), None)?;
@@ -12510,7 +12674,6 @@ impl CodexInner {
             .state
             .with(move |state| {
                 let ledger = state.own_request_usage.entry(owner.clone()).or_default();
-                ledger.path = Some(path);
                 let mut events = ledger.reconcile(
                     &owner,
                     offset,
@@ -12657,8 +12820,59 @@ impl CodexInner {
                     })
                     .await;
                 tracing::info!(method, "Codex notification ownership: live child");
+                let relay_failure = if method == "turn/started" {
+                    self.reactivate_codex_child_relay(&thread_id).await.err()
+                } else {
+                    None
+                };
                 self.handle_subagent_notification(method, params, &thread_id, &model)
                     .await;
+                if method == "turn/started" && relay_failure.is_none() {
+                    let progress = self
+                        .state
+                        .with({
+                            let thread_id = thread_id.clone();
+                            move |state| {
+                                state.subagent_streams.get(&thread_id).map(|child| {
+                                    ToolProgressData {
+                                        tool_call_id: child.progress_tool_call_id.clone(),
+                                        execution_mode: ToolExecutionMode::Background,
+                                        cancellable: false,
+                                        update: ToolProgressUpdate::SubAgent(
+                                            protocol::SubAgentProgress {
+                                                backend_kind: None,
+                                                agent_id: child.agent_id.clone(),
+                                                agent_name: child.agent_name.clone(),
+                                                last_tool_name: None,
+                                                tool_calls: 0,
+                                                completed: false,
+                                                status: protocol::SubAgentProgressStatus::Running,
+                                            },
+                                        ),
+                                    }
+                                })
+                            }
+                        })
+                        .await;
+                    let Some(progress) = progress else {
+                        self.state.with(|state| state.transport_closed = true).await;
+                        let error = "Codex native turn start lost its original spawn attribution";
+                        self.emitter.backend_error(error);
+                        self.emitter.close(error);
+                        return true;
+                    };
+                    self.emitter.tool_progress(&progress);
+                }
+                if let Some(error) = relay_failure {
+                    self.state.with(|state| state.transport_closed = true).await;
+                    self.emitter.backend_error(&error);
+                    self.emitter.close(&error);
+                    return true;
+                }
+                if method == "turn/completed" || method == "item/completed" {
+                    tracing::info!(target: "tyde_project_entry_diagnostic", method, subscribers = self.relocation_wake.receiver_count(), "Codex live child publishes readiness wake");
+                    self.relocation_wake.send_replace(());
+                }
                 true
             }
             CodexNotificationOwner::CompletedChild { thread_id } => {
@@ -12682,6 +12896,9 @@ impl CodexInner {
                 self.register_codex_descendant_from_notification(&ancestor_thread_id, params)
                     .await;
                 tracing::info!(method, "Codex notification ownership: nested descendant");
+                if method == "turn/completed" {
+                    self.relocation_wake.send_replace(());
+                }
                 true
             }
             CodexNotificationOwner::Unknown { thread_id } => {
@@ -12716,6 +12933,60 @@ impl CodexInner {
                 true
             }
         }
+    }
+
+    async fn reactivate_codex_child_relay(&self, thread_id: &str) -> Result<(), String> {
+        let registration = self
+            .state
+            .with({
+                let thread_id = thread_id.to_owned();
+                move |state| {
+                    let child = state.subagent_streams.get(&thread_id)?;
+                    child.relay_events.is_closed().then(|| {
+                        (
+                            state.subagent_emitter.clone(),
+                            child.progress_tool_call_id.clone(),
+                            child.agent_name.clone(),
+                        )
+                    })
+                }
+            })
+            .await;
+        let Some((sink, tool_id, name)) = registration else {
+            return Ok(());
+        };
+        let sink = sink.ok_or_else(|| "Codex native follow-up has no relay owner".to_owned())?;
+        let handle = sink
+            .on_subagent_spawned(
+                tool_id,
+                name,
+                String::new(),
+                "codex".to_owned(),
+                Some(protocol::SessionId(thread_id.to_owned())),
+            )
+            .await?;
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            raw_tx,
+            AgentName(CODEX_AGENT_NAME),
+        ));
+        let relay_events = handle.event_tx.clone();
+        spawn_codex_subagent_event_bridge(raw_rx, handle.event_tx, handle.model_usage_tx);
+        self.state
+            .with({
+                let thread_id = thread_id.to_owned();
+                move |state| {
+                    let child = state.subagent_streams.get_mut(&thread_id).ok_or_else(|| {
+                        "Codex native follow-up lost its registered owner".to_owned()
+                    })?;
+                    child.emitter = emitter;
+                    child.relay_events = relay_events;
+                    child.agent_id = handle.agent_id;
+                    child.name_update_tx = handle.name_update_tx;
+                    Ok(())
+                }
+            })
+            .await
     }
 
     async fn register_codex_descendant_from_notification(
@@ -12964,6 +13235,7 @@ impl CodexInner {
                 let Some(emitter) = self
                     .update_codex_subagent_stream(stream_key, move |stream| {
                         stream.terminated_turn_awaiting_replacement = None;
+                        stream.native_work_started = true;
                         stream.active_turn_id = Some(turn_id);
                         stream.current_message_id = None;
                         stream.current_generated_identity = None;
@@ -15429,9 +15701,11 @@ let stream_key = stream_key.as_str();
                 self.state
                     .with(move |state| {
                         let stream_key = stream_key.as_str();
-                        let terminal = state.subagent_streams.get(stream_key).map(|stream| {
+                        let terminal = state.subagent_streams.get_mut(stream_key).map(|stream| {
+                            stream.native_work_started = true;
                             (
                                 stream.spawn_item_id.clone(),
+                                stream.progress_tool_call_id.clone(),
                                 stream.agent_id.clone(),
                                 stream.agent_name.clone(),
                                 stream.current_tool_call_ids.len() as u64,
@@ -15445,23 +15719,11 @@ let stream_key = stream_key.as_str();
                     .await
             }
         };
-        if let Some((recorded_tool_call_id, agent_id, agent_name, tool_calls)) = terminal {
-            let tool_call_id = if self
-                .emitter
-                .has_pending_tool_request(&recorded_tool_call_id)
-            {
-                recorded_tool_call_id.clone()
-            } else {
-                format!("codex-native-spawn:{recorded_tool_call_id}")
-            };
+        if let Some((_, tool_call_id, agent_id, agent_name, tool_calls)) = terminal {
             eprintln!(
-                "TYDE CODEX CHILD SPAWN TERMINALIZE scoped_fallback={} pending={} status={turn_status}",
-                tool_call_id != recorded_tool_call_id,
-                self.emitter.has_pending_tool_request(&tool_call_id),
+                "TYDE CODEX CHILD SPAWN TERMINALIZE pending={} status={turn_status}",
+                self.emitter.has_pending_tool_request(&tool_call_id)
             );
-            if !self.emitter.has_pending_tool_request(&tool_call_id) {
-                return;
-            }
             tracing::info!(
                 status = turn_status,
                 "Terminalizing Codex native background spawn"
@@ -15492,6 +15754,9 @@ let stream_key = stream_key.as_str();
                     status,
                 }),
             });
+            if !self.emitter.has_pending_tool_request(&tool_call_id) {
+                return;
+            }
             if cancelled {
                 self.emitter.cancel_pending_tool(
                     &tool_call_id,
@@ -17699,6 +17964,7 @@ let stream_key = stream_key.as_str();
         let child_agent_id = handle.agent_id.clone();
         let spawned_agent = child_agent_id.clone();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
+        let relay_events = handle.event_tx.clone();
         spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx, handle.model_usage_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
@@ -17737,9 +18003,11 @@ let stream_key = stream_key.as_str();
                                     state.subagent_streams.insert(
                                         thread_id.clone(),
                                         CodexSubAgentStream {
+                                            relay_events,
                                             emitter,
                                             agent_id: child_agent_id,
                                             spawn_item_id: spawn_item_id.clone(),
+                                            progress_tool_call_id: progress_tool_call_id.clone(),
                                             activity_item_id: activity.item_id.clone(),
                                             agent_path: activity.agent_path.clone(),
                                             agent_name: spawn_name.clone(),
@@ -17765,6 +18033,7 @@ let stream_key = stream_key.as_str();
                                             terminated_turns: VecDeque::new(),
                                             terminated_turn_awaiting_replacement: None,
                                             pending_spawn_terminal_status: None,
+                                            native_work_started: false,
                                             background_work_failed: false,
                                             generated_identity_epoch:
                                                 codex_generated_identity_epoch(&thread_id),
@@ -19090,17 +19359,7 @@ fn parse_codex_subagent_collabs(item: &Value) -> Vec<CodexSubAgentSpawnInfo> {
         .get("tool")
         .and_then(Value::as_str)
         .is_some_and(|tool| tool.eq_ignore_ascii_case("spawnAgent"));
-    let has_legacy_spawn_shape = item.get("agentsStates").is_none()
-        && item.get("prompt").and_then(Value::as_str).is_some()
-        && (item
-            .get("receiverAgentType")
-            .and_then(Value::as_str)
-            .is_some()
-            || item
-                .get("receiverAgentName")
-                .and_then(Value::as_str)
-                .is_some());
-    if !explicit_spawn_tool && !has_legacy_spawn_shape {
+    if !explicit_spawn_tool {
         return Vec::new();
     }
     let Some(item_id) = item
@@ -21375,7 +21634,19 @@ fn codex_mcp_config_overrides(
     overrides
 }
 
+type CodexThreadCloseWaiters = HashMap<u64, oneshot::Sender<Result<(), CodexRpcError>>>;
+
 enum CodexPendingRpcCommand {
+    WaitForThreadClosed {
+        id: u64,
+        thread_id: String,
+        reply: oneshot::Sender<Result<(), CodexRpcError>>,
+    },
+    RemoveThreadClosed {
+        id: u64,
+        thread_id: String,
+    },
+    ThreadClosed(String),
     Insert {
         id: u64,
         reply: oneshot::Sender<Result<Value, CodexRpcError>>,
@@ -21401,8 +21672,34 @@ impl CodexPendingRpc {
         let (commands, mut inbox) = mpsc::unbounded_channel::<CodexPendingRpcCommand>();
         crate::backend::subprocess::spawn(async move {
             let mut pending = HashMap::new();
+            let mut thread_closures: HashMap<String, CodexThreadCloseWaiters> = HashMap::new();
             while let Some(command) = inbox.recv().await {
                 match command {
+                    CodexPendingRpcCommand::WaitForThreadClosed {
+                        id,
+                        thread_id,
+                        reply,
+                    } => {
+                        thread_closures
+                            .entry(thread_id)
+                            .or_default()
+                            .insert(id, reply);
+                    }
+                    CodexPendingRpcCommand::RemoveThreadClosed { id, thread_id } => {
+                        if let Some(waiters) = thread_closures.get_mut(&thread_id) {
+                            waiters.remove(&id);
+                            if waiters.is_empty() {
+                                thread_closures.remove(&thread_id);
+                            }
+                        }
+                    }
+                    CodexPendingRpcCommand::ThreadClosed(thread_id) => {
+                        if let Some(waiters) = thread_closures.remove(&thread_id) {
+                            for (_, reply) in waiters {
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
+                    }
                     CodexPendingRpcCommand::Insert { id, reply } => {
                         drop(pending.insert(id, reply));
                     }
@@ -21417,6 +21714,11 @@ impl CodexPendingRpc {
                     CodexPendingRpcCommand::Fail { reason, done } => {
                         for (_, reply) in pending.drain() {
                             let _ = reply.send(Err(CodexRpcError::transport(reason)));
+                        }
+                        for (_, waiters) in thread_closures.drain() {
+                            for (_, reply) in waiters {
+                                let _ = reply.send(Err(CodexRpcError::transport(reason)));
+                            }
                         }
                         let _ = done.send(());
                     }
@@ -21463,6 +21765,23 @@ impl CodexPendingRpc {
     }
 }
 
+struct CodexThreadClosedRegistration {
+    pending: CodexPendingRpc,
+    id: u64,
+    thread_id: String,
+}
+impl Drop for CodexThreadClosedRegistration {
+    fn drop(&mut self) {
+        let _ = self
+            .pending
+            .commands
+            .send(CodexPendingRpcCommand::RemoveThreadClosed {
+                id: self.id,
+                thread_id: self.thread_id.clone(),
+            });
+    }
+}
+
 struct CodexPendingRpcRegistration {
     pending: CodexPendingRpc,
     id: u64,
@@ -21493,10 +21812,14 @@ impl Drop for CodexOwnedProcess {
 #[derive(Clone)]
 struct CodexProcessOwner {
     commands: mpsc::UnboundedSender<CodexProcessCommand>,
+    #[cfg(feature = "test-support")]
+    native_pid: Option<u32>,
 }
 
 impl CodexProcessOwner {
     fn spawn(child: AsyncGroupChild) -> Self {
+        #[cfg(feature = "test-support")]
+        let native_pid = child.id();
         let (commands, mut inbox) = mpsc::unbounded_channel::<CodexProcessCommand>();
         let mut process = CodexOwnedProcess(Some(child));
         crate::backend::subprocess::spawn(async move {
@@ -21540,7 +21863,11 @@ impl CodexProcessOwner {
                 }
             }
         });
-        Self { commands }
+        Self {
+            commands,
+            #[cfg(feature = "test-support")]
+            native_pid,
+        }
     }
 
     async fn exit_code(&self) -> Option<i32> {
@@ -21860,6 +22187,9 @@ impl CodexRpc {
         }
         let mut config_overrides =
             codex_mcp_config_overrides(startup_mcp_servers, ssh_host.is_none());
+        // Native cleanup waits for both no subscribers and authoritative idle.
+        // A zero retention delay makes unsubscribe an event-driven unload boundary.
+        config_overrides.push("thread_unload_delay_secs=0".to_owned());
         let read_only_builtins_direct_tools = access_mode == BackendAccessMode::EnforcedReadOnly
             && execution_mode == BackendExecutionMode::Agent;
         let read_only_agentcontrol_direct_tools = read_only_builtins_direct_tools
@@ -22031,6 +22361,17 @@ impl CodexRpc {
                             params,
                         });
                     } else {
+                        if method == "thread/closed"
+                            && let Some(thread_id) = params.get("threadId").and_then(Value::as_str)
+                            && stdout_pending
+                                .commands
+                                .send(CodexPendingRpcCommand::ThreadClosed(thread_id.to_owned()))
+                                .is_err()
+                        {
+                            tracing::error!(
+                                "Codex response owner stopped before native thread closure"
+                            );
+                        }
                         let _ = stdout_inbound.send(CodexInbound::Notification {
                             method: method.to_string(),
                             params,
@@ -22133,6 +22474,45 @@ impl CodexRpc {
             );
         }
         Ok(bytes)
+    }
+
+    // The inbound owner awaits this operation: closure must come from the RPC
+    // reader, not be queued behind that same owner.
+    async fn unload_idle_thread(&self, thread_id: &str) -> Result<(), String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply, closed) = oneshot::channel();
+        let registration = CodexThreadClosedRegistration {
+            pending: self.pending.clone(),
+            id,
+            thread_id: thread_id.to_owned(),
+        };
+        self.pending
+            .commands
+            .send(CodexPendingRpcCommand::WaitForThreadClosed {
+                id,
+                thread_id: thread_id.to_owned(),
+                reply,
+            })
+            .map_err(|_| "Codex native closure owner stopped before unsubscribe".to_owned())?;
+        let response = self
+            .request("thread/unsubscribe", json!({"threadId": thread_id}))
+            .await
+            .map_err(|error| error.replace(thread_id, "<native-child>"))?;
+        let status = response.get("status").and_then(Value::as_str);
+        tracing::info!(target: "tyde_project_entry_diagnostic", status, "Codex idle native unsubscribe acknowledged");
+        match status {
+            Some("notLoaded") => {}
+            Some("notSubscribed" | "unsubscribed") => {
+                closed
+                    .await
+                    .map_err(|_| "Codex native closure channel stopped before unload".to_owned())?
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => return Err("Codex native unsubscribe returned no valid status".to_owned()),
+        }
+        drop(registration);
+        tracing::info!(target: "tyde_project_entry_diagnostic", "Codex authoritative idle native unload completed");
+        Ok(())
     }
 
     async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
@@ -22522,6 +22902,7 @@ use super::{
 };
 
 pub struct CodexBackend {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     workspace_is_local: bool,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
@@ -22581,6 +22962,8 @@ impl CodexBackend {
             CodexStartupCancelGuard(Some(startup_cancel_tx), startup_processes.clone());
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
+        let relocation_wake = tokio::sync::watch::channel(()).0;
+        let task_relocation_wake = relocation_wake.clone();
 
         crate::backend::subprocess::spawn(async move {
             let combined_instructions = (!inference_only)
@@ -22603,6 +22986,7 @@ impl CodexBackend {
                     startup_mcp_servers,
                     combined_instructions.as_deref(),
                     CodexSessionSpawnOptions {
+                        relocation_wake: task_relocation_wake,
                         ephemeral: false,
                         access_mode: config.resolved_spawn_config.access_mode,
                         subagent_emitter: initial_emitter,
@@ -22922,6 +23306,7 @@ impl CodexBackend {
                 steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
+                relocation_wake,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -24009,6 +24394,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::RetainedNativeSubagentSessions,
             tyde_agent_adapter::BackendCapability::ExcludeAgentDelegation,
             tyde_agent_adapter::BackendCapability::EnforcedReadOnly,
             tyde_agent_adapter::BackendCapability::NativeSubagentWaitProgress,
@@ -24083,6 +24469,8 @@ impl Backend for CodexBackend {
         let initial_emitter = config.subagent_emitter.clone();
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
+        let relocation_wake = tokio::sync::watch::channel(()).0;
+        let task_relocation_wake = relocation_wake.clone();
 
         let session_id = session_id.0;
         let backend_session_id =
@@ -24098,6 +24486,7 @@ impl Backend for CodexBackend {
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
                 CodexSessionSpawnOptions {
+                    relocation_wake: task_relocation_wake,
                     ephemeral: false,
                     access_mode: config.resolved_spawn_config.access_mode,
                     subagent_emitter: None,
@@ -24255,6 +24644,7 @@ impl Backend for CodexBackend {
                 steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
+                relocation_wake,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -24285,6 +24675,8 @@ impl Backend for CodexBackend {
         let initial_emitter = config.subagent_emitter.clone();
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
+        let relocation_wake = tokio::sync::watch::channel(()).0;
+        let task_relocation_wake = relocation_wake.clone();
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
@@ -24302,15 +24694,18 @@ impl Backend for CodexBackend {
                     None,
                     &config.startup_mcp_servers,
                     combined_instructions.as_deref(),
-                    config.resolved_spawn_config.access_mode,
                     &from_session_id.0,
-                    CodexSelectedSkillContext {
-                        skills: &config.resolved_spawn_config.skills,
-                        selection: config.resolved_spawn_config.skill_selection,
-                        installed_provider_version: config.provider_version.as_deref(),
-                        excluded_tool_categories: &config
-                            .resolved_spawn_config
-                            .excluded_tool_categories,
+                    CodexSessionForkOptions {
+                        access_mode: config.resolved_spawn_config.access_mode,
+                        relocation_wake: task_relocation_wake,
+                        skills: CodexSelectedSkillContext {
+                            skills: &config.resolved_spawn_config.skills,
+                            selection: config.resolved_spawn_config.skill_selection,
+                            installed_provider_version: config.provider_version.as_deref(),
+                            excluded_tool_categories: &config
+                                .resolved_spawn_config
+                                .excluded_tool_categories,
+                        },
                     },
                 ))
                 .await
@@ -24549,6 +24944,7 @@ impl Backend for CodexBackend {
                 steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
+                relocation_wake,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -24667,42 +25063,61 @@ impl Backend for CodexBackend {
         outcome
     }
 
-    async fn set_workspace_roots(
+    #[cfg(feature = "test-support")]
+    async fn native_process_id_for_test(&self) -> Result<u32, String> {
+        self.compaction_handle
+            .lock()
+            .expect("Codex command handle")
+            .as_ref()
+            .and_then(|handle| handle.inner.rpc.child.native_pid)
+            .ok_or_else(|| "Codex native process is unavailable".to_owned())
+    }
+
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        tracing::info!(target: "tyde_project_entry_diagnostic", available = true, "Codex relocation subscription acquired");
+        Some(self.relocation_wake.subscribe())
+    }
+
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        if !self.workspace_is_local {
-            return Err(super::WorkspaceRelocationError::Rejected(
-                "Codex workspace relocation is currently supported only for local sessions"
-                    .to_owned(),
-            ));
-        }
-        let roots = super::validate_local_workspace_roots(workspace_roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        let workspace_is_local = self.workspace_is_local;
         let handle = self
             .compaction_handle
             .lock()
             .expect("Codex command handle mutex poisoned")
-            .clone()
-            .ok_or_else(|| {
+            .clone();
+        async move {
+            if !workspace_is_local {
+                return Err(super::WorkspaceRelocationError::Rejected(
+                    "Codex workspace relocation is currently supported only for local sessions"
+                        .to_owned(),
+                ));
+            }
+            let roots = super::validate_local_workspace_roots(workspace_roots)
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            let handle = handle.ok_or_else(|| {
                 super::WorkspaceRelocationError::Rejected("Codex session is not ready".to_owned())
             })?;
-        let (reply, relocated) = oneshot::channel();
-        handle
-            .inner
-            .rpc
-            .inbound
-            .send(CodexInbound::Relocate { roots, reply })
-            .map_err(|_| {
-                super::WorkspaceRelocationError::Rejected(
-                    "Codex inbound processor stopped before workspace relocation".to_owned(),
+            let (reply, relocated) = oneshot::channel();
+            handle
+                .inner
+                .rpc
+                .inbound
+                .send(CodexInbound::Relocate { roots, reply })
+                .map_err(|_| {
+                    super::WorkspaceRelocationError::Rejected(
+                        "Codex inbound processor stopped before workspace relocation".to_owned(),
+                    )
+                })?;
+            relocated.await.map_err(|_| {
+                super::WorkspaceRelocationError::OutcomeUnknown(
+                    "Codex inbound processor stopped during workspace relocation".to_owned(),
                 )
-            })?;
-        relocated.await.map_err(|_| {
-            super::WorkspaceRelocationError::OutcomeUnknown(
-                "Codex inbound processor stopped during workspace relocation".to_owned(),
-            )
-        })?
+            })?
+        }
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

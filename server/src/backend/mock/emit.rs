@@ -619,6 +619,11 @@ pub(super) async fn spawn_native_child(
     } else {
         format!("mock-tool-use-{}", Uuid::new_v4())
     };
+    if child.lifecycle == MockChildLifecycle::PublishAfterGate
+        && let Some(gate) = &child.registration_gate
+    {
+        gate.wait().await;
+    }
     let _ = events_tx.send_event(tool_request(ToolRequest {
         tool_call_id: tool_use_id.clone(),
         tool_name: "Task".to_owned(),
@@ -629,7 +634,22 @@ pub(super) async fn spawn_native_child(
         },
     }));
 
-    if let Some(gate) = &child.registration_gate {
+    if matches!(
+        child.lifecycle,
+        MockChildLifecycle::ReportBeforeRegistration | MockChildLifecycle::PublishAfterGate
+    ) {
+        let _ = events_tx.send_event(tool_completed(ToolExecutionCompletedData {
+            tool_call_id: tool_use_id.clone(),
+            outcome: ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other {
+                    result: json!({"status": "completed"}),
+                },
+            },
+        }));
+    }
+    if child.lifecycle != MockChildLifecycle::PublishAfterGate
+        && let Some(gate) = &child.registration_gate
+    {
         gate.wait().await;
     }
     let handle = match emitter
@@ -679,7 +699,10 @@ pub(super) async fn spawn_native_child(
             emit_live_native_child_stream(&handle);
             active_subagents.push(handle);
         }
-        MockChildLifecycle::CompleteAndRetain => {
+        MockChildLifecycle::CompleteAndRetain
+        | MockChildLifecycle::ReportAndRetain
+        | MockChildLifecycle::ReportBeforeRegistration
+        | MockChildLifecycle::PublishAfterGate => {
             emit_native_child_turn(
                 &handle.event_tx,
                 &child.prompt,
@@ -765,6 +788,28 @@ pub(super) async fn spawn_native_child(
                     &child.name,
                 )));
                 active_subagents.push(grandchild_handle);
+            }
+            if matches!(
+                child.lifecycle,
+                MockChildLifecycle::ReportAndRetain
+                    | MockChildLifecycle::ReportBeforeRegistration
+                    | MockChildLifecycle::PublishAfterGate
+            ) {
+                let _ = events_tx.send_event(BackendEvent::Chat(native_child_link(
+                    &tool_use_id,
+                    &handle,
+                    &child.name,
+                )));
+                if child.lifecycle == MockChildLifecycle::ReportAndRetain {
+                    let _ = events_tx.send_event(tool_completed(ToolExecutionCompletedData {
+                        tool_call_id: tool_use_id.clone(),
+                        outcome: ToolExecutionOutcome::Succeeded {
+                            result: ToolExecutionResult::Other {
+                                result: json!({"status": "completed"}),
+                            },
+                        },
+                    }));
+                }
             }
             active_subagents.push(handle);
         }

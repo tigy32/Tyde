@@ -605,12 +605,15 @@ impl KiroSession {
             .then(|| adapter.capacity_probe_spec(&roots))
             .flatten();
         let agent_name = adapter.agent_name().to_owned();
+        let emitter = Arc::new(TurnEmitter::new_for_agent(event_tx, AgentName(&agent_name)));
         let inner = Arc::new(KiroInner {
+            failure_emitter: Arc::clone(&emitter),
+            relocation_wake: tokio::sync::watch::channel(()).0,
             adapter,
             capabilities,
             bridge: Arc::new(bridge),
-            emitter: Arc::new(TurnEmitter::new_for_agent(event_tx, AgentName(&agent_name))),
-            shutting_down: AtomicBool::new(false),
+            emitter,
+            shutting_down: Arc::new(AtomicBool::new(false)),
             workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             capacity_probe,
@@ -752,6 +755,10 @@ struct KiroState {
     replay_error: Option<String>,
     grok_turn_sequence: u64,
     native_child: bool,
+    /// Set once a routed native child finalizes a turn. Owned children stay
+    /// registered for late-output attribution after that; they are not
+    /// outstanding work unless a later native response or tool reopens.
+    native_child_turn_completed: bool,
     grok_request_usages: Vec<GrokRequestUsage>,
     grok_last_message_id: Option<ChatMessageId>,
     grok_pending_response_end: Option<Value>,
@@ -918,12 +925,14 @@ struct NativeSessionRoutes {
 }
 
 struct KiroInner {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     adapter: Arc<dyn AcpAgentAdapter>,
     capabilities: AcpCapabilities,
     bridge: Arc<AcpBridge>,
     emitter: Arc<TurnEmitter>,
     state: KiroStateActor,
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    failure_emitter: Arc<TurnEmitter>,
     workspace_reload_in_progress: AtomicBool,
     ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
@@ -1165,6 +1174,11 @@ impl KiroInner {
         self: &Arc<Self>,
         workspace_roots: Vec<String>,
     ) -> Result<(), crate::backend::WorkspaceRelocationError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(crate::backend::WorkspaceRelocationError::Rejected(
+                "ACP native session has closed".to_owned(),
+            ));
+        }
         if self.ssh_host.is_some() || !self.capabilities.load_session {
             return Err(crate::backend::WorkspaceRelocationError::Rejected(
                 "ACP workspace relocation requires a local provider with session/load support"
@@ -1173,6 +1187,11 @@ impl KiroInner {
         }
         let roots = crate::backend::validate_local_workspace_roots(workspace_roots)
             .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
+        let native_work = self.running_native_children().await;
+        tracing::info!(target: "tyde_project_entry_diagnostic", native_work, "ACP native relocation pre-admission");
+        if native_work > 0 {
+            return Err(crate::backend::WorkspaceRelocationError::Busy);
+        }
         let prompt_guard = self
             .state
             .admission(KiroAdmissionPhase::RelocationCandidate);
@@ -1188,10 +1207,13 @@ impl KiroInner {
         {
             return Err(crate::backend::WorkspaceRelocationError::Busy);
         }
+        tracing::info!(target: "tyde_project_entry_diagnostic", "ACP native relocation inbound fence entered");
         self.bridge
             .sync_inbound()
             .await
             .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
+        tracing::info!(target: "tyde_project_entry_diagnostic", "ACP native relocation inbound fence settled");
+        let running_children = self.running_native_children().await;
         let inner = Arc::clone(self);
         let (session_id, previous_root, startup_mcp_servers, settings) = self
             .state
@@ -1202,9 +1224,18 @@ impl KiroInner {
                     || !state.active_tool_contexts.is_empty()
                     || state.pending_compaction.is_some()
                     || state.replaying_history
-                    || !state.native_child_sessions.is_empty()
-                    || !state.native_owned_children.is_empty()
+                    || running_children > 0
                 {
+                    tracing::info!(
+                        in_flight_prompts = inner.in_flight_prompts.load(Ordering::SeqCst),
+                        active_response = state.active_response.is_some(),
+                        active_tools = state.active_tool_contexts.len(),
+                        compaction = state.pending_compaction.is_some(),
+                        replaying = state.replaying_history,
+                        retained_children = state.native_owned_children.len(),
+                        running_children,
+                        "Deferring ACP workspace relocation until native work settles"
+                    );
                     return Err(crate::backend::WorkspaceRelocationError::Busy);
                 }
                 state.prompt_admission.active =
@@ -1268,11 +1299,54 @@ impl KiroInner {
         let reload_guard = AcpWorkspaceReload(&self.workspace_reload_in_progress);
         tracing::info!(roots = roots.len(), backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
         let kind = self.adapter.backend_kind();
-        if matches!(
-            kind,
-            protocol::BackendKind::Grok | protocol::BackendKind::Opencode
-        ) {
-            let mut spec = self
+        if kind == protocol::BackendKind::Grok {
+            let mut children = self
+                .state
+                .with(|state| state.native_owned_children.clone())
+                .await;
+            let mut retained = Vec::new();
+            while let Some(child) = children.pop() {
+                let (id, previous, nested) = child
+                    .state
+                    .with(|state| {
+                        (
+                            state.session_id.clone(),
+                            state.workspace_root.clone(),
+                            state.native_owned_children.clone(),
+                        )
+                    })
+                    .await;
+                retained.push((id, previous));
+                children.extend(nested);
+            }
+            // Native close/load retains the engine's owned-child identity map;
+            // replacing the process discards it even when transcripts survive.
+            let mut closing = retained
+                .iter()
+                .rev()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            closing.push(session_id.clone());
+            for id in closing {
+                self.bridge
+                    .request("_x.ai/session/close", json!({"sessionId": id}))
+                    .await
+                    .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+            }
+            self.bridge
+                .sync_inbound()
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+            for (id, previous) in retained.iter().rev() {
+                crate::backend::grok::relocate_workspace_session(id, previous, cwd)
+                    .await
+                    .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+            }
+            crate::backend::grok::relocate_workspace_session(&session_id, &previous_root, cwd)
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+        } else if kind == protocol::BackendKind::Opencode {
+            let spec = self
                 .adapter
                 .spawn_spec(
                     &super::adapter::AcpSessionRoots {
@@ -1282,45 +1356,16 @@ impl KiroInner {
                     None,
                 )
                 .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
-            if kind == protocol::BackendKind::Grok {
-                let index = spec
-                    .local_args
-                    .iter()
-                    .position(|argument| argument == "stdio")
-                    .ok_or_else(|| {
-                        crate::backend::WorkspaceRelocationError::Rejected(
-                            "Grok relocation requires its native agent stdio invocation".to_owned(),
-                        )
-                    })?;
-                spec.local_args.insert(index, "--no-leader".to_owned());
-            }
             let program = spec.local_program.clone();
-            tracing::info!(
-                ?kind,
-                "Retiring native runtime before relocating persisted workspace metadata"
-            );
             self.bridge
                 .restart_local(spec, async {
-                    match kind {
-                        protocol::BackendKind::Grok => {
-                            crate::backend::grok::relocate_workspace_session(
-                                &session_id,
-                                &previous_root,
-                                cwd,
-                            )
-                            .await
-                        }
-                        protocol::BackendKind::Opencode => {
-                            crate::backend::opencode::relocate_workspace_session(
-                                &program,
-                                &session_id,
-                                &previous_root,
-                                cwd,
-                            )
-                            .await
-                        }
-                        _ => unreachable!(),
-                    }
+                    crate::backend::opencode::relocate_workspace_session(
+                        &program,
+                        &session_id,
+                        &previous_root,
+                        cwd,
+                    )
+                    .await
                 })
                 .await
                 .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
@@ -1393,6 +1438,22 @@ impl KiroInner {
                     }
                 })
                 .await
+        }
+        let mut children = self
+            .state
+            .with(|state| state.native_owned_children.clone())
+            .await;
+        while let Some(child) = children.pop() {
+            let roots = roots.to_vec();
+            let nested = child
+                .state
+                .with(move |state| {
+                    state.workspace_root = roots[0].clone();
+                    state.workspace_roots = Some(roots);
+                    state.native_owned_children.clone()
+                })
+                .await;
+            children.extend(nested);
         }
         self.execute(SessionCommand::UpdateSettings {
             settings,
@@ -2971,7 +3032,11 @@ std::ops::ControlFlow::Continue({
                 if self.adapter.backend_kind() == protocol::BackendKind::Grok
                     && matches!(normalized.session_update, "response_end" | "turn_end")
                 {
-                    let session_id = self.state.with(|state| state.session_id.clone()).await;
+                    let (session_id, native_child) = self
+                        .state
+                        .with(|state| (state.session_id.clone(), state.native_child))
+                        .await;
+                    tracing::info!(target: "tyde_project_entry_diagnostic", native_child, update = normalized.session_update, "Grok native info entered");
                     if let Ok(info) = self
                         .bridge
                         .request("_x.ai/session/info", json!({ "sessionId": session_id }))
@@ -2979,6 +3044,7 @@ std::ops::ControlFlow::Continue({
                     {
                         normalized_params["_tydeSessionInfo"] = info;
                     }
+                    tracing::info!(target: "tyde_project_entry_diagnostic", native_child, update = normalized.session_update, "Grok native info settled");
                     if normalized.session_update == "turn_end"
                         && let Ok(usage) = self
                             .bridge
@@ -2992,6 +3058,35 @@ std::ops::ControlFlow::Continue({
                     .await;
             }
         }
+    }
+
+    /// Routed children stay registered after their turns for late-output
+    /// attribution, and transcript-replayed children are already complete when
+    /// recorded. Only a routed child that has not finished its turn, or has
+    /// reopened native work, is outstanding.
+    async fn running_native_children(&self) -> usize {
+        let mut pending = self
+            .state
+            .with(|state| state.native_owned_children.clone())
+            .await;
+        let mut running = 0;
+        while let Some(child) = pending.pop() {
+            let (busy, grandchildren) = child
+                .state
+                .with(|state| {
+                    (
+                        !state.native_child_turn_completed
+                            || state.active_response.is_some()
+                            || !state.active_tool_contexts.is_empty()
+                            || state.grok_pending_turn_end.is_some(),
+                        state.native_owned_children.clone(),
+                    )
+                })
+                .await;
+            running += usize::from(busy);
+            pending.extend(grandchildren);
+        }
+        running
     }
 
     async fn register_native_child(
@@ -3064,6 +3159,8 @@ std::ops::ControlFlow::Continue({
         };
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let child = Arc::new(KiroInner {
+            failure_emitter: Arc::clone(&self.failure_emitter),
+            relocation_wake: self.relocation_wake.clone(),
             adapter: Arc::clone(&self.adapter),
             capabilities: self.capabilities.clone(),
             bridge: Arc::clone(&self.bridge),
@@ -3072,7 +3169,7 @@ std::ops::ControlFlow::Continue({
                 AgentName(self.adapter.agent_name()),
             )),
             state: KiroStateActor::spawn(state),
-            shutting_down: AtomicBool::new(false),
+            shutting_down: Arc::clone(&self.shutting_down),
             workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: self.ssh_host.clone(),
             capacity_probe: None,
@@ -3109,12 +3206,18 @@ std::ops::ControlFlow::Continue({
             }),
         };
         self.emitter.tool_progress(&progress);
+        let relay_owner = subagents;
+        let relay_session = session_id.clone();
+        let failure_emitter = Arc::clone(&self.failure_emitter);
+        let shutting_down = Arc::clone(&self.shutting_down);
+        let relay_name = progress.update.clone();
         let parent_emitter = Arc::clone(&self.emitter);
         self.state.apply(move |state| {
             state
                 .native_relay_tasks
                 .spawn(crate::backend::subprocess::inherit_execution(async move {
                     let mut progress = progress;
+                    let mut handle = handle;
                     while let Some(raw) = events_rx.recv().await {
                         if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
                         {
@@ -3126,6 +3229,39 @@ std::ops::ControlFlow::Continue({
                             continue;
                         }
                         if let Some(event) = map_kiro_value_to_chat_event(&raw) {
+                            if matches!(event, protocol::ChatEvent::TypingStatusChanged(true))
+                                && handle.event_tx.is_closed()
+                            {
+                                let protocol::ToolProgressUpdate::SubAgent(metadata) = &relay_name
+                                else {
+                                    unreachable!("native relay progress")
+                                };
+                                match relay_owner
+                                    .on_subagent_spawned(
+                                        progress.tool_call_id.clone(),
+                                        metadata.agent_name.clone(),
+                                        String::new(),
+                                        "grok".to_owned(),
+                                        Some(relay_session.clone()),
+                                    )
+                                    .await
+                                {
+                                    Ok(reopened) => {
+                                        if let protocol::ToolProgressUpdate::SubAgent(details) =
+                                            &mut progress.update
+                                        {
+                                            details.agent_id = reopened.agent_id.clone();
+                                        }
+                                        handle = reopened;
+                                    }
+                                    Err(error) => {
+                                        shutting_down.store(true, Ordering::Release);
+                                        failure_emitter.backend_error(&error);
+                                        failure_emitter.close(&error);
+                                        return;
+                                    }
+                                }
+                            }
                             if let protocol::ToolProgressUpdate::SubAgent(details) =
                                 &mut progress.update
                             {
@@ -3250,16 +3386,19 @@ std::ops::ControlFlow::Continue({
     ///
     /// ACP carries the classification in `kind`; everything else in the
     /// payload is agent-defined, which is why the adapter decides.
-    async fn map_tool_request(&self, params: &Value, args: &Value, workspace_root: &str) -> Value {
+    async fn map_tool_request(
+        &self,
+        params: &Value,
+        tool_name: &str,
+        args: &Value,
+        workspace_root: &str,
+    ) -> Value {
         let wire_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
-        let title = params
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or(wire_kind);
         let normalized_kind = if self.adapter.backend_kind() == protocol::BackendKind::Grok
-            && super::adapters::grok::is_exit_plan_mode_tool(title)
+            && (tool_name == "spawn_subagent"
+                || super::adapters::grok::is_exit_plan_mode_tool(tool_name))
         {
-            title.to_owned()
+            tool_name.to_owned()
         } else if wire_kind == "other"
             && matches!(
                 self.adapter.backend_kind(),
@@ -3378,6 +3517,35 @@ std::ops::ControlFlow::Continue({
                                 })
                         })
                         .await;
+                }
+            }
+            "native_child_started" => {
+                let Some(session_id) = update.get("child_session_id").and_then(Value::as_str)
+                else {
+                    self.emitter
+                        .backend_error("Native child start omitted its conversation identity");
+                    return;
+                };
+                let child = self
+                    .native_sessions
+                    .with({
+                        let session_id = session_id.to_owned();
+                        move |routes| {
+                            routes
+                                .children
+                                .get(&session_id)
+                                .and_then(std::sync::Weak::upgrade)
+                        }
+                    })
+                    .await;
+                // First registration initializes an unfinished turn. Later
+                // attempts have this explicit native start before tool enrichment.
+                if let Some(child) = child {
+                    child
+                        .state
+                        .with(|state| state.native_child_turn_completed = false)
+                        .await;
+                    child.emitter.typing_status_changed(true);
                 }
             }
             "response_end" => self.handle_grok_response_end(update).await,
@@ -3803,7 +3971,7 @@ std::ops::ControlFlow::Continue({
                 .await
         };
         let tool_type = self
-            .map_tool_request(params, &request.args, &workspace_root)
+            .map_tool_request(params, &request.tool_name, &request.args, &workspace_root)
             .await;
         let canonical_id = normalize_tool_call_id_fragment(&raw_tool_call_id);
 
@@ -4100,7 +4268,7 @@ std::ops::ControlFlow::Continue({
         };
 
         let tool_type = self
-            .map_tool_request(params, &request.args, &workspace_root)
+            .map_tool_request(params, &request.tool_name, &request.args, &workspace_root)
             .await;
         // Mapping can suspend on a file read while a cancellation runs, so the
         // commit rechecks the turn and emits its events in the same transition.
@@ -4894,6 +5062,7 @@ std::ops::ControlFlow::Continue({
                         ));
                         if state.native_child {
                             state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
+                            state.native_child_turn_completed = true;
                         }
                         (
                             turn_id,
@@ -4955,6 +5124,7 @@ std::ops::ControlFlow::Continue({
             }
         }
         self.emitter.typing_status_changed(false);
+        self.relocation_wake.send_replace(());
     }
 
     async fn record_opencode_request(
@@ -7847,7 +8017,7 @@ impl Backend for KiroBackend {
             }
 
             let events_tx_forward = events_tx_task.clone();
-            let forward_task = crate::backend::subprocess::spawn(async move {
+            let mut forward_task = crate::backend::subprocess::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
@@ -7874,8 +8044,16 @@ impl Backend for KiroBackend {
                 }
             });
 
+            let mut forwarder_finished = false;
             loop {
                 tokio::select! {
+                    result = &mut forward_task => {
+                        forwarder_finished = true;
+                        if result.is_err() {
+                            tracing::error!("ACP output forwarder failed");
+                        }
+                        break;
+                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -7935,7 +8113,10 @@ impl Backend for KiroBackend {
             }
 
             session.shutdown().await;
-            let _ = forward_task.await;
+            if !forwarder_finished {
+                let _ = forward_task.await;
+            }
+            drop(events_tx_task);
         });
 
         let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
@@ -8041,7 +8222,7 @@ impl Backend for KiroBackend {
             }
 
             let events_tx_forward = events_tx_task.clone();
-            let forward_task = crate::backend::subprocess::spawn(async move {
+            let mut forward_task = crate::backend::subprocess::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
@@ -8052,8 +8233,16 @@ impl Backend for KiroBackend {
             });
 
             let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
+            let mut forwarder_finished = false;
             loop {
                 tokio::select! {
+                    result = &mut forward_task => {
+                        forwarder_finished = true;
+                        if result.is_err() {
+                            tracing::error!("ACP output forwarder failed");
+                        }
+                        break;
+                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -8113,7 +8302,10 @@ impl Backend for KiroBackend {
             }
 
             session.shutdown().await;
-            let _ = forward_task.await;
+            if !forwarder_finished {
+                let _ = forward_task.await;
+            }
+            drop(events_tx_task);
         });
 
         let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
@@ -8170,14 +8362,27 @@ impl Backend for KiroBackend {
             .await
     }
 
-    async fn set_workspace_roots(
-        &mut self,
-        workspace_roots: Vec<String>,
-    ) -> Result<(), crate::backend::WorkspaceRelocationError> {
+    #[cfg(feature = "test-support")]
+    async fn native_process_id_for_test(&self) -> Result<u32, String> {
         self.command_handle
             .inner
-            .set_workspace_roots(workspace_roots)
+            .bridge
+            .native_process_id_for_test()
             .await
+    }
+
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Some(self.command_handle.inner.relocation_wake.subscribe())
+    }
+
+    fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<(), crate::backend::WorkspaceRelocationError>>
+    + Send
+    + 'static {
+        let inner = self.command_handle.inner.clone();
+        async move { inner.set_workspace_roots(workspace_roots).await }
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
@@ -8195,6 +8400,14 @@ impl Backend for KiroBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
+        if self
+            .command_handle
+            .inner
+            .shutting_down
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
         match input {
             input @ AgentInput::SendMessage(_) => {
                 self.command_handle
@@ -8252,6 +8465,19 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
         .unwrap_or_default();
 
     match kind {
+        "Error" => Some(ChatEvent::MessageAdded(ChatMessage {
+            origin: None,
+            message_id: None,
+            timestamp: unix_now_ms(),
+            sender: MessageSender::Error,
+            content: value.get("data")?.as_str()?.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        })),
         "StreamStart" => {
             let data = value.get("data").unwrap_or(&Value::Null);
             Some(ChatEvent::StreamStart(StreamStartData {

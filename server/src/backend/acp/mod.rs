@@ -311,6 +311,14 @@ impl AcpBridge {
         ))
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn native_process_id_for_test(&self) -> Result<u32, String> {
+        let (_lease, rpc) = self.rpc.acquire(false).await;
+        rpc.child
+            .native_pid
+            .ok_or_else(|| "ACP native process is unavailable".to_owned())
+    }
+
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         self.request_typed(method, params)
             .await
@@ -1183,6 +1191,8 @@ enum AcpChildCommand {
 #[derive(Clone)]
 struct AcpChildOwner {
     commands: mpsc::UnboundedSender<AcpChildCommand>,
+    #[cfg(feature = "test-support")]
+    native_pid: Option<u32>,
 }
 
 struct AcpChildResource(Option<AsyncGroupChild>);
@@ -1197,6 +1207,8 @@ impl Drop for AcpChildResource {
 
 impl AcpChildOwner {
     fn spawn(child: AsyncGroupChild) -> Self {
+        #[cfg(feature = "test-support")]
+        let native_pid = child.id();
         let (commands, mut inbox) = mpsc::unbounded_channel();
         crate::backend::subprocess::spawn(async move {
             let mut resource = AcpChildResource(Some(child));
@@ -1247,7 +1259,11 @@ impl AcpChildOwner {
                 }
             }
         });
-        Self { commands }
+        Self {
+            commands,
+            #[cfg(feature = "test-support")]
+            native_pid,
+        }
     }
 
     async fn inspect(&self) -> Option<std::process::ExitStatus> {

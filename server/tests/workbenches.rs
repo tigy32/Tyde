@@ -4398,6 +4398,468 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
 }
 
 #[tokio::test]
+async fn native_children_follow_entry_and_preserve_held_input() {
+    use server::backend::mock::MockRequest;
+    let repo = init_git_repo("native-child-entry");
+    let mut fixture =
+        Fixture::new_with_mock_backend_for_enabled_backends(vec![BackendKind::Codex]).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let source = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let destination =
+        create_workbench(&mut fixture.client, &source, "feature/native-child-entry").await;
+    let gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Delegating worker",
+            MockScript::one(MockTurn::gated_text_then_native_child(
+                "Delegated a check",
+                "helper",
+                "Check the build",
+                &gate,
+            ))
+            .then(MockTurn::text("Continuing in the destination"))
+            .then(MockTurn::workspace_roots()),
+        )
+        .await;
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Delegating worker".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(source.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&source),
+                prompt: "Delegate, then move".into(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    gate.wait_until_entered().await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": destination.id.0}),
+    )
+    .await;
+    assert!(!failed);
+    fixture
+        .client
+        .send_message(&agent.stream, "Ordinary work after the move".into())
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "input held behind entry", |env| {
+        env.kind == FrameKind::QueuedMessages
+            && env.stream == agent.stream
+            && env
+                .parse_payload::<protocol::QueuedMessagesPayload>()
+                .is_ok_and(|payload| {
+                    payload
+                        .messages
+                        .iter()
+                        .any(|entry| entry.message == "Ordinary work after the move")
+                })
+    })
+    .await;
+    gate.release_one();
+    let moved = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentProjectChanged,
+        "native subtree entered destination",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    // The native child's projection commits before the owner's move is published.
+    assert_eq!(moved.origin, protocol::AgentOrigin::BackendNative);
+    assert_eq!(moved.parent_agent_id.as_ref(), Some(&start.agent_id));
+    assert_eq!(moved.project_id, Some(destination.id.clone()));
+    assert_eq!(moved.workspace_roots, project_roots(&destination));
+    let parent = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentProjectChanged,
+        "owner entered destination",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(parent.agent_id, start.agent_id);
+    assert_eq!(parent.session_id, start.session_id);
+    assert_eq!(parent.workspace_roots, project_roots(&destination));
+    fixture.finish_turn(&agent).await;
+    let delivered = fixture.finish_turn(&agent).await;
+    let reported = delivered
+        .chat_events()
+        .into_iter()
+        .find_map(|event| match event {
+            protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&reported).unwrap(),
+        project_roots(&destination)
+    );
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    let moved_agents = snapshot
+        .agents
+        .iter()
+        .filter(|entry| {
+            entry.agent_id == start.agent_id
+                || entry.parent_agent_id.as_ref() == Some(&start.agent_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(moved_agents.len(), 2);
+    assert!(
+        moved_agents
+            .iter()
+            .all(|entry| entry.project_id == Some(destination.id.clone())
+                && entry.workspace_roots == project_roots(&destination))
+    );
+    let mock = fixture.mock(&agent).await;
+    let inputs = mock
+        .requests()
+        .await
+        .into_iter()
+        .filter_map(|request| match request {
+            MockRequest::Input(input) => Some(input.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 2);
+    assert!(inputs[0].starts_with("Tyde has moved this conversation into project "));
+    assert_eq!(inputs[1], "Ordinary work after the move");
+    mock.assert_clean().await;
+}
+
+#[tokio::test]
+async fn immediate_entry_waits_for_native_registration_publication() {
+    let repo = init_git_repo("native-registration-entry");
+    let mut fixture =
+        Fixture::new_with_mock_backend_for_enabled_backends(vec![BackendKind::Codex]).await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let source = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let destination = create_workbench(
+        &mut fixture.client,
+        &source,
+        "feature/native-registration-entry",
+    )
+    .await;
+    let native = MockGateHandle::new();
+    let native_after_entry = MockGateHandle::new();
+    let relocation = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Late metadata",
+            MockScript::one(MockTurn::text("Ready").with_late_native_child(&native))
+                .then(MockTurn::workspace_roots())
+                .then(
+                    MockTurn::text("Ready for entry race")
+                        .with_native_child_after_entry_begins(&native_after_entry),
+                )
+                .then(MockTurn::text("Continued after entry race"))
+                .then(MockTurn::workspace_roots())
+                .with_workspace_relocation_gate(&relocation),
+        )
+        .await;
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Late metadata".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(source.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&source),
+                prompt: "Delegate".into(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    fixture.finish_turn(&agent).await;
+    native.wait_until_entered().await;
+    fixture
+        .next_chat_event_matching(&agent, "native tool already completed", |event| {
+            matches!(event, protocol::ChatEvent::ToolExecutionCompleted(_))
+        })
+        .await;
+    let (publication, _, _) = fixture
+        .host_for_test()
+        .install_next_agent_creation_reply_test_gate()
+        .await;
+    native.release_one();
+    publication.wait_until_entered().await;
+    fixture
+        .client
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "pending-native-registration".into(),
+            agent_id: start.agent_id.clone(),
+            project_id: Some(destination.id.clone()),
+        })
+        .await
+        .unwrap();
+    let refused = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentMoveResult,
+        "pending registration blocks immediate entry",
+    )
+    .await
+    .parse_payload::<protocol::types::AgentMoveResultPayload>()
+    .unwrap();
+    assert!(refused.result.is_err());
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .all(|entry| entry.project_id == Some(source.id.clone()))
+    );
+    publication.release_one();
+    fixture.next_chat_event_matching(&agent, "native registration settled", |event| matches!(event, protocol::ChatEvent::ToolProgress(progress) if matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(child) if child.completed))).await;
+    fixture
+        .client
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "settled-native-registration".into(),
+            agent_id: start.agent_id.clone(),
+            project_id: Some(destination.id.clone()),
+        })
+        .await
+        .unwrap();
+    relocation.wait_until_entered().await;
+    relocation.release_one();
+    let moved = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentMoveResult,
+        "settled registration permits immediate entry",
+    )
+    .await
+    .parse_payload::<protocol::types::AgentMoveResultPayload>()
+    .unwrap()
+    .result
+    .unwrap();
+    assert_eq!(moved.agent_id, start.agent_id);
+    assert_eq!(moved.session_id, start.session_id);
+    assert_eq!(moved.project_id, Some(destination.id.clone()));
+    fixture
+        .client
+        .send_message(&agent.stream, "Report destination".into())
+        .await
+        .unwrap();
+    let reported = fixture
+        .finish_turn(&agent)
+        .await
+        .chat_events()
+        .into_iter()
+        .find_map(|event| match event {
+            protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&reported).unwrap(),
+        project_roots(&destination)
+    );
+    fixture
+        .client
+        .send_message(&agent.stream, "Begin reverse registration race".into())
+        .await
+        .unwrap();
+    fixture.finish_turn(&agent).await;
+    native_after_entry.wait_until_entered().await;
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": source.id.0}),
+    )
+    .await;
+    assert!(!failed);
+    relocation.wait_until_entered().await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Report after callback-entry race".into())
+        .await
+        .unwrap();
+    native_after_entry.release_one();
+    fixture.next_chat_event_matching(&agent, "registration and tool publication finish while provider entry is pending", |event| {
+        matches!(event, protocol::ChatEvent::ToolProgress(progress) if matches!(&progress.update, protocol::ToolProgressUpdate::SubAgent(child) if child.completed))
+    }).await;
+    // This completion happened before Busy, so entry must not lose its wake.
+    relocation.release_one_busy();
+    relocation.wait_until_entered().await;
+    relocation.release_one();
+    next_frame_matching_on(
+        &mut fixture.client,
+        "owner enters after late native registration",
+        |env| {
+            env.kind == FrameKind::AgentProjectChanged
+                && env.parse_payload::<AgentStartPayload>().is_ok_and(|entry| {
+                    entry.agent_id == start.agent_id && entry.project_id == Some(source.id.clone())
+                })
+        },
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    let reported = fixture
+        .finish_turn(&agent)
+        .await
+        .chat_events()
+        .into_iter()
+        .find_map(|event| match event {
+            protocol::ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&reported).unwrap(),
+        project_roots(&source)
+    );
+    let (_, snapshot) = fixture.connect_with_bootstrap().await;
+    let subtree = snapshot
+        .agents
+        .iter()
+        .filter(|entry| {
+            entry.agent_id == start.agent_id
+                || entry.parent_agent_id.as_ref() == Some(&start.agent_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(subtree.len(), 3);
+    assert!(
+        subtree
+            .iter()
+            .all(|entry| entry.project_id == Some(source.id.clone())
+                && entry.workspace_roots == project_roots(&source))
+    );
+    let mock = fixture.mock(&agent).await;
+    let deliveries = mock.requests().await.into_iter().filter(|request| matches!(request,
+        server::backend::mock::MockRequest::Input(input) if input.message == "Report after callback-entry race")).count();
+    assert_eq!(deliveries, 1);
+    mock.assert_clean().await;
+    let (mut input_client, input_bootstrap) = fixture.connect_with_bootstrap().await;
+    let input_stream = input_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .unwrap()
+        .instance_stream
+        .clone();
+    fixture::send_load_agent_on(&mut input_client, &input_stream).await;
+    fixture::next_frame_matching_on(
+        &mut input_client,
+        "attach checked-input connection before entry",
+        |env| env.kind == FrameKind::AgentBootstrap && env.stream == input_stream,
+    )
+    .await;
+    let (mut close_client, close_bootstrap) = fixture.connect_with_bootstrap().await;
+    let close_stream = close_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .unwrap()
+        .instance_stream
+        .clone();
+    fixture::send_load_agent_on(&mut close_client, &close_stream).await;
+    fixture::next_frame_matching_on(
+        &mut close_client,
+        "attach close connection before entry",
+        |env| env.kind == FrameKind::AgentBootstrap && env.stream == close_stream,
+    )
+    .await;
+    let buffered = fixture
+        .host_for_test()
+        .install_project_move_delivery_test_gate("Late metadata");
+    fixture
+        .client
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "entry-closed-mid-move".into(),
+            agent_id: start.agent_id.clone(),
+            project_id: Some(destination.id.clone()),
+        })
+        .await
+        .unwrap();
+    relocation.wait_until_entered().await;
+    input_client
+        .human_input(
+            &input_stream,
+            protocol::HumanInputPayload {
+                id: protocol::HumanInputId("entry-held-delivery".into()),
+                action: protocol::HumanInputAction::InterruptAndSend,
+                input: protocol::SendMessagePayload {
+                    message: "Must reject after native failure".into(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    buffered.wait_until_entered().await;
+    eprintln!("ENTRY TERMINAL phase=checked-delivery-buffered");
+    close_client.close_agent(&close_stream).await.unwrap();
+    mock.close_stream().await;
+    eprintln!("ENTRY TERMINAL phase=backend-output-closed");
+    let failed_move = fixture
+        .next_frame_matching("pending move fails on backend closure", |env| {
+            env.kind == FrameKind::AgentMoveResult
+                && env
+                    .parse_payload::<protocol::types::AgentMoveResultPayload>()
+                    .is_ok_and(|result| result.request_id == "entry-closed-mid-move")
+        })
+        .await
+        .parse_payload::<protocol::types::AgentMoveResultPayload>()
+        .unwrap();
+    assert!(failed_move.result.is_err());
+    let refused = fixture::next_frame_matching_on(
+        &mut input_client,
+        "buffered checked delivery settles on backend closure",
+        |env| {
+            env.kind == FrameKind::HumanInputStatus
+                && env
+                    .parse_payload::<protocol::HumanInputStatusPayload>()
+                    .is_ok_and(|status| {
+                        status.id.0 == "entry-held-delivery"
+                            && matches!(status.status, protocol::HumanInputStatus::Refused { .. })
+                    })
+        },
+    )
+    .await
+    .parse_payload::<protocol::HumanInputStatusPayload>()
+    .unwrap();
+    assert_eq!(refused.agent_id, start.agent_id);
+    fixture::next_frame_matching_on(
+        &mut close_client,
+        "pending close settles on backend closure",
+        |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == start.agent_id)
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
     use protocol::{
         WorkbenchAvailability, WorkbenchEngine, WorkbenchEnvironment, WorkbenchInitialization,

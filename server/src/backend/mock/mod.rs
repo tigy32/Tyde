@@ -193,6 +193,7 @@ pub struct MockBackend {
     mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
     send_gate: Option<gate::MockGate>,
+    workspace_relocation_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
     compaction_failure: Mutex<Option<MockCompactionFailure>>,
 }
@@ -230,6 +231,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let send_gate = launch_script.send_gate.clone();
+        let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_origin = initial_input.origin;
@@ -325,6 +327,7 @@ impl MockBackend {
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 send_gate: send_gate.clone(),
+                workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -349,6 +352,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let send_gate = launch_script.send_gate.clone();
+        let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let agent_control_await_mcp = emit::startup_http_mcp(
@@ -428,6 +432,7 @@ impl MockBackend {
                     mid_turn_steering,
                     shutdown_gate: shutdown_gate.clone(),
                     send_gate: send_gate.clone(),
+                    workspace_relocation_gate: workspace_relocation_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
                     compaction_failure,
                 },
@@ -505,6 +510,7 @@ impl MockBackend {
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 send_gate: send_gate.clone(),
+                workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -533,6 +539,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let send_gate = launch_script.send_gate.clone();
+        let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_origin = initial_input.origin;
@@ -628,6 +635,7 @@ impl MockBackend {
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 send_gate: send_gate.clone(),
+                workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -757,23 +765,33 @@ impl Backend for MockBackend {
         Ok(sessions)
     }
 
-    async fn set_workspace_roots(
+    fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        let roots = crate::backend::validate_local_workspace_roots(roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
-        let (reply, received) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .send(MockCommand::SetWorkspaceRoots { roots, reply })
-            .map_err(|_| {
-                super::WorkspaceRelocationError::Rejected("Mock backend is closed".to_owned())
-            })?;
-        received.await.map_err(|_| {
-            super::WorkspaceRelocationError::OutcomeUnknown(
-                "Mock backend closed during relocation".to_owned(),
-            )
-        })?
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        let command_tx = self.command_tx.clone();
+        let workspace_gate = self.workspace_relocation_gate.clone();
+        async move {
+            if let Some(gate) = workspace_gate
+                && gate.wait().await
+            {
+                return Err(super::WorkspaceRelocationError::Busy);
+            }
+            let roots = crate::backend::validate_local_workspace_roots(roots)
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            let (reply, received) = tokio::sync::oneshot::channel();
+            command_tx
+                .send(MockCommand::SetWorkspaceRoots { roots, reply })
+                .map_err(|_| {
+                    super::WorkspaceRelocationError::Rejected("Mock backend is closed".to_owned())
+                })?;
+            received.await.map_err(|_| {
+                super::WorkspaceRelocationError::OutcomeUnknown(
+                    "Mock backend closed during relocation".to_owned(),
+                )
+            })?
+        }
     }
 
     fn session_id(&self) -> SessionId {

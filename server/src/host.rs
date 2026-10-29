@@ -172,8 +172,8 @@ use crate::store::steering::SteeringStore;
 use crate::store::transcript::TranscriptStore;
 use crate::stream::{Stream, StreamClosed};
 use crate::sub_agent::{
-    HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx, SubAgentEmitter,
-    SubAgentHandle,
+    HostSubAgentCommand, HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx,
+    SubAgentEmitter, SubAgentHandle,
 };
 
 pub(crate) type HostCapacityTx = mpsc::UnboundedSender<HostCapacityUpdate>;
@@ -2374,7 +2374,6 @@ impl HostHandle {
                             state.sub_agent_spawn_tx.clone(),
                             state.capacity_tx.clone(),
                             AgentId("passive-capacity-test-agent".to_owned()),
-                            Vec::new(),
                         )
                     })
                     .await
@@ -3038,6 +3037,15 @@ impl HostHandle {
         gate
     }
 
+    pub fn install_project_move_delivery_test_gate(
+        &self,
+        name: &str,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        crate::agent::install_project_move_delivery_test_gate(name.to_owned(), gate.shared());
+        gate
+    }
+
     pub fn install_agent_startup_backend_ready_test_gate(
         &self,
         agent_name: &str,
@@ -3305,32 +3313,42 @@ fn workbench_remove_hook_cell() -> &'static std::sync::Mutex<Option<Arc<Workbenc
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+#[derive(Clone)]
 pub(crate) struct HostSubAgentEmitter {
     spawn_tx: HostSubAgentSpawnTx,
     capacity_tx: HostCapacityTx,
     parent_agent_id: AgentId,
-    workspace_roots: std::sync::RwLock<Vec<String>>,
 }
 
 impl HostSubAgentEmitter {
-    pub(crate) fn set_workspace_roots(&self, roots: Vec<String>) {
-        *self
-            .workspace_roots
-            .write()
-            .expect("subagent workspace lock") = roots;
+    pub(crate) async fn move_native_children(
+        &self,
+        project_id: Option<ProjectId>,
+        roots: Vec<String>,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.spawn_tx
+            .send(HostSubAgentCommand::ProjectChanged {
+                parent: self.parent_agent_id.clone(),
+                project_id,
+                roots,
+                reply,
+            })
+            .map_err(|_| "Native child owner stopped during project entry".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Native child project entry ended without an outcome".to_owned())?
     }
 
     pub(crate) fn new(
         spawn_tx: HostSubAgentSpawnTx,
         capacity_tx: HostCapacityTx,
         parent_agent_id: AgentId,
-        workspace_roots: Vec<String>,
     ) -> Self {
         Self {
             spawn_tx,
             capacity_tx,
             parent_agent_id,
-            workspace_roots: std::sync::RwLock::new(workspace_roots),
         }
     }
 }
@@ -3369,22 +3387,19 @@ impl SubAgentEmitter for HostSubAgentEmitter {
         Box::pin(async move {
             let (reply_tx, reply_rx) = oneshot::channel();
             self.spawn_tx
-                .send(HostSubAgentSpawnRequest {
-                    spawn_tx: self.spawn_tx.clone(),
-                    capacity_tx: self.capacity_tx.clone(),
-                    parent_agent_id: self.parent_agent_id.clone(),
-                    workspace_roots: self
-                        .workspace_roots
-                        .read()
-                        .expect("subagent workspace lock")
-                        .clone(),
-                    tool_use_id,
-                    name,
-                    description,
-                    agent_type,
-                    session_id_hint,
-                    reply: reply_tx,
-                })
+                .send(HostSubAgentCommand::Spawn(Box::new(
+                    HostSubAgentSpawnRequest {
+                        spawn_tx: self.spawn_tx.clone(),
+                        capacity_tx: self.capacity_tx.clone(),
+                        parent_agent_id: self.parent_agent_id.clone(),
+                        tool_use_id,
+                        name,
+                        description,
+                        agent_type,
+                        session_id_hint,
+                        reply: reply_tx,
+                    },
+                )))
                 .map_err(|_| {
                     format!(
                         "backend-native child spawn channel closed for parent {}",
@@ -8349,9 +8364,17 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                         let agent_id = &agent_id;
 
                         let guard = handle.reserve_project_move()?;
-                        if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+                        if state
+                            .registry
+                            .agent_subtree_post_order(agent_id)
+                            .iter()
+                            .any(|(id, child)| {
+                                id != agent_id
+                                    && child.snapshot().origin != AgentOrigin::BackendNative
+                            })
+                        {
                             return Ok(std::ops::ControlFlow::Break(Err(
-                                "Close this agent's child agents before moving it".to_owned(),
+                                crate::agent::CHILD_OWNERSHIP_MOVE_REJECTION.to_owned(),
                             )));
                         }
 
@@ -8394,7 +8417,10 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     if start.swarm_membership.is_some()
                         || start.team_id.is_some()
                         || start.workflow.is_some()
-                        || start.origin == AgentOrigin::Tychat
+                        || matches!(
+                            start.origin,
+                            AgentOrigin::Tychat | AgentOrigin::BackendNative
+                        )
                     {
                         return Ok(std::ops::ControlFlow::Break(Err(
                             "Team, workflow, swarm, and Tychat agents cannot move independently"
@@ -8413,9 +8439,16 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                             "This backend cannot move a running conversation".to_owned(),
                         )));
                     }
-                    if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+                    if state
+                        .registry
+                        .agent_subtree_post_order(agent_id)
+                        .iter()
+                        .any(|(id, child)| {
+                            id != agent_id && child.snapshot().origin != AgentOrigin::BackendNative
+                        })
+                    {
                         return Ok(std::ops::ControlFlow::Break(Err(
-                            "Close this agent's child agents before moving it".to_owned(),
+                            crate::agent::CHILD_OWNERSHIP_MOVE_REJECTION.to_owned(),
                         )));
                     }
 
@@ -8506,9 +8539,17 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                         let agent_id = &agent_id;
 
                         let guard = handle.reserve_project_move()?;
-                        if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+                        if state
+                            .registry
+                            .agent_subtree_post_order(agent_id)
+                            .iter()
+                            .any(|(id, child)| {
+                                id != agent_id
+                                    && child.snapshot().origin != AgentOrigin::BackendNative
+                            })
+                        {
                             return Ok(std::ops::ControlFlow::Break(Err(
-                                "Close this agent's child agents before moving it".to_owned(),
+                                crate::agent::CHILD_OWNERSHIP_MOVE_REJECTION.to_owned(),
                             )));
                         }
                         if handle.snapshot().project_id != current_id {
@@ -16099,49 +16140,18 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         &self,
         parent_agent_id: &AgentId,
     ) -> Result<SessionId, String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        tracing::debug!(
-            parent_agent_id = %parent_agent_id,
-            "waiting for backend-native child parent session registration"
-        );
-        loop {
-            let session_id = {
-                {
-                    let parent_agent_id = parent_agent_id.to_owned();
-                    self.state
-                        .with(move |state| {
-                            let parent_agent_id = &parent_agent_id;
-
-                            state
-                                .agent_sessions
-                                .get(parent_agent_id)
-                                .cloned()
-                                .or_else(|| {
-                                    state.pending_agent_sessions.get(parent_agent_id).cloned()
-                                })
-                        })
-                        .await
-                }
-            };
-            if let Some(session_id) = session_id {
-                tracing::debug!(
-                    parent_agent_id = %parent_agent_id,
-                    parent_session_id = %session_id,
-                    "resolved backend-native child parent session registration"
-                );
-                return Ok(session_id);
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                let message = format!(
-                    "cannot resolve parent session for backend-native child {}",
-                    parent_agent_id
-                );
-                tracing::warn!(parent_agent_id = %parent_agent_id, "{message}");
-                return Err(message);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let parent = self
+            .state
+            .with({
+                let parent_agent_id = parent_agent_id.clone();
+                move |state| state.registry.agent_handle(&parent_agent_id)
+            })
+            .await
+            .ok_or_else(|| "Native child owner is no longer registered".to_owned())?;
+        parent
+            .wait_for_swarm_startup_ready()
+            .await
+            .map_err(|_| "Native child owner failed before session registration".to_owned())
     }
 
     async fn wait_for_parent_tool_request(
@@ -16150,27 +16160,12 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         parent_agent_id: &AgentId,
         tool_use_id: &str,
     ) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let request_marker = format!("[{tool_use_id}]");
-        loop {
-            let observed = parent_handle
-                .read_activity_history(None, 1024, 1024 * 1024)
-                .await
-                .is_some_and(|history| {
-                    history.rendered.lines().any(|line| {
-                        line.contains("Tool requested:") && line.contains(&request_marker)
-                    })
-                });
-            if observed {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "parent agent {parent_agent_id} did not publish tool request {tool_use_id} before backend-native child spawn"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        if parent_handle.snapshot().agent_id != *parent_agent_id {
+            return Err("Native child publication has a different owner".to_owned());
         }
+        parent_handle
+            .await_tool_publication(tool_use_id.to_owned())
+            .await
     }
 
     async fn spawn_backend_native_subagent(
@@ -16204,17 +16199,14 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                     .await?
             }
         };
+        let _registration = parent_handle.begin_native_registration();
         let parent_session_id = self
             .wait_for_parent_session_id(&request.parent_agent_id)
             .await?;
-        let parent_start = parent_handle.snapshot();
-        if parent_start.workspace_roots != request.workspace_roots {
-            return Err(format!(
-                "backend-native child workspace roots do not match parent {}",
-                request.parent_agent_id
-            ));
-        }
-
+        let mut parent_start = parent_handle.snapshot();
+        let owner_start = parent_handle.native_owner_start();
+        parent_start.project_id = owner_start.project_id;
+        parent_start.workspace_roots = owner_start.workspace_roots;
         let session_id = request
             .session_id_hint
             .clone()
@@ -16241,7 +16233,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                 .map_err(|_| "backend-native child prompt channel closed".to_owned())?;
         }
         let created_at_ms = crate::agent::now_ms();
-        let relay_request = RelaySpawnRequest {
+        let mut relay_request = RelaySpawnRequest {
             created_at_ms,
             name: request.name.clone(),
             origin: AgentOrigin::BackendNative,
@@ -16286,6 +16278,10 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         let (start, agent_handle, visibility, mut visibility_guard, mut creation_guard) = {
             {
                 let parent_agent_id = request.parent_agent_id.clone();
+                let native_registration = parent_handle.native_registration_state();
+                let activation_parent = parent_handle.clone();
+                let activation_session_store = Arc::clone(&session_store);
+                let activation_session_id = session_id.clone();
                 let host = self.clone();
                 match {
                     #[cfg(feature = "test-support")]
@@ -16312,6 +16308,9 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                                         .to_owned(),
                                 ));
                             }
+                            let owner = activation_parent.native_owner_start();
+                            relay_request.project_id = owner.project_id;
+                            relay_request.workspace_roots = owner.workspace_roots;
                             let spawned = state.registry.spawn_relay(
                                 relay_request,
                                 RelayEventReceivers {
@@ -16320,12 +16319,14 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                                     total_usage: total_usage_rx,
                                 },
                                 RelayAgentRuntimeResources {
+                                    native_registration,
                                     parent_session_id,
-                                    session_store: Arc::clone(&session_store),
+                                    session_store: Arc::clone(&activation_session_store),
                                     transcript_store,
                                     session_summary_count_tx,
                                 },
                             );
+
                             host.register_restart_handle(&spawned.handle);
                             let creation_guard = UnpublishedAgentGuard::new(
                                 host.clone(),
@@ -16339,9 +16340,10 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                                 Arc::clone(&host.state),
                             );
                             let visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
-                            state
-                                .agent_sessions
-                                .insert(spawned.start.agent_id.clone(), session_id.clone());
+                            state.agent_sessions.insert(
+                                spawned.start.agent_id.clone(),
+                                activation_session_id.clone(),
+                            );
 
                             std::ops::ControlFlow::Continue((
                                 spawned.start,
@@ -16363,6 +16365,20 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
             }
         };
 
+        if start.project_id != parent_start.project_id
+            || start.workspace_roots != parent_start.workspace_roots
+        {
+            session_store
+                .move_to_project(
+                    &session_id,
+                    start.project_id.clone(),
+                    start.workspace_roots.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    format!("Cannot persist native child's canonical owner project: {error}")
+                })?;
+        }
         visibility.begin_fanout().await;
         let (host_streams, fanout_guard) = {
             {
@@ -16439,12 +16455,11 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         };
 
         let child_agent_id = start.agent_id.clone();
-        let child_emitter = Arc::new(HostSubAgentEmitter::new(
-            request.spawn_tx.clone(),
-            request.capacity_tx.clone(),
-            child_agent_id.clone(),
-            request.workspace_roots.clone(),
-        ));
+        let child_emitter = Arc::new(HostSubAgentEmitter {
+            spawn_tx: request.spawn_tx.clone(),
+            capacity_tx: request.capacity_tx.clone(),
+            parent_agent_id: child_agent_id.clone(),
+        });
         let result = SubAgentHandle {
             event_tx,
             model_usage_tx,
@@ -19894,8 +19909,7 @@ fn spawn_host_inner(
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
     let steering_store = SteeringStore::load(paths.steering)?;
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
-    let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
-        mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
+    let (sub_agent_spawn_tx, sub_agent_spawn_rx) = mpsc::unbounded_channel::<HostSubAgentCommand>();
     let (capacity_tx, capacity_rx): (HostCapacityTx, HostCapacityRx) = mpsc::unbounded_channel();
     let (supervisor_compaction_tx, supervisor_compaction_rx) =
         mpsc::unbounded_channel::<SupervisorCompactionRequest>();
@@ -22184,9 +22198,64 @@ fn emit_spawn_operation_shutdown(terminal: SpawnOperationTerminal) {
 
 fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
     let worker = async move {
-        while let Some(request) = rx.recv().await {
-            let result = host.spawn_backend_native_subagent(&request).await;
-            let _ = request.reply.send(result);
+        let mut requests = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                    request = rx.recv() => {
+                        let Some(request) = request else { break; };
+                        let host = host.clone();
+                        requests.spawn(async move {
+                match request {
+                    HostSubAgentCommand::Spawn(request) => {
+                let result = host.spawn_backend_native_subagent(&request).await;
+                let _ = request.reply.send(result);
+            }
+                    HostSubAgentCommand::ProjectChanged {
+                        parent,
+                        project_id,
+                        roots,
+                        reply,
+                    } => {
+                        let children = host
+                            .state
+                            .with(move |state| {
+                                state
+                                    .registry
+                                    .agent_subtree_post_order(&parent)
+                                    .into_iter()
+                                    .filter(|(_, handle)| {
+                                        handle.snapshot().origin == AgentOrigin::BackendNative
+                                    })
+                                    .map(|(_, handle)| handle)
+                                    .collect::<Vec<_>>()
+                            })
+                            .await;
+                        let mut result = Ok(());
+                        for child in children {
+                            if let Err(error) = child
+                                .move_native_project(project_id.clone(), roots.clone())
+                                .await
+                            {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                        let _ = reply.send(result);
+                    }
+                }
+                        });
+                    }
+                    Some(result) = requests.join_next(), if !requests.is_empty() => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "Native child host request failed");
+                        }
+                    }
+                }
+        }
+        while let Some(result) = requests.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "Native child host request failed");
+            }
         }
     };
 

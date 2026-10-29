@@ -105,18 +105,52 @@ pub struct AntigravityBackend {
 }
 
 struct AntigravityInner {
+    relocation_wake: tokio::sync::watch::Sender<()>,
     emitter: Arc<TurnEmitter>,
-    state: Mutex<AntigravityState>,
+    state: AntigravityStateActor,
+}
+
+type AntigravityStateUpdate = Box<dyn FnOnce(&mut AntigravityState) + Send>;
+
+struct AntigravityStateActor {
+    commands: mpsc::UnboundedSender<AntigravityStateUpdate>,
+}
+impl AntigravityStateActor {
+    fn new(mut state: AntigravityState) -> Self {
+        let (commands, mut inbox) = mpsc::unbounded_channel::<AntigravityStateUpdate>();
+        crate::backend::subprocess::spawn(async move {
+            while let Some(update) = inbox.recv().await {
+                update(&mut state);
+            }
+        });
+        Self { commands }
+    }
+    async fn with<R: Send + 'static>(
+        &self,
+        update: impl FnOnce(&mut AntigravityState) -> R + Send + 'static,
+    ) -> R {
+        let (reply, result) = oneshot::channel();
+        assert!(
+            self.commands
+                .send(Box::new(move |state| {
+                    let _ = reply.send(update(state));
+                }))
+                .is_ok(),
+            "Antigravity state owner stopped while borrowed"
+        );
+        result
+            .await
+            .expect("Antigravity state owner dropped its update")
+    }
 }
 
 struct AntigravityState {
+    #[cfg(feature = "test-support")]
+    native_pid: Option<u32>,
     model: String,
     /// True between accepting a message and seeing that turn's `result`.
     turn_active: bool,
     closing: bool,
-    /// Where a capacity report goes. Installed after spawn, so an early report
-    /// has nowhere to go and is simply not taken.
-    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     /// Resolves once the supervisor has killed the `agy` process and released
     /// its MCP config entries.
     shutdown_complete: Option<oneshot::Receiver<()>>,
@@ -1060,9 +1094,11 @@ struct Supervisor {
     /// a probe per turn.
     capacity_read_at: Option<std::time::Instant>,
     shutdown_complete: oneshot::Sender<()>,
-    native_pending: BTreeMap<u64, (String, String, String)>,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    native_pending: BTreeMap<u64, (String, Vec<super::antigravity_stream::AgySubagent>)>,
     native_sessions: BTreeSet<String>,
-    native_children: tokio::task::JoinSet<()>,
+    native_children: tokio::task::JoinSet<Result<(), String>>,
+    native_child_failure: Option<String>,
     session_id: String,
     /// The CLI-answered commands advertised for this session. An invoking
     /// message runs as its own `--print` invocation, never as a turn.
@@ -1079,6 +1115,15 @@ struct InitialTurn {
 }
 
 impl Supervisor {
+    async fn fail_native_child(&mut self, error: String) {
+        if self.native_child_failure.is_some() {
+            return;
+        }
+        self.inner.state.with(|state| state.closing = true).await;
+        self.native_child_failure = Some(error.clone());
+        self.inner.emitter.backend_error(&error);
+    }
+
     async fn run(
         mut self,
         mut process: AgyProcess,
@@ -1120,10 +1165,20 @@ impl Supervisor {
                     }
                 }
 
+                Some(result) = self.native_children.join_next(), if !self.native_children.is_empty() => {
+                    let result = result.unwrap_or_else(|error| Err(format!("Native child relay task failed: {error}")));
+                    if let Err(error) = result {
+                        self.fail_native_child(error).await;
+                        break;
+                    }
+                    self.inner.relocation_wake.send_replace(());
+                }
+
                 frame = process.frames_rx.recv() => {
                     match frame {
                         Some(Ok(frame)) => {
                             self.handle_frame(frame).await;
+                            if self.native_child_failure.is_some() { break; }
                             if !self.start_deferred_answer(&mut process).await {
                                 break;
                             }
@@ -1142,7 +1197,7 @@ impl Supervisor {
                                 ));
                                 self.deferred_answers.clear();
                             }
-                            if self.inner.state.lock().await.turn_active {
+                            if self.inner.state.with(|state| state.turn_active).await {
                                 emitter.backend_error(
                                     "Antigravity CLI exited while a turn was still running",
                                 );
@@ -1164,15 +1219,7 @@ impl Supervisor {
                     }
                 }
 
-                () = tokio::time::sleep(Duration::from_millis(100)), if !self.native_pending.is_empty() => {
-                    self.discover_native_children().await;
-                }
 
-                Some(result) = self.native_children.join_next(), if !self.native_children.is_empty() => {
-                    if let Err(error) = result {
-                        emitter.backend_error(&format!("Antigravity native child relay failed: {error}"));
-                    }
-                }
 
                 update = workspace_rx.recv() => {
                     let Some(WorkspaceRootsRequest { roots, reply }) = update else { break };
@@ -1215,9 +1262,12 @@ impl Supervisor {
         // including any question still waiting on the user.
         self.pending_questions.clear();
         self.inner
+            .state
+            .with(|state| state.turn_active = false)
+            .await;
+        self.inner
             .emitter
             .operation_cancelled("Antigravity turn cancelled.");
-        self.inner.state.lock().await.turn_active = false;
 
         let conversation_id = process.conversation_id.clone();
         process.terminate().await;
@@ -1230,6 +1280,14 @@ impl Supervisor {
         {
             Ok(restarted) => {
                 *process = restarted;
+                #[cfg(feature = "test-support")]
+                {
+                    let pid = process.child.id();
+                    self.inner
+                        .state
+                        .with(move |state| state.native_pid = pid)
+                        .await;
+                }
                 self.relaunch_before_next_turn = false;
                 true
             }
@@ -1443,11 +1501,14 @@ impl Supervisor {
             }
         };
         self.turn_counter += 1;
-        let model = {
-            let mut state = self.inner.state.lock().await;
-            state.turn_active = true;
-            state.model.clone()
-        };
+        let model = self
+            .inner
+            .state
+            .with(|state| {
+                state.turn_active = true;
+                state.model.clone()
+            })
+            .await;
         self.mapper = Some(TurnMapper::new(
             format!("{}-{}", process.conversation_id, self.turn_counter),
             model,
@@ -1461,8 +1522,11 @@ impl Supervisor {
         self.inner.emitter.typing_status_changed(true);
         if let Err(err) = process.send_turn(&message).await {
             self.inner.emitter.backend_error(&err);
+            self.inner
+                .state
+                .with(|state| state.turn_active = false)
+                .await;
             self.inner.emitter.typing_status_changed(false);
-            self.inner.state.lock().await.turn_active = false;
             self.mapper = None;
             return false;
         }
@@ -1477,28 +1541,25 @@ impl Supervisor {
                 if let Some(mapper) = self.mapper.as_mut() {
                     if native_spawn && !matches!(step.state.as_str(), STATE_ERROR | STATE_CANCELLED)
                     {
-                        let child = step
-                            .subagent_info
-                            .as_ref()
-                            .and_then(|info| info.subagents.first());
-                        self.native_pending
-                            .entry(step.step_index)
-                            .or_insert_with(|| {
-                                (
-                                    format!("agy-{}-{}", mapper.turn_id.0, step.step_index),
-                                    child
-                                        .and_then(|child| {
-                                            child.role.clone().or_else(|| child.type_name.clone())
-                                        })
-                                        .unwrap_or_else(|| "Antigravity subagent".to_owned()),
-                                    child
-                                        .and_then(|child| child.initial_prompt.clone())
-                                        .unwrap_or_default(),
-                                )
-                            });
-                        eprintln!(
-                            "TYDE ANTIGRAVITY NATIVE SPAWN step={} state={} info={:?}",
-                            step.step_index, step.state, step.subagent_info
+                        let pending =
+                            self.native_pending
+                                .entry(step.step_index)
+                                .or_insert_with(|| {
+                                    (
+                                        format!("agy-{}-{}", mapper.turn_id.0, step.step_index),
+                                        Vec::new(),
+                                    )
+                                });
+                        if step.state == STATE_DONE
+                            && let Some(info) = &step.subagent_info
+                        {
+                            pending.1 = info.subagents.clone();
+                        }
+                        tracing::info!(
+                            step = step.step_index,
+                            state = step.state,
+                            children = pending.1.len(),
+                            "Antigravity authoritative native child metadata"
                         );
                     }
                     mapper.handle_step(&self.inner.emitter, step).await;
@@ -1530,36 +1591,33 @@ impl Supervisor {
     }
 
     async fn discover_native_children(&mut self) {
-        let Some(subagents) = self.inner.state.lock().await.subagent_emitter.clone() else {
-            self.native_pending.clear();
+        let Some(subagents) = self.subagent_emitter.clone() else {
+            if !self.native_pending.is_empty() {
+                let error = "Antigravity native children have no owning event emitter".to_owned();
+                self.fail_native_child(error).await;
+            }
             return;
         };
-        let mut transcript = TranscriptReader::new(&self.brain_dir, &self.session_id);
-        transcript.refresh();
-        for (step, (tool_id, name, description)) in self.native_pending.clone() {
-            let Some(output) = transcript.result_for_tool_step(step) else {
+        for (step, (tool_id, children)) in self.native_pending.clone() {
+            if children.is_empty() {
                 continue;
-            };
-            let Some((_, objects)) = output.split_once("Created the following subagents:") else {
-                continue;
-            };
-            let mut ids = Vec::new();
-            for item in serde_json::Deserializer::from_str(objects.trim()).into_iter::<Value>() {
-                let Ok(object) = item else {
-                    break;
-                };
-                if let Some(id) = object.get("conversationId").and_then(Value::as_str) {
-                    ids.push(id.to_owned());
-                }
             }
-            if ids.is_empty() {
+            if children.iter().any(|child| child.conversation_id.is_none()) {
                 continue;
             }
             self.native_pending.remove(&step);
-            for id in ids {
+            for child_metadata in children {
+                let id = child_metadata
+                    .conversation_id
+                    .expect("validated native metadata");
                 if !self.native_sessions.insert(id.clone()) {
                     continue;
                 }
+                let name = child_metadata
+                    .role
+                    .or(child_metadata.type_name)
+                    .unwrap_or_else(|| "Antigravity subagent".to_owned());
+                let description = child_metadata.initial_prompt.unwrap_or_default();
                 match subagents
                     .on_subagent_spawned(
                         tool_id.clone(),
@@ -1571,10 +1629,7 @@ impl Supervisor {
                     .await
                 {
                     Ok(child) => {
-                        eprintln!(
-                            "TYDE ANTIGRAVITY NATIVE CHILD session={id} agent={}",
-                            child.agent_id.0
-                        );
+                        tracing::info!("Registered authoritative Antigravity native child");
                         self.inner
                             .emitter
                             .tool_progress(&protocol::ToolProgressData {
@@ -1593,42 +1648,39 @@ impl Supervisor {
                                     },
                                 ),
                             });
-                        let brain_dir = self.brain_dir.clone();
+                        let child_db = self.conversation_db.with_file_name(format!("{id}.db"));
                         let emitter = Arc::clone(&self.inner.emitter);
                         let tool_id = tool_id.clone();
                         let name = name.clone();
+                        let relay = AgyNativeChildRelay {
+                            child_db,
+                            tool_call_id: tool_id,
+                            name,
+                            child,
+                            emitter,
+                            session_id: SessionId(id),
+                            description,
+                            subagents: subagents.clone(),
+                        };
                         self.native_children
-                            .spawn(crate::backend::subprocess::inherit_execution(async move {
-                                relay_antigravity_child(
-                                    brain_dir, id, tool_id, name, child, emitter,
-                                )
-                                .await;
-                            }));
+                            .spawn(crate::backend::subprocess::inherit_execution(relay.run()));
                     }
-                    Err(error) => self
-                        .inner
-                        .emitter
-                        .backend_error(&format!("Antigravity child registration failed: {error}")),
+                    Err(error) => {
+                        let error = format!("Antigravity child registration failed: {error}");
+                        self.fail_native_child(error).await;
+                        return;
+                    }
                 }
             }
         }
     }
 
     async fn finish_turn(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !self.native_pending.is_empty() {
-            self.discover_native_children().await;
-            if self.native_pending.is_empty() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                self.inner.emitter.backend_error(
-                    "Antigravity omitted native child session metadata at turn completion",
-                );
-                self.native_pending.clear();
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        self.discover_native_children().await;
+        if !self.native_pending.is_empty() {
+            let error =
+                "Antigravity omitted native child session metadata at turn completion".to_owned();
+            self.fail_native_child(error).await;
         }
         if let Some(mut mapper) = self.mapper.take() {
             for (_, mut step) in std::mem::take(&mut mapper.deferred_tools) {
@@ -1650,10 +1702,15 @@ impl Supervisor {
         // A deferred answer starts its turn as soon as this one is over, so
         // the session never reports an idle it is about to leave.
         if self.deferred_answers.is_empty() {
+            self.inner
+                .state
+                .with(|state| state.turn_active = false)
+                .await;
             self.inner.emitter.typing_status_changed(false);
-            self.inner.state.lock().await.turn_active = false;
         }
-        self.refresh_capacity().await;
+        if self.native_child_failure.is_none() {
+            self.refresh_capacity().await;
+        }
     }
 
     /// Starts the oldest answer that arrived mid-turn once no turn is running.
@@ -1678,7 +1735,7 @@ impl Supervisor {
         {
             return;
         }
-        let emitter = self.inner.state.lock().await.subagent_emitter.clone();
+        let emitter = self.subagent_emitter.clone();
         let Some(emitter) = emitter else {
             return;
         };
@@ -1697,9 +1754,16 @@ impl Supervisor {
         process: &mut AgyProcess,
         roots: Vec<String>,
     ) -> Result<(), super::WorkspaceRelocationError> {
-        let state = self.inner.state.lock().await;
-        if state.closing
-            || state.turn_active
+        if let Some(error) = &self.native_child_failure {
+            return Err(super::WorkspaceRelocationError::Rejected(error.clone()));
+        }
+        let (closing, turn_active) = self
+            .inner
+            .state
+            .with(|state| (state.closing, state.turn_active))
+            .await;
+        if closing
+            || turn_active
             || self.mapper.is_some()
             || !self.pending_questions.is_empty()
             || !self.native_pending.is_empty()
@@ -1707,7 +1771,6 @@ impl Supervisor {
         {
             return Err(super::WorkspaceRelocationError::Busy);
         }
-        drop(state);
         let mut launch = self.launch.clone();
         launch.primary_root = roots[0].clone();
         launch.workspace_roots = roots.clone();
@@ -1771,8 +1834,24 @@ impl Supervisor {
                 }
                 *process = AgyProcess::start(&self.launch, Some(&self.session_id), Arc::clone(&self.inner.emitter)).await
                     .map_err(|recovery| super::WorkspaceRelocationError::OutcomeUnknown(format!("Workspace relocation failed: {error}; original runtime recovery failed: {recovery}")))?;
+                #[cfg(feature = "test-support")]
+                {
+                    let pid = process.child.id();
+                    self.inner
+                        .state
+                        .with(move |state| state.native_pid = pid)
+                        .await;
+                }
                 return Err(super::WorkspaceRelocationError::OutcomeUnknown(error));
             }
+        }
+        #[cfg(feature = "test-support")]
+        {
+            let pid = process.child.id();
+            self.inner
+                .state
+                .with(move |state| state.native_pid = pid)
+                .await;
         }
         self.launch = launch;
         self.relaunch_before_next_turn = false;
@@ -1788,13 +1867,20 @@ impl Supervisor {
         values: SessionSettingsValues,
     ) -> Result<(), String> {
         let model = selected_model(&values, Some(Path::new(&self.launch.primary_root))).await?;
-        let turn_active = {
-            let mut state = self.inner.state.lock().await;
-            if state.model == model {
-                return Ok(());
-            }
-            state.model = model.clone();
-            state.turn_active
+        let next_model = model.clone();
+        let turn_active = self
+            .inner
+            .state
+            .with(move |state| {
+                if state.model == next_model {
+                    return None;
+                }
+                state.model = next_model;
+                Some(state.turn_active)
+            })
+            .await;
+        let Some(turn_active) = turn_active else {
+            return Ok(());
         };
         self.launch.model = model;
         if turn_active {
@@ -1815,10 +1901,19 @@ impl Supervisor {
         .await?;
         process.terminate().await;
         *process = replacement;
+        #[cfg(feature = "test-support")]
+        {
+            let pid = process.child.id();
+            self.inner
+                .state
+                .with(move |state| state.native_pid = pid)
+                .await;
+        }
         Ok(())
     }
 
     async fn shutdown(mut self, mut process: AgyProcess) {
+        self.inner.state.with(|state| state.closing = true).await;
         self.native_children.abort_all();
         while self.native_children.join_next().await.is_some() {}
         process.terminate().await;
@@ -1827,6 +1922,11 @@ impl Supervisor {
         // removes this session's endpoints and bearer tokens from disk.
         drop(self.descriptor_dir);
         drop(self.skill_projection.take());
+        self.inner.emitter.close(
+            self.native_child_failure
+                .as_deref()
+                .unwrap_or("Antigravity backend shut down"),
+        );
         let _ = self.shutdown_complete.send(());
     }
 }
@@ -2252,7 +2352,10 @@ fn relocate_antigravity_metadata(
         }
     }
     replace_antigravity_metadata(path, &before, &after)?;
-    tracing::info!(path = %path.display(), ?roots, "Updated native Antigravity trajectory workspace fields without changing history");
+    tracing::info!(
+        root_count = roots.len(),
+        "Updated native Antigravity trajectory workspace fields without changing history"
+    );
     Ok((before, after))
 }
 
@@ -2354,86 +2457,512 @@ struct AntigravityTranscriptOpening {
     created_at_ms: Option<u64>,
 }
 
-async fn relay_antigravity_child(
-    brain_dir: PathBuf,
-    session_id: String,
+// Native children have a trajectory DB, not the CLI's rendered JSONL log.
+// These fields are from agy's trajectory.proto and cortex.proto store schema.
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyStep {
+    #[prost(int32, tag = "1")]
+    kind: i32,
+    #[prost(int32, tag = "4")]
+    status: i32,
+    #[prost(message, optional, tag = "5")]
+    metadata: Option<NativeAgyMetadata>,
+    #[prost(message, optional, tag = "20")]
+    response: Option<NativeAgyResponse>,
+    #[prost(message, optional, tag = "140")]
+    generic: Option<NativeAgyGeneric>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyMetadata {
+    #[prost(message, optional, tag = "1")]
+    created_at: Option<NativeAgyTimestamp>,
+    #[prost(message, optional, tag = "4")]
+    tool_call: Option<NativeAgyToolCall>,
+    #[prost(message, optional, tag = "9")]
+    usage: Option<NativeAgyUsage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyTimestamp {
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+    #[prost(int32, tag = "2")]
+    nanos: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyUsage {
+    #[prost(uint64, tag = "2")]
+    input: u64,
+    #[prost(uint64, tag = "3")]
+    output: u64,
+    #[prost(uint64, tag = "4")]
+    cache_write: u64,
+    #[prost(uint64, tag = "5")]
+    cache_read: u64,
+    #[prost(uint64, tag = "9")]
+    thinking: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyResponse {
+    #[prost(string, tag = "1")]
+    text: String,
+    #[prost(string, tag = "3")]
+    thinking: String,
+    #[prost(string, tag = "6")]
+    message_id: String,
+    #[prost(message, repeated, tag = "7")]
+    tools: Vec<NativeAgyToolCall>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyToolCall {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    arguments: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyGeneric {
+    #[prost(message, optional, tag = "2")]
+    result: Option<NativeAgyGenericResult>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyGenericResult {
+    #[prost(string, tag = "1")]
+    text: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct NativeAgyExecutor {
+    #[prost(enumeration = "NativeAgyTerminationReason", tag = "1")]
+    termination_reason: i32,
+    #[prost(bool, tag = "4")]
+    proceeded_with_auto_continue: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum NativeAgyTerminationReason {
+    Unspecified = 0,
+    Error = 1,
+    UserCanceled = 2,
+    MaxInvocations = 3,
+    NoToolCall = 4,
+    MaxForcedInvocations = 6,
+    EarlyContinue = 7,
+    TerminalStepType = 8,
+    TerminalCustomHook = 9,
+    InjectedResponse = 10,
+    MaxTokenBudgetExceeded = 11,
+}
+
+enum NativeAgyChildCompletion {
+    Completed(Vec<ChatEvent>),
+    Failed {
+        events: Vec<ChatEvent>,
+        reason: NativeAgyTerminationReason,
+    },
+}
+
+async fn wait_for_antigravity_native_child(
+    path: &Path,
+) -> Result<NativeAgyChildCompletion, String> {
+    use notify::Watcher;
+    let (updates, mut changed) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = updates.send(event);
+    })
+    .map_err(|error| format!("Cannot observe native child completion: {error}"))?;
+    let directory = path
+        .parent()
+        .ok_or("Native child trajectory has no directory")?;
+    watcher
+        .watch(directory, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| format!("Cannot subscribe to native child completion: {error}"))?;
+    let wal = path.with_extension("db-wal");
+    loop {
+        if let Some(events) = antigravity_native_child_history(path)? {
+            return Ok(events);
+        }
+        loop {
+            let event: notify::Result<notify::Event> = changed
+                .recv()
+                .await
+                .ok_or("Native child completion observer closed")?;
+            let event = event
+                .map_err(|error| format!("Native child completion observation failed: {error}"))?;
+            if matches!(
+                event.kind,
+                notify::EventKind::Modify(_)
+                    | notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+            ) && event
+                .paths
+                .iter()
+                .any(|entry| entry == path || entry == &wal)
+            {
+                break;
+            }
+        }
+    }
+}
+
+fn antigravity_native_child_history(
+    path: &Path,
+) -> Result<Option<NativeAgyChildCompletion>, String> {
+    use prost::Message;
+    use protocol::{
+        ChatMessage, ChatMessageId, MessageSender, ReasoningData, ToolExecutionCompletedData,
+        ToolRequest,
+    };
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| "Cannot open Antigravity native child trajectory".to_owned())?;
+    use rusqlite::OptionalExtension;
+    let executor = connection
+        .query_row(
+            "SELECT data FROM executor_metadata ORDER BY idx DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot read native child execution status: {error}"))?;
+    let Some(executor) = executor else {
+        return Ok(None);
+    };
+    let executor = NativeAgyExecutor::decode(executor.as_slice())
+        .map_err(|_| "Invalid native child execution status".to_owned())?;
+    let reason = NativeAgyTerminationReason::try_from(executor.termination_reason)
+        .map_err(|_| "Unsupported Antigravity native child termination reason".to_owned())?;
+    if executor.proceeded_with_auto_continue {
+        return Ok(None);
+    }
+    let failed = match reason {
+        NativeAgyTerminationReason::Unspecified | NativeAgyTerminationReason::EarlyContinue => {
+            return Ok(None);
+        }
+        NativeAgyTerminationReason::Error
+        | NativeAgyTerminationReason::UserCanceled
+        | NativeAgyTerminationReason::MaxInvocations
+        | NativeAgyTerminationReason::MaxForcedInvocations
+        | NativeAgyTerminationReason::MaxTokenBudgetExceeded => true,
+        NativeAgyTerminationReason::NoToolCall
+        | NativeAgyTerminationReason::TerminalStepType
+        | NativeAgyTerminationReason::TerminalCustomHook
+        | NativeAgyTerminationReason::InjectedResponse => false,
+    };
+    let mut query = connection
+        .prepare("SELECT step_format, step_payload FROM steps ORDER BY idx")
+        .map_err(|error| format!("Cannot read native child steps: {error}"))?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|error| format!("Cannot enumerate native child steps: {error}"))?;
+    let mut events = Vec::new();
+    let mut pending = BTreeMap::new();
+    for row in rows {
+        let (format, payload) =
+            row.map_err(|error| format!("Cannot read native child step: {error}"))?;
+        if format != 0 {
+            return Err("Unsupported Antigravity native child step encoding".to_owned());
+        }
+        let step = NativeAgyStep::decode(payload.as_slice())
+            .map_err(|_| "Invalid Antigravity native child step".to_owned())?;
+        // System context is not a user-visible assistant response.
+        if step.kind == 101 {
+            continue;
+        }
+        let metadata = step.metadata.ok_or("Native child step omitted metadata")?;
+        match step.kind {
+            15 => {
+                if step.status != 3 {
+                    return Err("Native child response was not completed".to_owned());
+                }
+                let response = step
+                    .response
+                    .ok_or("Native child response omitted payload")?;
+                if response.message_id.is_empty() {
+                    return Err("Native child response omitted identity".to_owned());
+                }
+                let mut declarations = Vec::new();
+                let mut requests = Vec::new();
+                for call in response.tools {
+                    if call.id.is_empty() || call.name.is_empty() {
+                        return Err("Native child tool omitted identity".to_owned());
+                    }
+                    let args: Value = serde_json::from_str(&call.arguments)
+                        .map_err(|_| "Native child tool contained invalid arguments".to_owned())?;
+                    let tool_type = tool_request_type(&call.name, &args, true);
+                    let is_mcp = call.name == MCP_DISPATCH_TOOL;
+                    let (name, args) = if is_mcp {
+                        mcp_inner_call(&args)
+                    } else {
+                        (call.name, args)
+                    };
+                    if pending
+                        .insert(call.id.clone(), (tool_type.clone(), is_mcp))
+                        .is_some()
+                    {
+                        return Err("Native child repeated a tool identity".to_owned());
+                    }
+                    declarations.push(ToolUseData {
+                        tool_call_id: call.id.clone(),
+                        name: name.clone(),
+                        arguments: args,
+                        content_offset: None,
+                    });
+                    requests.push(ChatEvent::ToolRequest(ToolRequest {
+                        tool_call_id: call.id,
+                        tool_name: name,
+                        tool_type,
+                    }));
+                }
+                events.push(ChatEvent::MessageAdded(ChatMessage {
+                    origin: None,
+                    message_id: Some(ChatMessageId(response.message_id)),
+                    timestamp: metadata
+                        .created_at
+                        .map(|stamp| {
+                            (stamp.seconds.max(0) as u64)
+                                .saturating_mul(1000)
+                                .saturating_add(stamp.nanos.max(0) as u64 / 1_000_000)
+                        })
+                        .unwrap_or_default(),
+                    sender: MessageSender::Assistant {
+                        agent: ANTIGRAVITY_AGENT_NAME.to_owned(),
+                    },
+                    content: response.text,
+                    reasoning: (!response.thinking.is_empty()).then_some(ReasoningData {
+                        text: response.thinking,
+                        tokens: metadata.usage.as_ref().map(|usage| usage.thinking),
+                        signature: None,
+                        blob: None,
+                    }),
+                    tool_calls: declarations,
+                    model_info: None,
+                    token_usage: metadata.usage.map(|usage| {
+                        MessageTokenUsage::request_known(protocol::TokenUsage {
+                            input_tokens: usage.input,
+                            output_tokens: usage.output,
+                            total_tokens: usage
+                                .input
+                                .saturating_add(usage.output)
+                                .saturating_add(usage.cache_read)
+                                .saturating_add(usage.cache_write),
+                            cached_prompt_tokens: Some(usage.cache_read),
+                            cache_creation_input_tokens: Some(usage.cache_write),
+                            reasoning_tokens: Some(usage.thinking),
+                        })
+                    }),
+                    context_breakdown: None,
+                    images: None,
+                }));
+                events.extend(requests);
+            }
+            132 => {
+                let call = metadata
+                    .tool_call
+                    .ok_or("Native child tool result omitted identity")?;
+                let (tool_type, is_mcp) = pending
+                    .remove(&call.id)
+                    .ok_or("Native child result has no declared tool")?;
+                let result = step
+                    .generic
+                    .and_then(|generic| generic.result)
+                    .ok_or("Native child tool result omitted payload")?;
+                let outcome = match step.status {
+                    3 => ToolExecutionOutcome::Succeeded {
+                        result: tool_execution_result(
+                            &tool_type,
+                            &result.text,
+                            Some(&result.text),
+                            is_mcp,
+                        ),
+                    },
+                    7 => ToolExecutionOutcome::Failed {
+                        message: result.text,
+                        details: None,
+                        normalization_failure: None,
+                        result: None,
+                    },
+                    6 | 12 => ToolExecutionOutcome::Cancelled {
+                        message: result.text,
+                    },
+                    _ => return Err("Native child tool has no terminal status".to_owned()),
+                };
+                events.push(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: call.id,
+                        outcome,
+                    },
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "Unsupported Antigravity native child step kind {}",
+                    step.kind
+                ));
+            }
+        }
+    }
+    if failed {
+        for (tool_call_id, _) in pending {
+            let message = format!("Native child executor terminated: {reason:?}");
+            events.push(ChatEvent::ToolExecutionCompleted(
+                ToolExecutionCompletedData {
+                    tool_call_id,
+                    outcome: if reason == NativeAgyTerminationReason::UserCanceled {
+                        ToolExecutionOutcome::Cancelled { message }
+                    } else {
+                        ToolExecutionOutcome::Failed {
+                            message,
+                            details: None,
+                            normalization_failure: None,
+                            result: None,
+                        }
+                    },
+                },
+            ));
+        }
+        return Ok(Some(NativeAgyChildCompletion::Failed { events, reason }));
+    }
+    if !pending.is_empty() || events.is_empty() {
+        return Err("Native child trajectory has no complete public response".to_owned());
+    }
+    Ok(Some(NativeAgyChildCompletion::Completed(events)))
+}
+
+struct AgyNativeChildRelay {
+    child_db: PathBuf,
     tool_call_id: String,
     name: String,
     child: crate::backend::SubAgentHandle,
     emitter: Arc<TurnEmitter>,
-) {
-    use protocol::{
-        MessageSender, StreamEndData, StreamStartData, SubAgentProgress, SubAgentProgressStatus,
-        ToolExecutionMode, ToolProgressData, ToolProgressUpdate,
-    };
-    let path = TranscriptReader::new(&brain_dir, &session_id)
-        .path()
-        .to_path_buf();
-    let mut forwarded = 0;
-    loop {
-        tokio::select! {
-            () = child.event_tx.closed() => return,
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        if !path.exists() {
-            continue;
-        }
-        let events = match antigravity_history(&brain_dir, &session_id) {
-            Ok(events) => events,
-            Err(error) => {
-                emitter.backend_error(&error);
-                return;
-            }
+    session_id: SessionId,
+    description: String,
+    subagents: Arc<dyn SubAgentEmitter>,
+}
+
+impl AgyNativeChildRelay {
+    async fn run(self) -> Result<(), String> {
+        let Self {
+            child_db,
+            tool_call_id,
+            name,
+            mut child,
+            emitter,
+            session_id,
+            description,
+            subagents,
+        } = self;
+        use protocol::{
+            MessageSender, StreamEndData, StreamStartData, SubAgentProgress,
+            SubAgentProgressStatus, ToolExecutionMode, ToolProgressData, ToolProgressUpdate,
         };
-        if events.len() <= forwarded {
-            continue;
+        let (events, failure) = match wait_for_antigravity_native_child(&child_db).await? {
+            NativeAgyChildCompletion::Completed(events) => (events, None),
+            NativeAgyChildCompletion::Failed { events, reason } => (events, Some(reason)),
+        };
+        if child.event_tx.is_closed() {
+            child = subagents
+                .on_subagent_spawned(
+                    tool_call_id.clone(),
+                    name.clone(),
+                    description,
+                    ANTIGRAVITY_AGENT_NAME.to_owned(),
+                    Some(session_id),
+                )
+                .await?;
         }
-        let complete = matches!(events.last(), Some(ChatEvent::MessageAdded(message)) if matches!(message.sender, MessageSender::Assistant { .. }) && message.tool_calls.is_empty());
+        child
+            .event_tx
+            .send(ChatEvent::TypingStatusChanged(true))
+            .map_err(|_| "Native child relay closed before response delivery".to_owned())?;
         let tool_calls = events
             .iter()
             .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
             .count() as u64;
-        let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(true));
-        for event in events.iter().skip(forwarded).cloned() {
+        for event in events {
             match event {
                 ChatEvent::MessageAdded(message)
                     if matches!(message.sender, MessageSender::Assistant { .. }) =>
                 {
-                    let _ = child.event_tx.send(ChatEvent::StreamStart(StreamStartData {
-                        agent: ANTIGRAVITY_AGENT_NAME.to_owned(),
-                        model: message.model_info.as_ref().map(|info| info.model.clone()),
-                    }));
-                    let _ = child
+                    child
                         .event_tx
-                        .send(ChatEvent::StreamEnd(StreamEndData { message }));
+                        .send(ChatEvent::StreamStart(StreamStartData {
+                            agent: ANTIGRAVITY_AGENT_NAME.to_owned(),
+                            model: message.model_info.as_ref().map(|info| info.model.clone()),
+                        }))
+                        .map_err(|_| {
+                            "Native child relay closed during response delivery".to_owned()
+                        })?;
+                    child
+                        .event_tx
+                        .send(ChatEvent::StreamEnd(StreamEndData { message }))
+                        .map_err(|_| {
+                            "Native child relay closed during response delivery".to_owned()
+                        })?;
                 }
                 event => {
-                    let _ = child.event_tx.send(event);
+                    child.event_tx.send(event).map_err(|_| {
+                        "Native child relay closed during response delivery".to_owned()
+                    })?;
                 }
             }
         }
-        forwarded = events.len();
-        if complete {
-            let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(false));
+        if let Some(reason) = failure {
+            let error = format!("Antigravity native child executor terminated: {reason:?}");
+            child
+                .event_tx
+                .send(ChatEvent::MessageAdded(protocol::ChatMessage {
+                    origin: None,
+                    message_id: None,
+                    timestamp: crate::agent::now_ms(),
+                    sender: MessageSender::Error,
+                    content: error.clone(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }))
+                .map_err(|_| "Native child relay closed before failure delivery".to_owned())?;
+            emitter.backend_error(&error);
         }
+        child
+            .event_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .map_err(|_| "Native child relay closed before completion delivery".to_owned())?;
         emitter.tool_progress(&ToolProgressData {
-            tool_call_id: tool_call_id.clone(),
+            tool_call_id,
             execution_mode: ToolExecutionMode::Background,
             cancellable: false,
             update: ToolProgressUpdate::SubAgent(SubAgentProgress {
                 backend_kind: None,
-                agent_id: child.agent_id.clone(),
-                agent_name: name.clone(),
+                agent_id: child.agent_id,
+                agent_name: name,
                 last_tool_name: None,
                 tool_calls,
-                completed: complete,
-                status: if complete {
-                    SubAgentProgressStatus::Completed
-                } else {
-                    SubAgentProgressStatus::Running
+                completed: true,
+                status: match failure {
+                    Some(NativeAgyTerminationReason::UserCanceled) => {
+                        SubAgentProgressStatus::Stopped
+                    }
+                    Some(_) => SubAgentProgressStatus::Failed,
+                    None => SubAgentProgressStatus::Completed,
                 },
             }),
         });
+        Ok(())
     }
 }
 
@@ -2657,6 +3186,10 @@ fn antigravity_brain_dir(conversations_dir: &Path) -> PathBuf {
 }
 
 impl Backend for AntigravityBackend {
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Some(self.inner.relocation_wake.subscribe())
+    }
+
     fn native_session_id_is_valid(session_id: &SessionId) -> bool {
         is_antigravity_native_session_id(session_id)
     }
@@ -2912,46 +3445,73 @@ impl Backend for AntigravityBackend {
             .map_err(|_| "Antigravity settings update channel closed".to_owned())?
     }
 
-    async fn set_workspace_roots(
+    fn set_workspace_roots(
         &mut self,
         workspace_roots: Vec<String>,
-    ) -> Result<(), super::WorkspaceRelocationError> {
-        let roots = super::validate_local_workspace_roots(workspace_roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
-        let (reply, result) = oneshot::channel();
-        self.workspace_tx
-            .send(WorkspaceRootsRequest { roots, reply })
-            .map_err(|_| {
-                super::WorkspaceRelocationError::Rejected(
-                    "Antigravity session has closed".to_owned(),
-                )
-            })?;
-        result.await.map_err(|_| {
-            super::WorkspaceRelocationError::OutcomeUnknown(
+    ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
+    {
+        let workspace_tx = self.workspace_tx.clone();
+        let inner = Arc::clone(&self.inner);
+        async move {
+            if inner.state.with(|state| state.closing).await {
+                return Err(super::WorkspaceRelocationError::Rejected(
+                    "Antigravity backend is closed".to_owned(),
+                ));
+            }
+            let roots = super::validate_local_workspace_roots(workspace_roots)
+                .map_err(super::WorkspaceRelocationError::Rejected)?;
+            let (reply, result) = oneshot::channel();
+            workspace_tx
+                .send(WorkspaceRootsRequest { roots, reply })
+                .map_err(|_| {
+                    super::WorkspaceRelocationError::Rejected(
+                        "Antigravity session has closed".to_owned(),
+                    )
+                })?;
+            result.await.map_err(|_| {
+                super::WorkspaceRelocationError::OutcomeUnknown(
                 "Antigravity closed while changing workspace roots; provider outcome is unknown"
                     .to_owned(),
             )
-        })?
+            })?
+        }
     }
 
     async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
-        let state = self.inner.state.lock().await;
-        crate::backend::session_settings_from_json(json!({"model": state.model}))
+        let model = self.inner.state.with(|state| state.model.clone()).await;
+        crate::backend::session_settings_from_json(json!({"model": model}))
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn native_process_id_for_test(&self) -> Result<u32, String> {
+        self.inner
+            .state
+            .with(|state| state.native_pid)
+            .await
+            .ok_or_else(|| "Antigravity native process is unavailable".to_owned())
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).is_ok()
+        !self.inner.state.with(|state| state.closing).await && self.input_tx.send(input).is_ok()
     }
 
     async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
         use crate::backend::SendOutcome;
+        let (closing, active) = self
+            .inner
+            .state
+            .with(|state| (state.closing, state.turn_active))
+            .await;
+        if closing {
+            return SendOutcome::Closed;
+        }
         // Antigravity only starts turns in response to caller input, so a
         // busy admission here means the caller dispatched against a stale
         // idle view (e.g. an actor/backend desync); hand the message back for
         // requeueing instead of letting the actor task reject and drop it.
         if let AgentInput::SendMessage(payload) = &input
             && payload.tool_response.is_none()
-            && self.inner.state.lock().await.turn_active
+            && active
         {
             return SendOutcome::Busy(input);
         }
@@ -2972,11 +3532,14 @@ impl Backend for AntigravityBackend {
     /// inside a process restart when it happens, and a returning `shutdown`
     /// that leaves the child running leaks it past the caller's teardown.
     async fn shutdown(self) {
-        let done = {
-            let mut state = self.inner.state.lock().await;
-            state.closing = true;
-            state.shutdown_complete.take()
-        };
+        let done = self
+            .inner
+            .state
+            .with(|state| {
+                state.closing = true;
+                state.shutdown_complete.take()
+            })
+            .await;
         drop(self.workspace_tx);
         drop(self.settings_tx);
         drop(self.input_tx);
@@ -3118,12 +3681,14 @@ impl AntigravityBackend {
 
         let session_id = SessionId(process.conversation_id.clone());
         let inner = Arc::new(AntigravityInner {
+            relocation_wake: tokio::sync::watch::channel(()).0,
             emitter: Arc::clone(&emitter),
-            state: Mutex::new(AntigravityState {
+            state: AntigravityStateActor::new(AntigravityState {
+                #[cfg(feature = "test-support")]
+                native_pid: process.child.id(),
                 model,
                 turn_active: false,
                 closing: false,
-                subagent_emitter: config.subagent_emitter.clone(),
                 shutdown_complete: None,
             }),
         });
@@ -3151,7 +3716,10 @@ impl AntigravityBackend {
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
 
         let (shutdown_complete_tx, shutdown_complete_rx) = oneshot::channel();
-        inner.state.lock().await.shutdown_complete = Some(shutdown_complete_rx);
+        inner
+            .state
+            .with(move |state| state.shutdown_complete = Some(shutdown_complete_rx))
+            .await;
         let supervisor = Supervisor {
             inner: Arc::clone(&inner),
             launch,
@@ -3168,9 +3736,11 @@ impl AntigravityBackend {
             deferred_answers: VecDeque::new(),
             capacity_read_at: None,
             shutdown_complete: shutdown_complete_tx,
+            subagent_emitter: config.subagent_emitter.clone(),
             native_pending: BTreeMap::new(),
             native_sessions: BTreeSet::new(),
             native_children: tokio::task::JoinSet::new(),
+            native_child_failure: None,
             session_id: session_id.0.clone(),
             slash_commands,
             relaunch_before_next_turn: false,

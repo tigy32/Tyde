@@ -11,7 +11,12 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + '_>>;
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + 'static,
+        >,
+    >;
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>>;
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability;
     fn begin_compaction<'a>(
         &'a self,
@@ -66,15 +71,23 @@ impl<B: Backend> BackendSender for B {
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + 'static,
+        >,
+    > {
+        let operation = Backend::set_workspace_roots(self, roots);
         Box::pin(async move {
             tracing::info!(target: "tyde_project_entry_diagnostic", "Backend relocation called");
-            let result = Backend::set_workspace_roots(self, roots).await;
+            let result = operation.await;
             tracing::info!(target: "tyde_project_entry_diagnostic", accepted = result.is_ok(),
                 busy = matches!(result, Err(WorkspaceRelocationError::Busy)), "Backend relocation returned");
             result
         })
+    }
+
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Backend::workspace_relocation_wake(self)
     }
 
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {

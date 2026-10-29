@@ -805,7 +805,7 @@ pub(crate) async fn generate_supervision_verdict(
             host_sub_agent_spawn_tx,
             capacity_tx: request.capacity_tx.clone(),
         }
-        .emitter(request.verdict_agent_id.clone(), workspace_roots.clone()),
+        .emitter(request.verdict_agent_id.clone()),
     ));
     let (_backend, mut events, _session_id) = match spawn_backend(
         false,

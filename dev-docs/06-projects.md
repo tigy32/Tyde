@@ -308,7 +308,9 @@ conformance setup.
 
 The host `AgentMove` operation resolves every destination project root and
 serializes relocation through the agent actor. It rejects active turns,
-queued work, compaction, background work, and team/workflow/child ownership.
+queued work, compaction, background work, and team/workflow/independent-child
+ownership. Native descendants move with their owner; native registration and
+actual child work block entry, but completed retained conversations do not.
 It persists roots and project assignment after provider acknowledgement and
 broadcasts `AgentMoveResult` to connected host clients. Existing chat tabs,
 messages, and drafts retain their identity. The live agent keeps its current

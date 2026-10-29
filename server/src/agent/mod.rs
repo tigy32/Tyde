@@ -196,13 +196,8 @@ struct HostSubAgentEmitterContext {
 }
 
 impl HostSubAgentEmitterContext {
-    fn emitter(self, agent_id: AgentId, workspace_roots: Vec<String>) -> HostSubAgentEmitter {
-        HostSubAgentEmitter::new(
-            self.host_sub_agent_spawn_tx,
-            self.capacity_tx,
-            agent_id,
-            workspace_roots,
-        )
+    fn emitter(self, agent_id: AgentId) -> HostSubAgentEmitter {
+        HostSubAgentEmitter::new(self.host_sub_agent_spawn_tx, self.capacity_tx, agent_id)
     }
 }
 
@@ -259,6 +254,7 @@ struct InitialFollowUpContext<'a> {
     pending_inputs: &'a mut VecDeque<AgentInput>,
     held_controls: &'a mut VecDeque<HeldControlDelivery>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
+    project_moves: &'a mut AgentProjectMoves,
     accepted_human_inputs: &'a HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
 }
 
@@ -282,6 +278,7 @@ struct QueueDispatchTerminalContext<'a> {
     pending_inputs: &'a mut VecDeque<AgentInput>,
     held_controls: &'a mut VecDeque<HeldControlDelivery>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
+    project_moves: &'a mut AgentProjectMoves,
     open_tool_call_ids: &'a mut HashSet<String>,
     pending_tool_response_ids: &'a mut HashSet<String>,
     active_agent_await_ids: &'a mut HashSet<String>,
@@ -564,6 +561,11 @@ enum AgentCommand {
     ReleaseCompaction {
         reply: oneshot::Sender<()>,
     },
+    AwaitToolPublication {
+        tool_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    NativeRegistrationSettled,
     ScheduleProjectMove {
         movement: ScheduledProjectMove,
         reply: oneshot::Sender<Result<(), String>>,
@@ -571,6 +573,11 @@ enum AgentCommand {
     DetachProject {
         project_id: protocol::ProjectId,
         reply: oneshot::Sender<AgentStartPayload>,
+    },
+    MoveNativeProject {
+        project_id: Option<protocol::ProjectId>,
+        roots: Vec<String>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     MoveToProject {
         project_id: Option<protocol::ProjectId>,
@@ -978,6 +985,7 @@ pub(crate) struct AgentHandle {
     final_usage: watch::Receiver<Option<AgentUsageSnapshot>>,
     close_preparing: Arc<AtomicBool>,
     moving_project: Arc<AtomicBool>,
+    native_registration: NativeRegistrationState,
     /// Live view of the actor's `AgentStartPayload`. Populated synchronously at
     /// handle construction and updated by the actor on name changes. Owning a
     /// clone of the receiver here means callers can snapshot the start payload
@@ -1064,10 +1072,36 @@ impl Drop for StartupCompletion {
     }
 }
 
-pub(crate) struct AgentProjectMoveGuard(Arc<AtomicBool>);
+const SCHEDULED_ENTRY_FAILED_MESSAGE: &str = "Tyde could not enter the destination project. Your project and workspace are unchanged. Report the entry failure; do not edit outside your assigned project.";
+
+pub(crate) const CHILD_OWNERSHIP_MOVE_REJECTION: &str =
+    "Close this agent's child agents before moving it";
+
+pub(crate) struct AgentProjectMoveGuard {
+    moving: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeRegistrationState {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    owner_start: watch::Receiver<AgentStartPayload>,
+    actor: mpsc::UnboundedSender<AgentCommand>,
+}
+
+pub(crate) struct NativeRegistrationGuard {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    actor: mpsc::UnboundedSender<AgentCommand>,
+}
+impl Drop for NativeRegistrationGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.actor.send(AgentCommand::NativeRegistrationSettled);
+    }
+}
+
 impl Drop for AgentProjectMoveGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.moving.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1077,14 +1111,70 @@ pub(crate) struct ScheduledProjectMove {
     pub guard: AgentProjectMoveGuard,
 }
 
-struct AgentProjectMoveContext<'a> {
-    backend: &'a mut crate::backend::handle::BackendHandle,
-    session_store: &'a SessionStoreHandle,
-    session_id: Option<&'a SessionId>,
-    current_start: &'a mut AgentStartPayload,
-    start_tx: &'a watch::Sender<AgentStartPayload>,
-    event_log: &'a mut AgentEventLog,
-    workspace_emitter: &'a HostSubAgentEmitter,
+#[derive(Default)]
+struct AgentProjectMoves {
+    scheduled: Option<ScheduledProjectMove>,
+    pending: Option<PendingAgentProjectMove>,
+    held_commands: VecDeque<AgentCommand>,
+    entry_pending:
+        Option<oneshot::Receiver<Result<crate::host::lifecycle::ProjectEntryExecution, String>>>,
+    entry_execution: Option<Result<crate::host::lifecycle::ProjectEntryExecution, String>>,
+}
+
+impl AgentProjectMoves {
+    fn terminalize(&mut self) {
+        if let Some(movement) = self.pending.take() {
+            match movement.origin {
+                ProjectMoveOrigin::Immediate { reply } => {
+                    let _ = reply.send(Err("Agent backend closed during project entry".to_owned()));
+                }
+                ProjectMoveOrigin::Scheduled { execution } => {
+                    if let Ok(execution) = execution {
+                        execution.complete(crate::host::lifecycle::ProjectEntryOutcome::Cancelled);
+                    }
+                }
+            }
+        }
+        self.scheduled = None;
+        self.entry_pending = None;
+        self.entry_execution = None;
+    }
+}
+
+#[cfg(feature = "test-support")]
+type ProjectMoveDeliveryTestGates =
+    std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;
+
+#[cfg(feature = "test-support")]
+fn project_move_delivery_test_gates() -> &'static ProjectMoveDeliveryTestGates {
+    static GATES: std::sync::OnceLock<ProjectMoveDeliveryTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_project_move_delivery_test_gate(
+    name: String,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    assert!(
+        project_move_delivery_test_gates()
+            .lock()
+            .expect("project delivery test gates")
+            .insert(name, gate)
+            .is_none()
+    );
+}
+
+#[cfg(feature = "test-support")]
+fn notify_project_move_delivery_test_gate(name: &str, command: &AgentCommand) {
+    if matches!(command, AgentCommand::DeliverMessage { human: Some(_), .. })
+        && let Some(gate) = project_move_delivery_test_gates()
+            .lock()
+            .expect("project delivery test gates")
+            .remove(name)
+    {
+        crate::host::notify_spawn_operation_test_gate_inner(&gate);
+    }
 }
 
 enum ProjectMoveFailure {
@@ -1093,62 +1183,86 @@ enum ProjectMoveFailure {
     Unreconciled(String),
 }
 
-async fn apply_agent_project_move(
-    context: AgentProjectMoveContext<'_>,
+type ProjectMoveOperation =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProjectMoveFailure>> + Send>>;
+
+enum ProjectMoveOrigin {
+    Scheduled {
+        execution: Result<crate::host::lifecycle::ProjectEntryExecution, String>,
+    },
+    Immediate {
+        reply: oneshot::Sender<Result<AgentStartPayload, String>>,
+    },
+}
+
+enum ProjectMoveStage {
+    Provider(ProjectMoveOperation),
+    Registration,
+    Children(ProjectMoveOperation),
+    Publication,
+}
+
+struct PendingAgentProjectMove {
     project_id: Option<protocol::ProjectId>,
     roots: Vec<String>,
-) -> Result<AgentStartPayload, ProjectMoveFailure> {
-    let session_id = context.session_id.ok_or_else(|| {
-        ProjectMoveFailure::Rejected("Agent has no saved conversation to move".to_owned())
-    })?;
-    if context.current_start.project_id == project_id
-        && context.current_start.workspace_roots == roots
-    {
-        return Ok(context.current_start.clone());
-    }
-    let previous_roots = context.current_start.workspace_roots.clone();
-    tracing::info!(
-        project_assigned = project_id.is_some(),
-        root_count = roots.len(),
-        roots_changed = previous_roots != roots,
-        "Moving agent workspace and project"
-    );
-    let moved = if previous_roots == roots {
-        Ok(())
-    } else {
-        context.backend.set_workspace_roots(roots.clone()).await
+    stage: ProjectMoveStage,
+    origin: ProjectMoveOrigin,
+    readiness_epoch: u64,
+}
+
+fn begin_agent_project_move(
+    backend: &mut crate::backend::handle::BackendHandle,
+    session_store: &Arc<SessionStoreHandle>,
+    session_id: Option<&SessionId>,
+    current_start: &AgentStartPayload,
+    native_registrations: &std::sync::atomic::AtomicUsize,
+    project_id: Option<protocol::ProjectId>,
+    roots: Vec<String>,
+) -> ProjectMoveOperation {
+    let Some(session_id) = session_id.cloned() else {
+        return Box::pin(std::future::ready(Err(ProjectMoveFailure::Rejected(
+            "Agent has no saved conversation to move".to_owned(),
+        ))));
     };
-    let moved = match moved {
-        Ok(()) => {
-            context
-                .session_store
-                .move_to_project(session_id, project_id.clone(), roots.clone())
-                .await
-        }
-        Err(crate::backend::WorkspaceRelocationError::Busy) => {
-            return Err(ProjectMoveFailure::Busy);
-        }
-        Err(crate::backend::WorkspaceRelocationError::Rejected(error)) => {
+    if native_registrations.load(Ordering::SeqCst) > 0 {
+        return Box::pin(std::future::ready(Err(ProjectMoveFailure::Busy)));
+    }
+    let session_store = Arc::clone(session_store);
+    let previous_roots = current_start.workspace_roots.clone();
+    let changed = previous_roots != roots;
+    let operation = if changed {
+        backend.set_workspace_roots(roots.clone())
+    } else {
+        Box::pin(std::future::ready(Ok(())))
+    };
+    let rollback = changed.then(|| backend.set_workspace_roots(previous_roots));
+    Box::pin(async move {
+        let moved = match operation.await {
+            Ok(()) => {
+                session_store
+                    .move_to_project(&session_id, project_id, roots)
+                    .await
+            }
+            Err(crate::backend::WorkspaceRelocationError::Busy) => {
+                return Err(ProjectMoveFailure::Busy);
+            }
+            Err(crate::backend::WorkspaceRelocationError::Rejected(error)) => {
+                return Err(ProjectMoveFailure::Rejected(error));
+            }
+            Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(error)) => Err(error),
+        };
+        if let Err(error) = moved {
+            if let Some(rollback) = rollback
+                && let Err(rollback) = rollback.await
+            {
+                return Err(ProjectMoveFailure::Unreconciled(format!(
+                    "{error}. The workspace could not be restored: {rollback}. Reopen the saved conversation before continuing."
+                )));
+            }
             return Err(ProjectMoveFailure::Rejected(error));
         }
-        Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(error)) => Err(error),
-    };
-    if let Err(error) = moved {
-        if previous_roots != roots
-            && let Err(rollback) = context.backend.set_workspace_roots(previous_roots).await
-        {
-            return Err(ProjectMoveFailure::Unreconciled(format!(
-                "{error}. The workspace could not be restored: {rollback}. Reopen the saved conversation before continuing."
-            )));
-        }
-        return Err(ProjectMoveFailure::Rejected(error));
-    }
-    context.current_start.project_id = project_id;
-    context.current_start.workspace_roots = roots.clone();
-    context.workspace_emitter.set_workspace_roots(roots);
-    overwrite_agent_start_payload(context.event_log, context.current_start);
-    context.start_tx.send_replace(context.current_start.clone());
-    Ok(context.current_start.clone())
+        Ok(())
+    })
 }
 
 fn detach_agent_project(
@@ -1166,6 +1280,51 @@ fn detach_agent_project(
 }
 
 use protocol::TaskUsageSource as TokenUsageSource;
+
+#[derive(Default)]
+struct ToolPublication {
+    closed: bool,
+    published: HashSet<String>,
+    waiting: HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>,
+}
+impl ToolPublication {
+    fn wait(&mut self, tool_id: String, reply: oneshot::Sender<Result<(), String>>) {
+        if self.closed {
+            let _ = reply.send(Err(
+                "Native child owner is no longer publishing tools".to_owned()
+            ));
+        } else if self.published.contains(&tool_id) {
+            let _ = reply.send(Ok(()));
+        } else {
+            self.waiting.entry(tool_id).or_default().push(reply);
+        }
+    }
+    fn close(&mut self) {
+        self.closed = true;
+        for (_, waiters) in self.waiting.drain() {
+            for reply in waiters {
+                let _ = reply.send(Err(
+                    "Native child owner stopped before publishing its tool request".to_owned(),
+                ));
+            }
+        }
+    }
+    fn observe(&mut self, event: &ChatEvent) {
+        if let ChatEvent::ToolRequest(request) = event {
+            self.published.insert(request.tool_call_id.clone());
+            if let Some(waiters) = self.waiting.remove(&request.tool_call_id) {
+                for reply in waiters {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+    }
+}
+impl Drop for ToolPublication {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 use crate::backend::TokenUsageTrackingMode;
 
@@ -1925,7 +2084,39 @@ impl AgentHandle {
         self.moving_project
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| "This agent is already moving".to_owned())?;
-        Ok(AgentProjectMoveGuard(self.moving_project.clone()))
+        Ok(AgentProjectMoveGuard {
+            moving: self.moving_project.clone(),
+        })
+    }
+
+    pub(crate) async fn await_tool_publication(&self, tool_id: String) -> Result<(), String> {
+        let (reply, outcome) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::AwaitToolPublication { tool_id, reply })
+            .map_err(|_| {
+                "Native child owner stopped before publishing its tool request".to_owned()
+            })?;
+        outcome
+            .await
+            .map_err(|_| "Native child publication ended without an outcome".to_owned())?
+    }
+
+    pub(crate) fn native_registration_state(&self) -> NativeRegistrationState {
+        self.native_registration.clone()
+    }
+
+    pub(crate) fn native_owner_start(&self) -> AgentStartPayload {
+        self.native_registration.owner_start.borrow().clone()
+    }
+
+    pub(crate) fn begin_native_registration(&self) -> NativeRegistrationGuard {
+        self.native_registration
+            .pending
+            .fetch_add(1, Ordering::SeqCst);
+        NativeRegistrationGuard {
+            count: self.native_registration.pending.clone(),
+            actor: self.native_registration.actor.clone(),
+        }
     }
 
     pub(crate) fn is_closing(&self) -> bool {
@@ -2292,6 +2483,24 @@ impl AgentHandle {
         received
             .await
             .map_err(|_| "Agent stopped before completing project detachment".to_owned())
+    }
+
+    pub(crate) async fn move_native_project(
+        &self,
+        project_id: Option<protocol::ProjectId>,
+        roots: Vec<String>,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::MoveNativeProject {
+                project_id,
+                roots,
+                reply,
+            })
+            .map_err(|_| "Native child stopped during project entry".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Native child project entry ended without an outcome".to_owned())?
     }
 
     pub async fn move_to_project(
@@ -3150,7 +3359,7 @@ pub(crate) async fn run_helper_text_turn(turn: HelperTextTurn) -> Result<String,
             host_sub_agent_spawn_tx,
             capacity_tx: turn.capacity_tx,
         }
-        .emitter(helper_agent_id, workspace_roots.clone()),
+        .emitter(helper_agent_id),
     ));
     let (_backend, mut events, _session_id) = spawn_backend(
         false,
@@ -3367,7 +3576,7 @@ pub(crate) async fn generate_agent_activity_summary(
             host_sub_agent_spawn_tx,
             capacity_tx: request.capacity_tx.clone(),
         }
-        .emitter(request.summary_agent_id.clone(), workspace_roots.clone()),
+        .emitter(request.summary_agent_id.clone()),
     ));
     let (_backend, mut events, _session_id) = match spawn_backend(
         false,
@@ -3548,7 +3757,7 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
             host_sub_agent_spawn_tx,
             capacity_tx,
         }
-        .emitter(summary_agent_id, workspace_roots.clone()),
+        .emitter(summary_agent_id),
     ));
     let (_backend, mut events, _session_id) = spawn_backend(
         false,
@@ -3913,6 +4122,13 @@ pub(crate) fn spawn_agent_actor(
         request.resolved_spawn_config.access_mode,
     );
     let (start_tx, start_rx) = watch::channel(start.clone());
+    let native_registration = NativeRegistrationState {
+        pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        owner_start: start_rx.clone(),
+        actor: tx.clone(),
+    };
+    let actor_native_registrations = native_registration.pending.clone();
+
     let (final_usage_tx, final_usage) = watch::channel(None);
     let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
     let accounting_actor = diagnostics.slot;
@@ -3967,13 +4183,10 @@ pub(crate) fn spawn_agent_actor(
         resolved_spawn_config.assert_session_policy(startup_failure.is_some());
         let startup_mcp_servers =
             customization::protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
+        let mut tool_publication = ToolPublication::default();
         let mut current_start = start.clone();
         let session_resumability_config = resolved_spawn_config.clone();
-        let workspace_emitter = Arc::new(
-            sub_agent_context
-                .clone()
-                .emitter(agent_id.clone(), workspace_roots.clone()),
-        );
+        let workspace_emitter = Arc::new(sub_agent_context.clone().emitter(agent_id.clone()));
         let spawn_config = BackendSpawnConfig {
             execution_mode: BackendExecutionMode::Agent,
             cost_hint,
@@ -4105,6 +4318,7 @@ pub(crate) fn spawn_agent_actor(
             })
             .collect::<VecDeque<_>>();
         let mut next_queue_sequence = queue.len() as u64 + 1;
+        let mut project_moves = AgentProjectMoves::default();
         let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
         let mut held_controls: VecDeque<HeldControlDelivery> = VecDeque::new();
         // Checked deliveries this actor has already acknowledged as accepted
@@ -4590,6 +4804,16 @@ pub(crate) fn spawn_agent_actor(
                                 &mut event_log,
                             ));
                         }
+                        AgentCommand::MoveNativeProject { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "Only a live native relay follows its owner project".to_owned(),
+                            ));
+                        }
+
+                        AgentCommand::AwaitToolPublication { tool_id, reply } => {
+                            tool_publication.wait(tool_id, reply);
+                        }
+                        AgentCommand::NativeRegistrationSettled => {}
                         AgentCommand::ScheduleProjectMove { reply, .. } => {
                             let _ = reply.send(Err(
                                 "This agent cannot enter another project in its current state"
@@ -4871,6 +5095,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut rx,
                     &status_handle,
                     &accepted_human_inputs,
+                    &mut project_moves,
                 )
                 .await;
                 return;
@@ -4891,6 +5116,8 @@ pub(crate) fn spawn_agent_actor(
             protocol::TychatOwnerMessage,
             oneshot::Sender<Result<protocol::TychatDeliveryReceipt, String>>,
         )> = None;
+        let mut relocation_wake = backend.workspace_relocation_wake();
+        tracing::info!(target: "tyde_project_entry_diagnostic", available = relocation_wake.is_some(), "Actor captured backend relocation subscription");
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
@@ -4905,14 +5132,8 @@ pub(crate) fn spawn_agent_actor(
         // gated on this: they are a narrow, deliberately terminal marker even
         // while typing is on.
         let mut backend_typing = false;
-        let mut scheduled_project_move: Option<ScheduledProjectMove> = None;
         let mut project_move_waiting_for_backend = false;
-        let mut project_entry_pending: Option<
-            oneshot::Receiver<Result<crate::host::lifecycle::ProjectEntryExecution, String>>,
-        > = None;
-        let mut project_entry_execution: Option<
-            Result<crate::host::lifecycle::ProjectEntryExecution, String>,
-        > = None;
+        let mut project_readiness_epoch: u64 = 0;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
         let mut open_tool_requests: HashMap<String, protocol::ToolRequest> = HashMap::new();
@@ -5051,6 +5272,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut rx,
                     &status_handle,
                     &accepted_human_inputs,
+                    &mut project_moves,
                 )
                 .await;
                 return;
@@ -5106,6 +5328,7 @@ pub(crate) fn spawn_agent_actor(
                     activity_stats.accounting_restore_incomplete |=
                         event_log.accounting_history_incomplete;
                     if event_log.accounting_storage_failed {
+                        tool_publication.close();
                         early_accounting_error =
                             Some("Cannot preserve incomplete task-accounting coverage".to_owned());
                     }
@@ -5297,6 +5520,7 @@ pub(crate) fn spawn_agent_actor(
                 &mut rx,
                 &status_handle,
                 &accepted_human_inputs,
+                &mut project_moves,
             )
             .await;
             return;
@@ -5431,6 +5655,7 @@ pub(crate) fn spawn_agent_actor(
                     pending_inputs: &mut pending_inputs,
                     held_controls: &mut held_controls,
                     rx: &mut rx,
+                    project_moves: &mut project_moves,
                     accepted_human_inputs: &accepted_human_inputs,
                 },
             )
@@ -5457,6 +5682,7 @@ pub(crate) fn spawn_agent_actor(
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
             if event_log.accounting_storage_failed {
+                tool_publication.close();
                 if let Some(backend) = backend.take() {
                     backend.shutdown().await;
                 }
@@ -5483,14 +5709,36 @@ pub(crate) fn spawn_agent_actor(
                     &mut rx,
                     &status_handle,
                     &accepted_human_inputs,
+                    &mut project_moves,
                 )
                 .await;
                 return;
             }
             if matches!(lifecycle, ActorLifecycle::Closing) {
+                tool_publication.close();
                 reject_held_agent_controls(&mut held_controls, DELIVERY_REJECTED_CLOSING);
             }
-            let project_entry_ready = scheduled_project_move.is_some()
+            if actor_native_registrations.load(Ordering::SeqCst) == 0
+                && let Some(movement) = project_moves.pending.as_mut()
+                && matches!(movement.stage, ProjectMoveStage::Registration)
+            {
+                let emitter = workspace_emitter.clone();
+                let project_id = movement.project_id.clone();
+                let roots = movement.roots.clone();
+                movement.stage = ProjectMoveStage::Children(Box::pin(async move {
+                    emitter
+                        .move_native_children(project_id, roots)
+                        .await
+                        .map_err(|error| {
+                            ProjectMoveFailure::Unreconciled(format!(
+                                "Native child project state could not be committed: {error}"
+                            ))
+                        })
+                }));
+            }
+            let project_entry_ready = project_moves.pending.is_none()
+                && project_moves.scheduled.is_some()
+                && actor_native_registrations.load(Ordering::SeqCst) == 0
                 && !project_move_waiting_for_backend
                 && matches!(lifecycle, ActorLifecycle::Running)
                 && !in_turn
@@ -5502,7 +5750,7 @@ pub(crate) fn spawn_agent_actor(
                 && pending_tool_response_ids.is_empty()
                 && open_tool_call_ids.is_empty()
                 && !status_handle.snapshot().await.has_background_work;
-            if scheduled_project_move.is_some()
+            if project_moves.scheduled.is_some()
                 && tracing::enabled!(target: "tyde_project_entry_diagnostic", tracing::Level::INFO)
             {
                 let background_work = status_handle.snapshot().await.has_background_work;
@@ -5514,17 +5762,17 @@ pub(crate) fn spawn_agent_actor(
                     context_compaction = context_compaction.is_some(), resume_replay_gate_pending,
                     pending_responses = pending_tool_response_ids.len(), open_tools = open_tool_call_ids.len(),
                     background_work,
-                    grant_pending = project_entry_pending.is_some(), grant_received = project_entry_execution.is_some(),
+                    grant_pending = project_moves.entry_pending.is_some(), grant_received = project_moves.entry_execution.is_some(),
                     queue_len = queue.len(), "actor project entry eligibility");
             }
-            if scheduled_project_move.is_none() {
-                project_entry_pending = None;
-                project_entry_execution = None;
+            if project_moves.scheduled.is_none() {
+                project_moves.entry_pending = None;
+                project_moves.entry_execution = None;
             }
             if project_entry_ready
-                && project_entry_pending.is_none()
-                && project_entry_execution.is_none()
-                && let Some(movement) = scheduled_project_move.as_ref()
+                && project_moves.entry_pending.is_none()
+                && project_moves.entry_execution.is_none()
+                && let Some(movement) = project_moves.scheduled.as_ref()
             {
                 match movement.project_store.enter_scheduled_project(
                     current_start.agent_id.clone(),
@@ -5532,124 +5780,48 @@ pub(crate) fn spawn_agent_actor(
                     movement.project_id.clone(),
                     current_start.workspace_roots.clone(),
                 ) {
-                    Ok(pending) => project_entry_pending = Some(pending),
-                    Err(error) => project_entry_execution = Some(Err(error)),
+                    Ok(pending) => project_moves.entry_pending = Some(pending),
+                    Err(error) => project_moves.entry_execution = Some(Err(error)),
                 }
             }
             if !project_entry_ready {
-                project_entry_execution = None;
+                project_moves.entry_execution = None;
             }
-            if project_entry_ready && project_entry_execution.is_some() {
-                let movement = match scheduled_project_move.take() {
-                    Some(movement) => movement,
-                    None => continue,
-                };
-                let mut execution = match project_entry_execution.take() {
-                    Some(execution) => execution,
-                    None => continue,
-                };
+            if project_entry_ready && let Some(mut execution) = project_moves.entry_execution.take()
+            {
+                let movement = project_moves
+                    .scheduled
+                    .as_ref()
+                    .expect("scheduled entry owns its execution");
                 let roots = match &mut execution {
-                    Err(error) => Err(ProjectMoveFailure::Rejected(error.clone())),
                     Ok(execution) => Ok(std::mem::take(&mut execution.roots)),
+                    Err(error) => Err(ProjectMoveFailure::Rejected(error.clone())),
                 };
-                let mut result = match roots {
+                let (roots, operation) = match roots {
                     Ok(roots) => {
-                        apply_agent_project_move(
-                            AgentProjectMoveContext {
-                                backend: backend.as_mut().expect("running actor has backend"),
-                                session_store: &session_store,
-                                session_id: current_session_id.as_ref(),
-                                current_start: &mut current_start,
-                                start_tx: &start_tx,
-                                event_log: &mut event_log,
-                                workspace_emitter: &workspace_emitter,
-                            },
+                        let operation = begin_agent_project_move(
+                            backend.as_mut().expect("running actor has backend"),
+                            &session_store,
+                            current_session_id.as_ref(),
+                            &current_start,
+                            &actor_native_registrations,
                             movement.project_id.clone(),
-                            roots,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                if let Ok(execution) = execution {
-                    use crate::host::lifecycle::ProjectEntryOutcome;
-                    match &mut result {
-                        Ok(_) => execution.complete(ProjectEntryOutcome::Committed),
-                        Err(ProjectMoveFailure::Busy) => {
-                            execution.complete(ProjectEntryOutcome::BackendBusy)
-                        }
-                        Err(ProjectMoveFailure::Rejected(_)) => {
-                            execution.complete(ProjectEntryOutcome::Rejected)
-                        }
-                        Err(ProjectMoveFailure::Unreconciled(message)) => {
-                            if let Err(error) = execution.retire().await {
-                                tracing::error!("Cannot withdraw failed project entry restoration");
-                                *message =
-                                    format!("{message}; conversation retirement failed: {error}");
-                            }
-                        }
-                    }
-                }
-                let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
-                match result {
-                    Err(ProjectMoveFailure::Busy) => {
-                        tracing::info!(target: "tyde_project_entry_diagnostic", "actor relocation result busy");
-                        tracing::info!(
-                            "Keeping scheduled project entry pending until backend work settles"
+                            roots.clone(),
                         );
-                        scheduled_project_move = Some(movement);
-                        project_move_waiting_for_backend = true;
+                        (roots, operation)
                     }
-                    Ok(start) => {
-                        drop(movement.guard);
-                        broadcast_live_event(
-                            &mut subscribers,
-                            FrameKind::AgentProjectChanged,
-                            &start,
-                        )
-                        .await;
-                        pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
-                            message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
-                                movement.project_id.as_ref().map_or_else(|| "Home (no project)".to_owned(), ToString::to_string), current_start.workspace_roots.join(", ")),
-                            images: None, origin: Some(MessageOrigin::System), tool_response: None,
-                        }));
-                    }
-                    Err(
-                        ProjectMoveFailure::Rejected(message)
-                        | ProjectMoveFailure::Unreconciled(message),
-                    ) => {
-                        drop(movement.guard);
-                        tracing::error!(fatal, "Scheduled project entry failed");
-                        if fatal {
-                            // Restart may begin as soon as the fatal error is
-                            // visible, before native shutdown has settled.
-                            status_handle.withdraw_recovery().await;
-                        }
-                        append_event(
-                            &canonical_stream,
-                            &mut event_log,
-                            &mut subscribers,
-                            FrameKind::AgentError,
-                            &AgentErrorPayload {
-                                agent_id: current_start.agent_id.clone(),
-                                code: AgentErrorCode::Internal,
-                                message,
-                                fatal,
-                            },
-                        )
-                        .await;
-                        if fatal {
-                            accepting_input_task.store(false, Ordering::SeqCst);
-                            lifecycle = ActorLifecycle::Closing;
-                            close_deadline = Some(tokio::time::Instant::now());
-                        } else {
-                            pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
-                                message: "Tyde could not enter the destination project. Your project and workspace are unchanged. Report the entry failure; do not edit outside your assigned project.".to_owned(),
-                                images: None, origin: Some(MessageOrigin::System), tool_response: None,
-                            }));
-                        }
-                    }
-                }
+                    Err(error) => (
+                        Vec::new(),
+                        Box::pin(std::future::ready(Err(error))) as ProjectMoveOperation,
+                    ),
+                };
+                project_moves.pending = Some(PendingAgentProjectMove {
+                    project_id: movement.project_id.clone(),
+                    roots,
+                    stage: ProjectMoveStage::Provider(operation),
+                    origin: ProjectMoveOrigin::Scheduled { execution },
+                    readiness_epoch: project_readiness_epoch,
+                });
             }
             latest_output
                 .observe_event_log(&event_log)
@@ -5691,7 +5863,8 @@ pub(crate) fn spawn_agent_actor(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if usage_settings.enabled
+            if project_moves.pending.is_none()
+                && usage_settings.enabled
                 && !exceeded.is_empty()
                 && usage_pause.is_none()
                 && matches!(lifecycle, ActorLifecycle::Running)
@@ -5991,6 +6164,7 @@ pub(crate) fn spawn_agent_actor(
                                 pending_inputs: &mut pending_inputs,
                                 held_controls: &mut held_controls,
                                 rx: &mut rx,
+                                project_moves: &mut project_moves,
                                 open_tool_call_ids: &mut open_tool_call_ids,
                                 pending_tool_response_ids: &mut pending_tool_response_ids,
                                 active_agent_await_ids: &mut active_agent_await_ids,
@@ -6086,7 +6260,10 @@ pub(crate) fn spawn_agent_actor(
                 !replay_state.active_background_progress.is_empty(),
                 Instant::now(),
             );
-            let supervisor_deadline = if usage_paused || supervisor_status.goal.is_some() {
+            let supervisor_deadline = if project_moves.pending.is_some()
+                || usage_paused
+                || supervisor_status.goal.is_some()
+            {
                 None
             } else {
                 supervisor_state
@@ -6099,7 +6276,8 @@ pub(crate) fn spawn_agent_actor(
             // silent immediately is measured from when it began rather than
             // from an older event. One interrupt per window: a backend that
             // swallows the first gets another a full window later, not a loop.
-            let stall_deadline = (!usage_paused
+            let stall_deadline = (project_moves.pending.is_none()
+                && !usage_paused
                 && supervisor_status.goal.is_none()
                 && supervisor_settings.settings.enabled
                 && supervisor_settings.settings.stall_timeout_enabled
@@ -6129,12 +6307,13 @@ pub(crate) fn spawn_agent_actor(
             tokio::pin!(supervisor_sleep);
             tokio::pin!(stall_sleep);
             let held_control_releasable = held_controls.front().is_some_and(|held| {
-                matches!(lifecycle, ActorLifecycle::Running)
+                project_moves.pending.is_none()
+                    && matches!(lifecycle, ActorLifecycle::Running)
                     && tychat_handoff.is_none()
                     && pending_inputs.is_empty()
                     && initial_follow_up.is_none()
-                    && scheduled_project_move.is_none()
-                    && project_entry_pending.is_none()
+                    && project_moves.scheduled.is_none()
+                    && project_moves.entry_pending.is_none()
                     && !resume_replay_gate_pending
                     && !usage_paused
                     && context_compaction.is_none()
@@ -6145,18 +6324,159 @@ pub(crate) fn spawn_agent_actor(
                         HeldControlRelease::NextTurn { idle_seen } => idle_seen,
                     }
             });
+            let project_move_in_flight = project_moves.pending.is_some();
             tokio::select! {
                 result = async {
-                    match project_entry_pending.as_mut() {
+                        match project_moves.pending.as_mut() {
+                            Some(movement) => match &mut movement.stage {
+                                ProjectMoveStage::Provider(operation) | ProjectMoveStage::Children(operation) => operation.as_mut().await,
+                                ProjectMoveStage::Publication if actor_native_registrations.load(Ordering::SeqCst) == 0 => Ok(()),
+                                ProjectMoveStage::Registration | ProjectMoveStage::Publication => std::future::pending().await,
+                            },
+                            None => std::future::pending().await,
+                        }
+                    }, if project_moves.pending.is_some() => {
+                        let movement = project_moves.pending.as_mut().expect("project move owns its completion");
+                        if result.is_ok() {
+                            match movement.stage {
+                                ProjectMoveStage::Provider(_) => {
+                                    current_start.project_id = movement.project_id.clone();
+                                    current_start.workspace_roots = movement.roots.clone();
+                                    overwrite_agent_start_payload(&mut event_log, &current_start);
+                                    start_tx.send_replace(current_start.clone());
+                                    movement.stage = ProjectMoveStage::Registration;
+                                    continue;
+                                }
+                                ProjectMoveStage::Children(_) => {
+                                    movement.stage = ProjectMoveStage::Publication;
+                                    continue;
+                                }
+                                ProjectMoveStage::Publication => {}
+                                ProjectMoveStage::Registration => unreachable!("registration waits for its settled event"),
+                            }
+                        }
+                        let movement_job = project_moves.pending.take().expect("project move owns its completion");
+                        let mut result = result.map(|()| current_start.clone());
+                        let readiness_changed = movement_job.readiness_epoch != project_readiness_epoch;
+                        match movement_job.origin {
+                            ProjectMoveOrigin::Scheduled { execution } => {
+                                let movement = project_moves.scheduled.take().expect("scheduled move retains its reservation");
+                                if let Ok(execution) = execution {
+                                    use crate::host::lifecycle::ProjectEntryOutcome;
+                                    match &mut result {
+                                        Ok(_) => execution.complete(ProjectEntryOutcome::Committed),
+                                        Err(ProjectMoveFailure::Busy) => {
+                                            execution.complete(ProjectEntryOutcome::BackendBusy)
+                                        }
+                                        Err(ProjectMoveFailure::Rejected(_)) => {
+                                            execution.complete(ProjectEntryOutcome::Rejected)
+                                        }
+                                        Err(ProjectMoveFailure::Unreconciled(message)) => {
+                                            if let Err(error) = execution.retire().await {
+                                                tracing::error!("Cannot withdraw failed project entry restoration");
+                                                *message =
+                                                    format!("{message}; conversation retirement failed: {error}");
+                                            }
+                                        }
+                                    }
+                                }
+                                let fatal = matches!(&result, Err(ProjectMoveFailure::Unreconciled(_)));
+                                match result {
+                                    Err(ProjectMoveFailure::Busy) => {
+                                        tracing::info!(target: "tyde_project_entry_diagnostic", "actor relocation result busy");
+                                        tracing::info!(
+                                            "Keeping scheduled project entry pending until backend work settles"
+                                        );
+                                        project_moves.scheduled = Some(movement);
+                                        project_move_waiting_for_backend = !readiness_changed;
+                                    }
+                                    Ok(start) => {
+                                        drop(movement.guard);
+                                        broadcast_live_event(
+                                            &mut subscribers,
+                                            FrameKind::AgentProjectChanged,
+                                            &start,
+                                        )
+                                        .await;
+                                        pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
+                                            message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
+                                                movement.project_id.as_ref().map_or_else(|| "Home (no project)".to_owned(), ToString::to_string), current_start.workspace_roots.join(", ")),
+                                            images: None, origin: Some(MessageOrigin::System), tool_response: None,
+                                        }));
+                                    }
+                                    Err(
+                                        ProjectMoveFailure::Rejected(message)
+                                        | ProjectMoveFailure::Unreconciled(message),
+                                    ) => {
+                                        drop(movement.guard);
+                                        tracing::error!(fatal, "Scheduled project entry failed");
+                                        if fatal {
+                                            // Restart may begin as soon as the fatal error is
+                                            // visible, before native shutdown has settled.
+                                            status_handle.withdraw_recovery().await;
+                                        }
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::AgentError,
+                                            &AgentErrorPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                code: AgentErrorCode::Internal,
+                                                message,
+                                                fatal,
+                                            },
+                                        )
+                                        .await;
+                                        if fatal {
+                                            accepting_input_task.store(false, Ordering::SeqCst);
+                                            lifecycle = ActorLifecycle::Closing;
+                                            close_deadline = Some(tokio::time::Instant::now());
+                                        } else {
+                                            pending_inputs.push_front(AgentInput::SendMessage(
+                                                SendMessagePayload {
+                                                    message: SCHEDULED_ENTRY_FAILED_MESSAGE.to_owned(),
+                                                    images: None,
+                                                    origin: Some(MessageOrigin::System),
+                                                    tool_response: None,
+                                                },
+                                            ));
+                                        }
+                                    }
+                                }
+
+                            }
+                            ProjectMoveOrigin::Immediate { reply } => {
+                                let result = match result {
+                                    Ok(start) => {
+                                        broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
+                                        Ok(start)
+                                    }
+                                    Err(ProjectMoveFailure::Busy) => Err(crate::backend::WorkspaceRelocationError::Busy.to_string()),
+                                    Err(ProjectMoveFailure::Rejected(message)) => Err(message),
+                                    Err(ProjectMoveFailure::Unreconciled(message)) => {
+                                        accepting_input_task.store(false, Ordering::SeqCst);
+                                        lifecycle = ActorLifecycle::Closing;
+                                        close_deadline = Some(tokio::time::Instant::now());
+                                        Err(message)
+                                    }
+                                };
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+
+                    result = async {
+                        match project_moves.entry_pending.as_mut() {
                         Some(pending) => match pending.await {
                             Ok(result) => result,
                             Err(_) => Err("Project lifecycle stopped before entry".to_owned()),
                         },
                         None => std::future::pending().await,
                     }
-                }, if project_entry_pending.is_some() => {
-                    project_entry_pending = None;
-                    project_entry_execution = Some(result);
+                    }, if project_moves.entry_pending.is_some() => {
+                        project_moves.entry_pending = None;
+                        project_moves.entry_execution = Some(result);
                 }
                 _ = &mut supervisor_sleep, if supervisor_deadline.is_some() => {
                     let now = Instant::now();
@@ -6402,6 +6722,7 @@ pub(crate) fn spawn_agent_actor(
                             pending_inputs: &mut pending_inputs,
                             held_controls: &mut held_controls,
                             rx: &mut rx,
+                                project_moves: &mut project_moves,
                             accepted_human_inputs: &accepted_human_inputs,
                         },
                     )
@@ -6473,6 +6794,19 @@ pub(crate) fn spawn_agent_actor(
                         last_stall_interrupt_at = Some(now);
                     }
                 }
+                    wake = async {
+                        match &mut relocation_wake {
+                            Some(wake) => wake.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if wake.is_ok() {
+                            project_readiness_epoch = project_readiness_epoch.wrapping_add(1);
+                            project_move_waiting_for_backend = false;
+                        } else {
+                            relocation_wake = None;
+                        }
+                    }
                 maybe_event = async {
                     if let Some(result) = &resume_replay_boundary {
                         Some(match deferred_resume_events.pop_front() {
@@ -6483,6 +6817,7 @@ pub(crate) fn spawn_agent_actor(
                         events.recv_backend().await
                     }
                 } => {
+                        project_readiness_epoch = project_readiness_epoch.wrapping_add(1);
                     project_move_waiting_for_backend = false;
                     let Some(event) = maybe_event else {
                         event_log.timing.interrupt();
@@ -6613,7 +6948,8 @@ pub(crate) fn spawn_agent_actor(
                                 &mut rx,
                                 &status_handle,
                                 &accepted_human_inputs,
-                            )
+
+            &mut project_moves,)
                             .await;
                             return;
                         }
@@ -6639,6 +6975,10 @@ pub(crate) fn spawn_agent_actor(
                             finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
                             return;
                         }
+                            tool_publication.close();
+                            if let Some(backend) = backend.take() {
+                                backend.shutdown().await;
+                            }
                         let payload = AgentErrorPayload {
                             agent_id: current_start.agent_id.clone(),
                             code: AgentErrorCode::BackendFailed,
@@ -6698,7 +7038,8 @@ pub(crate) fn spawn_agent_actor(
                             &mut rx,
                             &status_handle,
                             &accepted_human_inputs,
-                        )
+
+            &mut project_moves,)
                         .await;
                         return;
                     };
@@ -7034,7 +7375,8 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut rx,
                                                 &status_handle,
                                                 &accepted_human_inputs,
-                                            )
+
+            &mut project_moves,)
                                             .await;
                                             return;
                                         }
@@ -7073,6 +7415,7 @@ pub(crate) fn spawn_agent_actor(
                                                 pending_inputs: &mut pending_inputs,
                                                 held_controls: &mut held_controls,
                                                 rx: &mut rx,
+                                project_moves: &mut project_moves,
                                                 accepted_human_inputs: &accepted_human_inputs,
                                             },
                                         )
@@ -7186,7 +7529,8 @@ pub(crate) fn spawn_agent_actor(
                                         &mut rx,
                                         &status_handle,
                                         &accepted_human_inputs,
-                                    )
+
+            &mut project_moves,)
                                     .await;
                                     return;
                                 }
@@ -7750,6 +8094,7 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
+                        tool_publication.observe(&event);
                     if current_start.origin == protocol::AgentOrigin::Tychat && real_idle_transition
                         && let Some(turn) = tychat_turn.take()
                     {
@@ -7911,7 +8256,7 @@ pub(crate) fn spawn_agent_actor(
                         && !usage_paused
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
-                        && scheduled_project_move.is_none()
+                            && project_moves.scheduled.is_none()
                         && !queue.is_empty()
                         && context_compaction.as_ref().is_none_or(|flight| {
                             queue.front().is_some_and(|queued| {
@@ -8054,7 +8399,8 @@ pub(crate) fn spawn_agent_actor(
                                     &mut rx,
                                     &status_handle,
                                     &accepted_human_inputs,
-                                )
+
+            &mut project_moves,)
                                 .await;
                                 return;
                             }
@@ -8098,14 +8444,28 @@ pub(crate) fn spawn_agent_actor(
                             human: None,
                             reply: held.reply,
                         })
+                        } else if !project_move_in_flight
+                            && (pending_inputs.is_empty() || resume_replay_gate_pending || usage_paused)
+                            && let Some(command) = project_moves.held_commands.pop_front()
+                        {
+                            Some(command)
                     } else {
                         next_agent_command(&mut pending_inputs, &mut rx,
-                            !resume_replay_gate_pending && !usage_paused).await
+                                !project_move_in_flight && !resume_replay_gate_pending && !usage_paused).await
                     }
                 } => {
                     let Some(command) = maybe_command else {
                         break;
                     };
+                        if project_moves.pending.is_some() && !matches!(&command,
+                            AgentCommand::AwaitToolPublication { .. } | AgentCommand::NativeRegistrationSettled)
+                        {
+                            project_moves.held_commands.push_back(command);
+                            #[cfg(feature = "test-support")]
+                            notify_project_move_delivery_test_gate(&current_start.name, project_moves.held_commands.back().expect("buffered project command"));
+                            continue;
+                        }
+
                     // The two input-bearing commands share one delivery path.
                     // Normalizing here keeps that path single-sourced;
                     // `delivery_ack` is the only difference between them, and
@@ -8141,7 +8501,7 @@ pub(crate) fn spawn_agent_actor(
                             delivery_ack = Some(reply);
                             redirect = delivery_redirect;
                             tracing::info!(target: "tyde_project_entry_diagnostic", ?redirect, in_turn, control_redirect,
-                                pending_move = scheduled_project_move.is_some(), "actor received acknowledged delivery");
+                                    pending_move = project_moves.scheduled.is_some(), "actor received acknowledged delivery");
                             AgentCommand::SendInput(input)
                         }
                         AgentCommand::HumanInputAccepted { id, config, reply } => {
@@ -8741,7 +9101,7 @@ pub(crate) fn spawn_agent_actor(
                                     let admission = if (usage_paused
                                         || in_turn
                                         || context_compaction.is_some()
-                                        || scheduled_project_move.is_some())
+                                            || project_moves.scheduled.is_some())
                                         && !is_tool_response
                                     {
                                         None
@@ -8757,7 +9117,7 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                     };
                                     tracing::info!(target: "tyde_project_entry_diagnostic", ?admission, ?redirect, in_turn,
-                                        pending_move = scheduled_project_move.is_some(), is_tool_response,
+                                            pending_move = project_moves.scheduled.is_some(), is_tool_response,
                                         "actor ordinary send admission");
                                     if is_tool_response
                                         && admission
@@ -9100,7 +9460,8 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut rx,
                                                 &status_handle,
                                                 &accepted_human_inputs,
-                                            )
+
+            &mut project_moves,)
                                             .await;
                                             return;
                                         }
@@ -9508,7 +9869,7 @@ pub(crate) fn spawn_agent_actor(
                                 }
                                 AgentInput::SendQueuedMessageNow(payload) => {
                                     tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
-                                        pending_move = scheduled_project_move.is_some(), "actor received UI send-now");
+                                            pending_move = project_moves.scheduled.is_some(), "actor received UI send-now");
                                     let Some(index) =
                                         queue.iter().position(|entry| entry.id == payload.id)
                                     else {
@@ -9601,7 +9962,7 @@ pub(crate) fn spawn_agent_actor(
                                     }
 
                                     tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
-                                        pending_move = scheduled_project_move.is_some(), "actor UI send-now dispatch admitted");
+                                            pending_move = project_moves.scheduled.is_some(), "actor UI send-now dispatch admitted");
                                     let queued = queue
                                         .pop_front()
                                         .expect("queue front must exist after push_front");
@@ -9730,7 +10091,8 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut rx,
                                                 &status_handle,
                                                 &accepted_human_inputs,
-                                            )
+
+            &mut project_moves,)
                                             .await;
                                             return;
                                         }
@@ -10536,6 +10898,7 @@ pub(crate) fn spawn_agent_actor(
                                         pending_inputs: &mut pending_inputs,
                                         held_controls: &mut held_controls,
                                         rx: &mut rx,
+                                project_moves: &mut project_moves,
                                         open_tool_call_ids: &mut open_tool_call_ids,
                                         pending_tool_response_ids: &mut pending_tool_response_ids,
                                         active_agent_await_ids: &mut active_agent_await_ids,
@@ -10732,6 +11095,7 @@ pub(crate) fn spawn_agent_actor(
                                             pending_inputs: &mut pending_inputs,
                                             held_controls: &mut held_controls,
                                             rx: &mut rx,
+                                project_moves: &mut project_moves,
                                             open_tool_call_ids: &mut open_tool_call_ids,
                                             pending_tool_response_ids:
                                                 &mut pending_tool_response_ids,
@@ -10950,14 +11314,18 @@ pub(crate) fn spawn_agent_actor(
                             }
                             let _ = reply.send(());
                         }
+                            AgentCommand::MoveNativeProject { reply, .. } => { let _ = reply.send(Err("Only a live native relay follows its owner project".to_owned())); }
+
+                            AgentCommand::AwaitToolPublication { tool_id, reply } => { tool_publication.wait(tool_id, reply); }
+                            AgentCommand::NativeRegistrationSettled => { project_readiness_epoch = project_readiness_epoch.wrapping_add(1); project_move_waiting_for_backend = false; }
                         AgentCommand::ScheduleProjectMove { movement, reply } => {
-                            if !matches!(lifecycle, ActorLifecycle::Running) || scheduled_project_move.is_some()
+                                if !matches!(lifecycle, ActorLifecycle::Running) || project_moves.scheduled.is_some()
                                 || compaction_blocked || active_compaction.is_some() || context_compaction.is_some()
-                                || resume_replay_gate_pending || status_handle.snapshot().await.has_background_work {
-                                let _ = reply.send(Err("Finish compaction and background work before entering another project".to_owned()));
+                                    || resume_replay_gate_pending {
+                                    let _ = reply.send(Err("Finish compaction before entering another project".to_owned()));
                             } else {
                                 tracing::info!(in_turn, "Scheduled agent project entry at the next turn boundary");
-                                scheduled_project_move = Some(movement);
+                                    project_moves.scheduled = Some(movement);
                                 project_move_waiting_for_backend = false;
                                 let _ = reply.send(Ok(()));
                             }
@@ -10967,33 +11335,16 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(start);
                         }
                         AgentCommand::MoveToProject { project_id, roots, reply } => {
-                            let result = if !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
-                                Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned())
+                                if actor_native_registrations.load(Ordering::SeqCst) > 0 || !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
+                                    let _ = reply.send(Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned()));
                             } else {
-                                match apply_agent_project_move(AgentProjectMoveContext {
-                                    backend: backend.as_mut().expect("running actor has backend"),
-                                    session_store: &session_store,
-                                    session_id: current_session_id.as_ref(),
-                                    current_start: &mut current_start,
-                                    start_tx: &start_tx,
-                                    event_log: &mut event_log,
-                                    workspace_emitter: &workspace_emitter,
-                                }, project_id, roots).await {
-                                    Ok(start) => {
-                                        broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &start).await;
-                                        Ok(start)
+                                    let operation = begin_agent_project_move(backend.as_mut().expect("running actor has backend"),
+                                        &session_store, current_session_id.as_ref(), &current_start, &actor_native_registrations, project_id.clone(), roots.clone());
+                                    project_moves.pending = Some(PendingAgentProjectMove {
+                                        project_id, roots, stage: ProjectMoveStage::Provider(operation), origin: ProjectMoveOrigin::Immediate { reply },
+                                        readiness_epoch: project_readiness_epoch,
+                                    });
                                     }
-                                    Err(ProjectMoveFailure::Busy) => Err(crate::backend::WorkspaceRelocationError::Busy.to_string()),
-                                    Err(ProjectMoveFailure::Rejected(message)) => Err(message),
-                                    Err(ProjectMoveFailure::Unreconciled(message)) => {
-                                        accepting_input_task.store(false, Ordering::SeqCst);
-                                        lifecycle = ActorLifecycle::Closing;
-                                        close_deadline = Some(tokio::time::Instant::now());
-                                        Err(message)
-                                    }
-                                }
-                            };
-                            let _ = reply.send(result);
                         }
                         AgentCommand::SetTydePermissions { access, reply } => {
                             let result = if !matches!(lifecycle, ActorLifecycle::Running) {
@@ -11159,8 +11510,8 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::Interrupt { reply } => {
                             tracing::info!(target: "tyde_project_entry_diagnostic", in_turn,
                                 pending_responses = pending_tool_response_ids.len(),
-                                pending_move = scheduled_project_move.is_some(), "actor received Stop");
-                            if scheduled_project_move.take().is_some() {
+                                    pending_move = project_moves.scheduled.is_some(), "actor received Stop");
+                                if project_moves.scheduled.take().is_some() {
                                 append_event(&canonical_stream, &mut event_log, &mut subscribers,
                                     FrameKind::AgentError, &AgentErrorPayload {
                                         agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal,
@@ -11373,7 +11724,8 @@ pub(crate) fn spawn_agent_actor(
                                 &mut rx,
                                 &status_handle,
                                 &accepted_human_inputs,
-                            )
+
+            &mut project_moves,)
                             .await;
                             return;
                         }
@@ -11601,6 +11953,7 @@ pub(crate) fn spawn_agent_actor(
             final_usage,
             close_preparing: Arc::new(AtomicBool::new(false)),
             moving_project: Arc::new(AtomicBool::new(false)),
+            native_registration,
             start: start_rx,
             review_recipient,
         },
@@ -11641,6 +11994,7 @@ pub(crate) struct RelayEventReceivers {
 }
 
 pub(crate) struct RelayAgentRuntimeResources {
+    pub native_registration: NativeRegistrationState,
     pub parent_session_id: SessionId,
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
@@ -11662,6 +12016,7 @@ pub(crate) fn spawn_relay_agent_actor(
         mut total_usage,
     } = receivers;
     let RelayAgentRuntimeResources {
+        native_registration,
         parent_session_id,
         session_store,
         transcript_store,
@@ -11716,6 +12071,7 @@ pub(crate) fn spawn_relay_agent_actor(
         event_log.accounting.pending_submission = true;
         event_log.own_usage = Some(activity_stats.usage_snapshot());
         let mut activity_event_seq = 0_u64;
+        let mut tool_publication = ToolPublication::default();
         let mut current_start = start;
         let mut pending_alias = None;
         let mut in_turn = false;
@@ -11773,6 +12129,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut published_activity = status_handle.snapshot().await.activity();
         loop {
             if event_log.accounting_storage_failed {
+                tool_publication.close();
                 status_handle
                     .update(|status| {
                         status.terminated = true;
@@ -12093,6 +12450,7 @@ pub(crate) fn spawn_relay_agent_actor(
                     )
                     .await;
 
+                    tool_publication.observe(&event);
                     if matches!(event, ChatEvent::TypingStatusChanged(false))
                         && matches!(lifecycle, ActorLifecycle::Closing)
                     {
@@ -12200,6 +12558,20 @@ pub(crate) fn spawn_relay_agent_actor(
                             .await;
                             let _ = reply.send(InterruptOutcome::Rejected);
                         }
+                        AgentCommand::MoveNativeProject { project_id, roots, reply } => {
+                            let result = session_store.move_to_project(&session_id, project_id.clone(), roots.clone()).await;
+                            if result.is_ok() {
+                                current_start.project_id = project_id;
+                                current_start.workspace_roots = roots;
+                                overwrite_agent_start_payload(&mut event_log, &current_start);
+                                start_tx.send_replace(current_start.clone());
+                                broadcast_live_event(&mut subscribers, FrameKind::AgentProjectChanged, &current_start).await;
+                            }
+                            let _ = reply.send(result);
+                        }
+
+                        AgentCommand::AwaitToolPublication { tool_id, reply } => { tool_publication.wait(tool_id, reply); }
+                        AgentCommand::NativeRegistrationSettled => {}
                         AgentCommand::ScheduleProjectMove { reply, .. } => { let _ = reply.send(Err("This agent cannot enter another project in its current state".to_owned())); }
                         AgentCommand::DetachProject { project_id, reply } => {
                             let start = detach_agent_project(&project_id, &mut current_start, &start_tx, &mut event_log);
@@ -12473,6 +12845,7 @@ pub(crate) fn spawn_relay_agent_actor(
         final_usage,
         close_preparing: Arc::new(AtomicBool::new(false)),
         moving_project: Arc::new(AtomicBool::new(false)),
+        native_registration,
         start: start_rx,
         review_recipient,
     }
@@ -13530,7 +13903,9 @@ async fn park_terminal_agent(
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
     status_handle: &registry::AgentStatusHandle,
     accepted_human_inputs: &HashMap<protocol::HumanInputId, protocol::AcceptedHumanInput>,
+    project_moves: &mut AgentProjectMoves,
 ) {
+    project_moves.terminalize();
     reject_held_agent_controls(held_controls, DELIVERY_REJECTED_TERMINAL);
     event_log.timing.interrupt();
     event_log.timing.stop();
@@ -13542,13 +13917,29 @@ async fn park_terminal_agent(
         latest_output
             .observe_event_log(event_log)
             .expect("typed terminal replay log must project latest output");
-        let Some(command) = next_agent_command(pending_inputs, rx, true).await else {
+        let command = if !pending_inputs.is_empty() {
+            next_agent_command(pending_inputs, rx, true).await
+        } else {
+            match project_moves.held_commands.pop_front() {
+                Some(command) => Some(command),
+                None => next_agent_command(pending_inputs, rx, true).await,
+            }
+        };
+        let Some(command) = command else {
             break;
         };
         match command {
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
+
+            AgentCommand::MoveNativeProject { reply, .. } => {
+                let _ = reply.send(Err("Native relay is not live".to_owned()));
+            }
+            AgentCommand::AwaitToolPublication { reply, .. } => {
+                let _ = reply.send(Err("Native owner is not live".to_owned()));
+            }
+            AgentCommand::NativeRegistrationSettled => {}
             AgentCommand::ScheduleProjectMove { reply, .. } => {
                 let _ = reply.send(Err(
                     "This agent cannot enter another project in its current state".to_owned(),
@@ -13847,6 +14238,33 @@ async fn park_relay_terminal_agent(
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
+
+            AgentCommand::MoveNativeProject {
+                project_id,
+                roots,
+                reply,
+            } => {
+                let result = session_store
+                    .move_to_project(session_id, project_id.clone(), roots.clone())
+                    .await;
+                if result.is_ok() {
+                    current_start.project_id = project_id;
+                    current_start.workspace_roots = roots;
+                    overwrite_agent_start_payload(event_log, current_start);
+                    start_tx.send_replace(current_start.clone());
+                    broadcast_live_event(
+                        subscribers,
+                        FrameKind::AgentProjectChanged,
+                        current_start,
+                    )
+                    .await;
+                }
+                let _ = reply.send(result);
+            }
+            AgentCommand::AwaitToolPublication { reply, .. } => {
+                let _ = reply.send(Err("Native owner is not live".to_owned()));
+            }
+            AgentCommand::NativeRegistrationSettled => {}
             AgentCommand::ScheduleProjectMove { reply, .. } => {
                 let _ = reply.send(Err(
                     "This agent cannot enter another project in its current state".to_owned(),
@@ -15987,6 +16405,7 @@ async fn send_initial_follow_up_or_park(
         context.rx,
         context.status_handle,
         context.accepted_human_inputs,
+        context.project_moves,
     )
     .await;
     InitialFollowUpDispatch::Terminated
@@ -16051,6 +16470,7 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
         context.rx,
         context.status_handle,
         context.accepted_human_inputs,
+        context.project_moves,
     )
     .await;
 }

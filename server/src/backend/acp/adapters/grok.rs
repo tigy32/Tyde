@@ -101,7 +101,9 @@ impl AcpAgentAdapter for GrokAdapter {
         } else {
             self.spec.args.iter().map(String::as_str).collect()
         };
-        Ok(AcpSpawnSpec::new("Grok ACP", program, &args).with_local_cwd(roots.session_cwd.clone()))
+        Ok(AcpSpawnSpec::new("Grok ACP", program, &args)
+            .with_local_cwd(roots.session_cwd.clone())
+            .with_local_env("GROK_ACTIVE_AGENT_MESSAGES", "1"))
     }
 
     fn native_child_session(
@@ -157,6 +159,7 @@ impl AcpAgentAdapter for GrokAdapter {
         }
         let update = params.get("update")?;
         let session_update = match update.get("sessionUpdate").and_then(Value::as_str)? {
+            "subagent_spawned" => "native_child_started",
             "response_completed" => "response_end",
             "turn_completed" => "turn_end",
             "auto_compact_started" | "autoCompactStarted" => "grok_compact_started",
@@ -293,7 +296,7 @@ impl AcpAgentAdapter for GrokAdapter {
                         .unwrap_or(workspace_root),
                 });
             }
-            if kind == "task" || args.get("subagent_type").is_some() {
+            if matches!(kind, "task" | "spawn_subagent") || args.get("subagent_type").is_some() {
                 let execution_mode = if args
                     .get("background")
                     .or_else(|| args.get("run_in_background"))
