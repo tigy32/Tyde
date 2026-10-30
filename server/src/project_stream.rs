@@ -2877,7 +2877,7 @@ where
         }
         let output = match run_git(
             &root.0,
-            &["status", "--porcelain=v2", "--branch"],
+            &["status", "--porcelain=v2", "--branch", "-z"],
             GitAccessMode::ReadOnly,
         ) {
             Ok(output) => output,
@@ -2919,7 +2919,8 @@ where
         let mut behind = 0;
         let mut files = BTreeMap::<String, ProjectGitFileStatus>::new();
 
-        for line in output.lines() {
+        let mut records = output.split_terminator('\0');
+        while let Some(line) = records.next() {
             if let Some(head) = line.strip_prefix("# branch.head ") {
                 if head != "(detached)" {
                     branch = Some(head.to_owned());
@@ -2968,18 +2969,20 @@ where
             }
 
             if line.starts_with("1 ") || line.starts_with("2 ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                assert!(parts.len() >= 9, "invalid porcelain status line '{}'", line);
+                let renamed_or_copied = line.starts_with("2 ");
+                let field_count = if renamed_or_copied { 10 } else { 9 };
+                let parts: Vec<&str> = line.splitn(field_count, ' ').collect();
+                if parts.len() != field_count || parts[field_count - 1].is_empty() {
+                    return Err("invalid Git status path record".to_owned());
+                }
                 let xy = parts[1];
-                assert_eq!(xy.len(), 2, "invalid XY status '{}'", xy);
-                let path = line
-                    .rsplit_once(' ')
-                    .map(|(_, path)| path)
-                    .unwrap_or_else(|| panic!("missing path in status line '{}'", line))
-                    .split('\t')
-                    .next()
-                    .unwrap_or_else(|| panic!("missing path segment in status line '{}'", line))
-                    .to_owned();
+                if xy.len() != 2 || !xy.is_ascii() {
+                    return Err("invalid Git XY status".to_owned());
+                }
+                let path = parts[field_count - 1].to_owned();
+                if renamed_or_copied && records.next().is_none_or(str::is_empty) {
+                    return Err("missing Git rename/copy source path".to_owned());
+                }
                 files.insert(
                     path.clone(),
                     ProjectGitFileStatus {
@@ -3863,6 +3866,9 @@ where
 
     let mut args = vec![
         "diff",
+        "--numstat",
+        "-z",
+        "--patch",
         "--relative",
         git_diff_context_arg(payload.context_mode),
     ];
@@ -4059,18 +4065,14 @@ where
         validate_relative_path(path)?;
     }
 
-    let mut args = vec!["ls-files", "--others", "--exclude-standard"];
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
     if let Some(path) = path {
         args.push("--");
         args.push(path);
     }
 
     let raw = run_git(root, &args, GitAccessMode::ReadOnly)?;
-    Ok(raw
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+    Ok(raw.split_terminator('\0').map(ToOwned::to_owned).collect())
 }
 
 fn build_untracked_diff_file(
@@ -4155,7 +4157,14 @@ pub(crate) fn stage_hunk(
 
     let raw = run_git_mode(
         &path.root.0,
-        &["diff", "--", &path.relative_path],
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--patch",
+            "--",
+            &path.relative_path,
+        ],
         GitAccessMode::ReadOnly,
     )?;
     let parsed = parse_raw_git_diff(&raw)?;
@@ -4768,7 +4777,11 @@ fn git_command(
     if matches!(access_mode, GitAccessMode::ReadOnly) {
         command.arg("--no-optional-locks");
     }
-    command.arg("-C").arg(root).args(args);
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(args);
     Ok(command)
 }
 
@@ -4881,11 +4894,74 @@ fn is_git_binary_diff_marker(line: &str) -> bool {
 }
 
 fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
+    // Git emits combined patches before ordinary numstat records. Ordinary
+    // paths come from -z metadata, never the ambiguous presentation headers.
+    let mut metadata_start = 0;
+    for line in raw.split_inclusive('\n') {
+        let mut fields = line.splitn(3, '\t');
+        if let (Some(added), Some(deleted), Some(_)) = (fields.next(), fields.next(), fields.next())
+            && ((added == "-" && deleted == "-")
+                || [added, deleted].into_iter().all(|field| {
+                    !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+                }))
+        {
+            break;
+        }
+        metadata_start += line.len();
+    }
+    let (combined, mut remaining) = raw.split_at(metadata_start);
+    let mut paths = VecDeque::new();
+    while !remaining.is_empty() && !remaining.starts_with('\0') {
+        let (_, path) = remaining
+            .split_once('\t')
+            .and_then(|(_, remaining)| remaining.split_once('\t'))
+            .ok_or_else(|| "invalid Git numstat record".to_owned())?;
+        let (mut path, rest) = path
+            .split_once('\0')
+            .ok_or_else(|| "unterminated Git numstat path".to_owned())?;
+        remaining = rest;
+        if path.is_empty() {
+            let (source, rest) = remaining
+                .split_once('\0')
+                .ok_or_else(|| "missing Git diff rename/copy source".to_owned())?;
+            if source.is_empty() {
+                return Err("empty Git diff rename/copy source".to_owned());
+            }
+            (path, remaining) = rest
+                .split_once('\0')
+                .ok_or_else(|| "missing Git diff rename/copy destination".to_owned())?;
+        }
+        if path.is_empty() {
+            return Err("empty Git diff path".to_owned());
+        }
+        paths.push_back(path);
+    }
+    let patches = if paths.is_empty() {
+        remaining
+    } else {
+        remaining
+            .strip_prefix('\0')
+            .ok_or_else(|| "missing Git patch separator".to_owned())?
+    };
     let mut files = Vec::new();
     let mut current_file: Option<ParsedGitDiffFile> = None;
     let mut current_hunk: Option<ParsedGitDiffHunk> = None;
 
-    for line in raw.lines() {
+    let mut lines = combined.lines().chain(patches.lines());
+    while let Some(line) = lines.next() {
+        if line.starts_with("* Unmerged path ") {
+            let path = paths
+                .pop_front()
+                .ok_or_else(|| "unmerged Git marker has no path record".to_owned())?;
+            // Staged conflicts have no patch. Their marker prints the raw
+            // name, including embedded newlines, rather than Git quoting.
+            for _ in path.bytes().filter(|byte| *byte == b'\n') {
+                lines
+                    .next()
+                    .ok_or_else(|| "truncated unmerged Git marker".to_owned())?;
+            }
+            continue;
+        }
         if let Some(relative_path) = line
             .strip_prefix("diff --cc ")
             .or_else(|| line.strip_prefix("diff --combined "))
@@ -4900,7 +4976,7 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
                 return Err(format!("invalid combined diff header '{}'", line));
             }
             current_file = Some(ParsedGitDiffFile {
-                relative_path: relative_path.to_owned(),
+                relative_path: decode_git_patch_path(relative_path)?,
                 header_lines: vec![line.to_owned()],
                 unmerged: true,
                 hunks: Vec::new(),
@@ -4908,7 +4984,24 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
             continue;
         }
 
-        if let Some(diff_line) = line.strip_prefix("diff --git ") {
+        if line.starts_with("diff --git ") {
+            // A type change has one numstat record but a delete/add patch
+            // pair with identical headers. Both belong to that same delta.
+            let type_change_path = current_file.as_ref().and_then(|file| {
+                (file
+                    .header_lines
+                    .first()
+                    .is_some_and(|header| header == line)
+                    && file
+                        .header_lines
+                        .iter()
+                        .any(|header| header.starts_with("deleted file mode "))
+                    && lines
+                        .clone()
+                        .next()
+                        .is_some_and(|header| header.starts_with("new file mode ")))
+                .then(|| file.relative_path.clone())
+            });
             finish_parsed_git_diff_file(
                 &mut files,
                 &mut current_file,
@@ -4916,12 +5009,15 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
                 "hunk appeared before file in git diff",
             )?;
 
-            let parts: Vec<&str> = diff_line.split_whitespace().collect();
-            if parts.len() != 2 {
-                return Err(format!("invalid diff header '{}'", line));
-            }
+            let relative_path = match type_change_path {
+                Some(path) => path,
+                None => paths
+                    .pop_front()
+                    .ok_or_else(|| "Git patch has no path record".to_owned())?
+                    .to_owned(),
+            };
             current_file = Some(ParsedGitDiffFile {
-                relative_path: parse_diff_path(parts[0], parts[1]),
+                relative_path,
                 header_lines: vec![line.to_owned()],
                 unmerged: false,
                 hunks: Vec::new(),
@@ -4973,6 +5069,9 @@ fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
         &mut current_hunk,
         "trailing hunk appeared before file in git diff",
     )?;
+    if !paths.is_empty() {
+        return Err("Git path records have no matching patches".to_owned());
+    }
 
     Ok(files)
 }
@@ -4995,13 +5094,46 @@ fn finish_parsed_git_diff_file(
     Ok(())
 }
 
-fn parse_diff_path(a_path: &str, b_path: &str) -> String {
-    if let Some(path) = b_path.strip_prefix("b/")
-        && path != "dev/null"
-    {
-        return path.to_owned();
+fn decode_git_patch_path(path: &str) -> Result<String, String> {
+    if !path.starts_with('"') {
+        return Ok(path.to_owned());
     }
-    a_path.strip_prefix("a/").unwrap_or(a_path).to_owned()
+    let quoted = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .ok_or_else(|| "unterminated quoted Git patch path".to_owned())?;
+    let mut bytes = quoted.bytes();
+    let mut decoded = Vec::with_capacity(quoted.len());
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let escaped = match bytes.next() {
+            Some(b'a') => 7,
+            Some(b'b') => 8,
+            Some(b't') => b'\t',
+            Some(b'n') => b'\n',
+            Some(b'v') => 11,
+            Some(b'f') => 12,
+            Some(b'r') => b'\r',
+            Some(b'\\') => b'\\',
+            Some(b'"') => b'"',
+            Some(first @ b'0'..=b'3') => {
+                let second = bytes.next().filter(|byte| matches!(byte, b'0'..=b'7'));
+                let third = bytes.next().filter(|byte| matches!(byte, b'0'..=b'7'));
+                match (second, third) {
+                    (Some(second), Some(third)) => {
+                        (first - b'0') * 64 + (second - b'0') * 8 + (third - b'0')
+                    }
+                    _ => return Err("invalid Git patch path octal escape".to_owned()),
+                }
+            }
+            _ => return Err("invalid Git patch path escape".to_owned()),
+        };
+        decoded.push(escaped);
+    }
+    String::from_utf8(decoded).map_err(|_| "Git patch path is not valid UTF-8".to_owned())
 }
 
 fn build_hunk_id(relative_path: &str, index: usize) -> String {

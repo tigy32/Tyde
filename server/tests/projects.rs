@@ -2295,7 +2295,7 @@ async fn project_open_path_dispatches_and_blocks_symlink_escape() {
         ..server::HostRuntimeConfig::default()
     };
     let mut fixture = Fixture::new_with_runtime_config(runtime_config).await;
-    let repo = init_git_repo("open-path", &[("asset.bin", "inside")]);
+    let repo = init_git_repo("open-path", &[("文書/quote\" asset.bin", "inside")]);
     let outside = tempfile::tempdir().expect("outside tempdir");
     std::fs::write(outside.path().join("secret.bin"), b"\0outside binary")
         .expect("outside binary fixture");
@@ -2350,7 +2350,7 @@ async fn project_open_path_dispatches_and_blocks_symlink_escape() {
                 ProjectOpenPathPayload {
                     path: ProjectPath {
                         root: root.clone(),
-                        relative_path: "asset.bin".to_owned(),
+                        relative_path: "文書/quote\" asset.bin".to_owned(),
                     },
                     action,
                 },
@@ -2378,7 +2378,10 @@ async fn project_open_path_dispatches_and_blocks_symlink_escape() {
     assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(error.message.contains("outside project root"));
 
-    let linked_repo = init_git_repo("linked-open-path-root", &[("asset.bin", "linked")]);
+    let linked_repo = init_git_repo(
+        "linked-open-path-root",
+        &[("文書/quote\" asset.bin", "linked")],
+    );
     let linked_root_parent = tempfile::tempdir().expect("linked root parent");
     let linked_root = linked_root_parent.path().join("linked-project-root");
     symlink(linked_repo.path(), &linked_root).expect("linked project root");
@@ -2395,7 +2398,7 @@ async fn project_open_path_dispatches_and_blocks_symlink_escape() {
             ProjectReadFilePayload {
                 path: ProjectPath {
                     root: ProjectRootPath(project_root(&linked_project, 0)),
-                    relative_path: "asset.bin".to_owned(),
+                    relative_path: "文書/quote\" asset.bin".to_owned(),
                 },
             },
         )
@@ -3211,31 +3214,56 @@ async fn an_oversized_full_context_diff_fails_the_request_not_the_connection() {
 #[tokio::test]
 async fn project_read_diff_returns_typed_unmerged_file() {
     let mut fixture = Fixture::new().await;
-    let repo = init_git_repo("read-diff-unmerged", &[("src/lib.rs", "base\n")]);
+    let name = "文書/quote\" conflict\tline\ndiff --git injected.rs";
+    let binary = "文書/binary\" conflict.bin";
+    let repo = init_git_repo(
+        "read-diff-unmerged",
+        &[(name, "base\n"), (binary, "\0base")],
+    );
+    git(repo.path(), &["config", "core.quotePath", "true"]);
 
     git(repo.path(), &["checkout", "-b", "other"]);
-    write_file(&repo.path().join("src/lib.rs"), "theirs\n");
-    git(repo.path(), &["add", "src/lib.rs"]);
+    write_file(&repo.path().join(name), "theirs\n");
+    write_file(&repo.path().join(binary), "\0theirs");
+    git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "Change on other"]);
     git(repo.path(), &["checkout", "-"]);
-    write_file(&repo.path().join("src/lib.rs"), "ours\n");
-    git(repo.path(), &["add", "src/lib.rs"]);
+    write_file(&repo.path().join(name), "ours\n");
+    write_file(&repo.path().join(binary), "\0ours");
+    git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "Change on current"]);
     git_expect_failure(repo.path(), &["merge", "other"]);
 
-    let project = create_project_with_real_roots(
+    let project = create_project(
         &mut fixture.client,
         "Read Diff Unmerged",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
+    let bootstrap = expect_project_bootstrap(&mut fixture.client, "conflict path bootstrap").await;
+    assert_eq!(bootstrap.git_status.roots[0].files.len(), 2);
+    for path in [name, binary] {
+        let status = bootstrap.git_status.roots[0]
+            .files
+            .iter()
+            .find(|file| file.relative_path == path)
+            .unwrap();
+        assert_eq!(
+            status.staged,
+            Some(protocol::ProjectGitChangeKind::Unmerged)
+        );
+        assert_eq!(
+            status.unstaged,
+            Some(protocol::ProjectGitChangeKind::Unmerged)
+        );
+    }
     let root = protocol::ProjectRootPath(project_root(&project, 0));
     let request = ProjectReadDiffPayload {
         request_id: None,
         root: root.clone(),
         scope: ProjectDiffScope::Unstaged,
         revision: protocol::ProjectDiffRevision::WorkingTree,
-        path: Some("src/lib.rs".to_owned()),
+        path: Some(name.to_owned()),
         context_mode: DiffContextMode::Hunks,
         out_of_band: false,
     };
@@ -3248,12 +3276,41 @@ async fn project_read_diff_returns_typed_unmerged_file() {
     )
     .await;
     assert_eq!(diff.files.len(), 1);
-    assert_eq!(diff.files[0].relative_path, "src/lib.rs");
+    assert_eq!(diff.files[0].relative_path, name);
     assert!(diff.files[0].unmerged);
     assert!(diff.files[0].hunks.is_empty());
 
-    write_file(&repo.path().join("src/lib.rs"), "resolved\n");
-    git(repo.path(), &["add", "src/lib.rs"]);
+    let binary_diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            path: Some(binary.to_owned()),
+            out_of_band: true,
+            ..request.clone()
+        },
+        "binary combined path",
+    )
+    .await;
+    assert_eq!(binary_diff.files.len(), 1);
+    assert_eq!(binary_diff.files[0].relative_path, binary);
+    assert!(binary_diff.files[0].unmerged);
+    assert!(binary_diff.files[0].is_binary);
+    let staged = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            scope: ProjectDiffScope::Staged,
+            out_of_band: true,
+            ..request.clone()
+        },
+        "staged conflict marker with embedded newlines",
+    )
+    .await;
+    assert!(staged.files.is_empty());
+
+    write_file(&repo.path().join(name), "resolved\n");
+    write_file(&repo.path().join(binary), "\0resolved");
+    git(repo.path(), &["add", "."]);
 
     let resolved = request_project_diff(
         &mut fixture.client,
@@ -3723,7 +3780,379 @@ async fn project_read_diff_payload_echoes_context_mode() {
 
 #[tokio::test]
 async fn project_stage_file_updates_git_status_and_diffs() {
-    assert_project_stage_file_updates_git_status_and_diffs().await;
+    let names = [
+        "Ångström/Ünïcödé/ŶÅÉgjpqy.rs",
+        "文書/日本語ディレクトリ/設定ファイル.rs",
+        "مجلد/عربي/changed.rs",
+        "दस्तावेज़/เอกสาร/✨🚀/changed.rs",
+        "white space/  quote\" tab\tline\n.txt",
+        "文書/[a].txt",
+        "文書/a.txt",
+    ];
+    for quote_paths in ["true", "false"] {
+        let mut fixture = Fixture::new().await;
+        let copy_source = "copy source\n".repeat(20);
+        let mut initial = names.map(|name| (name, "before\n")).to_vec();
+        initial.extend([
+            ("旧 rename.txt", "rename source\n"),
+            ("元の copy.txt", copy_source.as_str()),
+            ("type 文書 \" name.txt", "regular file\n"),
+            ("aaa b/zzz", "deleted contents\n"),
+            ("aaa b/zzz b/aaa", "renamed contents\n"),
+        ]);
+        let repo = init_git_repo("path-actions", &initial);
+        let base_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["config", "core.quotePath", quote_paths]);
+        for name in names {
+            write_file(&repo.path().join(name), "after\n");
+        }
+        let project = create_project(
+            &mut fixture.client,
+            "Git path actions",
+            vec![repo.path().to_str().unwrap().to_owned()],
+        )
+        .await;
+        let bootstrap = expect_project_bootstrap(&mut fixture.client, "path bootstrap").await;
+        let root = ProjectRootPath(project_root(&project, 0));
+        let mut expected = names.to_vec();
+        expected.sort();
+        assert_eq!(
+            bootstrap.git_status.roots[0]
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        eprintln!(
+            "GIT_PATH_RECORDS quote_paths={quote_paths} bootstrap_paths={} exact=true",
+            expected.len()
+        );
+
+        for (index, file) in bootstrap.git_status.roots[0].files.iter().enumerate() {
+            let path = ProjectPath {
+                root: root.clone(),
+                relative_path: file.relative_path.clone(),
+            };
+            fixture
+                .client
+                .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+                .await
+                .expect("open emitted Git path");
+            let contents = expect_project_file_contents(&mut fixture.client, "open Git path").await;
+            assert_eq!(contents.path, path);
+            assert_eq!(contents.contents.as_deref(), Some("after\n"));
+            let read = |scope| ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
+                path: Some(path.relative_path.clone()),
+                context_mode: DiffContextMode::Hunks,
+                out_of_band: true,
+            };
+            let diff = request_project_diff(
+                &mut fixture.client,
+                &project.id,
+                read(ProjectDiffScope::Unstaged),
+                "diff emitted Git path",
+            )
+            .await;
+            assert_eq!(diff.files.len(), 1);
+            assert_eq!(diff.files[0].relative_path, path.relative_path);
+            assert_eq!(diff.files[0].hunks.len(), 1);
+            if index == 0 {
+                fixture
+                    .client
+                    .project_stage_hunk(
+                        &project.id,
+                        ProjectStageHunkPayload {
+                            path: path.clone(),
+                            hunk_id: diff.files[0].hunks[0].hunk_id.clone(),
+                        },
+                    )
+                    .await
+                    .expect("stage emitted hunk path");
+            } else {
+                fixture
+                    .client
+                    .project_stage_file(&project.id, ProjectStageFilePayload { path: path.clone() })
+                    .await
+                    .expect("stage emitted Git path");
+            }
+            expect_project_git_status_matching(
+                &mut fixture.client,
+                "staged exact Git path",
+                |status| {
+                    status.roots[0].files.iter().any(|file| {
+                        file.relative_path == path.relative_path
+                            && file.staged == Some(protocol::ProjectGitChangeKind::Modified)
+                            && file.unstaged.is_none()
+                    })
+                },
+            )
+            .await;
+            assert_eq!(
+                git_stdout(repo.path(), &["show", &format!(":{}", path.relative_path)]),
+                "after"
+            );
+            let staged = request_project_diff(
+                &mut fixture.client,
+                &project.id,
+                read(ProjectDiffScope::Staged),
+                "staged exact Git path",
+            )
+            .await;
+            assert_eq!(staged.files.len(), 1);
+            assert_eq!(staged.files[0].relative_path, path.relative_path);
+            fixture::send_project_payload(
+                &mut fixture.client,
+                &project.id,
+                FrameKind::ProjectUnstageFile,
+                &protocol::ProjectUnstageFilePayload { path: path.clone() },
+            )
+            .await;
+            expect_project_git_status_matching(
+                &mut fixture.client,
+                "unstaged exact Git path",
+                |status| {
+                    status.roots[0].files.iter().any(|file| {
+                        file.relative_path == path.relative_path
+                            && file.staged.is_none()
+                            && file.unstaged == Some(protocol::ProjectGitChangeKind::Modified)
+                    })
+                },
+            )
+            .await;
+            assert_eq!(
+                git_stdout(repo.path(), &["show", &format!(":{}", path.relative_path)]),
+                "before"
+            );
+            fixture::send_project_payload(
+                &mut fixture.client,
+                &project.id,
+                FrameKind::ProjectDiscardFile,
+                &protocol::ProjectDiscardFilePayload { path: path.clone() },
+            )
+            .await;
+            expect_project_git_status_matching(
+                &mut fixture.client,
+                "discarded exact Git path",
+                |status| {
+                    !status.roots[0]
+                        .files
+                        .iter()
+                        .any(|file| file.relative_path == path.relative_path)
+                },
+            )
+            .await;
+            assert_eq!(
+                fs::read_to_string(repo.path().join(&path.relative_path)).unwrap(),
+                "before\n"
+            );
+            for untouched in bootstrap.git_status.roots[0].files.iter().skip(index + 1) {
+                assert_eq!(
+                    fs::read_to_string(repo.path().join(&untouched.relative_path)).unwrap(),
+                    "after\n"
+                );
+            }
+        }
+        assert!(git_stdout(repo.path(), &["status", "--porcelain"]).is_empty());
+        eprintln!(
+            "GIT_PATH_RECORDS quote_paths={quote_paths} open_diff_stage_unstage_discard=true"
+        );
+        #[cfg(unix)]
+        {
+            let type_path = repo.path().join("type 文書 \" name.txt");
+            fs::remove_file(&type_path).unwrap();
+            std::os::unix::fs::symlink(names[0], &type_path).unwrap();
+        }
+        git(repo.path(), &["config", "diff.renames", "copies"]);
+        git(repo.path(), &["config", "status.renames", "copies"]);
+        let renamed = "改名 \" destination\t.txt";
+        let copied = "複製 \" destination.txt";
+        let untracked = "未追跡 \" new\tline\n.txt";
+        git(repo.path(), &["mv", "旧 rename.txt", renamed]);
+        fs::remove_file(repo.path().join("aaa b/zzz")).unwrap();
+        git(repo.path(), &["mv", "aaa b/zzz b/aaa", "zzz"]);
+        write_file(&repo.path().join(copied), &copy_source);
+        write_file(
+            &repo.path().join("元の copy.txt"),
+            &format!("{copy_source}changed\n"),
+        );
+        git(repo.path(), &["add", "."]);
+        write_file(&repo.path().join(untracked), "untracked contents\n");
+        let status = expect_project_git_status_matching(
+            &mut fixture.client,
+            "rename/copy records",
+            |status| {
+                status.roots[0].files.iter().any(|file| {
+                    file.relative_path == renamed
+                        && file.staged == Some(protocol::ProjectGitChangeKind::Renamed)
+                }) && status.roots[0]
+                    .files
+                    .iter()
+                    .any(|file| file.relative_path == untracked && file.untracked)
+            },
+        )
+        .await;
+        let mut expected = vec![
+            renamed,
+            copied,
+            "元の copy.txt",
+            untracked,
+            "aaa b/zzz",
+            "zzz",
+        ];
+        #[cfg(unix)]
+        expected.push("type 文書 \" name.txt");
+        expected.sort();
+        assert_eq!(
+            status.roots[0]
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            status.roots[0]
+                .files
+                .iter()
+                .find(|file| file.relative_path == copied)
+                .unwrap()
+                .staged,
+            Some(protocol::ProjectGitChangeKind::Copied)
+        );
+        assert_eq!(
+            status.roots[0]
+                .files
+                .iter()
+                .find(|file| file.relative_path == "元の copy.txt")
+                .unwrap()
+                .staged,
+            Some(protocol::ProjectGitChangeKind::Modified)
+        );
+        let staged = request_project_diff(
+            &mut fixture.client,
+            &project.id,
+            ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: ProjectDiffScope::Staged,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+                out_of_band: true,
+            },
+            "rename/copy diff paths",
+        )
+        .await;
+        assert_eq!(staged.files.len(), if cfg!(unix) { 7 } else { 5 });
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                status.roots[0]
+                    .files
+                    .iter()
+                    .find(|file| file.relative_path == "type 文書 \" name.txt")
+                    .unwrap()
+                    .staged,
+                Some(protocol::ProjectGitChangeKind::TypeChanged)
+            );
+            assert_eq!(
+                staged
+                    .files
+                    .iter()
+                    .filter(|file| file.relative_path == "type 文書 \" name.txt")
+                    .map(|file| file.change_kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(protocol::ProjectGitChangeKind::Deleted),
+                    Some(protocol::ProjectGitChangeKind::Added)
+                ]
+            );
+        }
+        for (path, kind) in [
+            (renamed, protocol::ProjectGitChangeKind::Renamed),
+            ("aaa b/zzz", protocol::ProjectGitChangeKind::Deleted),
+            ("zzz", protocol::ProjectGitChangeKind::Renamed),
+            (copied, protocol::ProjectGitChangeKind::Copied),
+            ("元の copy.txt", protocol::ProjectGitChangeKind::Modified),
+        ] {
+            assert_eq!(
+                staged
+                    .files
+                    .iter()
+                    .find(|file| file.relative_path == path)
+                    .unwrap()
+                    .change_kind,
+                Some(kind)
+            );
+        }
+        git(
+            repo.path(),
+            &["commit", "-m", "Rename and copy owned paths"],
+        );
+        let tip_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        let history = request_project_diff(
+            &mut fixture.client,
+            &project.id,
+            ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: ProjectDiffScope::Uncommitted,
+                revision: protocol::ProjectDiffRevision::CommittedRange { base_oid, tip_oid },
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+                out_of_band: true,
+            },
+            "History rename/copy diff paths",
+        )
+        .await;
+        assert_eq!(history.files, staged.files);
+        let untracked_diff = request_project_diff(
+            &mut fixture.client,
+            &project.id,
+            ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: ProjectDiffScope::Unstaged,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
+                path: Some(untracked.to_owned()),
+                context_mode: DiffContextMode::Hunks,
+                out_of_band: true,
+            },
+            "untracked quoted path",
+        )
+        .await;
+        assert_eq!(untracked_diff.files.len(), 1);
+        assert_eq!(untracked_diff.files[0].relative_path, untracked);
+        fixture::send_project_payload(
+            &mut fixture.client,
+            &project.id,
+            FrameKind::ProjectDiscardFile,
+            &protocol::ProjectDiscardFilePayload {
+                path: ProjectPath {
+                    root,
+                    relative_path: untracked.to_owned(),
+                },
+            },
+        )
+        .await;
+        expect_project_git_status_matching(
+            &mut fixture.client,
+            "discard untracked exact file",
+            |status| status.roots[0].clean,
+        )
+        .await;
+        assert!(!repo.path().join(untracked).exists());
+        assert_eq!(
+            fs::read_to_string(repo.path().join(copied)).unwrap(),
+            copy_source
+        );
+        eprintln!("GIT_PATH_RECORDS quote_paths={quote_paths} rename_copy_history_untracked=true");
+    }
 }
 
 async fn assert_project_stage_file_updates_git_status_and_diffs() {

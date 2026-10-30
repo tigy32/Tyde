@@ -2090,6 +2090,23 @@ impl Drop for ExhaustedFileDescriptors {
     }
 }
 
+#[allow(dead_code)]
+pub async fn send_project_payload<T: serde::Serialize>(
+    client: &mut client::Connection,
+    project_id: &protocol::ProjectId,
+    kind: FrameKind,
+    payload: &T,
+) {
+    let stream = StreamPath(format!("/project/{project_id}"));
+    let seq = client.outgoing_seq.entry(stream.clone()).or_insert(0);
+    let envelope =
+        Envelope::from_payload(stream, kind, *seq, payload).expect("serialize project payload");
+    *seq += 1;
+    protocol::write_envelope(&mut client.writer, &envelope)
+        .await
+        .expect("write project payload");
+}
+
 // The protocol fixture is compiled independently for every integration binary.
 #[allow(dead_code)]
 pub async fn send_host_payload<T: serde::Serialize>(
