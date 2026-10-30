@@ -4290,6 +4290,7 @@ pub mod scan_test_support {
         WatcherKernelRescan,
         WatcherRescanFinished,
         WatcherInvalidated,
+        WatcherRegisterPending,
         WatcherRegistered,
         WatcherUnregistered,
         FileObservationWaiting,

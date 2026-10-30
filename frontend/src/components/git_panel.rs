@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
@@ -15,6 +15,13 @@ use protocol::{
 };
 
 const HISTORY_PAGE_SIZE: usize = 20;
+
+/// File rows kept constructed beyond the scroller on each side, in viewports.
+const FILE_ROW_OVERSCAN_VIEWPORTS: f64 = 1.0;
+/// Row pitch until a rendered row is measured; matches `.gp-file-row`.
+const FILE_ROW_PX_ESTIMATE: f64 = 28.0;
+/// Rows a list constructs before its first geometry measurement.
+const FILE_ROWS_BEFORE_MEASUREMENT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoricalSelection {
@@ -90,6 +97,35 @@ struct PanelSignals {
     root_expansion: RwSignal<HashMap<HistoryScope, bool>>,
 }
 
+/// The one scroller every working-tree file list is windowed against, so
+/// rows outside it are never constructed.
+#[derive(Clone, Copy)]
+struct FileListViewport {
+    scroller: NodeRef<leptos::html::Div>,
+    /// Scrolling, or a resize of the scroller or its content, moves lists
+    /// relative to it; each list then re-derives its window from geometry.
+    geometry: Trigger,
+}
+
+impl FileListViewport {
+    fn new() -> Self {
+        Self {
+            scroller: NodeRef::new(),
+            geometry: Trigger::new(),
+        }
+    }
+}
+
+/// Rows `[start, end)` of a `total`-row list within one viewport of the
+/// scroller, where `view_top` is the scroller's top in list coordinates.
+fn file_row_window(total: usize, row_px: f64, view_top: f64, view_height: f64) -> (usize, usize) {
+    let margin = view_height * FILE_ROW_OVERSCAN_VIEWPORTS;
+    let clamp = |rows: f64| (rows.max(0.0) as usize).min(total);
+    let start = clamp(((view_top - margin) / row_px).floor());
+    let end = clamp(((view_top + view_height + margin) / row_px).ceil());
+    (start, end.max(start))
+}
+
 #[component]
 pub fn GitPanel(#[prop(default = Signal::derive(|| true))] visible: Signal<bool>) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -108,32 +144,72 @@ pub fn GitPanel(#[prop(default = Signal::derive(|| true))] visible: Signal<bool>
             .map(|roots| (project, roots))
     });
 
+    let viewport = FileListViewport::new();
+    let body = NodeRef::<leptos::html::Div>::new();
+    type SizeObserver = Option<(web_sys::ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>;
+    let size_observer: StoredValue<SizeObserver, LocalStorage> = StoredValue::new_local(None);
+    Effect::new(move |_| {
+        let (Some(scroller), Some(body)) = (viewport.scroller.get(), body.get()) else {
+            return;
+        };
+        let geometry = viewport.geometry;
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |_| geometry.notify());
+        match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => {
+                observer.observe(scroller.unchecked_ref());
+                observer.observe(body.unchecked_ref());
+                size_observer.update_value(|slot| {
+                    if let Some((previous, _)) = slot.replace((observer, callback)) {
+                        previous.disconnect();
+                    }
+                });
+            }
+            Err(error) => crate::components::header::report_user_error(format!(
+                "Cannot observe Git panel size: {error:?}"
+            )),
+        }
+    });
+    on_cleanup(move || {
+        size_observer.update_value(|slot| {
+            if let Some((observer, _)) = slot.take() {
+                observer.disconnect();
+            }
+        });
+    });
+
     view! {
         <div class="git-panel">
-            <div class="gp-content">
-                <ReviewCard />
-                {move || {
-                    match git_roots.get() {
-                        Some((project, roots)) => {
-                            let multi_root = roots.len() > 1;
-                            roots.into_iter().map(|root| {
-                                view! {
-                                    <GitRootSection
-                                        host_id=project.host_id.clone()
-                                        project_id=project.project_id.clone()
-                                        root=root
-                                        multi_root=multi_root
-                                        signals=signals
-                                        visible=visible
-                                    />
-                                }.into_any()
-                            }).collect()
+            <div
+                class="gp-content"
+                node_ref=viewport.scroller
+                on:scroll=move |_| viewport.geometry.notify()
+            >
+                <div node_ref=body>
+                    <ReviewCard />
+                    {move || {
+                        match git_roots.get() {
+                            Some((project, roots)) => {
+                                let multi_root = roots.len() > 1;
+                                roots.into_iter().map(|root| {
+                                    view! {
+                                        <GitRootSection
+                                            host_id=project.host_id.clone()
+                                            project_id=project.project_id.clone()
+                                            root=root
+                                            multi_root=multi_root
+                                            signals=signals
+                                            visible=visible
+                                            viewport=viewport
+                                        />
+                                    }.into_any()
+                                }).collect()
+                            }
+                            None => vec![view! {
+                                <div class="panel-empty">"No git status"</div>
+                            }.into_any()],
                         }
-                        None => vec![view! {
-                            <div class="panel-empty">"No git status"</div>
-                        }.into_any()],
-                    }
-                }}
+                    }}
+                </div>
             </div>
         </div>
     }
@@ -780,6 +856,7 @@ fn GitRootSection(
     multi_root: bool,
     signals: PanelSignals,
     visible: Signal<bool>,
+    viewport: FileListViewport,
 ) -> impl IntoView {
     let scope = HistoryScope {
         host_id: host_id.clone(),
@@ -1058,6 +1135,7 @@ fn GitRootSection(
                                     show_discard_btn=false
                                     file_counts=file_counts
                                     visible=visible
+                                    viewport=viewport
                                 />
                             </Show>
                             <Show when=move || has_staged>
@@ -1073,6 +1151,7 @@ fn GitRootSection(
                                     show_discard_btn=false
                                     file_counts=file_counts
                                     visible=visible
+                                    viewport=viewport
                                     commit_toggle=commit_open
                                 />
                                 <Show when=move || commit_open.get()>
@@ -1115,6 +1194,7 @@ fn GitRootSection(
                                     show_discard_btn=true
                                     file_counts=file_counts
                                     visible=visible
+                                    viewport=viewport
                                 />
                             </Show>
                             <Show when=move || has_untracked>
@@ -1130,6 +1210,7 @@ fn GitRootSection(
                                     show_discard_btn=true
                                     file_counts=file_counts
                                     visible=visible
+                                    viewport=viewport
                                 />
                             </Show>
                     }
@@ -1392,6 +1473,7 @@ fn GitFileSection(
     show_discard_btn: bool,
     file_counts: Memo<HashMap<String, u32>>,
     visible: Signal<bool>,
+    viewport: FileListViewport,
     /// When present, the header offers a "Commit…" action that toggles the
     /// signal; the owner renders the commit form wherever it belongs.
     #[prop(optional)]
@@ -1402,6 +1484,40 @@ fn GitFileSection(
     // Bulk action data
     let bulk_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
     let bulk_root = root_path.clone();
+    let root_path = StoredValue::new(root_path);
+
+    // Only rows near the scroller are constructed; padding stands in for the
+    // rest so the list keeps its full height and every row its position.
+    let total = files.len();
+    let files = StoredValue::new(files);
+    let shown = move || visible.get() && expanded.get();
+    let window = RwSignal::new((0, total.min(FILE_ROWS_BEFORE_MEASUREMENT)));
+    let row_px = RwSignal::new(FILE_ROW_PX_ESTIMATE);
+    let list_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        viewport.geometry.track();
+        if !shown() {
+            return;
+        }
+        let (Some(list), Some(scroller)) = (list_ref.get(), viewport.scroller.get_untracked())
+        else {
+            return;
+        };
+        let mut pitch = row_px.get_untracked();
+        if let Some(row) = list.first_element_child() {
+            let measured = row.get_bounding_client_rect().height();
+            if measured > 0.0 && measured != pitch {
+                pitch = measured;
+                row_px.set(measured);
+            }
+        }
+        let view_top = scroller.get_bounding_client_rect().top() + f64::from(scroller.client_top())
+            - list.get_bounding_client_rect().top();
+        let next = file_row_window(total, pitch, view_top, f64::from(scroller.client_height()));
+        if window.get_untracked() != next {
+            window.set(next);
+        }
+    });
 
     view! {
         <div class="gp-section">
@@ -1460,133 +1576,170 @@ fn GitFileSection(
                 </div>
             </div>
             // Keep panel controls and drafts alive, not thousands of hidden rows.
-            <Show when=move || visible.get() && expanded.get()>
-                <div class="gp-section-files">
-                    {files.iter().map(|file| {
-                        let path = file.relative_path.clone();
-                        let change_kind = match scope {
-                            ProjectDiffScope::Staged => file.staged,
-                            ProjectDiffScope::Unstaged => file.unstaged,
-                            // Git panel only opens diffs in Staged/Unstaged scopes;
-                            // Uncommitted is reserved for review snapshots.
-                            ProjectDiffScope::Uncommitted => file.unstaged.or(file.staged),
-                        };
-                        let is_untracked = file.untracked;
-                        let icon = if is_untracked {
-                            "?"
-                        } else {
-                            change_kind_icon(change_kind)
-                        };
-                        let icon_class = if is_untracked {
-                            "gp-status-icon untracked"
-                        } else {
-                            change_kind_class(change_kind)
-                        };
-
-                        // Filename leads the row; the parent directory renders
-                        // dimmed after it so long paths truncate from the
-                        // directory, never the filename.
-                        let (dir, name) = match path.rsplit_once('/') {
-                            Some((d, n)) => (Some(d.to_owned()), n.to_owned()),
-                            None => (None, path.clone()),
-                        };
-
-                        let root_for_click = root_path.clone();
-                        let path_for_click = path.clone();
-                        let path_for_badge = path.clone();
-                        let path_for_title = path.clone();
-                        let root_for_stage = root_path.clone();
-                        let path_for_stage = path.clone();
-                        let root_for_unstage = root_path.clone();
-                        let path_for_unstage = path.clone();
-                        let root_for_discard = root_path.clone();
-                        let path_for_discard = path.clone();
-                        view! {
-                            <div class="gp-file-row">
-                                <button
-                                    class="gp-file-btn"
-                                    title=path_for_title
-                                    aria-keyshortcuts="Enter"
-                                    on:click=move |_| {
-                                        view_diff(root_for_click.clone(), scope, path_for_click.clone());
-                                    }
-                                >
-                                    <span class=icon_class>{icon}</span>
-                                    <span class="gp-file-path">
-                                        <span class="gp-file-name">{name}</span>
-                                        {dir.map(|d| view! {
-                                            <span class="gp-file-dir">{d}</span>
-                                        })}
-                                    </span>
-                                    {move || {
-                                        let n = file_counts
-                                            .get()
-                                            .get(&path_for_badge)
-                                            .copied()
-                                            .unwrap_or(0);
-                                        (n > 0).then(|| view! {
-                                            <span
-                                                class="gp-file-comment-count"
-                                                data-test="gp-file-comment-count"
-                                                title="Review comments"
-                                            >
-                                                {format!("({n})")}
-                                            </span>
-                                        })
-                                    }}
-                                </button>
-                                <div class="gp-file-actions">
-                                    {show_discard_btn.then(|| {
-                                        let root = root_for_discard.clone();
-                                        let path = path_for_discard.clone();
-                                        view! {
-                                            <button
-                                                class="gp-discard-btn"
-                                                title="Discard changes"
-                                                on:click=move |_| {
-                                                    discard_file(root.clone(), path.clone());
-                                                }
-                                            >
-                                                "\u{2715}"
-                                            </button>
-                                        }
-                                    })}
-                                    {show_stage_btn.then(|| {
-                                        let root = root_for_stage.clone();
-                                        let path = path_for_stage.clone();
-                                        view! {
-                                            <button
-                                                class="gp-stage-btn"
-                                                title="Stage file"
-                                                on:click=move |_| {
-                                                    stage_file(root.clone(), path.clone());
-                                                }
-                                            >
-                                                "+"
-                                            </button>
-                                        }
-                                    })}
-                                    {show_unstage_btn.then(|| {
-                                        let root = root_for_unstage.clone();
-                                        let path = path_for_unstage.clone();
-                                        view! {
-                                            <button
-                                                class="gp-unstage-btn"
-                                                title="Unstage file"
-                                                on:click=move |_| {
-                                                    unstage_file(root.clone(), path.clone());
-                                                }
-                                            >
-                                                "\u{2212}"
-                                            </button>
-                                        }
-                                    })}
-                                </div>
-                            </div>
+            <Show when=shown>
+                <div
+                    class="gp-section-files"
+                    node_ref=list_ref
+                    style:padding-top=move || {
+                        format!("{}px", window.get().0 as f64 * row_px.get())
+                    }
+                    style:padding-bottom=move || {
+                        format!("{}px", (total - window.get().1) as f64 * row_px.get())
+                    }
+                >
+                    <For
+                        each=move || {
+                            let (start, end) = window.get();
+                            files.with_value(|files| files[start..end].to_vec())
                         }
-                    }).collect::<Vec<_>>()}
+                        key=|file| file.relative_path.clone()
+                        children=move |file| view! {
+                            <GitFileRow
+                                file=file
+                                scope=scope
+                                root_path=root_path.get_value()
+                                show_stage_btn=show_stage_btn
+                                show_unstage_btn=show_unstage_btn
+                                show_discard_btn=show_discard_btn
+                                file_counts=file_counts
+                            />
+                        }
+                    />
                 </div>
             </Show>
+        </div>
+    }
+}
+
+#[component]
+fn GitFileRow(
+    file: ProjectGitFileStatus,
+    scope: ProjectDiffScope,
+    root_path: ProjectRootPath,
+    show_stage_btn: bool,
+    show_unstage_btn: bool,
+    show_discard_btn: bool,
+    file_counts: Memo<HashMap<String, u32>>,
+) -> impl IntoView {
+    let path = file.relative_path.clone();
+    let change_kind = match scope {
+        ProjectDiffScope::Staged => file.staged,
+        ProjectDiffScope::Unstaged => file.unstaged,
+        // Git panel only opens diffs in Staged/Unstaged scopes;
+        // Uncommitted is reserved for review snapshots.
+        ProjectDiffScope::Uncommitted => file.unstaged.or(file.staged),
+    };
+    let is_untracked = file.untracked;
+    let icon = if is_untracked {
+        "?"
+    } else {
+        change_kind_icon(change_kind)
+    };
+    let icon_class = if is_untracked {
+        "gp-status-icon untracked"
+    } else {
+        change_kind_class(change_kind)
+    };
+
+    // Filename leads the row; the parent directory renders
+    // dimmed after it so long paths truncate from the
+    // directory, never the filename.
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((d, n)) => (Some(d.to_owned()), n.to_owned()),
+        None => (None, path.clone()),
+    };
+
+    let root_for_click = root_path.clone();
+    let path_for_click = path.clone();
+    let path_for_badge = path.clone();
+    let path_for_title = path.clone();
+    let root_for_stage = root_path.clone();
+    let path_for_stage = path.clone();
+    let root_for_unstage = root_path.clone();
+    let path_for_unstage = path.clone();
+    let root_for_discard = root_path.clone();
+    let path_for_discard = path.clone();
+    view! {
+        <div class="gp-file-row">
+            <button
+                class="gp-file-btn"
+                title=path_for_title
+                aria-keyshortcuts="Enter"
+                on:click=move |_| {
+                    view_diff(root_for_click.clone(), scope, path_for_click.clone());
+                }
+            >
+                <span class=icon_class>{icon}</span>
+                <span class="gp-file-path">
+                    <span class="gp-file-name">{name}</span>
+                    {dir.map(|d| view! {
+                        <span class="gp-file-dir">{d}</span>
+                    })}
+                </span>
+                {move || {
+                    let n = file_counts
+                        .get()
+                        .get(&path_for_badge)
+                        .copied()
+                        .unwrap_or(0);
+                    (n > 0).then(|| view! {
+                        <span
+                            class="gp-file-comment-count"
+                            data-test="gp-file-comment-count"
+                            title="Review comments"
+                        >
+                            {format!("({n})")}
+                        </span>
+                    })
+                }}
+            </button>
+            <div class="gp-file-actions">
+                {show_discard_btn.then(|| {
+                    let root = root_for_discard.clone();
+                    let path = path_for_discard.clone();
+                    view! {
+                        <button
+                            class="gp-discard-btn"
+                            title="Discard changes"
+                            on:click=move |_| {
+                                discard_file(root.clone(), path.clone());
+                            }
+                        >
+                            "\u{2715}"
+                        </button>
+                    }
+                })}
+                {show_stage_btn.then(|| {
+                    let root = root_for_stage.clone();
+                    let path = path_for_stage.clone();
+                    view! {
+                        <button
+                            class="gp-stage-btn"
+                            title="Stage file"
+                            on:click=move |_| {
+                                stage_file(root.clone(), path.clone());
+                            }
+                        >
+                            "+"
+                        </button>
+                    }
+                })}
+                {show_unstage_btn.then(|| {
+                    let root = root_for_unstage.clone();
+                    let path = path_for_unstage.clone();
+                    view! {
+                        <button
+                            class="gp-unstage-btn"
+                            title="Unstage file"
+                            on:click=move |_| {
+                                unstage_file(root.clone(), path.clone());
+                            }
+                        >
+                            "\u{2212}"
+                        </button>
+                    }
+                })}
+            </div>
         </div>
     }
 }
@@ -1915,6 +2068,298 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Let a layout change reach its browser frame, where resize observers
+    /// deliver, then let the reactive work they start finish.
+    async fn next_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        next_tick().await;
+    }
+
+    /// Scroll the Git panel and wait for the browser's own scroll event.
+    async fn scroll_git_to(container: &HtmlElement, top: i32) {
+        let scroller = query(container, ".gp-content").unwrap();
+        let target = top.min(scroller.scroll_height() - scroller.client_height());
+        assert_ne!(
+            scroller.scroll_top(),
+            target,
+            "scrolling the Git panel to {top} would not move it, so no scroll event would come"
+        );
+        let mut listener = None;
+        let scrolled = js_sys::Promise::new(&mut |resolve, _reject| {
+            scroller
+                .add_event_listener_with_callback("scroll", &resolve)
+                .unwrap();
+            listener = Some(resolve);
+        });
+        scroller.set_scroll_top(top);
+        let _ = wasm_bindgen_futures::JsFuture::from(scrolled).await;
+        scroller
+            .remove_event_listener_with_callback("scroll", &listener.unwrap())
+            .unwrap();
+        next_tick().await;
+    }
+
+    /// Root-level and nested paths alternate across scripts whose fallback
+    /// faces bring their own metrics: no name or directory label may change
+    /// a row's height or paint outside it, or windowed rows land at the
+    /// wrong offsets.
+    fn changed_path(index: usize) -> String {
+        match index % 6 {
+            0 => format!("changed-{index}.rs"),
+            1 => format!("src/changed-{index}.rs"),
+            2 => format!("Ångström/Ünïcödé/ŶÅÉgjpqy-{index}.rs"),
+            3 => format!("文書/日本語ディレクトリ/設定ファイル-{index}.rs"),
+            4 => format!("مجلد/عربي/changed-{index}.rs"),
+            _ => format!("दस्तावेज़/เอกสาร/✨🚀/changed-{index}.rs"),
+        }
+    }
+
+    /// Real monospace and script faces bundled as subsets, so the font
+    /// metrics under test are the same on every host.
+    const TEST_FONTS: [(&str, &[u8]); 7] = [
+        (
+            "Tyde Test DejaVu Sans Mono",
+            include_bytes!("../../test-fonts/dejavu-sans-mono.ttf"),
+        ),
+        (
+            "Tyde Test Noto Sans Mono",
+            include_bytes!("../../test-fonts/noto-sans-mono.ttf"),
+        ),
+        (
+            "Tyde Test Noto Sans CJK JP",
+            include_bytes!("../../test-fonts/noto-sans-cjk-jp.otf"),
+        ),
+        (
+            "Tyde Test Noto Sans Arabic",
+            include_bytes!("../../test-fonts/noto-sans-arabic.ttf"),
+        ),
+        (
+            "Tyde Test Noto Sans Devanagari",
+            include_bytes!("../../test-fonts/noto-sans-devanagari.ttf"),
+        ),
+        (
+            "Tyde Test Noto Sans Thai",
+            include_bytes!("../../test-fonts/noto-sans-thai.ttf"),
+        ),
+        (
+            "Tyde Test Noto Color Emoji",
+            include_bytes!("../../test-fonts/noto-color-emoji.ttf"),
+        ),
+    ];
+
+    /// Every character a row can show must have a glyph in each bundled
+    /// monospace face or in one of the script faces; the browser would
+    /// otherwise draw it from a host font.
+    fn assert_test_fonts_cover_rows() {
+        let faces = TEST_FONTS.map(|(family, bytes)| {
+            let face = ttf_parser::Face::parse(bytes, 0)
+                .unwrap_or_else(|error| panic!("test font {family} does not parse: {error}"));
+            (family, face)
+        });
+        let shown = (0..6)
+            .flat_map(|kind| changed_path(kind).chars().collect::<Vec<_>>())
+            .chain(' '..='~')
+            .chain(['…']);
+        for c in shown {
+            for (mono, face) in &faces[..2] {
+                assert!(
+                    std::iter::once(face)
+                        .chain(faces[2..].iter().map(|(_, face)| face))
+                        .any(|face| face.glyph_index(c).is_some()),
+                    "no bundled face in the {mono} stack draws U+{:04X}",
+                    u32::from(c)
+                );
+            }
+        }
+    }
+
+    /// Adds the bundled faces to the document; a face that fails to load
+    /// fails the test rather than leaving the browser to substitute one.
+    async fn load_test_fonts() -> Vec<web_sys::FontFace> {
+        let fonts = web_sys::window().unwrap().document().unwrap().fonts();
+        let mut faces = Vec::new();
+        for (family, bytes) in TEST_FONTS {
+            let face = web_sys::FontFace::new_with_u8_array(family, bytes).unwrap();
+            fonts.add(&face).unwrap();
+            wasm_bindgen_futures::JsFuture::from(face.load().unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("test font {family} failed to load: {error:?}"));
+            faces.push(face);
+        }
+        faces
+    }
+
+    fn changes_list(container: &HtmlElement) -> HtmlElement {
+        let section = query_all(container, ".gp-section")
+            .into_iter()
+            .find(|section| {
+                query(section, ".gp-section-title")
+                    .and_then(|title| title.text_content())
+                    .as_deref()
+                    == Some("Changes")
+            })
+            .expect("Changes section");
+        query(&section, ".gp-section-files").expect("expanded Changes list")
+    }
+
+    /// The vertical extent of `label`'s painted glyphs, fallback faces
+    /// included: its text box starts one ascent of the primary face above
+    /// the baseline, and the glyphs reach from there as far as their ink.
+    fn text_ink(
+        canvas: &web_sys::CanvasRenderingContext2d,
+        label: &web_sys::Element,
+    ) -> (f64, f64) {
+        let window = web_sys::window().unwrap();
+        let range = window.document().unwrap().create_range().unwrap();
+        range.select_node_contents(label).unwrap();
+        let text_box = range.get_bounding_client_rect();
+        let style = window.get_computed_style(label).unwrap().unwrap();
+        let font = ["font-style", "font-weight", "font-size", "font-family"]
+            .map(|property| style.get_property_value(property).unwrap())
+            .join(" ");
+        canvas.set_font(&font);
+        let ink = canvas.measure_text(&label.text_content().unwrap()).unwrap();
+        let baseline = text_box.top() + ink.font_bounding_box_ascent();
+        (
+            baseline - ink.actual_bounding_box_ascent(),
+            baseline + ink.actual_bounding_box_descent(),
+        )
+    }
+
+    /// Checks the "Changes" rows against what the user sees and returns their
+    /// paths: each row sits where the complete list places that file, the
+    /// rows cover the list's visible part without gaps, the list keeps the
+    /// height of all `total` rows, no row lies beyond one viewport of the
+    /// scroller, and every row keeps its controls and unclipped labels
+    /// inside itself.
+    fn changes_window(container: &HtmlElement, total: usize) -> Result<Vec<String>, String> {
+        let view = query(container, ".gp-content")
+            .unwrap()
+            .get_bounding_client_rect();
+        let list = changes_list(container);
+        let list_rect = list.get_bounding_client_rect();
+        let rows = query_all(&list, ".gp-file-row");
+        if rows.is_empty() {
+            return Err("the visible Changes list has no rows".to_owned());
+        }
+        let row_px = rows[0].get_bounding_client_rect().height();
+        if view.height() <= 0.0 || view.height() >= list_rect.height() {
+            return Err("the Git panel itself must scroll the long list".to_owned());
+        }
+        if (list_rect.height() - total as f64 * row_px).abs() >= 1.0 {
+            return Err(format!(
+                "list height {} must hold {total} rows of {row_px}px",
+                list_rect.height()
+            ));
+        }
+        let canvas = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("canvas")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .unwrap()
+            .get_context("2d")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::CanvasRenderingContext2d>()
+            .unwrap();
+        let mut paths = Vec::new();
+        let mut previous_bottom: Option<f64> = None;
+        for row in &rows {
+            let rect = row.get_bounding_client_rect();
+            let index = ((rect.top() - list_rect.top()) / row_px).round() as usize;
+            let path = query(row, ".gp-file-btn")
+                .unwrap()
+                .get_attribute("title")
+                .unwrap();
+            if path != changed_path(index) {
+                return Err(format!("row {index} shows {path}"));
+            }
+            if previous_bottom.is_some_and(|bottom| (rect.top() - bottom).abs() >= 0.5) {
+                return Err(format!("gap above row {index}"));
+            }
+            previous_bottom = Some(rect.bottom());
+            for part in query_all(row, "button, .gp-status-icon, .gp-file-name, .gp-file-dir") {
+                let part_rect = part.get_bounding_client_rect();
+                if part_rect.top() < rect.top() - 0.5 || part_rect.bottom() > rect.bottom() + 0.5 {
+                    return Err(format!(
+                        "row {index} ({path}) paints {} at {}..{} outside its row at {}..{}",
+                        part.class_name(),
+                        part_rect.top(),
+                        part_rect.bottom(),
+                        rect.top(),
+                        rect.bottom()
+                    ));
+                }
+            }
+            for label in query_all(row, ".gp-file-name, .gp-file-dir") {
+                let clip = label.get_bounding_client_rect();
+                let (ink_top, ink_bottom) = text_ink(&canvas, &label);
+                if ink_top < clip.top() - 0.5 || ink_bottom > clip.bottom() + 0.5 {
+                    return Err(format!(
+                        "row {index} clips {:?}: ink {ink_top}..{ink_bottom} in a {}..{} box",
+                        label.text_content().unwrap(),
+                        clip.top(),
+                        clip.bottom()
+                    ));
+                }
+            }
+            paths.push(path);
+        }
+        let first = rows[0].get_bounding_client_rect();
+        let last = rows[rows.len() - 1].get_bounding_client_rect();
+        if first.top() > view.top().max(list_rect.top()) + 0.5
+            || last.bottom() < view.bottom().min(list_rect.bottom()) - 0.5
+        {
+            return Err("rows must cover the visible part of the list".to_owned());
+        }
+        if first.top() < view.top() - view.height() - row_px
+            || last.bottom() > view.bottom() + view.height() + row_px
+        {
+            return Err(format!(
+                "{} rows were built for a {}px view; rows beyond one viewport must not exist",
+                rows.len(),
+                view.height()
+            ));
+        }
+        Ok(paths)
+    }
+
+    fn assert_changes_window(container: &HtmlElement, total: usize, context: &str) -> Vec<String> {
+        changes_window(container, total).unwrap_or_else(|problem| panic!("{context}: {problem}"))
+    }
+
+    /// Scroll the Git panel so the Changes row at `index` leads the view.
+    async fn scroll_to_change(container: &HtmlElement, index: usize) {
+        let scroller = query(container, ".gp-content").unwrap();
+        let list_offset = changes_list(container).get_bounding_client_rect().top()
+            - scroller.get_bounding_client_rect().top()
+            + f64::from(scroller.scroll_top());
+        let row_px = query(&changes_list(container), ".gp-file-row")
+            .unwrap()
+            .get_bounding_client_rect()
+            .height();
+        scroll_git_to(container, (list_offset + index as f64 * row_px) as i32).await;
+    }
+
+    fn changes_count(container: &HtmlElement) -> String {
+        let section = changes_list(container).parent_element().unwrap();
+        section
+            .query_selector(".gp-section-count")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap()
     }
 
     fn changed_root() -> ProjectRootGitStatus {
@@ -2663,7 +3108,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn docked_git_defers_file_rows_and_preserves_history() {
+    async fn docked_git_windows_file_rows_and_preserves_history() {
         let container = make_container();
         record_bridge();
         let mounted =
@@ -2725,26 +3170,32 @@ mod wasm_tests {
         click(&query(&container, ".dock-tab[aria-label=Files]").expect("Files tab"));
         next_tick().await;
         crate::dispatch::prime_host_for_tests(&state, "h1");
+        // The measured large-status case: every dirty file stays reachable,
+        // but only rows near the scroller are built.
+        let changed = 8192;
         let mut dirty = root_with_staged("/repo");
         dirty
             .files
-            .extend((0..64).map(|index| ProjectGitFileStatus {
-                relative_path: format!("src/changed-{index}.rs"),
+            .extend((0..changed).map(|index| ProjectGitFileStatus {
+                relative_path: changed_path(index),
                 staged: None,
                 unstaged: Some(ProjectGitChangeKind::Modified),
                 untracked: false,
             }));
-        crate::dispatch::dispatch_envelope(
-            &state,
-            "h1",
-            Envelope::from_payload(
-                StreamPath("/project/proj-1".to_owned()),
-                FrameKind::ProjectGitStatus,
-                0,
-                &ProjectGitStatusPayload { roots: vec![dirty] },
-            )
-            .unwrap(),
-        );
+        let send_status = |seq: u64, roots: Vec<ProjectRootGitStatus>| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "h1",
+                Envelope::from_payload(
+                    StreamPath("/project/proj-1".to_owned()),
+                    FrameKind::ProjectGitStatus,
+                    seq,
+                    &ProjectGitStatusPayload { roots },
+                )
+                .unwrap(),
+            );
+        };
+        send_status(0, vec![dirty.clone()]);
         next_tick().await;
         assert!(
             query_all(&container, ".gp-file-row").is_empty(),
@@ -2752,16 +3203,17 @@ mod wasm_tests {
         );
 
         click(&query(&container, ".dock-tab[aria-label=Git]").unwrap());
-        next_tick().await;
-        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
-        assert!(
-            query(&container, ".gp-content")
-                .unwrap()
-                .text_content()
-                .unwrap()
-                .contains("changed-63.rs"),
+        next_frame().await;
+        assert_eq!(
+            changes_count(&container),
+            changed.to_string(),
             "opening Git must render the latest server status"
         );
+        assert_eq!(
+            assert_changes_window(&container, changed, "opening Git")[0],
+            changed_path(0)
+        );
+        assert!(query(&container, ".gp-file-btn[title='src/staged.rs']").is_some());
         click(&query(&container, "[data-test=gp-commit-toggle]").unwrap());
         next_tick().await;
         let draft = query(&container, ".gp-commit-input")
@@ -2783,7 +3235,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(query_all(&container, ".gp-file-row").is_empty());
         click(&query(&container, ".dock-tab[aria-label=Git]").unwrap());
-        next_tick().await;
+        next_frame().await;
         assert_eq!(
             query_all(&container, ".gp-file-row").len(),
             1,
@@ -2791,9 +3243,105 @@ mod wasm_tests {
         );
         assert!(draft.is_same_node(Some(&query(&container, ".gp-commit-input").unwrap())));
         assert_eq!(draft.value(), "Keep this unsent commit");
+        // Every status refresh re-creates the root section, which re-mounts
+        // the commit form closed; close it now so the refresh below measures
+        // only the file list.
+        click(&query(&container, "[data-test=gp-commit-toggle]").unwrap());
         click(&changes);
-        next_tick().await;
-        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        next_frame().await;
+        assert_changes_window(&container, changed, "expanding Changes");
+
+        scroll_to_change(&container, 4000).await;
+        let deep = assert_changes_window(&container, changed, "scrolling deep");
+        assert!(deep.contains(&changed_path(4000)));
+        let file_at_top = |container: &HtmlElement| {
+            let top = query(container, ".gp-content")
+                .unwrap()
+                .get_bounding_client_rect()
+                .top();
+            query_all(container, ".gp-file-row")
+                .into_iter()
+                .find(|row| row.get_bounding_client_rect().bottom() > top + 1.0)
+                .map(|row| query(&row, ".gp-file-btn").unwrap().get_attribute("title"))
+        };
+        let top_before = file_at_top(&container);
+        let mut refreshed = dirty.clone();
+        refreshed.ahead = 1;
+        send_status(1, vec![refreshed]);
+        next_frame().await;
+        assert_changes_window(&container, changed, "refreshing while scrolled");
+        assert_eq!(
+            file_at_top(&container),
+            top_before,
+            "a status refresh must keep the file under the top of the view"
+        );
+
+        // The Font Size setting's range is 11px..=20px. The theme's monospace
+        // stack ends in whichever face the platform supplies; the bundled
+        // stacks pin two real monospace faces and their script fallbacks on
+        // every host. Every case is measured first and asserted once the
+        // document is back at its defaults, so a failure cannot leave the
+        // rest of the suite rendering at 20px.
+        assert_test_fonts_cover_rows();
+        let test_fonts = load_test_fonts().await;
+        let fallbacks = TEST_FONTS[2..]
+            .iter()
+            .map(|(family, _)| format!("\"{family}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let root_style = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .style();
+        let mut font_problems = Vec::new();
+        for font in [11, 20] {
+            root_style
+                .set_property("--base-font-size", &format!("{font}px"))
+                .unwrap();
+            for face in [None, Some(TEST_FONTS[0].0), Some(TEST_FONTS[1].0)] {
+                match face {
+                    Some(face) => root_style
+                        .set_property("--font-mono", &format!("\"{face}\", {fallbacks}"))
+                        .unwrap(),
+                    None => {
+                        root_style.remove_property("--font-mono").unwrap();
+                    }
+                }
+                next_frame().await;
+                scroll_git_to(&container, 0).await;
+                let top = changes_window(&container, changed);
+                scroll_to_change(&container, 4000).await;
+                let deep = changes_window(&container, changed);
+                let scroller = query(&container, ".gp-content").unwrap();
+                scroll_git_to(&container, scroller.scroll_height()).await;
+                let end = changes_window(&container, changed);
+                for (at, window, expected) in [
+                    ("top", top, 0),
+                    ("deep", deep, 4000),
+                    ("end", end, changed - 1),
+                ] {
+                    let case = format!("{font}px, {} monospace, {at}", face.unwrap_or("theme"));
+                    match window {
+                        Ok(paths) if paths.contains(&changed_path(expected)) => {}
+                        Ok(_) => font_problems.push(format!("{case}: row {expected} is not built")),
+                        Err(problem) => font_problems.push(format!("{case}: {problem}")),
+                    }
+                }
+            }
+        }
+        root_style.remove_property("--base-font-size").unwrap();
+        root_style.remove_property("--font-mono").unwrap();
+        let fonts = web_sys::window().unwrap().document().unwrap().fonts();
+        for face in &test_fonts {
+            fonts.delete(face);
+        }
+        next_frame().await;
+        assert!(font_problems.is_empty(), "{}", font_problems.join("\n"));
 
         state.toggle_sidebar(crate::sidebar_layout::SidebarSide::Left);
         next_tick().await;
@@ -2802,25 +3350,29 @@ mod wasm_tests {
             "a closed dock must defer rows even when Git remains its active tab"
         );
         state.activate_sidebar_tab(crate::sidebar_layout::SidebarTab::Git);
-        next_tick().await;
-        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        next_frame().await;
+        assert_changes_window(&container, changed, "reopening the dock");
         state.move_sidebar_tab(
             crate::sidebar_layout::SidebarTab::Git,
             crate::sidebar_layout::SidebarSide::Bottom,
             None,
         );
-        next_tick().await;
-        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        next_frame().await;
+        assert_changes_window(&container, changed, "moving Git to the bottom dock");
         state.sidebar_storage_blocked.set(true);
         next_tick().await;
         assert!(query_all(&container, ".gp-file-row").is_empty());
         state.sidebar_storage_blocked.set(false);
-        next_tick().await;
-        click(&query(&container, ".gp-file-btn[title='src/changed-63.rs']").unwrap());
+        next_frame().await;
+        let scroller = query(&container, ".gp-content").unwrap();
+        scroll_git_to(&container, scroller.scroll_height()).await;
+        let end = assert_changes_window(&container, changed, "scrolling to the end");
+        assert_eq!(end.last(), Some(&changed_path(changed - 1)));
+        click(&query(&container, ".gp-file-btn[title='src/changed-8191.rs']").unwrap());
         next_tick().await;
         assert!(
-            sent_lines_joined().contains("src/changed-63.rs"),
-            "remounted rows must retain their working-tree diff action"
+            sent_lines_joined().contains("src/changed-8191.rs"),
+            "the last of a long list must keep its working-tree diff action"
         );
     }
 

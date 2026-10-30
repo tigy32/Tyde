@@ -6357,6 +6357,20 @@ async fn project_watcher_follows_worktree_git_metadata() {
     );
     write_file(&worktree.join(".gitignore"), "target/\n");
     write_file(&worktree.join("target/deep/cache"), "artifact");
+    let claim_ref = "refs/tyde/workbench-creation/watcher-fixture";
+    git(repo.path(), &["update-ref", claim_ref, "HEAD"]);
+    let claim_dir = repo.path().join(".git/refs/tyde/workbench-creation");
+    let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
+    let removal_repo = repo.path().to_owned();
+    // Git removes the empty ownership-ref directory between stat and OS watch.
+    let removal = fixture.on_project_scan(
+        claim_dir.clone(),
+        server::ScanPoint::WatcherRegisterPending,
+        move || {
+            git(&removal_repo, &["update-ref", "-d", claim_ref]);
+            removed_tx.send(()).unwrap();
+        },
+    );
     let (primary_ready_tx, primary_ready_rx) = tokio::sync::oneshot::channel();
     let primary_ready = fixture.on_project_scan(
         repo.path().to_owned(),
@@ -6372,8 +6386,18 @@ async fn project_watcher_follows_worktree_git_metadata() {
     )
     .await;
     expect_project_bootstrap(&mut fixture.client, "primary bootstrap").await;
+    removed_rx.await.expect("actual ownership ref removed");
     primary_ready_rx.await.unwrap();
-    drop(primary_ready);
+    assert!(!claim_dir.exists());
+    drop((removal, primary_ready));
+    let (registered, registered_rx) =
+        watch_completion(&fixture, &claim_dir, server::ScanPoint::WatcherRegistered);
+    git(repo.path(), &["update-ref", claim_ref, "HEAD"]);
+    registered_rx
+        .await
+        .expect("recreated ref directory watched");
+    drop(registered);
+    git(repo.path(), &["update-ref", "-d", claim_ref]);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let ready = fixture.on_project_scan(
         worktree.clone(),

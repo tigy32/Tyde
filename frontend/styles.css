@@ -8303,9 +8303,11 @@ math merror {
     flex-direction: column;
 }
 
+/* The windowed file list positions rows by index from one measured pitch. */
 .gp-file-row {
     display: flex;
     align-items: center;
+    height: 28px;
     gap: var(--space-1);
     margin: 0 var(--space-1);
     padding: 0 var(--space-1);
@@ -8349,9 +8351,12 @@ math merror {
 .gp-status-icon.untracked { color: var(--text-tertiary); }
 .gp-status-icon.unmerged { color: var(--error); }
 
+/* Held to the name's 24px line: baseline-aligning the smaller directory label
+   shifts it down, which would otherwise grow nested-path rows. */
 .gp-file-path {
     display: flex;
     align-items: baseline;
+    height: 24px;
     gap: 7px;
     min-width: 0;
     font-family: var(--font-mono);

@@ -629,9 +629,20 @@ impl WatchState {
             desired.insert(path.to_owned());
             if !self.registered.contains(path) {
                 tracing::debug!(path = %path.display(), "registering non-recursive project filesystem watch");
+                #[cfg(feature = "test-support")]
+                crate::project_stream::scan_test_support::run(
+                    path,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherRegisterPending,
+                );
                 if let Err(error) = self.watcher.watch(path, RecursiveMode::NonRecursive) {
-                    if matches!(&error.kind, notify::ErrorKind::Io(cause) if cause.kind() == std::io::ErrorKind::NotFound)
-                    {
+                    let vanished = match &error.kind {
+                        notify::ErrorKind::PathNotFound => true,
+                        notify::ErrorKind::Io(cause) => {
+                            cause.kind() == std::io::ErrorKind::NotFound
+                        }
+                        _ => false,
+                    };
+                    if vanished {
                         desired.remove(path);
                         return Ok(());
                     }
