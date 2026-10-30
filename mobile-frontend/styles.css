@@ -26,6 +26,7 @@
 }
 
 [data-theme="dark"] {
+    color-scheme: dark;
     --bg-base: #121212;
     --bg-surface: #1a1a1a;
     --bg-surface-2: #242424;
@@ -54,6 +55,7 @@
 }
 
 [data-theme="light"] {
+    color-scheme: light;
     --bg-base: #f8f9fa;
     --bg-surface: #ffffff;
     --bg-surface-2: #f0f2f5;
@@ -1263,6 +1265,7 @@ input, textarea, select {
 
 .chat-back-button {
     min-width: 72px;
+    min-height: 44px;
     display: inline-flex;
     align-items: center;
     gap: 1px;
@@ -1355,6 +1358,10 @@ input, textarea, select {
     right: 0;
     top: calc(100% + var(--space-2));
     min-width: 188px;
+    max-width: calc(100vw - var(--tws-safe-left) - var(--tws-safe-right) - 32px);
+    max-height: calc(100cqh - max(var(--tws-gap), var(--tws-safe-top)) - var(--header-height) - var(--tws-safe-bottom) - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: var(--space-1);
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
@@ -2642,8 +2649,8 @@ input, textarea, select {
    weight: a bare glyph beside the filled pill, so the composer's right end
    reads as one control rather than two competing slabs. */
 .send-menu-toggle {
-    min-width: 30px;
-    width: 30px;
+    min-width: 44px;
+    width: 44px;
     height: var(--composer-control-height);
     padding: 0;
     border: none;
@@ -2729,6 +2736,9 @@ input, textarea, select {
     min-width: 140px;
     width: max-content;
     max-width: min(320px, calc(100vw - 2 * var(--chrome-gutter)));
+    max-height: calc(100cqh - var(--tws-safe-top) - var(--tws-safe-bottom) - 140px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
     padding: var(--space-1);
@@ -4591,13 +4601,13 @@ input, textarea, select {
 
 /* In-app confirmation modal (ConfirmModal) — replaces window.confirm. */
 .confirm-modal-backdrop {
-    position: fixed;
+    position: absolute;
     inset: 0;
     z-index: 1000;
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 1.5rem;
+    padding: max(1.5rem, var(--tws-safe-top)) max(1.5rem, var(--tws-safe-right)) max(1.5rem, var(--tws-safe-bottom)) max(1.5rem, var(--tws-safe-left));
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
@@ -4606,6 +4616,8 @@ input, textarea, select {
 .confirm-modal {
     width: 100%;
     max-width: 22rem;
+    max-height: 100%;
+    overflow-y: auto;
     border-radius: 1rem;
     padding: 1.25rem;
     background: var(--surface, #1c1c1e);
@@ -4638,14 +4650,13 @@ input, textarea, select {
    scroll. It clears the home indicator on its own — the tab dock underneath is
    covered by the backdrop and cannot be relied on for that inset. */
 .project-sheet-backdrop {
-    position: fixed;
+    position: absolute;
     inset: 0;
     z-index: 1000;
     display: flex;
     align-items: flex-end;
     justify-content: center;
-    padding: var(--space-3);
-    padding-bottom: max(var(--space-3), var(--safe-area-bottom));
+    padding: max(var(--space-3), var(--tws-safe-top)) max(var(--space-3), var(--tws-safe-right)) max(var(--space-3), var(--tws-safe-bottom)) max(var(--space-3), var(--tws-safe-left));
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
@@ -4657,7 +4668,7 @@ input, textarea, select {
     gap: var(--space-2);
     width: 100%;
     max-width: 32rem;
-    max-height: 70vh;
+    max-height: min(70dvh, 100%);
     padding: var(--space-4);
     border-radius: var(--radius-lg);
     background: var(--surface-float);
@@ -4676,6 +4687,7 @@ input, textarea, select {
     flex-direction: column;
     gap: var(--space-1);
     overflow-y: auto;
+    min-height: 0;
     -webkit-overflow-scrolling: touch;
 }
 
@@ -4720,14 +4732,13 @@ input, textarea, select {
    edits reached from an overflow menu, so they get the full sheet rather than
    a cramped popover anchored to a 44px button. */
 .session-settings-backdrop {
-    position: fixed;
+    position: absolute;
     inset: 0;
     z-index: 1000;
     display: flex;
     align-items: flex-end;
     justify-content: center;
-    padding: var(--space-3);
-    padding-bottom: max(var(--space-3), var(--safe-area-bottom));
+    padding: max(var(--space-3), var(--tws-safe-top)) max(var(--space-3), var(--tws-safe-right)) max(var(--space-3), var(--tws-safe-bottom)) max(var(--space-3), var(--tws-safe-left));
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
@@ -4739,7 +4750,7 @@ input, textarea, select {
     gap: var(--space-2);
     width: 100%;
     max-width: 32rem;
-    max-height: 70vh;
+    max-height: min(70dvh, 100%);
     padding: var(--space-4);
     border-radius: var(--radius-lg);
     background: var(--surface-float);
@@ -5432,3 +5443,78 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 .mobile-swarm-navigation .mobile-swarm-members { flex-shrink: 0; }
 .mobile-swarm-navigation .mobile-swarm-members[open] { flex-basis: 100%; }
 .mobile-swarm-thread-content { display: flex; align-items: center; gap: 12px; }
+
+/* Keep one mounted shell across window resizing; only its layout changes. */
+.chat-header,
+.chat-bottom-dock {
+    margin-left: max(calc(var(--tws-edge) + var(--tws-safe-left)), calc((100% - 56rem) / 2));
+    margin-right: max(calc(var(--tws-edge) + var(--tws-safe-right)), calc((100% - 56rem) / 2));
+}
+
+.tws-content > .shell-flow {
+    width: 100%;
+    max-width: 76rem;
+    margin-inline: auto;
+}
+
+.chat-messages > .shell-flow {
+    max-width: calc(56rem + 2 * var(--space-2));
+}
+
+.view > .view-header,
+.view > .shell-header {
+    margin-left: max(calc(var(--tws-edge) + var(--tws-safe-left)), calc((100% - 74rem) / 2));
+    margin-right: max(calc(var(--tws-edge) + var(--tws-safe-right)), calc((100% - 74rem) / 2));
+}
+
+.bottom-nav {
+    width: 100%;
+    max-width: 32rem;
+    margin-inline: auto;
+}
+
+@container tws (min-width: 640px) {
+    .agents-view .agent-list:has(> .agent-project-section),
+    .settings-body > .shell-flow {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: start;
+        gap: var(--space-5);
+    }
+
+    .agents-view .agent-project-section,
+    .settings-body .settings-section {
+        min-width: 0;
+        margin: 0;
+    }
+
+    .home-view > .shell-flow:has(> .agent-list) {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        column-gap: var(--space-4);
+    }
+
+    .home-view .home-hero,
+    .home-view .home-grid {
+        grid-column: 1 / -1;
+    }
+
+    .home-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .home-view .home-quick-actions {
+        grid-column: 1;
+        grid-row: 3 / 5;
+    }
+
+    .home-view .section-heading {
+        grid-column: 2;
+        grid-row: 3;
+    }
+
+    .home-view .agent-list {
+        grid-column: 2;
+        grid-row: 4;
+    }
+}

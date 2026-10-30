@@ -2085,6 +2085,11 @@ mod wasm_tests {
             (320, 568),
             (430, 932),
             (932, 430),
+            (382, 580),
+            (669, 867),
+            (951, 585),
+            (1024, 768),
+            (385, 571),
             (393, 852),
         ] {
             frame
@@ -2105,6 +2110,35 @@ mod wasm_tests {
             assert_eq!(input.value(), "preserved draft");
             assert_eq!(input.selection_start().unwrap(), Some(2));
             assert_eq!(input.selection_end().unwrap(), Some(8));
+            assert!(
+                transcript.is_same_node(
+                    container
+                        .query_selector("[data-mobile-test='chat-transcript']")
+                        .unwrap()
+                        .as_ref()
+                        .map(|element| element.as_ref())
+                )
+            );
+            let header = container.query_selector(".chat-header").unwrap().unwrap();
+            let header_bounds = header.get_bounding_client_rect();
+            let dock_bounds = dock.get_bounding_client_rect();
+            assert!(
+                header_bounds.width() <= 840.0 && dock_bounds.width() <= 840.0,
+                "wide chat chrome must stay on a readable rail"
+            );
+            assert!(
+                (header_bounds.left() - dock_bounds.left()).abs() <= 1.0
+                    && (header_bounds.right() - dock_bounds.right()).abs() <= 1.0,
+                "header and composer must share the same rails"
+            );
+            for selector in [".chat-back-button", ".send-menu-toggle"] {
+                let control = container.query_selector(selector).unwrap().unwrap();
+                let bounds = control.get_bounding_client_rect();
+                assert!(
+                    bounds.width() >= 44.0 && bounds.height() >= 44.0,
+                    "{selector} must remain a full touch target"
+                );
+            }
             wasm_bindgen_test::console_log!(
                 "Shell resize {width}x{height}: send_top={} send_bottom={} shell={} viewport={} document_h={}",
                 send.get_bounding_client_rect().top(),
@@ -2732,6 +2766,103 @@ mod wasm_tests {
             ));
         }
         drop(readings);
+        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
+        let theme_control = container
+            .query_selector("[data-mobile-test='settings-theme']")
+            .unwrap()
+            .unwrap();
+        for (width, height) in [(669, 867), (1024, 768), (385, 571), (669, 867)] {
+            frame
+                .set_attribute(
+                    "style",
+                    &format!("width:{width}px;height:{height}px;border:0"),
+                )
+                .unwrap();
+            render_shell(&frame).await;
+            assert!(
+                theme_control.is_same_node(
+                    container
+                        .query_selector("[data-mobile-test='settings-theme']")
+                        .unwrap()
+                        .as_ref()
+                        .map(|element| element.as_ref())
+                )
+            );
+            let sections = container.query_selector_all(".settings-section").unwrap();
+            let first: web_sys::Element = sections.item(0).unwrap().unchecked_into();
+            let second: web_sys::Element = sections.item(1).unwrap().unchecked_into();
+            let first = first.get_bounding_client_rect();
+            let second = second.get_bounding_client_rect();
+            if width >= 640 {
+                assert!(
+                    (first.top() - second.top()).abs() <= 1.0 && second.left() > first.right(),
+                    "wide settings must use two readable, non-overlapping columns"
+                );
+            } else {
+                assert!(
+                    second.top() >= first.bottom(),
+                    "Split View must restore the single-column settings list"
+                );
+            }
+            let nav = container
+                .query_selector("[data-mobile-test='bottom-nav']")
+                .unwrap()
+                .unwrap();
+            assert!(
+                nav.get_bounding_client_rect().width() <= 480.0,
+                "wide navigation stays a compact dock"
+            );
+        }
+        frame
+            .set_attribute("style", "width:594px;height:368px;border:0")
+            .unwrap();
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 20px; --tws-safe-bottom: 21px; --tws-safe-left: 62px; --tws-safe-right: 47px; }",
+        ));
+        let sheet_viewport = BrowserOverride(
+            js_sys::Function::new_with_args(
+                "w",
+                r#"
+                const viewport = w.visualViewport;
+                const saved = Object.getOwnPropertyDescriptor(viewport, 'height');
+                Object.defineProperty(viewport, 'height', {configurable:true, value:180});
+                viewport.dispatchEvent(new w.Event('resize'));
+                return () => {
+                    if (saved) Object.defineProperty(viewport, 'height', saved);
+                    else delete viewport.height;
+                    viewport.dispatchEvent(new w.Event('resize'));
+                };
+            "#,
+            )
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &frame.content_window().unwrap(),
+            )
+            .unwrap(),
+        );
+        for session_settings in [false, true] {
+            state.project_picker_open.set(!session_settings);
+            state.session_settings_open.set(session_settings);
+            render_shell(&frame).await;
+            let selector = if session_settings {
+                ".session-settings-sheet"
+            } else {
+                ".project-sheet"
+            };
+            let sheet = container.query_selector(selector).unwrap().unwrap();
+            let bounds = sheet.get_bounding_client_rect();
+            let shell_bounds = shell.get_bounding_client_rect();
+            assert!((shell_bounds.height() - 180.0).abs() <= 1.0);
+            assert!(
+                bounds.left() >= 62.0
+                    && bounds.right() <= 594.0 - 47.0
+                    && bounds.top() >= shell_bounds.top() + 20.0
+                    && bounds.bottom() <= shell_bounds.bottom() - 21.0,
+                "landscape sheets must respect the shell's contracted viewport and safe edges"
+            );
+        }
+        drop(sheet_viewport);
+        state.session_settings_open.set(false);
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
         frame
             .set_attribute("style", "width:852px;height:130px;border:0")
