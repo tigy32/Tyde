@@ -5136,7 +5136,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn windowed_list_does_not_mount_all_rows_for_long_transcript() {
         use crate::components::center_zone::CenterZone;
-        use crate::perf::diagnostic_tests::Capture;
+        use crate::perf::diagnostic_tests::{Capture, LocalMonitorClock};
         use crate::state::TabContent;
 
         ensure_styles_loaded();
@@ -5220,12 +5220,73 @@ mod wasm_tests {
             "the spacer must reserve geometry for unmounted rows"
         );
 
-        capture.start();
+        let clock = LocalMonitorClock::install();
+        let recorded = js_sys::eval(
+            r#"
+            (() => {
+                const invoke = window.__TAURI__.core.invoke;
+                window.__projectionRestoreInvoke = () => {
+                    window.__TAURI__.core.invoke = invoke;
+                    delete window.__projectionRestoreInvoke;
+                };
+                return new Promise(recorded => {
+                    window.__TAURI__.core.invoke = (cmd, args) => {
+                        if (cmd === 'log_ui_diagnostic') {
+                            recorded(JSON.stringify(args.record));
+                            return Promise.resolve(null);
+                        }
+                        return invoke(cmd, args);
+                    };
+                });
+            })()
+            "#,
+        )
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
         let other = state
             .open_tab(TabContent::empty_chat(), "Other".to_owned(), true)
             .unwrap();
         state.bump_tab_lru(other);
         state.chat_rows.update(|rows| {
+            rows.insert(AgentId("unrelated-local-private".into()), Vec::new());
+        });
+        next_tick().await;
+        next_tick().await;
+        clock.advance(2000.0);
+        clock.tick();
+        let local: serde_json::Value = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(recorded)
+                .await
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        js_sys::eval("window.__projectionRestoreInvoke()").unwrap();
+        drop(clock);
+        assert_eq!(local["diagnostic"]["event"], "event_loop_gap");
+        let work = &local["diagnostic"]["longest_work"];
+        assert_eq!(
+            work["operation"], "chat_virtual_window",
+            "deferred projection work must reach the local log with capture off"
+        );
+        assert_eq!(work["items"], total_rows);
+        assert_eq!(work["bytes"], 0);
+        assert!(work["frame"].is_null());
+        assert!(work["duration_ms"].as_u64().unwrap() >= 100);
+        assert_eq!(capture.export(), disabled);
+        for private in ["private", "generated payload"] {
+            assert!(
+                !local.to_string().contains(private),
+                "local diagnostics must not retain content or identifiers"
+            );
+        }
+
+        capture.start();
+        state.rename_tab_label(other, "Other renamed".into());
+        state.chat_rows.update(|rows| {
+            rows.remove(&AgentId("unrelated-local-private".into()));
             rows.insert(AgentId("unrelated-private".into()), Vec::new());
         });
         next_tick().await;

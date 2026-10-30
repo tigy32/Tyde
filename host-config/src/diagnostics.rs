@@ -15,6 +15,12 @@ pub enum UiOperation {
     WorkerSubmit,
     WorkerReceive,
     FileTreeBuild,
+    ChatRowProjection,
+    ChatContextScan,
+    ChatContextReportedScan,
+    ChatInkLayout,
+    ChatVirtualWindow,
+    ChatTabBinding,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

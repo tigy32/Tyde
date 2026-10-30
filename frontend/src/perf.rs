@@ -61,6 +61,12 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::WorkerSubmit => "highlight_worker_submit",
         UiOperation::WorkerReceive => "highlight_worker_receive",
         UiOperation::FileTreeBuild => "file_tree_build",
+        UiOperation::ChatRowProjection => "chat_row_projection",
+        UiOperation::ChatContextScan => "chat_context_scan",
+        UiOperation::ChatContextReportedScan => "chat_context_reported_scan",
+        UiOperation::ChatInkLayout => "chat_ink_layout",
+        UiOperation::ChatVirtualWindow => "chat_virtual_window",
+        UiOperation::ChatTabBinding => "chat_tab_binding",
     }
 }
 
@@ -249,8 +255,8 @@ fn emit_local(diagnostic: FrontendDiagnostic) {
     });
 }
 
-// These projections are observed only during an explicit Debug capture, never
-// by the automatic local monitor. Keep labels code-defined and counts numeric.
+// Deferred projections can run after host dispatch returns, so they must also
+// contribute to the bounded local summary when detailed capture is off.
 pub(crate) enum ChatProjection {
     Rows,
     ContextBreakdown,
@@ -261,26 +267,24 @@ pub(crate) enum ChatProjection {
 }
 
 pub(crate) struct CaptureSpan {
-    id: f64,
+    span: UiSpan,
     items: usize,
 }
 
 impl CaptureSpan {
     pub(crate) fn new(projection: ChatProjection) -> Self {
-        let id = if diagnostic_enabled() {
-            let label = match projection {
-                ChatProjection::Rows => "chat_row_projection",
-                ChatProjection::ContextBreakdown => "chat_context_scan",
-                ChatProjection::ContextReported => "chat_context_reported_scan",
-                ChatProjection::InkLayout => "chat_ink_layout",
-                ChatProjection::VirtualWindow => "chat_virtual_window",
-                ChatProjection::TabBinding => "chat_tab_binding",
-            };
-            diagnostic_begin(label, "", 0, 0, false)
-        } else {
-            0.0
+        let operation = match projection {
+            ChatProjection::Rows => UiOperation::ChatRowProjection,
+            ChatProjection::ContextBreakdown => UiOperation::ChatContextScan,
+            ChatProjection::ContextReported => UiOperation::ChatContextReportedScan,
+            ChatProjection::InkLayout => UiOperation::ChatInkLayout,
+            ChatProjection::VirtualWindow => UiOperation::ChatVirtualWindow,
+            ChatProjection::TabBinding => UiOperation::ChatTabBinding,
         };
-        Self { id, items: 0 }
+        Self {
+            span: UiSpan::new(operation, 0, 0),
+            items: 0,
+        }
     }
 
     pub(crate) fn items(&mut self, items: usize) {
@@ -294,10 +298,7 @@ impl CaptureSpan {
 
 impl Drop for CaptureSpan {
     fn drop(&mut self) {
-        if self.id != 0.0 {
-            diagnostic_set_items(self.id, self.items);
-            diagnostic_end(self.id, "scope_end");
-        }
+        self.span.set_items(self.items);
     }
 }
 
@@ -387,6 +388,15 @@ impl UiSpan {
         }
         if let Some(local) = &mut self.local {
             local.frame = Some(kind);
+        }
+    }
+
+    fn set_items(&mut self, items: usize) {
+        if self.capture != 0.0 {
+            diagnostic_set_items(self.capture, items);
+        }
+        if let Some(local) = &mut self.local {
+            local.items = items;
         }
     }
 

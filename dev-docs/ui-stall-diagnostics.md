@@ -45,12 +45,19 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   | `worker_receive`, `composer_input`, `composer_resize` | 0 | 1 |
   | `global_keydown` | 0 | 0 |
   | `file_tree_build` | 0 | listing entries |
+  | `chat_tab_binding` | 0 | 1 tab-to-agent lookup |
+  | `chat_row_projection` | 0 | projected loaded row handles |
+  | `chat_context_scan`, `chat_context_reported_scan` | 0 | rows actually visited |
+  | `chat_ink_layout`, `chat_virtual_window` | 0 | loaded rows supplied to calculation |
 
   No other details or arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
   `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
-  Deferred chat projections, browser layout and paint do not feed this
-  aggregate. Explicit captures below additionally name selected projections.
+  The selected deferred chat projections below feed this same bounded
+  aggregate, including when detailed capture is off. They can run after
+  host dispatch has returned; receive/dispatch timing cannot cover that work.
+  Their counts are not persisted session size, mounted rows or bytes cloned.
+  Browser layout, paint and other uninstrumented work remain uncovered.
   `focused` is `document.hasFocus()` at callback time, not a focus history.
   `longest_work:null` means no qualifying completed span was retained for that
   sampling window, not that the UI did no work. Pending calls are counted at
@@ -141,9 +148,9 @@ bridge wait initiated by that work.
   be added together. Host receive spans acquire their typed frame kind after
   parsing; dispatch spans identify the frame from the start. Neither identifies
   subsequent deferred reactive rendering or browser layout/paint. The following
-  capture-only spans measure selected deferred chat work separately:
+  projection spans measure selected deferred chat work separately:
 
-  | Capture-only `operation` | `items` |
+  | Projection `operation` | `items` |
   |---|---|
   | `chat_tab_binding` | 1 tab-to-agent lookup |
   | `chat_row_projection` | projected loaded row handles, including streaming row |
@@ -214,9 +221,10 @@ pending remote work cannot hide synchronous UI spans). Each incident retains at 
 records are not proof that no work occurred. Export serializes only this bounded
 state, on explicit request. There is no per-record console/network/disk output,
 DOM traversal, stack capture, payload serialization, mutation observer or global
-function patching. While detailed capture is disabled, the original UiSpan call
-sites still update the automatic local aggregate described above. The new chat
-projection call sites never feed that aggregate and retain nothing off-capture.
+function patching. While detailed capture is disabled, named synchronous work,
+including these selected chat projections, updates only the automatic local
+longest-span aggregate described above. No per-projection history is retained
+off-capture, and the existing disk admission budgets are unchanged.
 
 Records contain only fixed operation/command names, protocol FrameKind names,
 times, numeric sizes/counts, coarse outcome and visibility. No argument values,
