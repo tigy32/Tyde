@@ -91,7 +91,7 @@ struct PanelSignals {
 }
 
 #[component]
-pub fn GitPanel() -> impl IntoView {
+pub fn GitPanel(#[prop(default = Signal::derive(|| true))] visible: Signal<bool>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let signals = PanelSignals {
         historical_selection: RwSignal::new(None),
@@ -124,6 +124,7 @@ pub fn GitPanel() -> impl IntoView {
                                         root=root
                                         multi_root=multi_root
                                         signals=signals
+                                        visible=visible
                                     />
                                 }.into_any()
                             }).collect()
@@ -778,6 +779,7 @@ fn GitRootSection(
     root: ProjectRootGitStatus,
     multi_root: bool,
     signals: PanelSignals,
+    visible: Signal<bool>,
 ) -> impl IntoView {
     let scope = HistoryScope {
         host_id: host_id.clone(),
@@ -1055,6 +1057,7 @@ fn GitRootSection(
                                     show_unstage_btn=false
                                     show_discard_btn=false
                                     file_counts=file_counts
+                                    visible=visible
                                 />
                             </Show>
                             <Show when=move || has_staged>
@@ -1069,6 +1072,7 @@ fn GitRootSection(
                                     show_unstage_btn=true
                                     show_discard_btn=false
                                     file_counts=file_counts
+                                    visible=visible
                                     commit_toggle=commit_open
                                 />
                                 <Show when=move || commit_open.get()>
@@ -1110,6 +1114,7 @@ fn GitRootSection(
                                     show_unstage_btn=false
                                     show_discard_btn=true
                                     file_counts=file_counts
+                                    visible=visible
                                 />
                             </Show>
                             <Show when=move || has_untracked>
@@ -1124,6 +1129,7 @@ fn GitRootSection(
                                     show_unstage_btn=false
                                     show_discard_btn=true
                                     file_counts=file_counts
+                                    visible=visible
                                 />
                             </Show>
                     }
@@ -1385,6 +1391,7 @@ fn GitFileSection(
     show_unstage_btn: bool,
     show_discard_btn: bool,
     file_counts: Memo<HashMap<String, u32>>,
+    visible: Signal<bool>,
     /// When present, the header offers a "Commit…" action that toggles the
     /// signal; the owner renders the commit form wherever it belongs.
     #[prop(optional)]
@@ -1452,7 +1459,8 @@ fn GitFileSection(
                     })}
                 </div>
             </div>
-            <Show when=move || expanded.get()>
+            // Keep panel controls and drafts alive, not thousands of hidden rows.
+            <Show when=move || visible.get() && expanded.get()>
                 <div class="gp-section-files">
                     {files.iter().map(|file| {
                         let path = file.relative_path.clone();
@@ -2115,6 +2123,15 @@ mod wasm_tests {
         with_draft: bool,
         roots: Vec<ProjectRootGitStatus>,
     ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
+        mount_git_panel_surface(container, with_draft, roots, false)
+    }
+
+    fn mount_git_panel_surface(
+        container: HtmlElement,
+        with_draft: bool,
+        roots: Vec<ProjectRootGitStatus>,
+        docked: bool,
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
         let handle = mount_to(container, move || {
@@ -2136,9 +2153,24 @@ mod wasm_tests {
                     m.insert(ReviewId("rev-1".to_owned()), full_review());
                 });
             }
+            if docked {
+                state.sidebar_layout.update(|layouts| {
+                    layouts.mode = crate::sidebar_layout::InterfaceMode::Dinosaur;
+                });
+            }
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <GitPanel /> }
+            if docked {
+                view! {
+                    <style>{PROD_STYLES}</style>
+                    <div style="height:720px;width:1100px;display:flex;flex-direction:column">
+                        <crate::components::workbench::Workbench />
+                    </div>
+                }
+                .into_any()
+            } else {
+                view! { <GitPanel /> }.into_any()
+            }
         });
         Mounted::new(handle, holder)
     }
@@ -2631,11 +2663,28 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn loaded_history_and_hidden_focus_survive_status_refresh() {
+    async fn docked_git_defers_file_rows_and_preserves_history() {
         let container = make_container();
-        stub_recording_bridge();
-        let mounted = mount_git_panel_with_root(container.clone(), false, long_clean_history(25));
+        record_bridge();
+        let mounted =
+            mount_git_panel_surface(container.clone(), false, vec![long_clean_history(25)], true);
         next_tick().await;
+        assert_eq!(
+            query(&container, "[aria-label='Git panel']")
+                .unwrap()
+                .get_bounding_client_rect()
+                .height(),
+            0.0
+        );
+        click(&query(&container, ".dock-tab[aria-label=Git]").expect("Git tab"));
+        next_tick().await;
+        assert!(
+            query(&container, "[aria-label='Git panel']")
+                .unwrap()
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
         click(&history_toggle(&container, 0));
         next_tick().await;
 
@@ -2670,6 +2719,108 @@ mod wasm_tests {
                 .as_deref(),
             Some("true"),
             "a status refresh must not flip the root back to the working tree"
+        );
+
+        click(&history_toggle(&container, 0));
+        click(&query(&container, ".dock-tab[aria-label=Files]").expect("Files tab"));
+        next_tick().await;
+        crate::dispatch::prime_host_for_tests(&state, "h1");
+        let mut dirty = root_with_staged("/repo");
+        dirty
+            .files
+            .extend((0..64).map(|index| ProjectGitFileStatus {
+                relative_path: format!("src/changed-{index}.rs"),
+                staged: None,
+                unstaged: Some(ProjectGitChangeKind::Modified),
+                untracked: false,
+            }));
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "h1",
+            Envelope::from_payload(
+                StreamPath("/project/proj-1".to_owned()),
+                FrameKind::ProjectGitStatus,
+                0,
+                &ProjectGitStatusPayload { roots: vec![dirty] },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            query_all(&container, ".gp-file-row").is_empty(),
+            "a hidden Git panel must not construct rows for incoming status"
+        );
+
+        click(&query(&container, ".dock-tab[aria-label=Git]").unwrap());
+        next_tick().await;
+        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        assert!(
+            query(&container, ".gp-content")
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("changed-63.rs"),
+            "opening Git must render the latest server status"
+        );
+        click(&query(&container, "[data-test=gp-commit-toggle]").unwrap());
+        next_tick().await;
+        let draft = query(&container, ".gp-commit-input")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        draft.set_value("Keep this unsent commit");
+        draft
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        let changes = query_all(&container, ".gp-section-header")
+            .into_iter()
+            .find(|header| header.text_content().unwrap().contains("Changes"))
+            .unwrap();
+        click(&changes);
+        next_tick().await;
+        assert_eq!(query_all(&container, ".gp-file-row").len(), 1);
+        click(&query(&container, ".dock-tab[aria-label=Files]").unwrap());
+        next_tick().await;
+        assert!(query_all(&container, ".gp-file-row").is_empty());
+        click(&query(&container, ".dock-tab[aria-label=Git]").unwrap());
+        next_tick().await;
+        assert_eq!(
+            query_all(&container, ".gp-file-row").len(),
+            1,
+            "hiding Git must preserve section expansion"
+        );
+        assert!(draft.is_same_node(Some(&query(&container, ".gp-commit-input").unwrap())));
+        assert_eq!(draft.value(), "Keep this unsent commit");
+        click(&changes);
+        next_tick().await;
+        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+
+        state.toggle_sidebar(crate::sidebar_layout::SidebarSide::Left);
+        next_tick().await;
+        assert!(
+            query_all(&container, ".gp-file-row").is_empty(),
+            "a closed dock must defer rows even when Git remains its active tab"
+        );
+        state.activate_sidebar_tab(crate::sidebar_layout::SidebarTab::Git);
+        next_tick().await;
+        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        state.move_sidebar_tab(
+            crate::sidebar_layout::SidebarTab::Git,
+            crate::sidebar_layout::SidebarSide::Bottom,
+            None,
+        );
+        next_tick().await;
+        assert_eq!(query_all(&container, ".gp-file-row").len(), 65);
+        state.sidebar_storage_blocked.set(true);
+        next_tick().await;
+        assert!(query_all(&container, ".gp-file-row").is_empty());
+        state.sidebar_storage_blocked.set(false);
+        next_tick().await;
+        click(&query(&container, ".gp-file-btn[title='src/changed-63.rs']").unwrap());
+        next_tick().await;
+        assert!(
+            sent_lines_joined().contains("src/changed-63.rs"),
+            "remounted rows must retain their working-tree diff action"
         );
     }
 

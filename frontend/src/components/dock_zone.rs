@@ -194,17 +194,19 @@ pub fn SidebarPanels() -> impl IntoView {
         <For each=|| SidebarTab::ALL key=|tab| *tab children=move |tab| {
             // Every component has one lifetime; CSS grid placement moves its
             // existing DOM instead of recreating subscriptions or local state.
-            let style = move || {
-                if blocked.get() { return "display:none".into(); }
+            let placement = Memo::new(move |_| {
+                if blocked.get() { return None; }
                 layouts.with(|layouts| {
-                match [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom].into_iter().find(|side| layouts.current().pane(*side).active == Some(tab)) {
-                    Some(side) => {
-                        let pane = layouts.current().pane(side);
-                        if pane.visible && pane.active == Some(tab) { match side { SidebarSide::Bottom => "grid-column:1 / -1;grid-row:5".into(), _ => format!("grid-column:{};grid-row:2", side.column()) } } else { "display:none".into() }
-                    },
-                    None => "display:none".into(),
-                }
+                    [SidebarSide::Left, SidebarSide::Right, SidebarSide::Bottom].into_iter()
+                        .find(|side| layouts.current().pane(*side).active == Some(tab))
+                        .filter(|side| layouts.current().pane(*side).visible)
                 })
+            });
+            let visible = Signal::derive(move || placement.get().is_some());
+            let style = move || match placement.get() {
+                Some(SidebarSide::Bottom) => "grid-column:1 / -1;grid-row:5".into(),
+                Some(side) => format!("grid-column:{};grid-row:2", side.column()),
+                None => "display:none".into(),
             };
             view! {
                 <section class="dock-tab-mount sidebar-panel" aria-label=format!("{} panel", tab.label()) style=style>
@@ -212,7 +214,7 @@ pub fn SidebarPanels() -> impl IntoView {
                         SidebarTab::Agents => view! { <AgentsPanel /> }.into_any(),
                         SidebarTab::Sessions => view! { <SessionsPanel /> }.into_any(),
                         SidebarTab::Files => view! { <FileExplorer /> }.into_any(),
-                        SidebarTab::Git => view! { <GitPanel /> }.into_any(),
+                        SidebarTab::Git => view! { <GitPanel visible=visible /> }.into_any(),
                         SidebarTab::Search => view! { <SearchPanel /> }.into_any(),
                         SidebarTab::References => view! { <ReferencesPanel /> }.into_any(),
                         SidebarTab::Swarms => view! { <SwarmsPanel /> }.into_any(),
