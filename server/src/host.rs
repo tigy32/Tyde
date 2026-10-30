@@ -324,18 +324,52 @@ impl Drop for NewAgentFanoutBatchGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendSetupRefreshStep {
-    Setup,
-    SessionSchemas,
-    BackendConfigSnapshots,
+enum BackendSetupRefreshCommand {
+    Inventory,
+    AfterSetup,
 }
 
-const BACKEND_SETUP_REFRESH_ORDER: [BackendSetupRefreshStep; 3] = [
-    BackendSetupRefreshStep::Setup,
-    BackendSetupRefreshStep::SessionSchemas,
-    BackendSetupRefreshStep::BackendConfigSnapshots,
-];
+fn spawn_backend_setup_refresh_actor(
+    host: WeakHostHandle,
+    mut commands: mpsc::UnboundedReceiver<BackendSetupRefreshCommand>,
+) -> Result<(), String> {
+    let mut stopped = host.config.state.clone();
+    let worker = async move {
+        loop {
+            let command = tokio::select! {
+                command = commands.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+                changed = stopped.changed() => {
+                    if changed.is_err() { break; }
+                    continue;
+                },
+            };
+            let Some(host) = host.upgrade() else { break };
+            host.refresh_backend_setup_now(command).await;
+        }
+    };
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(worker);
+    } else {
+        std::thread::Builder::new()
+            .name("tyde-backend-setup-refresh".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(worker),
+                    Err(error) => {
+                        tracing::error!(%error, "cannot create backend setup refresh runtime")
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot start backend setup refresh actor: {error}"))?;
+    }
+    Ok(())
+}
 
 pub(crate) struct DeferredAgentAttachment {
     host_stream: StreamPath,
@@ -953,6 +987,8 @@ pub(crate) struct HostState {
     /// registrations do not start a second set.
     capacity_polling_started: bool,
     backend_setup: BackendSetupPayload,
+    #[cfg(feature = "test-support")]
+    backend_setup_refresh_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     backend_storage: crate::backend::BackendStorage,
     backend_probe_programs: HashMap<BackendKind, String>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1128,7 +1164,7 @@ pub struct HostHandle {
     restart: Arc<RestartShutdown>,
     state: Arc<StateOwner<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
-    backend_setup_refresh_lock: Arc<Mutex<()>>,
+    backend_setup_refresh_tx: mpsc::UnboundedSender<BackendSetupRefreshCommand>,
     /// Serializes the complete lifecycle of a host-settings apply — CAS
     /// read, commit, backend propagation, fanout, coupled refreshes, and
     /// result emission — across both write paths. Without it a slow
@@ -1349,7 +1385,7 @@ pub(crate) struct WeakHostHandle {
     restart: Weak<RestartShutdown>,
     state: Weak<StateOwner<HostState>>,
     workflow_save_lock: Weak<Mutex<()>>,
-    backend_setup_refresh_lock: Weak<Mutex<()>>,
+    backend_setup_refresh_tx: mpsc::UnboundedSender<BackendSetupRefreshCommand>,
     settings_apply_tx: mpsc::UnboundedSender<SettingsApplyCommand>,
     #[cfg(feature = "test-support")]
     task_usage_refresh_sync: mpsc::UnboundedSender<oneshot::Sender<()>>,
@@ -1364,7 +1400,7 @@ impl WeakHostHandle {
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
-            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            backend_setup_refresh_tx: host.backend_setup_refresh_tx.clone(),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
@@ -1379,7 +1415,7 @@ impl WeakHostHandle {
             restart: self.restart.upgrade()?,
             state: self.state.upgrade()?,
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
-            backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
+            backend_setup_refresh_tx: self.backend_setup_refresh_tx.clone(),
             settings_apply_tx: self.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
@@ -1397,7 +1433,7 @@ impl Clone for HostHandle {
             restart: Arc::clone(&self.restart),
             state: Arc::clone(&self.state),
             workflow_save_lock: Arc::clone(&self.workflow_save_lock),
-            backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
+            backend_setup_refresh_tx: self.backend_setup_refresh_tx.clone(),
             settings_apply_tx: self.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: self.task_usage_refresh_sync.clone(),
@@ -2663,6 +2699,15 @@ impl HostHandle {
                 .await
         };
         InstalledAgentNameGate { inner }
+    }
+
+    pub async fn install_backend_setup_refresh_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let shared = gate.shared();
+        self.state
+            .with(move |state| state.backend_setup_refresh_test_gate = Some(shared))
+            .await;
+        gate
     }
 
     pub async fn install_settings_lifecycle_test_gates(
@@ -4134,7 +4179,9 @@ impl HostHandle {
     pub(crate) async fn refresh_lazy_connection_catalogs(&self) {
         self.refresh_pending_session_discovery().await;
         self.refresh_backend_config_snapshots().await;
-        self.refresh_backend_setup().await;
+        if let Err(error) = self.refresh_backend_setup() {
+            tracing::error!(%error, "cannot refresh lazy connection backend setup");
+        }
     }
 
     async fn publish_new_agent_fanout(
@@ -11950,42 +11997,46 @@ std::ops::ControlFlow::Continue((
         mobile_access.unregister_push(device_id).await
     }
 
-    pub(crate) async fn refresh_backend_setup(&self) {
-        let Ok(refresh_guard) = self.backend_setup_refresh_lock.try_lock() else {
-            return;
-        };
-        let payload = self.collect_backend_setup_respecting_probe().await;
-        let changed = {
-            {
-                self.state
-                    .with(move |state| {
-                        let changed = state.backend_setup != payload;
-                        tracing::info!(
-                            changed,
-                            "refreshed backend installation state for new chat"
-                        );
-                        fan_out_backend_setup(state, payload);
-                        changed
-                    })
-                    .await
+    pub(crate) fn refresh_backend_setup(&self) -> AppResult<()> {
+        self.request_backend_setup_refresh(BackendSetupRefreshCommand::Inventory)
+    }
+
+    fn request_backend_setup_refresh(&self, command: BackendSetupRefreshCommand) -> AppResult<()> {
+        self.backend_setup_refresh_tx.send(command).map_err(|_| {
+            AppError::internal(
+                "backend_setup_refresh",
+                anyhow!("backend setup refresh actor stopped"),
+            )
+        })
+    }
+
+    async fn refresh_backend_setup_now(&self, command: BackendSetupRefreshCommand) {
+        #[cfg(feature = "test-support")]
+        {
+            let gate = self
+                .state
+                .with(|state| state.backend_setup_refresh_test_gate.clone())
+                .await;
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
-        };
-        if changed {
+        }
+        let payload = self.collect_backend_setup_respecting_probe().await;
+        let changed = self
+            .state
+            .with(move |state| {
+                let changed = state.backend_setup != payload;
+                tracing::info!(changed, "refreshed backend installation state for new chat");
+                fan_out_backend_setup(state, payload);
+                changed
+            })
+            .await;
+        // Installation and authentication completion must refresh dependent
+        // catalogs even when the installed CLI version did not change.
+        if changed || matches!(command, BackendSetupRefreshCommand::AfterSetup) {
             self.refresh_session_schemas_with_fanout(true).await;
             self.refresh_backend_config_snapshots_with_fanout(true)
                 .await;
-        }
-        drop(refresh_guard);
-    }
-
-    pub(crate) async fn fan_out_backend_setup(&self) {
-        let payload = self.collect_backend_setup_respecting_probe().await;
-        {
-            self.state
-                .with(move |state| {
-                    fan_out_backend_setup(state, payload);
-                })
-                .await
         }
     }
 
@@ -12515,23 +12566,6 @@ std::ops::ControlFlow::Continue((
             .await
     }
 
-    async fn refresh_after_backend_setup(&self) {
-        let refresh_guard = self.backend_setup_refresh_lock.lock().await;
-        for step in BACKEND_SETUP_REFRESH_ORDER {
-            match step {
-                BackendSetupRefreshStep::Setup => self.fan_out_backend_setup().await,
-                BackendSetupRefreshStep::SessionSchemas => {
-                    self.refresh_session_schemas_with_fanout(true).await
-                }
-                BackendSetupRefreshStep::BackendConfigSnapshots => {
-                    self.refresh_backend_config_snapshots_with_fanout(true)
-                        .await
-                }
-            }
-        }
-        drop(refresh_guard);
-    }
-
     pub(crate) async fn run_backend_setup(
         &self,
         connection_host_stream: &StreamPath,
@@ -12601,7 +12635,11 @@ std::ops::ControlFlow::Continue((
                     signal = exit.signal.as_deref(),
                     "host run_backend_setup terminal exited; refreshing backend state"
                 );
-                host.refresh_after_backend_setup().await;
+                if let Err(error) =
+                    host.request_backend_setup_refresh(BackendSetupRefreshCommand::AfterSetup)
+                {
+                    tracing::error!(%error, "cannot refresh backend state after setup");
+                }
             });
         }
         Ok(())
@@ -20109,6 +20147,8 @@ fn spawn_host_inner(
         capacity_polls_in_flight: HashSet::new(),
         capacity_polling_started: false,
         backend_setup: setup::stub_backend_setup(),
+        #[cfg(feature = "test-support")]
+        backend_setup_refresh_test_gate: None,
         backend_storage,
         backend_probe_programs: runtime_config.backend_probe_programs.clone(),
         #[cfg(any(test, feature = "test-support"))]
@@ -20190,6 +20230,7 @@ fn spawn_host_inner(
     });
     #[cfg(feature = "test-support")]
     let (task_usage_refresh_sync, task_usage_refresh_rx) = mpsc::unbounded_channel();
+    let (backend_setup_refresh_tx, backend_setup_refresh_rx) = mpsc::unbounded_channel();
     let host = HostHandle {
         project_catalog: project_store.clone(),
         config,
@@ -20200,7 +20241,7 @@ fn spawn_host_inner(
         }),
         state: Arc::new(state),
         workflow_save_lock: Arc::new(Mutex::new(())),
-        backend_setup_refresh_lock: Arc::new(Mutex::new(())),
+        backend_setup_refresh_tx,
         settings_apply_tx,
         #[cfg(feature = "test-support")]
         task_usage_refresh_sync,
@@ -20212,6 +20253,7 @@ fn spawn_host_inner(
     debug_host_binding.bind_host(&host)?;
     project_catalog_actor.start(WeakHostHandle::downgrade(&host))?;
     spawn_settings_apply_actor(WeakHostHandle::downgrade(&host), settings_apply_rx);
+    spawn_backend_setup_refresh_actor(WeakHostHandle::downgrade(&host), backend_setup_refresh_rx)?;
     let spawn_operation_worker = spawn_host_spawn_operation_task(
         WeakHostHandle {
             config: host.config.clone(),
@@ -20219,7 +20261,7 @@ fn spawn_host_inner(
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
-            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            backend_setup_refresh_tx: host.backend_setup_refresh_tx.clone(),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),
@@ -20248,7 +20290,7 @@ fn spawn_host_inner(
             restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
-            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            backend_setup_refresh_tx: host.backend_setup_refresh_tx.clone(),
             settings_apply_tx: host.settings_apply_tx.clone(),
             #[cfg(feature = "test-support")]
             task_usage_refresh_sync: host.task_usage_refresh_sync.clone(),

@@ -381,7 +381,7 @@ pub(crate) async fn route_client_envelope(
             FrameKind::BackendSetupRefresh => {
                 let _: protocol::BackendSetupRefreshPayload =
                     parse_payload(&envelope, "backend_setup_refresh")?;
-                host.refresh_backend_setup().await;
+                host.refresh_backend_setup()?;
             }
             FrameKind::BackendSettingsRefresh => {
                 let payload: BackendSettingsRefreshPayload =

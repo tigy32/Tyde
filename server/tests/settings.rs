@@ -816,14 +816,100 @@ fn generated_alias_never_overrides_user_alias() {
 }
 
 #[tokio::test]
-async fn backend_setup_refresh_republishes_without_reconnecting() {
+async fn backend_setup_refresh_republishes_without_blocking_agent_lifecycle() {
     let mut fixture = Fixture::new().await;
-    for _ in 0..2 {
-        fixture
-            .client
-            .backend_setup_refresh()
-            .await
-            .expect("request setup refresh");
+    let gate = fixture
+        .host_for_test()
+        .install_backend_setup_refresh_test_gate()
+        .await;
+    fixture
+        .client
+        .backend_setup_refresh()
+        .await
+        .expect("request setup refresh");
+    gate.wait_until_entered().await;
+    fixture
+        .client
+        .backend_setup_refresh()
+        .await
+        .expect("queue another setup refresh");
+
+    // The probe cannot finish until after this entire same-connection flow.
+    // Awaiting discovery in the connection router deadlocks at spawn instead.
+    let agent = fixture
+        .spawn_scripted(
+            "inventory-independent",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::text(
+                "inventory-independent reply",
+            )),
+        )
+        .await;
+    let turn = fixture.finish_turn(&agent).await;
+    assert!(
+        turn.chat_events().iter().any(|event| matches!(
+            event, protocol::ChatEvent::StreamEnd(end)
+                if end.message.content == "inventory-independent reply"
+        )),
+        "the ordinary launch turn must complete while inventory is held"
+    );
+    let (_, opened) = fixture.connect_with_bootstrap().await;
+    assert_eq!(opened.agents.len(), 1);
+    assert_eq!(opened.agents[0].agent_id, agent.new_agent.agent_id);
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close while discovery is held");
+    next_frame_matching_on(
+        &mut fixture.client,
+        "agent closed before inventory completion",
+        |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::BackendSetup,
+                "discovery barrier must still be held"
+            );
+            env.kind == FrameKind::AgentClosed
+        },
+    )
+    .await;
+    let (_, closed) = fixture.connect_with_bootstrap().await;
+    assert!(closed.agents.is_empty());
+    fixture
+        .client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: None,
+            cursor: None,
+            limit: None,
+        })
+        .await
+        .expect("list saved session while discovery is held");
+    let saved: protocol::SessionListPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "saved session before inventory completion",
+        |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::BackendSetup,
+                "discovery barrier must still be held"
+            );
+            env.kind == FrameKind::SessionList
+        },
+    )
+    .await
+    .parse_payload()
+    .expect("saved session list");
+    assert_eq!(saved.page.total_count, 1);
+    assert_eq!(saved.sessions.len(), 1);
+    eprintln!(
+        "BACKEND REFRESH EVIDENCE: held inventory; same-connection launch, exact reply, idle, reconnect, close and saved catalog completed"
+    );
+
+    for ordinal in 0..2 {
+        if ordinal > 0 {
+            gate.wait_until_entered().await;
+        }
+        gate.release_one();
         let envelope = next_frame_matching_on(
             &mut fixture.client,
             "fresh backend installation state",
@@ -834,6 +920,9 @@ async fn backend_setup_refresh_republishes_without_reconnecting() {
             envelope.parse_payload().expect("backend setup");
         assert_eq!(payload, fixture.bootstrap.backend_setup);
     }
+    eprintln!(
+        "BACKEND REFRESH EVIDENCE: both queued inventory refreshes published after explicit release"
+    );
 }
 
 #[tokio::test]
