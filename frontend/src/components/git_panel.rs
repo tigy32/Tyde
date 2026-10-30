@@ -5,7 +5,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, DiffKey, DiffViewState, next_client_request_id, root_display_name};
+use crate::state::{
+    ActiveProjectRef, AppState, DiffKey, DiffViewState, next_client_request_id, root_display_name,
+};
 
 use protocol::{
     FrameKind, ProjectDiffRevision, ProjectDiffScope, ProjectDiscardFilePayload,
@@ -58,7 +60,7 @@ struct HistoricalCommitSource<'a> {
     commits: &'a [ProjectGitCommitSummary],
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct HistoricalCommitList {
     scope: HistoryScope,
     empty_tree_oid: Option<String>,
@@ -143,6 +145,22 @@ pub fn GitPanel(#[prop(default = Signal::derive(|| true))] visible: Signal<bool>
             .cloned()
             .map(|roots| (project, roots))
     });
+    let has_status = Memo::new(move |_| git_roots.with(Option::is_some));
+    let root_scopes = Memo::new(move |_| {
+        git_roots.with(|status| {
+            status
+                .iter()
+                .flat_map(|(project, roots)| {
+                    roots.iter().map(|root| HistoryScope {
+                        host_id: project.host_id.clone(),
+                        project_id: project.project_id.clone(),
+                        root: root.root.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    let multi_root = Memo::new(move |_| root_scopes.with(|scopes| scopes.len() > 1));
 
     let viewport = FileListViewport::new();
     let body = NodeRef::<leptos::html::Div>::new();
@@ -186,33 +204,59 @@ pub fn GitPanel(#[prop(default = Signal::derive(|| true))] visible: Signal<bool>
             >
                 <div node_ref=body>
                     <ReviewCard />
-                    {move || {
-                        match git_roots.get() {
-                            Some((project, roots)) => {
-                                let multi_root = roots.len() > 1;
-                                roots.into_iter().map(|root| {
-                                    view! {
-                                        <GitRootSection
-                                            host_id=project.host_id.clone()
-                                            project_id=project.project_id.clone()
-                                            root=root
-                                            multi_root=multi_root
-                                            signals=signals
-                                            visible=visible
-                                            viewport=viewport
-                                        />
-                                    }.into_any()
-                                }).collect()
+                    <Show
+                        when=move || has_status.get()
+                        fallback=|| view! { <div class="panel-empty">"No git status"</div> }
+                    >
+                        // Keyed by host, project and root, so a status refresh
+                        // updates each root's section in place and keeps what
+                        // the user is editing there.
+                        <For
+                            each=move || root_scopes.get()
+                            key=|scope| scope.clone()
+                            children=move |scope| {
+                                let status = root_status(git_roots, scope.clone());
+                                view! {
+                                    <GitRootSection
+                                        scope=scope
+                                        status=status
+                                        multi_root=multi_root
+                                        signals=signals
+                                        visible=visible
+                                        viewport=viewport
+                                    />
+                                }
                             }
-                            None => vec![view! {
-                                <div class="panel-empty">"No git status"</div>
-                            }.into_any()],
-                        }
-                    }}
+                        />
+                    </Show>
                 </div>
             </div>
         </div>
     }
+}
+
+/// The live status of the root `scope` names within the panel's project.
+fn root_status(
+    git_roots: Memo<Option<(ActiveProjectRef, Vec<ProjectRootGitStatus>)>>,
+    scope: HistoryScope,
+) -> Memo<ProjectRootGitStatus> {
+    Memo::new(move |previous: Option<&ProjectRootGitStatus>| {
+        git_roots
+            .with(|status| {
+                status
+                    .as_ref()
+                    .filter(|(project, _)| {
+                        project.host_id == scope.host_id && project.project_id == scope.project_id
+                    })
+                    .and_then(|(_, roots)| {
+                        roots.iter().find(|root| root.root == scope.root).cloned()
+                    })
+            })
+            // Only while the keyed list drops a section whose root has left
+            // the status, in the same flush.
+            .or_else(|| previous.cloned())
+            .expect("a Git root section is built from its root's status")
+    })
 }
 
 /// Hidden while there is nothing to review and nothing reviewed, so a clean
@@ -850,122 +894,97 @@ fn commit_aria_label(commit: &ProjectGitCommitSummary) -> String {
 
 #[component]
 fn GitRootSection(
-    host_id: String,
-    project_id: protocol::ProjectId,
-    root: ProjectRootGitStatus,
-    multi_root: bool,
+    scope: HistoryScope,
+    status: Memo<ProjectRootGitStatus>,
+    multi_root: Memo<bool>,
     signals: PanelSignals,
     visible: Signal<bool>,
     viewport: FileListViewport,
 ) -> impl IntoView {
-    let scope = HistoryScope {
-        host_id: host_id.clone(),
-        project_id: project_id.clone(),
-        root: root.root.clone(),
+    let files_where = move |keep: fn(&ProjectGitFileStatus) -> bool| {
+        Memo::new(move |_| {
+            status.with(|root| {
+                root.files
+                    .iter()
+                    .filter(|file| keep(file))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        })
     };
-    let list = HistoricalCommitList {
-        scope: scope.clone(),
-        empty_tree_oid: root.empty_tree_oid.clone(),
-        commits: root.recent_commits.clone(),
-    };
-    let history_has_more = root.history_has_more;
-    let conflicts: Vec<_> = root
-        .files
-        .iter()
-        .filter(|f| {
-            f.staged == Some(ProjectGitChangeKind::Unmerged)
-                || f.unstaged == Some(ProjectGitChangeKind::Unmerged)
+    let conflicts = files_where(is_conflicted);
+    let staged = files_where(|f| f.staged.is_some() && !is_conflicted(f));
+    let unstaged = files_where(|f| f.unstaged.is_some() && !is_conflicted(f) && !f.untracked);
+    let untracked = files_where(|f| f.untracked);
+    let history_list_scope = scope.clone();
+    let history = Memo::new(move |_| {
+        status.with(|root| {
+            let list = HistoricalCommitList {
+                scope: history_list_scope.clone(),
+                empty_tree_oid: root.empty_tree_oid.clone(),
+                commits: root.recent_commits.clone(),
+            };
+            (list, root.history_has_more)
         })
-        .cloned()
-        .collect();
-    let staged: Vec<_> = root
-        .files
-        .iter()
-        .filter(|f| {
-            f.staged.is_some()
-                && f.staged != Some(ProjectGitChangeKind::Unmerged)
-                && f.unstaged != Some(ProjectGitChangeKind::Unmerged)
-        })
-        .cloned()
-        .collect();
-    let unstaged: Vec<_> = root
-        .files
-        .iter()
-        .filter(|f| {
-            f.unstaged.is_some()
-                && f.unstaged != Some(ProjectGitChangeKind::Unmerged)
-                && f.staged != Some(ProjectGitChangeKind::Unmerged)
-                && !f.untracked
-        })
-        .cloned()
-        .collect();
-    let untracked: Vec<_> = root.files.iter().filter(|f| f.untracked).cloned().collect();
-
-    let list = StoredValue::new(list);
-    let conflicts = StoredValue::new(conflicts);
-    let staged = StoredValue::new(staged);
-    let unstaged = StoredValue::new(unstaged);
-    let untracked = StoredValue::new(untracked);
-    let root_path = root.root.clone();
-    let root_handle = StoredValue::new(root.root.clone());
+    });
+    let root_handle = StoredValue::new(scope.root.clone());
     let conflicts_expanded = RwSignal::new(true);
     let staged_expanded = RwSignal::new(true);
     let unstaged_expanded = RwSignal::new(true);
     let untracked_expanded = RwSignal::new(true);
     let commit_open = RwSignal::new(false);
 
-    let conflicts_count = conflicts.with_value(Vec::len);
-    let staged_count = staged.with_value(Vec::len);
-    let unstaged_count = unstaged.with_value(Vec::len);
-    let untracked_count = untracked.with_value(Vec::len);
-    let changed_count = root.files.len();
+    let has_conflicts = move || !conflicts.with(Vec::is_empty);
+    let has_staged = move || !staged.with(Vec::is_empty);
+    let has_unstaged = move || !unstaged.with(Vec::is_empty);
+    let has_untracked = move || !untracked.with(Vec::is_empty);
+    let clean = Memo::new(move |_| status.with(|root| root.clean));
 
-    let has_conflicts = conflicts_count != 0;
-    let has_staged = staged_count != 0;
-    let has_unstaged = unstaged_count != 0;
-    let has_untracked = untracked_count != 0;
-    let clean = root.clean;
+    let root_label = root_display_name(&scope.root);
+    let root_title = scope.root.0.clone();
+    let branch_label = Memo::new(move |_| {
+        status.with(|root| root.branch.clone().unwrap_or_else(|| "--".to_owned()))
+    });
 
-    let root_label = root_display_name(&root.root);
-    let root_title = root.root.0.clone();
-    let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
-    let branch_title = branch_label.clone();
-
-    let ahead_behind = if root.ahead > 0 || root.behind > 0 {
-        let mut parts = Vec::new();
-        let mut spelled = Vec::new();
-        if root.ahead > 0 {
-            parts.push(format!("\u{2191}{}", root.ahead));
-            spelled.push(format!("{} ahead", root.ahead));
-        }
-        if root.behind > 0 {
-            parts.push(format!("\u{2193}{}", root.behind));
-            spelled.push(format!("{} behind", root.behind));
-        }
-        Some((parts.join(" "), spelled.join(", ")))
-    } else {
-        None
-    };
+    let ahead_behind = Memo::new(move |_| {
+        status.with(|root| {
+            if root.ahead == 0 && root.behind == 0 {
+                return None;
+            }
+            let mut parts = Vec::new();
+            let mut spelled = Vec::new();
+            if root.ahead > 0 {
+                parts.push(format!("\u{2191}{}", root.ahead));
+                spelled.push(format!("{} ahead", root.ahead));
+            }
+            if root.behind > 0 {
+                parts.push(format!("\u{2193}{}", root.behind));
+                spelled.push(format!("{} behind", root.behind));
+            }
+            Some((parts.join(" "), spelled.join(", ")))
+        })
+    });
     // The row reserves more width for its labels when it carries counts, and
     // that has to be stated here: inferring it in the stylesheet would rest the
     // root name's floor on a selector the webview might not support.
-    let toggle_class = if ahead_behind.is_some() {
-        "gp-root-toggle gp-root-toggle-counted"
-    } else {
-        "gp-root-toggle"
+    let toggle_class = move || {
+        if ahead_behind.with(Option::is_some) {
+            "gp-root-toggle gp-root-toggle-counted"
+        } else {
+            "gp-root-toggle"
+        }
     };
 
     // A lone root is always open. With several, dirty roots open and clean
     // ones collapse to their header line, so a project with many clean
     // roots stays one line per root. An explicit toggle wins over the
     // default and survives status refreshes.
-    let default_expanded = !multi_root || !clean;
     let expansion_scope = scope.clone();
     let expanded = Memo::new(move |_| {
         signals
             .root_expansion
             .with(|map| map.get(&expansion_scope).copied())
-            .unwrap_or(default_expanded)
+            .unwrap_or_else(|| !multi_root.get() || !clean.get())
     });
     let history_scope = scope.clone();
     let history_on = Memo::new(move |_| {
@@ -1014,7 +1033,7 @@ fn GitRootSection(
     // falls back to computing from the loaded `Review` (also root-filtered)
     // when the summary carries no per-file counts yet.
     let counts_state = state.clone();
-    let counts_root = root_path.clone();
+    let counts_root = scope.root.clone();
     let file_counts: Memo<HashMap<String, u32>> = Memo::new(move |_| {
         let Some(ap) = counts_state.active_project.get() else {
             return HashMap::new();
@@ -1052,31 +1071,35 @@ fn GitRootSection(
         })
     });
 
-    let state_label = if clean {
-        (
-            "gp-root-state clean",
-            "\u{2713}".to_owned(),
-            "Working tree clean".to_owned(),
-        )
-    } else if has_conflicts {
-        (
-            "gp-root-state conflicts",
-            format!(
-                "{conflicts_count} conflict{}",
-                if conflicts_count == 1 { "" } else { "s" }
-            ),
-            format!("{changed_count} changed files, {conflicts_count} unmerged"),
-        )
-    } else {
-        (
-            "gp-root-state",
-            changed_count.to_string(),
-            format!(
-                "{changed_count} changed file{}",
-                if changed_count == 1 { "" } else { "s" }
-            ),
-        )
-    };
+    let state_label = Memo::new(move |_| {
+        let changed_count = status.with(|root| root.files.len());
+        let conflicts_count = conflicts.with(Vec::len);
+        if clean.get() {
+            (
+                "gp-root-state clean",
+                "\u{2713}".to_owned(),
+                "Working tree clean".to_owned(),
+            )
+        } else if conflicts_count != 0 {
+            (
+                "gp-root-state conflicts",
+                format!(
+                    "{conflicts_count} conflict{}",
+                    if conflicts_count == 1 { "" } else { "s" }
+                ),
+                format!("{changed_count} changed files, {conflicts_count} unmerged"),
+            )
+        } else {
+            (
+                "gp-root-state",
+                changed_count.to_string(),
+                format!(
+                    "{changed_count} changed file{}",
+                    if changed_count == 1 { "" } else { "s" }
+                ),
+            )
+        }
+    });
 
     view! {
         <section class="gp-root" data-test="gp-root" data-root=root_title.clone()>
@@ -1091,14 +1114,20 @@ fn GitRootSection(
                         {move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}
                     </span>
                     <span class="gp-root-name" title=root_title.clone()>{root_label}</span>
-                    <span class="gp-root-branch" title=branch_title>{branch_label}</span>
-                    {ahead_behind.map(|(ab, ab_title)| view! {
+                    <span class="gp-root-branch" title=move || branch_label.get()>
+                        {move || branch_label.get()}
+                    </span>
+                    {move || ahead_behind.get().map(|(ab, ab_title)| view! {
                         <span class="gp-root-ahead-behind" title=ab_title>{ab}</span>
                     })}
                 </button>
                 <div class="gp-root-meta">
-                    <span class=state_label.0 data-test="gp-root-state" title=state_label.2>
-                        {state_label.1}
+                    <span
+                        class=move || state_label.with(|label| label.0)
+                        data-test="gp-root-state"
+                        title=move || state_label.with(|label| label.2.clone())
+                    >
+                        {move || state_label.with(|label| label.1.clone())}
                     </span>
                     <button
                         class="gp-root-history-toggle"
@@ -1119,14 +1148,13 @@ fn GitRootSection(
                 <Show
                     when=move || history_on.get()
                     fallback=move || view! {
-                            <Show when=move || clean>
+                            <Show when=move || clean.get()>
                                 <div class="gp-clean">"\u{2713} Working tree clean"</div>
                             </Show>
-                            <Show when=move || has_conflicts>
+                            <Show when=has_conflicts>
                                 <GitFileSection
                                     title="Conflicts"
-                                    count=conflicts_count
-                                    files=conflicts.get_value()
+                                    files=conflicts
                                     expanded=conflicts_expanded
                                     scope=ProjectDiffScope::Unstaged
                                     root_path=root_handle.get_value()
@@ -1138,11 +1166,10 @@ fn GitRootSection(
                                     viewport=viewport
                                 />
                             </Show>
-                            <Show when=move || has_staged>
+                            <Show when=has_staged>
                                 <GitFileSection
                                     title="Staged"
-                                    count=staged_count
-                                    files=staged.get_value()
+                                    files=staged
                                     expanded=staged_expanded
                                     scope=ProjectDiffScope::Staged
                                     root_path=root_handle.get_value()
@@ -1173,6 +1200,7 @@ fn GitRootSection(
                                                 if !msg.trim().is_empty() {
                                                     send_commit(root_handle.get_value(), msg);
                                                     commit_message.set(String::new());
+                                                    commit_open.set(false);
                                                 }
                                             }
                                         >
@@ -1181,11 +1209,10 @@ fn GitRootSection(
                                     </div>
                                 </Show>
                             </Show>
-                            <Show when=move || has_unstaged>
+                            <Show when=has_unstaged>
                                 <GitFileSection
                                     title="Changes"
-                                    count=unstaged_count
-                                    files=unstaged.get_value()
+                                    files=unstaged
                                     expanded=unstaged_expanded
                                     scope=ProjectDiffScope::Unstaged
                                     root_path=root_handle.get_value()
@@ -1197,11 +1224,10 @@ fn GitRootSection(
                                     viewport=viewport
                                 />
                             </Show>
-                            <Show when=move || has_untracked>
+                            <Show when=has_untracked>
                                 <GitFileSection
                                     title="Untracked"
-                                    count=untracked_count
-                                    files=untracked.get_value()
+                                    files=untracked
                                     expanded=untracked_expanded
                                     scope=ProjectDiffScope::Unstaged
                                     root_path=root_handle.get_value()
@@ -1215,15 +1241,25 @@ fn GitRootSection(
                             </Show>
                     }
                 >
-                    <RecentCommits
-                        list=list
-                        history_has_more=history_has_more
-                        signals=signals
-                    />
+                    {move || {
+                        let (list, history_has_more) = history.get();
+                        view! {
+                            <RecentCommits
+                                list=StoredValue::new(list)
+                                history_has_more=history_has_more
+                                signals=signals
+                            />
+                        }
+                    }}
                 </Show>
             </Show>
         </section>
     }
+}
+
+fn is_conflicted(file: &ProjectGitFileStatus) -> bool {
+    file.staged == Some(ProjectGitChangeKind::Unmerged)
+        || file.unstaged == Some(ProjectGitChangeKind::Unmerged)
 }
 
 #[component]
@@ -1463,8 +1499,7 @@ fn diff_label(root: &ProjectRootPath, path: &str, revision: &ProjectDiffRevision
 #[component]
 fn GitFileSection(
     title: &'static str,
-    count: usize,
-    files: Vec<ProjectGitFileStatus>,
+    files: Memo<Vec<ProjectGitFileStatus>>,
     expanded: RwSignal<bool>,
     scope: ProjectDiffScope,
     root_path: ProjectRootPath,
@@ -1481,21 +1516,32 @@ fn GitFileSection(
 ) -> impl IntoView {
     let toggle = move |_| expanded.update(|v| *v = !*v);
 
-    // Bulk action data
-    let bulk_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
-    let bulk_root = root_path.clone();
     let root_path = StoredValue::new(root_path);
+    // Bulk actions act on the files the latest status lists.
+    let for_each_path = move |act: fn(ProjectRootPath, String)| {
+        let paths: Vec<String> =
+            files.with_untracked(|files| files.iter().map(|f| f.relative_path.clone()).collect());
+        for path in paths {
+            act(root_path.get_value(), path);
+        }
+    };
 
     // Only rows near the scroller are constructed; padding stands in for the
     // rest so the list keeps its full height and every row its position.
-    let total = files.len();
-    let files = StoredValue::new(files);
+    let total = Memo::new(move |_| files.with(Vec::len));
     let shown = move || visible.get() && expanded.get();
-    let window = RwSignal::new((0, total.min(FILE_ROWS_BEFORE_MEASUREMENT)));
+    let window = RwSignal::new((0, total.get_untracked().min(FILE_ROWS_BEFORE_MEASUREMENT)));
+    // A refresh can shorten the list before its window is re-derived.
+    let rows = move || {
+        let (start, end) = window.get();
+        let total = total.get();
+        (start.min(total), end.min(total))
+    };
     let row_px = RwSignal::new(FILE_ROW_PX_ESTIMATE);
     let list_ref = NodeRef::<leptos::html::Div>::new();
     Effect::new(move |_| {
         viewport.geometry.track();
+        let total = total.get();
         if !shown() {
             return;
         }
@@ -1525,7 +1571,7 @@ fn GitFileSection(
                 <button class="gp-section-header" on:click=toggle>
                     <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
                     <span class="gp-section-title">{title}</span>
-                    <span class="gp-section-count">{count}</span>
+                    <span class="gp-section-count">{move || total.get()}</span>
                 </button>
                 <div class="gp-section-actions">
                     {commit_toggle.map(|open| view! {
@@ -1539,39 +1585,23 @@ fn GitFileSection(
                             "Commit\u{2026}"
                         </button>
                     })}
-                    {show_stage_btn.then(|| {
-                        let root = bulk_root.clone();
-                        let paths = bulk_paths.clone();
-                        view! {
-                            <button
-                                class="gp-section-action"
-                                title="Stage all"
-                                on:click=move |_| {
-                                    for path in &paths {
-                                        stage_file(root.clone(), path.clone());
-                                    }
-                                }
-                            >
-                                "++"
-                            </button>
-                        }
+                    {show_stage_btn.then(|| view! {
+                        <button
+                            class="gp-section-action"
+                            title="Stage all"
+                            on:click=move |_| for_each_path(stage_file)
+                        >
+                            "++"
+                        </button>
                     })}
-                    {show_unstage_btn.then(|| {
-                        let root = bulk_root.clone();
-                        let paths = bulk_paths.clone();
-                        view! {
-                            <button
-                                class="gp-section-action"
-                                title="Unstage all"
-                                on:click=move |_| {
-                                    for path in &paths {
-                                        unstage_file(root.clone(), path.clone());
-                                    }
-                                }
-                            >
-                                "\u{2212}\u{2212}"
-                            </button>
-                        }
+                    {show_unstage_btn.then(|| view! {
+                        <button
+                            class="gp-section-action"
+                            title="Unstage all"
+                            on:click=move |_| for_each_path(unstage_file)
+                        >
+                            "\u{2212}\u{2212}"
+                        </button>
                     })}
                 </div>
             </div>
@@ -1581,18 +1611,27 @@ fn GitFileSection(
                     class="gp-section-files"
                     node_ref=list_ref
                     style:padding-top=move || {
-                        format!("{}px", window.get().0 as f64 * row_px.get())
+                        format!("{}px", rows().0 as f64 * row_px.get())
                     }
                     style:padding-bottom=move || {
-                        format!("{}px", (total - window.get().1) as f64 * row_px.get())
+                        format!("{}px", (total.get() - rows().1) as f64 * row_px.get())
                     }
                 >
+                    // A row shows its file's whole status, so a changed status
+                    // rebuilds that row and leaves the others in place.
                     <For
                         each=move || {
-                            let (start, end) = window.get();
-                            files.with_value(|files| files[start..end].to_vec())
+                            let (start, end) = rows();
+                            files.with(|files| files[start..end].to_vec())
                         }
-                        key=|file| file.relative_path.clone()
+                        key=|file| {
+                            (
+                                file.relative_path.clone(),
+                                file.staged.as_ref().map(std::mem::discriminant),
+                                file.unstaged.as_ref().map(std::mem::discriminant),
+                                file.untracked,
+                            )
+                        }
                         children=move |file| view! {
                             <GitFileRow
                                 file=file
@@ -3243,13 +3282,17 @@ mod wasm_tests {
         );
         assert!(draft.is_same_node(Some(&query(&container, ".gp-commit-input").unwrap())));
         assert_eq!(draft.value(), "Keep this unsent commit");
-        // Every status refresh re-creates the root section, which re-mounts
-        // the commit form closed; close it now so the refresh below measures
-        // only the file list.
-        click(&query(&container, "[data-test=gp-commit-toggle]").unwrap());
         click(&changes);
+        let staged_header = query_all(&container, ".gp-section-header")
+            .into_iter()
+            .find(|header| header.text_content().unwrap().contains("Staged"))
+            .unwrap();
+        click(&staged_header);
         next_frame().await;
+        assert!(query(&container, ".gp-file-btn[title='src/staged.rs']").is_none());
         assert_changes_window(&container, changed, "expanding Changes");
+        draft.focus().unwrap();
+        draft.set_selection_range(5, 9).unwrap();
 
         scroll_to_change(&container, 4000).await;
         let deep = assert_changes_window(&container, changed, "scrolling deep");
@@ -3265,15 +3308,95 @@ mod wasm_tests {
                 .map(|row| query(&row, ".gp-file-btn").unwrap().get_attribute("title"))
         };
         let top_before = file_at_top(&container);
+        // A real status change while the user is mid-commit: one more staged
+        // file, a changed file deleted, and the branch a commit ahead.
         let mut refreshed = dirty.clone();
         refreshed.ahead = 1;
+        refreshed.files.push(ProjectGitFileStatus {
+            relative_path: "src/also-staged.rs".to_owned(),
+            staged: Some(ProjectGitChangeKind::Added),
+            unstaged: None,
+            untracked: false,
+        });
+        refreshed
+            .files
+            .iter_mut()
+            .find(|file| file.relative_path == changed_path(4000))
+            .unwrap()
+            .unstaged = Some(ProjectGitChangeKind::Deleted);
         send_status(1, vec![refreshed]);
         next_frame().await;
+        assert!(
+            query(&container, ".gp-commit-input")
+                .is_some_and(|input| draft.is_same_node(Some(&input))),
+            "a status refresh must keep the open commit form"
+        );
+        assert_eq!(draft.value(), "Keep this unsent commit");
+        let document = web_sys::window().unwrap().document().unwrap();
+        assert!(
+            document
+                .active_element()
+                .is_some_and(|focused| focused.is_same_node(Some(&draft))),
+            "a status refresh must keep focus in the commit message"
+        );
+        assert_eq!(
+            (draft.selection_start(), draft.selection_end()),
+            (Ok(Some(5)), Ok(Some(9))),
+            "a status refresh must keep the caret selection"
+        );
+        let section_count = |title: &str| {
+            query_all(&container, ".gp-section-header")
+                .into_iter()
+                .find(|header| header.text_content().unwrap().contains(title))
+                .and_then(|header| query(&header, ".gp-section-count"))
+                .and_then(|count| count.text_content())
+        };
+        assert_eq!(section_count("Staged").as_deref(), Some("2"));
+        assert!(
+            query(&container, ".gp-file-btn[title='src/also-staged.rs']").is_none(),
+            "a status refresh must keep a collapsed section collapsed"
+        );
         assert_changes_window(&container, changed, "refreshing while scrolled");
         assert_eq!(
             file_at_top(&container),
             top_before,
             "a status refresh must keep the file under the top of the view"
+        );
+        let deleted = query_all(&container, ".gp-file-btn")
+            .into_iter()
+            .find(|row| row.get_attribute("title") == Some(changed_path(4000)))
+            .expect("the refreshed row stays built");
+        assert_eq!(
+            query(&deleted, ".gp-status-icon")
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("D"),
+            "a refreshed row must show its file's current status"
+        );
+        assert_eq!(
+            query(&container, "[data-test=gp-root-state]")
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some((changed + 2).to_string().as_str())
+        );
+        assert_eq!(
+            query(&container, ".gp-root-ahead-behind")
+                .and_then(|ahead| ahead.text_content())
+                .as_deref(),
+            Some("\u{2191}1")
+        );
+        click(
+            &query_all(&container, ".gp-section-action")
+                .into_iter()
+                .find(|action| action.get_attribute("title").as_deref() == Some("Unstage all"))
+                .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            sent_lines_joined().contains("src/also-staged.rs"),
+            "a bulk action must act on the refreshed files"
         );
 
         // The Font Size setting's range is 11px..=20px. The theme's monospace
@@ -4154,20 +4277,28 @@ mod wasm_tests {
 
     /// The commit message box is behind the Staged section's "Commit…"
     /// action, so a root with staged files does not permanently spend the
-    /// space, and committing sends the typed message for that root.
+    /// space, and committing sends the typed message for that root and closes
+    /// the box. The form and its draft belong to one root of one project: a
+    /// status refresh keeps them, and no other root, nor a root at the same
+    /// path in another project, shows them.
     #[wasm_bindgen_test]
     async fn commit_form_is_behind_the_staged_commit_action() {
         record_bridge();
         let container = make_container();
-        let _mounted =
-            mount_git_panel_with_root(container.clone(), false, root_with_staged("/repo"));
+        let mounted = mount_git_panel_with_roots(
+            container.clone(),
+            false,
+            vec![root_with_staged("/repo"), root_with_staged("/other")],
+        );
         next_tick().await;
 
         assert!(
             query(&container, ".gp-commit-input").is_none(),
             "the commit box must not render until asked for"
         );
-        let toggle = query(&container, "[data-test=gp-commit-toggle]").expect("commit action");
+        let toggles = query_all(&container, "[data-test=gp-commit-toggle]");
+        assert_eq!(toggles.len(), 2);
+        let toggle = toggles[0].clone();
         assert_eq!(
             toggle.get_attribute("aria-expanded").as_deref(),
             Some("false")
@@ -4178,10 +4309,19 @@ mod wasm_tests {
             toggle.get_attribute("aria-expanded").as_deref(),
             Some("true")
         );
+        assert_eq!(
+            toggles[1].get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "opening one root's commit box leaves the other root's closed"
+        );
         let input: web_sys::HtmlTextAreaElement = query(&container, ".gp-commit-input")
             .expect("commit box")
             .dyn_into()
             .unwrap();
+        assert!(
+            input.closest("[data-root='/repo']").unwrap().is_some(),
+            "the commit box opens in the root whose action was used"
+        );
         let commit_button = query(&container, ".gp-commit-btn").expect("commit button");
         assert!(commit_button.has_attribute("disabled"));
 
@@ -4191,6 +4331,34 @@ mod wasm_tests {
             .unwrap();
         next_tick().await;
         assert!(!commit_button.has_attribute("disabled"));
+
+        let state = mounted.borrow().clone().unwrap();
+        let mut other = root_with_staged("/other");
+        other.files.push(ProjectGitFileStatus {
+            relative_path: "src/new.rs".to_owned(),
+            staged: Some(ProjectGitChangeKind::Added),
+            unstaged: None,
+            untracked: false,
+        });
+        state.git_status.update(|statuses| {
+            statuses.insert(
+                ProjectId("proj-1".to_owned()),
+                vec![root_with_staged("/repo"), other],
+            );
+        });
+        next_tick().await;
+        assert!(
+            query(&container, ".gp-file-btn[title='src/new.rs']").is_some(),
+            "the refresh reached the panel"
+        );
+        assert!(
+            query(&container, ".gp-commit-input")
+                .is_some_and(|current| input.is_same_node(Some(&current))),
+            "a status refresh must keep the open commit box"
+        );
+        assert_eq!(input.value(), "Fix staged thing");
+        assert_eq!(query_all(&container, ".gp-commit-input").len(), 1);
+
         click(&commit_button);
         next_tick().await;
         let sent = sent_lines_joined();
@@ -4202,7 +4370,52 @@ mod wasm_tests {
             sent.contains("/repo"),
             "the commit targets its root; sent: {sent}"
         );
+        assert!(
+            query(&container, ".gp-commit-input").is_none(),
+            "committing closes the commit box"
+        );
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        click(&toggle);
+        next_tick().await;
+        let input: web_sys::HtmlTextAreaElement = query(&container, ".gp-commit-input")
+            .expect("commit box")
+            .dyn_into()
+            .unwrap();
         assert_eq!(input.value(), "", "the box clears after committing");
+
+        input.set_value("Unsent in proj-1");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        state.git_status.update(|statuses| {
+            statuses.insert(
+                ProjectId("proj-2".to_owned()),
+                vec![root_with_staged("/repo")],
+            );
+        });
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "h1".to_owned(),
+            project_id: ProjectId("proj-2".to_owned()),
+        }));
+        next_tick().await;
+        assert!(
+            query(&container, ".gp-commit-input").is_none(),
+            "another project's root at the same path starts with its commit box closed"
+        );
+        click(&query(&container, "[data-test=gp-commit-toggle]").unwrap());
+        next_tick().await;
+        assert_eq!(
+            query(&container, ".gp-commit-input")
+                .unwrap()
+                .dyn_into::<web_sys::HtmlTextAreaElement>()
+                .unwrap()
+                .value(),
+            "",
+            "another project must not show this project's unsent draft"
+        );
     }
 
     /// Splits are created by dragging tabs: a git diff row is a plain
