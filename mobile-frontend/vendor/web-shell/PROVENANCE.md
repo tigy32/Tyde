@@ -2,8 +2,9 @@
 
 Unmodified npm archive of the private upstream repository
 `https://github.com/tigy32/TyggsWebShell`, pinned to
-`f8b5418d37e35bdedf398a45584677898880bc9c`.
-Archive SHA-256: `ba6c7827279e2cf1ad2d18fc8deceb45d449c1a0b660033275dc473cce73a687`.
+`c48397c1aee739bdcd94e8f814968e7645f9b704`.
+Archive `tyggs-web-shell-c48397c1aee7.tgz` SHA-256:
+`7bcceb1f778d060b3f27afe4678115248e7862b3f96cecd419517af3e56af242`.
 Produced locally with `npm pack --ignore-scripts` from that clean committed
 checkout after verifying the commit was pushed to upstream `main`.
 The adjacent runtime, README, license and package metadata are extracted
@@ -16,8 +17,10 @@ not at an unversioned origin-root URL. CSS is loaded before app styles.
 No npm install, registry access, or independent viewport implementation.
 
 This main-based revision includes the optional `endEditingOnHidden` API,
-default OFF. Tyde enables it in `src/shell.rs`. Visible focus/blur/pageshow and
-viewport measurement remain unchanged. The newer `keyboardHint()` API from upstream main is also
+default OFF. Tyde enables it in `src/shell.rs`. Visible focus/blur/pageshow do
+not end editing. Without input focus, a visual viewport contraction no longer
+sizes the shell or latches the keyboard, except dismissal motion after owned
+focus leaves, which ends with the existing settle window. The newer `keyboardHint()` API from upstream main is also
 included but INACTIVE: Tyde web/PWA has no binding or caller. It is not used as
 a guessed software-keyboard metric or a second layout authority.
 

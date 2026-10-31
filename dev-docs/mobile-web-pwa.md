@@ -101,7 +101,7 @@ in `./dev.sh check`.
 
 The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
 copy the viewport algorithm. The pinned revision is
-`f8b5418d37e35bdedf398a45584677898880bc9c`, published on the shell
+`c48397c1aee739bdcd94e8f814968e7645f9b704`, published on the shell
 repository's upstream `main`. The unmodified archive was produced locally with
 `npm pack --ignore-scripts` from that clean committed checkout.
 `mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
@@ -163,10 +163,25 @@ app switcher -> Messages -> switcher back with the composer still focused
 (accessory-only, no keys, 725px viewport) -> landscape -> portrait. WebKit then
 reported a 90.9px visual viewport with no keyboard on screen and the shell
 collapsed to the top of the screen. The same flow with the policy enabled
-returns unfocused at full height. The shell still applies visual viewport
-contraction while nothing is focused; an unfocused stale contraction (the
-user-reported floating tab bar) was not reproduced in the Simulator, so no
-shell measurement change was made for it.
+returns unfocused at full height.
+
+The user-reported Agents list showed visible tabs over a blank band: the shell
+classified no keyboard yet sized itself to a contracted viewport. A physical
+iPhone 14 Pro/iOS 27.0 reduced-DOM run also kept a stale 492px viewport after
+blur, with the keyboard latch held and no keys. The shared shell now follows a
+contraction only while an input owns focus, or as dismissal motion after that
+owned focus leaves; the existing settle window ends dismissal, releasing the
+latch and restoring layout height without a viewport event. A still-focused
+stale contraction is indistinguishable from a keyboard and stays covered only
+by the hidden-editing policy. Non-interactive cards no longer take focus: their
+previous `tabindex=-1` let a plain group reclaim the stale viewport as an opaque
+input owner. The app-surface browser test returns from background unfocused and
+requires a 492px stale reading to keep the full shell with no keyboard state,
+including after a focus attempt on a rendered dashboard stat card. Interactive
+tabindex rows, confirmation backdrops, chat action menus and host-browser
+directory rows remain opaque focus owners; while focused they can still follow
+a stale contraction. Native acceptance of the original return path remains
+pending; browser geometry assertions are not native keyboard proof.
 
 One bounded physical iPhone 14 Pro/iOS 27.0 reduced-DOM comparison observed
 hidden focusout, then native-first full-height/no-keyboard return (793px), same
@@ -210,7 +225,7 @@ inside47..797 on17e, and70..886 inside62..894 on18ProMax. Setup text/controls,
 scroll reachability, input/Send hit tests, native Done and portrait spot checks
 passed. This was iOS27 Simulator standalone/Safari, not physical-device or Duo
 certification; Send was hit-tested without a provider turn. The background-editing
-policy remains OFF and stale/no-keyboard prevention remains unaccepted.
+policy was still OFF in that candidate.
 
 Root-cause traces, before/after captures, provenance, native FAIL and cleanup
 receipts are retained until user signoff in

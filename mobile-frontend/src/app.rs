@@ -1757,6 +1757,15 @@ mod wasm_tests {
         state.host_settings_by_host.update(|settings| {
             settings.insert(host.clone(), empty_host_settings());
         });
+        // Connected without a current-stream bootstrap correctly renders Home's
+        // loading state, not the dashboard cards exercised below.
+        let host_stream = protocol::StreamPath("/host/composer".to_owned());
+        state.host_streams.update(|streams| {
+            streams.insert(host.clone(), host_stream.clone());
+        });
+        state.bootstrapped_host_streams.update(|streams| {
+            streams.insert(host.clone(), host_stream);
+        });
         state.agents.set(vec![crate::state::AgentInfo {
             local_host_id: host.clone(),
             agent_id: agent_id.clone(),
@@ -2215,6 +2224,36 @@ mod wasm_tests {
             assert_eq!(input.selection_start().unwrap(), Some(2));
             assert_eq!(input.selection_end().unwrap(), Some(8));
         }
+        // iOS can report a stale contracted viewport with no keyboard after a
+        // foreign-keyboard round trip; unfocused, it must not strand the shell.
+        let contract_viewport = js_sys::Function::new_with_args(
+            "w",
+            r#"
+            const saved = Object.getOwnPropertyDescriptor(w.visualViewport, 'height');
+            Object.defineProperty(w.visualViewport, 'height', {configurable:true, value:492});
+            w.visualViewport.dispatchEvent(new w.Event('resize'));
+            return () => {
+                if (saved) Object.defineProperty(w.visualViewport, 'height', saved);
+                else delete w.visualViewport.height;
+                w.visualViewport.dispatchEvent(new w.Event('resize'));
+            };
+        "#,
+        );
+        let stale_contraction = BrowserOverride(
+            contract_viewport
+                .call1(&wasm_bindgen::JsValue::NULL, &frame_window)
+                .unwrap(),
+        );
+        render_shell(&frame).await;
+        assert_eq!(frame_window.visual_viewport().unwrap().height(), 492.0);
+        assert!(
+            (shell.get_bounding_client_rect().height() - 852.0).abs() <= 1.0,
+            "unfocused stale contraction must keep the full shell: {}",
+            shell.get_bounding_client_rect().height()
+        );
+        assert!(!shell.has_attribute("data-tws-keyboard"));
+        drop(stale_contraction);
+        render_shell(&frame).await;
         assert_bottom_gap(&dock, 8.0);
         assert!(reachable(), "returned composer remains reachable");
         input.focus().unwrap();
@@ -2726,6 +2765,50 @@ mod wasm_tests {
         render_shell(&frame).await;
         assert!(!options.is_connected() && !intro.is_connected());
         state.viewing_chat.set(false);
+        state.active_tab.set(MobileTab::Home);
+        render_shell(&frame).await;
+        wasm_bindgen_test::console_log!(
+            "Dashboard stale-focus fixture: loading={} stat_present={}",
+            container
+                .query_selector("[data-mobile-test='home-loading']")
+                .unwrap()
+                .is_some(),
+            container
+                .query_selector("[data-mobile-test='home-stat-agents']")
+                .unwrap()
+                .is_some()
+        );
+        let stale_contraction = BrowserOverride(
+            contract_viewport
+                .call1(&wasm_bindgen::JsValue::NULL, &frame_window)
+                .unwrap(),
+        );
+        let stat = container
+            .query_selector("[data-mobile-test='home-stat-agents']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert!(stat.text_content().unwrap().contains("Active agents"));
+        stat.focus().unwrap();
+        render_shell(&frame).await;
+        assert!(
+            !frame_document
+                .active_element()
+                .is_some_and(|active| active.is_same_node(Some(&stat))),
+            "a non-interactive card must not acquire input ownership"
+        );
+        assert!(
+            (shell.get_bounding_client_rect().height() - 852.0).abs() <= 1.0,
+            "non-interactive cards must not reclaim a stale contraction"
+        );
+        assert!(!shell.has_attribute("data-tws-keyboard"));
+        let nav = container
+            .query_selector("[data-mobile-test='bottom-nav']")
+            .unwrap()
+            .unwrap();
+        assert!(nav.get_bounding_client_rect().height() >= 44.0);
+        drop(stale_contraction);
         let readings = standalone_readings();
         safe_area.set_text_content(Some(
             ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",

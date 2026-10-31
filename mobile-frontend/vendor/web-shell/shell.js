@@ -28,6 +28,18 @@ function editable(element) {
         return true;
     return element.matches('input:not(:disabled):not([readonly]):not([type=button]):not([type=submit]):not([type=reset]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=hidden])');
 }
+function inputFocus(document) {
+    let active = document.activeElement;
+    while (active?.shadowRoot)
+        active = active.shadowRoot.activeElement;
+    const editing = editable(active);
+    if (!active || active === document.body || active === document.documentElement)
+        return { owned: editing, editing };
+    // Opaque focus hosts can contain closed shadow roots. Known non-input controls cannot.
+    const owned = editing || active.matches("select, iframe, frame, embed, object")
+        || !active.matches("a, area, button, input, textarea, summary");
+    return { owned, editing };
+}
 function required(root, selector) {
     const element = root.querySelector(selector);
     if (!element)
@@ -68,6 +80,8 @@ export function attachShell(root, options = {}) {
     let dirty = true;
     let frame = 0;
     let settleUntil = 0;
+    let ownedContraction = false;
+    let dismissing = false;
     let hinted = null;
     let state = { top: 0, left: 0, width: html.clientWidth, height: html.clientHeight, keyboard: false, scale: 1 };
     const written = new Map();
@@ -87,7 +101,7 @@ export function attachShell(root, options = {}) {
     };
     const invalidate = () => { dirty = true; queue(); };
     const settle = () => { settleUntil = window.performance.now() + 900; invalidate(); };
-    const read = () => {
+    const read = (now) => {
         const scale = viewport?.scale ?? 1;
         if (Math.abs(scale - 1) > 0.01)
             return null;
@@ -96,18 +110,26 @@ export function attachShell(root, options = {}) {
         const top = Math.max(0, viewport?.offsetTop ?? 0);
         const left = Math.max(0, viewport?.offsetLeft ?? 0);
         const width = Math.max(1, Math.min(viewport?.width ?? layoutWidth, layoutWidth - left));
-        const focused = editable(document.activeElement);
-        if (!focused && !state.keyboard)
+        const { owned: ownsFocus, editing: focused } = inputFocus(document);
+        if (!ownsFocus && !state.keyboard)
             browserChrome = Math.max(0, window.outerHeight - layoutHeight);
         const referenceHeight = keyboard && coarsePointer.matches ? Math.max(layoutHeight, window.outerHeight - browserChrome) : layoutHeight;
-        if (hinted && hinted.until > 0 && window.performance.now() >= hinted.until) {
+        if (hinted && hinted.until > 0 && now >= hinted.until) {
             root.style.removeProperty("transition");
             // A shown keyboard keeps owning the height; a hidden one hands back to measurement.
             hinted = hinted.overlap > 0 ? { overlap: hinted.overlap, until: 0 } : null;
         }
-        // A native host's hint owns the height until its animation has finished.
-        const keyboardOpen = hinted ? hinted.overlap > 80 : (focused || state.keyboard) && referenceHeight - (viewport?.height ?? layoutHeight) > 80;
-        const measuredHeight = Math.max(1, Math.min(hinted ? layoutHeight - hinted.overlap : viewport?.height ?? layoutHeight, layoutHeight - top));
+        const visualHeight = viewport?.height ?? layoutHeight;
+        // Only focus that observed a contraction can hand ownership to dismissal.
+        if (!ownsFocus && ownedContraction)
+            dismissing = true;
+        if (ownsFocus || now >= settleUntil)
+            dismissing = false;
+        ownedContraction = ownsFocus && !hinted && visualHeight < referenceHeight;
+        const followViewport = ownsFocus || dismissing;
+        // Neither the latch nor a later unfocused event can own a stale contraction.
+        const keyboardOpen = hinted ? hinted.overlap > 80 : (focused || (state.keyboard && followViewport)) && referenceHeight - visualHeight > 80;
+        const measuredHeight = Math.max(1, Math.min(hinted ? layoutHeight - hinted.overlap : followViewport ? visualHeight : layoutHeight, layoutHeight - top));
         let height = measuredHeight;
         const standalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches;
         const safeTop = standalone ? parseFloat(window.getComputedStyle(root).getPropertyValue("--tws-safe-top")) || 0 : 0;
@@ -118,7 +140,7 @@ export function attachShell(root, options = {}) {
         // Shrinking the document during UIKit's keyboard pan separates paint from hit-testing.
         let documentHeight = documentRecovered && legacyShortfall(layoutHeight)
             ? Math.min(window.screen.height, layoutHeight + safeTop) : null;
-        if (!keyboardOpen && (!focused || documentHeight !== null) && legacyShortfall(measuredHeight)) {
+        if (!keyboardOpen && (!ownsFocus || documentHeight !== null) && legacyShortfall(measuredHeight)) {
             height = Math.min(window.screen.height, layoutHeight + safeTop - top);
             documentHeight = top + height;
         }
@@ -137,8 +159,8 @@ export function attachShell(root, options = {}) {
         else if (bounds.bottom > lower)
             content.scrollTop += Math.min(bounds.bottom - lower, bounds.top - upper);
     };
-    const apply = () => {
-        const reading = read();
+    const apply = (now = window.performance.now()) => {
+        const reading = read(now);
         if (!reading)
             return;
         const { documentHeight, ...next } = reading;
@@ -183,8 +205,11 @@ export function attachShell(root, options = {}) {
         frame = 0;
         if (stopped || document.hidden)
             return;
-        apply();
-        if (editable(document.activeElement) || window.performance.now() < settleUntil)
+        // Release and requeue share a sample: crossing the deadline during apply
+        // must still schedule the terminal read, even without another viewport event.
+        const now = window.performance.now();
+        apply(now);
+        if (inputFocus(document).owned || now < settleUntil)
             queue();
     }
     const listen = (target, name, callback, capture = false) => {

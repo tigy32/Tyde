@@ -24,7 +24,7 @@ pub fn Card(
     }
 
     let role = if interactive { "button" } else { "group" };
-    let tabindex = if interactive { "0" } else { "-1" };
+    let tabindex = interactive.then_some("0");
     let test = data_mobile_test.unwrap_or("card");
     let click_cb = on_click;
 
