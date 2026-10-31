@@ -19,4 +19,6 @@ rlimit = "0.10"
 [dev-dependencies]
 host-config = { path = "../host-config" }
 protocol = { path = "../protocol" }
+rmcp = { version = "0.15.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+serde_json.workspace = true
 tempfile = "3"

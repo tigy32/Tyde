@@ -166,6 +166,9 @@ fn print_usage() {
     println!(
         "                                 Same, recording ~/.tyde/run/tyde-host.pid once bound"
     );
+    println!(
+        "                                 TYDE_DEBUG_MCP_ATTACHMENT_PATH=<new file> publishes its debug MCP attachment"
+    );
     println!("  tyde-server host --status-uds  Check whether the Tyde UDS host is reachable");
     println!("  tyde-server host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde-server host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
@@ -255,6 +258,7 @@ fn run_host_uds(managed: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         let notification = server::host_launch::take_notification();
+        let debug_mcp_attachment = server::host_launch::take_debug_mcp_attachment()?;
         init_logging()?;
         server::init_process_env()?;
         let socket_path = resolve_socket_path()?;
@@ -267,23 +271,30 @@ fn run_host_uds(managed: bool) -> Result<(), String> {
 
         runtime.block_on(async move {
             let (listener, host) = bind_host_socket_before_start(&socket_path, spawn_host).await?;
+            // Installed before anything is announced, so a signal sent after an
+            // announcement always takes the graceful path that retracts it.
+            let shutdown = server::host_shutdown_signal().map_err(|error| error.to_string())?;
+            let attachment = match debug_mcp_attachment {
+                Some(path) => {
+                    Some(server::host_launch::publish_debug_mcp_attachment(&host, path).await?)
+                }
+                None => None,
+            };
             if managed {
                 record_managed_host_process()?;
             }
             server::host_launch::notify_ready(notification)?;
-            server::serve_uds(
-                listener,
-                server::ServerConfig::current(),
-                host,
-                server::host_shutdown_signal().map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|err| {
-                format!(
-                    "host UDS listener failed at {}: {err}",
-                    socket_path.display()
-                )
-            })
+            let served =
+                server::serve_uds(listener, server::ServerConfig::current(), host, shutdown)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "host UDS listener failed at {}: {err}",
+                            socket_path.display()
+                        )
+                    });
+            drop(attachment);
+            served
         })
     }
 }

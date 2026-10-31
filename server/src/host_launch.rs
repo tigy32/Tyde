@@ -38,6 +38,77 @@ pub fn notify_ready(path: Option<PathBuf>) -> Result<(), String> {
     }
 }
 
+const DEBUG_MCP_ATTACHMENT: &str = "TYDE_DEBUG_MCP_ATTACHMENT_PATH";
+
+/// Removed from the environment so the host's own DEV children never publish
+/// over their parent's attachment. A set but empty value is an owner error,
+/// not an opt-out: that owner would wait for an announcement forever.
+pub fn take_debug_mcp_attachment() -> Result<Option<PathBuf>, String> {
+    let value = std::env::var_os(DEBUG_MCP_ATTACHMENT);
+    // Entrypoints call this before creating runtime threads or child probes.
+    unsafe { std::env::remove_var(DEBUG_MCP_ATTACHMENT) };
+    match value {
+        Some(value) if value.is_empty() => Err(format!("{DEBUG_MCP_ATTACHMENT} is set but empty")),
+        value => Ok(value.map(PathBuf::from)),
+    }
+}
+
+/// The owner-only `tyde-debug` attachment of a running host. Retracted when
+/// the host shuts down.
+pub struct DebugMcpAttachment {
+    path: PathBuf,
+}
+
+/// Publishes the attachment before the host serves, then announces it with
+/// one stdout line, so an owner holding the host's stdout waits on an event
+/// instead of probing for a file or port.
+pub async fn publish_debug_mcp_attachment(
+    host: &crate::HostHandle,
+    path: PathBuf,
+) -> Result<DebugMcpAttachment, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let announcement = match path.to_str() {
+        Some(text) => serde_json::json!({ "debug_mcp_attachment": text }).to_string(),
+        None => return Err("debug MCP attachment path must be valid UTF-8".to_owned()),
+    };
+    let descriptor = host.debug_mcp_attachment().await?;
+    let bytes = serde_json::to_vec_pretty(&descriptor)
+        .map_err(|error| format!("serialize debug MCP attachment: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("create debug MCP attachment {}: {error}", path.display()))?;
+    let attachment = DebugMcpAttachment { path };
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "write debug MCP attachment {}: {error}",
+                attachment.path.display()
+            )
+        })?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{announcement}")
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("announce debug MCP attachment: {error}"))?;
+    Ok(attachment)
+}
+
+impl Drop for DebugMcpAttachment {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to retract debug MCP attachment"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 pub fn launch_current(program: &Path, log_path: &Path, managed: bool) -> Result<(), String> {
     let current =

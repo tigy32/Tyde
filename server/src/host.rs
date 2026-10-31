@@ -14559,6 +14559,25 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         }
     }
 
+    /// The `tyde-debug` attachment a backend would receive at spawn, without a
+    /// workspace root, for an owner that controls this host without an agent.
+    pub async fn debug_mcp_attachment(
+        &self,
+    ) -> Result<crate::mcp_bridge::BridgeDescriptor, String> {
+        let debug_mcp = self.state.with(move |state| state.debug_mcp.clone()).await;
+        if debug_mcp.url.is_empty() {
+            return Err("debug MCP server is unavailable in this host".to_owned());
+        }
+        let (url, headers) = debug_mcp_endpoint(&debug_mcp, None);
+        Ok(crate::mcp_bridge::BridgeDescriptor {
+            servers: vec![crate::mcp_bridge::BridgeServerConfig {
+                name: DEBUG_MCP_SERVER_NAME.to_owned(),
+                transport: crate::mcp_bridge::BridgeTransport::Http { url, headers },
+            }],
+            supports_parallel_tool_calls: false,
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub async fn debug_mcp_url_for_test(&self) -> String {
         {
@@ -22495,25 +22514,13 @@ pub(crate) fn startup_mcp_servers_for_settings(
     let mut servers = Vec::new();
 
     if settings.tyde_debug_mcp_enabled {
-        let mut headers = HashMap::new();
-        if let Some(repo_root) = workspace_roots
+        let repo_root = workspace_roots
             .first()
             .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            headers.insert(
-                crate::debug_mcp::DEBUG_REPO_ROOT_HEADER.to_string(),
-                repo_root.to_string(),
-            );
-        }
-        let url = workspace_roots
-            .first()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(|repo_root| debug_mcp_url_for_repo_root(&debug_mcp.url, repo_root))
-            .unwrap_or_else(|| debug_mcp.url.clone());
+            .filter(|value| !value.is_empty());
+        let (url, headers) = debug_mcp_endpoint(debug_mcp, repo_root);
         servers.push(StartupMcpServer {
-            name: "tyde-debug".to_string(),
+            name: DEBUG_MCP_SERVER_NAME.to_string(),
             supports_parallel_tool_calls: false,
             transport: StartupMcpTransport::Http {
                 url,
@@ -22645,6 +22652,26 @@ fn team_member_primary_project_id(member: &TeamMember) -> Result<ProjectId, Stri
         .first()
         .cloned()
         .ok_or_else(|| format!("team member {} has no project_ids", member.id))
+}
+
+const DEBUG_MCP_SERVER_NAME: &str = "tyde-debug";
+
+fn debug_mcp_endpoint(
+    debug_mcp: &DebugMcpHandle,
+    repo_root: Option<&str>,
+) -> (String, HashMap<String, String>) {
+    let mut headers = HashMap::new();
+    let Some(repo_root) = repo_root else {
+        return (debug_mcp.url.clone(), headers);
+    };
+    headers.insert(
+        crate::debug_mcp::DEBUG_REPO_ROOT_HEADER.to_string(),
+        repo_root.to_string(),
+    );
+    (
+        debug_mcp_url_for_repo_root(&debug_mcp.url, repo_root),
+        headers,
+    )
 }
 
 fn debug_mcp_url_for_repo_root(base_url: &str, repo_root: &str) -> String {

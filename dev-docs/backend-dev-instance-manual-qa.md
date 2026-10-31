@@ -305,6 +305,14 @@ checkout. Missing/unsupported contracts fail explicitly; merging the launcher
 fix into the resident alone does not make older consumer checkouts launchable.
 The declaration and matching notification producer must travel together.
 
+A source-matched launcher for a checkout the resident cannot launch comes from
+an owned host built from launcher-compatible source, started with its socket
+and every `DEV_INSTANCE_MUTABLE_PATHS` store redirected to fresh state and
+`TYDE_DEBUG_MCP_ATTACHMENT_PATH` set. Register the announced descriptor's HTTP
+URL as an MCP server for the agent that runs start, wait, and stop through it.
+Stop every DEV instance through that attachment before signalling the host;
+host shutdown does not run their stop cleanup.
+
 The child sends typed, identity-bound host-listening and UI-ready notifications
 to the owning launcher. The launcher performs the real host handshake and typed
 UI Ping/Pong once notified, while observing child-exit events. UI startup

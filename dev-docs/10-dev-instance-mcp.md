@@ -231,6 +231,14 @@ that loopback HTTP MCP URL into the backend spawn config. That gives the agent
 a backend-local MCP surface even when the Tyde host is running remotely over
 SSH.
 
+An owner that runs `tyde-server host --uds` itself, with no agent, can receive
+the same attachment: set `TYDE_DEBUG_MCP_ATTACHMENT_PATH` to a new file. Before
+serving, the host writes the server-generated `tyde-debug` bridge descriptor
+there (mode 0600, refusing an existing file), prints one stdout line
+`{"debug_mcp_attachment":"<path>"}`, and removes the file on graceful
+shutdown. Wait for that line instead of probing for the file or a port. The
+descriptor names no repository root, so `project_dir` must be absolute.
+
 #### 2. Child Dev Instance Endpoints
 
 The launched Tyde instance exposes two dev-only loopback endpoints:

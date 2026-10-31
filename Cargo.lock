@@ -9500,6 +9500,8 @@ dependencies = [
  "host-config",
  "protocol",
  "rlimit",
+ "rmcp",
+ "serde_json",
  "server",
  "tempfile",
  "tokio",
