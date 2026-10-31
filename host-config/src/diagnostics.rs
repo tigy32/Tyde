@@ -22,6 +22,19 @@ pub enum UiOperation {
     ChatVirtualWindow,
     ChatTabBinding,
     AgentsSidebarProjection,
+    TaskPoll,
+    TaskDrop,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTaskWork {
+    pub polls: u32,
+    pub poll_ms: u32,
+    pub longest_poll_ms: u32,
+    pub drops: u32,
+    pub drop_ms: u32,
+    pub longest_drop_ms: u32,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -97,6 +110,7 @@ pub enum FrontendDiagnostic {
         focused: bool,
         longest_work: Option<SlowUiWork>,
         pending_bridge_calls: u32,
+        task_work: UiTaskWork,
     },
 }
 

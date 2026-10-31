@@ -1854,7 +1854,7 @@ mod live_card_wasm_tests {
     use super::*;
     use crate::components::tool_card::test_utils::*;
     use crate::state::{ActiveProjectRef, AgentInfo, AppState, StreamingState};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
         AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,

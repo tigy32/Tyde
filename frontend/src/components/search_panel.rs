@@ -322,7 +322,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::center_zone::workspace_width;
     use crate::state::{ActiveProjectRef, AppState, FileResourceKey, OpenFile, PaneId, TabContent};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath, ProjectSearchFileResult,
         ProjectSearchMatch,

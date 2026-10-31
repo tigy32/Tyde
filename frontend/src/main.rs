@@ -20,7 +20,24 @@ mod voice;
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_test_support {
+    use leptos::prelude::*;
     use std::{any::Any, ops::Deref};
+
+    pub fn mount_to<F, N>(
+        parent: web_sys::HtmlElement,
+        view: F,
+    ) -> leptos::mount::UnmountHandle<N::State>
+    where
+        F: FnOnce() -> N + 'static,
+        N: IntoView,
+    {
+        static INITIALIZE: std::sync::Once = std::sync::Once::new();
+        INITIALIZE.call_once(|| {
+            crate::perf::install_task_diagnostics()
+                .expect("Install the UI executor before test mounts");
+        });
+        leptos::mount::mount_to(parent, view)
+    }
 
     pub struct ScopedRoot(web_sys::HtmlElement);
 
@@ -90,6 +107,7 @@ fn main() {
     console_log::init_with_level(log::Level::Debug).expect("failed to init logger");
     perf::install_local_diagnostics();
     perf::install_diagnostics();
+    perf::install_task_diagnostics().expect("Install the UI executor before mounting");
     perf::startup_phase(perf::FrontendStartupPhase::MountBegin);
     mount_to_body(app::App);
     perf::startup_phase(perf::FrontendStartupPhase::MountReturned);

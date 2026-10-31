@@ -2152,7 +2152,7 @@ mod wasm_tests {
     use super::*;
     use crate::state::{AppState, FileResourceKey, OpenFile, OpenTarget};
     use crate::wasm_test_support::ScopedRoot;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         ProjectBinaryFilePayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath,
     };

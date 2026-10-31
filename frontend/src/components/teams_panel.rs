@@ -2649,7 +2649,7 @@ fn delete_member(state: &AppState, host_id: String, member_id: TeamMemberId) {
 mod wasm_tests {
     use super::*;
     use crate::state::{ConnectionStatus, FileResourceKey, OpenTarget};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentControlStatus, AgentId, CustomAgent, CustomAgentId, FrameKind, ProjectId, ProjectPath,
         ProjectRootPath, SessionId, StreamPath, Team, TeamDraft, TeamDraftId, TeamDraftMember,

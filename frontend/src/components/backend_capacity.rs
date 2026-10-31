@@ -872,7 +872,7 @@ pub fn TaskCapacityLimits(host_id: String, backend_kind: BackendKind) -> impl In
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     // `ClaudeLimitType`/`CodexLimitSlot` come in through `use super::*`.
     use protocol::{Envelope, FrameKind, StreamPath, ValueProvenance};
     use wasm_bindgen::JsCast;

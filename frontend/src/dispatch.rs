@@ -7873,7 +7873,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::chat_message::ChatMessageView;
     use crate::state::{AppState, CodeIntelKey};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use leptos::prelude::*;
     use protocol::{
         BackendKind, CodeIntelDiagnostic, LaunchProfileId, ProjectFileVersion, ProjectPath,

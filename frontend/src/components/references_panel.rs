@@ -258,7 +258,7 @@ mod wasm_tests {
         ActiveProjectRef, AppState, FileResourceKey, OpenFile, PaneId, ProjectReferencesUiState,
         TabContent,
     };
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         ByteRange, CodeIntelReferenceLine, CodeIntelReferencesFileResult, ProjectFileVersion,
         ProjectId, ProjectPath, ProjectRootPath,

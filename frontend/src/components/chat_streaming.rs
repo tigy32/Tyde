@@ -281,7 +281,7 @@ fn capped_reasoning_text(text: &str) -> String {
 mod wasm_tests {
     use super::*;
     use crate::state::ActiveAgentRef;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::AgentId;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;

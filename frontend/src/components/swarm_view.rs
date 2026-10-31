@@ -3011,7 +3011,7 @@ pub(crate) mod wasm_tests {
     use crate::components::center_zone::CenterZone;
     use crate::components::swarms_panel::SwarmsPanel;
     use crate::state::{ConnectionStatus, FileResourceKey, OpenFile};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentId, Envelope, FrameKind, HostFilterId, LaunchProfileId,
         SWARM_DEFAULT_AGENT_WAKE_BUDGET, SwarmBackendAllocation, SwarmBoardNotifyPayload,

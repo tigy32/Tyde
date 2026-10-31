@@ -2737,7 +2737,7 @@ mod wasm_tests {
     use super::*;
     use crate::state::AppState;
     use crate::wasm_test_support::ScopedRoot;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentId, AgentManualTagAssignment, AgentManualTagDescriptor, AgentPinsSnapshot,
         AgentSortMode, AgentStatusFilter, AgentSystemTagAssignment, AgentSystemTagDescriptor,

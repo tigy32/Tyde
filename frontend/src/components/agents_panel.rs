@@ -3722,7 +3722,7 @@ mod wasm_tests {
     use crate::components::center_zone::CenterWorkspaceWidth;
     use crate::dispatch::dispatch_envelope;
     use crate::state::{ChatMessageEntry, ChatRowHandle, TabId};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::types::{
         AgentCompactNotifyPayload, AgentCompactStatus, TeamCompactNotifyPayload, TeamCompactStatus,
     };

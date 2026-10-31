@@ -1131,7 +1131,7 @@ pub(crate) fn Composer(
 mod wasm_tests {
     use super::*;
     use crate::wasm_test_support::Mounted;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentId, ProjectId, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewComment,
         ReviewCommentId, ReviewDiffSelection, ReviewDiffSide, ReviewId, ReviewLocation,

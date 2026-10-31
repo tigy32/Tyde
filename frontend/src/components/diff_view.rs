@@ -5468,8 +5468,8 @@ mod wasm_tests {
     use super::*;
     use crate::state::DiffViewState;
     use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
+    use crate::wasm_test_support::mount_to;
     use crate::wasm_test_support::{Mounted, ScopedRoot};
-    use leptos::mount::mount_to;
     use protocol::ProjectGitDiffHunk;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;

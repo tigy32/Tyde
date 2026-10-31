@@ -714,7 +714,7 @@ pub(crate) fn format_compact(n: u64) -> String {
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentId, ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageTokenUsage,
         TokenUsage, TokenUsageUnavailableReason,

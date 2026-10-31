@@ -1910,7 +1910,7 @@ pub fn VoiceRuntime() -> impl IntoView {
 mod wasm_tests {
     use super::*;
     use crate::state::TabContent;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;

@@ -53,12 +53,21 @@ around the incident. These new lines are pasteable, content-free diagnostics:
 
   No other details or arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
-  `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
+  `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0,"task_work":{"polls":3,"poll_ms":620,"longest_poll_ms":610,"drops":1,"drop_ms":0,"longest_drop_ms":0}}`.
   The selected deferred chat and sidebar projections below feed this same bounded
   aggregate, including when detailed capture is off. They can run after
   host dispatch has returned; receive/dispatch timing cannot cover that work.
   Their counts are not persisted session size, mounted rows or bytes cloned.
-  Browser layout, paint and other uninstrumented work remain uncovered.
+  `task_work` counts Leptos executor polls and future destruction since the
+  preceding tick (`polls`, `poll_ms`, `longest_poll_ms`, `drops`, `drop_ms`,
+  `longest_drop_ms`). These measure only synchronous poll/destruction scopes,
+  not time awaiting a future. Submillisecond durations accumulate before totals
+  are converted to whole milliseconds. They include deferred reactive rendering and
+  cleanup after receive/dispatch returns. They remain separate from
+  `longest_work` so an outer task does not hide a named inner projection.
+  Counts reset on every tick and visibility transition. Times are inclusive
+  wall intervals, not CPU samples; nested application spans overlap them.
+  Browser layout, paint and work outside these scopes remain uncovered.
   `focused` is `document.hasFocus()` at callback time, not a focus history.
   `longest_work:null` means no qualifying completed span was retained for that
   sampling window, not that the UI did no work. Pending calls are counted at
@@ -298,6 +307,16 @@ export: some contain file paths. Existing server tracing and agent timing do
 not measure the browser thread. The unlanded responsiveness-audit workbench has
 additional specialized debug/test harnesses; those are not prerequisites for
 this recorder and are not represented as shipped capabilities.
+
+The existing wasm-bindgen local executor also brackets each Leptos task poll
+and final future drop as `task_poll`/`task_drop` in detailed captures. The
+underlying scheduler, wakeups and unsupported threaded-spawn behavior remain
+unchanged; no executor queue, timer, global function patch or task metadata is
+added. These scopes answer whether deferred UI work or future destruction
+occupied a gap that receive/projection spans missed. A short poll followed by
+a long pending wait is not synchronous work. They do not identify a native
+GC/JIT/allocation producer, prove causation, or establish that an unobserved
+original freeze is fixed.
 
 ## Long-session reproduction bounds
 

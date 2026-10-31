@@ -544,8 +544,8 @@ pub fn OrchestrationView(records: Signal<Vec<OrchestrationRecord>>) -> impl Into
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
+    use crate::wasm_test_support::mount_to;
     use crate::wasm_test_support::{Mounted, ScopedRoot};
-    use leptos::mount::mount_to;
     use protocol::{
         OrchestrationAgentType, OrchestrationEvent, OrchestrationId, OrchestrationWorkerInfo,
     };

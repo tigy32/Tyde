@@ -1038,7 +1038,7 @@ pub async fn team_draft_discard(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use leptos::prelude::{provide_context, view};
     use std::rc::Rc;
     use wasm_bindgen::JsCast;

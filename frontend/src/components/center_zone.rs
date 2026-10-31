@@ -1890,7 +1890,7 @@ mod wasm_tests {
     use crate::components::command_palette::CommandId;
     use crate::state::{FileResourceKey, OpenFile, TAB_LRU_CAPACITY};
     use crate::wasm_test_support::ScopedRoot;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{ProjectFileVersion, ProjectPath, ProjectRootPath};
     use wasm_bindgen_test::*;
     use web_sys::{HtmlElement, HtmlInputElement};

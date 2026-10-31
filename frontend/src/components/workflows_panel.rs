@@ -1301,7 +1301,7 @@ fn WorkflowRunForm(request: WorkflowRunRequest) -> impl IntoView {
 mod wasm_tests {
     use super::*;
     use crate::state::ActiveProjectRef;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{ProjectRootPath, StreamPath, WorkflowCoordinatorSpec, WorkflowSource};
     use std::cell::RefCell;
     use std::rc::Rc;

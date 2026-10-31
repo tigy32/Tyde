@@ -2638,6 +2638,7 @@ dependencies = [
 name = "frontend"
 version = "0.0.0"
 dependencies = [
+ "any_spawner",
  "base64 0.22.1",
  "console_error_panic_hook",
  "console_log",

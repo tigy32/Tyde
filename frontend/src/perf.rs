@@ -11,12 +11,15 @@
 //! perf::log_phase("file_open", "response", "file:src/foo.rs", " bytes=12345");
 //! ```
 use host_config::diagnostics::{
-    FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, SlowUiWork,
+    FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, SlowUiWork, UiTaskWork,
 };
 pub(crate) use host_config::diagnostics::{FrontendStartupPhase, UiOperation};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -68,6 +71,8 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::ChatVirtualWindow => "chat_virtual_window",
         UiOperation::ChatTabBinding => "chat_tab_binding",
         UiOperation::AgentsSidebarProjection => "agents_sidebar_projection",
+        UiOperation::TaskPoll => "task_poll",
+        UiOperation::TaskDrop => "task_drop",
     }
 }
 
@@ -99,6 +104,53 @@ extern "C" {
     fn stop_local_monitor(monitor: &JsValue);
 }
 
+pub(crate) fn install_task_diagnostics() -> Result<(), any_spawner::ExecutorError> {
+    any_spawner::Executor::init_custom_executor(UiExecutor)
+}
+
+struct UiExecutor;
+
+impl any_spawner::CustomExecutor for UiExecutor {
+    fn spawn(&self, _: any_spawner::PinnedFuture<()>) {
+        // Preserve the wasm-bindgen executor's unsupported threaded-spawn contract.
+        panic!("Executor::spawn called, but no global 'spawn' function is configured.");
+    }
+
+    fn spawn_local(&self, future: any_spawner::PinnedLocalFuture<()>) {
+        wasm_bindgen_futures::spawn_local(UiTask {
+            future: Some(future),
+        });
+    }
+
+    fn poll_local(&self) {}
+}
+
+struct UiTask {
+    future: Option<any_spawner::PinnedLocalFuture<()>>,
+}
+
+impl Future for UiTask {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let _span = UiSpan::new(UiOperation::TaskPoll, 0, 1);
+        self.get_mut()
+            .future
+            .as_mut()
+            .expect("A UI task is retired only when dropped")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl Drop for UiTask {
+    fn drop(&mut self) {
+        let _span = UiSpan::new(UiOperation::TaskDrop, 0, 1);
+        // Field destruction otherwise happens after this scope has ended.
+        drop(self.future.take());
+    }
+}
+
 struct LocalMonitor {
     handle: JsValue,
     _tick: Closure<dyn Fn(f64, bool, bool)>,
@@ -106,6 +158,7 @@ struct LocalMonitor {
     started: f64,
     last_tick: f64,
     longest: Option<SlowUiWork>,
+    task_work: TaskWork,
     pending: u32,
     queue: VecDeque<FrontendDiagnostic>,
     sending: bool,
@@ -113,6 +166,23 @@ struct LocalMonitor {
     dropped: u32,
     window_start: f64,
     emitted: u32,
+}
+
+#[derive(Default)]
+struct TaskWork {
+    summary: UiTaskWork,
+    poll_ms: f64,
+    drop_ms: f64,
+}
+
+impl TaskWork {
+    fn finish(self) -> UiTaskWork {
+        UiTaskWork {
+            poll_ms: millis(self.poll_ms),
+            drop_ms: millis(self.drop_ms),
+            ..self.summary
+        }
+    }
 }
 
 impl Drop for LocalMonitor {
@@ -137,12 +207,14 @@ fn install_local_monitor(env: &JsValue) {
             let interval = millis(now - m.last_tick);
             m.last_tick = now;
             let longest_work = m.longest.take();
+            let task_work = std::mem::take(&mut m.task_work).finish();
             (visible && interval >= 1250).then_some(FrontendDiagnostic::EventLoopGap {
                 interval_ms: interval,
                 expected_ms: 1000,
                 focused,
                 longest_work,
                 pending_bridge_calls: m.pending,
+                task_work,
             })
         });
         if let Some(diagnostic) = diagnostic {
@@ -154,6 +226,7 @@ fn install_local_monitor(env: &JsValue) {
             if let Some(m) = slot {
                 m.last_tick = now;
                 m.longest = None;
+                m.task_work = TaskWork::default();
             }
         });
     });
@@ -167,6 +240,7 @@ fn install_local_monitor(env: &JsValue) {
             started,
             last_tick: started,
             longest: None,
+            task_work: TaskWork::default(),
             pending: 0,
             queue: VecDeque::new(),
             sending: false,
@@ -429,7 +503,25 @@ impl Drop for UiSpan {
                 m.pending = m.pending.saturating_sub(1);
                 return;
             }
-            let duration_ms = millis(local_monitor_now(&m.handle) - span.start);
+            let duration = local_monitor_now(&m.handle) - span.start;
+            let duration_ms = millis(duration);
+            match span.operation {
+                UiOperation::TaskPoll => {
+                    m.task_work.summary.polls = m.task_work.summary.polls.saturating_add(1);
+                    m.task_work.poll_ms += duration;
+                    m.task_work.summary.longest_poll_ms =
+                        m.task_work.summary.longest_poll_ms.max(duration_ms);
+                    return;
+                }
+                UiOperation::TaskDrop => {
+                    m.task_work.summary.drops = m.task_work.summary.drops.saturating_add(1);
+                    m.task_work.drop_ms += duration;
+                    m.task_work.summary.longest_drop_ms =
+                        m.task_work.summary.longest_drop_ms.max(duration_ms);
+                    return;
+                }
+                _ => {}
+            }
             if duration_ms >= 100
                 && m.longest
                     .as_ref()
@@ -525,7 +617,7 @@ export function diagnosticTestBrowserWork(env, start, end) { return env.browserW
 
     #[wasm_bindgen(inline_js = r#"
 export function localMonitorTestEnvironment() {
-    let time = 1000, timer = null;
+    let time = 1000, timer = null, readingStep = 150;
     return {
         document: {
             visibilityState: 'visible', hasFocus: () => true,
@@ -533,9 +625,10 @@ export function localMonitorTestEnvironment() {
         },
         // Every reading advances the injected clock, so synchronous work has a
         // deterministic nonzero duration without real time passing.
-        performance: {now: () => (time += 150)},
+        performance: {now: () => (time += readingStep)},
         setTimeout(fn) { timer = fn; return 1; }, clearTimeout() { timer = null; },
         advance(amount) { time += amount; },
+        readingStep(amount) { readingStep = amount; },
         tick() { const fn = timer; timer = null; if (fn) fn(); },
     };
 }
@@ -563,6 +656,10 @@ export function localMonitorTestCall(env, method, amount) { return env[method](a
 
         pub(crate) fn advance(&self, amount: f64) {
             local_monitor_test_call(&self.env, "advance", amount);
+        }
+
+        pub(crate) fn reading_step(&self, amount: f64) {
+            local_monitor_test_call(&self.env, "readingStep", amount);
         }
 
         pub(crate) fn tick(&self) {

@@ -571,7 +571,7 @@ fn short_id(id: &TerminalId) -> &str {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;

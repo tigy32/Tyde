@@ -1992,7 +1992,7 @@ mod wasm_tests {
     };
     use crate::dispatch::{ChatEventSource, apply_chat_event, apply_chat_event_from};
     use crate::state::{AgentInfo, ToolCallId};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentActivityStatsPayload, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
         ChatEvent, Envelope, MessageOrigin, OperationCancelledData, QueuedMessageEntry, ReviewId,

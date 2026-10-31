@@ -1491,8 +1491,8 @@ mod wasm_tests {
 
     use super::*;
     use crate::state::{AppState, ProjectInfo, sort_project_infos};
+    use crate::wasm_test_support::mount_to;
     use host_config::{ConfiguredHost, HostTransportConfig};
-    use leptos::mount::mount_to;
     use protocol::{
         GitBranchName, Project, ProjectId, ProjectRootPath, ProjectSource, WorkbenchRoot,
     };

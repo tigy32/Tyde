@@ -851,7 +851,7 @@ pub fn LaunchChooser(
 mod wasm_tests {
     use super::*;
     use crate::wasm_test_support::ScopedRoot;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         CustomAgentId, LaunchProfile, LaunchProfileCatalog, LaunchProfileId, SessionSettingValue,
         SessionSettingsValues, ToolPolicy,
@@ -2413,6 +2413,8 @@ mod wasm_tests {
         );
 
         assert_rendered_draft(&container, "Claude", "Auto").await;
+        let capture = crate::perf::diagnostic_tests::Capture::browser();
+        capture.start();
         let arrow = container
             .query_selector("button[aria-label='Choose backend and agent role']")
             .unwrap()
@@ -2434,6 +2436,73 @@ mod wasm_tests {
                 .length(),
             2,
             "the server default profile and default role start selected"
+        );
+        let clock = crate::perf::diagnostic_tests::LocalMonitorClock::install();
+        clock.reading_step(0.125);
+        let diagnostic = js_sys::eval(
+            r#"(() => {
+                const invoke = window.__TAURI__.core.invoke;
+                window.__restoreChooserDiagnostic = () => {
+                    window.__TAURI__.core.invoke = invoke;
+                    delete window.__restoreChooserDiagnostic;
+                };
+                return new Promise(resolve => {
+                    window.__TAURI__.core.invoke = (command, args) => {
+                        if (command === 'log_ui_diagnostic') {
+                            resolve(JSON.stringify(args.record));
+                            return Promise.resolve(null);
+                        }
+                        return invoke(command, args);
+                    };
+                });
+            })()"#,
+        )
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
+        let search = dialog
+            .query_selector("input[aria-label='Find a backend']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        for query in ["Cl", "Claude"].into_iter().cycle().take(16) {
+            search.set_value(query);
+            search
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_eq!(
+                dialog
+                    .query_selector_all(".launch-backend-choice")
+                    .unwrap()
+                    .length(),
+                1,
+                "each search must render the matching backend"
+            );
+            assert!(dialog.text_content().unwrap().contains("Claude"));
+        }
+        clock.advance(2000.0);
+        clock.tick();
+        let diagnostic: serde_json::Value = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(diagnostic)
+                .await
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        js_sys::eval("window.__restoreChooserDiagnostic()").unwrap();
+        drop(clock);
+        let task_work = &diagnostic["diagnostic"]["task_work"];
+        assert!(task_work["polls"].as_u64().unwrap() >= 16);
+        assert_eq!(
+            task_work["longest_poll_ms"], 0,
+            "these DOM updates use fractional clock readings"
+        );
+        assert!(
+            task_work["poll_ms"].as_u64().unwrap() > 0,
+            "short DOM polls must accumulate rather than truncate to zero"
         );
         let close = dialog
             .query_selector("button[aria-label='Close agent chooser']")
@@ -2484,6 +2553,15 @@ mod wasm_tests {
                 .is_same_node(Some(&arrow)),
             "closing returns focus to the chooser trigger"
         );
+        capture.stop();
+        let captured = capture.export();
+        let records = captured["records"].as_array().unwrap();
+        for operation in ["task_poll", "task_drop"] {
+            assert!(
+                records.iter().any(|row| row["operation"] == operation),
+                "opening and disposing the dialog must expose {operation}"
+            );
+        }
     }
 
     /// With no server `default_profile_id`, the primary button opens an

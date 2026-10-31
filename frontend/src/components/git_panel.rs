@@ -2064,7 +2064,7 @@ mod wasm_tests {
     use crate::components::center_zone::CenterWorkspaceWidth;
     use crate::state::{ActiveProjectRef, CenterZoneState, PaneId, TabContent, TabId};
     use crate::wasm_test_support::Mounted;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentId, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, Project,
         ProjectBootstrapPayload, ProjectEventPayload, ProjectFileListPayload, ProjectGitChangeKind,

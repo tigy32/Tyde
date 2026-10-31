@@ -6,8 +6,8 @@
 //! helpers below keep the renderer tests small and focused on user-perceived
 //! output.
 
+use crate::wasm_test_support::mount_to;
 use leptos::IntoView;
-use leptos::mount::mount_to;
 use protocol::{
     ToolExecutionCompletedData, ToolExecutionNormalizationFailure, ToolExecutionOutcome,
     ToolExecutionResult,

@@ -10248,7 +10248,7 @@ fn SkillsTab() -> impl IntoView {
 mod wasm_tests {
     use super::*;
     use crate::state::AppState;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     // Only the tests construct command-error payloads, so this stays out of the
     // production import list — where it would be an unused import on any target that
     // compiles the crate without the wasm test module.

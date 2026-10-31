@@ -2161,7 +2161,7 @@ fn ReviewChangesButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoVi
 mod wasm_tests {
     use super::*;
     use crate::state::{ActiveAgentRef, AgentInfo, AppState, ChatMessageEntry, TabContent};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, BackendKind, ChatEvent,
         ChatMessage, MessageSender, ProjectGitChangeKind, ProjectGitFileStatus, ProjectId,
@@ -5266,6 +5266,9 @@ mod wasm_tests {
         js_sys::eval("window.__projectionRestoreInvoke()").unwrap();
         drop(clock);
         assert_eq!(local["diagnostic"]["event"], "event_loop_gap");
+        let task_work = &local["diagnostic"]["task_work"];
+        assert!(task_work["polls"].as_u64().unwrap() > 0);
+        assert!(task_work["poll_ms"].as_u64().unwrap() > 0);
         let work = &local["diagnostic"]["longest_work"];
         assert_eq!(
             work["operation"], "chat_virtual_window",
@@ -5307,6 +5310,7 @@ mod wasm_tests {
             );
         }
         assert!(records.iter().any(|r| r["operation"] == "chat_tab_binding"));
+        assert!(records.iter().any(|r| r["operation"] == "task_poll"));
         assert!(
             !records.iter().any(|r| r["operation"] == "chat_ink_layout"),
             "Default appearance must not claim Ink layout work"

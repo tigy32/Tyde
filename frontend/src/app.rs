@@ -1642,7 +1642,7 @@ mod wasm_tests {
             .dyn_into::<web_sys::HtmlElement>()
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
-        let handle = leptos::mount::mount_to(container.clone(), || {
+        let handle = crate::wasm_test_support::mount_to(container.clone(), || {
             view! {
                 <div class="chat-card-body" inner_html=crate::markdown::render_markdown(
                     "[Open source](/host/project/src/main.rs)"
@@ -1840,7 +1840,7 @@ mod wasm_tests {
         document.body().unwrap().append_child(&element).unwrap();
         let container = crate::wasm_test_support::ScopedRoot::new(element, "stall-file-view");
         let mounted_state = state.clone();
-        let handle = leptos::mount::mount_to(container.clone(), move || {
+        let handle = crate::wasm_test_support::mount_to(container.clone(), move || {
             provide_context(mounted_state.clone());
             view! { <crate::components::file_explorer::FileExplorer /> }
         });

@@ -311,7 +311,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::tool_card::{ToolCardView, test_utils::*};
     use crate::state::{AgentInfo, AppState, TabContent, ToolRequestEntry};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, StreamPath, ToolRequest};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;

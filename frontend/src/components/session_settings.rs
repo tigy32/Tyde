@@ -985,7 +985,7 @@ fn TaskUsageBadge(
 mod wasm_tests {
     use super::*;
     use crate::state::{ActiveAgentRef, AgentInfo, TabContent};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         AgentActivitySummaryPayload, AgentActivitySummaryState, AgentId, AgentOrigin, Envelope,
         FrameKind, LaunchProfile, LaunchProfileId, LaunchProfileKind, SelectOption,

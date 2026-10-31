@@ -1785,7 +1785,7 @@ mod wasm_tests {
     };
     use crate::components::swarms_panel::SwarmsPanel;
     use crate::state::{ActiveProjectRef, TabContent};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         FrameKind, LaunchProfileCatalog, LaunchProfileKind, Project, ProjectSource,
         SwarmChangePreview, SwarmDraftGeneration, SwarmDraftNotifyPayload, SwarmMemberId,

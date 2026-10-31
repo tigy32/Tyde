@@ -147,7 +147,7 @@ mod wasm_tests {
     use crate::state::{
         FileResourceKey, HoverPopover as HoverPopoverState, OpenTarget, TabContent, TabId,
     };
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{
         ByteRange, CodeIntelDiagnostic, ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath,
     };

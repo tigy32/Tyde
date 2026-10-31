@@ -810,8 +810,8 @@ fn FileRow(
 mod wasm_tests {
     use super::*;
     use crate::state::ActiveProjectRef;
+    use crate::wasm_test_support::mount_to;
     use crate::wasm_test_support::{Mounted, ScopedRoot};
-    use leptos::mount::mount_to;
     use protocol::{
         CodeIntelLanguageId, CodeIntelOverviewHeadline, CodeIntelOverviewPayload,
         CodeIntelProviderId, CodeIntelProviderStatus, CodeIntelResourceMode, CodeIntelRootOverview,

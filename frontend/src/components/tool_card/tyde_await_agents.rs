@@ -143,7 +143,7 @@ mod wasm_tests {
     use super::*;
     use crate::components::tool_card::test_utils::*;
     use crate::state::AgentInfo;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, StreamPath};
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;

@@ -2298,7 +2298,7 @@ pub fn ChatInput(
 mod wasm_tests {
     use super::*;
     use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, TabContent};
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, SessionId, StreamPath};
     use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;

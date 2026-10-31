@@ -857,7 +857,7 @@ fn format_token_count(tokens: u64) -> String {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use leptos::mount::mount_to;
+    use crate::wasm_test_support::mount_to;
     use protocol::Task;
     use std::cell::RefCell;
     use std::rc::Rc;
