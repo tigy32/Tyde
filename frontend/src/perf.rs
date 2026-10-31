@@ -67,6 +67,7 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::ChatInkLayout => "chat_ink_layout",
         UiOperation::ChatVirtualWindow => "chat_virtual_window",
         UiOperation::ChatTabBinding => "chat_tab_binding",
+        UiOperation::AgentsSidebarProjection => "agents_sidebar_projection",
     }
 }
 
@@ -391,7 +392,7 @@ impl UiSpan {
         }
     }
 
-    fn set_items(&mut self, items: usize) {
+    pub(crate) fn set_items(&mut self, items: usize) {
         if self.capture != 0.0 {
             diagnostic_set_items(self.capture, items);
         }

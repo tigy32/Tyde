@@ -21,6 +21,7 @@ pub enum UiOperation {
     ChatInkLayout,
     ChatVirtualWindow,
     ChatTabBinding,
+    AgentsSidebarProjection,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]

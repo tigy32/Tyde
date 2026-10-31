@@ -543,7 +543,7 @@ struct AgentTreeGroup {
 
 /// A swarm shown as one summary row in the project its members run in, in
 /// place of the member rows the Agents list hides.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SidebarSwarmRef {
     host_id: String,
     project_id: ProjectId,
@@ -576,7 +576,7 @@ impl AgentProjectSection {
 
 /// A folder's top-level rows by kind: the visible "(N)" is their sum and
 /// assistive tech hears the same rows named, e.g. "1 agent, 1 swarm".
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct FolderCount {
     agents: usize,
     swarms: usize,
@@ -600,6 +600,28 @@ impl FolderCount {
     }
 }
 
+/// A folder's own rows; nested agents stay inside their parent's tree.
+#[derive(Clone, Debug, PartialEq)]
+struct FolderRows {
+    swarms: Vec<SidebarSwarmRef>,
+    groups: Vec<AgentTreeGroup>,
+}
+
+impl FolderRows {
+    fn count(&self) -> FolderCount {
+        FolderCount {
+            agents: self.groups.len(),
+            swarms: self.swarms.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WorkbenchRows {
+    workbench: ProjectInfo,
+    rows: FolderRows,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AgentHostSection {
     key: String,
@@ -612,6 +634,26 @@ struct AgentHostSection {
 struct SidebarProjection {
     pinned: Vec<AgentTreeGroup>,
     hosts: Vec<AgentHostSection>,
+}
+
+impl SidebarProjection {
+    fn agent_rows(&self) -> usize {
+        fn rows(trees: &[AgentTreeGroup]) -> usize {
+            trees.iter().map(|tree| 1 + rows(&tree.children)).sum()
+        }
+        rows(&self.pinned)
+            + self
+                .hosts
+                .iter()
+                .map(|host| {
+                    host.custom_groups
+                        .iter()
+                        .map(|group| rows(&group.groups))
+                        .chain(host.projects.iter().map(|project| rows(&project.groups)))
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1417,28 +1459,78 @@ fn disclosure_chevron(expanded: impl Fn() -> bool + Send + Sync + 'static) -> im
     }
 }
 
+/// Renders `items` keyed by identity. Each row reads only its own item, so
+/// adding, removing or changing one row leaves every other row mounted.
+fn keyed_rows<T, K, V>(
+    items: Memo<Vec<T>>,
+    key_of: fn(&T) -> K,
+    render: impl Fn(Memo<T>) -> V + Clone + Send + Sync + 'static,
+) -> impl IntoView
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: IntoView + 'static,
+{
+    let keys = Memo::new(move |_| items.with(|items| items.iter().map(key_of).collect::<Vec<_>>()));
+    let positions = Memo::new(move |_| {
+        keys.with(|keys| {
+            keys.iter()
+                .cloned()
+                .enumerate()
+                .map(|(position, key)| (key, position))
+                .collect::<HashMap<_, _>>()
+        })
+    });
+    view! {
+        <For
+            each=move || keys.get()
+            key=|key| key.clone()
+            children=move |key| {
+                // `For` disposes a row after its key leaves `items`; until then
+                // the row keeps the item it last rendered.
+                let item = Memo::new(move |previous: Option<&T>| {
+                    positions
+                        .with(|positions| positions.get(&key).copied())
+                        .map(|position| items.with(|items| items[position].clone()))
+                        .or_else(|| previous.cloned())
+                        .expect("a keyed row starts from a listed item")
+                });
+                render(item)
+            }
+        />
+    }
+}
+
+fn tree_key(tree: &AgentTreeGroup) -> SidebarAgentRef {
+    agent_ref(&tree.parent)
+}
+
 fn folder_members(
     state: AppState,
-    swarms: Vec<SidebarSwarmRef>,
-    groups: Vec<AgentTreeGroup>,
+    rows: Memo<FolderRows>,
     interactions: AgentsPanelInteractions,
     collapsed: RwSignal<HashSet<String>>,
     key: String,
 ) -> impl IntoView {
     let expanded = Memo::new(move |_| !collapsed.with(|folders| folders.contains(&key)));
+    let swarms = Memo::new(move |_| rows.with(|rows| rows.swarms.clone()));
+    let groups = Memo::new(move |_| rows.with(|rows| rows.groups.clone()));
     move || {
         if expanded.get() {
-            let swarm_rows = swarms
-                .clone()
-                .into_iter()
-                .map(|swarm| render_swarm_row(state.clone(), swarm))
-                .collect_view();
-            let agent_rows = groups
-                .clone()
-                .into_iter()
-                .map(|group| render_agent_tree_group(state.clone(), group, interactions.clone()))
-                .collect_view();
-            view! { {swarm_rows} {agent_rows} }.into_any()
+            let swarm_state = state.clone();
+            let group_state = state.clone();
+            let interactions = interactions.clone();
+            view! {
+                <For
+                    each=move || swarms.get()
+                    key=|swarm| swarm.clone()
+                    children=move |swarm| render_swarm_row(swarm_state.clone(), swarm)
+                />
+                {keyed_rows(groups, tree_key, move |group| {
+                    render_agent_tree_group(group_state.clone(), group, interactions.clone())
+                })}
+            }
+            .into_any()
         } else {
             ().into_any()
         }
@@ -1722,6 +1814,8 @@ pub fn AgentsPanel() -> impl IntoView {
 
     let section_state = state.clone();
     let projection = Memo::new(move |_| {
+        let mut span =
+            crate::perf::UiSpan::new(crate::perf::UiOperation::AgentsSidebarProjection, 0, 0);
         let snapshot = section_state.agents_view_preferences.get();
         let projects = section_state.projects.get();
         let active = section_state.active_project.get();
@@ -1807,7 +1901,19 @@ pub fn AgentsPanel() -> impl IntoView {
                 .hosts
                 .retain(|host| !host.projects.is_empty() || !host.custom_groups.is_empty());
         }
+        span.set_items(projection.agent_rows());
         projection
+    });
+    let sidebar_empty =
+        Memo::new(move |_| projection.with(|p| p.pinned.is_empty() && p.hosts.is_empty()));
+    let pinned = Memo::new(move |_| projection.with(|p| p.pinned.clone()));
+    let pinned_visible = Memo::new(move |_| pinned.with(|pinned| !pinned.is_empty()));
+    let hosts = Memo::new(move |_| projection.with(|p| p.hosts.clone()));
+    let groups_state = state.clone();
+    let has_custom_groups = Memo::new(move |_| {
+        groups_state
+            .agents_view_preferences
+            .with(|snapshot| !snapshot.groups.groups.is_empty())
     });
 
     Effect::new(move |_| {
@@ -2075,38 +2181,50 @@ pub fn AgentsPanel() -> impl IntoView {
             <AgentRestorationNotice />
             <div class="panel-content" node_ref=scroll_ref>
                 {move || {
-                    let projection = projection.get();
-                    if projection.pinned.is_empty() && projection.hosts.is_empty() {
+                    if sidebar_empty.get() {
                         view! {
                             <div class="panel-empty">"No agents yet"</div>
                         }.into_any()
                     } else {
-                        let has_custom_groups = !state.agents_view_preferences.get_untracked().groups.groups.is_empty();
                         let ungroup_target_state = state.clone();
-                        let pinned = (!projection.pinned.is_empty()).then(|| view! {
-                            <section class="agent-sidebar-pinned" aria-label="Pinned">
-                                <div class="agent-sidebar-groups-heading">"Pinned"</div>
-                                {projection.pinned.into_iter().map(|tree| render_agent_tree_group(state.clone(), tree, interactions.clone())).collect_view()}
-                            </section>
-                        });
-                        let hosts = projection.hosts.into_iter().map(|host| {
-                        let add_project_state = state.clone();
-                        let add_project_host = host.key.clone();
-                        let host_id_for_projects = host.key.clone();
-                        let host_label_for_projects = host.label.clone();
-                        let custom_groups = host.custom_groups;
-                        let custom_groups_view = if custom_groups.is_empty() {
-                            ().into_any()
-                        } else {
+                        let pinned_state = state.clone();
+                        let pinned_interactions = interactions.clone();
+                        let pinned_view = move || pinned_visible.get().then(|| {
+                            let state = pinned_state.clone();
+                            let interactions = pinned_interactions.clone();
                             view! {
-                                    <section class="agent-sidebar-custom-groups-section">
-                                        <div class="agent-sidebar-groups-heading">"Groups"</div>
-                                        {custom_groups.into_iter().map(|custom_group| {
-                                            let group_id = custom_group.group.id.clone();
+                                <section class="agent-sidebar-pinned" aria-label="Pinned">
+                                    <div class="agent-sidebar-groups-heading">"Pinned"</div>
+                                    {keyed_rows(pinned, tree_key, move |tree| render_agent_tree_group(state.clone(), tree, interactions.clone()))}
+                                </section>
+                            }
+                        });
+                        let host_state = state.clone();
+                        let host_interactions = interactions.clone();
+                        let render_host = move |host: Memo<AgentHostSection>| {
+                        let state = host_state.clone();
+                        let interactions = host_interactions.clone();
+                        let host_key = host.with_untracked(|host| host.key.clone());
+                        let host_label = Memo::new(move |_| host.with(|host| host.label.clone()));
+                        let add_project_state = state.clone();
+                        let add_project_host = host_key.clone();
+                        let projects = Memo::new(move |_| host.with(|host| host.projects.clone()));
+                        let custom_groups = Memo::new(move |_| host.with(|host| host.custom_groups.clone()));
+                        let has_custom_group_rows = Memo::new(move |_| custom_groups.with(|groups| !groups.is_empty()));
+                        let render_custom_group = {
+                            let state = state.clone();
+                            let interactions = interactions.clone();
+                            move |custom_group: Memo<AgentCustomGroupSection>| {
+                                            let group_id = custom_group.with_untracked(|custom_group| custom_group.group.id.clone());
                                             let group_id_attr = group_id.0.clone();
                                             let folder_key = format!("group:{}", group_id.0);
-                                            let member_count = FolderCount { agents: custom_group.groups.len(), swarms: 0 };
-                                            let group_name = custom_group.group.name.clone();
+                                            let header = Memo::new(move |_| custom_group.with(|custom_group| {
+                                                (custom_group.group.name.clone(), FolderCount { agents: custom_group.groups.len(), swarms: 0 })
+                                            }));
+                                            let members = Memo::new(move |_| custom_group.with(|custom_group| FolderRows {
+                                                swarms: Vec::new(),
+                                                groups: custom_group.groups.clone(),
+                                            }));
                                             let header_group_id = group_id.clone();
                                             let hover_class_group_id = group_id.clone();
                                             let keyboard_state = state.clone();
@@ -2144,10 +2262,9 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 }
                                             };
                                             let rename_group_id = group_id.clone();
-                                            let rename_group_name = group_name.clone();
                                             let on_group_rename = move |ev: web_sys::MouseEvent| {
                                                 ev.stop_propagation();
-                                                group_edit_value.set(rename_group_name.clone());
+                                                group_edit_value.set(header.with_untracked(|(name, _)| name.clone()));
                                                 editing_group.set(Some(rename_group_id.clone()));
                                             };
                                             let delete_state = state.clone();
@@ -2164,7 +2281,6 @@ pub fn AgentsPanel() -> impl IntoView {
                                             };
                                             let edit_state_base = state.clone();
                                             let edit_group_id_base = group_id.clone();
-                                            let edit_compare_name_base = group_name.clone();
                                             let header_class_group_id = header_group_id.clone();
                                             let header_focus_group_id = header_group_id.clone();
                                             let members_key = folder_key.clone();
@@ -2196,7 +2312,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                             if editing_group.with(|current| current.as_ref() == Some(&group_id)) {
                                                                 let keydown_state = edit_state_base.clone();
                                                                 let keydown_group_id = edit_group_id_base.clone();
-                                                                let keydown_compare_name = edit_compare_name_base.clone();
+                                                                let keydown_compare_name = header.with_untracked(|(name, _)| name.clone());
                                                                 let on_group_edit_keydown = move |ev: web_sys::KeyboardEvent| {
                                                                     ev.stop_propagation();
                                                                     match ev.key().as_str() {
@@ -2219,7 +2335,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 };
                                                                 let blur_state = edit_state_base.clone();
                                                                 let blur_group_id = edit_group_id_base.clone();
-                                                                let blur_compare_name = edit_compare_name_base.clone();
+                                                                let blur_compare_name = header.with_untracked(|(name, _)| name.clone());
                                                                 let on_group_edit_blur = move |_: web_sys::FocusEvent| {
                                                                     if editing_group.with_untracked(|current| current.as_ref() != Some(&blur_group_id)) {
                                                                         return;
@@ -2253,7 +2369,10 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 }.into_any()
                                                             } else {
                                                                 view! {
-                                                                    {folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name.clone(), member_count)}
+                                                                    {
+                                                                        let (group_name, member_count) = header.get();
+                                                                        folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name, member_count)
+                                                                    }
                                                                 }.into_any()
                                                             }
                                                         }}
@@ -2278,74 +2397,90 @@ pub fn AgentsPanel() -> impl IntoView {
                                                             </button>
                                                         </span>
                                                     </div>
-                                                    {folder_members(state.clone(), Vec::new(), custom_group.groups, interactions.clone(), collapsed_folders, members_key)}
+                                                    {folder_members(state.clone(), members, interactions.clone(), collapsed_folders, members_key)}
                                                 </section>
                                             }
-                                        }).collect_view()}
+                            }
+                        };
+                        let render_project = {
+                            let state = state.clone();
+                            let interactions = interactions.clone();
+                            let no_project_host = host_key.clone();
+                            move |project: Memo<AgentProjectSection>| {
+                                let project_key = project.with_untracked(|project| project.key.clone());
+                                let folder_key = format!("project:{project_key}");
+                                let header = Memo::new(move |_| {
+                                    project.with(|project| (project.label.clone(), project.project.clone(), project.folder_count()))
+                                });
+                                let editor = state.project_editor;
+                                let header_key = folder_key.clone();
+                                let no_project_host = no_project_host.clone();
+                                view! {
+                                    <section class="agent-sidebar-project-section" data-project-key=project_key>
+                                        <div class="agent-sidebar-project-header">
+                                            {move || {
+                                                let (label, target, member_count) = header.get();
+                                                let heading = if target.is_some() { format!("Project: {label}") } else { label.clone() };
+                                                let edit_name = format!("Edit project {label}");
+                                                view! {
+                                                    {folder_toggle(collapsed_folders, header_key.clone(), heading, label.clone(), member_count)}
+                                                    {match target {
+                                                        Some(target) => view! {
+                                                            <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
+                                                                on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
+                                                            <ProjectNewAgent
+                                                                destination=LaunchDestination::Project(target)
+                                                                name=format!("New agent in {label}")
+                                                                launch=launch
+                                                            />
+                                                        }.into_any(),
+                                                        None => view! {
+                                                            <ProjectNewAgent
+                                                                destination=LaunchDestination::NoProject { host_id: no_project_host.clone() }
+                                                                name=format!("New agent without a project on {}", host_label.get())
+                                                                launch=launch
+                                                            />
+                                                        }.into_any(),
+                                                    }}
+                                                }
+                                            }}
+                                        </div>
+                                        {project_members(state.clone(), project, interactions.clone(), collapsed_folders, folder_key.clone(), show_workbenches, launch)}
                                     </section>
-                                }.into_any()
+                                }
+                            }
                         };
                         view! {
-                            <section class="agent-sidebar-host-section" data-host-id=host.key>
+                            <section class="agent-sidebar-host-section" data-host-id=host_key>
                                 <div class="agent-sidebar-host-header">
-                                    <span aria-label=format!("Host: {}", host.label)>{host.label.clone()}</span>
-                                    <button type="button" class="agent-new-project" aria-label=format!("New project on {}", host.label)
+                                    <span aria-label=move || format!("Host: {}", host_label.get())>{move || host_label.get()}</span>
+                                    <button type="button" class="agent-new-project" aria-label=move || format!("New project on {}", host_label.get())
                                         on:click=move |_| crate::components::host_browser::open_project_browser_for_host(&add_project_state, &add_project_host)>"+ Project"</button>
                                 </div>
                                 <div
                                     class="agent-sidebar-default-tree"
                                     data-agent-drop-kind="ungroup"
                                 >
-                                            {host.projects.into_iter().map(|project| {
-                                                let no_project_host = host_id_for_projects.clone();
-                                                let no_project_host_label = host_label_for_projects.clone();
-                                                let folder_key = format!("project:{}", project.key);
-                                                let member_count = project.folder_count();
-                                                let editor = state.project_editor;
-                                                let target = project.project.clone();
-                                                let heading = if target.is_some() { format!("Project: {}", project.label) } else { project.label.clone() };
-                                                let edit_name = format!("Edit project {}", project.label);
-                                                view! {
-                                                    <section class="agent-sidebar-project-section" data-project-key=project.key.clone()>
-                                                        <div class="agent-sidebar-project-header">
-                                                            {folder_toggle(collapsed_folders, folder_key.clone(), heading, project.label.clone(), member_count)}
-                                                            {match target {
-                                                                Some(target) => view! {
-                                                                    <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
-                                                                        on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
-                                                                    <ProjectNewAgent
-                                                                        destination=LaunchDestination::Project(target)
-                                                                        name=format!("New agent in {}", project.label)
-                                                                        launch=launch
-                                                                    />
-                                                                }.into_any(),
-                                                                None => view! {
-                                                                    <ProjectNewAgent
-                                                                        destination=LaunchDestination::NoProject { host_id: no_project_host.clone() }
-                                                                        name=format!("New agent without a project on {no_project_host_label}")
-                                                                        launch=launch
-                                                                    />
-                                                                }.into_any(),
-                                                            }}
-                                                        </div>
-                                                        {project_members(state.clone(), project.clone(), interactions.clone(), collapsed_folders, folder_key, show_workbenches, launch)}
-                                                    </section>
-                                                }
-                                            }).collect_view()}
+                                    {keyed_rows(projects, |project| project.key.clone(), render_project)}
                                 </div>
-                                {custom_groups_view}
+                                {move || has_custom_group_rows.get().then(|| view! {
+                                    <section class="agent-sidebar-custom-groups-section">
+                                        <div class="agent-sidebar-groups-heading">"Groups"</div>
+                                        {keyed_rows(custom_groups, |custom_group| custom_group.group.id.clone(), render_custom_group.clone())}
+                                    </section>
+                                })}
                             </section>
                         }
-                        }).collect_view();
+                        };
                         view! { <div class="agent-card-list">
-                                {pinned}
+                                {pinned_view}
                                 <div class="agent-group-live-status" aria-live="polite">
                                     {move || group_live_status.get()}
                                 </div>
                                 {move || {
                                     let dragging_or_picking =
                                         dragged_agent.get().is_some() || keyboard_agent.get().is_some();
-                                    if dragging_or_picking && has_custom_groups {
+                                    if dragging_or_picking && has_custom_groups.get() {
                                         render_ungroup_drop_target(
                                             ungroup_target_state.clone(),
                                             keyboard_agent,
@@ -2356,7 +2491,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                         ().into_any()
                                     }
                                 }}
-                            {hosts}
+                            {keyed_rows(hosts, |host| host.key.clone(), render_host)}
                         </div> }.into_any()
                     }
                 }}
@@ -2392,7 +2527,7 @@ pub fn AgentsPanel() -> impl IntoView {
 
 fn project_members(
     state: AppState,
-    project: AgentProjectSection,
+    project: Memo<AgentProjectSection>,
     interactions: AgentsPanelInteractions,
     collapsed: RwSignal<HashSet<String>>,
     key: String,
@@ -2402,12 +2537,69 @@ fn project_members(
     let expanded_key = key.clone();
     let project_expanded =
         Memo::new(move |_| !collapsed.with(|folders| folders.contains(&expanded_key)));
+    let all_rows = Memo::new(move |_| {
+        project.with(|project| FolderRows {
+            swarms: project.swarms.clone(),
+            groups: project.groups.clone(),
+        })
+    });
+    let own_rows = Memo::new(move |_| {
+        project.with(|project| {
+            let in_workbench = |id: &ProjectId| {
+                project
+                    .workbenches
+                    .iter()
+                    .any(|workbench| workbench.project.id == *id)
+            };
+            FolderRows {
+                swarms: project
+                    .swarms
+                    .iter()
+                    .filter(|swarm| !in_workbench(&swarm.project_id))
+                    .cloned()
+                    .collect(),
+                groups: project
+                    .groups
+                    .iter()
+                    .filter(|tree| !tree.parent.project_id.as_ref().is_some_and(in_workbench))
+                    .cloned()
+                    .collect(),
+            }
+        })
+    });
+    let workbenches = Memo::new(move |_| {
+        project.with(|project| {
+            project
+                .workbenches
+                .iter()
+                .map(|workbench| {
+                    let id = &workbench.project.id;
+                    WorkbenchRows {
+                        workbench: workbench.clone(),
+                        rows: FolderRows {
+                            swarms: project
+                                .swarms
+                                .iter()
+                                .filter(|swarm| swarm.project_id == *id)
+                                .cloned()
+                                .collect(),
+                            groups: project
+                                .groups
+                                .iter()
+                                .filter(|tree| tree.parent.project_id.as_ref() == Some(id))
+                                .cloned()
+                                .collect(),
+                        },
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+    });
     move || {
         if !show_workbenches.get() {
             return folder_members(
                 state.clone(),
-                project.swarms.clone(),
-                project.groups.clone(),
+                all_rows,
                 interactions.clone(),
                 collapsed,
                 key.clone(),
@@ -2417,35 +2609,52 @@ fn project_members(
         if !project_expanded.get() {
             return ().into_any();
         }
-        let mut groups = project.groups.clone();
-        let mut swarms = project.swarms.clone();
-        let workbenches = project.workbenches.iter().map(|workbench| {
-            let target = ActiveProjectRef { host_id: workbench.host_id.clone(), project_id: workbench.project.id.clone() };
-            let (members, remaining): (Vec<_>, Vec<_>) = groups.drain(..).partition(|tree| tree.parent.project_id.as_ref() == Some(&target.project_id));
-            groups = remaining;
-            let (member_swarms, remaining): (Vec<_>, Vec<_>) = swarms.drain(..).partition(|swarm| swarm.project_id == target.project_id);
-            swarms = remaining;
-            let count = FolderCount { agents: members.len(), swarms: member_swarms.len() };
+        let workbench_state = state.clone();
+        let workbench_interactions = interactions.clone();
+        let render_workbench = move |workbench: Memo<WorkbenchRows>| {
+            let target = workbench.with_untracked(|workbench| ActiveProjectRef {
+                host_id: workbench.workbench.host_id.clone(),
+                project_id: workbench.workbench.project.id.clone(),
+            });
             let folder_key = format!("workbench:{}:{}", target.host_id, target.project_id.0);
-            let label = workbench.project.name.clone();
-            let edit_label = format!("Edit project {label}");
-            let editor = state.project_editor;
+            let header = Memo::new(move |_| {
+                workbench.with(|workbench| {
+                    (
+                        workbench.workbench.project.name.clone(),
+                        workbench.rows.count(),
+                    )
+                })
+            });
+            let rows = Memo::new(move |_| workbench.with(|workbench| workbench.rows.clone()));
+            let header_key = folder_key.clone();
+            let editor = workbench_state.project_editor;
+            let project_id = target.project_id.0.clone();
             view! {
-                <section class="agent-sidebar-workbench-section" data-project-id=target.project_id.0.clone()>
+                <section class="agent-sidebar-workbench-section" data-project-id=project_id>
                     <div class="agent-sidebar-project-header agent-sidebar-workbench">
-                        {folder_toggle(collapsed, folder_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
-                        <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
-                            on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
-                        <ProjectNewAgent destination=LaunchDestination::Project(target.clone()) name=format!("New agent in {label}") launch=launch />
+                        {move || {
+                            let (label, count) = header.get();
+                            let edit_label = format!("Edit project {label}");
+                            let target = target.clone();
+                            view! {
+                                {folder_toggle(collapsed, header_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
+                                <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
+                                    on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
+                                <ProjectNewAgent destination=LaunchDestination::Project(target) name=format!("New agent in {label}") launch=launch />
+                            }
+                        }}
                     </div>
-                    {folder_members(state.clone(), member_swarms, members, interactions.clone(), collapsed, folder_key)}
+                    {folder_members(workbench_state.clone(), rows, workbench_interactions.clone(), collapsed, folder_key)}
                 </section>
             }
-        }).collect_view();
+        };
         view! {
-            {folder_members(state.clone(), swarms, groups, interactions.clone(), collapsed, key.clone())}
-            <div class="agent-sidebar-workbenches">{workbenches}</div>
-        }.into_any()
+            {folder_members(state.clone(), own_rows, interactions.clone(), collapsed, key.clone())}
+            <div class="agent-sidebar-workbenches">
+                {keyed_rows(workbenches, |workbench| workbench.workbench.project.id.clone(), render_workbench)}
+            </div>
+        }
+        .into_any()
     }
 }
 
@@ -2463,66 +2672,82 @@ fn ProjectNewAgent(
 
 fn render_agent_tree_group(
     state: AppState,
-    group: AgentTreeGroup,
+    group: Memo<AgentTreeGroup>,
     interactions: AgentsPanelInteractions,
 ) -> AnyView {
     #[cfg(all(test, target_arch = "wasm32"))]
     wasm_tests::trace_sidebar_stack("tree group", std::ptr::addr_of!(state) as usize);
-    let parent = group.parent;
-    let children = group.children;
-    let parent_ref = agent_ref(&parent);
-    let group_id = parent.agent_id.0.clone();
+    let (parent_ref, parent_ref_host, group_id) = group.with_untracked(|group| {
+        (
+            agent_ref(&group.parent),
+            group.parent.host_id.clone(),
+            group.parent.agent_id.0.clone(),
+        )
+    });
     let expanded_parents = interactions.expanded_parents;
     let inactive_parents = interactions.inactive_parents;
-    let children_agents = children
-        .iter()
-        .map(|child| child.parent.clone())
-        .collect::<Vec<_>>();
+    let card = Memo::new(move |_| group.with(|group| (group.parent.clone(), group.children.len())));
+    let children = Memo::new(move |_| group.with(|group| group.children.clone()));
+    let child_count = Memo::new(move |_| children.with(Vec::len));
+    let has_children = Memo::new(move |_| child_count.get() > 0);
     let running = {
         let state = state.clone();
         Memo::new(move |_| {
-            children_agents
-                .iter()
-                .filter(|agent| child_is_running(&state, agent))
-                .count()
+            children.with(|children| {
+                children
+                    .iter()
+                    .filter(|child| child_is_running(&state, &child.parent))
+                    .count()
+            })
         })
     };
-    let child_count = children.len();
-    let parent_ref_host = parent.host_id.clone();
-    let parent_view = agent_card(state.clone(), parent, child_count, interactions.clone());
-    let children_view = children
-        .into_iter()
-        .map(|child| {
-            let parent = parent_ref.clone();
-            let child_agent = child.parent.clone();
-            let child_state = state.clone();
-            let visible = move || {
-                expanded_parents.with(|set| set.contains(&parent))
-                    && (child_is_running(&child_state, &child_agent)
-                        || inactive_parents.with(|set| set.contains(&parent)))
-            };
-            view! {
-                <div class="agent-card-child" class:agent-card-child-hidden=move || !visible()>
-                    {render_agent_tree_group(state.clone(), child, interactions.clone())}
-                </div>
-            }
-        })
-        .collect_view();
+    let card_state = state.clone();
+    let card_interactions = interactions.clone();
+    let parent_view = move || {
+        let (parent, child_count) = card.get();
+        agent_card(
+            card_state.clone(),
+            parent,
+            child_count,
+            card_interactions.clone(),
+        )
+    };
+    let child_parent = parent_ref.clone();
+    let children_view = keyed_rows(children, tree_key, move |child: Memo<AgentTreeGroup>| {
+        let parent = child_parent.clone();
+        let child_state = state.clone();
+        let visible = move || {
+            expanded_parents.with(|set| set.contains(&parent))
+                && (child.with(|child| child_is_running(&child_state, &child.parent))
+                    || inactive_parents.with(|set| set.contains(&parent)))
+        };
+        view! {
+            <div class="agent-card-child" class:agent-card-child-hidden=move || !visible()>
+                {render_agent_tree_group(state.clone(), child, interactions.clone())}
+            </div>
+        }
+    });
     let parent_expanded = parent_ref.clone();
     let toggle_parent = parent_ref.clone();
     let inactive_open = parent_ref;
     let has_inactive = Memo::new(move |_| {
-        child_count > running.get() && expanded_parents.with(|set| set.contains(&parent_expanded))
+        child_count.get() > running.get()
+            && expanded_parents.with(|set| set.contains(&parent_expanded))
     });
     let inactive_expanded =
         Memo::new(move |_| inactive_parents.with(|set| set.contains(&inactive_open)));
-    let inactive_button = (child_count > 0).then(|| view! {
-        <button class="agent-show-inactive" style=move || if has_inactive.get() { "" } else { "display:none" } aria-expanded=move || inactive_expanded.get().to_string()
-            on:click=move |_| inactive_parents.update(|set| { if !set.remove(&toggle_parent) { set.insert(toggle_parent.clone()); } })>
-            <span class="agent-card-disclosure-slot">{disclosure_chevron(move || inactive_expanded.get())}</span>
-            <span class="agent-show-inactive-label">{move || format!("{} inactive", child_count - running.get())}</span>
-        </button>
-    });
+    let inactive_button = move || {
+        has_children.get().then(|| {
+        let toggle_parent = toggle_parent.clone();
+        view! {
+            <button class="agent-show-inactive" style=move || if has_inactive.get() { "" } else { "display:none" } aria-expanded=move || inactive_expanded.get().to_string()
+                on:click=move |_| inactive_parents.update(|set| { if !set.remove(&toggle_parent) { set.insert(toggle_parent.clone()); } })>
+                <span class="agent-card-disclosure-slot">{disclosure_chevron(move || inactive_expanded.get())}</span>
+                <span class="agent-show-inactive-label">{move || format!("{} inactive", child_count.get() - running.get())}</span>
+            </button>
+        }
+    })
+    };
     view! {
         <div class="agent-card-group" data-host-id=parent_ref_host data-agent-id=group_id>
             {parent_view}
@@ -7356,6 +7581,279 @@ mod wasm_tests {
             failures.is_empty(),
             "Owned children must not become root cards at sidebar boundaries: {failures:?}"
         );
+    }
+
+    /// The reported freezes followed workbench and agent lifecycle frames.
+    /// Each such frame used to rebuild every sidebar row; each frame must now
+    /// replace only the rows it changes, and the projection that it triggers
+    /// must reach the local stall log by name.
+    #[wasm_bindgen_test]
+    async fn sidebar_lifecycle_frames_keep_unrelated_rows_mounted() {
+        use crate::perf::diagnostic_tests::LocalMonitorClock;
+
+        const HOST: &str = "sidebar-lifecycle";
+        let container = make_container();
+        let state = make_app_state(HOST);
+        reset_inbound_seqs(&state, HOST);
+        state.agents_view_preferences.update(|snapshot| {
+            snapshot.sidebar.hide_sub_agents = false;
+            snapshot.sidebar.show_workbenches = true;
+            snapshot.sidebar.project_visibility = AgentsSidebarProjectVisibility::AllProjects;
+        });
+        state
+            .configured_hosts
+            .set(vec![configured_host(HOST, "Lifecycle Host")]);
+        let workbench = |id: &str, parent: &str, sort_order| {
+            let mut info = project_info(HOST, id, id, sort_order);
+            info.project.source = ProjectSource::GitWorkbench {
+                environment: Default::default(),
+                parent_project_id: ProjectId(parent.to_owned()),
+                branch: protocol::GitBranchName(id.to_owned()),
+                roots: vec![protocol::WorkbenchRoot {
+                    parent_root: ProjectRootPath(format!("/tmp/{parent}")),
+                    worktree_root: ProjectRootPath(format!("/tmp/{id}")),
+                }],
+            };
+            info.project
+        };
+        state.projects.set(vec![
+            project_info(HOST, "alpha", "Alpha Project", 0),
+            project_info(HOST, "beta", "Beta Project", 1),
+            ProjectInfo {
+                host_id: HOST.to_owned(),
+                project: workbench("alpha-bench", "alpha", 2),
+            },
+        ]);
+        for (id, name, project, parent) in [
+            ("parent-a", "Parent Agent", "alpha", None),
+            ("child-a", "Child Agent", "alpha", Some("parent-a")),
+            ("beta-agent", "Beta Agent", "beta", None),
+            ("bench-agent", "Bench Agent", "alpha-bench", None),
+        ] {
+            push_agent_with_scope(&state, HOST, id, name, true, Some(project), parent);
+        }
+        let _mount = mount_panel(&container, state.clone());
+        next_tick().await;
+
+        let find = |selector: &str| -> Option<web_sys::Element> {
+            container.query_selector(selector).unwrap()
+        };
+        let mounted = [
+            "[data-agent-id='parent-a'] > .agent-card",
+            "[data-agent-id='child-a'] > .agent-card",
+            "[data-agent-id='beta-agent'] > .agent-card",
+            "[data-project-key='sidebar-lifecycle:alpha']",
+            "[data-project-key='sidebar-lifecycle:beta']",
+        ]
+        .map(|selector| {
+            let node = find(selector).unwrap_or_else(|| panic!("{selector} renders"));
+            (selector, node)
+        });
+        let bench_section = find("[data-project-id='alpha-bench']").expect("workbench renders");
+        let focused_action =
+            find("[data-agent-id='beta-agent'] button[aria-label='Agent actions']")
+                .expect("the unrelated agent has a keyboard action")
+                .dyn_into::<web_sys::HtmlElement>()
+                .unwrap();
+        focused_action.focus().unwrap();
+        let document = container.owner_document().unwrap();
+        let assert_unrelated_rows_kept = |frame: &str| {
+            assert!(
+                document
+                    .active_element()
+                    .is_some_and(|active| active.is_same_node(Some(&focused_action))),
+                "{frame} must preserve keyboard focus on the unrelated agent action"
+            );
+            for (selector, node) in &mounted {
+                assert!(
+                    node.is_connected()
+                        && find(selector).is_some_and(|current| current.is_same_node(Some(node))),
+                    "{frame} must leave {selector} mounted"
+                );
+            }
+        };
+        let host_frame = |seq, kind, payload: serde_json::Value| {
+            dispatch_frame(
+                &state,
+                HOST,
+                StreamPath(format!("/host/{HOST}")),
+                kind,
+                seq,
+                &payload,
+            );
+        };
+        let text = || {
+            container
+                .query_selector(".agents-panel")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+        };
+
+        host_frame(
+            0,
+            FrameKind::ProjectNotify,
+            serde_json::to_value(protocol::ProjectNotifyPayload::Upsert {
+                project: workbench("beta-bench", "beta", 3),
+            })
+            .unwrap(),
+        );
+        let start = protocol::AgentStartPayload {
+            tyde_permissions: Default::default(),
+            swarm_membership: None,
+            agent_id: AgentId("fresh-agent".to_owned()),
+            name: "Fresh Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: Some(ProjectId("beta-bench".to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            workflow: None,
+            created_at_ms: 1,
+        };
+        host_frame(
+            1,
+            FrameKind::NewAgent,
+            serde_json::to_value(NewAgentPayload {
+                tyde_permissions: Default::default(),
+                swarm_membership: None,
+                agent_id: start.agent_id.clone(),
+                name: start.name.clone(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                workspace_roots: Vec::new(),
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                project_id: start.project_id.clone(),
+                parent_agent_id: None,
+                session_id: None,
+                workflow: None,
+                created_at_ms: 1,
+                instance_stream: agent_stream("fresh-agent"),
+                activity_summary: Default::default(),
+                activity: protocol::AgentActivity::Idle,
+                review_recipient: false,
+            })
+            .unwrap(),
+        );
+        crate::dispatch::prime_agent_stream_for_tests(
+            &state,
+            HOST,
+            &agent_stream("fresh-agent"),
+            &start,
+        );
+        next_tick().await;
+        assert!(
+            find("[data-project-id='beta-bench'] [data-agent-id='fresh-agent'] > .agent-card")
+                .is_some_and(|card| card.text_content().unwrap().contains("Fresh Agent")),
+            "the new workbench shows its new agent"
+        );
+        assert!(bench_section.is_connected());
+        assert_unrelated_rows_kept("adding a workbench and its agent");
+
+        dispatch_frame(
+            &state,
+            HOST,
+            agent_stream("fresh-agent"),
+            FrameKind::AgentRenamed,
+            0,
+            &protocol::AgentRenamedPayload {
+                agent_id: AgentId("fresh-agent".to_owned()),
+                name: "Renamed Agent".to_owned(),
+            },
+        );
+        next_tick().await;
+        assert!(text().contains("Renamed Agent") && !text().contains("Fresh Agent"));
+        assert!(bench_section.is_connected());
+        assert_unrelated_rows_kept("renaming an agent");
+
+        host_frame(
+            2,
+            FrameKind::AgentClosed,
+            serde_json::to_value(protocol::AgentClosedPayload {
+                agent_id: AgentId("bench-agent".to_owned()),
+            })
+            .unwrap(),
+        );
+        host_frame(
+            3,
+            FrameKind::ProjectNotify,
+            serde_json::to_value(protocol::ProjectNotifyPayload::Delete {
+                project: workbench("alpha-bench", "alpha", 2),
+            })
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(!text().contains("Bench Agent"));
+        assert!(
+            !bench_section.is_connected() && find("[data-project-id='alpha-bench']").is_none(),
+            "removing a workbench removes its section"
+        );
+        assert!(text().contains("Renamed Agent"));
+        assert_unrelated_rows_kept("removing a workbench");
+
+        let clock = LocalMonitorClock::install();
+        let recorded = js_sys::eval(
+            r#"
+            (() => {
+                const invoke = window.__TAURI__.core.invoke;
+                window.__sidebarRestoreInvoke = () => {
+                    window.__TAURI__.core.invoke = invoke;
+                    delete window.__sidebarRestoreInvoke;
+                };
+                return new Promise(recorded => {
+                    window.__TAURI__.core.invoke = (cmd, args) => {
+                        if (cmd === 'log_ui_diagnostic') {
+                            recorded(JSON.stringify(args.record));
+                            return Promise.resolve(null);
+                        }
+                        return invoke(cmd, args);
+                    };
+                });
+            })()
+            "#,
+        )
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
+        push_agent_with_scope(
+            &state,
+            HOST,
+            "late-agent",
+            "Late Agent",
+            true,
+            Some("beta"),
+            None,
+        );
+        next_tick().await;
+        clock.advance(2000.0);
+        clock.tick();
+        let local: JsonValue = serde_json::from_str(
+            &wasm_bindgen_futures::JsFuture::from(recorded)
+                .await
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        js_sys::eval("window.__sidebarRestoreInvoke()").unwrap();
+        drop(clock);
+        assert_eq!(local["diagnostic"]["event"], "event_loop_gap");
+        let work = &local["diagnostic"]["longest_work"];
+        assert_eq!(work["operation"], "agents_sidebar_projection");
+        assert_eq!(
+            work["items"], 5,
+            "parent, child, beta, renamed and late agent rows"
+        );
+        assert_unrelated_rows_kept("a later agent");
     }
 
     #[wasm_bindgen_test]

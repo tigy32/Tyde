@@ -49,11 +49,12 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   | `chat_row_projection` | 0 | projected loaded row handles |
   | `chat_context_scan`, `chat_context_reported_scan` | 0 | rows actually visited |
   | `chat_ink_layout`, `chat_virtual_window` | 0 | loaded rows supplied to calculation |
+  | `agents_sidebar_projection` | 0 | projected agent rows |
 
   No other details or arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
   `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0}`.
-  The selected deferred chat projections below feed this same bounded
+  The selected deferred chat and sidebar projections below feed this same bounded
   aggregate, including when detailed capture is off. They can run after
   host dispatch has returned; receive/dispatch timing cannot cover that work.
   Their counts are not persisted session size, mounted rows or bytes cloned.
@@ -169,7 +170,7 @@ bridge wait initiated by that work.
   be added together. Host receive spans acquire their typed frame kind after
   parsing; dispatch spans identify the frame from the start. Neither identifies
   subsequent deferred reactive rendering or browser layout/paint. The following
-  projection spans measure selected deferred chat work separately:
+  projection spans measure selected deferred chat and sidebar work separately:
 
   | Projection `operation` | `items` |
   |---|---|
@@ -179,6 +180,7 @@ bridge wait initiated by that work.
   | `chat_context_reported_scan` | rows actually visited in the ever-reported scan |
   | `chat_ink_layout` | loaded rows supplied to stretch layout |
   | `chat_virtual_window` | loaded rows supplied to viewport/spacer calculation |
+  | `agents_sidebar_projection` | projected agent rows, including nested children; swarm rows are not counted |
 
   These spans wrap the actual existing work, including full-entry clones in
   context scans. Counts are not persisted session size, mounted DOM rows,
@@ -188,6 +190,8 @@ bridge wait initiated by that work.
   typed stats. Stretch layout runs only for Flow/Notebook, not Default. Hidden
   hot-set chats can still execute projections; visibility alone does not imply
   suspension. No extra signal subscriptions or transcript scans are added.
+  The sidebar span covers computing the projection, not the DOM rows built
+  from it; rows are keyed, so a lifecycle frame rebuilds only changed rows.
 
   Compare these intervals to typed receive/dispatch records and frame gaps on
   the same monotonic timeline. Synchronous nesting retains capture-local
