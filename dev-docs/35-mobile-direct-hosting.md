@@ -130,3 +130,97 @@ The compile-time embed is the one thing `./dev.sh check` cannot cover — it nev
 sets `TYDE_MOBILE_BUNDLE_DIR`, so every checked build has an empty table. What
 check *does* cover is that such a build says so: with no directory configured it
 reports an error naming the builder script rather than binding a port that 404s.
+
+## Bounded typed apparatus adapter
+
+On Linux/macOS, the existing `tyde-dev-driver` provides exactly five private-file
+operations for a disposable, empty canonical DEV host. It does not launch hosts,
+create tunnels, redeem offers, change expiry/Cancel, or drive a device.
+
+Build/export from the completed, committed workbench:
+
+```sh
+./dev.sh mobile-direct-export /absolute/new/private-export
+```
+
+First pass `./dev.sh check` on the committed implementation workbench, as for
+any source change. Export requires that clean committed tree and builds only the
+driver, not a new host or mobile bundle. It uses Cargo's actual artifact path and
+exports `tyde-dev-driver`, private build logs, and `build-receipt.json`. The
+receipt hashes the executable and every tracked source file and pins HEAD and
+the compiler. This is a host-native executable; run the same canonical command
+on macOS if the executor needs a macOS binary. Do not copy a Linux binary to macOS.
+
+Each invocation is foreground and has only two path arguments:
+
+```sh
+/absolute/private-export/tyde-dev-driver mobile-direct \
+  /absolute/private-run/request.json /absolute/private-run/new-receipt.json
+```
+
+All JSON inputs/outputs must be owned regular mode0600 files in canonical,
+owned mode0700 directories. The adapter rejects symlink inputs, existing outputs,
+mutable inventory mismatches and unrelated host settings changes. Do not put
+endpoints, origins, offers, identifiers or credentials in argv or logs. stdout
+contains only a completion marker; failures contain only stage context.
+
+Save the **actual decoded canonical `tyde_dev_instance_wait` Ready result** as
+`ready.json` (not the MCP JSON-RPC envelope). Never construct a substitute Ready.
+Create one immutable `run.json` per case, with these fields:
+
+```json
+{
+  "ready_path": "/absolute/private-run/ready.json",
+  "expected": {
+    "protocol_version": 94,
+    "tyde_version": {"major": 0, "minor": 8, "patch": 14},
+    "release_version": "0.9.6-beta.15",
+    "project_dir": "/absolute/immutable-source"
+  },
+  "bundle_dir": "/absolute/immutable-mobile-web",
+  "inventory": {"each/relative/file": "its-lowercase-sha256"}
+}
+```
+
+`inventory` is the **complete exact** public directory inventory from the sealed
+case, including shell, manifest and all versioned artifacts. No stage directories,
+AppleDouble sidecars, symlinks or special files are permitted. Hashes are checked
+before and after every operation. Packet owners still qualify manifest/SRI,
+trusted HTTPS, native custody and authenticated mobile transport separately.
+
+Each request has `run` (the absolute `run.json` path) and an `operation` object:
+
+| `operation.kind` | Other operation fields | Result |
+|---|---|---|
+| `configure` | none | One four-field CAS, kernel `127.0.0.1:0`, Directory Online/count/bind |
+| `set_origin` | `previous`, `origin_path` | CAS actual origin from a private JSON string file |
+| `offer` | `previous`, `offer_path` | One direct offer; unchanged serialized production payload at new private path |
+| `revoke` | `previous` | Wait for this offer's Consumed state; revoke its sole disposable device |
+| `disable` | `previous` | CAS hosting off; await authoritative Disabled |
+
+`previous` is the prior invocation's receipt path. Sequence is configure →
+set_origin → offer → native episode → revoke → disable. Without an offer,
+configure/set_origin may go directly to disable. Each predecessor is claimed
+with a new `.used` file **before** sending; never retry a failed or lost operation.
+Retain partial outputs/claims for diagnosis. A failed operation is not success
+and the tool performs no rollback, renewal, automatic retry or hidden cleanup.
+Revoke never accepts an arbitrary device ID. Disable refuses an active offer,
+so it cannot conceal the separately owned expiry/Cancel defect. After Disabled,
+a new sealed case may configure the same DEV host with a fresh run/receipt chain.
+
+Every operation observes an exact source-typed Hello/Welcome probe, including
+release_version, independently of `client::connect`, then uses that production
+client's validated event/sequence stream. CAS success requires the matching
+SettingsWriteResult, applied/no errors, HostSettings/current_etag/desired fields,
+and authoritative hosting state; fanout and result may arrive in either order.
+Receipts retain these **actual private observations**, not reconstructed status.
+The probe is not OS process/executable attestation; retain the packet owner's
+kernel/process custody evidence for the actual canonical host separately.
+
+`server/tests/mobile_direct_adapter.rs` exercises the adapter across real TCP,
+production server/protocol and real HTTP with the shared mock-backend fixture.
+Only the test emulates phone redemption; no provider turns or native acceptance
+are claimed. It rejects a wrong Welcome release, missing-origin offer creation
+(with no offer payload), and an active-offer disable,
+then proves configure/origin/offer/consumption/revoke/Disabled. Run only through
+`./dev.sh check`.

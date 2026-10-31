@@ -852,6 +852,7 @@ usage() {
     printf 'Usage: %s check [--explain-cache]\n' "$0"
     printf '       %s rust-toolchain\n' "$0"
     printf '       %s release <command> [args]\n' "$0"
+    printf '       %s mobile-direct-export ABS_NEW_DIRECTORY\n' "$0"
     printf '       %s mobile-bundle [--out DIR] [--version X.Y.Z]\n' "$0"
 }
 
@@ -873,6 +874,14 @@ case "${1:-}" in
     release)
         shift
         exec tools/release.sh "$@"
+        ;;
+    mobile-direct-export)
+        shift
+        [[ $# -eq 1 && "$1" == /* ]] || die "mobile-direct-export requires one absolute new directory"
+        [[ -z "$(git status --porcelain)" ]] || die "commit the completed workbench before export"
+        verify_active_rust_toolchain "$(rust_toolchain_channel)"
+        set_sccache_environment
+        exec python3 tools/export-mobile-direct.py "$@"
         ;;
     mobile-bundle)
         shift

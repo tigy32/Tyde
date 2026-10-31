@@ -22,6 +22,8 @@ async fn run() {
                 Err(err) => Err(err),
             }
         }
+        #[cfg(unix)]
+        Some("mobile-direct") => tyde_dev_driver::mobile_direct::run(&args[1..]).await,
         Some("debug") => {
             args.remove(0);
             let config = tyde_dev_driver::debug::DebugServerConfig::from_args_env(&args);
@@ -30,7 +32,7 @@ async fn run() {
                 Err(err) => Err(err),
             }
         }
-        _ => Err("usage: tyde-dev-driver <agent-control|debug> ...".to_string()),
+        _ => Err("usage: tyde-dev-driver <agent-control|debug|mobile-direct> ...".to_string()),
     };
 
     if let Err(err) = result {

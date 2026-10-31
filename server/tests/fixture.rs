@@ -953,6 +953,44 @@ impl Fixture {
         self.host.install_spawn_operation_publication_test_gate()
     }
 
+    // Shared by every sim binary; only the adapter flow needs a TCP endpoint.
+    #[allow(dead_code)]
+    pub async fn listen_tcp(
+        &self,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let host = self.host.clone();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let (socket, _) = accepted.expect("accept fixture client");
+                        let host = host.clone();
+                        connections.spawn(async move {
+                            let connection = server::accept(&server::ServerConfig::current(), socket)
+                                .await.expect("fixture handshake");
+                            // An exact-version probe intentionally closes after Welcome.
+                            let _ = server::run_connection(connection, host).await;
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        (address, stop, task)
+    }
+
     #[allow(dead_code)]
     pub fn host_for_test(&self) -> server::HostHandle {
         self.host.clone()
