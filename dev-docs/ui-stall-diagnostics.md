@@ -132,6 +132,35 @@ v0.9.4-beta.15 rescan correction did not cover directory expansion or all real
 inventory changes. These are source/tag ancestry findings, not historical
 binary reproductions or proof that earlier versions cannot stall.
 
+## Native rescan backlog and retired file views
+
+An isolated exact-c7 large-tree SSH lifecycle capture observed a 504-second
+project-delete cleanup interval. Native samples showed watcher reconciliation;
+server traces recorded 339 full reconciliations from 22,039 native loss notices,
+while the completed file-view reads took at most 4ms. These are observations,
+not timing requirements or evidence of the original 8–20-second UI freezes.
+
+Native loss notices formerly occupied the ordinary 128-event FIFO individually.
+Watch acknowledgements and retirement commands waited behind repeated full
+inventory reconciliations. Native loss and userspace overflow now share one
+pending rescan marker. A loss arriving after reconciliation starts can still
+schedule the next reconciliation; changed-file observation and retirement joins
+are preserved. The protocol regression holds the worker, delivers two explicit
+native losses and queues a real directory view. A later native rescan moves its
+directory only before the queued watch-update boundary; later legitimate losses
+cannot change the test verdict. The client must receive the original populated
+page. The oracle is independent of event paths and never asserts elapsed time.
+
+The ordinary native-loss queue dates to `f78ed526` (v0.9.4-beta.7). File-view
+watch barriers and retirement joins arrived in `8c912340` (v0.9.6-beta.9).
+These are source/tag ancestry findings, not historical binary reproductions or
+an introduction date for the original UI freezes. The older TREE-Q capture
+shows delayed delivery of its populated tree, but lacks producer-side stacks;
+a later watcher-qualified capture observed an 812-second Q-view delivery wait,
+with reconciliation in its native sample and 441 completed reconciliations.
+These captures and the deterministic protocol regression establish the queue
+mechanism without retrospectively manufacturing the missing original stacks.
+
 ## Existing opt-in detailed capture
 
 The client recorder is off until explicitly started. It uses the existing

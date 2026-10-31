@@ -6432,6 +6432,105 @@ async fn project_watcher_prunes_ignored_build_trees() {
     )
     .await;
 
+    #[cfg(target_os = "linux")]
+    {
+        let root = repo.path().to_owned();
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let paused =
+            fixture.on_project_scan(root.clone(), server::ScanPoint::WatcherProcess, move || {
+                held.send(()).unwrap();
+                resume.recv().unwrap();
+            });
+        fs::write(root.join("src/main.rs"), "hold watcher\n").unwrap();
+        holding.await.unwrap();
+        for path in ["src/main.rs", "tracked/keep.rs"] {
+            let injected = fixture.on_project_scan(
+                root.join(path),
+                server::ScanPoint::WatcherForceRescan,
+                || {},
+            );
+            let (delivered, observed) =
+                watch_completion(&fixture, &root, server::ScanPoint::WatcherRescanDelivered);
+            fs::write(root.join(path), "native loss\n").unwrap();
+            observed.await.unwrap();
+            drop((injected, delivered));
+        }
+        let (armed, armed_rx) = std::sync::mpsc::channel();
+        let changed_root = root.clone();
+        let first = fixture.on_project_scan(
+            root.clone(),
+            server::ScanPoint::WatcherRescanStarting,
+            move || {
+                let next_root = changed_root.clone();
+                let next = server::InstalledScanHook::install(
+                    changed_root,
+                    server::ScanPoint::WatcherRescanStarting,
+                    Box::new(move || {
+                        fs::rename(next_root.join("src"), next_root.join("moved")).unwrap();
+                    }),
+                );
+                assert!(armed.send(next).is_ok());
+            },
+        );
+        // Only rescans ahead of the queued watch update may move the directory.
+        let boundary = fixture.on_project_scan(
+            root.clone(),
+            server::ScanPoint::WatcherViewApplying,
+            move || drop(armed_rx.recv().unwrap()),
+        );
+        let (queued, queued_rx) =
+            watch_completion(&fixture, &root, server::ScanPoint::WatcherViewQueued);
+        let view = directory_view(&project_root(&project, 0), "src");
+        fixture
+            .client
+            .project_file_view(
+                &project.id,
+                ProjectFileViewPayload {
+                    view: view.clone(),
+                    active: true,
+                },
+            )
+            .await
+            .unwrap();
+        queued_rx.await.unwrap();
+        release.send(()).unwrap();
+        let page = file_view_state_matching(&mut fixture.client, &view, |state| {
+            !matches!(state, ProjectFileViewState::Loading)
+        })
+        .await;
+        drop((paused, first, boundary, queued));
+        if root.join("moved").exists() {
+            fs::rename(root.join("moved"), root.join("src")).unwrap();
+        }
+        assert!(
+            matches!(page, ProjectFileViewState::Ready { entries, .. } if entries.iter().any(|entry| entry.path.relative_path == "src/main.rs")),
+            "the queued view must render before a second pending native rescan changes its directory"
+        );
+        fixture
+            .client
+            .project_file_view(
+                &project.id,
+                ProjectFileViewPayload {
+                    view: view.clone(),
+                    active: false,
+                },
+            )
+            .await
+            .unwrap();
+        file_view_state_matching(&mut fixture.client, &view, |state| {
+            *state == ProjectFileViewState::Closed
+        })
+        .await;
+        expect_watched_write(
+            &mut fixture.client,
+            &project,
+            "src/main.rs",
+            "watch survives coalesced native loss\n",
+        )
+        .await;
+    }
+
     write_file(&repo.path().join("fresh/deep/new.rs"), "new\n");
     expect_watched_listing(&mut fixture.client, "fresh/deep/new.rs", true).await;
     expect_watched_write(

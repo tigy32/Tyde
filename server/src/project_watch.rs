@@ -37,7 +37,10 @@ struct EventSink {
 
 impl EventSink {
     fn send(&self, event: &Event) -> bool {
-        if self.pending.fetch_add(1, Ordering::Relaxed) < 128 {
+        let dropped = if event.need_rescan() {
+            self.request_rescan();
+            false
+        } else if self.pending.fetch_add(1, Ordering::Relaxed) < 128 {
             if self.tx.send(Command::Event(event.clone())).is_err() {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
             } else {
@@ -52,14 +55,13 @@ impl EventSink {
             false
         } else {
             self.pending.fetch_sub(1, Ordering::Relaxed);
-            if !self.rescan.swap(true, Ordering::Relaxed) {
+            if self.request_rescan() {
                 tracing::warn!(
                     event_kind = ?event.kind,
                     dropped_paths = event.paths.len(),
                     queue_limit = 128,
                     "project watch queue full; scheduling catch-up rescan"
                 );
-                let _ = self.tx.send(Command::Rescan);
                 #[cfg(feature = "test-support")]
                 for root in &self.roots {
                     crate::project_stream::scan_test_support::run(
@@ -69,7 +71,28 @@ impl EventSink {
                 }
             }
             true
+        };
+        #[cfg(feature = "test-support")]
+        if event.need_rescan() {
+            for root in &self.roots {
+                crate::project_stream::scan_test_support::run(
+                    root,
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherRescanDelivered,
+                );
+            }
         }
+        dropped
+    }
+
+    fn request_rescan(&self) -> bool {
+        if self.rescan.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        if self.tx.send(Command::Rescan).is_err() {
+            self.rescan.store(false, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 }
 
@@ -144,6 +167,19 @@ impl Routes {
                 crate::project_stream::scan_test_support::ScanPoint::WatcherDispatch,
             );
         }
+        #[cfg(feature = "test-support")]
+        let event = if event.paths.iter().any(|path| {
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherForceRescan,
+            )
+        }) {
+            let mut rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+            rescan.paths = event.paths;
+            rescan
+        } else {
+            event
+        };
         let mut recipients = HashSet::new();
         if event.need_rescan() {
             tracing::warn!(
@@ -477,6 +513,13 @@ impl ProjectWatcher {
                             continue;
                         }
                         Command::ViewDirectories(paths, queries, cancel, reply) => {
+                            #[cfg(feature = "test-support")]
+                            for root in &state.roots {
+                                crate::project_stream::scan_test_support::run(
+                                    root,
+                                    crate::project_stream::scan_test_support::ScanPoint::WatcherViewApplying,
+                                );
+                            }
                             let _ = reply.send(state.set_view_directories(paths, queries, &cancel));
                             continue;
                         }
@@ -499,6 +542,15 @@ impl ProjectWatcher {
                             path,
                             crate::project_stream::scan_test_support::ScanPoint::WatcherProcess,
                         );
+                    }
+                    #[cfg(feature = "test-support")]
+                    if event.need_rescan() {
+                        for root in &state.roots {
+                            crate::project_stream::scan_test_support::run(
+                                root,
+                                crate::project_stream::scan_test_support::ScanPoint::WatcherRescanStarting,
+                            );
+                        }
                     }
                     match state.process(event) {
                         Ok(Some(event)) => {
@@ -551,6 +603,13 @@ impl ProjectWatcher {
                 reply,
             ))
             .map_err(|_| watch_error("project filesystem watcher stopped"))?;
+        #[cfg(feature = "test-support")]
+        for path in &paths {
+            crate::project_stream::scan_test_support::run(
+                Path::new(&path.root.0),
+                crate::project_stream::scan_test_support::ScanPoint::WatcherViewQueued,
+            );
+        }
         self.view_paths = Some((paths, queries));
         self.view_cancel = Some(cancel.clone());
         Ok(Some(ViewWatchUpdate {
