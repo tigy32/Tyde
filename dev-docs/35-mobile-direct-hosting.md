@@ -121,10 +121,38 @@ address, where the failure surfaces away from the settings that caused it.
 
 ## Tests
 
-`tests/tests/mobile_direct_hosting.rs` drives the real HTTP origin: asset
-serving and cache headers, the master switch and the enable toggle taking the
-origin down, pairing redemption through `/tyde/pair`, a full `client::connect`
-handshake over the real WebSocket, token rejection, and offer expiry.
+`server/tests/mobile_direct_hosting.rs` uses the shared `fixture::Fixture` and
+drives the real HTTP origin: asset serving and cache headers, the master
+switch reporting why hosting stops, pairing redemption through `/tyde/pair`,
+a full `client::connect` handshake over the real WebSocket, token rejection,
+cancellation, stale-cancel
+isolation, scheduled expiry and renewal, and outstanding-offer retirement when
+mobile access is disabled. The coarse flow requires a server `Expired` event
+before HTTP redemption, using an injected zero-duration deadline, not a sleep.
+Cancellation is observed through ordered real protocol events, including the
+terminal event if its normal grace has already returned the screen to Idle.
+The same flow causes a real filesystem replacement failure, requires visible
+`StoreLoadFailed` rather than a false cancellation, retries after repairing
+storage, and restarts the host before checking the retired link again.
+
+Direct offers use the same current-offer cancellation/expiry lifecycle as
+managed offers. Terminal cleanup retires the current credential regardless of
+transport; only the current offer ID can trigger it. Managed cancellation still
+uses its existing service RPC and failure handling. No frontend timer repairs
+server pairing state, and HTTP expiry uses the same server transition.
+Retirement commits before changing active credentials or reporting success;
+failed storage leaves the offer available for an explicit retry, not silently
+retired only in memory. Direct redemption matches the direct credential's own
+ID and rejects overlapping managed offers or handoffs.
+
+The regression predates native iOS navigation: commit
+`7c76181c26d61b128c7c86e5cfbd00d52ab042e6` (2026-09-02) introduced the separate
+direct credential and expiry scheduling, while Cancel and expiry still checked
+only the managed credential. The four extracted paths were unchanged between
+`c9844587fa54fdd9c180b8dd6a5331f073afe24f` and native source05
+`c492e654d1d3c77617952eeece6e7797b57b58da`. The preserved source06 extraction
+receipt and red protocol check identify the pre-existing Cancel failure; they
+are provenance, not validation of this independently committed fix.
 
 The compile-time embed is the one thing `./dev.sh check` cannot cover — it never
 sets `TYDE_MOBILE_BUNDLE_DIR`, so every checked build has an empty table. What

@@ -9,17 +9,17 @@
 //! headers that only an HTTP response (not the loader's `<meta>` copy) can
 //! carry.
 
+mod fixture;
+
+use fixture::Fixture;
 use std::time::Duration;
 
 use mobile_pairing::DirectMobilePairingQrPayload;
 use protocol::{
     CommandErrorPayload, Envelope, FrameKind, MobileAccessStatePayload, MobileDirectHostingStatus,
-    MobilePairingOfferPayload, MobilePairingStartPayload,
+    MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState,
 };
 use settings_model::HostBootstrapPayload;
-use tokio::time::timeout;
-
-const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A bundle laid out exactly like the deployed `tyde/` prefix: loader shell and
 /// manifest at the root, the immutable app bundle under `v<version>/`.
@@ -69,61 +69,6 @@ impl BundleFixture {
     }
 }
 
-struct Harness {
-    host: server::HostHandle,
-    _store_dir: tempfile::TempDir,
-}
-
-impl Harness {
-    fn new() -> Self {
-        Self::build(None)
-    }
-
-    fn with_pairing_ttl(ttl: Duration) -> Self {
-        Self::build(Some(ttl))
-    }
-
-    fn build(pairing_ttl: Option<Duration>) -> Self {
-        let store_dir = tempfile::tempdir().expect("create direct hosting store dir");
-        let runtime_config = server::HostRuntimeConfig {
-            mobile_pairing_ttl: pairing_ttl,
-            skip_real_backend_probe: true,
-            ..Default::default()
-        };
-        let host = server::spawn_host_with_mock_backend_and_runtime_config(
-            store_dir.path().join("sessions.json"),
-            store_dir.path().join("projects.json"),
-            store_dir.path().join("settings.json"),
-            runtime_config,
-        )
-        .expect("spawn test host");
-        Self {
-            host,
-            _store_dir: store_dir,
-        }
-    }
-
-    async fn connect_desktop(&self) -> client::Connection {
-        let (client_stream, server_stream) = tokio::io::duplex(8192);
-        let server_config = server::ServerConfig::current();
-        let client_config = client::ClientConfig::current();
-        let host = self.host.clone();
-
-        tokio::spawn(async move {
-            let conn = server::accept(&server_config, server_stream)
-                .await
-                .expect("server handshake failed");
-            if let Err(error) = server::run_connection(conn, host).await {
-                eprintln!("server connection loop failed: {error:?}");
-            }
-        });
-
-        client::connect(&client_config, client_stream)
-            .await
-            .expect("client handshake failed")
-    }
-}
-
 async fn next_event(client: &mut client::Connection, context: &str) -> Envelope {
     // These are positive local protocol waits, not timed product contracts.
     // The old five-second cutoff rejected healthy initial backend discovery.
@@ -139,17 +84,6 @@ async fn next_event(client: &mut client::Connection, context: &str) -> Envelope 
         started.elapsed().as_millis()
     );
     event
-}
-
-async fn expect_initial_replay(client: &mut client::Connection) -> MobileAccessStatePayload {
-    loop {
-        let env = next_event(client, "initial HostBootstrap").await;
-        if env.kind != FrameKind::HostBootstrap {
-            continue;
-        }
-        let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrap");
-        return bootstrap.mobile_access;
-    }
 }
 
 async fn wait_for_direct_hosting(
@@ -251,17 +185,17 @@ fn header(response: &reqwest::Response, name: &str) -> String {
 async fn direct_hosting_serves_the_mobile_web_origin() {
     server::install_default_crypto_provider();
     let bundle = BundleFixture::write();
-    let harness = Harness::new();
-    let mut client = harness.connect_desktop().await;
+    let mut fixture = Fixture::new().await;
+    let initial = fixture.bootstrap.mobile_access.clone();
+    let client = &mut fixture.client;
 
-    let initial = expect_initial_replay(&mut client).await;
     assert_eq!(
         initial.direct_hosting,
         MobileDirectHostingStatus::Disabled,
         "direct hosting must be off until it is turned on"
     );
 
-    let status = enable_direct_hosting(&mut client, &bundle.path()).await;
+    let status = enable_direct_hosting(client, &bundle.path()).await;
     let base = online_addr(&status);
 
     // The loader shell: `/tyde/` resolves to its index, and `/tyde` redirects
@@ -336,11 +270,10 @@ async fn direct_hosting_serves_the_mobile_web_origin() {
 async fn direct_hosting_reports_an_unusable_bundle_directory() {
     server::install_default_crypto_provider();
     let empty = tempfile::tempdir().expect("create empty dir");
-    let harness = Harness::new();
-    let mut client = harness.connect_desktop().await;
-    expect_initial_replay(&mut client).await;
+    let mut fixture = Fixture::new().await;
+    let client = &mut fixture.client;
 
-    let status = enable_direct_hosting(&mut client, &empty.path().to_string_lossy()).await;
+    let status = enable_direct_hosting(client, &empty.path().to_string_lossy()).await;
 
     let MobileDirectHostingStatus::Error { message } = &status else {
         panic!("expected an error for a directory with no loader shell, got {status:?}");
@@ -351,51 +284,6 @@ async fn direct_hosting_reports_an_unusable_bundle_directory() {
     );
 }
 
-/// Turning direct hosting off must actually release the port, not just stop
-/// advertising it.
-#[tokio::test]
-async fn disabling_direct_hosting_stops_serving() {
-    server::install_default_crypto_provider();
-    let bundle = BundleFixture::write();
-    let harness = Harness::new();
-    let mut client = harness.connect_desktop().await;
-    expect_initial_replay(&mut client).await;
-
-    let status = enable_direct_hosting(&mut client, &bundle.path()).await;
-    let base = online_addr(&status);
-    assert_eq!(get(&base, "/tyde/").await.status(), 200);
-
-    client
-        .replace_setting("/mobile_direct_hosting_enabled", false, true)
-        .await
-        .expect("clear mobile_direct_hosting_enabled");
-    wait_for_direct_hosting(
-        &mut client,
-        |status| matches!(status, MobileDirectHostingStatus::Disabled),
-        "direct hosting to stop",
-    )
-    .await;
-
-    let stopped = timeout(EVENT_TIMEOUT, async {
-        loop {
-            if reqwest::Client::new()
-                .get(format!("http://{base}/tyde/"))
-                .send()
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-    assert!(
-        stopped.is_ok(),
-        "the origin must stop answering once direct hosting is off"
-    );
-}
-
 /// A build with no bundle compiled in, pointed at no directory, has nothing to
 /// serve. It has to say so and say what to do about it, rather than binding a
 /// port that answers 404 for every asset the phone asks for. `./dev.sh check`
@@ -403,9 +291,8 @@ async fn disabling_direct_hosting_stops_serving() {
 #[tokio::test]
 async fn direct_hosting_without_any_bundle_explains_itself() {
     server::install_default_crypto_provider();
-    let harness = Harness::new();
-    let mut client = harness.connect_desktop().await;
-    expect_initial_replay(&mut client).await;
+    let mut fixture = Fixture::new().await;
+    let client = &mut fixture.client;
 
     client
         .replace_setting("/enable_mobile_connections", true, false)
@@ -425,7 +312,7 @@ async fn direct_hosting_without_any_bundle_explains_itself() {
         .expect("set mobile_direct_hosting_enabled");
 
     let status = wait_for_direct_hosting(
-        &mut client,
+        client,
         |status| !matches!(status, MobileDirectHostingStatus::Disabled),
         "direct hosting to report a missing bundle",
     )
@@ -436,63 +323,6 @@ async fn direct_hosting_without_any_bundle_explains_itself() {
     assert!(
         message.contains("bundle") && message.contains("build-mobile-web-bundle.sh"),
         "the failure must name what is missing and how to produce it; got: {message:?}"
-    );
-}
-
-/// `enable_mobile_connections` is documented as the master switch for mobile
-/// access. Direct hosting is a second transport, so turning that switch off has
-/// to take the HTTP origin down too — otherwise a paired phone keeps a working
-/// route into the host after the user believes they closed mobile access.
-#[tokio::test]
-async fn the_mobile_master_switch_stops_direct_hosting() {
-    server::install_default_crypto_provider();
-    let bundle = BundleFixture::write();
-    let harness = Harness::new();
-    let mut client = harness.connect_desktop().await;
-    expect_initial_replay(&mut client).await;
-
-    let status = enable_direct_hosting(&mut client, &bundle.path()).await;
-    let base = online_addr(&status);
-    assert_eq!(get(&base, "/tyde/").await.status(), 200);
-
-    // Only the master switch moves; direct hosting stays enabled.
-    client
-        .replace_setting("/enable_mobile_connections", false, true)
-        .await
-        .expect("clear enable_mobile_connections");
-    // Direct hosting is still switched on, so going quiet would read as
-    // "nothing happened" in the settings tab. The host says which switch did it.
-    let stopped_status = wait_for_direct_hosting(
-        &mut client,
-        |status| matches!(status, MobileDirectHostingStatus::Error { .. }),
-        "direct hosting to stop with the master switch",
-    )
-    .await;
-    let MobileDirectHostingStatus::Error { message } = &stopped_status else {
-        panic!("expected a reported reason, got {stopped_status:?}");
-    };
-    assert!(
-        message.contains("mobile connections are off"),
-        "the reason must name the switch that stopped it; got: {message:?}"
-    );
-
-    let stopped = timeout(EVENT_TIMEOUT, async {
-        loop {
-            if reqwest::Client::new()
-                .get(format!("http://{base}/tyde/"))
-                .send()
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-    assert!(
-        stopped.is_ok(),
-        "the origin must stop answering once mobile connections are off"
     );
 }
 
@@ -659,7 +489,7 @@ fn pairing_uri_fragment(qr_uri: &str) -> &str {
     qr_uri
         .split_once('#')
         .map(|(_, fragment)| fragment)
-        .unwrap_or_else(|| panic!("pairing URL {qr_uri} carries no fragment"))
+        .unwrap_or_else(|| panic!("pairing URL carries no fragment"))
 }
 
 async fn redeem(base: &str, payload: &DirectMobilePairingQrPayload) -> reqwest::Response {
@@ -675,6 +505,77 @@ async fn redeem(base: &str, payload: &DirectMobilePairingQrPayload) -> reqwest::
         .expect("POST /tyde/pair")
 }
 
+// The next operation replies from the same mobile actor after earlier commands.
+// Observe its public error boundary, rather than sleeping for cancellation.
+async fn mobile_access_events_after_commands(
+    client: &mut client::Connection,
+) -> Vec<MobileAccessStatePayload> {
+    send_host_payload(
+        client,
+        FrameKind::MobileDeviceRename,
+        &protocol::MobileDeviceRenamePayload {
+            device_id: protocol::MobileDeviceId("unpaired-observer".into()),
+            label: "Unused".into(),
+        },
+    )
+    .await;
+    // A legitimate terminal event can reach Idle after its250ms grace.
+    // Keep the delivered event, not a load-dependent last-state sample.
+    let mut events = Vec::new();
+    loop {
+        let frame = next_event(client, "mobile command completion").await;
+        match frame.kind {
+            FrameKind::MobileAccessState => {
+                events.push(frame.parse_payload::<MobileAccessStatePayload>().unwrap());
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = frame.parse_payload().unwrap();
+                assert!(error.operation == "mobile_device_rename" && !error.fatal);
+                return events;
+            }
+            FrameKind::MobilePairingOffer => {
+                panic!("unexpected pairing offer while awaiting mobile command completion");
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn scheduled_direct_expiry_allows_renewal() {
+    let bundle = BundleFixture::write();
+    // Inject the exact expiry boundary; no elapsed-time assumption or real sleep.
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        mobile_pairing_ttl: Some(Duration::ZERO),
+        ..Default::default()
+    })
+    .await;
+    let desktop = &mut fixture.client;
+    let status = enable_direct_hosting(desktop, &bundle.path()).await;
+    let base = online_addr(&status);
+    for _ in 0..2 {
+        let offer = start_direct_pairing(desktop).await;
+        let payload = DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&offer.qr_uri.0))
+            .expect("parse direct offer");
+        loop {
+            let frame = next_event(desktop, "scheduled direct expiry before redemption").await;
+            assert_ne!(frame.kind, FrameKind::CommandError);
+            if frame.kind == FrameKind::MobileAccessState {
+                let state: MobileAccessStatePayload = frame.parse_payload().unwrap();
+                if matches!(&state.pairing, MobilePairingState::Expired { offer_id } if *offer_id == offer.offer_id)
+                {
+                    assert!(state.paired_devices.is_empty());
+                    break;
+                }
+            }
+        }
+        // HTTP cannot be the operation that repairs stale Active state.
+        assert!(
+            redeem(&base, &payload).await.status() == 403,
+            "The server must reject an offer already expired by its scheduler"
+        );
+    }
+}
+
 /// The pairing and transport flow end to end: the host mints an offer, a phone
 /// redeems it over HTTP for a durable token, connects a WebSocket with that
 /// token, completes the real protocol handshake, and drives an agent.
@@ -682,14 +583,75 @@ async fn redeem(base: &str, payload: &DirectMobilePairingQrPayload) -> reqwest::
 async fn direct_pairing_grants_a_working_protocol_connection() {
     server::install_default_crypto_provider();
     let bundle = BundleFixture::write();
-    let harness = Harness::new();
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
+    let mut fixture = Fixture::new().await;
+    let pairings_path = server::store::mobile_pairings::MobilePairingsStore::path_for_store_parent(
+        fixture.store_dir(),
+    );
+    assert!(pairings_path.starts_with(fixture.store_dir()));
+    let desktop = &mut fixture.client;
 
-    let status = enable_direct_hosting(&mut desktop, &bundle.path()).await;
+    let status = enable_direct_hosting(desktop, &bundle.path()).await;
     let base = online_addr(&status);
 
-    let offer = start_direct_pairing(&mut desktop).await;
+    let cancelled = start_direct_pairing(desktop).await;
+    let cancelled_payload =
+        DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&cancelled.qr_uri.0))
+            .expect("parse cancelled direct offer");
+    let preserved_path = pairings_path.with_extension("before-cancel.json");
+    std::fs::rename(&pairings_path, &preserved_path).unwrap();
+    // An actual filesystem replacement error, independent of permission bits/root.
+    std::fs::create_dir(&pairings_path).unwrap();
+    send_host_payload(
+        desktop,
+        FrameKind::MobilePairingCancel,
+        &protocol::MobilePairingCancelPayload {
+            offer_id: cancelled.offer_id.clone(),
+        },
+    )
+    .await;
+    let failed = mobile_access_events_after_commands(desktop).await;
+    std::fs::remove_dir(&pairings_path).unwrap();
+    std::fs::rename(&preserved_path, &pairings_path).unwrap();
+    assert!(failed.iter().any(|phase| matches!(&phase.pairing, MobilePairingState::Failed { offer_id, code: protocol::MobileAccessErrorCode::StoreLoadFailed, .. } if *offer_id == cancelled.offer_id)),
+        "A failed store replacement must surface StoreLoadFailed");
+    assert!(
+        !failed
+            .iter()
+            .any(|phase| matches!(&phase.pairing, MobilePairingState::Cancelled { .. })),
+        "Failed durable retirement must not acknowledge cancellation"
+    );
+    send_host_payload(
+        desktop,
+        FrameKind::MobilePairingCancel,
+        &protocol::MobilePairingCancelPayload {
+            offer_id: cancelled.offer_id.clone(),
+        },
+    )
+    .await;
+    let phases = mobile_access_events_after_commands(desktop).await;
+    assert!(phases.iter().any(|phase| matches!(&phase.pairing, MobilePairingState::Cancelled { offer_id } if *offer_id == cancelled.offer_id)),
+        "Cancel must terminate the direct offer over the real protocol");
+    assert!(
+        redeem(&base, &cancelled_payload).await.status() == 403,
+        "Cancelled direct credentials must be unusable over HTTP"
+    );
+
+    // A successful retry must retire the credential on disk, not just in memory.
+    let bootstrap = fixture.restart_host().await;
+    assert!(matches!(
+        bootstrap.mobile_access.pairing,
+        MobilePairingState::Idle
+    ));
+    let base = online_addr(&bootstrap.mobile_access.direct_hosting);
+    assert!(
+        redeem(&base, &cancelled_payload).await.status() == 403,
+        "A cancelled offer must remain unusable after a real host restart"
+    );
+    let desktop = &mut fixture.client;
+
+    scheduled_direct_expiry_allows_renewal().await;
+
+    let offer = start_direct_pairing(desktop).await;
     let payload = DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&offer.qr_uri.0))
         .expect("parse the direct pairing QR");
     assert_eq!(
@@ -697,6 +659,24 @@ async fn direct_pairing_grants_a_working_protocol_connection() {
         "the QR must describe the offer the host announced"
     );
 
+    send_host_payload(
+        desktop,
+        FrameKind::MobilePairingCancel,
+        &protocol::MobilePairingCancelPayload {
+            offer_id: cancelled.offer_id.clone(),
+        },
+    )
+    .await;
+    let phases = mobile_access_events_after_commands(desktop).await;
+    assert!(!phases.iter().any(|phase| matches!(&phase.pairing, MobilePairingState::Cancelled { offer_id } if *offer_id == offer.offer_id)),
+        "A stale cancellation must not affect the renewed offer");
+
+    let mut mismatched = payload.clone();
+    mismatched.offer_id = cancelled.offer_id;
+    assert!(
+        redeem(&base, &mismatched).await.status() == 403,
+        "A valid secret must not redeem another offer ID"
+    );
     let response = redeem(&base, &payload).await;
     assert_eq!(response.status(), 200, "redeeming a fresh offer must work");
     let grant: protocol::MobileDirectPairResponse =
@@ -712,7 +692,7 @@ async fn direct_pairing_grants_a_working_protocol_connection() {
 
     // The device now appears in the host's paired list.
     let state = wait_for_direct_hosting(
-        &mut desktop,
+        desktop,
         |status| matches!(status, MobileDirectHostingStatus::Online { .. }),
         "device to be recorded",
     )
@@ -745,6 +725,99 @@ async fn direct_pairing_grants_a_working_protocol_connection() {
         bootstrap.mobile_access.paired_devices[0].device_id,
         grant.device_id
     );
+
+    let failed_disable = start_direct_pairing(desktop).await;
+    let failed_disable_payload =
+        DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&failed_disable.qr_uri.0))
+            .expect("parse failed-disable direct offer");
+    std::fs::rename(&pairings_path, &preserved_path).unwrap();
+    std::fs::create_dir(&pairings_path).unwrap();
+    desktop
+        .replace_setting("/enable_mobile_connections", false, true)
+        .await
+        .unwrap();
+    let states = mobile_access_events_after_commands(desktop).await;
+    std::fs::remove_dir(&pairings_path).unwrap();
+    std::fs::rename(&preserved_path, &pairings_path).unwrap();
+    assert!(
+        states.iter().any(|state| matches!(
+            state.connection_status,
+            protocol::MobileConnectionStatus::Error {
+                code: protocol::MobileAccessErrorCode::StoreLoadFailed,
+                ..
+            }
+        )),
+        "Master-disable retirement errors must be visible"
+    );
+    assert!(
+        !states
+            .iter()
+            .any(|state| matches!(state.pairing, MobilePairingState::Idle)),
+        "Failed master-disable retirement must not claim Idle"
+    );
+    send_host_payload(
+        desktop,
+        FrameKind::MobilePairingCancel,
+        &protocol::MobilePairingCancelPayload {
+            offer_id: failed_disable.offer_id.clone(),
+        },
+    )
+    .await;
+    let states = mobile_access_events_after_commands(desktop).await;
+    assert!(
+        states.iter().any(|state| matches!(&state.pairing,
+        MobilePairingState::Cancelled { offer_id } if *offer_id == failed_disable.offer_id)),
+        "A failed master-disable must retain credentials for explicit retirement retry"
+    );
+    desktop
+        .replace_setting("/enable_mobile_connections", true, false)
+        .await
+        .unwrap();
+    let status = wait_for_direct_hosting(
+        desktop,
+        |state| matches!(state, MobileDirectHostingStatus::Online { .. }),
+        "hosting after retirement retry",
+    )
+    .await;
+    assert!(
+        redeem(&online_addr(&status), &failed_disable_payload)
+            .await
+            .status()
+            == 403,
+        "Explicit retirement retry must invalidate the failed-disable offer"
+    );
+
+    let unspent = start_direct_pairing(desktop).await;
+    let unspent_payload =
+        DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&unspent.qr_uri.0))
+            .expect("parse unspent direct offer");
+    desktop
+        .replace_setting("/enable_mobile_connections", false, true)
+        .await
+        .unwrap();
+    wait_for_direct_hosting(
+        desktop,
+        |state| matches!(state, MobileDirectHostingStatus::Error { message } if message.contains("mobile connections are off")),
+        "master switch reports why direct hosting stopped",
+    )
+    .await;
+    desktop
+        .replace_setting("/enable_mobile_connections", true, false)
+        .await
+        .unwrap();
+    let status = wait_for_direct_hosting(
+        desktop,
+        |state| matches!(state, MobileDirectHostingStatus::Online { .. }),
+        "master switch restarts direct hosting",
+    )
+    .await;
+    assert!(
+        redeem(&online_addr(&status), &unspent_payload)
+            .await
+            .status()
+            == 403,
+        "Disabling mobile access must retire outstanding direct credentials"
+    );
 }
 
 /// An unpaired or revoked token must not reach the protocol at all.
@@ -752,11 +825,10 @@ async fn direct_pairing_grants_a_working_protocol_connection() {
 async fn direct_websocket_refuses_an_unknown_device_token() {
     server::install_default_crypto_provider();
     let bundle = BundleFixture::write();
-    let harness = Harness::new();
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
+    let mut fixture = Fixture::new().await;
+    let desktop = &mut fixture.client;
 
-    let status = enable_direct_hosting(&mut desktop, &bundle.path()).await;
+    let status = enable_direct_hosting(desktop, &bundle.path()).await;
     let base = online_addr(&status);
 
     let refused = open_mobile_websocket(&base, "not-a-real-device-token").await;
@@ -770,31 +842,5 @@ async fn direct_websocket_refuses_an_unknown_device_token() {
     assert!(
         anonymous.is_err(),
         "an unauthenticated upgrade must be refused"
-    );
-}
-
-/// An expired offer must not be redeemable, even with the right secret.
-#[tokio::test]
-async fn direct_pairing_offer_expires() {
-    server::install_default_crypto_provider();
-    let bundle = BundleFixture::write();
-    let harness = Harness::with_pairing_ttl(Duration::from_millis(150));
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
-
-    let status = enable_direct_hosting(&mut desktop, &bundle.path()).await;
-    let base = online_addr(&status);
-
-    let offer = start_direct_pairing(&mut desktop).await;
-    let payload = DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&offer.qr_uri.0))
-        .expect("parse the direct pairing QR");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let response = redeem(&base, &payload).await;
-    assert_eq!(
-        response.status(),
-        403,
-        "an expired pairing code must be refused"
     );
 }

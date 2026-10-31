@@ -1525,20 +1525,30 @@ impl MobileAccessActor {
     }
 
     async fn disable_mobile_access(&mut self) {
+        let retirement = self.cancel_active_pairing_without_state();
+        // The master switch must stop connections even if retirement fails.
         self.abort_all_tasks();
         self.mobile_pairings_lease = None;
+        if let Err(message) = retirement {
+            self.connection_status = MobileConnectionStatus::Error {
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            };
+            return;
+        }
         self.connection_status = MobileConnectionStatus::Disabled;
         self.pairing = MobilePairingState::Idle;
-        self.active_requester = None;
-        if self.pairings.active_pairing.take().is_some() {
-            let _ = self.pairings_store.save(&self.pairings);
-        }
         for record in &mut self.pairings.devices {
             if record.state == MobileDeviceState::Connected {
                 record.state = MobileDeviceState::Paired;
             }
         }
-        let _ = self.pairings_store.save(&self.pairings);
+        if let Err(message) = self.pairings_store.save(&self.pairings) {
+            self.connection_status = MobileConnectionStatus::Error {
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            };
+        }
     }
 
     async fn start_pairing(&mut self, requester: StreamPath, direct: bool) {
@@ -1549,12 +1559,6 @@ impl MobileAccessActor {
                 return;
             }
         };
-
-        // Self-hosted pairing validates its own prerequisites.
-        if direct {
-            self.start_direct_pairing(requester, offer_id).await;
-            return;
-        }
 
         if !self.settings.enable_mobile_connections {
             self.pairing = MobilePairingState::Failed {
@@ -1589,7 +1593,12 @@ impl MobileAccessActor {
             return;
         }
 
-        self.start_managed_pairing(requester).await;
+        // Both transports must preserve a pending managed acknowledgement.
+        if direct {
+            self.start_direct_pairing(requester, offer_id).await;
+        } else {
+            self.start_managed_pairing(requester).await;
+        }
     }
 
     /// Publishes a single-use, short-lived offer for a phone that will reach
@@ -1681,7 +1690,11 @@ impl MobileAccessActor {
         };
 
         // One outstanding offer at a time, whichever transport asked for it.
-        self.cancel_active_pairing_without_state();
+        if let Err(message) = self.cancel_active_pairing_without_state() {
+            self.fail_pairing(offer_id, MobileAccessErrorCode::StoreLoadFailed, message)
+                .await;
+            return;
+        }
         self.pairings.active_direct_pairing = Some(ActiveDirectMobilePairing {
             offer_id: offer_id.clone(),
             secret_hash: token_hash(&secret),
@@ -1752,19 +1765,17 @@ impl MobileAccessActor {
                 "no pairing code is waiting to be used",
             ));
         };
-        if active.offer_id != request.offer_id {
+        if active.offer_id != request.offer_id
+            || self.pairings.active_pairing.is_some()
+            || self.pairings.pending_handoff_ack.is_some()
+        {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::PairingRejected,
                 "this pairing code is no longer the current one",
             ));
         }
         if now >= active.expires_at_ms {
-            self.pairings.active_direct_pairing = None;
-            let _ = self.pairings_store.save(&self.pairings);
-            self.pairing = MobilePairingState::Expired {
-                offer_id: active.offer_id,
-            };
-            self.fan_out_state().await;
+            self.pairing_expired(&active.offer_id).await;
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::PairingRejected,
                 "this pairing code has expired; show a new one",
@@ -1954,7 +1965,11 @@ impl MobileAccessActor {
                 handoff: None,
             }),
         };
-        self.cancel_active_pairing_without_state();
+        if let Err(message) = self.cancel_active_pairing_without_state() {
+            self.fail_pairing(offer_id, MobileAccessErrorCode::StoreLoadFailed, message)
+                .await;
+            return;
+        }
         self.pairings.active_pairing = Some(credential.clone());
         if let Err(message) = self.pairings_store.save(&self.pairings) {
             self.pairing = MobilePairingState::Failed {
@@ -1988,14 +2003,26 @@ impl MobileAccessActor {
         }
     }
 
+    fn active_pairing_offer_id(&self) -> Option<&MobilePairingOfferId> {
+        match &self.pairings.active_pairing {
+            Some(active) => Some(&active.offer_id),
+            None => self
+                .pairings
+                .active_direct_pairing
+                .as_ref()
+                .map(|active| &active.offer_id),
+        }
+    }
+
     async fn cancel_pairing(&mut self, offer_id: &MobilePairingOfferId) {
-        let Some(active) = self.pairings.active_pairing.as_ref() else {
-            return;
-        };
-        if &active.offer_id != offer_id {
+        if self.active_pairing_offer_id() != Some(offer_id) {
             return;
         }
-        if let Some(managed) = active.managed.as_ref()
+        if let Some(managed) = self
+            .pairings
+            .active_pairing
+            .as_ref()
+            .and_then(|active| active.managed.as_ref())
             && let Err(error) = self
                 .managed_service
                 .cancel_host_offer(offer_id, &managed.host_offer_token)
@@ -2009,7 +2036,15 @@ impl MobileAccessActor {
             self.fan_out_state().await;
             return;
         }
-        self.cancel_active_pairing_without_state();
+        if let Err(message) = self.cancel_active_pairing_without_state() {
+            self.fail_pairing(
+                offer_id.clone(),
+                MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            )
+            .await;
+            return;
+        }
         self.pairing = MobilePairingState::Cancelled {
             offer_id: offer_id.clone(),
         };
@@ -2603,7 +2638,15 @@ impl MobileAccessActor {
                 self.pairing_expired(offer_id).await;
             }
             ManagedOfferTerminalState::Cancelled => {
-                self.cancel_active_pairing_without_state();
+                if let Err(message) = self.cancel_active_pairing_without_state() {
+                    self.fail_pairing(
+                        offer_id.clone(),
+                        MobileAccessErrorCode::StoreLoadFailed,
+                        message,
+                    )
+                    .await;
+                    return;
+                }
                 self.pairing = MobilePairingState::Cancelled {
                     offer_id: offer_id.clone(),
                 };
@@ -2652,7 +2695,15 @@ impl MobileAccessActor {
         if &active.offer_id != offer_id {
             return;
         }
-        self.cancel_active_pairing_without_state();
+        if let Err(message) = self.cancel_active_pairing_without_state() {
+            self.fail_pairing(
+                offer_id.clone(),
+                MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            )
+            .await;
+            return;
+        }
         self.pairing = MobilePairingState::Failed {
             offer_id: offer_id.clone(),
             code,
@@ -2717,13 +2768,18 @@ impl MobileAccessActor {
     }
 
     async fn pairing_expired(&mut self, offer_id: &MobilePairingOfferId) {
-        let Some(active) = self.pairings.active_pairing.as_ref() else {
-            return;
-        };
-        if &active.offer_id != offer_id {
+        if self.active_pairing_offer_id() != Some(offer_id) {
             return;
         }
-        self.cancel_active_pairing_without_state();
+        if let Err(message) = self.cancel_active_pairing_without_state() {
+            self.fail_pairing(
+                offer_id.clone(),
+                MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            )
+            .await;
+            return;
+        }
         self.pairing = MobilePairingState::Expired {
             offer_id: offer_id.clone(),
         };
@@ -2932,8 +2988,12 @@ impl MobileAccessActor {
         });
     }
 
-    fn cancel_active_pairing_without_state(&mut self) {
-        self.pairings.active_pairing = None;
+    fn cancel_active_pairing_without_state(&mut self) -> Result<(), String> {
+        let mut retired = self.pairings.clone();
+        retired.active_pairing = None;
+        retired.active_direct_pairing = None;
+        self.pairings_store.save(&retired)?;
+        self.pairings = retired;
         if let Some(task) = self.pairing_ttl_task.take() {
             task.abort();
         }
@@ -2944,9 +3004,7 @@ impl MobileAccessActor {
             task.abort();
         }
         self.active_requester = None;
-        if let Err(message) = self.pairings_store.save(&self.pairings) {
-            tracing::warn!(error = %message, "failed to persist active mobile pairing cancellation");
-        }
+        Ok(())
     }
 
     fn abort_all_tasks(&mut self) {
