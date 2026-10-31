@@ -1014,6 +1014,30 @@ pub(crate) async fn route_client_envelope(
         let stream_path = envelope.stream.clone();
         let project_id = parse_project_id(&stream_path)?;
         let project_output_stream = host_output_stream.with_path(stream_path.clone());
+        if envelope.kind == FrameKind::ProjectFileView {
+            let payload: ProjectFileViewPayload = parse_payload(&envelope, "project_file_view")?;
+            #[cfg(feature = "test-support")]
+            if let Some(action) = crate::project_stream::scan_test_support::take(
+                std::path::Path::new(&envelope.stream.0),
+                crate::project_stream::scan_test_support::ScanPoint::FileViewRouting,
+            ) {
+                tokio::task::spawn_blocking(action).await.map_err(|error| {
+                    AppError::internal_message(
+                        "project_file_view",
+                        "file view routing gate failed",
+                        error,
+                    )
+                })?;
+            }
+            return host
+                .set_project_file_view(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await;
+        }
         host.ensure_host_project_subscription(
             connection_host_stream,
             &project_output_stream,
@@ -1027,30 +1051,6 @@ pub(crate) async fn route_client_envelope(
                 let _: ProjectAccessedPayload = parse_payload(&envelope, "project_accessed")?;
                 host.project_accessed(connection_host_stream, &project_output_stream, project_id)
                     .await?;
-            }
-            FrameKind::ProjectFileView => {
-                let payload: ProjectFileViewPayload =
-                    parse_payload(&envelope, "project_file_view")?;
-                #[cfg(feature = "test-support")]
-                if let Some(action) = crate::project_stream::scan_test_support::take(
-                    std::path::Path::new(&envelope.stream.0),
-                    crate::project_stream::scan_test_support::ScanPoint::FileViewRouting,
-                ) {
-                    tokio::task::spawn_blocking(action).await.map_err(|error| {
-                        AppError::internal_message(
-                            "project_file_view",
-                            "file view routing gate failed",
-                            error,
-                        )
-                    })?;
-                }
-                host.set_project_file_view(
-                    connection_host_stream,
-                    &project_output_stream,
-                    project_id,
-                    payload,
-                )
-                .await?;
             }
             FrameKind::ProjectReadFile => {
                 let payload: ProjectReadFilePayload =

@@ -1226,13 +1226,20 @@ async fn host_browse_workbench_project_roots_opens_worktree() {
 #[tokio::test]
 async fn delete_project_emits_delete_and_removes_it_from_replay() {
     let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("delete-view", &[("README.md", "Preserve source\n")]);
     let project = create_project(
         &mut fixture.client,
         "Delete Me",
-        vec!["/tmp/delete-me".to_owned()],
+        vec![repo.path().to_string_lossy().into_owned()],
     )
     .await;
 
+    let view = directory_view(&project_root(&project, 0), "");
+    assert!(matches!(
+        subscribe_file_view(&mut fixture.client, &project.id, view.clone()).await,
+        ProjectFileViewState::Ready { entries, .. }
+            if entries.iter().any(|entry| entry.path.relative_path == "README.md")
+    ));
     fixture
         .client
         .project_delete(ProjectDeletePayload {
@@ -1246,6 +1253,13 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         other => panic!("expected delete project notification, got {other:?}"),
     }
 
+    next_frame_matching_on(&mut fixture.client, "project deletion committed", |event| {
+        event.kind == FrameKind::ProjectOperation
+            && event.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
+                matches!(operation.mutation, protocol::ProjectMutation::Delete(ref payload) if payload.id == project.id)
+                    && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
+            })
+    }).await;
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(
         bootstrap.projects.is_empty(),
@@ -1257,6 +1271,45 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         "deleted project should not replay",
     )
     .await;
+    for client in [&mut fixture.client, &mut late_client] {
+        client
+            .project_file_view(
+                &project.id,
+                ProjectFileViewPayload {
+                    view: view.clone(),
+                    active: false,
+                },
+            )
+            .await
+            .unwrap();
+        loop {
+            let event = client.next_event().await.unwrap().unwrap();
+            assert_ne!(
+                event.kind,
+                FrameKind::CommandError,
+                "closing a retired view must not resubscribe to its deleted project"
+            );
+            assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+            if event.kind == FrameKind::ProjectFileViewState {
+                let page: ProjectFileViewStatePayload = event.parse_payload().unwrap();
+                if page.view == view && page.state == ProjectFileViewState::Closed {
+                    break;
+                }
+            }
+        }
+    }
+    late_client
+        .project_file_view(&project.id, ProjectFileViewPayload { view, active: true })
+        .await
+        .unwrap();
+    let error = expect_command_error(&mut late_client, "activation still validates project").await;
+    assert_eq!(error.request_kind, FrameKind::ProjectFileView);
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "Preserve source\n"
+    );
 }
 
 #[tokio::test]

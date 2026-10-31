@@ -17397,6 +17397,50 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         payload: ProjectFileViewPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_file_view";
+        if !payload.active {
+            let connection_host_stream = connection_host_stream.clone();
+            let output = project_output_stream.clone();
+            return self
+                .state
+                .with(move |state| {
+                    let subscriber =
+                        state
+                            .host_streams
+                            .get(&connection_host_stream)
+                            .ok_or_else(|| {
+                                AppError::invalid(
+                                    OPERATION,
+                                    "connection host stream is not registered",
+                                )
+                            })?;
+                    // Retirement consumes existing connection-owned interest; it never subscribes.
+                    if subscriber.project_readiness.contains_key(&project_id)
+                        && let Some(subscription) = state.project_streams.get(&project_id)
+                    {
+                        return subscription
+                            .handle
+                            .set_file_view(payload, connection_host_stream)
+                            .map_err(|error| project_command_error(OPERATION, error));
+                    }
+                    let closed = protocol::ProjectFileViewStatePayload {
+                        view: payload.view,
+                        state: protocol::ProjectFileViewState::Closed,
+                    };
+                    let value = serde_json::to_value(closed).map_err(|error| {
+                        AppError::internal_message(
+                            OPERATION,
+                            "failed to encode closed file view",
+                            error,
+                        )
+                    })?;
+                    output
+                        .send_value(FrameKind::ProjectFileViewState, value)
+                        .map_err(|_| {
+                            AppError::internal(OPERATION, anyhow!("file view output closed"))
+                        })
+                })
+                .await;
+        }
         let handle = self
             .ensure_host_project_subscription(
                 connection_host_stream,

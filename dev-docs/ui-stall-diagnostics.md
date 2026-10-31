@@ -161,6 +161,16 @@ with reconciliation in its native sample and 441 completed reconciliations.
 These captures and the deterministic protocol regression establish the queue
 mechanism without retrospectively manufacturing the missing original stacks.
 
+A separate late `project_file_view(active=false)` reached the server after its
+project had been deleted. Eager subscription rejected this legitimate retirement
+as an unknown project. Retirement now acts only on existing connection-owned
+interest. When the connection's project subscription has already ended, it emits
+typed `Closed` instead of opening a project actor. Activation still validates
+the project. This eager file-view subscription path also dates to `8c912340`. Two other late warnings
+were background Git operations reporting an unavailable selected Xcode path;
+they remain real infrastructure failures, not a reason to suppress errors or
+change SDK/CoreSimulator configuration.
+
 ## Existing opt-in detailed capture
 
 The client recorder is off until explicitly started. It uses the existing
