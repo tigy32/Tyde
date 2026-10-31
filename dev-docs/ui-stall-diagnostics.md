@@ -110,6 +110,27 @@ v0.9.6-beta.7. The `frame`, `bytes`, `items` fields and `file_tree_build`
 operation ship in builds after v0.9.6-beta.8; earlier gap lines name only the
 operation and duration.
 
+## Large-project connection loss
+
+Workbench creation/removal on a 100,352-file project over real SSH exposed a
+separate connection failure: a 13,346,950-byte `project_event` exceeded the
+8 MiB chat output budget even with an empty queue. Directory notifications
+expanded tracked descendants, and the frontend publisher included unread files
+in one `FilesChanged` event. Replacement bootstraps followed roughly 17.8-second
+operation intervals; this does not establish an original UI-thread freeze.
+
+Frontend invalidations now contain only paths whose versions the project actor
+has supplied to readers or file subscribers, including subsequent code-intel
+subscriptions. Internal code-intel workspace notifications, file listings and
+the existing queue limits are unchanged. Unread inventory growth therefore
+does not grow that frontend event.
+
+Source history dates this inventory-expansion path to `e43a8bd1`, first shipped
+in v0.9.4-beta.2. The earlier queue budget shipped in v0.8.19-beta.52. The
+v0.9.4-beta.15 rescan correction did not cover directory expansion or all real
+inventory changes. These are source/tag ancestry findings, not historical
+binary reproductions or proof that earlier versions cannot stall.
+
 ## Existing opt-in detailed capture
 
 The client recorder is off until explicitly started. It uses the existing

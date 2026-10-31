@@ -1110,7 +1110,13 @@ async fn run_project_subscription(
                     }
                     ProjectStreamCommand::CurrentFileVersion { path, reply } => {
                         let result = current_file_version(&command_project, &path, &file_versions);
-                        let _ = reply.send(result);
+                        // Later code-intel subscriptions share the listener,
+                        // but each still holds its own file version.
+                        let observation = if result.is_ok() {
+                            observed_files.insert(path.clone());
+                            match watcher.as_mut() { Some(watcher) => watcher.observe(&path).map(Some), None => Ok(None) }
+                        } else { Ok(None) };
+                        complete_after_file_watch(&mut observation_tasks, watch_tx.clone(), observation, move || { let _ = reply.send(result); });
                     }
                     ProjectStreamCommand::ValidatePath { path, reply } => {
                         let _ = reply.send(validate_project_path(&command_project, &path));
@@ -1263,31 +1269,29 @@ async fn run_project_subscription(
                 }
                 let changes = take_pending_file_version_changes(&mut pending_file_version_changes);
                 notify_file_version_listeners(&mut file_version_listeners, &changes);
-                // §M4: also tell the *frontend* which files advanced, so it can
-                // re-read any it has open and keep its rendered version (and the
-                // version it stamps on code-intel queries) in step with the
-                // server. The internal listener broadcast above only reaches the
-                // code-intel services; nothing else re-syncs the client's copy.
-                if !changes.is_empty() {
-                    let files = changes
-                        .iter()
-                        .map(|change| ProjectFileVersionChange {
-                            path: change.path.clone(),
-                            version: change.version,
-                        })
-                        .collect();
-                    if let Err(error) = broadcast_project_event(
+                // Directory reconciliation can include the entire inventory.
+                // Code-intel needs all workspace changes; frontend invalidation
+                // only needs versions held by readers and file subscribers.
+                let files: Vec<_> = changes
+                    .iter()
+                    .filter(|change| observed_files.contains(&change.path))
+                    .map(|change| ProjectFileVersionChange {
+                        path: change.path.clone(),
+                        version: change.version,
+                    })
+                    .collect();
+                if !files.is_empty()
+                    && let Err(error) = broadcast_project_event(
                         &mut subscribers,
                         &ProjectEventPayload::FilesChanged { files },
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            error = %error,
-                            "failed to broadcast file-version changes to subscribers"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "failed to broadcast file-version changes to subscribers"
+                    );
                 }
             }
             _ = git_poll.tick(), if !subscribers.is_empty() && !debounce_active && git_tasks.is_empty() && !pending_git.requested => {

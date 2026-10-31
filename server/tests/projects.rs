@@ -2747,6 +2747,9 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
         } else {
             None
         };
+        if let Some(healthy) = &healthy {
+            observe_project_file(&mut fixture.client, healthy, "healthy.rs").await;
+        }
         let index = repo.path().join(".git/index");
         let saved_index = fs::read(&index).unwrap();
         fs::write(&index, "temporarily unreadable Git index").unwrap();
@@ -5518,8 +5521,13 @@ async fn project_watch_failures_keep_other_projects_live() {
     (failed_rx).await.unwrap();
     drop(failure);
     fs::remove_dir_all(removed_repo.path()).unwrap();
-    fs::write(healthy_repo.path().join("src/file.rs"), "still watching\n").unwrap();
-    expect_watched_change(&mut fixture.client, "src/file.rs").await;
+    expect_watched_write(
+        &mut fixture.client,
+        &projects[1],
+        "src/file.rs",
+        "still watching\n",
+    )
+    .await;
     assert_no_watched_changes(&mut fixture.client, &[]).await;
     assert_eq!(
         directory_watch_ids(&healthy_repo.path().join("src")),
@@ -5645,11 +5653,27 @@ async fn project_watch_failures_keep_other_projects_live() {
     drop(overflow);
     let mut changed = false;
     let mut listed = false;
+    let mut storm_changed = false;
     (async {
-        while !changed || !listed {
+        while !changed || !listed || !storm_changed {
             let event = fixture.client.next_event().await.unwrap().unwrap();
             assert_ne!(event.kind, FrameKind::CommandError);
             assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+            if event.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    event.parse_payload().unwrap()
+            {
+                assert!(
+                    !files.iter().any(|file| {
+                        file.path.relative_path == "new/leaf.rs"
+                            || file.path.relative_path == "gone/leaf.rs"
+                    }),
+                    "inventory reconciliation must not publish unread files to clients"
+                );
+                storm_changed |= files.iter().any(|file| {
+                    file.path == storm_before.path && file.version > storm_before.version
+                });
+            }
             if event.stream == StreamPath(format!("/project/{}", projects[1].id))
                 && event.kind == FrameKind::ProjectEvent
                 && let protocol::ProjectEventPayload::FilesChanged { files } =
@@ -5683,12 +5707,13 @@ async fn project_watch_failures_keep_other_projects_live() {
         }
     })
     .await;
-    fs::write(
-        storm_repo.path().join("new/leaf.rs"),
+    expect_watched_write(
+        &mut fixture.client,
+        &storm,
+        "new/leaf.rs",
         "native watch restored\n",
     )
-    .unwrap();
-    expect_watched_change(&mut fixture.client, "new/leaf.rs").await;
+    .await;
     fixture
         .client
         .project_read_file(
@@ -5838,7 +5863,7 @@ async fn expect_inotify_instances(expected: usize) {
     };
     (async {
         while count() != expected {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await;
@@ -5937,6 +5962,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
 
     #[cfg(target_os = "linux")]
     {
+        observe_project_file(&mut fixture.client, &projects[2], "src/file.rs").await;
         let healthy_registration = directory_watch_ids(&repos[1].path().join("src"));
         assert_eq!(healthy_registration.len(), 1);
         let slow_path = ProjectPath {
@@ -6026,14 +6052,20 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             healthy_registration,
             "userspace overflow must retain healthy kernel registrations"
         );
-        fs::write(
-            repos[1].path().join("src/dir/leaf.rs"),
+        expect_watched_write(
+            &mut fixture.client,
+            &projects[1],
+            "src/dir/leaf.rs",
             "watch restored after dropped deletion\n",
         )
-        .unwrap();
-        expect_watched_change(&mut fixture.client, "src/dir/leaf.rs").await;
-        fs::write(repos[1].path().join("src/burst-299.rs"), "after overflow\n").unwrap();
-        expect_watched_change(&mut fixture.client, "src/burst-299.rs").await;
+        .await;
+        expect_watched_write(
+            &mut fixture.client,
+            &projects[1],
+            "src/burst-299.rs",
+            "after overflow\n",
+        )
+        .await;
     }
 
     {
@@ -6071,6 +6103,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         },
     )
     .await;
+    observe_project_file(&mut fixture.client, &nested, "renamed/leaf.rs").await;
     fs::write(
         repos[0].path().join("src/renamed/leaf.rs"),
         "after rename\n",
@@ -6278,6 +6311,27 @@ async fn expect_watched_listing(client: &mut client::Connection, path: &str, pre
     );
 }
 
+async fn observe_project_file(
+    client: &mut client::Connection,
+    project: &Project,
+    relative_path: &str,
+) -> ProjectFileContentsPayload {
+    // FilesChanged invalidates held versions, not unread inventory entries.
+    client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(project, 0)),
+                    relative_path: relative_path.to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    expect_project_file_contents(client, "observe file before watched write").await
+}
+
 async fn expect_watched_write(
     client: &mut client::Connection,
     project: &Project,
@@ -6290,11 +6344,7 @@ async fn expect_watched_write(
     };
     let absolute = Path::new(&path.root.0).join(relative_path);
     eprintln!("PROJECT WATCH WAIT begin=observe-before-write fixture_entry={relative_path}");
-    client
-        .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
-        .await
-        .unwrap();
-    let before = expect_project_file_contents(client, "observe file before watched write").await;
+    let before = observe_project_file(client, project, relative_path).await;
     eprintln!("PROJECT WATCH WAIT end=observe-before-write fixture_entry={relative_path}");
     fs::write(&absolute, contents).unwrap();
     eprintln!("PROJECT WATCH WAIT begin=invalidation fixture_entry={relative_path}");
@@ -6334,6 +6384,12 @@ async fn project_watcher_prunes_ignored_build_trees() {
     );
     write_file(
         &repo.path().join("target/debug/.fingerprint/cache"),
+        "artifact",
+    );
+    write_file(
+        &repo
+            .path()
+            .join("target/debug/.fingerprint/subscription-cache"),
         "artifact",
     );
     write_file(&repo.path().join("pruned/deep/new.rs"), "unopened\n");
@@ -6607,14 +6663,8 @@ async fn project_watcher_prunes_ignored_build_trees() {
             watch_completion(&fixture, &pruned, server::ScanPoint::WatcherUnregistered);
         fs::write(&control, ignored).unwrap();
         removed_rx.await.unwrap();
-        // Pruning itself invalidates entries removed from the watch inventory.
-        // Consume that transition before asserting absence for later writes.
-        expect_watched_change_at_phase(
-            &mut fixture.client,
-            "pruned/deep/new.rs",
-            "ignore policy adopted",
-        )
-        .await;
+        // Listings include ignored files. Native unregistration above is the
+        // policy-adoption boundary; unread paths have no held-version event.
         #[cfg(target_os = "linux")]
         assert!(
             !directory_has_inotify_watch(&pruned),
@@ -6640,12 +6690,6 @@ async fn project_watcher_prunes_ignored_build_trees() {
             fs::remove_file(&control).unwrap();
         }
         restored_rx.await.unwrap();
-        expect_watched_change_at_phase(
-            &mut fixture.client,
-            "pruned/deep/new.rs",
-            "ignore policy removed",
-        )
-        .await;
         #[cfg(target_os = "linux")]
         assert!(
             directory_has_inotify_watch(&pruned),
@@ -6729,6 +6773,49 @@ async fn project_watcher_prunes_ignored_build_trees() {
     .await;
     drop((scan, held, settled));
 
+    for relative in [
+        "target/debug/.fingerprint/cache",
+        "target/debug/.fingerprint/subscription-cache",
+    ] {
+        let path = ProjectPath {
+            root: ProjectRootPath(project_root(&project, 0)),
+            relative_path: relative.to_owned(),
+        };
+        fixture::send_project_payload(
+            &mut fixture.client,
+            &project.id,
+            FrameKind::CodeIntelSubscribeFile,
+            &protocol::CodeIntelSubscribeFilePayload { path: path.clone() },
+        )
+        .await;
+        next_frame_matching_on(&mut fixture.client, "each subscription holds a file version", |event| {
+            event.kind == FrameKind::CodeIntelStatus
+                && matches!(event.parse_payload::<protocol::CodeIntelStatusPayload>(), Ok(status)
+                    if status.state == protocol::CodeIntelState::Unsupported
+                        && matches!(&status.scope, protocol::CodeIntelStatusScope::File { path: observed, .. } if observed == &path))
+        }).await;
+    }
+    fs::write(
+        repo.path()
+            .join("target/debug/.fingerprint/subscription-cache"),
+        "second subscription update",
+    )
+    .unwrap();
+    next_frame_matching_on(&mut fixture.client, "second subscription invalidates without a file read", |event| {
+        event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files })
+                if files.iter().any(|file| file.path.relative_path == "target/debug/.fingerprint/subscription-cache"))
+    }).await;
+    let second = observe_project_file(
+        &mut fixture.client,
+        &project,
+        "target/debug/.fingerprint/subscription-cache",
+    )
+    .await;
+    assert_eq!(
+        second.contents.as_deref(),
+        Some("second subscription update")
+    );
     fixture
         .client
         .project_read_file(
@@ -6741,7 +6828,7 @@ async fn project_watcher_prunes_ignored_build_trees() {
             },
         )
         .await
-        .expect("explicitly open ignored file");
+        .expect("read subscribed ignored file");
     let initial = expect_project_file_contents(&mut fixture.client, "ignored file contents").await;
     write_file(
         &repo.path().join("target/debug/.fingerprint/replacement"),
@@ -6856,8 +6943,7 @@ async fn project_watcher_follows_worktree_git_metadata() {
     next_frame_matching_on(&mut fixture.client, "remove shared Git owner", |event| {
         event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == primary.id)
     }).await;
-    fs::write(worktree.join("source.rs"), "modified\n").unwrap();
-    expect_watched_change(&mut fixture.client, "source.rs").await;
+    expect_watched_write(&mut fixture.client, &project, "source.rs", "modified\n").await;
     let root = ProjectRootPath(project_root(&project, 0));
     let git_dir =
         std::path::PathBuf::from(git_stdout(&worktree, &["rev-parse", "--absolute-git-dir"]));
