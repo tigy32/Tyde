@@ -5291,9 +5291,13 @@ impl CodexInner {
             .ok_or(super::WorkspaceRelocationError::Busy)?;
         let loaded = self
             .rpc
-            .request("thread/loaded/list", json!({}))
+            .request_typed("thread/loaded/list", json!({}))
             .await
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
+            .map_err(|error| {
+                super::WorkspaceRelocationError::Rejected(
+                    error.lifecycle_diagnostic("thread/loaded/list"),
+                )
+            })?;
         let loaded = loaded
             .get("data")
             .and_then(Value::as_array)
@@ -5302,6 +5306,7 @@ impl CodexInner {
                     "Codex loaded-thread inventory omitted data".to_owned(),
                 )
             })?;
+        tracing::info!(target: "tyde_project_entry_diagnostic", loaded_threads = loaded.len(), "Codex relocation loaded-thread inventory");
         let mut children = Vec::new();
         let mut parent_loaded = false;
         for id in loaded {
@@ -5316,12 +5321,16 @@ impl CodexInner {
             }
             let snapshot = self
                 .rpc
-                .request(
+                .request_typed(
                     "thread/read",
                     json!({"threadId": id, "includeTurns": false}),
                 )
                 .await
-                .map_err(super::WorkspaceRelocationError::Rejected)?;
+                .map_err(|error| {
+                    super::WorkspaceRelocationError::Rejected(
+                        error.lifecycle_diagnostic("thread/read"),
+                    )
+                })?;
             match snapshot
                 .pointer("/thread/status/type")
                 .and_then(Value::as_str)
@@ -5340,7 +5349,7 @@ impl CodexInner {
                 .and_then(Value::as_i64)
                 .ok_or_else(|| {
                     super::WorkspaceRelocationError::Rejected(
-                        "Codex loaded child omitted native ancestry".to_owned(),
+                        "Codex loaded non-owner thread omitted native ancestry; relocation stopped before workspace mutation. Report a restore/thread lifecycle defect; do not retry the move".to_owned(),
                     )
                 })?;
             children.push((depth, id.to_owned()));
@@ -5360,11 +5369,14 @@ impl CodexInner {
         }
         tracing::info!(?roots, "Changing Codex workspace roots");
         tracing::info!(target: "tyde_project_entry_diagnostic", "Codex native thread/settings/update dispatch");
-        let execution_roots = super::execution_workspace_roots(&roots)
-            .map_err(super::WorkspaceRelocationError::Rejected)?;
+        let execution_roots = super::execution_workspace_roots(&roots).map_err(|_| {
+            super::WorkspaceRelocationError::Rejected(
+                "Codex could not resolve execution workspace roots before relocation".to_owned(),
+            )
+        })?;
         let updated = self
             .rpc
-            .request(
+            .request_typed(
                 "thread/settings/update",
                 json!({"threadId": thread_id, "cwd": execution_roots[0]}),
             )
@@ -5373,7 +5385,11 @@ impl CodexInner {
         // setter accepts cwd; runtime roots are applied on each next turn.
         tracing::info!(target: "tyde_project_entry_diagnostic", accepted = updated.is_ok(), "Codex native thread/settings/update result");
         relocation.finish(updated.is_ok().then_some(execution_roots));
-        updated.map_err(super::WorkspaceRelocationError::OutcomeUnknown)?;
+        updated.map_err(|error| {
+            super::WorkspaceRelocationError::OutcomeUnknown(
+                error.lifecycle_diagnostic("thread/settings/update"),
+            )
+        })?;
         tracing::info!(
             ?roots,
             "Codex accepted cwd and staged runtime roots for subsequent turns"
@@ -10017,6 +10033,16 @@ impl CodexInner {
             CodexInbound::Relocate { roots, reply } => {
                 if !reply.is_closed() {
                     let outcome = self.relocate_workspace(roots).await;
+                    if let Err(error) = &outcome
+                        && !matches!(error, super::WorkspaceRelocationError::Busy)
+                    {
+                        tracing::warn!(target: "tyde_project_entry_diagnostic",
+                            outcome = error.kind(), reason = %error, "Codex workspace relocation refused");
+                        self.emitter.error_message(&format!(
+                            "Workspace relocation {}: {error}",
+                            error.kind()
+                        ));
+                    }
                     // A busy refusal changed nothing; any other failure is the
                     // only report of an uncertain provider workspace.
                     if let Err(Err(error)) = reply.send(outcome)
@@ -10026,12 +10052,6 @@ impl CodexInner {
                             outcome = error.kind(),
                             "Codex workspace relocation failed with no caller waiting"
                         );
-                        self.emitter.backend_error(&format!(
-                            "Codex could not finish changing workspace roots ({}) after the \
-                             request was abandoned; reopen the saved conversation before \
-                             continuing.",
-                            error.kind()
-                        ));
                     }
                 }
             }
@@ -21973,6 +21993,17 @@ impl CodexRpcError {
         }
     }
 
+    fn lifecycle_diagnostic(&self, operation: &'static str) -> String {
+        match self.code {
+            Some(code) => format!(
+                "Codex {operation} failed with provider error code {code}; check provider compatibility and connection before continuing"
+            ),
+            None => format!(
+                "Codex {operation} transport failed; check the provider process and connection before continuing"
+            ),
+        }
+    }
+
     fn method_unavailable(&self, method: &str) -> bool {
         if self.code == Some(-32601) {
             return true;
@@ -22495,9 +22526,9 @@ impl CodexRpc {
             })
             .map_err(|_| "Codex native closure owner stopped before unsubscribe".to_owned())?;
         let response = self
-            .request("thread/unsubscribe", json!({"threadId": thread_id}))
+            .request_typed("thread/unsubscribe", json!({"threadId": thread_id}))
             .await
-            .map_err(|error| error.replace(thread_id, "<native-child>"))?;
+            .map_err(|error| error.lifecycle_diagnostic("thread/unsubscribe"))?;
         let status = response.get("status").and_then(Value::as_str);
         tracing::info!(target: "tyde_project_entry_diagnostic", status, "Codex idle native unsubscribe acknowledged");
         match status {
@@ -22506,7 +22537,7 @@ impl CodexRpc {
                 closed
                     .await
                     .map_err(|_| "Codex native closure channel stopped before unload".to_owned())?
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.lifecycle_diagnostic("thread/closed"))?;
             }
             _ => return Err("Codex native unsubscribe returned no valid status".to_owned()),
         }
@@ -24512,6 +24543,25 @@ impl Backend for CodexBackend {
             };
 
             let handle = session.command_handle();
+            // Restore owns this unused startup root, not a native child. Release
+            // it before adopting the saved root; never make relocation ignore it.
+            tracing::info!(target: "tyde_project_entry_diagnostic", "Releasing Codex restore startup thread");
+            if let Err(error) = handle
+                .inner
+                .rpc
+                .unload_idle_thread(&session.session_id().0)
+                .await
+            {
+                emit_codex_resume_startup_error(
+                    &events_tx,
+                    format!(
+                        "Codex restore stopped before resuming the saved conversation: {error}"
+                    ),
+                );
+                session.shutdown().await;
+                return;
+            }
+            tracing::info!(target: "tyde_project_entry_diagnostic", "Codex restore startup thread released before resume");
             let maybe_emitter = initial_emitter;
             if let Some(emitter) = maybe_emitter
                 && let Err(err) = session.set_subagent_emitter(emitter).await

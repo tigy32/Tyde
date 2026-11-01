@@ -4133,7 +4133,7 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     .await;
     mock.set_workspace_relocation_results(vec![
         Err(WorkspaceRelocationError::Rejected(
-            "Destination rejected before mutation".to_owned(),
+            "Destination rejected before mutation: PRIVATE_RELOCATION_DETAIL".to_owned(),
         )),
         Err(WorkspaceRelocationError::Rejected(
             "Restoration was never admissible".to_owned(),
@@ -4168,7 +4168,20 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         "a rejected move cannot terminate the conversation"
     );
     assert!(rejected.message.contains("before mutation"));
-    fixture.finish_turn(&agent).await;
+    let failure_turn = fixture.finish_turn(&agent).await;
+    assert!(
+        failure_turn
+            .chat_events()
+            .iter()
+            .any(|event| matches!(event,
+                protocol::ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, protocol::MessageSender::System)
+                        && message.origin == Some(protocol::MessageOrigin::System)
+                        && message.content.contains("workspace are unchanged")
+                        && !message.content.contains("PRIVATE_RELOCATION_DETAIL")
+            )),
+        "entry failure must not submit private backend details as conversation input"
+    );
     let (_, unchanged) = fixture.connect_with_bootstrap().await;
     let live = unchanged
         .agents

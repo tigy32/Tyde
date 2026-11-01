@@ -14650,6 +14650,103 @@ async fn real_cancelled_relocation_then_compaction<B: Backend>(host: &mut Harnes
 }
 
 conformance2_scenario!(
+    real_restored_workspace_relocation,
+    [
+        BackendCapability::ResumeSession,
+        BackendCapability::SetWorkspaceRoots
+    ]
+);
+
+async fn real_restored_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
+    let memory = unique_payload();
+    let initial = match host.backend() {
+        BackendKind::Kiro => format!(
+            "We are planning restored-token.txt before moving this coding workspace. \
+             Its entire planned contents are `{memory}`. In this planning turn, tell me \
+             the exact file contents and finish with TYDE_RESTORE_READY. Do not use \
+             tools or write files until I say to proceed."
+        ),
+        _ => format!(
+            "The synthetic conversation token is `{memory}`. Repeat it exactly, followed by \
+             TYDE_RESTORE_READY. Do not use tools or write files during this setup turn. \
+             Keep the token for a later file-writing step."
+        ),
+    };
+    let source = spawn_agent(host, &initial).await;
+    let ready = collect_turn(host, &source, &initial).await;
+    assert_final_text_contains(&ready, "TYDE_RESTORE_READY");
+    assert!(
+        ready.final_text().contains(&memory),
+        "setup must establish the exact conversation token before restore"
+    );
+    assert_clean_close(host, &source).await;
+    let resumed = resume_agent(host, &source.session_id).await;
+    assert_eq!(
+        resumed
+            .replayed_history
+            .iter()
+            .filter(|event| matches!(event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User) && message.content == initial
+            ))
+            .count(),
+        1,
+        "restore must replay the original user message exactly once"
+    );
+    let destination = tempfile::tempdir().expect("restored relocation destination");
+    if let Err(error) = set_workspace_roots(
+        host,
+        vec![destination.path().to_string_lossy().into_owned()],
+    )
+    .await
+    {
+        panic!(
+            "idle restored conversation must relocate before any follow-up (outcome={})",
+            error.kind()
+        );
+    }
+    assert!(
+        host.backend_ref().session_id() == source.session_id,
+        "restore and relocation must preserve conversation identity"
+    );
+    let prompt = match host.backend() {
+        BackendKind::Kiro => {
+            "Proceed with implementing restored-token.txt now, using only the \
+            exact file contents we planned in the first message. Write it in the runtime default \
+            working directory using a relative filename. Do not change directory or override \
+            tool cwd. Finish with TYDE_RESTORE_MOVED."
+        }
+        _ => {
+            "In the runtime default working directory, write restored-token.txt with only \
+            the synthetic conversation token from the first message. Use a relative filename, \
+            do not change directory or override tool cwd. Reply TYDE_RESTORE_MOVED."
+        }
+    };
+    let follow_up = ask(host, &resumed, prompt).await;
+    assert_final_text_contains(&follow_up, "TYDE_RESTORE_MOVED");
+    assert_eq!(
+        follow_up
+            .user_messages()
+            .filter(|message| message.content == prompt)
+            .count(),
+        1,
+        "the follow-up must retain its user attribution exactly once"
+    );
+    let actual = std::fs::read_to_string(destination.path().join("restored-token.txt"))
+        .expect("restored conversation must write in the destination workspace");
+    assert!(
+        actual.trim() == memory,
+        "relocation must preserve conversation memory"
+    );
+    assert!(
+        !host.workspace().join("restored-token.txt").exists(),
+        "relocation must not leave tools in the source workspace"
+    );
+    assert_universal_contract(&[ready, follow_up]);
+    assert_clean_close(host, &resumed).await;
+}
+
+conformance2_scenario!(
     real_workspace_relocation,
     [BackendCapability::SetWorkspaceRoots]
 );

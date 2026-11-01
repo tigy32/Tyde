@@ -74,6 +74,62 @@ fork, resume and inference configurations; their permission policies remain
 unchanged. The extended real Backend flow reproduces the startup rejection
 without the repair, rather than injecting malformed transport configuration.
 
+## Restore before workspace relocation
+
+`real_restored_workspace_relocation` requires `ResumeSession` and
+`SetWorkspaceRoots`. It closes and restores a real conversation, relocates it
+before any follow-up, and verifies the original user message replays exactly
+once, the native conversation identity survives, and a correctly attributed
+follow-up writes remembered context only in the destination. Setup and
+assertions are identical for all seven eligible providers; Muse does not
+advertise workspace relocation.
+
+The Codex 0.162.1 regression reproduced through the production `Backend` trait
+with gpt-5.6-luna/low: the idle restored process reported two loaded threads,
+no active turn/tools/background work/native children, then rejected the
+non-owner thread for missing native ancestry. The new case failed in 4.91 s
+before lifecycle repair, before `thread/settings/update` was dispatched.
+This is independent reproduction, not proof of the customer's precise error.
+An inherited older test executable lacked the inventory guard; its passing run
+was discarded as current-source evidence.
+
+The leak predates the rejection. `4075229f` (2026-04-13) already replaced the
+owned thread identity on `ResumeSession` without releasing the previous root.
+`084b7b78` (2026-04-15) introduced backend restore as `thread/start` followed by
+`thread/resume`, leaving the unused startup root loaded. `e5f089ba`, authored
+2026-10-29 and committed 2026-10-30 at 07:09:07 -0700, added loaded-thread
+inventory and the native-child ancestry check, exposing that older leak.
+Its parent updated workspace settings without inspecting loaded threads.
+
+Restore now releases only its known unused startup root with the existing
+native unsubscribe/closure handshake before installing the restored session's
+emitter and resuming the saved conversation. Closure failure explicitly stops
+restore. Relocation still checks every other loaded thread, rejects missing
+ancestry, waits for real native-child work and unloads idle descendants in depth
+order. It does not skip unrecognized threads or infer ownership from history.
+No customer session was modified or restarted, and repeated moves are not a
+repair path.
+
+Codex relocation diagnostics retain operation, outcome, static invariant reason
+and numeric RPC error code, never native identities or raw provider prose.
+The loaded inventory records counts only. The adapter emits its sanitized
+failure reason through the existing error-message conversation event, without
+changing typing state. The server's system continuation remains generic: other
+providers can return private native error data that must not become model input.
+The existing server workbench protocol flow asserts that private details stay
+out of the system continuation and pre-mutation rejection leaves roots unchanged.
+
+The setup prompt explicitly limits its no-file instruction to the setup turn
+and requires the model to echo the exact token before restore. The first real
+run exposed an ambiguous unconditional no-file instruction (Kiro declined the
+later write) and a Codex token transcription that omitted its last character.
+The prompts now establish consent and exact token acquisition; the destination,
+identity, attribution and exact-memory assertions remain intact. Claude's first
+run failed on its native weekly rate limit, not on relocation. Kiro also
+rejected the generic repetition-only setup as unrelated to a coding task; its
+prompt now describes planning and then implementing the same file, with the
+same token acquisition, consent and assertions. Only prompt wording differs.
+
 ## Workspace relocation readiness
 
 Workspace relocation distinguishes `Busy`, `Rejected`, and `OutcomeUnknown`.
