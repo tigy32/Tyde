@@ -421,6 +421,7 @@ fn sample_custom_agent(
     tool_policy: ToolPolicy,
 ) -> CustomAgent {
     CustomAgent {
+        hidden: false,
         id: CustomAgentId(id.to_string()),
         name: format!("{id} name"),
         description: format!("{id} description"),
@@ -429,6 +430,92 @@ fn sample_custom_agent(
         mcp_server_ids,
         tool_policy,
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hidden_templates_migrate_and_preserve_visibility_edits() {
+    let mut fixture = Fixture::new().await;
+    for agent in &fixture.bootstrap.custom_agents {
+        assert_eq!(
+            agent.hidden,
+            matches!(agent.id.0.as_str(), "tyde-implementer" | "tyde-lander")
+        );
+    }
+    let path = fixture.store_dir().join("custom_agents.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let records = saved["records"].as_object_mut().unwrap();
+    for record in records.values_mut() {
+        record.as_object_mut().unwrap().remove("hidden");
+    }
+    records.get_mut("tyde-implementer").unwrap()["instructions"] =
+        serde_json::json!("Keep my customized instructions");
+    let mut custom = serde_json::to_value(sample_custom_agent(
+        "mine",
+        vec![],
+        vec![],
+        ToolPolicy::Unrestricted,
+    ))
+    .unwrap();
+    custom.as_object_mut().unwrap().remove("hidden");
+    records.insert("mine".into(), custom);
+    fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+    let migrated = fixture.restart_host().await;
+    for agent in &migrated.custom_agents {
+        assert_eq!(
+            agent.hidden,
+            matches!(agent.id.0.as_str(), "tyde-implementer" | "tyde-lander")
+        );
+    }
+    let mut implementer = migrated
+        .custom_agents
+        .iter()
+        .find(|agent| agent.id.0 == "tyde-implementer")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        implementer.instructions.as_deref(),
+        Some("Keep my customized instructions")
+    );
+    implementer.hidden = false;
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: implementer.clone(),
+        })
+        .await
+        .unwrap();
+    fixture
+        .next_frame_matching("visibility change", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+        })
+        .await;
+    let mut mine = migrated
+        .custom_agents
+        .iter()
+        .find(|agent| agent.id.0 == "mine")
+        .unwrap()
+        .clone();
+    mine.hidden = true;
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: mine.clone(),
+        })
+        .await
+        .unwrap();
+    fixture
+        .next_frame_matching("custom visibility change", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+        })
+        .await;
+    let restarted = fixture.restart_host().await;
+    assert!(restarted.custom_agents.contains(&implementer));
+    assert!(restarted.custom_agents.contains(&mine));
+    let exported: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(exported["records"]["tyde-implementer"]["hidden"], false);
+    assert_eq!(exported["records"]["mine"]["hidden"], true);
 }
 
 #[tokio::test(start_paused = true)]
@@ -883,7 +970,8 @@ async fn superseded_builtin_prompts_upgrade_on_restart() {
         ),
     ] {
         let id = CustomAgentId(id.to_owned());
-        let active = builtins[&id].clone();
+        let mut active = builtins[&id].clone();
+        active.hidden = !active.hidden;
         assert_ne!(
             active.instructions.as_deref(),
             Some(instructions.as_str()),
@@ -1095,6 +1183,7 @@ async fn host_customization_upsert_delete_round_trip_and_notify() {
 async fn invalid_custom_agent_upsert_with_blank_description_keeps_connection_alive() {
     let mut fixture = Fixture::new().await;
     let custom_agent = CustomAgent {
+        hidden: false,
         id: CustomAgentId("invalid-agent".to_string()),
         name: "Invalid Agent".to_string(),
         description: "   ".to_string(),
@@ -1300,12 +1389,14 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
         title: "Zulu".to_string(),
         content: "host steering body".to_string(),
     };
-    let custom_agent = sample_custom_agent(
+    let mut custom_agent = sample_custom_agent(
         "reviewer",
         vec![skill.id.clone()],
         vec![mcp_server.id.clone()],
         ToolPolicy::Unrestricted,
     );
+
+    custom_agent.hidden = true;
 
     fixture
         .client

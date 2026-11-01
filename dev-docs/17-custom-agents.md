@@ -70,9 +70,27 @@ pub enum SteeringScope {
 
 ### 2.2 Custom agents
 
+`hidden` controls user-facing picker visibility only. Settings → Custom Agents
+always lists every template and exposes a **Hidden** toggle, including built-ins.
+Hidden templates remain discoverable and spawnable by ID through agent control;
+they do not lose permissions, roles, instructions, or existing session choices.
+Explicitly configured defaults continue to apply even when hidden.
+
+Fresh stores hide Implementer (`tyde-implementer`) and Lander (`tyde-lander`);
+Default, Help, Orchestrator, and Project Manager remain selectable. New custom
+templates start visible. On loading an older store, only records missing
+`hidden` receive those defaults, which are then saved. This changes no user
+prompts or other customization. Explicit `true`/`false` survives reload and
+built-in prompt upgrades. Store JSON transfers retain the field; older store
+imports use the same missing-field migration. Older protocol payloads without
+it deserialize as visible. Config MCP upserts preserve visibility when omitted.
+
+
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomAgent {
+    #[serde(default)]
+    pub hidden: bool,
     pub id: CustomAgentId,
     pub name: String,
     pub description: String,

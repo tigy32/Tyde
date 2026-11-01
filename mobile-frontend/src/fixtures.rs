@@ -148,6 +148,7 @@ pub fn seed_state(state: &AppState) {
         agents.entry(host.clone()).or_default().insert(
             CustomAgentId("fixture-reviewer".to_owned()),
             CustomAgent {
+                hidden: false,
                 id: CustomAgentId("fixture-reviewer".to_owned()),
                 name: "Code reviewer".to_owned(),
                 description: "Review a change for correctness and regressions.".to_owned(),

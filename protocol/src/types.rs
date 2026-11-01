@@ -5394,6 +5394,9 @@ pub struct NewAgentPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomAgent {
+    /// Picker visibility only; hidden templates remain available by ID.
+    #[serde(default)]
+    pub hidden: bool,
     pub id: CustomAgentId,
     pub name: String,
     pub description: String,

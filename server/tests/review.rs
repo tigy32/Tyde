@@ -1039,6 +1039,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     client
         .custom_agent_upsert(protocol::CustomAgentUpsertPayload {
             custom_agent: protocol::CustomAgent {
+                hidden: false,
                 id: protocol::CustomAgentId("tyde-default".to_owned()),
                 name: "Default".to_owned(),
                 description: "Customization regression fixture".to_owned(),

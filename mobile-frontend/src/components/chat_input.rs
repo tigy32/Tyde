@@ -981,7 +981,7 @@ pub(super) fn NewChatOptions() -> impl IntoView {
         let mut agents = custom_agents_state
             .active_host_custom_agents()
             .into_values()
-            .filter(|agent| agent.id.0 != "tyde-default")
+            .filter(|agent| !agent.hidden && agent.id.0 != "tyde-default")
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.name.cmp(&right.name));
         agents
@@ -1007,6 +1007,22 @@ pub(super) fn NewChatOptions() -> impl IntoView {
             .map(|id| id.0)
             .unwrap_or_else(|| "tyde-default".to_owned())
     };
+    let selected_hidden_state = state.clone();
+    let selected_hidden_agent = Memo::new(move |_| {
+        let id = protocol::CustomAgentId(selected_agent_value());
+        selected_hidden_state
+            .active_host_custom_agents()
+            .get(&id)
+            .filter(|agent| agent.hidden)
+            .cloned()
+    });
+    let default_visibility_state = state.clone();
+    let default_visible = Memo::new(move |_| {
+        !default_visibility_state
+            .active_host_custom_agents()
+            .values()
+            .any(|agent| agent.id.0 == "tyde-default" && agent.hidden)
+    });
     let change_agent_state = state.clone();
     let on_agent_change = move |event| {
         change_agent_state
@@ -1138,10 +1154,12 @@ pub(super) fn NewChatOptions() -> impl IntoView {
                     prop:value=selected_agent_value
                     on:change=on_agent_change
                 >
-                    <option value="tyde-default">"Default agent"</option>
+                    <Show when=move || default_visible.get()><option value="tyde-default" prop:selected=move || selected_agent_value() == "tyde-default">"Default agent"</option></Show>
+                    {move || selected_hidden_agent.get().map(|agent| view! { <option value=agent.id.0 hidden=true prop:selected=true>{agent.name}</option> })}
                     {move || custom_agents.get().into_iter().map(|agent| {
                         let value = agent.id.0;
-                        view! { <option value=value>{agent.name}</option> }
+                        let selected_value = value.clone();
+                        view! { <option value=value prop:selected=move || selected_agent_value() == selected_value>{agent.name}</option> }
                     }).collect::<Vec<_>>()}
                 </select>
             </label>
@@ -3086,6 +3104,7 @@ mod wasm_tests {
                 agents.entry(host.clone()).or_default().insert(
                     CustomAgentId("reviewer".to_owned()),
                     CustomAgent {
+                        hidden: false,
                         id: CustomAgentId("reviewer".to_owned()),
                         name: "Reviewer".to_owned(),
                         description: "Review changes before they ship.".to_owned(),
@@ -3193,6 +3212,51 @@ mod wasm_tests {
                 .unwrap()
                 .contains("My setup guide")
         );
+        let set_hidden = |hidden| {
+            state.custom_agents_by_host.update(|hosts| {
+                hosts
+                    .get_mut(&LocalHostId("host-1".into()))
+                    .unwrap()
+                    .get_mut(&CustomAgentId("reviewer".into()))
+                    .unwrap()
+                    .hidden = hidden;
+            })
+        };
+        set_hidden(true);
+        next_tick().await;
+        assert!(
+            agent
+                .query_selector("option[value=reviewer]")
+                .unwrap()
+                .is_none()
+        );
+        set_hidden(false);
+        next_tick().await;
+        assert!(
+            agent
+                .query_selector("option[value=reviewer]")
+                .unwrap()
+                .is_some()
+        );
+        state
+            .draft_custom_agent_id
+            .set(Some(CustomAgentId("reviewer".into())));
+        next_tick().await;
+        set_hidden(true);
+        next_tick().await;
+        assert_eq!(
+            agent.value(),
+            "reviewer",
+            "hiding preserves the chosen template"
+        );
+        assert!(
+            agent
+                .query_selector("option[value=reviewer][hidden]")
+                .unwrap()
+                .is_some()
+        );
+        set_hidden(false);
+        next_tick().await;
         agent.set_value("tyde-default");
         agent
             .dispatch_event(&web_sys::Event::new("change").unwrap())
@@ -3212,6 +3276,36 @@ mod wasm_tests {
             }));
         next_tick().await;
         assert_eq!(agent.value(), "tyde-default", "Project chats keep Default");
+        state.custom_agents_by_host.update(|hosts| {
+            let agents = hosts.get_mut(&LocalHostId("host-1".into())).unwrap();
+            let mut default = agents[&CustomAgentId("reviewer".into())].clone();
+            default.id = CustomAgentId("tyde-default".into());
+            default.hidden = true;
+            default.name = "Default agent".into();
+            agents.insert(default.id.clone(), default);
+        });
+        next_tick().await;
+        assert_eq!(
+            agent.value(),
+            "tyde-default",
+            "hidden implicit default remains selected"
+        );
+        assert!(
+            agent
+                .query_selector("option[value=tyde-default][hidden]")
+                .unwrap()
+                .is_some()
+        );
+        state.custom_agents_by_host.update(|hosts| {
+            hosts
+                .get_mut(&LocalHostId("host-1".into()))
+                .unwrap()
+                .get_mut(&CustomAgentId("tyde-default".into()))
+                .unwrap()
+                .hidden = false
+        });
+        next_tick().await;
+
         state.active_project.set(None);
         next_tick().await;
         assert_eq!(

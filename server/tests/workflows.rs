@@ -459,6 +459,7 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
         .client
         .custom_agent_upsert(protocol::CustomAgentUpsertPayload {
             custom_agent: protocol::CustomAgent {
+                hidden: false,
                 id: protocol::CustomAgentId("tyde-default".to_owned()),
                 name: "Default".to_owned(),
                 description: "Customization regression fixture".to_owned(),

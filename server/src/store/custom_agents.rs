@@ -1976,13 +1976,14 @@ pub struct CustomAgentStore {
 
 impl CustomAgentStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        let mut records = Self::read_from_disk(&path)?;
-        let mut changed = false;
+        let (mut records, mut changed) = Self::read_from_disk(&path)?;
         for custom_agent in builtin_custom_agents() {
             validate_custom_agent(&custom_agent)?;
             match records.get_mut(&custom_agent.id.0) {
-                Some(existing) if is_superseded_builtin(existing) => {
+                Some(existing) if has_superseded_builtin_prompt(existing) => {
+                    let hidden = existing.hidden;
                     *existing = custom_agent;
+                    existing.hidden = hidden;
                     changed = true;
                 }
                 Some(_) => {}
@@ -2014,6 +2015,7 @@ impl CustomAgentStore {
 
     pub fn list(&self) -> Result<Vec<CustomAgent>, String> {
         let mut agents = Self::read_from_disk(&self.path)?
+            .0
             .into_values()
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
@@ -2023,19 +2025,19 @@ impl CustomAgentStore {
     pub fn get(&self, id: &CustomAgentId) -> Option<CustomAgent> {
         Self::read_from_disk(&self.path)
             .ok()
-            .and_then(|records| records.get(&id.0).cloned())
+            .and_then(|(records, _)| records.get(&id.0).cloned())
     }
 
     pub fn upsert(&self, custom_agent: CustomAgent) -> Result<CustomAgent, String> {
         validate_custom_agent(&custom_agent)?;
-        let mut records = Self::read_from_disk(&self.path)?;
+        let (mut records, _) = Self::read_from_disk(&self.path)?;
         records.insert(custom_agent.id.0.clone(), custom_agent.clone());
         self.save(&records)?;
         Ok(custom_agent)
     }
 
     pub fn delete(&self, id: &CustomAgentId) -> Result<CustomAgentId, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
+        let (mut records, _) = Self::read_from_disk(&self.path)?;
         if records.remove(&id.0).is_none() {
             return Err(format!("cannot delete missing custom agent {}", id));
         }
@@ -2043,10 +2045,35 @@ impl CustomAgentStore {
         Ok(id.clone())
     }
 
-    fn read_from_disk(path: &Path) -> Result<HashMap<String, CustomAgent>, String> {
+    fn read_from_disk(path: &Path) -> Result<(HashMap<String, CustomAgent>, bool), String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let records = serde_json::from_str::<StoreFile>(&contents)
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&contents).map_err(|err| {
+                        format!(
+                            "Failed to parse custom agent store {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                let mut migrated = false;
+                if let Some(records) = value
+                    .get_mut("records")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    for record in records.values_mut() {
+                        let hidden = matches!(
+                            record.get("id").and_then(serde_json::Value::as_str),
+                            Some(IMPLEMENTER_CUSTOM_AGENT_ID | LANDER_CUSTOM_AGENT_ID)
+                        );
+                        if let Some(fields) = record.as_object_mut()
+                            && !fields.contains_key("hidden")
+                        {
+                            fields.insert("hidden".into(), hidden.into());
+                            migrated = true;
+                        }
+                    }
+                }
+                let records = serde_json::from_value::<StoreFile>(value)
                     .map(|store| store.records)
                     .map_err(|err| {
                         format!(
@@ -2059,9 +2086,9 @@ impl CustomAgentStore {
                         format!("Invalid custom agent store {}: {err}", path.display())
                     })?;
                 }
-                Ok(records)
+                Ok((records, migrated))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((HashMap::new(), false)),
             Err(err) => Err(format!(
                 "Failed to read custom agent store {}: {err}",
                 path.display()
@@ -2104,6 +2131,7 @@ impl CustomAgentStore {
 pub fn builtin_custom_agents() -> Vec<CustomAgent> {
     vec![
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
             name: "Default".to_owned(),
             description:
@@ -2115,6 +2143,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2126,6 +2155,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
             name: "Help".to_owned(),
             description:
@@ -2137,6 +2167,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(PROJECT_MANAGER_CUSTOM_AGENT_ID.to_owned()),
             name: "Project Manager".to_owned(),
             description:
@@ -2148,6 +2179,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: true,
             id: CustomAgentId(LANDER_CUSTOM_AGENT_ID.to_owned()),
             name: "Lander".to_owned(),
             description:
@@ -2159,6 +2191,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: true,
             id: CustomAgentId(IMPLEMENTER_CUSTOM_AGENT_ID.to_owned()),
             name: "Implementer".to_owned(),
             description:
@@ -2191,6 +2224,14 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
     superseded_builtin_custom_agents()
         .iter()
         .any(|published| published == record)
+}
+
+fn has_superseded_builtin_prompt(record: &CustomAgent) -> bool {
+    superseded_builtin_custom_agents().iter().any(|published| {
+        let mut published = published.clone();
+        published.hidden = record.hidden;
+        published == *record
+    })
 }
 
 /// Every previously shipped builtin definition, used to distinguish unedited
@@ -2228,6 +2269,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         published.push(agent);
     }
     published.push(CustomAgent {
+        hidden: false,
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Tyde Operator".to_owned(),
         description: "Top-level coordinator for this host: runs agents, changes settings, and answers questions about Tyde.".to_owned(),
@@ -2236,6 +2278,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         tool_policy: ToolPolicy::Unrestricted,
     });
     published.push(CustomAgent {
+        hidden: false,
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),
         description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
@@ -2245,6 +2288,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         tool_policy: ToolPolicy::Unrestricted,
     });
     published.push(CustomAgent {
+        hidden: false,
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),
         description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
@@ -2254,6 +2298,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
         tool_policy: ToolPolicy::Unrestricted,
     });
     published.push(CustomAgent {
+        hidden: false,
         id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
         name: "Help".to_owned(),
         description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
@@ -2264,6 +2309,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     });
     published.extend([
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description: "Coordinates teammates, routes tasks, and reports verified progress."
@@ -2274,6 +2320,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2285,6 +2332,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2296,6 +2344,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2307,6 +2356,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2318,6 +2368,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2329,6 +2380,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2340,6 +2392,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2351,6 +2404,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description:
@@ -2362,6 +2416,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(PROJECT_MANAGER_CUSTOM_AGENT_ID.to_owned()),
             name: "Project Manager".to_owned(),
             description:
@@ -2373,6 +2428,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(OPERATOR_CUSTOM_AGENT_ID.to_owned()),
             name: "Tyde Operator".to_owned(),
             description:
@@ -2384,6 +2440,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned()),
             name: "Code Reviewer".to_owned(),
             description: "Reviews correctness, maintainability, tests, and architecture."
@@ -2394,6 +2451,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Frontend Engineer".to_owned(),
             description: "Builds UI behavior, state projection, and interaction polish.".to_owned(),
@@ -2406,6 +2464,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(BACKEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Backend Engineer".to_owned(),
             description: "Owns server behavior, persistence, validation, and protocol flow."
@@ -2419,6 +2478,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEST_QA_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Test / QA Engineer".to_owned(),
             description: "Adds focused tests and verifies observable behavior.".to_owned(),
@@ -2428,6 +2488,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(DEBUGGER_CUSTOM_AGENT_ID.to_owned()),
             name: "Debugger".to_owned(),
             description: "Root-causes bugs through evidence and focused instrumentation."
@@ -2444,6 +2505,7 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
 fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
     vec![
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: LEGACY_TEAM_LEAD_NAME.to_owned(),
             description: LEGACY_TEAM_LEAD_DESCRIPTION.to_owned(),
@@ -2453,6 +2515,7 @@ fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned()),
             name: "Code Reviewer".to_owned(),
             description: "Reviews correctness, maintainability, tests, and architecture.".to_owned(),
@@ -2465,6 +2528,7 @@ fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Frontend Engineer".to_owned(),
             description: "Builds UI behavior, state projection, and interaction polish.".to_owned(),
@@ -2477,6 +2541,7 @@ fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(BACKEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Backend Engineer".to_owned(),
             description: "Owns server behavior, persistence, validation, and protocol flow.".to_owned(),
@@ -2489,6 +2554,7 @@ fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
             tool_policy: ToolPolicy::Unrestricted,
         },
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(TEST_QA_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
             name: "Test / QA Engineer".to_owned(),
             description: "Adds focused tests and verifies observable behavior.".to_owned(),

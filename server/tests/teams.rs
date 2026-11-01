@@ -354,6 +354,7 @@ fn tool_result_json(result: &rmcp::model::CallToolResult) -> Value {
 
 fn sample_custom_agent(id: &str) -> CustomAgent {
     CustomAgent {
+        hidden: false,
         id: CustomAgentId(id.to_owned()),
         name: format!("{id} agent"),
         description: format!("{id} team agent"),

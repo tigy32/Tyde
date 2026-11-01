@@ -80,13 +80,21 @@ pub fn TychatTab() -> impl IntoView {
         let Some(host) = state.selected_host_id.get() else {
             return Vec::new();
         };
-        let mut agents: Vec<(CustomAgentId, String)> = state.custom_agents.with(|hosts| {
+        let mut agents: Vec<(CustomAgentId, String, bool)> = state.custom_agents.with(|hosts| {
             hosts
                 .get(&host)
                 .map(|agents| {
                     agents
                         .values()
-                        .map(|agent| (agent.id.clone(), agent.name.clone()))
+                        .filter(|agent| {
+                            !agent.hidden
+                                || config
+                                    .get()
+                                    .and_then(|config| config.custom_agent_id)
+                                    .as_ref()
+                                    == Some(&agent.id)
+                        })
+                        .map(|agent| (agent.id.clone(), agent.name.clone(), agent.hidden))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -193,7 +201,7 @@ pub fn TychatTab() -> impl IntoView {
                             send_host_replace(&state.get_value(), "/tychat/custom_agent_id", (!value.is_empty()).then_some(CustomAgentId(value)));
                         }>
                         {move || config.get().is_some_and(|config| config.custom_agent_id.is_none()).then(|| view! { <option value="">"No custom agent"</option> })}
-                        {move || custom_agents.get().into_iter().map(|(id, name)| view! { <option value=id.0>{name}</option> }).collect_view()}
+                        {move || custom_agents.get().into_iter().map(|(id, name, hidden)| { let selected_id = id.clone(); view! { <option value=id.0 hidden=hidden prop:selected=move || config.get().and_then(|config| config.custom_agent_id).as_ref() == Some(&selected_id)>{name}</option> } }).collect_view()}
                     </select>
                 </div>
                 <div class="settings-field">

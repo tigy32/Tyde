@@ -7121,6 +7121,17 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
         .expect("enabled backend list");
     assert_eq!(enabled_backends, &[json!("claude")]);
     assert_eq!(options["complexity_tiers_enabled"], false);
+    for id in ["tyde-implementer", "tyde-lander"] {
+        assert!(
+            options["custom_agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|agent| agent["id"] == id && agent["hidden"] == true),
+            "hidden templates remain discoverable"
+        );
+    }
+
     assert_eq!(
         options["launch_profile_preference"],
         json!([

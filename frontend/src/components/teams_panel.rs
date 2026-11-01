@@ -2349,14 +2349,25 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 }
 
 fn custom_agent_options(agents: Vec<CustomAgent>, current: Option<CustomAgentId>) -> impl IntoView {
+    let hidden_ids = agents
+        .iter()
+        .filter(|agent| agent.hidden)
+        .map(|agent| agent.id.0.clone())
+        .collect::<std::collections::HashSet<_>>();
     let options = agents
         .into_iter()
+        .filter(|agent| !agent.hidden || current.as_ref() == Some(&agent.id))
         .map(|agent| SelectOption {
             value: agent.id.0,
             label: agent.name,
         })
         .collect::<Vec<_>>();
-    select_options_view(options, current.map(|id| id.0).unwrap_or_default())
+    let current = current.map(|id| id.0).unwrap_or_default();
+    options_including_current(&options, &current).into_iter().map(|entry| {
+        let selected = entry.value == current;
+        let hidden = hidden_ids.contains(&entry.value);
+        view! { <option value=entry.value hidden=hidden disabled=entry.unavailable prop:selected=selected>{entry.label}</option> }
+    }).collect_view()
 }
 
 fn backend_options(backends: Vec<BackendKind>, current: Option<BackendKind>) -> impl IntoView {
@@ -3896,6 +3907,7 @@ mod wasm_tests {
 
     fn make_custom_agent(id: &str, name: &str) -> CustomAgent {
         CustomAgent {
+            hidden: false,
             id: CustomAgentId(id.to_owned()),
             name: name.to_owned(),
             description: String::new(),

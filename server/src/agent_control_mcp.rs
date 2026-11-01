@@ -631,6 +631,7 @@ pub(crate) struct ListLaunchOptionsResult {
 
 #[derive(Debug, Serialize)]
 struct CustomAgentOption {
+    hidden: bool,
     id: String,
     name: String,
     description: String,
@@ -3164,6 +3165,7 @@ pub(crate) async fn do_list_launch_options(
         .into_iter()
         .filter(|agent| include_host_operator || agent.id.0 != protocol::OPERATOR_CUSTOM_AGENT_ID)
         .map(|agent| CustomAgentOption {
+            hidden: agent.hidden,
             id: agent.id.0,
             name: agent.name,
             description: agent.description,

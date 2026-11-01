@@ -46,6 +46,7 @@ pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router 
     server::store::custom_agents::CustomAgentStore::load(store.path().join("custom_agents.json"))
         .expect("reconnect custom agents")
         .upsert(CustomAgent {
+            hidden: false,
             id: CustomAgentId("rtc-bootstrap".to_owned()),
             name: "RTC bootstrap agent".to_owned(),
             description: "Initial state spans multiple acknowledgement windows".to_owned(),

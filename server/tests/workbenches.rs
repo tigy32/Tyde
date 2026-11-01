@@ -1083,6 +1083,7 @@ async fn workbench_remove_cascades_team_member_reference() {
         .await
         .expect("set enabled backends failed");
     let custom_agent = CustomAgent {
+        hidden: false,
         id: CustomAgentId("workbench-team-agent".to_owned()),
         name: "Workbench team agent".to_owned(),
         description: "workbench team agent".to_owned(),

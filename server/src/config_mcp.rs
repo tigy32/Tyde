@@ -351,6 +351,8 @@ struct CustomAgentIdToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UpsertCustomAgentToolInput {
+    /// Hide from user pickers, not agent discovery or spawning. Omit to preserve.
+    hidden: Option<bool>,
     /// Omit to create a new agent; pass an existing id to replace it.
     custom_agent_id: Option<String>,
     name: String,
@@ -436,6 +438,7 @@ struct McpServerIdToolInput {
 
 #[derive(Debug, Serialize)]
 struct CustomAgentSummary {
+    hidden: bool,
     custom_agent_id: String,
     name: String,
     description: String,
@@ -446,6 +449,7 @@ struct CustomAgentSummary {
 
 fn summarize(agent: &CustomAgent) -> CustomAgentSummary {
     CustomAgentSummary {
+        hidden: agent.hidden,
         custom_agent_id: agent.id.0.clone(),
         name: agent.name.clone(),
         description: agent.description.clone(),
@@ -1110,6 +1114,9 @@ impl TydeConfigMcpServer {
             Err(err) => return Ok(err_text(err)),
         };
         let custom_agent = CustomAgent {
+            hidden: input
+                .hidden
+                .unwrap_or_else(|| existing.as_ref().is_some_and(|agent| agent.hidden)),
             id: CustomAgentId(id),
             name: input.name,
             description: input.description,

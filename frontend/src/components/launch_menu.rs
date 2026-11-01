@@ -534,6 +534,12 @@ pub fn LaunchChooser(
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
     });
+    let default_visible = Memo::new(move |_| {
+        !agents
+            .get()
+            .iter()
+            .any(|agent| agent.id.0 == DEFAULT_CUSTOM_AGENT_ID && agent.hidden)
+    });
     let ready_profile = Memo::new(move |_| {
         let id = selected_profile.get()?;
         entries.get()?.into_iter().find_map(|entry| match entry {
@@ -790,8 +796,8 @@ pub fn LaunchChooser(
                         <input type="search" aria-label="Find a role" placeholder="Find a role…"
                             prop:value=move || role_query.get() on:input=move |ev| role_query.set(event_target_value(&ev)) />
                         <div class="launch-role-list" role="group" aria-label="Agent role choices">
-                            <Show when=move || "default agent".contains(&role_query.get().trim().to_lowercase())
-                                || default_description.get().to_lowercase().contains(&role_query.get().trim().to_lowercase())>
+                            <Show when=move || default_visible.get() && ("default agent".contains(&role_query.get().trim().to_lowercase())
+                                || default_description.get().to_lowercase().contains(&role_query.get().trim().to_lowercase()))>
                                 <button type="button" class="launch-role-choice" aria-pressed=move || selected_agent.get().is_none_or(|id| id.0 == DEFAULT_CUSTOM_AGENT_ID).to_string()
                                     title=move || default_description.get() on:click=move |_| role_override.set(Some(CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned())))>
                                     <span class="launch-choice-text"><strong>"Default agent"</strong><small>{default_description}</small></span>
@@ -800,7 +806,7 @@ pub fn LaunchChooser(
                             </Show>
                             {move || {
                                 let query = role_query.get().trim().to_lowercase();
-                                agents.get().into_iter().filter(|agent| agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
+                                agents.get().into_iter().filter(|agent| !agent.hidden && agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
                                     && (agent.name.to_lowercase().contains(&query) || agent.description.to_lowercase().contains(&query)))
                                     .map(|agent| {
                                         let id = agent.id;
@@ -818,8 +824,8 @@ pub fn LaunchChooser(
                             }}
                             <Show when=move || {
                                 let query = role_query.get().trim().to_lowercase();
-                                !("default agent".contains(&query) || default_description.get().to_lowercase().contains(&query))
-                                    && !agents.get().iter().any(|agent| agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
+                                !(default_visible.get() && ("default agent".contains(&query) || default_description.get().to_lowercase().contains(&query)))
+                                    && !agents.get().iter().any(|agent| !agent.hidden && agent.id.0 != DEFAULT_CUSTOM_AGENT_ID
                                         && (agent.name.to_lowercase().contains(&query) || agent.description.to_lowercase().contains(&query)))
                             }><p class="launch-empty">"No roles match your search."</p></Show>
                         </div>
@@ -1161,6 +1167,75 @@ mod wasm_tests {
     /// unavailable entries stay visible with their server-provided reason —
     /// they are never silently dropped from the menu.
     #[wasm_bindgen_test]
+    async fn hidden_roles_are_not_choices_but_selected_defaults_remain_launchable() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+        );
+        let hidden_id = CustomAgentId("custom-hidden".into());
+        state.custom_agents.update(|hosts| {
+            hosts.entry("local".into()).or_default().insert(
+                hidden_id.clone(),
+                CustomAgent {
+                    hidden: true,
+                    id: hidden_id.clone(),
+                    name: "Private specialist".into(),
+                    description: "Custom instructions".into(),
+                    instructions: None,
+                    skill_ids: vec![],
+                    mcp_server_ids: vec![],
+                    tool_policy: ToolPolicy::Unrestricted,
+                },
+            );
+        });
+        state.launch_profile_catalog.update(|hosts| {
+            let catalog = hosts.get_mut("local").unwrap();
+            catalog.home_custom_agent_id = Some(hidden_id.clone());
+            catalog.default_profile_id = Some(LaunchProfileId("claude:default".into()));
+        });
+        let open = RwSignal::new(true);
+        let _handle = mount_menu(&container, &state, open);
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Private specialist").is_none());
+        assert!(
+            !find_button_by_text(&container, "Create agent")
+                .unwrap()
+                .has_attribute("disabled")
+        );
+        state.custom_agents.update(|hosts| {
+            hosts
+                .get_mut("local")
+                .unwrap()
+                .get_mut(&hidden_id)
+                .unwrap()
+                .hidden = false
+        });
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Private specialist").is_some());
+        state.custom_agents.update(|hosts| {
+            hosts
+                .get_mut("local")
+                .unwrap()
+                .get_mut(&hidden_id)
+                .unwrap()
+                .hidden = true
+        });
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Private specialist").is_none());
+        find_button_by_text(&container, "Create agent")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().custom_agent_id.get_untracked(),
+            Some(hidden_id)
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn renders_ready_profiles_and_unavailable_reason() {
         let container = make_container();
         let state = AppState::new();
@@ -1257,6 +1332,7 @@ mod wasm_tests {
                 hosts.entry(host.into()).or_default().insert(
                     id.clone(),
                     CustomAgent {
+                        hidden: false,
                         id,
                         name: format!("{host} role"),
                         description: "Host-specific role".into(),
@@ -1708,6 +1784,7 @@ mod wasm_tests {
             hosts.entry("unbootstrapped".into()).or_default().insert(
                 late_help.clone(),
                 CustomAgent {
+                    hidden: false,
                     id: late_help.clone(),
                     name: "Late Help".into(),
                     description: "Home role delivered with the catalog".into(),
@@ -1935,6 +2012,7 @@ mod wasm_tests {
             host.insert(
                 CustomAgentId("reviewer".to_owned()),
                 CustomAgent {
+                    hidden: false,
                     id: CustomAgentId("reviewer".to_owned()),
                     name: "Reviewer".to_owned(),
                     description: "Reviews code".to_owned(),
@@ -2155,6 +2233,7 @@ mod wasm_tests {
                 agents.insert(
                     id.clone(),
                     CustomAgent {
+                        hidden: false,
                         id,
                         name: name.to_owned(),
                         description: format!("{name} role"),
@@ -2640,6 +2719,7 @@ mod wasm_tests {
             hosts.entry("local".to_owned()).or_default().insert(
                 CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
                 CustomAgent {
+                    hidden: false,
                     id: CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
                     name: "Default".to_owned(),
                     description: "My project defaults".to_owned(),
@@ -2652,6 +2732,7 @@ mod wasm_tests {
             hosts.entry("local".to_owned()).or_default().insert(
                 help_id.clone(),
                 CustomAgent {
+                    hidden: false,
                     id: help_id.clone(),
                     name: "My setup guide".to_owned(),
                     description: "My customized Help".to_owned(),

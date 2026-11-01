@@ -8300,6 +8300,7 @@ fn parse_tool_list(raw: &str) -> Vec<String> {
 
 #[derive(Clone)]
 struct CustomAgentForm {
+    hidden: RwSignal<bool>,
     id: CustomAgentId,
     is_new: bool,
     name: RwSignal<String>,
@@ -8314,6 +8315,7 @@ struct CustomAgentForm {
 impl CustomAgentForm {
     fn from_agent(agent: &CustomAgent) -> Self {
         Self {
+            hidden: RwSignal::new(agent.hidden),
             id: agent.id.clone(),
             is_new: false,
             name: RwSignal::new(agent.name.clone()),
@@ -8328,6 +8330,7 @@ impl CustomAgentForm {
 
     fn blank() -> Self {
         Self {
+            hidden: RwSignal::new(false),
             id: CustomAgentId(generate_id()),
             is_new: true,
             name: RwSignal::new(String::new()),
@@ -8367,6 +8370,7 @@ impl CustomAgentForm {
 
         let instructions = self.instructions.get_untracked().trim().to_string();
         Ok(CustomAgent {
+            hidden: self.hidden.get_untracked(),
             id: self.id.clone(),
             name,
             description,
@@ -8715,6 +8719,7 @@ fn CustomAgentEditor(
     };
     let is_default_agent = !form.is_new && form.id.0.as_str() == "tyde-default";
 
+    let hidden_sig = form.hidden;
     let name_sig = form.name;
     let description_sig = form.description;
     let instructions_sig = form.instructions;
@@ -8808,6 +8813,14 @@ fn CustomAgentEditor(
         <div class="settings-field">
             <label class="settings-label">{title}</label>
             <div class="settings-form">
+                <label class="settings-toggle-row">
+                    <span>"Hidden"</span>
+                    <span class="settings-toggle">
+                        <input type="checkbox" prop:checked=move || hidden_sig.get()
+                            on:change=move |ev| hidden_sig.set(event_target_checked(&ev)) />
+                        <span class="settings-toggle-slider"></span>
+                    </span>
+                </label>
                 <label class="settings-form-label">
                     <span>"Name"</span>
                     <input
@@ -10258,6 +10271,80 @@ mod wasm_tests {
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn hidden_custom_agents_remain_editable_and_save_visibility() {
+        let calls = install_settings_send_stub();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        let agent = CustomAgent {
+            hidden: true,
+            id: CustomAgentId("hidden-custom".into()),
+            name: "Hidden specialist".into(),
+            description: "Custom description".into(),
+            instructions: Some("Keep these instructions".into()),
+            skill_ids: vec![],
+            mcp_server_ids: vec![],
+            tool_policy: ToolPolicy::Unrestricted,
+        };
+        state.custom_agents.update(|hosts| {
+            hosts
+                .entry("host-lp".into())
+                .or_default()
+                .insert(agent.id.clone(), agent);
+        });
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <CustomAgentsTab /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Hidden specialist")
+        );
+        click_tab(&container, "Edit");
+        next_tick().await;
+        let hidden: HtmlInputElement = container
+            .query_selector("input[type=checkbox]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(hidden.checked());
+        hidden.click();
+        next_tick().await;
+        assert!(!hidden.checked());
+        click_tab(&container, "Save");
+        next_tick().await;
+        next_tick().await;
+        let sent = calls
+            .iter()
+            .filter_map(|entry| {
+                let entry = entry.dyn_into::<js_sys::Array>().ok()?;
+                if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                    return None;
+                }
+                let args: Value = serde_json::from_str(&entry.get(1).as_string()?).ok()?;
+                let envelope: protocol::Envelope =
+                    serde_json::from_str(args.get("line")?.as_str()?).ok()?;
+                (envelope.kind == protocol::FrameKind::CustomAgentUpsert).then(|| {
+                    envelope
+                        .parse_payload::<protocol::CustomAgentUpsertPayload>()
+                        .unwrap()
+                        .custom_agent
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].hidden);
+        assert_eq!(
+            sent[0].instructions.as_deref(),
+            Some("Keep these instructions")
+        );
+    }
 
     #[wasm_bindgen_test]
     async fn workbenches_engine_waits_for_server_state_and_tracks_host_support() {
@@ -13117,6 +13204,7 @@ mod wasm_tests {
                 agents.insert(
                     CustomAgentId(id.to_owned()),
                     CustomAgent {
+                        hidden: false,
                         id: CustomAgentId(id.to_owned()),
                         name: name.to_owned(),
                         description: String::new(),
