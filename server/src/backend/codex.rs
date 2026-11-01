@@ -1713,6 +1713,7 @@ pub struct CodexSession {
 struct CodexThreadResponseConfig<'a> {
     cwd: String,
     startup_mcp_servers: &'a [StartupMcpServer],
+    ephemeral: bool,
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
 }
@@ -2006,11 +2007,12 @@ impl CodexSession {
             ?runtime_roots,
             "Starting Codex with ordered workspace roots"
         );
+        let ephemeral = ephemeral || execution_mode == BackendExecutionMode::InferenceOnly;
         let mut thread_start_params = json!({
             "cwd": cwd,
             "sandbox": codex_sandbox_mode(access_mode, execution_mode),
             "approvalPolicy": codex_approval_policy(execution_mode),
-            "ephemeral": ephemeral || execution_mode == BackendExecutionMode::InferenceOnly,
+            "ephemeral": ephemeral,
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
@@ -2096,6 +2098,7 @@ impl CodexSession {
             CodexThreadResponseConfig {
                 cwd,
                 startup_mcp_servers,
+                ephemeral,
                 access_mode,
                 execution_mode,
             },
@@ -2330,6 +2333,7 @@ impl CodexSession {
             CodexThreadResponseConfig {
                 cwd,
                 startup_mcp_servers,
+                ephemeral: false,
                 access_mode,
                 execution_mode: BackendExecutionMode::Agent,
             },
@@ -2399,9 +2403,7 @@ impl CodexSession {
             thread_id,
             response_projections,
             model,
-            config.access_mode,
-            config.execution_mode,
-            codex_has_http_mcp_servers(config.startup_mcp_servers),
+            &config,
             subagent_emitter,
         );
         let inner = Arc::new(CodexInner {
@@ -4660,6 +4662,7 @@ struct CodexState {
     reasoning_effort_override: Option<String>,
     speed_override: Option<String>,
     approval_policy: Option<String>,
+    ephemeral: bool,
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
     turn_network_access: bool,
@@ -4811,9 +4814,7 @@ fn initial_codex_state(
     thread_id: String,
     response_projections: HashMap<String, CodexResponseProjection>,
     model: Option<String>,
-    access_mode: BackendAccessMode,
-    execution_mode: BackendExecutionMode,
-    turn_network_access: bool,
+    config: &CodexThreadResponseConfig<'_>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
 ) -> CodexState {
     let generated_identity_epoch = codex_generated_identity_epoch(&thread_id);
@@ -4834,9 +4835,10 @@ fn initial_codex_state(
         reasoning_effort_override: None,
         speed_override: None,
         approval_policy: None,
-        access_mode,
-        execution_mode,
-        turn_network_access,
+        ephemeral: config.ephemeral,
+        access_mode: config.access_mode,
+        execution_mode: config.execution_mode,
+        turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
         active_turn_id: None,
         foreground_response_completed: false,
         interrupt_requested_turn_id: None,
@@ -9571,6 +9573,7 @@ impl CodexInner {
                     .with(move |state| {
                         state.pending_resume_thread_id = None;
                         state.thread_id = resumed_thread_id;
+                        state.ephemeral = false;
                         let resumed_thread_id = state.thread_id.clone();
                         state.response_projections.clear();
                         // Usage boundaries still group typed items on older app-servers
@@ -12648,6 +12651,9 @@ impl CodexInner {
             .state
             .with(move |state| {
                 let emitter = if owner == state.thread_id {
+                    if state.ephemeral {
+                        return None;
+                    }
                     root_emitter
                 } else if let Some(stream) = state.subagent_streams.get(&owner) {
                     Arc::clone(&stream.emitter)

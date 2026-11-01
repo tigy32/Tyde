@@ -55,6 +55,13 @@ working/idle state, and the response splitter retains its existing boundaries.
 Native context-window occupancy remains a separate provider measurement.
 Per-response footers retain that notification's native request usage rather
 than borrowing the latest ledger row when the reader has read ahead.
+Root threads explicitly started with `ephemeral: true` (including
+`BackendExecutionMode::InferenceOnly` supervisor/helper sessions) do not
+materialize a rollout file on disk (`thread/read` returns `path: null`), cannot
+be forked, resumed, or compacted, and report per-response and turn usage from
+the live `thread/tokenUsage/updated` notification without rollout-file
+reconciliation. Durable root threads and native subagent threads still require a
+materialized `/thread/path` and fail explicitly when it is absent.
 
 Resume rebuilds the same own-thread ledger and emits its final checkpoint,
 not intermediate historical totals. Repeated request IDs remain idempotent
