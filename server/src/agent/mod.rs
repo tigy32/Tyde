@@ -246,7 +246,7 @@ struct InitialFollowUpContext<'a> {
     event_log: &'a mut AgentEventLog,
     latest_output: &'a mut AgentControlLatestOutput,
     latest_slash_commands: Option<&'a protocol::SlashCommandCatalog>,
-    pending_attaches: &'a mut Vec<(Stream, oneshot::Sender<bool>)>,
+    pending_attaches: &'a mut Vec<PendingAgentAttach>,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
@@ -470,6 +470,18 @@ impl UsageSnapshotReply {
     }
 }
 
+pub(crate) struct AgentAttachment {
+    pub completed: oneshot::Receiver<bool>,
+    pub admitted: oneshot::Receiver<()>,
+}
+
+struct PendingAgentAttach {
+    stream: Stream,
+    reply: oneshot::Sender<bool>,
+    admitted: Option<oneshot::Sender<()>>,
+    actor: mpsc::UnboundedSender<AgentCommand>,
+}
+
 enum AgentCommand {
     MarkAccountingSessionShared {
         reply: oneshot::Sender<Result<(), String>>,
@@ -639,10 +651,7 @@ enum AgentCommand {
     ReadMockControl {
         reply: oneshot::Sender<Option<crate::backend::mock::MockControl>>,
     },
-    Attach {
-        stream: Stream,
-        reply: oneshot::Sender<bool>,
-    },
+    Attach(PendingAgentAttach),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2924,22 +2933,29 @@ impl AgentHandle {
         reply_rx.await.ok().flatten()
     }
 
-    pub fn begin_attach(&self, stream: Stream) -> Option<oneshot::Receiver<bool>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    pub(crate) fn begin_attach(&self, mut stream: Stream) -> Option<AgentAttachment> {
+        stream.register_bootstrap();
+        let (reply, completed) = oneshot::channel();
+        let (admitted, admission) = oneshot::channel();
         self.tx
-            .send(AgentCommand::Attach {
+            .send(AgentCommand::Attach(PendingAgentAttach {
                 stream,
-                reply: reply_tx,
-            })
+                reply,
+                admitted: Some(admitted),
+                actor: self.tx.clone(),
+            }))
             .ok()?;
-        Some(reply_rx)
+        Some(AgentAttachment {
+            completed,
+            admitted: admission,
+        })
     }
 
     pub async fn attach(&self, stream: Stream) -> bool {
         let Some(reply_rx) = self.begin_attach(stream) else {
             return false;
         };
-        reply_rx.await.unwrap_or(false)
+        reply_rx.completed.await.unwrap_or(false)
     }
 }
 
@@ -4660,7 +4676,7 @@ pub(crate) fn spawn_agent_actor(
                 None => startup.await,
             }
         });
-        let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
+        let mut pending_startup_attaches: Vec<PendingAgentAttach> = Vec::new();
         let mut restart_deferred = false;
         let mut deferred_restart_stop: Option<oneshot::Sender<()>> = None;
 
@@ -4762,13 +4778,13 @@ pub(crate) fn spawn_agent_actor(
                             let _ = session_binding_tx.send(Err("agent startup closed".to_owned()));
                             return;
                         }
-                        AgentCommand::Attach { stream, reply } => {
+                        AgentCommand::Attach(attachment) => {
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
-                                stream = %stream.path(),
+                                stream = %attachment.stream.path(),
                                 "deferring agent stream attachment until startup bootstrap is available"
                             );
-                            pending_startup_attaches.push((stream, reply));
+                            pending_startup_attaches.push(attachment);
                         }
                         AgentCommand::ReadOutput { reply, .. } => {
                             let _ = reply.send(Vec::new());
@@ -5179,7 +5195,7 @@ pub(crate) fn spawn_agent_actor(
         let mut deferred_resume_events = VecDeque::new();
         let mut resume_replay_boundary: Option<Result<(), String>> = None;
         let mut resume_live_turn_seen = false;
-        let mut pending_resume_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
+        let mut pending_resume_attaches: Vec<PendingAgentAttach> = Vec::new();
         if is_resume {
             pending_resume_attaches.append(&mut pending_startup_attaches);
         }
@@ -11871,26 +11887,25 @@ pub(crate) fn spawn_agent_actor(
                             close_deadline =
                                 Some(tokio::time::Instant::now() + CLOSE_TURN_GRACE);
                         }
-                        AgentCommand::Attach { stream, reply } => {
+                        AgentCommand::Attach(attachment) => {
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
-                                stream = %stream.path(),
+                                stream = %attachment.stream.path(),
                                 "attaching stream to active agent"
                             );
                             if resume_replay_gate_pending {
-                                pending_resume_attaches.push((stream, reply));
+                                pending_resume_attaches.push(attachment);
                                 continue;
                             }
-                            let attached = attach_subscriber_with_latest_output(
+                            attach_subscriber_with_latest_output(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
                                 &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
-                                stream,
+                                attachment,
                             );
-                            let _ = reply.send(attached);
                         }
                     }
                 }
@@ -12776,17 +12791,16 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ = reply.send(true);
                             return;
                         }
-                        AgentCommand::Attach { stream, reply } => {
-                            let attached = attach_subscriber_with_latest_output(
+                        AgentCommand::Attach(attachment) => {
+                            attach_subscriber_with_latest_output(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
                                 &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
-                                stream,
+                                attachment,
                             );
-                            let _ = reply.send(attached);
                         }
                     }
                 }
@@ -14072,17 +14086,16 @@ async fn park_terminal_agent(
                 }
                 reply.send(snapshot);
             }
-            AgentCommand::Attach { stream, reply } => {
-                let attached = attach_subscriber_with_latest_output(
+            AgentCommand::Attach(attachment) => {
+                attach_subscriber_with_latest_output(
                     event_log,
                     None,
                     latest_output.output(),
                     &status_handle.snapshot().await,
                     None,
                     subscribers,
-                    stream,
+                    attachment,
                 );
-                let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
                 status_handle.withdraw_recovery().await;
@@ -14373,17 +14386,16 @@ async fn park_relay_terminal_agent(
                 snapshot.timing = event_log.timing.snapshot();
                 reply.send(snapshot);
             }
-            AgentCommand::Attach { stream, reply } => {
-                let attached = attach_subscriber_with_latest_output(
+            AgentCommand::Attach(attachment) => {
+                attach_subscriber_with_latest_output(
                     event_log,
                     None,
                     latest_output.output(),
                     &status_handle.snapshot().await,
                     None,
                     subscribers,
-                    stream,
+                    attachment,
                 );
-                let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
                 finish_actor_close(
@@ -16137,23 +16149,22 @@ async fn flush_pending_agent_attaches(
     latest_output: &mut AgentControlLatestOutput,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
-    pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
+    pending_attaches: &mut Vec<PendingAgentAttach>,
     status_handle: &registry::AgentStatusHandle,
 ) {
     let output = current_latest_output(latest_output, event_log)
         .expect("typed agent replay log must project latest output");
     let status = status_handle.snapshot().await;
-    for (stream, reply) in std::mem::take(pending_attaches) {
-        let attached = attach_subscriber_with_latest_output(
+    for attachment in std::mem::take(pending_attaches) {
+        attach_subscriber_with_latest_output(
             event_log,
             replay_state,
             &output,
             &status,
             slash_commands,
             subscribers,
-            stream,
+            attachment,
         );
-        let _ = reply.send(attached);
     }
 }
 
@@ -18249,8 +18260,49 @@ fn attach_subscriber_with_latest_output(
     status: &registry::AgentStatus,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
-    stream: Stream,
-) -> bool {
+    attachment: PendingAgentAttach,
+) {
+    let PendingAgentAttach {
+        mut stream,
+        reply,
+        admitted,
+        actor,
+    } = attachment;
+    #[cfg(feature = "test-support")]
+    stream.record_replay_request();
+    // Startup-held attachments own no replay credit. Only a ready actor may
+    // reserve materialization; a capacity wait resumes through its mailbox.
+    match stream.try_reserve_bootstrap() {
+        Ok(true) => {}
+        Ok(false) => {
+            tokio::spawn(async move {
+                if stream.reserve_bootstrap().await.is_err() {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let continuation = PendingAgentAttach {
+                    stream,
+                    reply,
+                    admitted: None,
+                    actor: actor.clone(),
+                };
+                if actor.send(AgentCommand::Attach(continuation)).is_err() {
+                    tracing::debug!("agent stopped before admitted bootstrap materialization");
+                }
+            });
+            if let Some(admitted) = admitted {
+                let _ = admitted.send(());
+            }
+            return;
+        }
+        Err(_) => {
+            let _ = reply.send(false);
+            if let Some(admitted) = admitted {
+                let _ = admitted.send(());
+            }
+            return;
+        }
+    }
     let bootstrap_started = Instant::now();
     let stream_path = stream.path().clone();
     let mut events = agent_bootstrap_events_from_log(event_log);
@@ -18327,11 +18379,12 @@ fn attach_subscriber_with_latest_output(
         pending_user_questions,
     })
     .expect("failed to serialize AgentBootstrap payload");
-    if stream
-        .send_value(FrameKind::AgentBootstrap, payload)
-        .is_err()
-    {
-        return false;
+    if stream.send_bootstrap(payload).is_err() {
+        let _ = reply.send(false);
+        if let Some(admitted) = admitted {
+            let _ = admitted.send(());
+        }
+        return;
     }
 
     subscribers.push(stream);
@@ -18341,7 +18394,10 @@ fn attach_subscriber_with_latest_output(
         bootstrap_event_count,
         "activated agent subscriber after AgentBootstrap"
     );
-    true
+    let _ = reply.send(true);
+    if let Some(admitted) = admitted {
+        let _ = admitted.send(());
+    }
 }
 
 fn filtered_session_history_entries_from_log(

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use protocol::{Envelope, FrameKind, ProtocolFrame, StreamPath, VoiceAudioPayload};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 const CONTROL_LIMIT: usize = 64;
 const BULK_LIMIT: usize = 256;
@@ -17,6 +17,7 @@ pub(crate) enum OutputLane {
     Control,
     Chat,
     Bulk,
+    Replay,
     Audio,
 }
 
@@ -26,6 +27,7 @@ pub(crate) struct QueuedOutput {
     pub lane: OutputLane,
     pub audio_packets: usize,
     pub bytes: usize,
+    pub(crate) admission: Option<Arc<OwnedSemaphorePermit>>,
     prerequisites: Vec<SchedulerToken>,
     pub(crate) completions: Vec<SchedulerToken>,
 }
@@ -41,6 +43,8 @@ struct Queues {
     control: VecDeque<QueuedOutput>,
     chat: VecDeque<QueuedOutput>,
     bulk: VecDeque<QueuedOutput>,
+    replay: VecDeque<QueuedOutput>,
+    prefer_replay: bool,
     audio: VecDeque<QueuedOutput>,
     audio_packets: usize,
     control_bytes: usize,
@@ -53,16 +57,73 @@ struct Queues {
     streams: usize,
     close_on_no_streams: bool,
     pending_tokens: HashMap<SchedulerToken, usize>,
+    waiting_bootstraps: HashMap<StreamPath, tokio_util::sync::CancellationToken>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct OutputQueue {
     inner: Arc<Mutex<Queues>>,
     ready: Arc<Notify>,
+    replay_capacity: Arc<Semaphore>,
+    closed: tokio_util::sync::CancellationToken,
+    #[cfg(feature = "test-support")]
+    replay_requests: Arc<AtomicU64>,
+    #[cfg(feature = "test-support")]
+    replay_changed: Arc<Notify>,
     records_written: Arc<AtomicU64>,
     dropped_audio_packets: Arc<AtomicU64>,
     dropped_audio_bytes: Arc<AtomicU64>,
     audio_high_water_packets: Arc<AtomicU64>,
+}
+
+impl Default for OutputQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            ready: Arc::default(),
+            replay_capacity: Arc::new(Semaphore::new(2)),
+            closed: tokio_util::sync::CancellationToken::new(),
+            records_written: Arc::default(),
+            dropped_audio_packets: Arc::default(),
+            dropped_audio_bytes: Arc::default(),
+            audio_high_water_packets: Arc::default(),
+            #[cfg(feature = "test-support")]
+            replay_requests: Arc::default(),
+            #[cfg(feature = "test-support")]
+            replay_changed: Arc::default(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct ReplayAdmissionProbe {
+    requested: Arc<AtomicU64>,
+    changed: Arc<Notify>,
+    queues: Arc<Mutex<Queues>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ReplayAdmissionProbe {
+    pub fn waiting_streams(&self) -> Vec<StreamPath> {
+        self.queues
+            .lock()
+            .expect("output queue lock poisoned")
+            .waiting_bootstraps
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn requested(&self, count: u64) {
+        loop {
+            let changed = self.changed.notified();
+            if self.requested.load(Ordering::Acquire) >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for OutputQueue {
@@ -114,11 +175,21 @@ impl Drop for OutputReceiver {
 }
 
 impl OutputQueue {
+    #[cfg(feature = "test-support")]
+    pub fn replay_probe(&self) -> ReplayAdmissionProbe {
+        ReplayAdmissionProbe {
+            requested: self.replay_requests.clone(),
+            changed: self.replay_changed.clone(),
+            queues: self.inner.clone(),
+        }
+    }
+
     fn queue_mut(queues: &mut Queues, lane: OutputLane) -> &mut VecDeque<QueuedOutput> {
         match lane {
             OutputLane::Control => &mut queues.control,
             OutputLane::Chat => &mut queues.chat,
             OutputLane::Bulk => &mut queues.bulk,
+            OutputLane::Replay => &mut queues.replay,
             OutputLane::Audio => &mut queues.audio,
         }
     }
@@ -128,6 +199,7 @@ impl OutputQueue {
             OutputLane::Control => &queues.control,
             OutputLane::Chat => &queues.chat,
             OutputLane::Bulk => &queues.bulk,
+            OutputLane::Replay => &queues.replay,
             OutputLane::Audio => &queues.audio,
         }
     }
@@ -144,7 +216,7 @@ impl OutputQueue {
             OutputLane::Control => queues.control_bytes,
             OutputLane::Chat => queues.chat_bytes,
             OutputLane::Bulk => queues.bulk_bytes,
-            OutputLane::Audio => 0,
+            OutputLane::Audio | OutputLane::Replay => 0,
         }
     }
     fn add_lane_bytes(queues: &mut Queues, lane: OutputLane, bytes: usize) {
@@ -152,7 +224,7 @@ impl OutputQueue {
             OutputLane::Control => queues.control_bytes += bytes,
             OutputLane::Chat => queues.chat_bytes += bytes,
             OutputLane::Bulk => queues.bulk_bytes += bytes,
-            OutputLane::Audio => {}
+            OutputLane::Audio | OutputLane::Replay => {}
         }
     }
     fn subtract_lane_bytes(queues: &mut Queues, item: &QueuedOutput) {
@@ -162,7 +234,7 @@ impl OutputQueue {
             }
             OutputLane::Chat => queues.chat_bytes = queues.chat_bytes.saturating_sub(item.bytes),
             OutputLane::Bulk => queues.bulk_bytes = queues.bulk_bytes.saturating_sub(item.bytes),
-            OutputLane::Audio => {}
+            OutputLane::Audio | OutputLane::Replay => {}
         }
     }
     fn pop_lane(queues: &mut Queues, lane: OutputLane) -> Option<QueuedOutput> {
@@ -237,6 +309,34 @@ impl OutputQueue {
         if queues.closed || queues.fatal_overflow {
             return Err(StreamClosed);
         }
+        if output.frame.envelope.kind == FrameKind::AgentClosed {
+            let mut payload: protocol::AgentClosedPayload = output
+                .frame
+                .envelope
+                .parse_payload()
+                .map_err(|_| StreamClosed)?;
+            let prefix = format!("/agent/{}/", payload.agent_id);
+            let cancelled: Vec<_> = queues
+                .waiting_bootstraps
+                .keys()
+                .filter(|path| path.0.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for path in &cancelled {
+                if let Some(cancelled) = queues.waiting_bootstraps.remove(path) {
+                    cancelled.cancel();
+                }
+                queues
+                    .pending_tokens
+                    .remove(&SchedulerToken::Bootstrapped(path.clone()));
+            }
+            payload.cancelled_bootstraps = cancelled;
+            output.frame.envelope.payload =
+                serde_json::to_value(payload).map_err(|_| StreamClosed)?;
+            output.bytes = serde_json::to_vec(&output.frame.envelope)
+                .map_err(|_| StreamClosed)?
+                .len();
+        }
         if output.lane == OutputLane::Audio {
             while queues.audio_packets + output.audio_packets > AUDIO_PACKET_LIMIT {
                 let Some(dropped) = queues.audio.pop_front() else {
@@ -267,6 +367,9 @@ impl OutputQueue {
             OutputLane::Control => (Some(CONTROL_LIMIT), CONTROL_BYTE_LIMIT),
             OutputLane::Chat => (None, CHAT_BYTE_LIMIT),
             OutputLane::Bulk => (Some(BULK_LIMIT), BULK_BYTE_LIMIT),
+            // A ready actor acquires a slot before constructing its snapshot.
+            // Its separate window cannot consume ordinary bulk/control capacity.
+            OutputLane::Replay => (Some(2), protocol::framing::MAX_LOGICAL_HEADER),
             OutputLane::Audio => unreachable!(),
         };
         if Self::lane_bytes(&queues, output.lane).saturating_add(output.bytes) > byte_limit {
@@ -279,6 +382,8 @@ impl OutputQueue {
             } else {
                 queues.closed = true;
             }
+            self.replay_capacity.close();
+            self.closed.cancel();
             self.ready.notify_waiters();
             return Err(StreamClosed);
         }
@@ -294,6 +399,8 @@ impl OutputQueue {
             } else {
                 queues.closed = true;
             }
+            self.replay_capacity.close();
+            self.closed.cancel();
             self.ready.notify_waiters();
             return Err(StreamClosed);
         }
@@ -316,7 +423,17 @@ impl OutputQueue {
                     .cloned(),
             );
         }
+        let registered = output.frame.envelope.kind == FrameKind::AgentBootstrap
+            && queues
+                .waiting_bootstraps
+                .remove(&output.frame.envelope.stream)
+                .is_some();
         for token in &output.completions {
+            if registered
+                && *token == SchedulerToken::Bootstrapped(output.frame.envelope.stream.clone())
+            {
+                continue;
+            }
             *queues.pending_tokens.entry(token.clone()).or_default() += 1;
         }
         Self::queue_mut(&mut queues, lane).push_back(output);
@@ -418,6 +535,8 @@ impl OutputQueue {
         queues.streams = queues.streams.saturating_sub(1);
         if queues.streams == 0 && queues.close_on_no_streams {
             queues.closed = true;
+            self.closed.cancel();
+            self.replay_capacity.close();
             drop(queues);
             self.ready.notify_waiters();
         }
@@ -447,9 +566,22 @@ impl OutputQueue {
         lower
     }
 
+    fn pop_bulk(queues: &mut Queues) -> Option<QueuedOutput> {
+        let (first, second) = if queues.prefer_replay {
+            (OutputLane::Replay, OutputLane::Bulk)
+        } else {
+            (OutputLane::Bulk, OutputLane::Replay)
+        };
+        let output = Self::pop_lane(queues, first).or_else(|| Self::pop_lane(queues, second));
+        if output.is_some() {
+            queues.prefer_replay = !queues.prefer_replay;
+        }
+        output
+    }
+
     fn pop_lower(queues: &mut Queues, include_bulk: bool) -> Option<QueuedOutput> {
         if queues.prefer_bulk && include_bulk {
-            if let Some(item) = Self::pop_lane(queues, OutputLane::Bulk) {
+            if let Some(item) = Self::pop_bulk(queues) {
                 return Some(item);
             }
             return Self::pop_lane(queues, OutputLane::Chat);
@@ -458,7 +590,7 @@ impl OutputQueue {
             return Some(item);
         }
         if include_bulk {
-            Self::pop_lane(queues, OutputLane::Bulk)
+            Self::pop_bulk(queues)
         } else {
             None
         }
@@ -497,6 +629,8 @@ impl OutputQueue {
     pub fn close(&self) {
         let mut queues = self.inner.lock().expect("output queue lock poisoned");
         queues.closed = true;
+        self.replay_capacity.close();
+        self.closed.cancel();
         queues.audio.clear();
         queues.audio_packets = 0;
         drop(queues);
@@ -524,17 +658,104 @@ impl OutputQueue {
 pub(crate) struct Stream {
     path: StreamPath,
     queue: OutputQueue,
+    bootstrap_admission: Option<OwnedSemaphorePermit>,
+    bootstrap_cancelled: Option<tokio_util::sync::CancellationToken>,
+    #[cfg(feature = "test-support")]
+    replay_recorded: bool,
 }
 
 impl Stream {
+    pub fn register_bootstrap(&mut self) {
+        if self.bootstrap_cancelled.is_some() {
+            return;
+        }
+        let mut queues = self.queue.inner.lock().expect("output queue lock poisoned");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        queues
+            .waiting_bootstraps
+            .insert(self.path.clone(), cancelled.clone());
+        *queues
+            .pending_tokens
+            .entry(SchedulerToken::Bootstrapped(self.path.clone()))
+            .or_default() += 1;
+        self.bootstrap_cancelled = Some(cancelled);
+    }
+
+    pub async fn closed(&self) {
+        match &self.bootstrap_cancelled {
+            Some(cancelled) => tokio::select! {
+                _ = self.queue.closed.cancelled() => {},
+                _ = cancelled.cancelled() => {},
+            },
+            None => self.queue.closed.cancelled().await,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn record_replay_request(&mut self) {
+        if !self.replay_recorded {
+            self.replay_recorded = true;
+            self.queue.replay_requests.fetch_add(1, Ordering::Release);
+            self.queue.replay_changed.notify_waiters();
+        }
+    }
+
     pub fn close(&self) {
         self.queue.close();
     }
 
     pub fn new(path: StreamPath, queue: OutputQueue) -> Self {
         queue.add_stream();
-        Self { path, queue }
+        Self {
+            path,
+            queue,
+            bootstrap_admission: None,
+            bootstrap_cancelled: None,
+            #[cfg(feature = "test-support")]
+            replay_recorded: false,
+        }
     }
+
+    pub fn try_reserve_bootstrap(&mut self) -> Result<bool, StreamClosed> {
+        if self.bootstrap_admission.is_some() {
+            return Ok(true);
+        }
+        match self.queue.replay_capacity.clone().try_acquire_owned() {
+            Ok(admission) => {
+                self.bootstrap_admission = Some(admission);
+                Ok(true)
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => Err(StreamClosed),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Ok(false),
+        }
+    }
+
+    pub async fn reserve_bootstrap(&mut self) -> Result<(), StreamClosed> {
+        if self.try_reserve_bootstrap()? {
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        self.record_replay_request();
+        let admission = tokio::select! {
+            admission = self.queue.replay_capacity.clone().acquire_owned() => admission.map_err(|_| StreamClosed)?,
+            () = self.closed() => return Err(StreamClosed),
+        };
+        self.bootstrap_admission = Some(admission);
+        Ok(())
+    }
+
+    pub fn send_bootstrap(&mut self, payload: serde_json::Value) -> Result<(), StreamClosed> {
+        if self
+            .bootstrap_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.is_cancelled())
+        {
+            return Err(StreamClosed);
+        }
+        let admission = self.bootstrap_admission.take().map(Arc::new);
+        self.send_frame_with_admission(FrameKind::AgentBootstrap, payload, Vec::new(), admission)
+    }
+
     pub fn with_path(&self, path: StreamPath) -> Self {
         Self::new(path, self.queue.clone())
     }
@@ -575,13 +796,27 @@ impl Stream {
         payload: serde_json::Value,
         binary: Vec<u8>,
     ) -> Result<(), StreamClosed> {
+        self.send_frame_with_admission(kind, payload, binary, None)
+    }
+
+    fn send_frame_with_admission(
+        &self,
+        kind: FrameKind,
+        payload: serde_json::Value,
+        binary: Vec<u8>,
+        admission: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Result<(), StreamClosed> {
         let envelope = Envelope {
             stream: self.path.clone(),
             kind,
             seq: 0,
             payload,
         };
-        let lane = classify_envelope(&envelope);
+        let lane = if admission.is_some() {
+            OutputLane::Replay
+        } else {
+            classify_envelope(&envelope)
+        };
         let audio_packets = if lane == OutputLane::Audio {
             let audio = envelope
                 .parse_payload::<VoiceAudioPayload>()
@@ -606,6 +841,7 @@ impl Stream {
             lane,
             audio_packets,
             bytes,
+            admission,
             prerequisites,
             completions,
         })
@@ -692,6 +928,10 @@ impl Clone for Stream {
         Self {
             path: self.path.clone(),
             queue: self.queue.clone(),
+            bootstrap_admission: None,
+            bootstrap_cancelled: self.bootstrap_cancelled.clone(),
+            #[cfg(feature = "test-support")]
+            replay_recorded: self.replay_recorded,
         }
     }
 }

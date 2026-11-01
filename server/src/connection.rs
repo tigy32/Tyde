@@ -131,6 +131,27 @@ pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<
             nova: Arc::new(crate::voice_aws::AwsNovaProvider),
             dictation: Arc::new(crate::voice_aws::AwsTranscribeProvider),
         },
+        #[cfg(feature = "test-support")]
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn run_connection_observing_replay(
+    connection: Connection,
+    host: HostHandle,
+    observer: oneshot::Sender<crate::stream::ReplayAdmissionProbe>,
+) -> Result<(), FrameError> {
+    run_connection_with_origin(
+        connection,
+        host,
+        ConnectionOrigin::Desktop,
+        crate::voice::VoiceProviders {
+            nova: Arc::new(crate::voice_aws::AwsNovaProvider),
+            dictation: Arc::new(crate::voice_aws::AwsTranscribeProvider),
+        },
+        Some(observer),
     )
     .await
 }
@@ -148,6 +169,8 @@ pub async fn run_mobile_connection(
             nova: Arc::new(crate::voice_aws::AwsNovaProvider),
             dictation: Arc::new(crate::voice_aws::AwsTranscribeProvider),
         },
+        #[cfg(feature = "test-support")]
+        None,
     )
     .await
 }
@@ -165,6 +188,7 @@ pub async fn run_connection_with_synthetic_voice(
             nova: Arc::new(crate::voice::SyntheticNovaProvider),
             dictation: Arc::new(crate::voice::SyntheticDictationProvider),
         },
+        None,
     )
     .await
 }
@@ -174,6 +198,9 @@ async fn run_connection_with_origin(
     host: HostHandle,
     origin: ConnectionOrigin,
     voice_providers: crate::voice::VoiceProviders,
+    #[cfg(feature = "test-support")] observer: Option<
+        oneshot::Sender<crate::stream::ReplayAdmissionProbe>,
+    >,
 ) -> Result<(), FrameError> {
     let mobile_connection = origin.is_mobile();
     let started = std::time::Instant::now();
@@ -192,6 +219,10 @@ async fn run_connection_with_origin(
     } = connection;
 
     let output_queue = OutputQueue::default();
+    #[cfg(feature = "test-support")]
+    if let Some(observer) = observer {
+        let _ = observer.send(output_queue.replay_probe());
+    }
     let (inbound_tx, inbound_rx) = mpsc::channel::<ProtocolFrame>(256);
 
     let host_output_stream = Stream::new(host_stream.clone(), output_queue.clone());
@@ -367,6 +398,7 @@ async fn run_connection_with_origin(
     catalog_refresh_task.abort();
     let _ = catalog_refresh_task.await;
 
+    output_queue.close();
     bootstrap_attachments.abort_all();
     let mut result = result;
     while let Some(attachment) = bootstrap_attachments.join_next().await {
@@ -430,6 +462,7 @@ where
     let mut pending_record_stream: Option<protocol::StreamPath> = None;
     let mut pending_host_bootstrap = false;
     let mut pending_record_completions = Vec::<SchedulerToken>::new();
+    let mut pending_record_admission = None;
     let mut deferred_same_stream = std::collections::VecDeque::<QueuedOutput>::new();
     let mut deferred_same_stream_bytes = 0usize;
     let mut interleaved_audio_streak = 0u8;
@@ -507,6 +540,7 @@ where
                             if final_record {
                                 output.complete_tokens(&pending_record_completions);
                                 pending_record_completions.clear();
+                                drop(pending_record_admission.take());
                                 pending_record_stream = None;
                                 writer.flush().await?;
                                 if pending_host_bootstrap {
@@ -555,6 +589,7 @@ where
                     pending_record_stream = Some(queued.frame.envelope.stream.clone());
                     pending_host_bootstrap = queued.frame.envelope.kind == FrameKind::HostBootstrap;
                     pending_record_completions.clone_from(&queued.completions);
+                    pending_record_admission = queued.admission.take();
                     pending_records.extend(records);
                     tokio::task::yield_now().await;
                 }
@@ -732,6 +767,15 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
     let mut project_queues =
         HashMap::<(protocol::StreamPath, ProjectRequestLane), mpsc::Sender<Envelope>>::new();
     let mut project_tasks = tokio::task::JoinSet::<()>::new();
+    let (agent_load_tx, agent_load_rx) = mpsc::channel(32);
+    project_tasks.spawn(route_queued_requests(
+        host.clone(),
+        host_stream.clone(),
+        host_output_stream.clone(),
+        origin.clone(),
+        cancel.clone(),
+        agent_load_rx,
+    ));
     let mut voice_ingress = VoiceIngressState::default();
     loop {
         tokio::select! {
@@ -842,6 +886,15 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     continue;
                 }
 
+                if request_kind == FrameKind::LoadAgent {
+                    if agent_load_tx.try_send(envelope).is_err() {
+                        let error = AppError::invalid("load_agent", "agent load queue is full or closed");
+                        emit_command_error(&host_output_stream, request_stream, request_kind, request_id, request_context, &error);
+                    }
+                    first_request.notify_one();
+                    continue;
+                }
+
                 if envelope.stream.0.starts_with("/project/") {
                     // Closing a view cancels native watch installation; a read awaiting
                     // that installation must not sit ahead of its cancellation.
@@ -853,7 +906,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         let output = host_output_stream.clone();
                         let origin = origin.clone();
                         let cancel = cancel.clone();
-                        project_tasks.spawn(route_project_requests(host, host_stream, output, origin, cancel, rx));
+                        project_tasks.spawn(route_queued_requests(host, host_stream, output, origin, cancel, rx));
                         tx
                     });
                     let (failed, message) = match lane {
@@ -909,7 +962,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
     }
 }
 
-async fn route_project_requests(
+async fn route_queued_requests(
     host: HostHandle,
     host_stream: protocol::StreamPath,
     output: Stream,

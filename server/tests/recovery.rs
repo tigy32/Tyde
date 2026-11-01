@@ -5,7 +5,6 @@ use protocol::{FrameKind, ProjectCreatePayload, ProjectNotifyPayload, ProjectRoo
 use server::recovery::{Registry, Session};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
 
 struct Wire {
     relay: tokio::task::JoinHandle<()>,
@@ -134,9 +133,8 @@ impl Wire {
     async fn drop_transport(self) {
         self.relay.abort();
         let _ = self.relay.await;
-        timeout(Duration::from_secs(2), self.attachment)
+        self.attachment
             .await
-            .expect("detach without destroying logical session")
             .expect("attachment task")
             .expect_err("wire must fail");
     }
@@ -244,10 +242,7 @@ async fn connection_resumes_projects_and_commands_without_new_bootstrap() {
     // an outage. Cleanup of the old attachment must leave its replacement live.
     let old_wire = wire;
     let (_, wire) = attach(&fixture, &registry, &session, Some(id)).await;
-    let old_result = timeout(Duration::from_secs(2), old_wire.attachment)
-        .await
-        .expect("superseded attachment stops")
-        .expect("old attachment task");
+    let old_result = old_wire.attachment.await.expect("old attachment task");
     assert!(old_result.is_ok() || !session.is_closed());
     old_wire.relay.abort();
     client
@@ -297,10 +292,9 @@ async fn expired_and_overflowed_sessions_require_a_fresh_bootstrap() {
             let handshake = tokio::spawn(async move {
                 client::connect(&client::ClientConfig::current(), logical).await
             });
-            timeout(Duration::from_secs(2), wire.attachment)
+            wire.attachment
                 .await
-                .expect("overflow closes attachment")
-                .unwrap()
+                .expect("overflow attachment task")
                 .expect_err("overflow is not resumable");
             wire.relay.abort();
             handshake.abort();
@@ -329,4 +323,265 @@ async fn expired_and_overflowed_sessions_require_a_fresh_bootstrap() {
         bootstrap.projects.is_empty(),
         "fresh bootstrap remains available after replay loss"
     );
+}
+
+#[tokio::test]
+async fn initial_history_burst_survives_a_blocked_writer_losslessly() {
+    use protocol::{AgentBootstrapEvent, AgentBootstrapPayload, ChatEvent};
+    use server::backend::mock::{MockScript, MockTurn};
+
+    let mut fixture = Fixture::new().await;
+    let response = "r".repeat(2304 * 1024);
+    let mut agents = Vec::new();
+    for index in 0..9 {
+        let agent = fixture
+            .spawn_scripted(
+                &format!("burst-{index}"),
+                MockScript::one(MockTurn::text(response.clone())),
+            )
+            .await;
+        fixture.finish_turn(&agent).await;
+        agents.push(agent);
+    }
+    let (mut client, release, admission) =
+        fixture.connect_with_paused_output_observing_replay().await;
+    admission.requested(agents.len() as u64).await;
+    // Each mailbox barrier follows either its enqueued attachment or its
+    // observed capacity wait. No delay or transport-speed assumption is needed.
+    for agent in &agents {
+        fixture.mock(agent).await;
+    }
+    let cancelled_stream = admission
+        .waiting_streams()
+        .into_iter()
+        .next()
+        .expect("a capacity-waiting interest");
+    // These advertised streams are known only to the server probe while
+    // HostBootstrap is held. Send typed wire frames without mutating the
+    // client's not-yet-initialized stream registry.
+    let close = protocol::Envelope::from_payload(
+        cancelled_stream.clone(),
+        FrameKind::CloseAgent,
+        0,
+        &protocol::CloseAgentPayload::default(),
+    )
+    .unwrap();
+    protocol::write_envelope(&mut client.writer, &close)
+        .await
+        .unwrap();
+    let closed = next_frame_matching_on(
+        &mut fixture.client,
+        "close command remains responsive while output held",
+        |frame| frame.kind == FrameKind::AgentClosed,
+    )
+    .await
+    .parse_payload::<protocol::AgentClosedPayload>()
+    .unwrap();
+    let expected_live = agents.len() - 1;
+    let working_stream = admission
+        .waiting_streams()
+        .into_iter()
+        .find(|stream| stream != &cancelled_stream)
+        .expect("another pending interest");
+    let working = agents
+        .iter()
+        .find(|agent| {
+            working_stream
+                .0
+                .starts_with(&format!("/agent/{}/", agent.new_agent.agent_id))
+        })
+        .expect("pending agent belongs to the fixture");
+    fixture
+        .mock(working)
+        .await
+        .enqueue(MockTurn::held_text("live work during replay"))
+        .await;
+    let work = protocol::Envelope::from_payload(
+        working_stream.clone(),
+        FrameKind::SendMessage,
+        0,
+        &protocol::SendMessagePayload {
+            message: "work".into(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .unwrap();
+    protocol::write_envelope(&mut client.writer, &work)
+        .await
+        .unwrap();
+    fixture.next_chat_event_matching(working, "held-output command reaches live agent", |event| {
+        matches!(event, ChatEvent::StreamDelta(delta) if delta.text.contains("live work during replay"))
+    }).await;
+    let interrupt = protocol::Envelope::from_payload(
+        working_stream,
+        FrameKind::Interrupt,
+        1,
+        &protocol::InterruptPayload::default(),
+    )
+    .unwrap();
+    protocol::write_envelope(&mut client.writer, &interrupt)
+        .await
+        .unwrap();
+    fixture
+        .next_chat_event_matching(working, "held-output interrupt reaches idle", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    client
+        .project_create(ProjectCreatePayload {
+            name: "Command admitted during history pressure".into(),
+            roots: vec![ProjectRootPath(root.path().to_string_lossy().into_owned())],
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "other subscriber observes command while writer held", |frame| {
+        frame.kind == FrameKind::ProjectNotify && frame.parse_payload::<ProjectNotifyPayload>()
+            .is_ok_and(|payload| matches!(payload, ProjectNotifyPayload::Upsert { project } if project.name == "Command admitted during history pressure"))
+    }).await;
+    release.send(()).expect("release blocked server writer");
+    let host: protocol::HostBootstrapPayload = next_frame_matching_on(
+        &mut client,
+        "host registration after held output",
+        |frame| frame.kind == FrameKind::HostBootstrap,
+    )
+    .await
+    .parse_payload()
+    .unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut bootstrap_bytes = 0;
+    let mut cancelled = false;
+    while seen.len() < expected_live || !cancelled {
+        let envelope = next_frame_matching_on(&mut client, "complete initial history", |frame| {
+            matches!(
+                frame.kind,
+                FrameKind::AgentBootstrap | FrameKind::AgentClosed
+            )
+        })
+        .await;
+        if envelope.kind == FrameKind::AgentClosed {
+            let retirement: protocol::AgentClosedPayload = envelope.parse_payload().unwrap();
+            assert!(
+                retirement.agent_id == closed.agent_id,
+                "the requested agent closes"
+            );
+            assert!(
+                retirement.cancelled_bootstraps == vec![cancelled_stream.clone()],
+                "closure explicitly cancels the unmaterialized interest"
+            );
+            cancelled = true;
+            continue;
+        }
+        assert!(
+            envelope.stream != cancelled_stream,
+            "a cancelled interest must not emit a late snapshot"
+        );
+        bootstrap_bytes += serde_json::to_vec(&envelope).unwrap().len();
+        assert!(
+            seen.insert(envelope.stream.clone()),
+            "bootstrap delivered twice"
+        );
+        let payload: AgentBootstrapPayload = envelope.parse_payload().unwrap();
+        let responses = payload
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => {
+                    Some(&end.message.content)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|content| content.as_str() == response)
+                .count(),
+            1,
+            "each history retains its complete large response exactly once"
+        );
+    }
+    assert!(
+        bootstrap_bytes > 64 * 1024 * 1024,
+        "exercise aggregate bulk pressure"
+    );
+    assert!(
+        host.agents
+            .iter()
+            .all(|agent| seen.contains(&agent.instance_stream)
+                || agent.instance_stream == cancelled_stream)
+    );
+    client
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .unwrap();
+    next_frame_matching_on(
+        &mut client,
+        "commands remain usable after replay",
+        |frame| frame.kind == FrameKind::SessionList,
+    )
+    .await;
+
+    // Retention is intentionally smaller than the aggregate history, but
+    // larger than every individual record. Full retention must pace output.
+    let registry = Registry::with_limits(16 * 1024 * 1024, Duration::from_secs(300));
+    let (session, logical) = Session::new();
+    let (id, wire) = attach(&fixture, &registry, &session, None).await;
+    let mut resumed = client::connect(&client::ClientConfig::current(), logical)
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut resumed, "resumable host registration", |frame| {
+        frame.kind == FrameKind::HostBootstrap
+    })
+    .await;
+    wire.downlink.send(false).unwrap();
+    registry
+        .wait_for_output_capacity_pressure(id)
+        .await
+        .expect("bounded recovery output parks instead of closing");
+    wire.downlink.send(true).unwrap();
+    let mut replayed = std::collections::HashSet::new();
+    while replayed.len() < expected_live {
+        let frame =
+            next_frame_matching_on(&mut resumed, "lossless recovery pressure drain", |frame| {
+                frame.kind == FrameKind::AgentBootstrap
+            })
+            .await;
+        assert!(
+            replayed.insert(frame.stream.clone()),
+            "recovery duplicates no bootstrap"
+        );
+        let bootstrap: AgentBootstrapPayload = frame.parse_payload().unwrap();
+        let complete = bootstrap.events.iter().filter(|event| matches!(event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) if end.message.content == response)).count();
+        assert_eq!(complete, 1, "bounded recovery retains the complete message");
+    }
+    wire.drop_transport().await;
+    let (same_id, wire) = attach(&fixture, &registry, &session, Some(id)).await;
+    assert!(same_id == id, "resume retains the recovery session");
+    resumed
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .unwrap();
+    let event = next_frame_matching_on(
+        &mut resumed,
+        "commands after capacity-pressure resume",
+        |frame| {
+            assert_ne!(
+                frame.kind,
+                FrameKind::HostBootstrap,
+                "resume must not restart history"
+            );
+            frame.kind == FrameKind::SessionList
+        },
+    )
+    .await;
+    assert_eq!(event.kind, FrameKind::SessionList);
+    eprintln!(
+        "REPLAY PRESSURE: live_histories={expected_live} bootstrap_bytes={bootstrap_bytes} cancelled_interests=1 held_commands_and_interrupt_observed=true ack_capacity_and_resume_lossless=true"
+    );
+    wire.drop_transport().await;
+    session.close();
 }

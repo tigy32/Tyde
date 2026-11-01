@@ -4416,6 +4416,7 @@ mod wasm_tests {
                 FrameKind::AgentClosed,
                 2,
                 &protocol::AgentClosedPayload {
+                    cancelled_bootstraps: Vec::new(),
                     agent_id: old_agent_id,
                 },
             ),
@@ -5766,6 +5767,7 @@ mod wasm_tests {
                 FrameKind::AgentClosed,
                 1,
                 &protocol::AgentClosedPayload {
+                    cancelled_bootstraps: Vec::new(),
                     agent_id: AgentId("a-1".to_owned()),
                 },
             ),

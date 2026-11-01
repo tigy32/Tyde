@@ -100,6 +100,11 @@ filter = 'binary_id(server::projects) & test(project_watcher_follows_worktree_gi
 success-output = "final"
 retries = 0
 
+# Retain the bounded replay and actor-admission protocol evidence.
+[[profile.default.overrides]]
+filter = 'binary_id(server::agents) & (test(held_fork_does_not_block_later_connection_request) | test(subagent_turn_token_usage_is_strictly_self)) | binary_id(server::recovery) & test(initial_history_burst_survives_a_blocked_writer_losslessly) | binary_id(server::review) & (test(review_modes_share_persisted_aspects_and_exact_source_assignments) | test(advisory_review_reattaches_and_exposes_failures_and_configuration_changes))'
+success-output = "final"
+
 [profile.default]
 # Five minutes is a suite optimization target, not a deadline. Only an
 # individual test running for ten minutes is terminated as hung.

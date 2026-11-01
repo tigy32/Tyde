@@ -591,6 +591,19 @@ impl Fixture {
     pub async fn connect_with_paused_output(
         &self,
     ) -> (client::Connection, tokio::sync::oneshot::Sender<()>) {
+        let (client, release, _) = self.connect_with_paused_output_observing_replay().await;
+        (client, release)
+    }
+
+    #[allow(dead_code)]
+    pub async fn connect_with_paused_output_observing_replay(
+        &self,
+    ) -> (
+        client::Connection,
+        tokio::sync::oneshot::Sender<()>,
+        server::ReplayAdmissionProbe,
+    ) {
+        let (observation, observed) = tokio::sync::oneshot::channel();
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let (release, released) = tokio::sync::oneshot::channel();
         let (entered, blocked) = tokio::sync::oneshot::channel();
@@ -605,7 +618,10 @@ impl Fixture {
                 entered: Some(entered),
                 released: false,
             });
-            if server::run_connection(connection, host).await.is_err() {
+            if server::run_connection_observing_replay(connection, host, observation)
+                .await
+                .is_err()
+            {
                 eprintln!("Paused connection ended with a protocol error");
             }
         });
@@ -613,7 +629,11 @@ impl Fixture {
             .await
             .expect("paused client handshake");
         blocked.await.expect("paused writer must remain alive");
-        (client, release)
+        (
+            client,
+            release,
+            observed.await.expect("observe production replay"),
+        )
     }
 
     #[allow(dead_code)]

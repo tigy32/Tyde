@@ -2,12 +2,14 @@
 //! byte stream; acknowledgements mean delivery into that stream, not execution.
 use std::collections::{HashMap, VecDeque};
 use std::io;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -44,9 +46,40 @@ impl Replay {
     }
 }
 
+struct AttachmentLease {
+    session: Arc<Session>,
+    generation: u64,
+    token: CancellationToken,
+}
+
+impl Drop for AttachmentLease {
+    fn drop(&mut self) {
+        self.token.cancel();
+        let mut detached = self.session.detached.lock().expect("detach time poisoned");
+        if self.session.generation.load(Ordering::Acquire) == self.generation {
+            *detached = Some(Instant::now());
+        }
+    }
+}
+
+enum Delivery {
+    Fence {
+        received: u64,
+        token: CancellationToken,
+        reply: oneshot::Sender<io::Result<AttachmentLease>>,
+    },
+    Record {
+        generation: u64,
+        kind: u8,
+        seq: u64,
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+}
+
 pub struct Session {
     replay: Mutex<Replay>,
-    delivery: AsyncMutex<Option<tokio::io::WriteHalf<DuplexStream>>>,
+    delivery: mpsc::Sender<Delivery>,
     received: AtomicU64,
     generation: AtomicU64,
     attachment: Mutex<Option<CancellationToken>>,
@@ -54,6 +87,8 @@ pub struct Session {
     changed: Notify,
     closed: CancellationToken,
     limit: usize,
+    #[cfg(feature = "test-support")]
+    capacity_waiting: AtomicBool,
 }
 
 impl Session {
@@ -64,6 +99,7 @@ impl Session {
     pub fn with_limits(limit: usize, window: Duration) -> (Arc<Self>, DuplexStream) {
         let (logical, transport) = tokio::io::duplex(256 * 1024);
         let (reader, writer) = tokio::io::split(transport);
+        let (delivery, deliveries) = mpsc::channel(1);
         let session = Arc::new(Self {
             replay: Mutex::new(Replay {
                 frames: VecDeque::new(),
@@ -71,7 +107,7 @@ impl Session {
                 next: 0,
                 bytes: 0,
             }),
-            delivery: AsyncMutex::new(Some(writer)),
+            delivery,
             received: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             attachment: Mutex::new(None),
@@ -79,7 +115,10 @@ impl Session {
             changed: Notify::new(),
             closed: CancellationToken::new(),
             limit,
+            #[cfg(feature = "test-support")]
+            capacity_waiting: AtomicBool::new(false),
         });
+        tokio::spawn(session.clone().deliver(writer, deliveries));
         let producer = session.clone();
         tokio::spawn(async move {
             let mut reader = protocol::FrameReader::new(BufReader::new(reader));
@@ -94,15 +133,42 @@ impl Session {
                     protocol::write_frame(&mut bytes, &frame)
                         .await
                         .map_err(io::Error::other)?;
-                    let mut replay = producer.replay.lock().expect("replay poisoned");
-                    if bytes.len() > producer.limit.saturating_sub(replay.bytes) {
-                        return Err(invalid("resume unavailable: replay buffer exhausted"));
+                    if bytes.len() > producer.limit {
+                        return Err(invalid(
+                            "resume unavailable: record exceeds replay capacity",
+                        ));
                     }
-                    replay.bytes += bytes.len();
-                    replay.next += 1;
-                    replay.frames.push_back(Arc::new(bytes));
-                    drop(replay);
-                    producer.changed.notify_waiters();
+                    let bytes = Arc::new(bytes);
+                    loop {
+                        let changed = producer.changed.notified();
+                        let admitted = {
+                            let mut replay = producer.replay.lock().expect("replay poisoned");
+                            if bytes.len() <= producer.limit.saturating_sub(replay.bytes) {
+                                replay.bytes += bytes.len();
+                                replay.next += 1;
+                                replay.frames.push_back(bytes.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if admitted {
+                            #[cfg(feature = "test-support")]
+                            producer.capacity_waiting.store(false, Ordering::Release);
+                            producer.changed.notify_waiters();
+                            break;
+                        }
+                        #[cfg(feature = "test-support")]
+                        {
+                            if !producer.capacity_waiting.swap(true, Ordering::AcqRel) {
+                                producer.changed.notify_waiters();
+                            }
+                        }
+                        tokio::select! {
+                            _ = producer.closed.cancelled() => return Ok(()),
+                            _ = changed => {},
+                        }
+                    }
                 }
             }
             .await;
@@ -127,7 +193,6 @@ impl Session {
                     }
                 }
             }
-            cleanup.delivery.lock().await.take();
             let mut replay = cleanup.replay.lock().expect("replay poisoned");
             replay.frames.clear();
             replay.bytes = 0;
@@ -175,31 +240,20 @@ impl Session {
         W: AsyncWrite + Unpin + Send,
     {
         let token = CancellationToken::new();
-        let generation;
-        {
-            // Fence delivery from a previous attachment before publishing the
-            // new generation. A completed logical envelope is never cancelled.
-            let delivery = self.delivery.lock().await;
-            if self.is_closed() {
-                return Err(invalid("resume unavailable: session closed"));
-            }
-            self.replay
-                .lock()
-                .expect("replay poisoned")
-                .acknowledge(received)?;
-            let mut detached = self.detached.lock().expect("detach time poisoned");
-            generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            if let Some(old) = self
-                .attachment
-                .lock()
-                .expect("attachment poisoned")
-                .replace(token.clone())
-            {
-                old.cancel();
-            }
-            *detached = None;
-            drop(delivery);
-        }
+        let (reply, fenced) = oneshot::channel();
+        self.delivery
+            .send(Delivery::Fence {
+                received,
+                token: token.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| invalid("recovery delivery actor stopped"))?;
+        let lease = fenced
+            .await
+            .map_err(|_| invalid("recovery delivery fence lost"))??;
+        let generation = lease.generation;
+        self.changed.notify_waiters();
         let reader = self.read_wire(reader, generation, &token);
         let writer = self.write_wire(writer, received, &token);
         tokio::pin!(reader, writer);
@@ -217,15 +271,12 @@ impl Session {
             },
         };
         token.cancel();
-        let mut detached = self.detached.lock().expect("detach time poisoned");
-        if self.generation.load(Ordering::Acquire) == generation {
-            if result
+        if self.generation.load(Ordering::Acquire) == generation
+            && result
                 .as_ref()
                 .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
-            {
-                self.close();
-            }
-            *detached = Some(Instant::now());
+        {
+            self.close();
         }
         result
     }
@@ -278,27 +329,106 @@ impl Session {
                 _ = token.cancelled() => return Ok(()),
                 record = record => record?,
             };
-            let mut delivery = self.delivery.lock().await;
-            if self.generation.load(Ordering::Acquire) != generation {
-                return Ok(());
+            let (reply, delivered) = oneshot::channel();
+            self.delivery
+                .send(Delivery::Record {
+                    generation,
+                    kind,
+                    seq,
+                    bytes,
+                    reply,
+                })
+                .await
+                .map_err(|_| invalid("recovery delivery actor stopped"))?;
+            delivered
+                .await
+                .map_err(|_| invalid("recovery delivery completion lost"))??;
+        }
+    }
+
+    async fn deliver(
+        self: Arc<Self>,
+        mut writer: tokio::io::WriteHalf<DuplexStream>,
+        mut requests: mpsc::Receiver<Delivery>,
+    ) {
+        loop {
+            let request = tokio::select! {
+                _ = self.closed.cancelled() => return,
+                request = requests.recv() => match request { Some(request) => request, None => return },
+            };
+            match request {
+                Delivery::Fence {
+                    received,
+                    token,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = (|| {
+                        if self.is_closed() {
+                            return Err(invalid("resume unavailable: session closed"));
+                        }
+                        self.replay
+                            .lock()
+                            .expect("replay poisoned")
+                            .acknowledge(received)?;
+                        let mut detached = self.detached.lock().expect("detach time poisoned");
+                        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                        if let Some(old) = self
+                            .attachment
+                            .lock()
+                            .expect("attachment poisoned")
+                            .replace(token.clone())
+                        {
+                            old.cancel();
+                        }
+                        *detached = None;
+                        self.changed.notify_waiters();
+                        Ok(AttachmentLease {
+                            session: self.clone(),
+                            generation,
+                            token,
+                        })
+                    })();
+                    let _ = reply.send(result);
+                }
+                Delivery::Record {
+                    generation,
+                    kind,
+                    seq,
+                    bytes,
+                    reply,
+                } => {
+                    let result = async {
+                        if self.generation.load(Ordering::Acquire) != generation {
+                            return Ok(());
+                        }
+                        if kind == 0 {
+                            self.replay
+                                .lock()
+                                .expect("replay poisoned")
+                                .acknowledge(seq)?;
+                        } else {
+                            let received = self.received();
+                            if seq > received {
+                                return Err(invalid("gap in recovery replay"));
+                            }
+                            if seq == received {
+                                writer.write_all(&bytes).await?;
+                                self.received.store(received + 1, Ordering::Release);
+                            }
+                        }
+                        self.changed.notify_waiters();
+                        Ok(())
+                    };
+                    let result = tokio::select! {
+                        _ = self.closed.cancelled() => return,
+                        result = result => result,
+                    };
+                    let _ = reply.send(result);
+                }
             }
-            if kind == 0 {
-                self.replay
-                    .lock()
-                    .expect("replay poisoned")
-                    .acknowledge(seq)?;
-                continue;
-            }
-            let received = self.received();
-            if seq > received {
-                return Err(invalid("gap in recovery replay"));
-            }
-            if seq == received {
-                let writer = delivery.as_mut().ok_or_else(|| invalid("session closed"))?;
-                writer.write_all(&bytes).await?;
-                self.received.store(received + 1, Ordering::Release);
-            }
-            self.changed.notify_waiters();
         }
     }
 
@@ -364,6 +494,30 @@ impl Default for Registry {
 }
 
 impl Registry {
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_output_capacity_pressure(&self, id: Uuid) -> io::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| invalid("recovery session missing"))?;
+        loop {
+            let changed = session.changed.notified();
+            if session.is_closed() {
+                return Err(invalid("recovery session closed before capacity wait"));
+            }
+            if session.capacity_waiting.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = session.closed.cancelled() => return Err(invalid("recovery session closed before capacity wait")),
+            }
+        }
+    }
+
     pub fn with_limits(limit: usize, window: Duration) -> Self {
         Self {
             sessions: Arc::default(),

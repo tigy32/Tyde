@@ -4610,6 +4610,10 @@ pub struct AgentRenamedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentClosedPayload {
     pub agent_id: AgentId,
+    /// Pending snapshots cancelled by closure, rather than silently omitted.
+    /// Already queued snapshots complete before this event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_bootstraps: Vec<StreamPath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

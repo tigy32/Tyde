@@ -437,6 +437,14 @@ async fn spawn_review_author(
             FrameKind::AgentBootstrap if env.stream == new_agent.instance_stream => {
                 let bootstrap: protocol::AgentBootstrapPayload =
                     env.parse_payload().expect("agent bootstrap payload");
+                eprintln!(
+                    "Review author bootstrap: status={:?} events={}",
+                    bootstrap.status,
+                    bootstrap.events.len()
+                );
+                // Completed snapshots omit historical typing edges. Their
+                // typed status still proves the same current idle boundary.
+                saw_idle |= bootstrap.status == protocol::AgentControlStatus::Idle;
                 for event in bootstrap.events {
                     match event {
                         AgentBootstrapEvent::AgentStart(payload) => {
@@ -5763,7 +5771,9 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     for _ in 0..4 {
         gate.wait_until_entered().await;
     }
+    eprintln!("REVIEW_REATTACH first four turn gates entered");
     let running = wait_review_execution(&mut client, &review.id, 1).await;
+    eprintln!("REVIEW_REATTACH first execution registered");
     assert_eq!(running.ai_reviewer.rounds[0].reviewers.len(), 4);
     assert!(
         running.ai_reviewer.rounds[0]
@@ -5777,7 +5787,9 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     for _ in 0..4 {
         gate.release_one();
     }
+    eprintln!("REVIEW_REATTACH first four gates released; awaiting completion");
     let (failed, done) = reattached.await.unwrap();
+    eprintln!("REVIEW_REATTACH reattached completion observed");
     assert!(!failed);
     assert_eq!(done["status"], "completed");
     let (_, again) = review_mcp_call(
@@ -5831,6 +5843,24 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
         .map(|agent| agent.instance_stream.clone())
         .collect::<Vec<_>>();
     assert_eq!(reviewer_streams.len(), 4);
+    // GoalChanged is live-only. Establish every replay subscription before
+    // releasing a turn whose live output this observer must see.
+    let mut attached = std::collections::HashSet::new();
+    next_frame_matching_on(
+        &mut reviewer_observer,
+        "reviewer subscriptions ready",
+        |env| {
+            if reviewer_streams.contains(&env.stream) && env.kind == FrameKind::AgentBootstrap {
+                attached.insert(env.stream.clone());
+            }
+            attached.len() == reviewer_streams.len()
+        },
+    )
+    .await;
+    eprintln!(
+        "REVIEW_CANCEL reviewer subscriptions ready={}",
+        attached.len()
+    );
     let stopped = start_review_call(&caller, "stop", "review_team");
     for _ in 0..4 {
         gate.wait_until_entered().await;
@@ -5838,6 +5868,7 @@ async fn advisory_review_reattaches_and_exposes_failures_and_configuration_chang
     for _ in 0..4 {
         gate.release_one();
     }
+    eprintln!("REVIEW_CANCEL four reused turn gates entered and released");
     // GoalChanged follows every scripted output step, including any idle.
     // Observe it on the real protocol before inspecting canonical status.
     let mut drained = std::collections::HashSet::new();

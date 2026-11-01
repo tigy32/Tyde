@@ -3228,6 +3228,31 @@ async fn subagent_turn_token_usage_is_strictly_self() {
 
     registration.wait_until_entered().await;
     fixture::next_logical_frame_matching_on(&mut fixture.client, "native spawn request is durably observed", |env| env.stream == parent_new.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if matches!(request.tool_type, ToolRequestType::AgentSpawn { .. })))).await;
+    let pressure_peer = fixture.spawn("Native credit peer", "temporary peer").await;
+    fixture.finish_turn(&pressure_peer).await;
+    let (held_client, release_output, admission) =
+        fixture.connect_with_paused_output_observing_replay().await;
+    admission.requested(2).await;
+    fixture.mock_by_id(&parent_new.agent_id).await;
+    fixture.mock(&pressure_peer).await;
+    assert!(
+        admission.waiting_streams().is_empty(),
+        "both existing snapshots must occupy credit before native publication"
+    );
+    fixture
+        .client
+        .close_agent(&pressure_peer.stream)
+        .await
+        .unwrap();
+    expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "temporary credit peer closed",
+    )
+    .await;
+    eprintln!(
+        "NATIVE ADMISSION: held subscriber owns both replay credits before child registration"
+    );
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let commit = fixture.on_next_session_commit(move || {
@@ -3270,6 +3295,14 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
     );
+    admission.requested(3).await;
+    eprintln!(
+        "NATIVE ADMISSION: fast subscriber received every initial typing/stream edge while slow subscriber awaited credit"
+    );
+    release_output
+        .send(())
+        .expect("release native publication pressure");
+    drop(held_client);
     fixture::next_logical_frame_matching_on(&mut fixture.client, "native timing tool completion", |env| env.stream == child_new.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "native-timing-fixture"))).await;
     let task_usage = expect_task_token_usage_matching(
         &mut fixture.client,
@@ -9199,9 +9232,15 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             .iter()
             .find(|agent| &agent.agent_id == expected)
             .expect("subtree advertised before close");
+        // A capacity-waiting interest has not materialized history. Closure
+        // must explicitly retire it, rather than omit it or build discarded data.
+        let completed = bootstrapped.contains(&advertised.instance_stream);
+        let cancelled = closed
+            .cancelled_bootstraps
+            .contains(&advertised.instance_stream);
         assert!(
-            bootstrapped.contains(&advertised.instance_stream),
-            "Closure must follow the advertised agent bootstrap"
+            completed != cancelled,
+            "closure must follow either completed bootstrap or explicit cancellation, never both"
         );
     }
     assert!(
@@ -13835,54 +13874,78 @@ async fn held_fork_does_not_block_later_connection_request() {
     let mut fixture = Fixture::new().await;
     let (_source, session_id) =
         spawn_named_session(&mut fixture, "Fork HOL Source", BackendKind::Claude).await;
-    let startup_gate = fixture
-        .host_for_test()
-        .install_agent_startup_completion_test_gate("Held Fork");
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            launch_context: protocol::AgentLaunchContext::Standard,
-            name: Some("Held Fork".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::Fork {
-                from_session_id: session_id,
-                prompt: "fork while startup is held".to_owned(),
-                images: None,
-                access_mode: Default::default(),
-            },
+    let names = ["Held Fork", "Second Held Fork"];
+    let gates = names
+        .iter()
+        .map(|name| {
+            fixture
+                .host_for_test()
+                .install_agent_startup_completion_test_gate(name)
         })
-        .await
-        .expect("send held fork");
-    startup_gate.wait_until_entered().await;
-    let env = expect_kind(
-        &mut fixture.client,
-        FrameKind::NewAgent,
-        "held fork NewAgent",
-    )
-    .await;
-    let forked: NewAgentPayload = env.parse_payload().expect("parse held fork NewAgent");
+        .collect::<Vec<_>>();
+    let mut held_streams = Vec::new();
+    for (name, gate) in names.into_iter().zip(&gates) {
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some(name.to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Fork {
+                    from_session_id: session_id.clone(),
+                    prompt: "fork while startup is held".to_owned(),
+                    images: None,
+                    access_mode: Default::default(),
+                },
+            })
+            .await
+            .expect("send held fork");
+        gate.wait_until_entered().await;
+        let env = expect_kind(
+            &mut fixture.client,
+            FrameKind::NewAgent,
+            "held fork NewAgent",
+        )
+        .await;
+        let forked: NewAgentPayload = env.parse_payload().expect("parse held fork NewAgent");
+        held_streams.push(forked.instance_stream);
+    }
     fixture
         .client
         .list_sessions(ListSessionsPayload::default())
         .await
-        .expect("list sessions behind held fork");
+        .expect("list sessions behind held forks");
     loop {
         let env = fixture
             .client
             .next_event()
             .await
-            .expect("read request behind held fork")
+            .expect("read request behind held forks")
             .expect("connection remained open");
-        if env.stream == forked.instance_stream {
-            panic!("held fork emitted {} before Bootstrap release", env.kind);
-        }
+        assert!(
+            !held_streams.contains(&env.stream),
+            "a held fork must not emit before bootstrap release"
+        );
         if env.kind == FrameKind::SessionList {
             break;
         }
     }
-    startup_gate.release_one();
+    eprintln!("REPLAY READINESS: two startup actors held; requesting independent third bootstrap");
+    let fast = fixture
+        .spawn("Fast beside held startups", "fast independent turn")
+        .await;
+    fixture
+        .finish_turn(&fast)
+        .await
+        .assert_stream_end_contains("fast independent turn");
+    eprintln!(
+        "REPLAY READINESS: independent bootstrap and complete live turn observed before either startup release"
+    );
+    for gate in gates {
+        gate.release_one();
+    }
 }
 
 /// An authoritatively Unavailable session schema surfaces as exactly one

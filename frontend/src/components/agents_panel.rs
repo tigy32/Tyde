@@ -7821,6 +7821,7 @@ mod wasm_tests {
             2,
             FrameKind::AgentClosed,
             serde_json::to_value(protocol::AgentClosedPayload {
+                cancelled_bootstraps: Vec::new(),
                 agent_id: AgentId("bench-agent".to_owned()),
             })
             .unwrap(),
@@ -11501,6 +11502,7 @@ mod wasm_tests {
             FrameKind::AgentClosed,
             2,
             &protocol::AgentClosedPayload {
+                cancelled_bootstraps: Vec::new(),
                 agent_id: AgentId("a-old".to_owned()),
             },
         );

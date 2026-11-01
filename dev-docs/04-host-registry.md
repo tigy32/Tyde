@@ -341,6 +341,26 @@ the host stream for each active agent, then the connection replays
 that agent's event log on the agent's instance stream. The late-joiner
 sees the exact same events that the first client saw.
 
+Agent snapshots acquire one of two connection-owned replay credits before the
+actor constructs history. Credit survives until the final encoded record is
+written; slow output cannot overflow the ordinary Bulk lane with aggregate
+snapshots. Attachments enter the actor mailbox before startup completes, but acquire
+credit only at the actor's bootstrap-ready flush point. Two held startups
+cannot occupy the window ahead of a ready third agent. Capacity waits happen
+outside the agent/host actors,
+so close, interrupt and other commands remain serviceable. Closure explicitly
+names advertised snapshots cancelled before materialization; queued snapshots
+finish before closure. Native registration waits for the relay actor's
+admission decision before releasing its producer, not for a slow writer's
+credit or bootstrap completion. Recovery retention similarly waits for ACK
+capacity.
+
+This bounds concurrent snapshot materialization, not the entire catalog: the
+host descriptor catalog is still monolithic, and a single snapshot exceeding
+the logical frame limit fails explicitly. These remain separate scale gaps.
+A 100k-agent catalog must not imply loading every history; lazy connections
+continue to load only explicitly requested agents. No 100k-scale claim is made.
+
 ---
 
 ## Connection Changes

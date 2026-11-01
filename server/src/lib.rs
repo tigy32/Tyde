@@ -53,10 +53,10 @@ pub use agent::take_duplicate_tool_completion_count;
 pub use agent::usage_wakeup_spawn_config;
 pub use agent_control_mcp::AgentControlMcpCaller;
 #[cfg(feature = "test-support")]
-pub use connection::run_connection_with_synthetic_voice;
-#[cfg(feature = "test-support")]
 pub use connection::{ProductionWriterProbe, start_production_writer_probe};
 pub use connection::{run_connection, run_mobile_connection};
+#[cfg(feature = "test-support")]
+pub use connection::{run_connection_observing_replay, run_connection_with_synthetic_voice};
 pub use host::{
     HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,
     spawn_host_with_mock_backend_and_runtime_config, spawn_host_with_session_store,
@@ -73,6 +73,8 @@ pub use process_env::init_process_env;
 pub use project_stream::scan_test_support::{InstalledScanHook, ScanPoint};
 #[cfg(feature = "test-support")]
 pub use self_improvement::{learning_analysis_prompt, parse_learning_analysis};
+#[cfg(feature = "test-support")]
+pub use stream::ReplayAdmissionProbe;
 
 #[cfg(feature = "test-support")]
 pub fn feedback_analysis_spawn_config_for_test(

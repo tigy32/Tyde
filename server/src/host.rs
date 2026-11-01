@@ -374,7 +374,7 @@ fn spawn_backend_setup_refresh_actor(
 pub(crate) struct DeferredAgentAttachment {
     host_stream: StreamPath,
     agent_stream: StreamPath,
-    reply: Option<oneshot::Receiver<bool>>,
+    reply: Option<crate::agent::AgentAttachment>,
     agent_handle: Option<AgentHandle>,
     stream: Option<Stream>,
 }
@@ -3852,8 +3852,9 @@ impl HostHandle {
                 .known_agent_streams
                 .insert(instance_stream.clone());
             let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
-            let agent_stream = subscriber.stream.with_path(instance_stream.clone());
+            let mut agent_stream = subscriber.stream.with_path(instance_stream.clone());
             if attach_eagerly {
+                agent_stream.register_bootstrap();
                 subscriber
                     .attached_agent_streams
                     .insert(instance_stream.clone());
@@ -4247,17 +4248,13 @@ impl HostHandle {
             agent_stream = %agent_stream,
             "attaching deferred agent stream"
         );
-        let reply = match reply {
-            Some(reply) => Some(reply),
+        let attached = match reply {
+            Some(reply) => reply.completed.await.unwrap_or(false),
             None => match (agent_handle, stream) {
-                (Some(agent_handle), Some(stream)) => agent_handle.begin_attach(stream),
-                (None, None) => None,
+                (Some(agent_handle), Some(stream)) => agent_handle.attach(stream).await,
+                (None, None) => false,
                 _ => unreachable!("deferred agent attachment source must be complete"),
             },
-        };
-        let attached = match reply {
-            Some(reply) => reply.await.unwrap_or(false),
-            None => false,
         };
         tracing::debug!(
             host_stream = %host_stream,
@@ -7639,14 +7636,10 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             self.schedule_generated_agent_name(agent_handle.clone(), request);
         }
         for attachment in deferred_attachments {
-            if restoration.is_some() || review_startup_deferred {
-                let host = self.clone();
-                tokio::spawn(async move {
-                    host.attach_deferred_agent_stream(attachment).await;
-                });
-            } else {
-                self.attach_deferred_agent_stream(attachment).await;
-            }
+            let host = self.clone();
+            tokio::spawn(async move {
+                host.attach_deferred_agent_stream(attachment).await;
+            });
         }
         if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
             terminal_claim
@@ -7930,7 +7923,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 "Swarm session is owned by swarm lifecycle",
             ));
         }
-        let restoring = request.restoration.is_some();
         let request = self.apply_complexity_tier_settings(request).await;
         let request = self.resolve_backend_launch(request).await;
         tracing::info!(
@@ -8207,14 +8199,10 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         }
         dead_paths.extend(fanout_guard.release().await);
         for attachment in deferred_attachments {
-            if restoring {
-                let host = self.clone();
-                tokio::spawn(async move {
-                    host.attach_deferred_agent_stream(attachment).await;
-                });
-            } else {
-                self.attach_deferred_agent_stream(attachment).await;
-            }
+            let host = self.clone();
+            tokio::spawn(async move {
+                host.attach_deferred_agent_stream(attachment).await;
+            });
         }
         if !dead_paths.is_empty() {
             {
@@ -13632,6 +13620,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                                     .visible_host_streams(&closed_agent_id)
                             });
                             let payload = serde_json::to_value(AgentClosedPayload {
+                                cancelled_bootstraps: Vec::new(),
                                 agent_id: closed_agent_id.clone(),
                             })
                             .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
@@ -16593,8 +16582,18 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
             })
             .await;
         visibility_guard.disarm();
-        for attachment in deferred_attachments {
-            self.attach_deferred_agent_stream(attachment).await;
+        for mut attachment in deferred_attachments {
+            // The native producer starts emitting when registration returns.
+            // Wait for the relay's admission decision, never for writer credit.
+            if let Some(receipt) = attachment.reply.as_mut()
+                && (&mut receipt.admitted).await.is_err()
+            {
+                tracing::debug!("native relay stopped before attachment admission");
+            }
+            let host = self.clone();
+            tokio::spawn(async move {
+                host.attach_deferred_agent_stream(attachment).await;
+            });
         }
         if !dead_paths.is_empty() {
             {
@@ -23601,7 +23600,8 @@ fn emit_new_agent_for_stream(
     stream.send_value(FrameKind::NewAgent, payload)?;
 
     let attachment = attach_eagerly.then(|| {
-        let agent_stream = stream.with_path(instance_stream.clone());
+        let mut agent_stream = stream.with_path(instance_stream.clone());
+        agent_stream.register_bootstrap();
         DeferredAgentAttachment {
             host_stream: stream.path().clone(),
             agent_stream: instance_stream,

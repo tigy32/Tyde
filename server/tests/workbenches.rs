@@ -2282,7 +2282,22 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         before.tyde_permissions,
         protocol::AgentTydePermissions::Agent
     );
-    let mut observer = fixture.connect().await;
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    let observer_child = &bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == child.agent_id)
+        .expect("observer knows the controlled child")
+        .instance_stream;
+    // A live-move assertion needs an attached subscriber, not just a completed
+    // handshake: replay admission may still be waiting on another snapshot.
+    fixture::next_frame_matching_on(
+        &mut observer,
+        "observer child attached before live move",
+        |env| env.kind == FrameKind::AgentBootstrap && &env.stream == observer_child,
+    )
+    .await;
+    eprintln!("CROSS-PROJECT CHILD MOVE: observer child bootstrap completed before movement");
     for destination in [Some(&other), Some(&other_workbench), None] {
         let project_id = destination.map(|project| project.id.clone());
         let roots = destination.map_or_else(|| project_roots(&other_workbench), project_roots);
