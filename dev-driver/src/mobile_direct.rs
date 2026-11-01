@@ -74,6 +74,7 @@ enum Phase {
     Configured,
     OriginSet,
     Offered,
+    Reoffered,
     Revoked,
     Disabled,
 }
@@ -88,6 +89,8 @@ struct Receipt {
     settings: HostSettingsPayload,
     mobile_access: MobileAccessStatePayload,
     offer: Option<MobilePairingOfferPayload>,
+    #[serde(default)]
+    superseded_receipt_sha256: Option<String>,
 }
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -626,6 +629,29 @@ impl Adapter {
         }
     }
 
+    pub async fn offer_after_expired_unused(
+        &mut self,
+        previous: &MobilePairingOfferPayload,
+    ) -> Result<MobilePairingOfferPayload> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock before epoch")?
+            .as_millis();
+        require(
+            u128::from(previous.expires_at_ms) <= now
+                && self.mobile_access.paired_devices.is_empty()
+                && match &self.mobile_access.pairing {
+                    MobilePairingState::Expired { offer_id } => *offer_id == previous.offer_id,
+                    // The server clears its terminal state after the grace period.
+                    // The packet owner separately proves the old offer was never staged.
+                    MobilePairingState::Idle => true,
+                    _ => false,
+                },
+            "renewal requires expired prior offer, no devices and authoritative retirement",
+        )?;
+        self.offer().await
+    }
+
     pub async fn revoke(&mut self, offer: &MobilePairingOfferPayload) -> Result<()> {
         loop {
             match &self.mobile_access.pairing {
@@ -698,13 +724,16 @@ pub async fn run(args: &[String]) -> Result<()> {
     let endpoint = ready_endpoint(&ready_bytes, &config.expected)?;
     let mut adapter = Adapter::connect(endpoint, &config.expected).await?;
     let mut output = reserve(Path::new(output_path))?;
+    let mut previous_sha256 = None;
     let previous = match &request.operation {
         Operation::Configure => None,
         Operation::SetOrigin { previous, .. }
         | Operation::Offer { previous, .. }
         | Operation::Revoke { previous }
         | Operation::Disable { previous } => {
-            let receipt: Receipt = decode(&read_private(previous)?)?;
+            let bytes = read_private(previous)?;
+            previous_sha256 = Some(digest(&bytes));
+            let receipt: Receipt = decode(&bytes)?;
             require(
                 receipt.run_sha256 == digest(&run_bytes)
                     && receipt.ready_sha256 == digest(&ready_bytes)
@@ -724,6 +753,9 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
     };
     let mut offer = previous.as_ref().and_then(|p| p.offer.clone());
+    let mut superseded_receipt_sha256 = previous
+        .as_ref()
+        .and_then(|p| p.superseded_receipt_sha256.clone());
     let phase = match request.operation {
         Operation::Configure => {
             adapter.configure(&config.bundle_dir, count).await?;
@@ -741,25 +773,46 @@ pub async fn run(args: &[String]) -> Result<()> {
             Phase::OriginSet
         }
         Operation::Offer { offer_path, .. } => {
+            let prior = previous.as_ref().ok_or("offer requires previous receipt")?;
             require(
-                previous
-                    .as_ref()
-                    .is_some_and(|p| p.phase == Phase::OriginSet),
-                "offer requires origin receipt",
+                matches!(prior.phase, Phase::OriginSet | Phase::Offered)
+                    && prior.superseded_receipt_sha256.is_none(),
+                "offer requires origin receipt or one original offered receipt",
             )?;
             require(
-                adapter.hosting_matches(Some(count))?,
-                "directory host is not Online",
+                adapter.hosting_matches(Some(count))?
+                    && prior.mobile_access.direct_hosting == adapter.mobile_access.direct_hosting,
+                "directory host is not the same Online listener",
             )?;
             let mut file = reserve(&offer_path)?;
-            let payload = adapter.offer().await?;
+            let (payload, phase) = if prior.phase == Phase::Offered {
+                let old = prior.offer.as_ref().ok_or("receipt has no prior offer")?;
+                require(
+                    matches!(&prior.mobile_access.pairing,
+                        MobilePairingState::Active { offer_id, expires_at_ms }
+                        if *offer_id == old.offer_id && *expires_at_ms == old.expires_at_ms)
+                        && prior.mobile_access.paired_devices.is_empty(),
+                    "previous receipt did not attest this unused active offer",
+                )?;
+                let payload = adapter.offer_after_expired_unused(old).await?;
+                require(
+                    payload.offer_id != old.offer_id,
+                    "renewal reused prior offer",
+                )?;
+                superseded_receipt_sha256 = previous_sha256.clone();
+                (payload, Phase::Reoffered)
+            } else {
+                (adapter.offer().await?, Phase::Offered)
+            };
             save(&mut file, &payload)?;
             offer = Some(payload);
-            Phase::Offered
+            phase
         }
         Operation::Revoke { .. } => {
             require(
-                previous.as_ref().is_some_and(|p| p.phase == Phase::Offered),
+                previous
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.phase, Phase::Offered | Phase::Reoffered)),
                 "revoke requires offered receipt",
             )?;
             adapter
@@ -795,6 +848,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             settings: adapter.settings,
             mobile_access: adapter.mobile_access,
             offer,
+            superseded_receipt_sha256,
         },
     )?;
     println!("mobile-direct: completed");

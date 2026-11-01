@@ -161,7 +161,7 @@ reports an error naming the builder script rather than binding a port that 404s.
 
 ## Bounded typed apparatus adapter
 
-On Linux/macOS, the existing `tyde-dev-driver` provides exactly five private-file
+On Linux/macOS, the existing `tyde-dev-driver` provides five private-file
 operations for a disposable, empty canonical DEV host. It does not launch hosts,
 create tunnels, redeem offers, change expiry/Cancel, or drive a device.
 
@@ -231,7 +231,27 @@ set_origin → offer → native episode → revoke → disable. Without an offer
 configure/set_origin may go directly to disable. Each predecessor is claimed
 with a new `.used` file **before** sending; never retry a failed or lost operation.
 Retain partial outputs/claims for diagnosis. A failed operation is not success
-and the tool performs no rollback, renewal, automatic retry or hidden cleanup.
+and the tool performs no rollback, automatic retry or hidden cleanup.
+A packet owner may explicitly continue once from the original `offered` receipt
+using the same `offer` operation with **that receipt** as `previous`, a fresh
+`offer_path` and a fresh receipt output. Never reuse the claimed `origin_set`
+receipt, remove `.used`, copy receipts to mint claims, or replay configuration.
+The old receipt and all claims/failed outputs remain immutable. This is not an
+automatic retry or authority to repeat a native episode.
+
+Continuation requires the same run/Ready/Welcome/settings/inventory and exact
+Online listener, a prior receipt attesting its active offer and no devices,
+expiry by the actual wall clock, and current server state `Expired` for that
+same offer or `Idle` after terminal grace, still with no devices. `Active`,
+`Consumed`, `Cancelled`, `Failed`, wrong-offer expiry and paired devices fail.
+Current Idle is not historical proof that an offer was never used: the packet
+owner must independently retain the never-staged/no-device-input evidence and
+explicit continuation authority. No synthetic Ready or lifecycle is accepted.
+The new receipt has phase `reoffered` and `superseded_receipt_sha256` binding the
+original offered receipt. It cannot produce another offer. Use the new receipt
+and this executable for subsequent revoke/disable. Old receipts remain readable;
+new receipts must not be handed back to an older executable.
+
 Revoke never accepts an arbitrary device ID. Disable refuses an active offer,
 so it cannot conceal the separately owned expiry/Cancel defect. After Disabled,
 a new sealed case may configure the same DEV host with a fresh run/receipt chain.
