@@ -783,7 +783,8 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                                 type="button"
                                 class="context-menu-item"
                                 role="menuitem"
-                                on:click=move |_| {
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    ev.stop_propagation();
                                     card_menu.set(None);
                                     resume();
                                 }
@@ -802,7 +803,8 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                                 type="button"
                                 class="context-menu-item"
                                 role="menuitem"
-                                on:click=move |_| {
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    ev.stop_propagation();
                                     card_menu.set(None);
                                     delete();
                                 }

@@ -4779,11 +4779,53 @@ mod wasm_tests {
                 "the conversation menu must offer {item}, got: {history_menu_text:?}"
             );
         }
-        dispatch_key(
-            &history_menu.clone().dyn_into::<HtmlElement>().unwrap(),
-            "Escape",
-        );
-        next_tick().await;
+        // Native dispatch can clean up the menu between target and ancestor
+        // listeners. Each action must consume its click before that cleanup;
+        // a synchronous DOM click alone would let the ancestor hide the bug.
+        for (label, expected_frame) in [
+            ("Resume conversation", "spawn_agent"),
+            ("Delete conversation", "delete_session"),
+        ] {
+            if label == "Delete conversation" {
+                dispatch_context_menu(&history, 40.0, 120.0);
+                next_tick().await;
+            }
+            let item = menu_item(&container, label);
+            let stopped_at_target = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = stopped_at_target.clone();
+            let observe = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MouseEvent)>::new(
+                move |event: web_sys::MouseEvent| observed.set(event.cancel_bubble()),
+            );
+            item.add_event_listener_with_callback("click", observe.as_ref().unchecked_ref())
+                .unwrap();
+            let before = recorded_frames(&calls).len();
+            item.click();
+            item.remove_event_listener_with_callback("click", observe.as_ref().unchecked_ref())
+                .unwrap();
+            next_tick().await;
+            next_tick().await;
+            let after = recorded_frames(&calls);
+            let sent: Vec<_> = after[before..]
+                .iter()
+                .map(|(kind, _, _)| kind.as_str())
+                .collect();
+            assert_eq!(
+                sent,
+                vec![expected_frame],
+                "A saved-menu action must never also activate its row"
+            );
+            assert!(
+                stopped_at_target.get(),
+                "The menu action must stop its own click before its ancestor can retire"
+            );
+            assert!(
+                container
+                    .query_selector(".sidebar-card-menu")
+                    .unwrap()
+                    .is_none(),
+                "Choosing the saved action retires its menu"
+            );
+        }
 
         state.settings_open.set(true);
         next_tick().await;

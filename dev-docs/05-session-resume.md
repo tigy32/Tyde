@@ -659,6 +659,20 @@ over.
 
 ---
 
+### Saved-menu action isolation
+
+Saved-row menu items stop their own click before closing the menu. During
+native input dispatch, reactive cleanup can remove the ancestor menu's native
+click stopper between listeners; the original event still reaches the saved
+row and would resume it. The server's Delete/Resume contracts are unchanged.
+
+This source pattern was introduced by `7da2b7ccb2ee3be6245127ca11434ef55f526fa1`
+(2026-09-07), which added the saved-row context menu without the item-level stop
+already used by expanded Delete. The existing rendered card flow checks both
+menu actions at their target and their exact outgoing command kinds. A
+synchronous DOM click alone had hidden the native listener-retirement defect.
+This does not identify or resolve the separate reported 8–20s UI freezes.
+
 ## 16. Migration Strategy
 
 Recommended implementation order:
