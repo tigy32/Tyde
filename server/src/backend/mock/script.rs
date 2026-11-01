@@ -918,6 +918,65 @@ impl MockTurn {
         ])
     }
 
+    pub fn async_question_with_continued_messages(
+        tool_call_id: &str,
+        continued_messages: usize,
+        gate: &MockGateHandle,
+    ) -> Self {
+        let mut steps = vec![
+            MockStep::emit(emit::typing(true)),
+            MockStep::emit(emit::stream_end(emit::mock_assistant_message(
+                Some(ChatMessageId(Uuid::new_v4().to_string())),
+                "asking non-blocking question".to_owned(),
+            ))),
+            MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "request_user_input_async".to_owned(),
+                tool_type: protocol::ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::NonBlocking,
+                    questions: vec![protocol::AskUserQuestion {
+                        id: None,
+                        question: "Choose a deployment region".to_owned(),
+                        header: Some("Region".to_owned()),
+                        options: vec![
+                            protocol::AskUserQuestionOption {
+                                label: "us-west".to_owned(),
+                                description: None,
+                            },
+                            protocol::AskUserQuestionOption {
+                                label: "eu-central".to_owned(),
+                                description: None,
+                            },
+                        ],
+                        answer_schema: None,
+                        multi_select: false,
+                    }],
+                },
+            })),
+        ];
+        for index in 0..continued_messages {
+            steps.push(MockStep::emit(emit::stream_end(
+                emit::mock_assistant_message(
+                    Some(ChatMessageId(Uuid::new_v4().to_string())),
+                    format!("continued progress message {index}"),
+                ),
+            )));
+        }
+        steps.push(MockStep::emit(emit::error_card(
+            "Recoverable progress warning",
+        )));
+        steps.push(MockStep::Gate(gate.gate()));
+        steps.push(MockStep::emit(emit::typing(false)));
+        Self::await_tool_response(
+            steps,
+            MockPendingTool {
+                tool_call_id: tool_call_id.to_owned(),
+                gate_before_completion: None,
+                gate_after_completion: None,
+            },
+        )
+    }
+
     pub fn blocking_question_request(tool_call_id: &str, gate: &MockGateHandle) -> Self {
         let mut turn = Self::async_question_request(tool_call_id, gate);
         if let MockTurnBody::Steps(steps) = &mut turn.body {

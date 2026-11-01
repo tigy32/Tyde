@@ -2498,6 +2498,122 @@ input, textarea, select {
     color: var(--text-secondary);
 }
 
+.activity-drawer .pinned-question-section {
+    border: 1px solid var(--border-strong);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: var(--surface-float);
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.16);
+    overflow: hidden;
+}
+
+.activity-drawer.question-open .activity-toggle {
+    width: 100%;
+    border-radius: 0;
+}
+
+.activity-drawer.question-open .activity-list {
+    border-radius: 0;
+    box-shadow: none;
+}
+
+.activity-drawer .pinned-question-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 36px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border-default);
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.activity-drawer .pinned-question-dot {
+    flex: 0 0 6px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-primary);
+}
+
+.activity-drawer .pinned-question-title {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.activity-drawer .pinned-question-pager {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.activity-drawer .pinned-question-nav {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    background: var(--surface-default);
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1;
+}
+
+.activity-drawer .pinned-question-nav:disabled {
+    opacity: 0.45;
+}
+
+.activity-drawer .pinned-question-position {
+    min-width: 3.2em;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.activity-drawer .pinned-question-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.activity-drawer .pinned-question-pager + .pinned-question-toggle {
+    margin-left: 4px;
+}
+
+.activity-drawer .pinned-question-chevron {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+}
+
+.activity-drawer .pinned-question-body {
+    max-height: min(260px, 28cqh);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 10px 12px 12px;
+}
+
+@container tws (min-height: 600px) {
+    .activity-drawer .pinned-question-body {
+        max-height: min(360px, 44cqh);
+    }
+}
+
 .activity-dot {
     flex: 0 0 8px;
     height: 8px;
@@ -5517,4 +5633,15 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
         grid-column: 2;
         grid-row: 4;
     }
+}
+
+.activity-drawer.question-open .activity-list {
+    max-height: min(340px, 22cqh);
+}
+
+.activity-drawer .pinned-question-body .ask-question-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    background: var(--surface-float);
 }

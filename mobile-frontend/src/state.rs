@@ -882,6 +882,66 @@ pub enum MobileTab {
     Settings,
 }
 
+#[derive(Clone, Debug)]
+pub struct MobileUserQuestionItemDraft {
+    pub selected: ArcRwSignal<Vec<usize>>,
+    pub custom: ArcRwSignal<String>,
+    pub note: ArcRwSignal<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MobileUserQuestionDraftState {
+    pub items: std::sync::Arc<Vec<MobileUserQuestionItemDraft>>,
+    pub submitted: ArcRwSignal<Option<SubmissionOriginId>>,
+    pub sending: ArcRwSignal<bool>,
+    pub send_error: ArcRwSignal<Option<String>>,
+}
+
+impl MobileUserQuestionDraftState {
+    pub fn from_questions(
+        questions: &[protocol::AskUserQuestion],
+        answers: &[protocol::UserQuestionAnswer],
+    ) -> Self {
+        let items = questions
+            .iter()
+            .map(|question| {
+                let answer = answers
+                    .iter()
+                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
+                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
+                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, option)| {
+                                labels.contains(&option.label).then_some(index)
+                            })
+                            .collect(),
+                        String::new(),
+                        note.clone().unwrap_or_default(),
+                    ),
+                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
+                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
+                    }
+                    None => (Vec::new(), String::new(), String::new()),
+                };
+                MobileUserQuestionItemDraft {
+                    selected: ArcRwSignal::new(selected),
+                    custom: ArcRwSignal::new(custom),
+                    note: ArcRwSignal::new(note),
+                }
+            })
+            .collect();
+        Self {
+            items: std::sync::Arc::new(items),
+            submitted: ArcRwSignal::new(None),
+            sending: ArcRwSignal::new(false),
+            send_error: ArcRwSignal::new(None),
+        }
+    }
+}
+
 // ── App state ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1047,6 +1107,10 @@ pub struct AppState {
     /// published on its stream. The composer completes `/` drafts from this.
     pub slash_commands: RwSignal<HashMap<AgentRef, protocol::SlashCommandCatalog>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
+    pub pending_user_questions: RwSignal<HashMap<AgentRef, Vec<ToolRequest>>>,
+    pub completed_tool_results: RwSignal<HashMap<(AgentRef, String), ToolExecutionCompletedData>>,
+    user_question_drafts:
+        std::sync::Arc<std::sync::Mutex<HashMap<(AgentRef, String), MobileUserQuestionDraftState>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
     /// Agents the server reports as `AgentActivity::AwaitingUser`: parked on
     /// the user's answer, not thinking. Fed only by server activity frames.
@@ -1211,6 +1275,9 @@ impl AppState {
             goal_capabilities: RwSignal::new(HashMap::new()),
             slash_commands: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
+            pending_user_questions: RwSignal::new(HashMap::new()),
+            completed_tool_results: RwSignal::new(HashMap::new()),
+            user_question_drafts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_turn_active: RwSignal::new(HashMap::new()),
             agent_awaiting_user: RwSignal::new(HashSet::new()),
             agents_with_background_work: RwSignal::new(HashSet::new()),
@@ -2131,6 +2198,15 @@ impl AppState {
         self.agent_message_queue.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
+        self.pending_user_questions.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.completed_tool_results.update(|m| {
+            m.retain(|(agent, _), _| agent.local_host_id != *host);
+        });
+        if let Ok(mut drafts) = self.user_question_drafts.lock() {
+            drafts.retain(|(agent, _), _| agent.local_host_id != *host);
+        }
         self.agent_turn_active.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
@@ -2237,6 +2313,38 @@ impl AppState {
             .is_some_and(|active| active == host)
         {
             self.active_local_host_id.set(None);
+        }
+    }
+
+    pub fn user_question_draft(
+        &self,
+        agent_ref: &AgentRef,
+        tool_call_id: &str,
+        questions: &[protocol::AskUserQuestion],
+        answered: bool,
+        answers: &[protocol::UserQuestionAnswer],
+    ) -> MobileUserQuestionDraftState {
+        if answered {
+            return MobileUserQuestionDraftState::from_questions(questions, answers);
+        }
+        let key = (agent_ref.clone(), tool_call_id.to_owned());
+        let mut drafts = self
+            .user_question_drafts
+            .lock()
+            .expect("question draft registry lock");
+        if let Some(existing) = drafts.get(&key)
+            && existing.items.len() == questions.len()
+        {
+            return existing.clone();
+        }
+        let draft = MobileUserQuestionDraftState::from_questions(questions, answers);
+        drafts.insert(key, draft.clone());
+        draft
+    }
+
+    pub fn clear_agent_question_drafts(&self, agent_ref: &AgentRef) {
+        if let Ok(mut drafts) = self.user_question_drafts.lock() {
+            drafts.retain(|(owner, _), _| owner != agent_ref);
         }
     }
 }

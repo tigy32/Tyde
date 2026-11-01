@@ -3071,6 +3071,66 @@ pub fn reduce_diff_response(
 }
 
 #[derive(Clone, Debug)]
+pub struct UserQuestionItemDraft {
+    pub selected: ArcRwSignal<Vec<usize>>,
+    pub custom: ArcRwSignal<String>,
+    pub note: ArcRwSignal<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserQuestionDraftState {
+    pub questions: Vec<UserQuestionItemDraft>,
+    pub delivered: ArcRwSignal<bool>,
+    pub sending: ArcRwSignal<bool>,
+    pub send_error: ArcRwSignal<Option<String>>,
+}
+
+impl UserQuestionDraftState {
+    pub fn from_questions_and_answers(
+        questions: &[protocol::AskUserQuestion],
+        answers: &[protocol::UserQuestionAnswer],
+    ) -> Self {
+        let items = questions
+            .iter()
+            .map(|question| {
+                let answer = answers
+                    .iter()
+                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
+                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
+                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, option)| {
+                                labels.contains(&option.label).then_some(index)
+                            })
+                            .collect(),
+                        String::new(),
+                        note.clone().unwrap_or_default(),
+                    ),
+                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
+                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
+                    }
+                    None => (Vec::new(), String::new(), String::new()),
+                };
+                UserQuestionItemDraft {
+                    selected: ArcRwSignal::new(selected),
+                    custom: ArcRwSignal::new(custom),
+                    note: ArcRwSignal::new(note),
+                }
+            })
+            .collect();
+        Self {
+            questions: items,
+            delivered: ArcRwSignal::new(false),
+            sending: ArcRwSignal::new(false),
+            send_error: ArcRwSignal::new(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct StreamingState {
     pub row_id: ChatRowId,
     // A steer may append rows before this response finishes. Keep its start position.
@@ -3684,6 +3744,9 @@ impl ComposerHandle {
     }
 }
 
+type UserQuestionDraftKey = (Option<AgentId>, String);
+type UserQuestionDraftMap = HashMap<UserQuestionDraftKey, UserQuestionDraftState>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub app_update_status: RwSignal<Option<host_config::updates::AppUpdateStatus>>,
@@ -3770,6 +3833,23 @@ pub struct AppState {
     /// update without re-rendering the whole map. Cleared anywhere
     /// `chat_tool_rows` is cleared.
     pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
+    /// Server-authoritative unanswered `AskUserQuestion` tool requests per
+    /// agent, in request order. Populated from `ChatEvent::ToolRequest` and
+    /// `AgentBootstrapPayload::pending_user_questions`, and retired only on
+    /// `ChatEvent::ToolExecutionCompleted` or terminal agent teardown. Never
+    /// populated from paged `SessionHistory`.
+    pub pending_user_questions: RwSignal<HashMap<AgentId, Vec<protocol::ToolRequest>>>,
+    /// Completed tool execution outcomes indexed by `(agent_id, tool_call_id)`
+    /// so historical tool requests paged in via `SessionHistory` after their
+    /// completion already arrived in `AgentBootstrap` or live events render
+    /// their settled outcome.
+    pub completed_tool_results:
+        RwSignal<HashMap<(AgentId, String), protocol::ToolExecutionCompletedData>>,
+    /// Shared per-question interactive draft and submission state keyed by
+    /// `(agent_id, tool_call_id)` so the pinned bottom-drawer question card and
+    /// inline transcript card share selections, free text, notes, and in-flight
+    /// send locks across drawer state transitions and virtualized scrolling.
+    user_question_drafts: Arc<Mutex<UserQuestionDraftMap>>,
     /// Per-chat composer state, keyed by the owning chat tab. Deliberately a
     /// plain map and not a signal: the *lookup* never needs to be reactive
     /// because each `ChatView` binds to one fixed `TabId`, and the reactivity
@@ -4377,6 +4457,9 @@ impl AppState {
             agent_activity_stats: RwSignal::new(HashMap::new()),
             task_token_usage: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
+            pending_user_questions: RwSignal::new(HashMap::new()),
+            completed_tool_results: RwSignal::new(HashMap::new()),
+            user_question_drafts: Arc::new(Mutex::new(HashMap::new())),
             composers: Arc::new(Mutex::new(HashMap::new())),
             detached_composer: ComposerHandle::default(),
             #[cfg(target_arch = "wasm32")]
@@ -6971,6 +7054,18 @@ impl AppState {
             self.tool_progress.update(|map| {
                 map.retain(|(id, _), _| !drop_set.contains(id));
             });
+            self.pending_user_questions.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.completed_tool_results.update(|map| {
+                map.retain(|(id, _), _| !drop_set.contains(id));
+            });
+            if let Ok(mut drafts) = self.user_question_drafts.lock() {
+                drafts.retain(|(id, _), _| {
+                    id.as_ref()
+                        .is_none_or(|agent_id| !drop_set.contains(agent_id))
+                });
+            }
             self.chat_message_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
@@ -7339,6 +7434,40 @@ impl AppState {
             .is_some_and(|active| active.host_id == host_id)
         {
             self.active_terminal.set(None);
+        }
+    }
+
+    pub fn user_question_draft(
+        &self,
+        agent_id: Option<AgentId>,
+        tool_call_id: &str,
+        questions: &[protocol::AskUserQuestion],
+        answered: bool,
+        answers: &[protocol::UserQuestionAnswer],
+    ) -> UserQuestionDraftState {
+        if answered {
+            return UserQuestionDraftState::from_questions_and_answers(questions, answers);
+        }
+        let key = (agent_id, tool_call_id.to_owned());
+        let mut drafts = self
+            .user_question_drafts
+            .lock()
+            .expect("user_question_drafts mutex poisoned");
+        if let Some(existing) = drafts.get(&key)
+            && existing.questions.len() == questions.len()
+        {
+            return existing.clone();
+        }
+        let draft = UserQuestionDraftState::from_questions_and_answers(questions, answers);
+        if !answered {
+            drafts.insert(key, draft.clone());
+        }
+        draft
+    }
+
+    pub fn clear_agent_question_drafts(&self, agent_id: &AgentId) {
+        if let Ok(mut drafts) = self.user_question_drafts.lock() {
+            drafts.retain(|(id, _), _| id.as_ref() != Some(agent_id));
         }
     }
 

@@ -836,6 +836,7 @@ struct AgentReplayState {
     progress_log_index: HashMap<String, usize>,
     active_tool_progress: HashMap<String, protocol::ToolProgressData>,
     active_background_progress: HashMap<String, protocol::ToolProgressData>,
+    pending_user_questions: Vec<protocol::ToolRequest>,
 }
 
 impl AgentReplayState {
@@ -13663,6 +13664,7 @@ async fn enter_terminal_failure(
     context.status_handle.abandon_restart_continuation();
     context.accepting_input.store(false, Ordering::SeqCst);
     context.replay_state.clear_active_stream();
+    context.replay_state.pending_user_questions.clear();
     context.queue.clear();
     context
         .status_handle
@@ -16715,7 +16717,21 @@ fn record_chat_event_for_replay(
                 &ChatEvent::MessageMetadataUpdated(update.clone()),
             );
         }
-        ChatEvent::ToolRequest(_) => {
+        ChatEvent::ToolRequest(request) => {
+            if matches!(
+                request.tool_type,
+                protocol::ToolRequestType::AskUserQuestion { .. }
+            ) {
+                if let Some(existing) = replay_state
+                    .pending_user_questions
+                    .iter_mut()
+                    .find(|item| item.tool_call_id == request.tool_call_id)
+                {
+                    *existing = request.clone();
+                } else {
+                    replay_state.pending_user_questions.push(request.clone());
+                }
+            }
             if let Some(active) = replay_state.active_stream.as_mut() {
                 active.tool_events.push(event.clone());
             } else {
@@ -16729,6 +16745,9 @@ fn record_chat_event_for_replay(
             replay_state
                 .active_background_progress
                 .remove(&completion.tool_call_id);
+            replay_state
+                .pending_user_questions
+                .retain(|request| request.tool_call_id != completion.tool_call_id);
             if let Some(active) = replay_state.active_stream.as_mut()
                 && active.tool_events.iter().any(|buffered| {
                     matches!(
@@ -18291,6 +18310,13 @@ fn attach_subscriber_with_latest_output(
         }
     }
 
+    let pending_user_questions = if status.terminated {
+        Vec::new()
+    } else {
+        replay_state
+            .map(|state| state.pending_user_questions.clone())
+            .unwrap_or_default()
+    };
     let bootstrap_event_count = events.len();
     let payload = serde_json::to_value(AgentBootstrapPayload {
         events,
@@ -18298,6 +18324,7 @@ fn attach_subscriber_with_latest_output(
         activity: status.activity(),
         status: status.status(),
         error: status.last_error.clone(),
+        pending_user_questions,
     })
     .expect("failed to serialize AgentBootstrap payload");
     if stream

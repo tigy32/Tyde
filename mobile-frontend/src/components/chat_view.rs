@@ -1476,98 +1476,24 @@ mod wasm_tests {
         (state, handle)
     }
 
-    async fn sleep_ms(millis: i32) {
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
-                .unwrap();
-        });
-        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    }
-
-    /// Timer samples repeatedly observed a reveal at time=0, even in view.
-    /// Sample actual animation frames as well as requiring the transition to
-    /// finish; the flush-edge and bounded-height assertions remain unchanged.
     async fn wait_for_drawer_motion(container: &HtmlElement) {
-        const SAMPLE_MS: i32 = 16;
-        const STILL_SAMPLES: u32 = 4;
-        const MAX_SAMPLES: u32 = 200;
-
-        // Let the click's reactive DOM patch land, so the first sample is
-        // taken against a drawer that is already animating.
         next_tick().await;
-        next_tick().await;
-
-        let viewport_height = web_sys::window()
-            .unwrap()
-            .inner_height()
-            .unwrap()
-            .as_f64()
-            .unwrap();
-        let container_bounds = container.get_bounding_client_rect();
-        console_log!(
-            "DRAWER VIEWPORT height={} container_top={} container_bottom={}",
-            viewport_height,
-            container_bounds.top(),
-            container_bounds.bottom()
-        );
-
-        let mut previous = f64::NAN;
-        let mut still = 0;
-        for _ in 0..MAX_SAMPLES {
-            sleep_ms(SAMPLE_MS).await;
-            let frame = js_sys::Promise::new(&mut |resolve, _reject| {
-                web_sys::window()
-                    .unwrap()
-                    .request_animation_frame(&resolve)
-                    .unwrap();
-            });
-            wasm_bindgen_futures::JsFuture::from(frame).await.unwrap();
-            let Some(drawer) = container
-                .query_selector("[data-mobile-test='activity-drawer']")
-                .unwrap()
-            else {
-                return;
-            };
-            let top = drawer.get_bounding_client_rect().top();
-            if (top - previous).abs() < 0.01 {
-                still += 1;
-                if still == STILL_SAMPLES {
-                    let animation_state = js_sys::Function::new_with_args("drawer", "return JSON.stringify(drawer.getAnimations({subtree:true}).map(a => ({state:a.playState,time:a.currentTime,timing:a.effect.getComputedTiming()})))")
-                        .call1(&wasm_bindgen::JsValue::NULL, &drawer).unwrap();
-                    let list = container
-                        .query_selector("[data-mobile-test='activity-list']")
-                        .unwrap()
-                        .unwrap();
-                    let input = container
-                        .query_selector("[data-mobile-test='chat-input-capsule']")
-                        .unwrap()
-                        .unwrap();
-                    let list_bounds = list.get_bounding_client_rect();
-                    let input_bounds = input.get_bounding_client_rect();
-                    console_log!(
-                        "DRAWER STABILITY top={} list_bottom={} input_top={} gap={} animations={:?}",
-                        top,
-                        list_bounds.bottom(),
-                        input_bounds.top(),
-                        list_bounds.bottom() - input_bounds.top(),
-                        animation_state.as_string()
-                    );
-                    let reveal_running = js_sys::Function::new_with_args("drawer", "return drawer.querySelector('.activity-reveal').getAnimations().some(a => a.pending || a.playState === 'running')")
-                        .call1(&wasm_bindgen::JsValue::NULL, &drawer).unwrap().as_bool().unwrap();
-                    if reveal_running {
-                        still = 0;
-                    } else {
-                        return;
-                    }
-                }
-            } else {
-                still = 0;
+        js_sys::Function::new_with_args("root", r#"
+            root.getBoundingClientRect();
+            for (const animation of root.getAnimations({subtree: true})) {
+                if (Number.isFinite(animation.effect.getComputedTiming().endTime)) animation.finish();
             }
-            previous = top;
-        }
-        panic!("activity drawer never stopped moving");
+            const drawer = root.querySelector('[data-mobile-test="activity-drawer"]');
+            const question = root.querySelector('[data-mobile-test="pinned-question-section"]');
+            const input = root.querySelector('[data-mobile-test="chat-input-capsule"]');
+            console.log('Mobile drawer settled geometry', JSON.stringify({
+                expanded: drawer?.classList.contains('expanded'),
+                height: drawer?.getBoundingClientRect().height,
+                questionTop: question?.getBoundingClientRect().top,
+                rootTop: root.getBoundingClientRect().top,
+                inputTop: input?.getBoundingClientRect().top
+            }));
+        "#).call1(&wasm_bindgen::JsValue::NULL, container).unwrap();
     }
 
     fn rendered_text_contrast(text: &web_sys::Element, surface: &web_sys::Element) -> f64 {
@@ -2270,6 +2196,7 @@ mod wasm_tests {
                     tool_call_id: "background-check".to_owned(), execution_mode: protocol::ToolExecutionMode::Background, cancellable: false,
                     update: protocol::ToolProgressUpdate::Other { payload: serde_json::json!({"description": "Restored running command"}) },
                 }))], latest_output: Default::default(), activity: protocol::AgentActivity::Idle,
+                pending_user_questions: Vec::new(),
             },
         ).unwrap());
         settle_autoscroll().await;
@@ -2286,6 +2213,291 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Restored running command")
         );
+
+        state.agent_turn_active.update(|turns| {
+            turns.insert(child_ref.clone(), true);
+        });
+        for (call_id, prompt, opt_a, opt_b) in [
+            ("mq-1", "Pick target environment", "staging", "production"),
+            ("mq-2", "Pick cache policy", "warm", "cold"),
+        ] {
+            crate::dispatch::apply_chat_event(
+                &state,
+                &owner,
+                protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: "AskUserQuestion".to_owned(),
+                    tool_type: protocol::ToolRequestType::AskUserQuestion {
+                        mode: protocol::UserQuestionMode::NonBlocking,
+                        questions: vec![protocol::AskUserQuestion {
+                            id: None,
+                            question: prompt.to_owned(),
+                            header: Some("Deploy".to_owned()),
+                            options: vec![
+                                protocol::AskUserQuestionOption {
+                                    label: opt_a.to_owned(),
+                                    description: None,
+                                },
+                                protocol::AskUserQuestionOption {
+                                    label: opt_b.to_owned(),
+                                    description: None,
+                                },
+                            ],
+                            answer_schema: None,
+                            multi_select: false,
+                        }],
+                    },
+                }),
+            );
+        }
+        settle_autoscroll().await;
+
+        let drawer = element("activity-drawer");
+        // If activity was open from earlier in the test, collapse it to measure State 2 vs State 3.
+        if drawer.class_list().contains("expanded") {
+            click(&element("activity-toggle"));
+        }
+        wait_for_drawer_motion(&container).await;
+        let section = element("pinned-question-section");
+        assert!(section.text_content().unwrap().contains("2 questions"));
+        assert_eq!(
+            element("pinned-question-position").text_content().unwrap(),
+            "1 of 2"
+        );
+        assert!(
+            section
+                .text_content()
+                .unwrap()
+                .contains("Pick target environment")
+        );
+        let height_state_2 = drawer.get_bounding_client_rect().height();
+
+        click(&element("activity-toggle"));
+        wait_for_drawer_motion(&container).await;
+        let height_state_3 = drawer.get_bounding_client_rect().height();
+        assert!(
+            height_state_3 > height_state_2,
+            "State 3 height ({height_state_3}) > State 2 height ({height_state_2})"
+        );
+        assert!(
+            element("activity-list")
+                .text_content()
+                .unwrap()
+                .contains("Release verification")
+        );
+
+        assert!(
+            element("pinned-question-section")
+                .get_bounding_client_rect()
+                .top()
+                >= container.get_bounding_client_rect().top(),
+            "question header remains on screen above expanded activity at keyboard height"
+        );
+        click(&element("pinned-question-toggle"));
+        wait_for_drawer_motion(&container).await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pinned-question-section']")
+                .unwrap()
+                .is_none()
+        );
+        let toggle_text = element("activity-toggle").text_content().unwrap();
+        assert!(
+            toggle_text.contains("2 questions")
+                && toggle_text.contains("1 agent")
+                && toggle_text.contains("1 command"),
+            "State 1 toggle text: {toggle_text}"
+        );
+        let height_state_1 = drawer.get_bounding_client_rect().height();
+        assert!(
+            height_state_1 < height_state_2,
+            "State 1 height ({height_state_1}) < State 2 height ({height_state_2})"
+        );
+
+        click(&element("activity-toggle"));
+        wait_for_drawer_motion(&container).await;
+        let first_option = container
+            .query_selector(
+                "[data-mobile-test='pinned-question-body'] [data-mobile-test='ask-question-option']",
+            )
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        click(&first_option);
+        settle_autoscroll().await;
+        assert_eq!(
+            first_option.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+
+        click(&element("pinned-question-next"));
+        settle_autoscroll().await;
+        assert_eq!(
+            element("pinned-question-position").text_content().unwrap(),
+            "2 of 2"
+        );
+        assert!(
+            element("pinned-question-body")
+                .text_content()
+                .unwrap()
+                .contains("Pick cache policy")
+        );
+
+        click(&element("pinned-question-prev"));
+        settle_autoscroll().await;
+        let preserved_option = container
+            .query_selector(
+                "[data-mobile-test='pinned-question-body'] [data-mobile-test='ask-question-option']",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved_option.get_attribute("aria-pressed").as_deref(),
+            Some("true"),
+            "draft selection preserved on mobile across question navigation"
+        );
+
+        container.style().set_property("width", "390px").unwrap();
+        container.style().set_property("height", "844px").unwrap();
+        container
+            .style()
+            .set_property("container-name", "tws")
+            .unwrap();
+        wait_for_drawer_motion(&container).await;
+        let assert_answer_controls = || {
+            let body = element("pinned-question-body");
+            let custom = body
+                .query_selector("[data-mobile-test='ask-question-custom']")
+                .unwrap()
+                .unwrap();
+            let submit = body
+                .query_selector("[data-mobile-test='ask-question-submit']")
+                .unwrap()
+                .unwrap();
+            let pane = body.get_bounding_client_rect();
+            let field = custom.get_bounding_client_rect();
+            let action = submit.get_bounding_client_rect();
+            assert!(
+                field.top() >= pane.top() && field.bottom() <= pane.bottom(),
+                "normal phone height shows the entire free-text answer field"
+            );
+            assert!(
+                field.bottom() <= action.top() && action.bottom() <= pane.bottom(),
+                "Submit never overlaps the normal-height answer field"
+            );
+        };
+        assert_answer_controls();
+        click(&element("activity-toggle"));
+        wait_for_drawer_motion(&container).await;
+        assert_answer_controls();
+
+        let history_question = protocol::ToolRequest {
+            tool_call_id: "mobile-old-question".to_owned(),
+            tool_name: "AskUserQuestion".to_owned(),
+            tool_type: protocol::ToolRequestType::AskUserQuestion {
+                mode: protocol::UserQuestionMode::NonBlocking,
+                questions: vec![protocol::AskUserQuestion {
+                    id: None,
+                    question: "Earlier decision?".to_owned(),
+                    header: None,
+                    options: Vec::new(),
+                    answer_schema: None,
+                    multi_select: false,
+                }],
+            },
+        };
+        crate::dispatch::reset_inbound_seq_for_host(&owner.local_host_id);
+        for (seq, events) in [
+            vec![protocol::ChatEvent::ToolExecutionCompleted(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id: "mobile-old-question".to_owned(),
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::Other {
+                            result: serde_json::json!({}),
+                        },
+                    },
+                },
+            )],
+            vec![
+                protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+                    origin: None,
+                    message_id: None,
+                    timestamp: 0,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "codex".to_owned(),
+                    },
+                    content: "Earlier decision".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }),
+                protocol::ChatEvent::ToolRequest(history_question),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = state.next_history_page_request_id();
+            state.session_history.update(|map| {
+                map.insert(
+                    owner.clone(),
+                    crate::state::SessionHistoryState {
+                        message_count: 1,
+                        oldest_seq: None,
+                        has_more_before: true,
+                        pending_request: Some(crate::state::PendingSessionHistoryRequest {
+                            request_id: request_id.clone(),
+                            before_seq: None,
+                        }),
+                    },
+                );
+            });
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &owner.local_host_id,
+                protocol::Envelope::from_payload(
+                    StreamPath("stream/1".to_owned()),
+                    protocol::FrameKind::SessionHistory,
+                    seq as u64,
+                    &protocol::SessionHistoryPayload {
+                        agent_id: owner.agent_id.clone(),
+                        request_id,
+                        request_before_seq: None,
+                        events,
+                        has_more_before: true,
+                        oldest_seq: Some(1),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        settle_autoscroll().await;
+        let historical_submit = container
+            .query_selector(".chat-transcript [data-mobile-test='ask-question-submit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert!(
+            historical_submit.disabled(),
+            "history pages must not reopen a resolved question"
+        );
+        assert!(
+            historical_submit
+                .text_content()
+                .unwrap()
+                .contains("Answer sent")
+        );
+        assert_eq!(
+            element("pinned-question-title").text_content().unwrap(),
+            "2 questions",
+            "historical questions never enter the live inbox"
+        );
+
         state.clear_host_runtime(&owner.local_host_id);
         settle_autoscroll().await;
         assert!(
@@ -4574,6 +4786,7 @@ mod wasm_tests {
                     )],
                     latest_output: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    pending_user_questions: Vec::new(),
                 },
             )
             .unwrap(),

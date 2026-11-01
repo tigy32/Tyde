@@ -1560,6 +1560,9 @@ fn settle_fatal_agent_ui(state: &AppState, agent_ref: &AgentRef) {
     state.agent_awaiting_user.update(|m| {
         m.remove(agent_ref);
     });
+    state.pending_user_questions.update(|m| {
+        m.remove(agent_ref);
+    });
     // Cancelled/Retry cards claim live activity ("Retrying in 800ms…") that a
     // dead agent can never follow through on. Terminated supersedes them.
     state.transient_events.update(|m| {
@@ -1636,6 +1639,13 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.completed_tool_calls.update(|map| {
         map.remove(agent_ref);
     });
+    state.pending_user_questions.update(|map| {
+        map.remove(agent_ref);
+    });
+    state.completed_tool_results.update(|map| {
+        map.retain(|(owner, _), _| owner != agent_ref);
+    });
+    state.clear_agent_question_drafts(agent_ref);
     state.agent_load_requests.update(|m| {
         m.remove(agent_ref);
     });
@@ -2403,6 +2413,22 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                         .and_then(|entry| mobile_message_tool_name(&entry.message, &tool_call_id))
                 })
                 .unwrap_or_else(|| mobile_fallback_tool_name(&request));
+            if matches!(
+                request.tool_type,
+                protocol::ToolRequestType::AskUserQuestion { .. }
+            ) {
+                state.pending_user_questions.update(|map| {
+                    let entries = map.entry(agent_ref.clone()).or_default();
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|entry| entry.tool_call_id == tool_call_id)
+                    {
+                        *existing = request.clone();
+                    } else {
+                        entries.push(request.clone());
+                    }
+                });
+            }
             let tool_entry = ToolRequestEntry {
                 tool_name,
                 request,
@@ -2440,6 +2466,17 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
         }
         ChatEvent::ToolExecutionCompleted(data) => {
             let call_id = data.tool_call_id.clone();
+            state.pending_user_questions.update(|map| {
+                if let Some(entries) = map.get_mut(&agent_ref) {
+                    entries.retain(|entry| entry.tool_call_id != call_id);
+                    if entries.is_empty() {
+                        map.remove(&agent_ref);
+                    }
+                }
+            });
+            state.completed_tool_results.update(|map| {
+                map.insert((agent_ref.clone(), call_id.clone()), data.clone());
+            });
             state.completed_tool_calls.update(|map| {
                 map.entry(agent_ref.clone())
                     .or_default()
@@ -2624,11 +2661,29 @@ fn apply_session_history(
 
     let mut replay = MobileHistoryReplay::default();
     for event in payload.events {
+        if let ChatEvent::ToolExecutionCompleted(completion) = &event {
+            state.completed_tool_results.update(|map| {
+                map.insert(
+                    (agent_ref.clone(), completion.tool_call_id.clone()),
+                    completion.clone(),
+                );
+            });
+        }
         replay.apply(event, host, &agent_ref);
     }
 
     let prepended_message_count = replay.rows.len();
     if !replay.rows.is_empty() {
+        for row in &mut replay.rows {
+            for tool in &mut row.tool_requests {
+                if tool.result.is_none() {
+                    tool.result = state.completed_tool_results.with_untracked(|map| {
+                        map.get(&(agent_ref.clone(), tool.request.tool_call_id.clone()))
+                            .cloned()
+                    });
+                }
+            }
+        }
         state.chat_messages.update(|map| {
             let current = map.remove(&agent_ref).unwrap_or_default();
             let mut combined = replay.rows;
@@ -3222,6 +3277,12 @@ fn apply_host_bootstrap(
     state.completed_tool_calls.update(|map| {
         map.retain(|agent, _| agent.local_host_id != *host);
     });
+    state.pending_user_questions.update(|map| {
+        map.retain(|agent, _| agent.local_host_id != *host);
+    });
+    state.completed_tool_results.update(|map| {
+        map.retain(|(agent, _), _| agent.local_host_id != *host);
+    });
     state.agent_load_requests.update(|loads| {
         loads.retain(|agent_ref| agent_ref.local_host_id != *host);
     });
@@ -3464,6 +3525,12 @@ fn apply_agent_bootstrap(
     state.completed_tool_calls.update(|map| {
         map.remove(&agent_ref);
     });
+    state.pending_user_questions.update(|map| {
+        map.remove(&agent_ref);
+    });
+    state.completed_tool_results.update(|map| {
+        map.retain(|(owner, _), _| owner != &agent_ref);
+    });
     // Replace prior per-agent chat/stream/queue/task state so the bootstrap
     // snapshot is authoritative.
     state.chat_messages.update(|m| {
@@ -3638,6 +3705,13 @@ fn apply_agent_bootstrap(
         settle_fatal_agent_ui(state, &agent_ref);
         return;
     }
+    state.pending_user_questions.update(|map| {
+        if payload.pending_user_questions.is_empty() {
+            map.remove(&agent_ref);
+        } else {
+            map.insert(agent_ref.clone(), payload.pending_user_questions);
+        }
+    });
     set_agent_activity(state, agent_ref.clone(), payload.activity);
     if payload.activity != AgentActivity::Thinking {
         state.streaming_text.update(|map| {
@@ -3808,6 +3882,7 @@ mod wasm_tests {
             events: Vec::new(),
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            pending_user_questions: Vec::new(),
         };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
             .expect("synthetic AgentBootstrap");
@@ -4781,6 +4856,7 @@ mod wasm_tests {
             ],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            pending_user_questions: Vec::new(),
         };
         dispatch_envelope(
             &state,
@@ -5622,6 +5698,7 @@ mod wasm_tests {
             )],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            pending_user_questions: Vec::new(),
         };
         dispatch_envelope(
             &state,

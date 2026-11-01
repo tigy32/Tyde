@@ -2339,6 +2339,10 @@ pub struct AgentBootstrapPayload {
     pub latest_output: AgentControlOutput,
     /// Authoritative activity after replaying `events`.
     pub activity: AgentActivity,
+    /// Authoritative unanswered `AskUserQuestion` requests in request order,
+    /// retained across transcript tail truncation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_user_questions: Vec<ToolRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9657,7 +9661,7 @@ pub struct StreamEndData {
     pub message: ChatMessage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub tool_call_id: String,
     /// The provider's own name for the tool, as declared by the owning

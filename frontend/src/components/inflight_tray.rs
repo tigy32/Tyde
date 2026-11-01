@@ -657,29 +657,31 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
     });
 
-    let header_text = move || {
-        let snapshot = snapshot.get();
-        let mut parts = Vec::new();
-        if snapshot.counts.running > 0 {
-            parts.push(format!("{} running", snapshot.counts.running));
+    let pending_questions: Signal<Vec<protocol::ToolRequest>> = Signal::derive({
+        let state = state.clone();
+        move || {
+            let Some(parent) = agent_ref.get() else {
+                return Vec::new();
+            };
+            let parent_is_fatal = state.agents.with(|agents| {
+                agents.iter().any(|agent| {
+                    agent.host_id == parent.host_id
+                        && agent.agent_id == parent.agent_id
+                        && agent.fatal_error.is_some()
+                })
+            });
+            if parent_is_fatal {
+                return Vec::new();
+            }
+            state
+                .pending_user_questions
+                .with(|map| map.get(&parent.agent_id).cloned().unwrap_or_default())
         }
-        if snapshot.counts.queued > 0 {
-            parts.push(format!("{} queued", snapshot.counts.queued));
-        }
-        if let Some(waiting) = waiting.get() {
-            parts.push(waiting);
-        }
-        if parts.is_empty() && queued_edit.get().is_some() {
-            parts.push("queued edit needs recovery".to_owned());
-        }
-        parts.join(" \u{b7} ")
-    };
-
-    let on_toggle = move |_: web_sys::MouseEvent| {
-        let next = !expanded.get_untracked();
-        expanded.set(next);
-        persist_expanded(next);
-    };
+    });
+    let has_questions = move || !pending_questions.with(|questions| questions.is_empty());
+    let question_open = RwSignal::new(false);
+    let active_question_call_id = RwSignal::new(None::<String>);
+    let seen_question_ids = RwSignal::new((None::<ActiveAgentRef>, Vec::<String>::new()));
 
     let chat_appearance = state.chat_appearance;
     let is_ink = move || chat_appearance.get().uses_ink_chrome();
@@ -697,8 +699,88 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
             ink_open.set(false);
         }
     });
-    let collapse_ink = Callback::new(move |()| {
+    Effect::new(move |_| {
+        let owner = ink_owner.get();
+        let questions = pending_questions.get();
+        let ids: Vec<String> = questions
+            .iter()
+            .map(|question| question.tool_call_id.clone())
+            .collect();
+        if ids.is_empty() {
+            question_open.set(false);
+            active_question_call_id.set(None);
+            seen_question_ids.set((owner, Vec::new()));
+            return;
+        }
+        let (prev_owner, prev_ids) = seen_question_ids.get_untracked();
+        let owner_changed = prev_owner != owner;
+        let has_new = owner_changed || ids.iter().any(|id| !prev_ids.contains(id));
+        if has_new {
+            if !question_open.get_untracked() {
+                expanded.set(false);
+            }
+            question_open.set(true);
+        }
+        seen_question_ids.set((owner, ids.clone()));
+        let current = active_question_call_id.get_untracked();
+        if current.as_ref().is_none_or(|id| !ids.contains(id)) {
+            active_question_call_id.set(ids.first().cloned());
+        }
+    });
+
+    let header_text = move || {
+        let snapshot = snapshot.get();
+        let mut parts = Vec::new();
+        let q_count = pending_questions.with(|questions| questions.len());
+        if q_count > 0 && !question_open.get() {
+            parts.push(count_label(q_count, "question", "questions"));
+        }
+        if snapshot.counts.running > 0 {
+            parts.push(format!("{} running", snapshot.counts.running));
+        }
+        if snapshot.counts.queued > 0 {
+            parts.push(format!("{} queued", snapshot.counts.queued));
+        }
+        if let Some(waiting) = waiting.get() {
+            parts.push(waiting);
+        }
+        if parts.is_empty() && queued_edit.get().is_some() {
+            parts.push("queued edit needs recovery".to_owned());
+        }
+        parts.join(" \u{b7} ")
+    };
+
+    let on_toggle = move |_: web_sys::MouseEvent| {
+        if has_questions() && !question_open.get_untracked() {
+            question_open.set(true);
+            expanded.set(false);
+            return;
+        }
+        let next = !expanded.get_untracked();
+        expanded.set(next);
+        persist_expanded(next);
+    };
+
+    let collapse_current_question = Callback::new(move |()| {
+        question_open.set(false);
+        expanded.set(false);
+        persist_expanded(false);
+    });
+    let collapse_ink_question = Callback::new(move |()| {
+        question_open.set(false);
         ink_open.set(false);
+        if let Some(tab) = ink_tab.get_untracked()
+            && let Err(error) = tab.focus()
+        {
+            log::error!("Cannot return focus to background activity: {error:?}");
+        }
+    });
+    let collapse_ink = Callback::new(move |()| {
+        if ink_open.get_untracked() {
+            ink_open.set(false);
+        } else {
+            question_open.set(false);
+        }
         if let Some(tab) = ink_tab.get_untracked()
             && let Err(error) = tab.focus()
         {
@@ -708,6 +790,10 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
     let ink_tab_text = move || {
         let snapshot = snapshot.get();
         let mut parts = Vec::new();
+        let q_count = pending_questions.with(|questions| questions.len());
+        if q_count > 0 && !question_open.get() {
+            parts.push(count_label(q_count, "question", "questions"));
+        }
         let agents = snapshot.children.len() + snapshot.subagents.len();
         if agents > 0 {
             parts.push(count_label(agents, "agent", "agents"));
@@ -730,38 +816,70 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
     };
 
     view! {
-        <Show when=move || has_work() && is_ink()>
+        <Show when=move || (has_work() || has_questions()) && is_ink()>
             <div class="ink-activity" data-testid="ink-activity">
                 <div
                     class="ink-activity-drawer"
-                    class:expanded=move || ink_open.get()
+                    class:expanded=move || has_work() && ink_open.get() && (!has_questions() || question_open.get())
+                    class:question-open=move || has_questions() && question_open.get()
                     on:keydown=move |event: leptos::ev::KeyboardEvent| {
-                        if event.key() == "Escape" && ink_open.get_untracked() {
+                        if event.key() == "Escape"
+                            && (ink_open.get_untracked()
+                                || (has_questions() && question_open.get_untracked()))
+                        {
                             event.prevent_default();
                             event.stop_propagation();
                             collapse_ink.run(());
                         }
                     }
                 >
-                    <button
-                        type="button"
-                        class="ink-activity-tab"
-                        node_ref=ink_tab
-                        aria-expanded=move || ink_open.get().to_string()
-                        on:click=move |_| ink_open.update(|open| *open = !*open)
-                    >
-                        <span class="ink-activity-dot" aria-hidden="true"></span>
-                        <span class="ink-activity-tab-text">{ink_tab_text}</span>
-                        <svg class="ink-activity-chevron" viewBox="0 0 16 16" aria-hidden="true">
-                            <path d="M4 10L8 6L12 10" />
-                        </svg>
-                    </button>
+                    <Show when=move || has_questions() && question_open.get()>
+                        <PinnedQuestionSection
+                            agent_ref=agent_ref
+                            pending_questions=pending_questions
+                            active_question_call_id=active_question_call_id
+                            on_collapse=collapse_ink_question
+                        />
+                    </Show>
+                    <Show when=move || has_work() || !question_open.get()>
+                        <button
+                            type="button"
+                            class="ink-activity-tab"
+                            node_ref=ink_tab
+                            aria-expanded=move || {
+                                (if has_questions() && !question_open.get() {
+                                    false
+                                } else {
+                                    ink_open.get()
+                                })
+                                .to_string()
+                            }
+                            on:click=move |_| {
+                                if has_questions() && !question_open.get_untracked() {
+                                    question_open.set(true);
+                                    ink_open.set(false);
+                                } else if has_work() {
+                                    ink_open.update(|open| *open = !*open);
+                                } else {
+                                    question_open.set(false);
+                                }
+                            }
+                        >
+                            <span class="ink-activity-dot" aria-hidden="true"></span>
+                            <span class="ink-activity-tab-text">{ink_tab_text}</span>
+                            <svg class="ink-activity-chevron" viewBox="0 0 16 16" aria-hidden="true">
+                                <path d="M4 10L8 6L12 10" />
+                            </svg>
+                        </button>
+                    </Show>
                     <div
                         class="ink-activity-reveal"
                         role="region"
                         aria-label="Background activity"
-                        aria-hidden=move || (!ink_open.get()).to_string()
-                        inert=move || !ink_open.get()
+                        aria-hidden=move || {
+                            (!(has_work() && ink_open.get() && (!has_questions() || question_open.get()))).to_string()
+                        }
+                        inert=move || !(has_work() && ink_open.get() && (!has_questions() || question_open.get()))
                     >
                         <div class="ink-activity-clip">
                             <div class="ink-activity-list">
@@ -838,19 +956,39 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                 </div>
             </div>
         </Show>
-        <Show when=move || has_work() && !is_ink()>
-            <div class="inflight-tray">
-                <button type="button" class="inflight-tray-header" on:click=on_toggle>
-                    <span
-                        class="inflight-tray-chevron"
-                        class:expanded=move || expanded.get()
-                        aria-hidden="true"
-                    >
-                        "\u{25b6}"
-                    </span>
-                    <span class="inflight-tray-summary">{header_text}</span>
-                </button>
-                <Show when=move || expanded.get()>
+        <Show when=move || (has_work() || has_questions()) && !is_ink()>
+            <div
+                class="inflight-tray"
+                class:question-open=move || has_questions() && question_open.get()
+                class:activity-open=move || has_work() && expanded.get() && (!has_questions() || question_open.get())
+            >
+                <Show when=move || has_questions() && question_open.get()>
+                    <PinnedQuestionSection
+                        agent_ref=agent_ref
+                        pending_questions=pending_questions
+                        active_question_call_id=active_question_call_id
+                        on_collapse=collapse_current_question
+                    />
+                </Show>
+                <Show when=move || has_work() || !question_open.get()>
+                    <button type="button" class="inflight-tray-header" on:click=on_toggle>
+                        <span
+                            class="inflight-tray-chevron"
+                            class:expanded=move || {
+                                has_work()
+                                    && expanded.get()
+                                    && (!has_questions() || question_open.get())
+                            }
+                            aria-hidden="true"
+                        >
+                            "\u{25b6}"
+                        </span>
+                        <span class="inflight-tray-summary">{header_text}</span>
+                    </button>
+                </Show>
+                <Show when=move || {
+                    has_work() && expanded.get() && (!has_questions() || question_open.get())
+                }>
                     <div class="inflight-tray-body">
                         <For
                             each=move || snapshot.get().children
@@ -900,6 +1038,123 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                 </Show>
             </div>
         </Show>
+    }
+}
+
+#[component]
+fn PinnedQuestionSection(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_questions: Signal<Vec<protocol::ToolRequest>>,
+    active_question_call_id: RwSignal<Option<String>>,
+    on_collapse: Callback<()>,
+) -> impl IntoView {
+    let total = Signal::derive(move || pending_questions.with(|questions| questions.len()));
+    let active_index = Signal::derive(move || {
+        let current = active_question_call_id.get();
+        pending_questions.with(|questions| {
+            current
+                .as_deref()
+                .and_then(|id| questions.iter().position(|q| q.tool_call_id == id))
+                .unwrap_or(0)
+        })
+    });
+    let active_request = Signal::derive(move || {
+        let idx = active_index.get();
+        pending_questions.with(|questions| questions.get(idx).cloned())
+    });
+
+    view! {
+        <section
+            class="pinned-question-section"
+            data-testid="pinned-question-section"
+            aria-label="Pending question"
+        >
+            <div class="pinned-question-bar" data-testid="pinned-question-bar">
+                <span class="pinned-question-dot" aria-hidden="true"></span>
+                <span class="pinned-question-title" data-testid="pinned-question-title">
+                    {move || count_label(total.get(), "question", "questions")}
+                </span>
+                <Show when={move || total.get() > 1}>
+                    <div class="pinned-question-pager" data-testid="pinned-question-pager">
+                        <button
+                            type="button"
+                            class="pinned-question-nav"
+                            data-testid="pinned-question-prev"
+                            aria-label="Previous question"
+                            prop:disabled={move || active_index.get() == 0}
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                let idx = active_index.get_untracked();
+                                if idx > 0
+                                    && let Some(prev_id) =
+                                        pending_questions.with_untracked(|questions| {
+                                            questions.get(idx - 1).map(|q| q.tool_call_id.clone())
+                                        })
+                                {
+                                    active_question_call_id.set(Some(prev_id));
+                                }
+                            }
+                        >
+                            "\u{2039}"
+                        </button>
+                        <span
+                            class="pinned-question-position"
+                            data-testid="pinned-question-position"
+                        >
+                            {move || format!("{} of {}", active_index.get() + 1, total.get())}
+                        </span>
+                        <button
+                            type="button"
+                            class="pinned-question-nav"
+                            data-testid="pinned-question-next"
+                            aria-label="Next question"
+                            prop:disabled={move || active_index.get() + 1 >= total.get()}
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                let idx = active_index.get_untracked();
+                                if let Some(next_id) =
+                                    pending_questions.with_untracked(|questions| {
+                                        questions.get(idx + 1).map(|q| q.tool_call_id.clone())
+                                    })
+                                {
+                                    active_question_call_id.set(Some(next_id));
+                                }
+                            }
+                        >
+                            "\u{203a}"
+                        </button>
+                    </div>
+                </Show>
+                <button
+                    type="button"
+                    class="pinned-question-toggle"
+                    data-testid="pinned-question-toggle"
+                    aria-label="Collapse question"
+                    aria-expanded="true"
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        on_collapse.run(());
+                    }
+                >
+                    <svg class="pinned-question-chevron" viewBox="0 0 16 16" aria-hidden="true">
+                        <path d="M4 6L8 10L12 6" />
+                    </svg>
+                </button>
+            </div>
+            <div class="pinned-question-body" data-testid="pinned-question-body">
+                {move || {
+                    active_request.get().map(|request| {
+                        crate::components::tool_card::ask_user_question::render(
+                            agent_ref,
+                            &request.tool_call_id,
+                            &request.tool_type,
+                            None,
+                            crate::state::ToolOutputMode::Full,
+                        )
+                    })
+                }}
+            </div>
+        </section>
     }
 }
 
@@ -4674,6 +4929,538 @@ mod wasm_tests {
             count(&container, ".tool-live-agent-status"),
             1,
             "exactly one live status badge on screen — the tray's"
+        );
+    }
+
+    fn assert_question_action_visible(container: &HtmlElement) {
+        js_sys::Function::new_with_args("root", r#"
+            const pane = root.querySelector('.pinned-question-body');
+            const button = pane.querySelector('.ask-question-submit');
+            const p = pane.getBoundingClientRect(), b = button.getBoundingClientRect();
+            if (b.top < p.top || b.bottom > p.bottom || b.width === 0 || b.height === 0)
+                throw new Error('Question action is clipped: '+JSON.stringify({pane:p.toJSON(),button:b.toJSON()}));
+            button.scrollIntoView({block: 'nearest'});
+            const r = button.getBoundingClientRect();
+            if (!button.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2)))
+                throw new Error('Question action is not a visible hit target');
+        "#).call1(&wasm_bindgen::JsValue::NULL, container)
+            .expect("the existing answer action stays visible above activity");
+    }
+
+    async fn settle_question_drawer(container: &HtmlElement) {
+        next_tick().await;
+        let geometry = js_sys::Function::new_with_args("root", r#"
+            root.getBoundingClientRect();
+            for (const animation of root.getAnimations({subtree: true})) {
+                if (Number.isFinite(animation.effect.getComputedTiming().endTime)) animation.finish();
+            }
+            const drawer = root.querySelector('.ink-activity-drawer');
+            const reveal = root.querySelector('.ink-activity-reveal');
+            return JSON.stringify({height: drawer?.getBoundingClientRect().height,
+                expanded: drawer?.classList.contains('expanded'),
+                reveal: reveal?.getBoundingClientRect().height});
+        "#).call1(&wasm_bindgen::JsValue::NULL, container).unwrap();
+        wasm_bindgen_test::console_log!(
+            "Pinned drawer settled geometry: {:?}",
+            geometry.as_string()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn pinned_questions_three_heights_multi_queue_draft_preservation_and_inline_sync() {
+        ensure_styles_loaded();
+        install_send_stub();
+        js_sys::eval(
+            r#"
+            window.__pinnedAnswerSends = 0;
+            window.__TAURI__.core.invoke = (command, args) => {
+                if (command === 'send_host_line' && JSON.parse(args.line).kind === 'human_input')
+                    window.__pinnedAnswerSends++;
+                return Promise.resolve();
+            };
+        "#,
+        )
+        .unwrap();
+        if let Some(storage) = local_storage() {
+            let _ = storage.remove_item(STORAGE_INFLIGHT_TRAY_EXPANDED);
+        }
+
+        fn make_question_request(
+            call_id: &str,
+            prompt: &str,
+            opt_a: &str,
+            opt_b: &str,
+        ) -> ToolRequest {
+            ToolRequest {
+                tool_call_id: call_id.to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::NonBlocking,
+                    questions: vec![protocol::AskUserQuestion {
+                        id: None,
+                        question: prompt.to_owned(),
+                        header: Some("Decision".to_owned()),
+                        options: vec![
+                            protocol::AskUserQuestionOption {
+                                label: opt_a.to_owned(),
+                                description: None,
+                            },
+                            protocol::AskUserQuestionOption {
+                                label: opt_b.to_owned(),
+                                description: None,
+                            },
+                        ],
+                        answer_schema: None,
+                        multi_select: false,
+                    }],
+                },
+            }
+        }
+
+        let state = AppState::new();
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Ink);
+        state.agents.update(|agents| {
+            agents.push(parent_agent());
+            agents.push(child_agent("agent-a", "Builder"));
+        });
+        set_turn_active(&state, "agent-a");
+        seed_progress(
+            &state,
+            ToolProgressData {
+                tool_call_id: "cmd-1".to_owned(),
+                execution_mode: ToolExecutionMode::Background,
+                cancellable: true,
+                update: ToolProgressUpdate::Other {
+                    payload: serde_json::json!({ "description": "cargo test" }),
+                },
+            },
+        );
+
+        let parent_id = parent_ref().agent_id;
+        let q1 = make_question_request(
+            "q-1",
+            "Which region should we deploy to?",
+            "us-west",
+            "eu-central",
+        );
+        let q2 = make_question_request("q-2", "Which rollout strategy?", "canary", "blue-green");
+
+        apply_chat_event_from(
+            &state,
+            "host-1",
+            &parent_id,
+            ChatEvent::MessageAdded(protocol::ChatMessage {
+                origin: None,
+                message_id: None,
+                timestamp: 1,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "claude".to_owned(),
+                },
+                content: "Asking two non-blocking questions while work continues.".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+            ChatEventSource::Live,
+        );
+        apply_chat_event_from(
+            &state,
+            "host-1",
+            &parent_id,
+            ChatEvent::ToolRequest(q1.clone()),
+            ChatEventSource::Live,
+        );
+        apply_chat_event_from(
+            &state,
+            "host-1",
+            &parent_id,
+            ChatEvent::ToolRequest(q2.clone()),
+            ChatEventSource::Live,
+        );
+        // Agent continues chatting after asking non-blocking questions.
+        for idx in 0..5 {
+            apply_chat_event_from(
+                &state,
+                "host-1",
+                &parent_id,
+                ChatEvent::MessageAdded(protocol::ChatMessage {
+                    origin: None,
+                    message_id: None,
+                    timestamp: 10 + idx,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "claude".to_owned(),
+                    },
+                    content: format!("Continued agent output message {idx}"),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }),
+                ChatEventSource::Live,
+            );
+        }
+
+        let inline_q1_entry = state
+            .chat_row_for_tool_untracked(&parent_ref().agent_id, "q-1")
+            .and_then(|row| row.message_entry().cloned())
+            .expect("inline message entry for q-1");
+
+        let container =
+            crate::wasm_test_support::ScopedRoot::new(make_container(), "pinned-questions");
+        container.style().set_property("width", "720px").unwrap();
+        container.style().set_property("height", "720px").unwrap();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            let agent_ref = Signal::derive(|| Some(parent_ref()));
+            let q1_tool = Signal::derive(move || {
+                inline_q1_entry.with(|entry| entry.tool_requests[0].clone())
+            });
+            view! {
+                <crate::components::chat_presentation::ChatPresentation>
+                    <div class="inline-q1-host">
+                        {move || view! { <ToolCardView agent_ref=agent_ref entry=q1_tool.get() /> }}
+                    </div>
+                    <InflightTray agent_ref=agent_ref />
+                </crate::components::chat_presentation::ChatPresentation>
+            }
+        });
+        let _handle = handle;
+        settle_question_drawer(&container).await;
+
+        let drawer = container
+            .query_selector(".ink-activity-drawer")
+            .unwrap()
+            .expect("ink activity drawer mounted")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+
+        // State 2 (question-only intermediate height): question open at top, activity collapsed below.
+        assert_eq!(
+            count(&container, "[data-testid='pinned-question-section']"),
+            1
+        );
+        let pinned_text = container
+            .query_selector("[data-testid='pinned-question-section']")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            pinned_text.contains("2 questions"),
+            "question count: {pinned_text}"
+        );
+        assert!(
+            pinned_text.contains("1 of 2"),
+            "pager position: {pinned_text}"
+        );
+        assert!(pinned_text.contains("Which region should we deploy to?"));
+        let tab = container
+            .query_selector(".ink-activity-tab")
+            .unwrap()
+            .expect("activity tab below pinned question")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let tab_label = tab.text_content().unwrap();
+        assert_eq!(
+            tab_label, "1 agent \u{b7} 1 command",
+            "State 2 keeps the activity bar collapsed below the question without duplicating the question count"
+        );
+        assert_question_action_visible(&container);
+        let height_state_2 = drawer.get_bounding_client_rect().height();
+
+        // State 3 (fully expanded): click activity tab to expand unchanged agents/commands beneath question.
+        tab.click();
+        settle_question_drawer(&container).await;
+        assert!(drawer.class_list().contains("expanded"));
+        assert_eq!(
+            count(&container, "[data-testid='pinned-question-section']"),
+            1
+        );
+        let pinned_rect = container
+            .query_selector("[data-testid='pinned-question-section']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let tab_rect = tab.get_bounding_client_rect();
+        assert!(
+            pinned_rect.bottom() <= tab_rect.top() + 1.5,
+            "pinned question stays at the top of the drawer above the activity section"
+        );
+        let list_text = container
+            .query_selector(".ink-activity-list")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            list_text.contains("Builder") && list_text.contains("Running"),
+            "existing agent row is unchanged beneath the question: {list_text}"
+        );
+        assert_question_action_visible(&container);
+        let height_state_3 = drawer.get_bounding_client_rect().height();
+        assert!(
+            height_state_3 > height_state_2,
+            "State 3 height ({height_state_3}) must exceed State 2 height ({height_state_2})"
+        );
+
+        // State 1 (collapsed): click question collapse toggle -> single bar with question + activity counts.
+        let collapse_btn = container
+            .query_selector("[data-testid='pinned-question-toggle']")
+            .unwrap()
+            .expect("collapse button")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        collapse_btn.click();
+        settle_question_drawer(&container).await;
+        assert_eq!(
+            count(&container, "[data-testid='pinned-question-section']"),
+            0
+        );
+        let collapsed_label = tab.text_content().unwrap();
+        assert_eq!(
+            collapsed_label, "2 questions \u{b7} 1 agent \u{b7} 1 command",
+            "State 1 collapsed bar shows pending question count + activity counts"
+        );
+        let height_state_1 = drawer.get_bounding_client_rect().height();
+        assert!(
+            height_state_1 < height_state_2,
+            "State 1 height ({height_state_1}) must be smaller than State 2 height ({height_state_2})"
+        );
+
+        // Clicking collapsed bar returns to State 2 (question open, activity collapsed).
+        tab.click();
+        settle_question_drawer(&container).await;
+        assert_eq!(
+            count(&container, "[data-testid='pinned-question-section']"),
+            1
+        );
+        assert!(!drawer.class_list().contains("expanded"));
+
+        // Select option 0 ("us-west") in pinned question 1 and verify inline card syncs immediately.
+        let pinned_opt_0 = container
+            .query_selector("[data-testid='pinned-question-body'] .ask-question-option")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        pinned_opt_0.click();
+        settle_question_drawer(&container).await;
+        let inline_opt_0 = container
+            .query_selector(".inline-q1-host .ask-question-option")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inline_opt_0.get_attribute("aria-pressed").as_deref(),
+            Some("true"),
+            "selecting an option in the pinned drawer updates the shared inline transcript card"
+        );
+
+        // Navigate to question 2 ("2 of 2"), pick option 1 ("blue-green"), then navigate back to 1.
+        let next_btn = container
+            .query_selector("[data-testid='pinned-question-next']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        next_btn.click();
+        settle_question_drawer(&container).await;
+        let body_q2 = container
+            .query_selector("[data-testid='pinned-question-section']")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(body_q2.contains("2 of 2") && body_q2.contains("Which rollout strategy?"));
+        let q2_options = container
+            .query_selector_all("[data-testid='pinned-question-body'] .ask-question-option")
+            .unwrap();
+        q2_options
+            .item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        settle_question_drawer(&container).await;
+
+        let prev_btn = container
+            .query_selector("[data-testid='pinned-question-prev']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        prev_btn.click();
+        settle_question_drawer(&container).await;
+        let q1_first_opt = container
+            .query_selector("[data-testid='pinned-question-body'] .ask-question-option")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            q1_first_opt.get_attribute("aria-pressed").as_deref(),
+            Some("true"),
+            "question 1 draft selection is preserved across < 1 of N > navigation"
+        );
+
+        // Submit question 1 from the pinned drawer; verify both pinned and inline cards lock.
+        let submit_btn = container
+            .query_selector("[data-testid='pinned-question-body'] .ask-question-submit")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        submit_btn.click();
+        settle_question_drawer(&container).await;
+        assert!(
+            submit_btn.disabled(),
+            "pinned submit locks while awaiting server completion"
+        );
+        let inline_submit = container
+            .query_selector(".inline-q1-host .ask-question-submit")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert!(
+            inline_submit.disabled(),
+            "inline submit also locks so no duplicate answer can be sent"
+        );
+
+        inline_submit.click();
+        submit_btn.click();
+        settle_question_drawer(&container).await;
+        assert_eq!(
+            js_sys::eval("window.__pinnedAnswerSends").unwrap().as_f64(),
+            Some(1.0),
+            "pinned and inline controls emit exactly one answer together"
+        );
+
+        // Server completes q-1 -> pinned drawer retires q-1 and advances to q-2 with its draft intact.
+        apply_chat_event_from(
+            &state,
+            "host-1",
+            &parent_id,
+            ChatEvent::ToolExecutionCompleted(succeeded_completion(
+                "q-1",
+                ToolExecutionResult::Other {
+                    result: serde_json::json!({}),
+                },
+            )),
+            ChatEventSource::Live,
+        );
+        settle_question_drawer(&container).await;
+        let remaining_text = container
+            .query_selector("[data-testid='pinned-question-section']")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            remaining_text.contains("1 question")
+                && remaining_text.contains("Which rollout strategy?"),
+            "completing q-1 advances the pinned drawer to q-2: {remaining_text}"
+        );
+        let q2_second_opt = container
+            .query_selector_all("[data-testid='pinned-question-body'] .ask-question-option")
+            .unwrap()
+            .item(1)
+            .unwrap()
+            .dyn_into::<web_sys::Element>()
+            .unwrap();
+        assert_eq!(
+            q2_second_opt.get_attribute("aria-pressed").as_deref(),
+            Some("true"),
+            "q-2 draft selection remains intact after q-1 resolves"
+        );
+        let inline_q1_text = container
+            .query_selector(".inline-q1-host")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert!(
+            inline_q1_text.contains("Answer sent"),
+            "inline q-1 card settles to completed state: {inline_q1_text}"
+        );
+        let historical =
+            make_question_request("old-question", "Previously answered question?", "Yes", "No");
+        let history_stream = StreamPath("/agent/agent-parent/instance-1".to_owned());
+        crate::dispatch::clear_stream_seq_for_tests("host-1", &history_stream);
+        apply_history_page(
+            &state,
+            vec![ChatEvent::ToolExecutionCompleted(succeeded_completion(
+                "old-question",
+                ToolExecutionResult::Other {
+                    result: serde_json::json!({}),
+                },
+            ))],
+        );
+        crate::dispatch::clear_stream_seq_for_tests("host-1", &history_stream);
+        apply_history_page(
+            &state,
+            vec![
+                ChatEvent::MessageAdded(protocol::ChatMessage {
+                    origin: None,
+                    message_id: None,
+                    timestamp: 0,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "claude".to_owned(),
+                    },
+                    content: "Earlier question".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }),
+                ChatEvent::ToolRequest(historical),
+            ],
+        );
+        let old_tool = state
+            .chat_row_for_tool_untracked(&parent_id, "old-question")
+            .unwrap()
+            .message_entry()
+            .unwrap()
+            .with_untracked(|entry| entry.tool_requests[0].clone());
+        let history_root = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        container.append_child(&history_root).unwrap();
+        let history_state = state.clone();
+        let _history_handle = mount_to(history_root.clone(), move || {
+            provide_context(history_state);
+            view! { <ToolCardView agent_ref=Signal::derive(|| Some(parent_ref())) entry=old_tool /> }
+        });
+        settle_question_drawer(&container).await;
+        let historical_submit = history_root
+            .query_selector(".ask-question-submit")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert!(
+            historical_submit.disabled(),
+            "newest-first history pages must not reopen an answered question"
+        );
+        assert!(history_root.text_content().unwrap().contains("Answer sent"));
+        assert_eq!(
+            state
+                .pending_user_questions
+                .with_untracked(|map| map[&parent_id].len()),
+            1,
+            "paging history cannot populate the live question inbox"
         );
     }
 }

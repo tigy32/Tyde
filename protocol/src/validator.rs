@@ -1103,6 +1103,22 @@ impl ProtocolValidator {
                         format!("failed to parse AgentBootstrap payload: {error}"),
                     )
                 })?;
+                if let Some(non_question) = payload.pending_user_questions.iter().find(|request| {
+                    !matches!(
+                        request.tool_type,
+                        crate::ToolRequestType::AskUserQuestion { .. }
+                    )
+                }) {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentBootstrap pending_user_questions contained non-question tool_call_id {}",
+                            non_question.tool_call_id
+                        ),
+                    ));
+                }
                 state.saw_bootstrap = true;
                 let bootstrap_events = payload.events;
                 for event in bootstrap_events.iter().cloned() {

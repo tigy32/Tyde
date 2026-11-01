@@ -1156,7 +1156,7 @@ fn structured_response(
 }
 
 #[component]
-fn AskUserQuestionCard(
+pub(crate) fn AskUserQuestionCard(
     owner_agent_ref: AgentRef,
     tool_call_id: String,
     questions: Vec<AskUserQuestion>,
@@ -1165,37 +1165,22 @@ fn AskUserQuestionCard(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
+    let draft = state.user_question_draft(
+        &owner_agent_ref,
+        &tool_call_id,
+        &questions,
+        answered,
+        &answers,
+    );
     let questions = std::sync::Arc::new(questions);
     let states: std::sync::Arc<Vec<QuestionState>> = std::sync::Arc::new(
-        questions
+        draft
+            .items
             .iter()
-            .map(|question| {
-                let answer = answers
-                    .iter()
-                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
-                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
-                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
-                        question
-                            .options
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, option)| {
-                                labels.contains(&option.label).then_some(index)
-                            })
-                            .collect(),
-                        String::new(),
-                        note.clone().unwrap_or_default(),
-                    ),
-                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
-                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
-                    }
-                    None => (Vec::new(), String::new(), String::new()),
-                };
-                QuestionState {
-                    selected: RwSignal::new(selected),
-                    custom: RwSignal::new(custom),
-                    note: RwSignal::new(note),
-                }
+            .map(|item| QuestionState {
+                selected: RwSignal::from(item.selected.clone()),
+                custom: RwSignal::from(item.custom.clone()),
+                note: RwSignal::from(item.note.clone()),
             })
             .collect(),
     );
@@ -1203,9 +1188,9 @@ fn AskUserQuestionCard(
     // the card finds its own reply afterwards — including after a deliberate resend
     // has replaced the underlying record — and therefore how a later transport
     // failure ever gets back to the card that caused it.
-    let submitted = RwSignal::new(None::<SubmissionOriginId>);
-    let sending = RwSignal::new(false);
-    let send_error = RwSignal::new(None::<String>);
+    let submitted = RwSignal::from(draft.submitted);
+    let sending = RwSignal::from(draft.sending);
+    let send_error = RwSignal::from(draft.send_error);
     let status = ReplyStatus {
         submitted,
         sending,
@@ -2869,6 +2854,38 @@ mod wasm_tests {
                  plain message the agent queues: {other:?}"
             ),
         }
+        let mut completed = ask_entry(false);
+        completed.result = Some(succeeded_completion(
+            "toolu_ask",
+            ToolExecutionResult::Other {
+                result: serde_json::json!({}),
+            },
+        ));
+        let settled = make_container();
+        let settled_state = state.clone();
+        let _settled_mount = mount_to(settled.clone(), move || {
+            provide_context(settled_state);
+            view! { <ToolCardView owner_agent_ref=owner_ref() entry=completed /> }
+        });
+        next_tick().await;
+        let settled_submit = submit_button(&settled);
+        assert_eq!(
+            settled_submit.text_content().unwrap(),
+            "Answer sent",
+            "authoritative completion replaces the shared draft's earlier queued state"
+        );
+        assert!(settled_submit.disabled());
+        assert!(
+            !has_sent_note(&settled),
+            "a completed question must not retain a local queue note"
+        );
+        settled_submit.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            1,
+            "the settled shared draft cannot submit again"
+        );
     }
 
     /// Admission is not delivery, and the card must not claim it is.

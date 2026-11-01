@@ -275,6 +275,7 @@ pub fn prime_agent_stream_for_tests(
             activity: protocol::AgentActivity::Idle,
             status: protocol::AgentControlStatus::Idle,
             error: None,
+            pending_user_questions: Vec::new(),
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -5173,6 +5174,13 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agent_session_schemas.update(|map| {
         map.remove(&agent_id);
     });
+    state.pending_user_questions.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.completed_tool_results.update(|map| {
+        map.retain(|(id, _), _| id != &agent_id);
+    });
+    state.clear_agent_question_drafts(&agent_id);
 
     // active_agent is a Memo over center_zone — closing the chat tabs below
     // drives it to None for this agent.
@@ -5203,6 +5211,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
 
 fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
     state.streaming_text.update(|map| {
+        map.remove(agent_id);
+    });
+    state.pending_user_questions.update(|map| {
         map.remove(agent_id);
     });
     state.agent_turn_active.update(|map| {
@@ -5703,10 +5714,32 @@ fn apply_session_history(
 
     let mut replay = HistoryReplay::default();
     for event in payload.events {
+        if let ChatEvent::ToolExecutionCompleted(completion) = &event {
+            state.completed_tool_results.update(|map| {
+                map.insert(
+                    (agent_id.clone(), completion.tool_call_id.clone()),
+                    completion.clone(),
+                );
+            });
+        }
         replay.apply(event, host_id, &agent_id);
     }
 
     if !replay.rows.is_empty() {
+        for row in &replay.rows {
+            if let Some(entry) = row.message_entry() {
+                entry.update(|entry| {
+                    for tool in &mut entry.tool_requests {
+                        if tool.result.is_none() {
+                            tool.result = state.completed_tool_results.with_untracked(|map| {
+                                map.get(&(agent_id.clone(), tool.request.tool_call_id.clone()))
+                                    .cloned()
+                            });
+                        }
+                    }
+                });
+            }
+        }
         // Markers in the page go through the shared upsert: one already on
         // screen is *merged* in place rather than dropped (a paged copy can be
         // richer than the live one that raced past it), and two copies of one
@@ -6335,6 +6368,22 @@ pub fn apply_chat_event_from(
                 tool_call_id,
                 tool_name
             );
+            if matches!(
+                request.tool_type,
+                protocol::ToolRequestType::AskUserQuestion { .. }
+            ) {
+                state.pending_user_questions.update(|map| {
+                    let entries = map.entry(agent_id.clone()).or_default();
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|entry| entry.tool_call_id == tool_call_id)
+                    {
+                        *existing = request.clone();
+                    } else {
+                        entries.push(request.clone());
+                    }
+                });
+            }
             let tool_entry = ToolRequestEntry {
                 presentation: Default::default(),
                 tool_name: tool_name.clone(),
@@ -6389,6 +6438,17 @@ pub fn apply_chat_event_from(
                 data.outcome
             );
             let call_id = data.tool_call_id.clone();
+            state.pending_user_questions.update(|map| {
+                if let Some(entries) = map.get_mut(&agent_id) {
+                    entries.retain(|entry| entry.tool_call_id != call_id);
+                    if entries.is_empty() {
+                        map.remove(&agent_id);
+                    }
+                }
+            });
+            state.completed_tool_results.update(|map| {
+                map.insert((agent_id.clone(), call_id.clone()), data.clone());
+            });
             state.tool_progress.update(|progress| {
                 progress.remove(&(agent_id.clone(), ToolCallId(call_id.clone())));
             });
@@ -7437,6 +7497,12 @@ fn apply_agent_bootstrap(
     state.agent_session_schemas.update(|map| {
         map.remove(&agent_id);
     });
+    state.pending_user_questions.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.completed_tool_results.update(|map| {
+        map.retain(|(id, _), _| id != &agent_id);
+    });
 
     for event in payload.events {
         match event {
@@ -7511,6 +7577,13 @@ fn apply_agent_bootstrap(
     if fatal {
         settle_fatal_agent_ui(state, &agent_id);
     } else {
+        state.pending_user_questions.update(|map| {
+            if payload.pending_user_questions.is_empty() {
+                map.remove(&agent_id);
+            } else {
+                map.insert(agent_id.clone(), payload.pending_user_questions);
+            }
+        });
         set_agent_activity(state, &agent_id, payload.activity);
         if payload.activity != protocol::AgentActivity::Thinking {
             state.streaming_text.update(|map| {

@@ -586,6 +586,11 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .parse_payload()
         .expect("parse pending structured question replay");
         assert_eq!(replay.activity, AgentActivity::AwaitingUser);
+        assert_eq!(
+            replay.pending_user_questions,
+            vec![structured.clone()],
+            "{case}: authoritative pending_user_questions must carry the unanswered question"
+        );
         assert!(replay.events.iter().any(|event| matches!(event,
             protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
                 if pending.tool_call_id == structured.tool_call_id && pending.tool_type == structured.tool_type)),
@@ -771,10 +776,141 @@ async fn ordinary_message_withdraws_async_question_in_live_and_replayed_state() 
         .parse_payload()
         .expect("agent bootstrap");
     assert_eq!(replay.activity, AgentActivity::Idle);
+    assert!(
+        replay.pending_user_questions.is_empty(),
+        "withdrawn question must not remain in pending_user_questions"
+    );
     assert_eq!(replay.events.iter().filter(|event| matches!(event,
         protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion)) if completion.tool_call_id == question.tool_call_id
             && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. })
     )).count(), 1, "reattaching must replay one terminal cancellation, not resurrect the question");
+    fixture.mock(&agent).await.assert_clean().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_user_question_survives_bootstrap_past_history_tail_and_retires_on_answer() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "pinned-question-past-tail",
+            MockScript::one(MockTurn::async_question_with_continued_messages(
+                "pinned-q-1",
+                18,
+                &gate,
+            ))
+            .then(MockTurn::text("region answer processed")),
+        )
+        .await;
+    gate.wait_until_entered().await;
+    gate.release_one();
+    let question = expect_live_question_awaiting_user(&mut fixture, &agent).await;
+    assert_eq!(question.tool_call_id, "pinned-q-1");
+
+    let (mut observer, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "pinned-question-observer",
+    )
+    .await;
+    let descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("agent descriptor");
+    let stream = descriptor.instance_stream.clone();
+    fixture::send_load_agent_on(&mut observer, &stream).await;
+    let replay: protocol::AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut observer, "pinned question replay", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == stream
+        })
+        .await
+        .parse_payload()
+        .expect("agent bootstrap");
+    assert!(
+        replay.error.is_some(),
+        "recoverable error must be present without retiring pending questions"
+    );
+    assert_eq!(replay.activity, AgentActivity::AwaitingUser);
+    assert!(
+        replay.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::HasPriorHistory { message_count, .. }
+                if *message_count > 0
+        )),
+        "continued messages must push the question turn before the initial 15-message tail"
+    );
+    assert!(
+        !replay.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(req))
+                if req.tool_call_id == "pinned-q-1"
+        )),
+        "the question ToolRequest itself is outside the 15-message tail"
+    );
+    assert_eq!(
+        replay.pending_user_questions,
+        vec![question.clone()],
+        "AgentBootstrap.pending_user_questions must still carry the unanswered question"
+    );
+    drop(observer);
+
+    fixture
+        .client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: "Region: us-west".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                    tool_call_id: question.tool_call_id.clone(),
+                    answer: "Region: us-west".to_owned(),
+                    structured_answers: None,
+                }),
+            },
+        )
+        .await
+        .expect("submit answer to pinned question");
+    let answered = fixture.finish_turn(&agent).await;
+    answered.assert_stream_end_contains("region answer processed");
+    assert_eq!(
+        answered
+            .chat_events()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == "pinned-q-1"
+                        && matches!(completion.outcome, protocol::ToolExecutionOutcome::Succeeded { .. })
+            ))
+            .count(),
+        1,
+        "answering the pinned question must complete it once"
+    );
+
+    let (mut after_answer, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "pinned-question-after-answer",
+    )
+    .await;
+    let descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("agent descriptor");
+    let stream = descriptor.instance_stream.clone();
+    fixture::send_load_agent_on(&mut after_answer, &stream).await;
+    let settled: protocol::AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut after_answer, "settled question replay", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == stream
+        })
+        .await
+        .parse_payload()
+        .expect("settled agent bootstrap");
+    assert!(
+        settled.pending_user_questions.is_empty(),
+        "completed question must be retired from pending_user_questions"
+    );
     fixture.mock(&agent).await.assert_clean().await;
 }
 

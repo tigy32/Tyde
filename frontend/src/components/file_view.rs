@@ -2631,6 +2631,19 @@ mod wasm_tests {
                  z-index: 2147483647; background: white; display: flex; flex-direction: column;",
             )
             .unwrap();
+        let image_loaded = js_sys::Function::new_with_args(
+            "root",
+            r#"
+            return new Promise((resolve, reject) => {
+                root.addEventListener('load', resolve, {capture: true, once: true});
+                root.addEventListener('error', reject, {capture: true, once: true});
+            });
+        "#,
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, &container)
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
         let mount_path = path.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -2660,16 +2673,10 @@ mod wasm_tests {
             view! { <FileView tab_id=TabId(20_102) key=file_key(mount_path) /> }
         });
 
-        for _ in 0..10 {
-            next_tick().await;
-            if !container
-                .text_content()
-                .unwrap_or_default()
-                .contains("Loading preview")
-            {
-                break;
-            }
-        }
+        wasm_bindgen_futures::JsFuture::from(image_loaded)
+            .await
+            .unwrap();
+        next_tick().await;
         let buttons = container.query_selector_all("button").unwrap();
         let actual = (0..buttons.length())
             .filter_map(|index| buttons.item(index))

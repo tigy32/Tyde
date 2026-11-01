@@ -134,43 +134,28 @@ fn AskUserQuestionCard(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
+    let draft = state.user_question_draft(
+        agent_ref.get_untracked().map(|target| target.agent_id),
+        &tool_call_id,
+        &questions,
+        answered,
+        &answers,
+    );
     let questions = Arc::new(questions);
     let states: Arc<Vec<QuestionState>> = Arc::new(
-        questions
+        draft
+            .questions
             .iter()
-            .map(|question| {
-                let answer = answers
-                    .iter()
-                    .find(|answer| question.id.as_ref() == Some(&answer.question_id));
-                let (selected, custom, note) = match answer.map(|answer| &answer.answer) {
-                    Some(protocol::UserQuestionAnswerValue::Selected { labels, note }) => (
-                        question
-                            .options
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, option)| {
-                                labels.contains(&option.label).then_some(index)
-                            })
-                            .collect(),
-                        String::new(),
-                        note.clone().unwrap_or_default(),
-                    ),
-                    Some(protocol::UserQuestionAnswerValue::FreeText { text, note }) => {
-                        (Vec::new(), text.clone(), note.clone().unwrap_or_default())
-                    }
-                    None => (Vec::new(), String::new(), String::new()),
-                };
-                QuestionState {
-                    selected: RwSignal::new(selected),
-                    custom: RwSignal::new(custom),
-                    note: RwSignal::new(note),
-                }
+            .map(|item| QuestionState {
+                selected: RwSignal::from(item.selected.clone()),
+                custom: RwSignal::from(item.custom.clone()),
+                note: RwSignal::from(item.note.clone()),
             })
             .collect(),
     );
-    let delivered = RwSignal::new(false);
-    let sending = RwSignal::new(false);
-    let send_error = RwSignal::new(None::<String>);
+    let delivered = RwSignal::from(draft.delivered);
+    let sending = RwSignal::from(draft.sending);
+    let send_error = RwSignal::from(draft.send_error);
     let fatal_state = state.clone();
     let target_is_fatal = Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
 

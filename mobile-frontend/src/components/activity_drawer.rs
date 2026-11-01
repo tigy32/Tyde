@@ -206,13 +206,76 @@ pub fn ActivityDrawer() -> impl IntoView {
         move |_| activity_snapshot(&state)
     });
     let active = state.active_agent;
+    let has_work = move || !snapshot.with(ActivitySnapshot::is_empty);
+    let pending_questions: Signal<Vec<protocol::ToolRequest>> = Signal::derive({
+        let state = state.clone();
+        move || {
+            let Some(parent) = state.active_agent.get() else {
+                return Vec::new();
+            };
+            let parent_is_fatal = state.agents.with(|agents| {
+                agents.iter().any(|agent| {
+                    agent.local_host_id == parent.local_host_id
+                        && agent.agent_id == parent.agent_id
+                        && agent.fatal_error.is_some()
+                })
+            });
+            if parent_is_fatal {
+                return Vec::new();
+            }
+            let owner = parent.as_agent_ref();
+            state
+                .pending_user_questions
+                .with(|map| map.get(&owner).cloned().unwrap_or_default())
+        }
+    });
+    let has_questions = move || !pending_questions.with(|questions| questions.is_empty());
+    let question_open = RwSignal::new(false);
+    let active_question_call_id = RwSignal::new(None::<String>);
+    let seen_question_ids = RwSignal::new((None::<ActiveAgentRef>, Vec::<String>::new()));
+
     Effect::new(move |_| {
         active.track();
         expanded.set(false);
     });
     Effect::new(move |_| {
-        if snapshot.with(ActivitySnapshot::is_empty) {
+        if !has_work() {
             expanded.set(false);
+        }
+    });
+    Effect::new(move |_| {
+        let owner = active.get();
+        let questions = pending_questions.get();
+        let ids: Vec<String> = questions
+            .iter()
+            .map(|question| question.tool_call_id.clone())
+            .collect();
+        if ids.is_empty() {
+            question_open.set(false);
+            active_question_call_id.set(None);
+            seen_question_ids.set((owner, Vec::new()));
+            return;
+        }
+        let (prev_owner, prev_ids) = seen_question_ids.get_untracked();
+        let owner_changed = prev_owner != owner;
+        let has_new = owner_changed || ids.iter().any(|id| !prev_ids.contains(id));
+        if has_new {
+            if !question_open.get_untracked() {
+                expanded.set(false);
+            }
+            question_open.set(true);
+        }
+        seen_question_ids.set((owner, ids.clone()));
+        let current = active_question_call_id.get_untracked();
+        if current.as_ref().is_none_or(|id| !ids.contains(id)) {
+            active_question_call_id.set(ids.first().cloned());
+        }
+    });
+    let collapse_question = Callback::new(move |()| {
+        question_open.set(false);
+        expanded.set(false);
+        if let Some(toggle) = toggle_ref.get_untracked() {
+            let _ = toggle.focus();
         }
     });
     let open_agent = Callback::new(move |target: ActiveAgentRef| {
@@ -222,52 +285,104 @@ pub fn ActivityDrawer() -> impl IntoView {
     });
 
     view! {
-        <Show when=move || !snapshot.with(ActivitySnapshot::is_empty)>
+        <Show when=move || has_work() || has_questions()>
             <div class="activity-anchor" data-mobile-test="activity-anchor">
                 <div
                     class="activity-drawer"
-                    class:expanded=move || expanded.get()
+                    class:expanded=move || has_work() && expanded.get() && (!has_questions() || question_open.get())
+                    class:question-open=move || has_questions() && question_open.get()
                     data-mobile-test="activity-drawer"
                     on:keydown=move |event: web_sys::KeyboardEvent| {
-                        if event.key() == "Escape" && expanded.get_untracked() {
+                        if event.key() == "Escape"
+                            && (expanded.get_untracked()
+                                || (has_questions() && question_open.get_untracked()))
+                        {
                             event.prevent_default();
                             event.stop_propagation();
-                            expanded.set(false);
+                            if expanded.get_untracked() {
+                                expanded.set(false);
+                            } else {
+                                question_open.set(false);
+                            }
                             if let Some(toggle) = toggle_ref.get() {
                                 let _ = toggle.focus();
                             }
                         }
                     }
                 >
-                    <button
-                        type="button"
-                        class="activity-toggle"
-                        data-mobile-test="activity-toggle"
-                        node_ref=toggle_ref
-                        aria-expanded=move || expanded.get().to_string()
-                        aria-controls="mobile-background-activity"
-                        aria-label=move || if expanded.get() { "Collapse background activity" } else { "Expand background activity" }
-                        on:click=move |_| expanded.update(|open| *open = !*open)
-                    >
-                        <span>{move || snapshot.with(|snapshot| {
-                            let n = snapshot.agents.len();
-                            format!("{n} agent{}", if n == 1 { "" } else { "s" })
-                        })}</span>
-                        <svg viewBox="0 0 16 16" aria-hidden="true" class="activity-chevron">
-                            <path d="M3 10L8 5L13 10" />
-                        </svg>
-                        <span>{move || snapshot.with(|snapshot| {
-                            let n = snapshot.commands.len();
-                            format!("{n} command{}", if n == 1 { "" } else { "s" })
-                        })}</span>
-                    </button>
+                    <Show when=move || has_questions() && question_open.get()>
+                        <MobilePinnedQuestionSection
+                            active_agent=active
+                            pending_questions=pending_questions
+                            active_question_call_id=active_question_call_id
+                            on_collapse=collapse_question
+                        />
+                    </Show>
+                    <Show when=move || has_work() || !question_open.get()>
+                        <button
+                            type="button"
+                            class="activity-toggle"
+                            data-mobile-test="activity-toggle"
+                            node_ref=toggle_ref
+                            aria-expanded=move || {
+                                (if has_questions() && !question_open.get() {
+                                    false
+                                } else {
+                                    expanded.get()
+                                })
+                                .to_string()
+                            }
+                            aria-controls="mobile-background-activity"
+                            aria-label=move || {
+                                if expanded.get() {
+                                    "Collapse background activity"
+                                } else {
+                                    "Expand background activity"
+                                }
+                            }
+                            on:click=move |_| {
+                                if has_questions() && !question_open.get_untracked() {
+                                    question_open.set(true);
+                                    expanded.set(false);
+                                } else if has_work() {
+                                    expanded.update(|open| *open = !*open);
+                                } else {
+                                    question_open.set(false);
+                                }
+                            }
+                        >
+                            {move || {
+                                let q = pending_questions.with(|questions| questions.len());
+                                (q > 0 && !question_open.get()).then(|| view! {
+                                    <span>{format!("{q} question{}", if q == 1 { "" } else { "s" })}</span>
+                                })
+                            }}
+                            <Show when=move || has_work()>
+                                <span>{move || snapshot.with(|snapshot| {
+                                    let n = snapshot.agents.len();
+                                    format!("{n} agent{}", if n == 1 { "" } else { "s" })
+                                })}</span>
+                            </Show>
+                            <svg viewBox="0 0 16 16" aria-hidden="true" class="activity-chevron">
+                                <path d="M3 10L8 5L13 10" />
+                            </svg>
+                            <Show when=move || has_work()>
+                                <span>{move || snapshot.with(|snapshot| {
+                                    let n = snapshot.commands.len();
+                                    format!("{n} command{}", if n == 1 { "" } else { "s" })
+                                })}</span>
+                            </Show>
+                        </button>
+                    </Show>
                     <div
                         class="activity-reveal"
                         id="mobile-background-activity"
                         role="region"
                         aria-label="Background activity"
-                        aria-hidden=move || (!expanded.get()).to_string()
-                        inert=move || !expanded.get()
+                        aria-hidden=move || {
+                            (!(has_work() && expanded.get() && (!has_questions() || question_open.get()))).to_string()
+                        }
+                        inert=move || !(has_work() && expanded.get() && (!has_questions() || question_open.get()))
                     >
                         <div class="activity-clip">
                             <div class="activity-list" data-mobile-test="activity-list">
@@ -318,5 +433,130 @@ pub fn ActivityDrawer() -> impl IntoView {
                 </div>
             </div>
         </Show>
+    }
+}
+
+#[component]
+fn MobilePinnedQuestionSection(
+    active_agent: RwSignal<Option<ActiveAgentRef>>,
+    pending_questions: Signal<Vec<protocol::ToolRequest>>,
+    active_question_call_id: RwSignal<Option<String>>,
+    on_collapse: Callback<()>,
+) -> impl IntoView {
+    let total = Signal::derive(move || pending_questions.with(|questions| questions.len()));
+    let active_index = Signal::derive(move || {
+        let current = active_question_call_id.get();
+        pending_questions.with(|questions| {
+            current
+                .as_deref()
+                .and_then(|id| questions.iter().position(|q| q.tool_call_id == id))
+                .unwrap_or(0)
+        })
+    });
+    let active_request = Signal::derive(move || {
+        let idx = active_index.get();
+        pending_questions.with(|questions| questions.get(idx).cloned())
+    });
+
+    view! {
+        <section
+            class="pinned-question-section"
+            data-mobile-test="pinned-question-section"
+            aria-label="Pending question"
+        >
+            <div class="pinned-question-bar" data-mobile-test="pinned-question-bar">
+                <span class="pinned-question-dot" aria-hidden="true"></span>
+                <span class="pinned-question-title" data-mobile-test="pinned-question-title">
+                    {move || {
+                        let count = total.get();
+                        format!("{count} question{}", if count == 1 { "" } else { "s" })
+                    }}
+                </span>
+                <Show when={move || total.get() > 1}>
+                    <div class="pinned-question-pager" data-mobile-test="pinned-question-pager">
+                        <button
+                            type="button"
+                            class="pinned-question-nav"
+                            data-mobile-test="pinned-question-prev"
+                            aria-label="Previous question"
+                            disabled={move || active_index.get() == 0}
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                let idx = active_index.get_untracked();
+                                if idx > 0
+                                    && let Some(prev_id) =
+                                        pending_questions.with_untracked(|questions| {
+                                            questions.get(idx - 1).map(|q| q.tool_call_id.clone())
+                                        })
+                                {
+                                    active_question_call_id.set(Some(prev_id));
+                                }
+                            }
+                        >
+                            "\u{2039}"
+                        </button>
+                        <span
+                            class="pinned-question-position"
+                            data-mobile-test="pinned-question-position"
+                        >
+                            {move || format!("{} of {}", active_index.get() + 1, total.get())}
+                        </span>
+                        <button
+                            type="button"
+                            class="pinned-question-nav"
+                            data-mobile-test="pinned-question-next"
+                            aria-label="Next question"
+                            disabled={move || active_index.get() + 1 >= total.get()}
+                            on:click=move |ev| {
+                                ev.stop_propagation();
+                                let idx = active_index.get_untracked();
+                                if let Some(next_id) =
+                                    pending_questions.with_untracked(|questions| {
+                                        questions.get(idx + 1).map(|q| q.tool_call_id.clone())
+                                    })
+                                {
+                                    active_question_call_id.set(Some(next_id));
+                                }
+                            }
+                        >
+                            "\u{203a}"
+                        </button>
+                    </div>
+                </Show>
+                <button
+                    type="button"
+                    class="pinned-question-toggle"
+                    data-mobile-test="pinned-question-toggle"
+                    aria-label="Collapse question"
+                    aria-expanded="true"
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        on_collapse.run(());
+                    }
+                >
+                    <svg class="pinned-question-chevron" viewBox="0 0 16 16" aria-hidden="true">
+                        <path d="M3 6L8 11L13 6" />
+                    </svg>
+                </button>
+            </div>
+            <div class="pinned-question-body" data-mobile-test="pinned-question-body">
+                {move || {
+                    let parent = active_agent.get()?;
+                    let request = active_request.get()?;
+                    let ToolRequestType::AskUserQuestion { questions, .. } = request.tool_type else {
+                        return None;
+                    };
+                    Some(view! {
+                        <crate::components::tool_card::AskUserQuestionCard
+                            owner_agent_ref=parent.as_agent_ref()
+                            tool_call_id=request.tool_call_id
+                            questions=questions
+                            answered=false
+                            answers=Vec::new()
+                        />
+                    })
+                }}
+            </div>
+        </section>
     }
 }

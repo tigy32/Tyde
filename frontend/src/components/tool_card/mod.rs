@@ -27,7 +27,7 @@ use crate::state::{
     ToolOutputMode, ToolRequestEntry,
 };
 
-mod ask_user_question;
+pub(crate) mod ask_user_question;
 mod error_result;
 mod exit_plan_mode;
 mod get_type_docs;

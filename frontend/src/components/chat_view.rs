@@ -6667,6 +6667,7 @@ mod wasm_tests {
             ],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            pending_user_questions: Vec::new(),
         }
     }
 
@@ -6688,6 +6689,7 @@ mod wasm_tests {
             events,
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            pending_user_questions: Vec::new(),
         }
     }
 
