@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rlimit = "0.10"
 
 [dev-dependencies]
+fs2 = "0.4"
 host-config = { path = "../host-config" }
 protocol = { path = "../protocol" }
 rmcp = { version = "0.15.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }

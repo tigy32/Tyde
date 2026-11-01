@@ -13,6 +13,7 @@ enum CliMode {
     HostStdio,
     HostUds { managed: bool },
     HostStatusUds,
+    HostLaunchLock,
     HostLaunchUds { managed: bool },
     HostBridgeUds,
     McpBridge,
@@ -37,6 +38,7 @@ fn main() {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),
         CliMode::HostUds { managed } => exit_on_error(run_host_uds(managed)),
         CliMode::HostStatusUds => exit_on_error(run_host_status_uds()),
+        CliMode::HostLaunchLock => exit_on_error(run_host_launch_lock()),
         CliMode::HostLaunchUds { managed } => exit_on_error(run_host_launch_uds(managed)),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
         CliMode::McpBridge => exit_on_error(run_mcp_bridge()),
@@ -119,6 +121,9 @@ where
         return CliMode::HostUds { managed: false };
     }
 
+    if args.as_slice() == ["host", "--lock-launch"] {
+        return CliMode::HostLaunchLock;
+    }
     if args.as_slice() == ["host", "--launch-uds", "--managed"] {
         return CliMode::HostLaunchUds { managed: true };
     }
@@ -328,6 +333,17 @@ fn replace_run_file(path: &std::path::Path, value: &str) -> Result<(), String> {
     std::fs::write(&staged, format!("{value}\n"))
         .and_then(|()| std::fs::rename(&staged, path))
         .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+fn run_host_launch_lock() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        server::host_launch::lock_launch_descriptor()
+    }
+    #[cfg(not(unix))]
+    {
+        Err("managed host launch locking requires Unix file descriptors".to_owned())
+    }
 }
 
 fn run_host_status_uds() -> Result<(), String> {

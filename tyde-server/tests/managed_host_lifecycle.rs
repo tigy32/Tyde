@@ -3,9 +3,11 @@
 //! disposable `$HOME`.
 #![cfg(unix)]
 
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
 
 use host_config::managed_host;
 use host_config::{
@@ -17,11 +19,10 @@ use protocol::{
     WelcomePayload, read_envelope, write_envelope,
 };
 
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
-
 struct ManagedHome {
     dir: tempfile::TempDir,
     version: TydeReleaseVersion,
+    untracked: std::cell::RefCell<Vec<Child>>,
 }
 
 impl ManagedHome {
@@ -30,7 +31,11 @@ impl ManagedHome {
         let version: TydeReleaseVersion = env!("CARGO_PKG_VERSION")
             .parse()
             .expect("crate version is a release version");
-        let home = Self { dir, version };
+        let home = Self {
+            dir,
+            version,
+            untracked: Default::default(),
+        };
         let bin_dir = home.path().join(".tyde/bin").join(home.version.as_str());
         std::fs::create_dir_all(&bin_dir).expect("create managed bin dir");
         std::os::unix::fs::symlink(
@@ -100,20 +105,30 @@ impl ManagedHome {
         );
     }
 
-    /// Starts `tyde-server host --uds` the way releases before the
-    /// server-owned pid file did: detached, with nothing recording the pid.
+    /// Keeps an old-style, unregistered host alive under explicit test custody.
     fn spawn_untracked_server(&self, bin: &Path) -> u32 {
-        let output = self.sh(&format!(
-            "nohup {} host --uds > /dev/null 2>&1 < /dev/null &\necho $!",
-            managed_host::shell_quote(&bin.display().to_string())
-        ));
-        let pid = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .expect("shell prints the server pid");
-        wait_until("untracked server to accept connections", || {
-            self.socket_is_live()
-        });
+        let ready_dir = tempfile::Builder::new()
+            .prefix("tyde-lifecycle-ready-")
+            .tempdir()
+            .unwrap();
+        let ready_path = ready_dir.path().join("ready");
+        let listener = std::os::unix::net::UnixListener::bind(&ready_path).unwrap();
+        let child = self
+            .command(bin)
+            .args(["host", "--uds"])
+            .env("TYDE_HOST_STARTUP_SOCKET", &ready_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owned untracked server");
+        let pid = child.id();
+        self.untracked.borrow_mut().push(child);
+        let (mut ready, _) = listener.accept().expect("actual host readiness event");
+        let mut marker = [0; 4];
+        ready
+            .read_exact(&mut marker)
+            .expect("complete readiness acknowledgement");
+        assert_eq!(&marker, b"TYHR");
         pid
     }
 
@@ -121,8 +136,45 @@ impl ManagedHome {
         std::os::unix::net::UnixStream::connect(self.path().join(".tyde/tyde.sock")).is_ok()
     }
 
+    fn hold_legacy_launch_guard(&self) -> u32 {
+        let mut child = self
+            .command("/bin/sh")
+            .args([
+                "-c",
+                r#"set -eu
+mkdir -p "$HOME/.tyde/run"
+launch_lock="$HOME/.tyde/run/tyde-host-launch.pid"
+(set -C; printf '%s\n' "$$" > "$launch_lock")
+trap 'rm -f "$launch_lock"' EXIT
+printf 'LEGACY_OWNER_READY\n'
+read -r completion || exit 0
+"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start historical O_EXCL-only launch owner");
+        let stdout = child.stdout.take().unwrap();
+        let pid = child.id();
+        self.untracked.borrow_mut().push(child);
+        let mut ready = String::new();
+        BufReader::new(stdout).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "LEGACY_OWNER_READY");
+        pid
+    }
+
+    fn release_legacy_launch_guard(&self, pid: u32) {
+        let mut children = self.untracked.borrow_mut();
+        let child = children.iter_mut().find(|child| child.id() == pid).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+
     fn managed_server_pids(&self) -> Vec<u32> {
-        pids_matching(&format!("^{}/", self.path().join(".tyde/bin").display()))
+        pids_matching(&format!(
+            "^{}/[^/]+/tyde-server host --uds( --managed)?$",
+            self.path().join(".tyde/bin").display()
+        ))
     }
 
     fn recorded_pid(&self) -> Option<u32> {
@@ -138,13 +190,15 @@ impl ManagedHome {
         std::fs::read_to_string(log).unwrap_or_default()
     }
 
-    /// Waits for every server that lost the socket race to exit, and returns
-    /// the one process left holding it.
+    /// Launch completion must leave exactly one live socket owner.
     fn sole_managed_server(&self) -> u32 {
-        wait_until("exactly one managed server to remain", || {
-            self.managed_server_pids().len() == 1
-        });
-        self.managed_server_pids()[0]
+        let owners = self.managed_server_pids();
+        assert_eq!(
+            owners.len(),
+            1,
+            "completed launch must leave one live socket owner"
+        );
+        owners[0]
     }
 
     fn assert_managed_by(&self, owner: u32, context: &str) {
@@ -169,14 +223,10 @@ impl Drop for ManagedHome {
         for pid in pids_matching(&format!("^{}/", self.path().display())) {
             kill(pid);
         }
-    }
-}
-
-fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + SETTLE_TIMEOUT;
-    while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
+        for child in self.untracked.get_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -189,6 +239,14 @@ fn pids_matching(pattern: &str) -> Vec<u32> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|line| line.trim().parse().expect("pgrep prints pids"))
+        .filter(|pid: &u32| {
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("read exact process state");
+            let state = String::from_utf8_lossy(&state.stdout);
+            !state.trim().is_empty() && !state.trim().starts_with('Z')
+        })
         .collect()
 }
 
@@ -206,6 +264,119 @@ fn dead_pid() -> u32 {
     pid
 }
 
+struct LaunchCaller {
+    child: Child,
+    stderr: BufReader<ChildStderr>,
+    joined: bool,
+}
+
+impl LaunchCaller {
+    fn waiting(home: &ManagedHome) -> Self {
+        let shim = home.path().join("launch-no-delay");
+        std::fs::create_dir_all(&shim).unwrap();
+        let sleep = shim.join("sleep");
+        std::fs::write(
+            &sleep,
+            "#!/bin/sh\nprintf 'launch attempted delay polling\\n' >&2\nexit 97\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sleep, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut path = vec![shim];
+        path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let mut child = home
+            .command("/bin/sh")
+            .args(["-c", &managed_host::launch_script(&home.version)])
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("start owned launch caller");
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let mut caller = Self {
+            child,
+            stderr,
+            joined: false,
+        };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                caller.stderr.read_line(&mut line).unwrap(),
+                0,
+                "Launch must enter its native descriptor wait, not fail or poll a delay while the resource owner is active"
+            );
+            if line.trim() == "tyde-server: waiting for managed launch owner" {
+                break;
+            }
+        }
+        caller
+    }
+
+    fn finish(mut self) {
+        let status = self.child.wait().expect("join launch completion");
+        self.joined = true;
+        let mut stderr = String::new();
+        self.stderr.read_to_string(&mut stderr).unwrap();
+        assert!(status.success(), "event-released launch failed: {stderr}");
+    }
+
+    fn refuse_legacy_owner(mut self) {
+        let status = self.child.wait().expect("join legacy guard refusal");
+        self.joined = true;
+        let mut stderr = String::new();
+        self.stderr.read_to_string(&mut stderr).unwrap();
+        assert!(!status.success());
+        assert!(stderr.contains("legacy managed launch guard exists"));
+    }
+
+    fn cancel(mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", self.child.id())])
+            .status()
+            .expect("cancel only owned caller process group");
+        assert!(status.success());
+        assert!(!self.child.wait().expect("join canceled caller").success());
+        self.joined = true;
+        let mut tail = Vec::new();
+        self.stderr
+            .read_to_end(&mut tail)
+            .expect("all owned caller descriptors close after cancellation");
+    }
+}
+
+impl Drop for LaunchCaller {
+    fn drop(&mut self) {
+        if !self.joined {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.child.id())])
+                .status();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct LaunchLease(std::fs::File);
+impl LaunchLease {
+    fn hold(home: &ManagedHome) -> Self {
+        let run = home.path().join(".tyde/run");
+        std::fs::create_dir_all(&run).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run.join("tyde-host-launch.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&file).unwrap();
+        Self(file)
+    }
+}
+impl Drop for LaunchLease {
+    fn drop(&mut self) {
+        fs2::FileExt::unlock(&self.0).unwrap();
+    }
+}
+
 #[test]
 fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     let home = ManagedHome::install();
@@ -213,21 +384,58 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     assert!(fresh.installed_target);
     assert_eq!(fresh.running, RemoteTydeRunningState::NotRunning);
 
+    let legacy_owner = home.hold_legacy_launch_guard();
+    let incompatible = home.launch();
+    assert!(!incompatible.status.success());
+    assert!(
+        String::from_utf8_lossy(&incompatible.stderr)
+            .contains("legacy managed launch guard exists")
+    );
+    assert!(home.managed_server_pids().is_empty());
+    assert!(home.recorded_pid().is_none());
+    assert!(!home.socket_is_live());
+    home.release_legacy_launch_guard(legacy_owner);
+    let legacy_guard = home.path().join(".tyde/run/tyde-host-launch.pid");
+    let stale = dead_pid().to_string();
+    std::fs::write(&legacy_guard, &stale).unwrap();
+    let inode = std::fs::symlink_metadata(&legacy_guard).unwrap().ino();
+    let stale_refused = home.launch();
+    assert!(!stale_refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale_refused.stderr)
+            .contains("legacy managed launch guard exists")
+    );
+    assert!(std::fs::read_to_string(&legacy_guard).unwrap() == stale);
+    assert_eq!(
+        std::fs::symlink_metadata(&legacy_guard).unwrap().ino(),
+        inode
+    );
+    assert!(home.managed_server_pids().is_empty());
+
+    let lease = LaunchLease::hold(&home);
+    let queued = LaunchCaller::waiting(&home);
+    // The historical client replaces its stale marker while the new caller
+    // actually waits on its lease. The replacement owner must not be reclaimed.
+    std::fs::remove_file(&legacy_guard).unwrap();
+    let replacement = home.hold_legacy_launch_guard();
+    drop(lease);
+    queued.refuse_legacy_owner();
+    assert!(std::fs::read_to_string(&legacy_guard).unwrap().trim() == replacement.to_string());
+    assert!(home.managed_server_pids().is_empty());
+    home.release_legacy_launch_guard(replacement);
+
     // Two clients (or a superseded and a fresh reconnect attempt) launch at
     // once. Exactly one server can own the socket, and the pid file must name
     // that one, or every later reconnect relaunches into a bound socket.
-    let launches = std::thread::scope(|scope| {
-        let first = scope.spawn(|| home.launch());
-        let second = scope.spawn(|| home.launch());
-        [first.join().unwrap(), second.join().unwrap()]
-    });
-    for launch in &launches {
-        assert!(
-            launch.status.success(),
-            "concurrent launch failed: {}",
-            String::from_utf8_lossy(&launch.stderr)
-        );
-    }
+    let lease = LaunchLease::hold(&home);
+    let first = LaunchCaller::waiting(&home);
+    let canceled = LaunchCaller::waiting(&home);
+    canceled.cancel();
+    let second = LaunchCaller::waiting(&home);
+    drop(lease);
+    first.finish();
+    second.finish();
+    assert!(!home.path().join(".tyde/run/tyde-host-launch.pid").exists());
     let owner = home.sole_managed_server();
     home.assert_managed_by(owner, "after concurrent launches");
 
@@ -247,12 +455,31 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
         home.launch_log()
     );
 
+    let invalid_parent = home.path().join("not-a-directory");
+    std::fs::write(&invalid_parent, b"owned error boundary").unwrap();
+    let failed = home
+        .command("/bin/sh")
+        .args(["-c", &managed_host::launch_script(&home.version)])
+        .env("TYDE_SOCKET_PATH", invalid_parent.join("host.sock"))
+        .output()
+        .expect("observe real launcher error");
+    assert!(
+        !failed.status.success(),
+        "real startup errors must not be reported as readiness"
+    );
+    assert!(
+        home.launch().status.success(),
+        "failed caller must release its launch lease"
+    );
+    home.assert_managed_by(owner, "after failed caller");
+
     // SIGTERM runs production cleanup; disconnecting the earlier probes did
     // not shut down this shared host.
     home.stop();
-    wait_until("stopped server to exit", || {
-        home.managed_server_pids().is_empty()
-    });
+    assert!(
+        home.managed_server_pids().is_empty(),
+        "completed stop must leave no live managed host"
+    );
     assert_eq!(home.probe().running, RemoteTydeRunningState::NotRunning);
 
     // The state older releases left in the wild: a live managed server that
@@ -267,6 +494,33 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
         format!("{}\n", home.version.as_str()),
     )
     .unwrap();
+    let pending_target: TydeReleaseVersion = "0.9.6-beta.999999".parse().unwrap();
+    let pending_probe = home.sh(&managed_host::probe_script(&pending_target));
+    assert!(
+        pending_probe.status.success(),
+        "an installation probe must not require the missing target's helper"
+    );
+    let pending = managed_host::parse_probe_output(
+        &String::from_utf8(pending_probe.stdout).unwrap(),
+        RemotePlatform {
+            os: RemoteOperatingSystem::Linux,
+            arch: RemoteArchitecture::X86_64,
+        },
+        pending_target,
+    )
+    .unwrap();
+    assert!(!pending.installed_target);
+    assert_eq!(
+        pending.running,
+        RemoteTydeRunningState::Managed {
+            version: home.version.clone()
+        }
+    );
+    assert_ne!(
+        home.recorded_pid(),
+        Some(orphan),
+        "read-only installation probe must not publish an unleased adoption"
+    );
     assert_eq!(
         home.probe().running,
         RemoteTydeRunningState::Managed {
@@ -283,7 +537,10 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     );
     assert_eq!(home.sole_managed_server(), orphan);
     home.stop();
-    wait_until("adopted server to exit", || !home.socket_is_live());
+    assert!(
+        !home.socket_is_live(),
+        "completed stop must retract the adopted socket"
+    );
 
     // A socket held by a server Tyde did not launch is never claimed.
     let manual_dir = home.path().join("manual");
@@ -300,7 +557,17 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     assert_eq!(home.recorded_pid(), None);
     assert!(home.managed_server_pids().is_empty());
     kill(manual);
-    wait_until("unmanaged server to exit", || !home.socket_is_live());
+    let mut children = home.untracked.borrow_mut();
+    let manual_child = children
+        .iter_mut()
+        .find(|child| child.id() == manual)
+        .unwrap();
+    manual_child.wait().expect("join manual server exit");
+    drop(children);
+    assert!(
+        !home.socket_is_live(),
+        "joined manual host must not accept connections"
+    );
 
     // Once that server is gone its stale socket file must not block a launch.
     assert_eq!(home.probe().running, RemoteTydeRunningState::NotRunning);
@@ -318,8 +585,8 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
 fn managed_stop_refuses_a_reused_foreign_pid() {
     let home = ManagedHome::install();
     let mut foreign = home
-        .command("sleep")
-        .arg("120")
+        .command("cat")
+        .stdin(Stdio::piped())
         .spawn()
         .expect("spawn foreign process");
     let run = home.path().join(".tyde/run");
@@ -331,8 +598,8 @@ fn managed_stop_refuses_a_reused_foreign_pid() {
         .try_wait()
         .expect("inspect foreign process")
         .is_none();
-    let _ = foreign.kill();
-    foreign.wait().expect("reap owned probe");
+    drop(foreign.stdin.take());
+    foreign.wait().expect("reap owned EOF-driven probe");
     assert!(
         !result.status.success(),
         "stop must reject a pid belonging to another command"

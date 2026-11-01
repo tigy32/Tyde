@@ -109,6 +109,44 @@ impl Drop for DebugMcpAttachment {
     }
 }
 
+/// Lock the shell's inherited descriptor. Closing this duplicate does not
+/// release its shared open-file-description lease; shell exit/cancellation does.
+pub fn lock_launch_descriptor() -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    let duplicate = unsafe { libc::fcntl(9, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate managed launch descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(duplicate) };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!("tyde-server: waiting for managed launch owner");
+            fs2::FileExt::lock_exclusive(&file)
+                .map_err(|error| format!("acquire managed launch lease: {error}"))
+        }
+        Err(error) => Err(format!("acquire managed launch lease: {error}")),
+    }?;
+
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| "managed launch requires HOME".to_owned())?;
+    let legacy_guard = PathBuf::from(home).join(".tyde/run/tyde-host-launch.pid");
+    // Older clients can replace this pathname without taking our lease. Even a
+    // dead PID cannot authorize unlinking what may now be a different owner's guard.
+    match std::fs::symlink_metadata(legacy_guard) {
+        Ok(_) => Err(
+            "legacy managed launch guard exists; finish or cancel its client; stale guards require explicit owner repair"
+                .to_owned(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect legacy managed launch guard: {error}")),
+    }
+}
+
 #[cfg(unix)]
 pub fn launch_current(program: &Path, log_path: &Path, managed: bool) -> Result<(), String> {
     let current =

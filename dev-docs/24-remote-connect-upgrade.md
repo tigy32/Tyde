@@ -27,10 +27,44 @@ pid file always names the socket owner. The launch script succeeds only when
 the pid file names the process it started; the mere existence of a socket
 proves nothing, because another server may own it.
 
-Launches are serialized by `~/.tyde/run/tyde-host-launch.pid`, created with a
-shell noclobber redirection (`O_EXCL`). Do not use `mkdir` as the lock: uutils
-coreutils reports success when it loses the create race. With the lock held, a launch that finds a live socket settles on the recorded server instead
-of starting a second one against a bound socket.
+Launches and orphan adoption share a kernel file lease on
+`~/.tyde/run/tyde-host-launch.lock`. The shell opens descriptor 9 and the exact
+installed server's internal `host --lock-launch` command locks its shared open
+file description. Contenders wait for actual release, cancellation or an error,
+not a retry count or elapsed deadline. The pathname is never unlinked: removing
+it could let different callers lock different inodes. Closing the last inherited
+lease descriptor releases it, including on launcher failure. The process-launch
+exec helper closes unowned descriptors before the independent host executes, so
+the long-lived server cannot retain the launch lease. No external locking utility,
+extra interpreter, host-load admission or execution-mode change is required.
+
+While holding that lease, callers also publish the historical O_EXCL PID guard
+so an older client's script cannot enter the same critical section. An already
+active legacy owner produces an explicit incompatibility error: that client must
+finish or cancel its launch. It is never bypassed or delay-polled. A stale guard
+also fails explicitly: PID absence cannot authorize removal while older callers
+can still replace the pathname outside the new lease. Explicit owner repair must
+establish that no legacy launcher can still mutate that guard. Normal release,+HUP, INT and TERM remove only the caller's own marker; an uncatchable kill can
+leave a guard that requires explicit repair. The real lifecycle flow covers a
+live O_EXCL-only owner, stale-guard refusal and replacement by an actual owner
+while a new caller is queued, separately from native lease contention.
+
+Installation probes with a missing exact target cannot invoke its lock helper.
+They may observe a unique live managed-directory owner, but do not publish an
+adoption. Installation already re-probes the exact target before stop/launch;
+that probe performs any required adoption under the lease. Probes never download
+anything. An ambiguous set of orphan processes is not guessed or polled into a
+winner.
+
+The former 100-attempt delay-polling deadline first appeared in
+`fd5c727244e992f557458d531ea32f137d69f62c` (2026-07-21), before its
+2026-09-19 extraction into this module. A real concurrent lifecycle check later
+rejected a still-active launcher at that boundary. The regression now holds the
+actual resource lease, starts real callers, observes native contention, cancels
+one caller and releases the owner explicitly. PID/socket assertions, real launch
+error propagation, orphan adoption and foreign-PID refusal remain covered.
+Neither this defect nor its source introduction establishes the original 8–20s
+UI-freeze cause or introduction.
 
 Releases before the server-owned pid file could record a server that then
 failed to bind, leaving the real owner running but untracked. When the socket

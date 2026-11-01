@@ -12,33 +12,33 @@ use crate::{
 const SHELL_LIB: &str = r#"pid_file="$HOME/.tyde/run/tyde-host.pid"
 version_file="$HOME/.tyde/run/tyde-host-version"
 socket="$HOME/.tyde/tyde.sock"
-launch_lock="$HOME/.tyde/run/tyde-host-launch.pid"
+launch_lock="$HOME/.tyde/run/tyde-host-launch.lock"
+legacy_launch_lock="$HOME/.tyde/run/tyde-host-launch.pid"
 
-# The lock is a noclobber redirection because that is an O_EXCL create inside
-# the shell itself. `mkdir` is not a lock: uutils coreutils reports success
-# when it loses the create race, which let two launches run at once.
 acquire_launch_lock() {
   mkdir -p "$HOME/.tyde/run"
-  i=0
-  while ! (set -C; printf '%s\n' "$$" > "$launch_lock") 2>/dev/null; do
-    lock_pid="$(cat "$launch_lock" 2>/dev/null || true)"
-    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-      rm -f "$launch_lock"
-      continue
-    fi
-    if [ "$i" -ge 100 ]; then
-      echo "timed out waiting for another managed Tyde launch" >&2
-      exit 1
-    fi
-    i=$((i + 1))
-    sleep 0.1
-  done
-  trap 'rm -f "$launch_lock"' EXIT
+  # The inherited open file description owns the lease, not this pathname or a pid.
+  # Keep the inode stable so queued callers cannot acquire different locks.
+  exec 9>>"$launch_lock"
+  "$1" host --lock-launch
+  if ! (set -C; printf '%s\n' "$$" > "$legacy_launch_lock") 2>/dev/null; then
+    echo "legacy managed launch guard changed during acquisition" >&2
+    exit 1
+  fi
+  trap release_launch_lock EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 release_launch_lock() {
-  rm -f "$launch_lock"
-  trap - EXIT
+  if [ "$(cat "$legacy_launch_lock")" != "$$" ]; then
+    echo "managed launch guard owner changed before release" >&2
+    exit 1
+  fi
+  rm "$legacy_launch_lock"
+  trap - EXIT HUP INT TERM
+  exec 9>&-
 }
 
 recorded_pid_alive() {
@@ -54,26 +54,23 @@ socket_is_live() {
 # Releases whose launch script wrote the pid file could record a server that
 # then lost the bind race, leaving the real socket owner untracked. Reclaim it
 # when exactly one server launched from the managed bin directory is running.
-# Call with the launch lock held.
-adopt_orphaned_server() {
-  i=0
-  while :; do
-    orphan_pids="$(pgrep -u "$(id -u)" -f "^$HOME/\.tyde/bin/[^/]+/tyde-server host --uds" || true)"
-    orphan_count="$(printf '%s\n' "$orphan_pids" | grep -c . || true)"
-    if [ "$orphan_count" -le 1 ] || [ "$i" -ge 10 ]; then
-      break
-    fi
-    i=$((i + 1))
-    sleep 0.2
-  done
+find_orphaned_server() {
+  orphan_pids="$(pgrep -u "$(id -u)" -f "^$HOME/\.tyde/bin/[^/]+/tyde-server host --uds" || true)"
+  orphan_count="$(printf '%s\n' "$orphan_pids" | grep -c . || true)"
   [ "$orphan_count" -eq 1 ] || return 1
   orphan_version="$(ps -o args= -p "$orphan_pids" | sed -n "s|^$HOME/\.tyde/bin/\([^/]*\)/tyde-server host --uds.*|\1|p")"
   [ -n "$orphan_version" ] || return 1
+}
+
+# Publication requires the launch lease; installation probes only observe.
+adopt_orphaned_server() {
+  find_orphaned_server || return 1
   printf '%s\n' "$orphan_version" > "$version_file.adopt"
   mv "$version_file.adopt" "$version_file"
   printf '%s\n' "$orphan_pids" > "$pid_file.adopt"
   mv "$pid_file.adopt" "$pid_file"
 }
+
 "#;
 
 const PROBE_BODY: &str = r#"if [ -x "$HOME/.tyde/bin/$target_version/tyde-server" ]; then
@@ -94,6 +91,7 @@ for candidate in "$HOME/.tyde/bin/$target_version/tyde-server" "$HOME/.tyde/bin/
   fi
 done
 running=not_running
+running_version=
 if recorded_pid_alive && [ -S "$socket" ]; then
   running=managed
 elif [ -S "$socket" ] && [ -z "$status_bin" ]; then
@@ -101,16 +99,28 @@ elif [ -S "$socket" ] && [ -z "$status_bin" ]; then
     running=unknown_socket
   fi
 elif socket_is_live "$status_bin"; then
-  acquire_launch_lock
-  if recorded_pid_alive || adopt_orphaned_server; then
+  lock_bin="$HOME/.tyde/bin/$target_version/tyde-server"
+  if [ -x "$lock_bin" ]; then
+    acquire_launch_lock "$lock_bin"
+    if recorded_pid_alive || adopt_orphaned_server; then
+      running=managed
+    else
+      running=unknown_socket
+    fi
+    release_launch_lock
+  elif find_orphaned_server; then
+    # Installation probes cannot require a helper from the not-yet-installed target.
+    # Observe the unique owner without publishing ownership outside its lease.
     running=managed
+    running_version="$orphan_version"
   else
     running=unknown_socket
   fi
-  release_launch_lock
 fi
 echo "running=$running"
-if [ "$running" = managed ] && [ -f "$version_file" ]; then
+if [ -n "$running_version" ]; then
+  echo "running_version=$running_version"
+elif [ "$running" = managed ] && [ -f "$version_file" ]; then
   printf 'running_version=%s\n' "$(cat "$version_file" 2>/dev/null || true)"
 else
   echo running_version=
@@ -120,11 +130,11 @@ fi
 const LAUNCH_BODY: &str = r#"bin="$HOME/.tyde/bin/$version/tyde-server"
 log_file="$HOME/.tyde/logs/tyde-host-$version.log"
 mkdir -p "$HOME/.tyde/logs"
-acquire_launch_lock
 if [ ! -x "$bin" ]; then
   echo "managed tyde-server binary is not executable: $bin" >&2
   exit 1
 fi
+acquire_launch_lock "$bin"
 if socket_is_live "$bin"; then
   if recorded_pid_alive || adopt_orphaned_server; then
     release_launch_lock

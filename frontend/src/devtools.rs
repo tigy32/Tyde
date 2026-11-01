@@ -74,6 +74,7 @@ fn format_js_error(value: JsValue) -> String {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::mount_to;
     use leptos::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};

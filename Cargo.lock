@@ -9500,6 +9500,7 @@ dependencies = [
 name = "tyde-server"
 version = "0.9.6-beta.16"
 dependencies = [
+ "fs2",
  "host-config",
  "protocol",
  "rlimit",
