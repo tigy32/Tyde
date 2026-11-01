@@ -6702,6 +6702,10 @@ impl AppState {
         if current == next {
             return;
         }
+        let _diagnostic = crate::perf::UiSpan::transition(
+            crate::perf::UiTransition::ProjectSwitch,
+            usize::from(next.is_some()),
+        );
 
         if let Some(outgoing) = current {
             let snapshot = ProjectViewMemory {
@@ -7501,6 +7505,7 @@ impl AppState {
         label: String,
         closeable: bool,
     ) -> Option<TabId> {
+        let _diagnostic = crate::perf::UiSpan::transition(crate::perf::UiTransition::TabOpen, 1);
         let tabs_enabled = self.tabs_enabled.get_untracked();
         let ratio = self.center_split_ratio.get_untracked();
         let mut result = None;
@@ -7959,6 +7964,8 @@ impl AppState {
         if doomed.is_empty() {
             return;
         }
+        let _diagnostic =
+            crate::perf::UiSpan::transition(crate::perf::UiTransition::TabClose, doomed.len());
         // Release the doomed diff tabs' code-intel holds *first*, so the file
         // teardown below sees an accurate holder set. Closing a file tab and the
         // diff tab holding the same file together must still tear the file down.
@@ -7997,6 +8004,7 @@ impl AppState {
     }
 
     pub fn reveal_tab(&self, id: TabId) -> bool {
+        let _diagnostic = crate::perf::UiSpan::transition(crate::perf::UiTransition::TabReveal, 1);
         let mut revealed = false;
         self.center_zone.update(|center_zone| {
             revealed = center_zone.reveal_tab(id);

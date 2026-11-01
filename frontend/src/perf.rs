@@ -11,9 +11,10 @@
 //! perf::log_phase("file_open", "response", "file:src/foo.rs", " bytes=12345");
 //! ```
 use host_config::diagnostics::{
-    FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, SlowUiWork, UiTaskWork,
+    FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, MAX_UI_ACTIVITY, SlowUiWork,
+    UiActivityContext, UiFrameActivity, UiTaskWork, UiTransitionActivity,
 };
-pub(crate) use host_config::diagnostics::{FrontendStartupPhase, UiOperation};
+pub(crate) use host_config::diagnostics::{FrontendStartupPhase, UiOperation, UiTransition};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -73,6 +74,10 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::AgentsSidebarProjection => "agents_sidebar_projection",
         UiOperation::TaskPoll => "task_poll",
         UiOperation::TaskDrop => "task_drop",
+        UiOperation::ProjectSwitch => "project_switch",
+        UiOperation::TabOpen => "tab_open",
+        UiOperation::TabClose => "tab_close",
+        UiOperation::TabReveal => "tab_reveal",
     }
 }
 
@@ -159,6 +164,7 @@ struct LocalMonitor {
     last_tick: f64,
     longest: Option<SlowUiWork>,
     task_work: TaskWork,
+    activity: ActivityContext,
     pending: u32,
     queue: VecDeque<FrontendDiagnostic>,
     sending: bool,
@@ -166,6 +172,68 @@ struct LocalMonitor {
     dropped: u32,
     window_start: f64,
     emitted: u32,
+}
+
+struct ActivityContext {
+    commands: VecDeque<(protocol::FrameKind, f64)>,
+    dispatch: Option<(protocol::FrameKind, f64)>,
+    transitions: VecDeque<(UiTransition, f64)>,
+}
+
+impl Default for ActivityContext {
+    fn default() -> Self {
+        Self {
+            commands: VecDeque::with_capacity(MAX_UI_ACTIVITY),
+            dispatch: None,
+            transitions: VecDeque::with_capacity(MAX_UI_ACTIVITY),
+        }
+    }
+}
+
+impl ActivityContext {
+    fn snapshot(&self, now: f64) -> UiActivityContext {
+        let frame = |&(kind, at): &(protocol::FrameKind, f64)| UiFrameActivity {
+            frame: frame_name(kind),
+            age_ms: millis(now - at),
+        };
+        UiActivityContext {
+            commands: self.commands.iter().map(frame).collect(),
+            dispatch: self.dispatch.as_ref().map(frame),
+            transitions: self
+                .transitions
+                .iter()
+                .map(|&(transition, at)| UiTransitionActivity {
+                    transition,
+                    age_ms: millis(now - at),
+                })
+                .collect(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.commands.clear();
+        self.dispatch = None;
+        self.transitions.clear();
+    }
+}
+
+fn frame_name(kind: protocol::FrameKind) -> FrameName {
+    serde_json::to_value(kind)
+        .and_then(serde_json::from_value::<FrameName>)
+        .expect("protocol frame kinds serialize as snake_case identifiers")
+}
+
+pub(crate) fn command_queued(kind: protocol::FrameKind) {
+    LOCAL_MONITOR.with_borrow_mut(|slot| {
+        if let Some(m) = slot {
+            if m.activity.commands.len() == MAX_UI_ACTIVITY {
+                m.activity.commands.pop_front();
+            }
+            m.activity
+                .commands
+                .push_back((kind, local_monitor_now(&m.handle)));
+        }
+    });
 }
 
 #[derive(Default)]
@@ -208,13 +276,14 @@ fn install_local_monitor(env: &JsValue) {
             m.last_tick = now;
             let longest_work = m.longest.take();
             let task_work = std::mem::take(&mut m.task_work).finish();
-            (visible && interval >= 1250).then_some(FrontendDiagnostic::EventLoopGap {
+            (visible && interval >= 1250).then(|| FrontendDiagnostic::EventLoopGap {
                 interval_ms: interval,
                 expected_ms: 1000,
                 focused,
                 longest_work,
                 pending_bridge_calls: m.pending,
                 task_work,
+                activity: m.activity.snapshot(now),
             })
         });
         if let Some(diagnostic) = diagnostic {
@@ -227,6 +296,7 @@ fn install_local_monitor(env: &JsValue) {
                 m.last_tick = now;
                 m.longest = None;
                 m.task_work = TaskWork::default();
+                m.activity.clear();
             }
         });
     });
@@ -241,6 +311,7 @@ fn install_local_monitor(env: &JsValue) {
             last_tick: started,
             longest: None,
             task_work: TaskWork::default(),
+            activity: ActivityContext::default(),
             pending: 0,
             queue: VecDeque::new(),
             sending: false,
@@ -406,8 +477,12 @@ impl UiSpan {
             if waiting {
                 m.pending = m.pending.saturating_add(1);
             }
+            let start = local_monitor_now(&m.handle);
+            if let (UiOperation::HostDispatch, Some(kind)) = (operation, frame) {
+                m.activity.dispatch = Some((kind, start));
+            }
             Some(LocalSpan {
-                start: local_monitor_now(&m.handle),
+                start,
                 operation,
                 waiting,
                 frame,
@@ -426,6 +501,27 @@ impl UiSpan {
             },
             local: Self::local(operation, false, None, bytes, items),
         }
+    }
+
+    pub(crate) fn transition(transition: UiTransition, items: usize) -> Self {
+        let operation = match transition {
+            UiTransition::ProjectSwitch => UiOperation::ProjectSwitch,
+            UiTransition::TabOpen => UiOperation::TabOpen,
+            UiTransition::TabClose => UiOperation::TabClose,
+            UiTransition::TabReveal => UiOperation::TabReveal,
+        };
+        let span = Self::new(operation, 0, items);
+        if let Some(local) = &span.local {
+            LOCAL_MONITOR.with_borrow_mut(|slot| {
+                if let Some(m) = slot {
+                    if m.activity.transitions.len() == MAX_UI_ACTIVITY {
+                        m.activity.transitions.pop_front();
+                    }
+                    m.activity.transitions.push_back((transition, local.start));
+                }
+            });
+        }
+        span
     }
 
     pub(crate) fn frame(kind: protocol::FrameKind) -> Self {
@@ -530,11 +626,7 @@ impl Drop for UiSpan {
                 m.longest = Some(SlowUiWork {
                     operation: span.operation,
                     duration_ms,
-                    frame: span.frame.map(|kind| {
-                        serde_json::to_value(kind)
-                            .and_then(serde_json::from_value::<FrameName>)
-                            .expect("protocol frame kinds serialize as snake_case identifiers")
-                    }),
+                    frame: span.frame.map(frame_name),
                     bytes: count(span.bytes),
                     items: count(span.items),
                 });
@@ -617,11 +709,12 @@ export function diagnosticTestBrowserWork(env, start, end) { return env.browserW
 
     #[wasm_bindgen(inline_js = r#"
 export function localMonitorTestEnvironment() {
-    let time = 1000, timer = null, readingStep = 150;
+    let time = 1000, timer = null, readingStep = 150, foreground = true, visibility;
     return {
         document: {
-            visibilityState: 'visible', hasFocus: () => true,
-            addEventListener() {}, removeEventListener() {},
+            get visibilityState() { return foreground ? 'visible' : 'hidden'; }, hasFocus: () => true,
+            addEventListener(name, fn) { if (name === 'visibilitychange') visibility = fn; },
+            removeEventListener(name) { if (name === 'visibilitychange') visibility = null; },
         },
         // Every reading advances the injected clock, so synchronous work has a
         // deterministic nonzero duration without real time passing.
@@ -629,16 +722,36 @@ export function localMonitorTestEnvironment() {
         setTimeout(fn) { timer = fn; return 1; }, clearTimeout() { timer = null; },
         advance(amount) { time += amount; },
         readingStep(amount) { readingStep = amount; },
+        visibility(amount) { foreground = amount === 1; visibility(); },
         tick() { const fn = timer; timer = null; if (fn) fn(); },
     };
 }
 export function localMonitorTestCall(env, method, amount) { return env[method](amount); }
+export function localLogCapture() {
+    const invoke = window.__TAURI__.core.invoke, records = [];
+    window.__TAURI__.core.invoke = (command, args) => {
+        if (command === 'log_ui_diagnostic') {
+            records.push(args.record);
+            return Promise.resolve(null);
+        }
+        return invoke(command, args);
+    };
+    return {read: () => JSON.stringify(records), stop: () => {window.__TAURI__.core.invoke = invoke;}};
+}
+export function localLogRead(capture) { return capture.read(); }
+export function localLogStop(capture) { capture.stop(); }
 "#)]
     extern "C" {
         #[wasm_bindgen(js_name = localMonitorTestEnvironment)]
         fn local_monitor_test_environment() -> JsValue;
         #[wasm_bindgen(js_name = localMonitorTestCall)]
         fn local_monitor_test_call(env: &JsValue, method: &str, amount: f64);
+        #[wasm_bindgen(js_name = localLogCapture)]
+        fn local_log_capture() -> JsValue;
+        #[wasm_bindgen(js_name = localLogRead)]
+        fn local_log_read(capture: &JsValue) -> String;
+        #[wasm_bindgen(js_name = localLogStop)]
+        fn local_log_stop(capture: &JsValue);
     }
 
     /// The automatic local monitor on an injected clock and timer; dropping it
@@ -665,11 +778,33 @@ export function localMonitorTestCall(env, method, amount) { return env[method](a
         pub(crate) fn tick(&self) {
             local_monitor_test_call(&self.env, "tick", 0.0);
         }
+
+        pub(crate) fn visibility(&self, visible: bool) {
+            local_monitor_test_call(&self.env, "visibility", if visible { 1.0 } else { 0.0 });
+        }
     }
 
     impl Drop for LocalMonitorClock {
         fn drop(&mut self) {
             super::LOCAL_MONITOR.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    pub(crate) struct LocalLogCapture(JsValue);
+
+    impl LocalLogCapture {
+        pub(crate) fn install() -> Self {
+            Self(local_log_capture())
+        }
+
+        pub(crate) fn records(&self) -> serde_json::Value {
+            serde_json::from_str(&local_log_read(&self.0)).unwrap()
+        }
+    }
+
+    impl Drop for LocalLogCapture {
+        fn drop(&mut self) {
+            local_log_stop(&self.0);
         }
     }
 

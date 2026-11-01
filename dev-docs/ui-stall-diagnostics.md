@@ -51,7 +51,7 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   | `chat_ink_layout`, `chat_virtual_window` | 0 | loaded rows supplied to calculation |
   | `agents_sidebar_projection` | 0 | projected agent rows |
 
-  No other details or arguments are recorded. The desktop shell drops a record
+  No IDs, labels, paths, payloads or command arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
   `{"event":"event_loop_gap","interval_ms":1690,"expected_ms":1000,"focused":true,"longest_work":{"operation":"host_receive","duration_ms":610,"frame":"project_bootstrap","bytes":3580000,"items":1},"pending_bridge_calls":0,"task_work":{"polls":3,"poll_ms":620,"longest_poll_ms":610,"drops":1,"drop_ms":0,"longest_drop_ms":0}}`.
   The selected deferred chat and sidebar projections below feed this same bounded
@@ -65,7 +65,42 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   are converted to whole milliseconds. They include deferred reactive rendering and
   cleanup after receive/dispatch returns. They remain separate from
   `longest_work` so an outer task does not hide a named inner projection.
-  Counts reset on every tick and visibility transition. Times are inclusive
+  `activity` supplies content-free context even when `longest_work` is null:
+  the last four typed command attempts (`commands`), the latest host-dispatch
+  start (`dispatch`), and the last four central project/tab transition starts
+  (`transitions`). Each entry has `age_ms` at the timer callback. Command kinds
+  are the requested kind before send-gate/bridge awaits, not rewritten envelopes,
+  server receipt or completion. Dispatch kinds come from the typed dispatcher,
+  not a guess from history. Transitions are `project_switch`, `tab_open`,
+  `tab_close`, `tab_reveal`; open includes reuse of an existing tab, and reveal
+  includes an unsuccessful attempt. Programmatic changes can use these paths;
+  this is not an interaction trace or complete gesture coverage (split/move
+  and chooser-only changes are not included).
+
+  For example, `commands:[{"frame":"workbench_create","age_ms":8100}]`
+  places a requested mutation before the sample; it does not assign the gap to
+  that request. Entries survive ordinary ticks so a slow server wait followed
+  by local work retains context. Visibility transitions clear them. New entries
+  overwrite the oldest in each four-entry list; unrelated traffic can displace
+  an earlier action. Latest dispatch can likewise be unrelated, and old ages
+  are explicit. There is no inferred lifecycle state or request/reply pairing.
+
+  Central project switching and tab open/close/reveal also contribute named
+  synchronous spans to `longest_work` and opt-in captures. Their `bytes` is0;
+  `items` is1 for open/reveal, the number requested closed, or1/0 for a project/
+  Home destination. Durations include nested work, not asynchronous completion.
+
+  The context stores only enum discriminants and monotonic timestamps: two
+  four-entry buffers and one latest dispatch. Dispatch reuses its existing
+  clock read; each typed command adds one clock read and a bounded queue update.
+  Transitions add one ordinary span. No new timer, per-action log, stack capture,
+  payload serialization, provider request or disk writer is added. Activity frame-name
+  strings/record arrays are created only for a gap. Native ingress validates
+  both list bounds and every new frame kind; malformed context fails explicitly.
+  The existing record budgets/queues below are unchanged. This does not measure
+  the original freeze or prove these paths cause it.
+
+  Task counts reset on every tick and visibility transition. Times are inclusive
   wall intervals, not CPU samples; nested application spans overlap them.
   Browser layout, paint and work outside these scopes remain uncovered.
   `focused` is `document.hasFocus()` at callback time, not a focus history.

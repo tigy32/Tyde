@@ -2535,6 +2535,9 @@ mod wasm_tests {
     async fn closing_the_last_closeable_tab_falls_back_to_home() {
         let container = make_container();
         let state = AppState::new();
+        let clock = crate::perf::diagnostic_tests::LocalMonitorClock::install();
+        clock.reading_step(0.0);
+        let log = crate::perf::diagnostic_tests::LocalLogCapture::install();
 
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -2553,6 +2556,12 @@ mod wasm_tests {
             "the Home tab must not offer a close affordance"
         );
 
+        // A normal tick emits no record and must not erase the preceding open.
+        clock.advance(1000.0);
+        clock.tick();
+        settle().await;
+        assert_eq!(log.records().as_array().unwrap().len(), 0);
+
         let close = tab_button_named(&container, "Chat")
             .query_selector(".tab-close")
             .unwrap()
@@ -2561,6 +2570,11 @@ mod wasm_tests {
             .unwrap();
         close.click();
         settle().await;
+
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let records = log.records();
 
         assert_eq!(
             tab_labels(&container),
@@ -2571,6 +2585,53 @@ mod wasm_tests {
             text_of(&visible_mount(&container)).contains("Manage Hosts"),
             "Home should become the visible tab after the last closeable tab closes"
         );
+        clock.visibility(false);
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let hidden_records = log.records();
+        clock.visibility(true);
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let reset_records = log.records();
+        drop(clock);
+        drop(log);
+        drop(_handle);
+        drop(container);
+        settle().await;
+
+        let diagnostic = &records.as_array().unwrap().last().unwrap()["diagnostic"];
+        let transitions = diagnostic["activity"]["transitions"]
+            .as_array()
+            .expect("normal logs retain actual tab transition context");
+        assert!(
+            transitions
+                .iter()
+                .any(|row| row["transition"] == "tab_open")
+        );
+        assert_eq!(transitions.last().unwrap()["transition"], "tab_close");
+        assert!(
+            diagnostic["longest_work"].is_null(),
+            "fast transitions still need context"
+        );
+        assert!(
+            !records.to_string().contains("Chat"),
+            "tab labels are not diagnostic data"
+        );
+
+        assert_eq!(records.as_array().unwrap().len(), 1);
+        assert_eq!(hidden_records.as_array().unwrap().len(), 1);
+        let reset = &reset_records.as_array().unwrap().last().unwrap()["diagnostic"]["activity"];
+        assert_eq!(reset["commands"].as_array().unwrap().len(), 0);
+        assert_eq!(reset["transitions"].as_array().unwrap().len(), 0);
+        assert!(reset["dispatch"].is_null());
+        let opened = transitions
+            .iter()
+            .find(|row| row["transition"] == "tab_open")
+            .unwrap();
+        assert_eq!(opened["age_ms"], 3000);
+        assert_eq!(transitions.last().unwrap()["age_ms"], 2000);
     }
 
     /// Bulk close keeps the non-closeable Home tab and activates it. The

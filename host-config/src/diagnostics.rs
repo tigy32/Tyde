@@ -24,6 +24,10 @@ pub enum UiOperation {
     AgentsSidebarProjection,
     TaskPoll,
     TaskDrop,
+    ProjectSwitch,
+    TabOpen,
+    TabClose,
+    TabReveal,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -35,6 +39,39 @@ pub struct UiTaskWork {
     pub drops: u32,
     pub drop_ms: u32,
     pub longest_drop_ms: u32,
+}
+
+pub const MAX_UI_ACTIVITY: usize = 4;
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiTransition {
+    ProjectSwitch,
+    TabOpen,
+    TabClose,
+    TabReveal,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiFrameActivity {
+    pub frame: FrameName,
+    pub age_ms: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTransitionActivity {
+    pub transition: UiTransition,
+    pub age_ms: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiActivityContext {
+    pub commands: Vec<UiFrameActivity>,
+    pub dispatch: Option<UiFrameActivity>,
+    pub transitions: Vec<UiTransitionActivity>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -111,6 +148,7 @@ pub enum FrontendDiagnostic {
         longest_work: Option<SlowUiWork>,
         pending_bridge_calls: u32,
         task_work: UiTaskWork,
+        activity: UiActivityContext,
     },
 }
 

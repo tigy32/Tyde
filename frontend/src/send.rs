@@ -45,6 +45,7 @@ pub async fn send_binary_frame<T: serde::Serialize>(
     payload: &T,
     binary: &[u8],
 ) -> Result<(), String> {
+    crate::perf::command_queued(kind);
     #[cfg(all(test, target_arch = "wasm32"))]
     wasm_bindgen_test::console_log!("Send gate requested kind={}", kind);
     let _send_lock = acquire_send_lock(host_id, &stream).await;
@@ -295,6 +296,7 @@ pub async fn send_frame_unreported<T: Serialize>(
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
+    crate::perf::command_queued(kind);
     let scope = crate::notices::request_scope(host_id, &stream, kind);
     if !crate::notices::is_background_send(kind)
         && let Some(scope) = &scope

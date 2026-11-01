@@ -1759,7 +1759,8 @@ mod wasm_tests {
                                 window.__stallEntered();
                             });
                         }
-                        if (cmd === 'send_host_line' && args.hostId === 'stall-attribution-host') {
+                        if (cmd === 'send_host_line' && args.hostId === 'stall-attribution-host'
+                            && JSON.parse(args.line).kind === 'project_file_view') {
                             window.__stallViewSent(args.line);
                         }
                         return Promise.resolve(null);
@@ -1825,12 +1826,10 @@ mod wasm_tests {
             )
             .unwrap(),
         );
-        state
-            .active_project
-            .set(Some(crate::state::ActiveProjectRef {
-                host_id: host_id.into(),
-                project_id: project_id.clone(),
-            }));
+        state.switch_active_project(Some(crate::state::ActiveProjectRef {
+            host_id: host_id.into(),
+            project_id: project_id.clone(),
+        }));
         let document = web_sys::window().unwrap().document().unwrap();
         let element = document
             .create_element("div")
@@ -1978,5 +1977,25 @@ mod wasm_tests {
         leptos::task::tick().await;
         drop(handles);
         drop(clock);
+        let activity = &gap["activity"];
+        assert_eq!(activity["dispatch"]["frame"], "project_file_view_state");
+        assert!(
+            activity["commands"]
+                .as_array()
+                .is_some_and(|commands| commands
+                    .iter()
+                    .any(|command| command["frame"] == "project_file_view")),
+            "ordinary typed commands must survive until the gap without a Debug capture"
+        );
+        assert!(
+            activity["transitions"]
+                .as_array()
+                .is_some_and(|transitions| transitions
+                    .iter()
+                    .any(|transition| transition["transition"] == "project_switch"))
+        );
+        assert!(!record.to_string().contains("/repo"));
+        assert!(!record.to_string().contains("stall-attribution"));
+        assert!(!record.to_string().contains("send_host_line"));
     }
 }

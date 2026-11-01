@@ -172,16 +172,30 @@ impl DiagnosticSink {
         record: host_config::diagnostics::FrontendDiagnosticRecord,
     ) -> Result<(), &'static str> {
         if let host_config::diagnostics::FrontendDiagnostic::EventLoopGap {
-            longest_work: Some(work),
+            longest_work,
+            activity,
             ..
         } = &record.diagnostic
-            && let Some(frame) = &work.frame
-            && serde_json::from_value::<protocol::FrameKind>(serde_json::Value::String(
-                frame.as_str().to_owned(),
-            ))
-            .is_err()
         {
-            return Err("Local diagnostic names an unknown frame kind");
+            if activity.commands.len() > host_config::diagnostics::MAX_UI_ACTIVITY
+                || activity.transitions.len() > host_config::diagnostics::MAX_UI_ACTIVITY
+            {
+                return Err("Local diagnostic activity exceeds its bound");
+            }
+            for frame in longest_work
+                .iter()
+                .filter_map(|work| work.frame.as_ref())
+                .chain(activity.commands.iter().map(|command| &command.frame))
+                .chain(activity.dispatch.iter().map(|dispatch| &dispatch.frame))
+            {
+                if serde_json::from_value::<protocol::FrameKind>(serde_json::Value::String(
+                    frame.as_str().to_owned(),
+                ))
+                .is_err()
+                {
+                    return Err("Local diagnostic names an unknown frame kind");
+                }
+            }
         }
         let (settled, result) = tokio::sync::oneshot::channel();
         self.0
