@@ -400,6 +400,21 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn spawn_agent_on_creation_stream(
+        &mut self,
+        payload: SpawnAgentPayload,
+    ) -> Result<StreamPath, FrameError> {
+        let stream = self
+            .host_stream()
+            .spawn_child(Uuid::new_v4())
+            .map_err(|e| FrameError::Protocol(e.to_string()))?;
+        let envelope = Envelope::from_payload(stream.clone(), FrameKind::SpawnAgent, 0, &payload)
+            .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), 1);
+        write_envelope(&mut self.writer, &envelope).await?;
+        Ok(stream)
+    }
+
     /// Registers this device's Web Push subscription with the host. Valid only
     /// on a mobile connection: the host binds it to the device the transport
     /// authenticated as, ignoring anything the client might claim.
@@ -1430,7 +1445,32 @@ impl Connection {
             )));
         }
 
-        if envelope.stream.0.starts_with("/host/") {
+        if let Some(parent) = envelope.stream.spawn_parent() {
+            if parent != host_stream
+                || envelope.seq != 0
+                || !self.outgoing_seq.contains_key(&envelope.stream)
+            {
+                return Err(FrameError::Protocol(
+                    "foreign or repeated creation terminal".into(),
+                ));
+            }
+            match envelope.kind {
+                FrameKind::AgentStart => {
+                    let _: AgentStartPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CommandError => {
+                    let error: CommandErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    if error.stream != envelope.stream
+                        || error.request_kind != FrameKind::SpawnAgent
+                    {
+                        return Err(FrameError::Protocol("misaddressed creation error".into()));
+                    }
+                }
+                _ => return Err(FrameError::Protocol("unexpected creation terminal".into())),
+            }
+        } else if envelope.stream.0.starts_with("/host/") {
             match envelope.kind {
                 FrameKind::HostBootstrap => {
                     let payload: HostBootstrapPayload =
@@ -2105,7 +2145,7 @@ impl Connection {
         let mut host_streams = self
             .outgoing_seq
             .keys()
-            .filter(|stream| stream.0.starts_with("/host/"));
+            .filter(|stream| stream.is_host_root());
 
         let host_stream = host_streams
             .next()

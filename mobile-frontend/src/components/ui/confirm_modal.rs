@@ -24,6 +24,7 @@ pub fn ConfirmModal(
     #[prop(into)] on_confirm: Callback<()>,
     #[prop(into)] on_cancel: Callback<()>,
 ) -> impl IntoView {
+    crate::native::track_modal(open);
     let confirm_label = confirm_label.unwrap_or_else(|| "Confirm".to_owned());
     let cancel_label = cancel_label.unwrap_or_else(|| "Cancel".to_owned());
     let confirm_variant = if destructive.unwrap_or(false) {

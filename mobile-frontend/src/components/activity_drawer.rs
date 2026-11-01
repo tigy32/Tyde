@@ -281,7 +281,7 @@ pub fn ActivityDrawer() -> impl IntoView {
     let open_agent = Callback::new(move |target: ActiveAgentRef| {
         expanded.set(false);
         state.active_agent.set(Some(target));
-        state.viewing_chat.set(true);
+        state.show_chat();
     });
 
     view! {

@@ -32,7 +32,7 @@ use store::{IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord
 pub use qr::{ensure_camera_permission, scan_qr};
 pub use service::{
     AuthProvider, RedeemOutcome, authenticate as authenticate_managed,
-    complete_boot_auth_callback as complete_boot_managed_auth_callback,
+    complete_boot_auth_callback as complete_boot_managed_auth_callback, native_sign_in,
     probe_auth as probe_managed_auth,
 };
 
@@ -102,6 +102,9 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
         log::info!(
             "mobile_pairing_schema_handoff host_protocol={version} client_protocol={PROTOCOL_VERSION}"
         );
+        if crate::native::is_native() {
+            return Err("This native app and host use different protocols. Update the app and host together.".into());
+        }
         request_loader_repair(qr_uri);
         return Err(
             "Switching to the client for this host. If this page does not reload, open the \
@@ -113,10 +116,15 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
     match offer {
         MobilePairingQrOffer::ManagedService(payload) => {
+            crate::native::check_host_release(&payload.release_version)?;
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::ManagedService { host_label })
         }
         MobilePairingQrOffer::Direct(payload) => {
+            crate::native::check_host_release(&payload.release_version)?;
+            if crate::native::is_native() {
+                crate::native::direct_origin(qr_uri)?;
+            }
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::SelfHosted { host_label })
         }
@@ -126,21 +134,25 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
     }
 }
 
-/// Redeems a self-hosted offer against the origin this bundle was served from
-/// and connects over it.
-///
-/// The offer's origin is deliberately not taken from the QR: the page is
-/// already loaded from the host, so `location.origin` is the address the user
-/// actually reached, and trusting the payload instead would let a forged QR
-/// point the redemption somewhere else.
-pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String> {
+/// Redeems against the pinned native host link or this browser document's origin.
+/// Returns the exact persisted record after starting its existing connection
+/// actor; this is not protocol Welcome/bootstrap or Connected authority.
+pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<LocalHostId, String> {
     let offer = parse_mobile_pairing_qr_offer(qr_uri)
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
     let MobilePairingQrOffer::Direct(payload) = offer else {
         return Err("this pairing code is not for a self-hosted Tyde".to_owned());
     };
     let host_label = normalize_host_label(payload.host_label.clone())?;
-    let origin = direct::document_origin()?;
+    let native_origin = if crate::native::is_native() {
+        Some(crate::native::direct_origin(qr_uri)?)
+    } else {
+        None
+    };
+    let origin = match &native_origin {
+        Some(origin) => origin.clone(),
+        None => direct::document_origin()?,
+    };
 
     let grant = direct::redeem_direct_offer(
         &origin,
@@ -163,6 +175,7 @@ pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String> 
         last_connected_at_ms: None,
         managed: None,
         direct: Some(store::DirectPairingRecord {
+            native_origin,
             device_id: grant.device_id.0.clone(),
             device_token_key_id: token_key_id.clone(),
         }),
@@ -175,7 +188,8 @@ pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String> 
     }
 
     emit_paired_hosts_changed().await;
-    connection::manager().connect(local_host_id).await
+    connection::manager().connect(local_host_id.clone()).await?;
+    Ok(local_host_id)
 }
 
 /// Label a freshly paired phone shows up as in the host's device list until the
@@ -191,7 +205,7 @@ fn default_device_label() -> String {
 /// Redeems a managed offer with `tycode.dev` and connects to the managed relay.
 /// Thin re-export of the [`service`] seam so the pairing flow calls it through
 /// the `bridge` façade like every other host action.
-pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
+pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<LocalHostId, RedeemOutcome> {
     service::redeem_and_connect(qr_uri).await
 }
 
@@ -279,6 +293,9 @@ pub fn begin_tyggs_sign_in(
     provider: AuthProvider,
     resume_qr_uri: Option<&str>,
 ) -> Result<(), String> {
+    if crate::native::is_native() {
+        return Err("Native sign-in must use the system authentication session".into());
+    }
     let url = service::tyggs_sign_in_url(provider)?;
     if let Some(qr_uri) = resume_qr_uri {
         stash_pending_pairing_uri(qr_uri);
@@ -362,12 +379,18 @@ pub async fn frontend_attached(
     let manager = connection::manager();
     manager.frontend_attached();
     let records = IndexedDbHostStore.list().await?;
+    let mut failures = Vec::new();
     for record in records.into_iter().filter(|record| record.auto_connect) {
         if let Err(error) = manager.connect(record.local_host_id.clone()).await {
             log::error!("auto-connect for {} failed: {error}", record.local_host_id);
+            failures.push(error);
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 pub async fn wasm_log(level: &str, message: &str) {
@@ -497,6 +520,7 @@ fn normalize_host_label(host_label: String) -> Result<String, String> {
 /// [`service`]). Kept here so both test suites build identical managed URIs.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod tests_support {
+    pub(crate) use super::store::{DirectPairingRecord, IndexedDbHostStore, WebPairedHostRecord};
     use mobile_pairing::{
         ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, PreSharedKey,
     };
@@ -504,8 +528,7 @@ pub(crate) mod tests_support {
 
     pub async fn store_reconnect_host() -> mobile_shell_types::LocalHostId {
         use super::store::{
-            IndexedDbHostStore, IndexedDbPskStore, ManagedPairingRecord, PskStore,
-            WebPairedHostRecord, store_device_secret,
+            IndexedDbPskStore, ManagedPairingRecord, PskStore, store_device_secret,
         };
         let local_host_id = mobile_shell_types::LocalHostId(uuid::Uuid::new_v4().to_string());
         let key = IndexedDbPskStore

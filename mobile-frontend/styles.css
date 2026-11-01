@@ -4992,8 +4992,7 @@ input, textarea, select {
     gap: var(--space-3);
 }
 
-.capacity-card,
-.capacity-compact {
+.capacity-card {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
@@ -5131,8 +5130,7 @@ input, textarea, select {
 }
 
 /* Stacked: label above bar above figures. Never a wide row that clips. */
-.capacity-measure,
-.capacity-compact-bucket {
+.capacity-measure {
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -5153,8 +5151,7 @@ input, textarea, select {
     border-radius: var(--radius-full);
 }
 
-.capacity-figures,
-.capacity-compact-figures {
+.capacity-figures {
     display: flex;
     gap: var(--space-4);
     font-size: 13px;
@@ -5175,49 +5172,6 @@ input, textarea, select {
 .capacity-credits {
     font-size: 13px;
     color: var(--text-secondary);
-}
-
-/* The vendor's own bucket type. The server's label rule is lossy — seven_day and
-   seven_day_overage_included both label as "weekly limit" — so this is what
-   keeps two different limits distinguishable. */
-.capacity-compact-vendor {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-tertiary);
-}
-
-/* The compact row is labelled "Subscription" so it can never be read as this
-   task's token usage — a different measurement of a different thing. */
-.capacity-compact-title {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-}
-
-.capacity-compact-label {
-    font-size: 14px;
-    color: var(--text-primary);
-}
-
-.capacity-compact-state {
-    font-size: 14px;
-    color: var(--text-secondary);
-}
-
-.capacity-compact-more {
-    font-size: 12px;
-    color: var(--accent-primary);
-}
-
-.capacity-compact-coverage {
-    font-size: 12px;
-    color: var(--accent-warning);
-}
-
-.capacity-compact-freshness {
-    font-size: 12px;
-    color: var(--text-tertiary);
 }
 
 /* ── Pending submission recovery ────────────────────────────────────── */
@@ -5645,3 +5599,211 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     z-index: 1;
     background: var(--surface-float);
 }
+
+/* UIKit reserves system bars; the shared shell alone measures the inner viewport. */
+.mobile-app[data-native-host] {
+    --tws-safe-top: 0px;
+    --tws-safe-bottom: 0px;
+    --tws-safe-left: 0px;
+    --tws-safe-right: 0px;
+    --safe-area-top: 0px;
+    --safe-area-bottom: 0px;
+}
+
+[data-native-host] .mobile-shell-error-banner {
+    position: relative;
+    inset: auto;
+    z-index: auto;
+    flex: none;
+    align-items: flex-start;
+    margin: var(--space-2) var(--space-3) 0;
+}
+
+[data-native-host] .mobile-shell-error-message {
+    align-self: center;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    max-height: min(8rem, 25vh);
+    overflow-y: auto;
+}
+
+[data-native-host] .error-banner-dismiss {
+    min-width: 44px;
+    min-height: 44px;
+}
+
+[data-native-host] .connection-banner {
+    position: relative;
+    inset: auto;
+    z-index: 1;
+    flex: none;
+    padding: var(--space-2) var(--space-3);
+}
+
+[data-native-host] .home-hero-status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+[data-native-host] .native-workspace {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+}
+
+[data-native-host] .native-workspace-status { flex: none; }
+[data-native-host] .native-pane { min-height: 0; min-width: 0; overflow: hidden; }
+[data-native-host] .native-pane[hidden] { display: none; }
+[data-native-host] .native-workspace:not(.native-pairing) .view-header > .view-title,
+[data-native-host] .native-workspace:not(.native-pairing) .view-header > [data-mobile-test="agents-new-chat"] { display: none; }
+[data-native-host] .chat-header:not(:has(.chat-rename-bar)) > :not(.chat-context-bar) { display: none; }
+[data-native-host] .chat-header:not(:has(.chat-rename-bar)):not(:has(.chat-context-bar)) { display: none; }
+[data-native-host] .chat-header:not(:has(.chat-rename-bar)):has(.chat-context-bar) {
+    height: 6px;
+    min-height: 6px;
+    margin: 6px 12px 0;
+    padding: 0;
+    border-radius: 3px;
+    box-shadow: none;
+}
+[data-native-host] .chat-header:not(:has(.chat-rename-bar)) .chat-context-bar rect { rx: 2px; }
+[data-native-host] .native-workspace:not(.native-pairing) .view-header:has(> .view-title:only-child),
+[data-native-host] .agents-view > .shell-header > .view-header { display: none; }
+[data-native-host] .sessions-view .view-header { display: none; }
+[data-native-host] .native-split { grid-template-columns: minmax(calc(280px + 1px), 32%) minmax(0, 1fr); }
+[data-native-host] .native-split > .native-agents-pane {
+    border-inline-end: 1px solid var(--border-default);
+}
+[data-native-host] .native-split .agents-view {
+    display: flex;
+    flex-direction: column;
+}
+[data-native-host] .native-split .agents-view > .shell-header {
+    margin: 8px 12px;
+    align-self: stretch;
+}
+[data-native-host] .native-split .agents-view .view-header {
+    display: flex;
+    padding: 0;
+    margin: 0;
+    box-shadow: none;
+    border-radius: 0;
+    background: none;
+}
+[data-native-host] .native-split .agents-view .view-title,
+[data-native-host] .native-split .agents-view [data-mobile-test="agents-new-chat"] { display: block; }
+[data-native-host] .native-split .agents-view .view-body { margin: 0; }
+[data-native-host] .native-split .agents-view .shell-flow { padding: 0 12px 12px; }
+[data-native-host] .native-split .agents-view .shell-flow::before,
+[data-native-host] .native-split .agents-view .shell-flow::after { height: 0; }
+[data-native-host] .native-split .agent-list { display: flex; flex-direction: column; }
+[data-native-host] .native-split .agent-child-collapse,
+[data-native-host] .native-split .ui-button,
+[data-native-host] .native-split .agent-list-item { min-height: 44px; }
+
+[data-native-host] .new-chat-options {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+}
+[data-native-host] .new-chat-option-select,
+[data-native-host] .new-chat-option-project,
+[data-native-host] .capacity-refresh { min-height: 44px; }
+[data-native-host] .chat-input-field:focus-visible,
+[data-native-host] .search-bar input:focus-visible,
+[data-native-host] .pairing-paste-input:focus-visible { outline: none; }
+[data-native-host] .pairing-paste-input:focus {
+    box-shadow: inset 0 0 0 1px var(--accent-primary);
+}
+[data-native-host] .chat-input-row:focus-within:not(:has(.chat-input-field:focus)) {
+    box-shadow: var(--rim-float), var(--shadow-float);
+}
+
+[data-native-host] .chat-send-split {
+    border-radius: var(--radius-md);
+    background: var(--accent-primary);
+}
+[data-native-host] .chat-send-split > button {
+    min-height: 44px;
+    border-radius: 0;
+    color: white;
+}
+[data-native-host] .chat-send-split > .send-menu-toggle {
+    border-inline-start: 1px solid rgb(255 255 255 / 28%);
+    background: rgb(0 0 0 / 18%);
+}
+
+[data-native-host] .native-split .agent-child-collapse { min-width: 44px; }
+
+[data-native-host] .chat-send-split > .send-button {
+    border-start-start-radius: var(--radius-md);
+    border-end-start-radius: var(--radius-md);
+}
+[data-native-host] .chat-send-split > .send-menu-toggle {
+    border-start-end-radius: var(--radius-md);
+    border-end-end-radius: var(--radius-md);
+}
+[data-native-host] .native-split .ui-card:has([aria-current="page"]) {
+    background: var(--accent-soft);
+    border-color: transparent;
+}
+[data-native-host] .native-split .agent-child-controls { display: contents; }
+[data-native-host] .native-split .agent-child-collapse { order: -1; }
+[data-native-host] .native-split .agent-child-count-badge { order: 1; }
+[data-native-host] .settings-select:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+[data-native-host] .pairing-host-origin { overflow-wrap: anywhere; }
+[data-native-host] .picker-view .shell-flow,
+[data-native-host] .pairing-view .shell-flow {
+    width: 100%;
+    max-width: 32rem;
+    margin-inline: auto;
+}
+[data-native-host] .pairing-view .shell-flow {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+[data-native-host] .onboarding-view .view-body { padding: 0; }
+[data-native-host] .onboarding-view .shell-flow {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--space-5);
+    min-height: 100%;
+    max-width: 32rem;
+    padding: var(--space-6) var(--space-5);
+    margin-inline: auto;
+}
+[data-native-host] .onboarding-view .shell-flow::before,
+[data-native-host] .onboarding-view .shell-flow::after { display: none; }
+[data-native-host] .native-onboarding-steps {
+    display: grid;
+    gap: var(--space-4);
+    margin: 0;
+    padding-left: var(--space-5);
+    font: inherit;
+}
+[data-native-host] .native-onboarding-steps li::marker { color: var(--text-secondary); }
+
+[data-native-host] .paired-host-identity {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+}
+
+[data-native-host] .mobile-swarm-image-open {
+    display: block;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: zoom-in;
+}
+
+[data-native-host] .connection-banner[hidden] { display: none; }
+[data-native-host] .mobile-shell-error-banner { flex-wrap: wrap; }
+[data-native-host] .mobile-shell-error-message { flex: 1 1 16rem; }
+[data-native-host] .connection-banner-action { min-width: 44px; min-height: 44px; }

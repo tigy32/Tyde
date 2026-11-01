@@ -518,6 +518,8 @@ pub enum AppMode {
     /// User has at least one paired host but is not currently in the pairing
     /// flow. The picker / per-host workspace renders here.
     Workspace,
+    /// Native host chooser; preserve the selected record until Open or Back.
+    HostPicker,
     /// Pairing flow is on-screen.
     Pairing(PairingScreen),
 }
@@ -944,6 +946,29 @@ impl MobileUserQuestionDraftState {
 
 // ── App state ──────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeAuthRecovery {
+    pub local_host_id: LocalHostId,
+    pub auth: MobileServiceAuthState,
+}
+
+impl NativeAuthRecovery {
+    pub fn busy(&self) -> bool {
+        matches!(self.auth, MobileServiceAuthState::Authenticating)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeChatDestination {
+    pub local_host_id: LocalHostId,
+    pub stream: StreamPath,
+    pub tab: MobileTab,
+    pub draft_id: uuid::Uuid,
+    pub source_agent: Option<ActiveAgentRef>,
+    pub created_agent: Option<AgentId>,
+    pub source_draft: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub host_releases: RwSignal<HashMap<LocalHostId, crate::bundle::HostRelease>>,
@@ -1001,6 +1026,14 @@ pub struct AppState {
     // Tab navigation within the per-host workspace
     pub active_tab: RwSignal<MobileTab>,
     pub viewing_chat: RwSignal<bool>,
+    pub chat_origin_tab: RwSignal<MobileTab>,
+    pub chat_draft_id: RwSignal<uuid::Uuid>,
+    pub native_regular_width: RwSignal<bool>,
+    pub native_modal_sources: RwSignal<Vec<Signal<bool>>>,
+    pub native_chat_destination: RwSignal<Option<NativeChatDestination>>,
+    pub native_auth_recovery: RwSignal<Option<NativeAuthRecovery>>,
+    pub native_chat_action: RwSignal<Option<mobile_shell_types::native::NativeIntent>>,
+    pub native_chat_heading: RwSignal<(String, Option<String>)>,
 
     // Projects
     pub projects: RwSignal<Vec<ProjectInfo>>,
@@ -1205,6 +1238,12 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn show_chat(&self) {
+        self.native_chat_destination.set(None);
+        self.chat_origin_tab.set(self.active_tab.get_untracked());
+        self.viewing_chat.set(true);
+    }
+
     pub fn new() -> Self {
         Self {
             host_releases: RwSignal::new(HashMap::new()),
@@ -1240,6 +1279,14 @@ impl AppState {
 
             active_tab: RwSignal::new(MobileTab::Home),
             viewing_chat: RwSignal::new(false),
+            chat_origin_tab: RwSignal::new(MobileTab::Home),
+            chat_draft_id: RwSignal::new(uuid::Uuid::new_v4()),
+            native_regular_width: RwSignal::new(false),
+            native_modal_sources: RwSignal::new(Vec::new()),
+            native_chat_destination: RwSignal::new(None),
+            native_auth_recovery: RwSignal::new(None),
+            native_chat_action: RwSignal::new(None),
+            native_chat_heading: RwSignal::new(("New Chat".into(), None)),
 
             projects: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),

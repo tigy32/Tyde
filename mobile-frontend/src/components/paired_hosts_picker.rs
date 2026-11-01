@@ -52,16 +52,30 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                 let id_for_confirm = id.clone();
                                 let id_for_forget = id.clone();
                                 let label = host.host_label.clone();
+                                let native = crate::native::is_native();
+                                let origin = host.direct_origin.filter(|_| native);
+                                let identity = match &origin {
+                                    Some(origin) => format!("{label}, {origin}, {}", host.credential_fingerprint),
+                                    None if native => format!("{label}, {}", host.credential_fingerprint),
+                                    None => label.clone(),
+                                };
+                                let open_label = if native { format!("Open {identity}") } else { "Open".into() };
                                 let state = state_for_rows.clone();
                                 let state_for_status = state.clone();
                                 let state_for_select = state.clone();
                                 let state_for_forget = state.clone();
-                                let label_for_confirm = label.clone();
+                                let label_for_confirm = identity.clone();
 
                                 view! {
                                     <div class="paired-host-card">
                                         <div class="paired-host-info">
                                             <div class="paired-host-label">{label.clone()}</div>
+                                            {native.then(|| view! {
+                                                <div class="paired-host-identity" data-mobile-test="paired-host-identity">
+                                                    {origin.map(|origin| view! { <span data-mobile-test="paired-host-origin">{origin}</span> })}
+                                                    <span class="settings-value-mono">{host.credential_fingerprint}</span>
+                                                </div>
+                                            })}
                                             <div class="paired-host-status">
                                                 <ConnectionPill
                                                     state=state_for_status
@@ -117,15 +131,19 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                                         />
                                                         <Button
                                                             label="Open"
+                                                            data_mobile_test="paired-host-open"
+                                                            aria_label=open_label.clone()
                                                             variant=ButtonVariant::Primary
                                                             full_width=true
                                                             on_click=Callback::new({
                                                                 let state_for_select = state_for_select.clone();
                                                                 let id_for_select = id_for_select.clone();
                                                                 move |_: ()| {
-                                                                    state_for_select
-                                                                        .active_local_host_id
-                                                                        .set(Some(id_for_select.clone()));
+                                                                    if crate::native::is_native() {
+                                                                        crate::native::open_host(&state_for_select, id_for_select.clone());
+                                                                    } else {
+                                                                        state_for_select.active_local_host_id.set(Some(id_for_select.clone()));
+                                                                    }
                                                                 }
                                                             })
                                                         />
@@ -134,7 +152,7 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                                             variant=ButtonVariant::Destructive
                                                             full_width=true
                                                             data_mobile_test="paired-host-forget"
-                                                            aria_label=format!("Delete pairing for {}", label)
+                                                            aria_label=format!("Delete pairing for {}", identity)
                                                             on_click=Callback::new(move |_: ()| confirming_forget.set(Some(id_for_confirm_set.clone())))
                                                         />
                                                     </div>
@@ -215,6 +233,7 @@ fn ConnectDisconnectButton(
     local_host_id_for_connect: LocalHostId,
     local_host_id_for_disconnect: LocalHostId,
 ) -> impl IntoView {
+    let native_sign_in_host = local_host_id_for_connect.clone();
     let id_status_lookup = local_host_id_for_connect.clone();
     let state_for_status = state.clone();
     let status = move || {
@@ -293,7 +312,16 @@ fn ConnectDisconnectButton(
             .app_mode
             .set(AppMode::Pairing(PairingScreen::Scanner));
     });
+    let native_sign_in_state = state.clone();
     let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if crate::native::is_native() {
+            crate::actions::native_sign_in_and_reconnect(
+                native_sign_in_state.clone(),
+                native_sign_in_host.clone(),
+                provider,
+            );
+            return;
+        }
         if let Err(error) = bridge::begin_tyggs_sign_in(provider, None) {
             log::error!("failed to start Tyggs sign-in: {error}");
         }
@@ -438,6 +466,7 @@ mod wasm_tests {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
 
+            direct_origin: None,
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,
@@ -450,7 +479,7 @@ mod wasm_tests {
         let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let state_handle_for_mount = state_handle.clone();
-        let _handle = mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.paired_hosts.set(vec![
                 fixture_host("h1", "Laptop"),
@@ -480,6 +509,68 @@ mod wasm_tests {
         next_tick().await;
         let text = container.text_content().unwrap_or_default();
         assert!(text.contains("Online"), "expected Online pill, got: {text}");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='paired-host-identity']")
+                .unwrap()
+                .is_none(),
+            "Browser/PWA host cards must not gain native identity chrome"
+        );
+        let boundary = js_sys::Function::new_no_args(
+            r#"
+            const had = Object.hasOwn(window, '__tydeNativeHost'), native = window.__tydeNativeHost;
+            const selection = localStorage.getItem('tyde.selected-host.v1');
+            window.__tydeNativeHost = {};
+            return () => {
+                if (had) window.__tydeNativeHost = native; else delete window.__tydeNativeHost;
+                if (selection === null) localStorage.removeItem('tyde.selected-host.v1');
+                else localStorage.setItem('tyde.selected-host.v1', selection);
+            };
+        "#,
+        )
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .unwrap()
+        .dyn_into::<js_sys::Function>()
+        .unwrap();
+        let mut first = fixture_host("same-label-managed-a", "Studio");
+        first.credential_fingerprint = "managed-fingerprint-a".into();
+        let mut second = fixture_host("same-label-managed-b", "Studio");
+        second.credential_fingerprint = "managed-fingerprint-b".into();
+        state.paired_hosts.set(vec![first.clone(), second.clone()]);
+        next_tick().await;
+        let result: Result<(), String> = async {
+            let identities = container.query_selector_all("[data-mobile-test='paired-host-identity']").unwrap();
+            if identities.length() != 2 || !(0..identities.length()).all(|index| {
+                identities.item(index).unwrap().text_content().unwrap().contains(if index == 0 {
+                    "managed-fingerprint-a"
+                } else { "managed-fingerprint-b" })
+            }) { return Err("Same-label native managed hosts must each render their existing nonsecret fingerprint without inventing a direct origin".into()); }
+            if container.query_selector("[data-mobile-test='paired-host-origin']").unwrap().is_some() {
+                return Err("Managed host identity must not invent a direct origin".into());
+            }
+            let open = container.query_selector("[aria-label='Open Studio, managed-fingerprint-b']").unwrap()
+                .ok_or("Native managed Open actions must distinguish exact existing identities")?.dyn_into::<HtmlElement>().unwrap();
+            open.click();
+            next_tick().await;
+            if state.active_local_host_id.get_untracked() != Some(second.local_host_id) {
+                return Err("The identified managed row must open its exact typed host".into());
+            }
+            let delete = container.query_selector("[data-mobile-test='paired-host-forget'][aria-label='Delete pairing for Studio, managed-fingerprint-a']").unwrap()
+                .ok_or("The native managed Delete affordance must identify its own record")?.dyn_into::<HtmlElement>().unwrap();
+            delete.click();
+            next_tick().await;
+            if container.query_selector("[data-mobile-test='paired-host-forget-confirm'][aria-label='Delete pairing for Studio, managed-fingerprint-a']").unwrap().is_none() {
+                return Err("Delete confirmation must preserve the selected managed record identity".into());
+            }
+            container.query_selector("[data-mobile-test='paired-host-forget-cancel']").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            if state.paired_hosts.get_untracked().len() != 2 { return Err("Cancelling must preserve both managed pairings".into()); }
+            Ok(())
+        }.await;
+        drop(handle);
+        container.remove();
+        boundary.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+        assert!(result.is_ok(), "{}", result.unwrap_err());
     }
 
     /// A host stuck in `UpdateRequired` must not offer a no-op Connect button;

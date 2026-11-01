@@ -66,7 +66,7 @@ fn AgentHandoffView(owner_agent_ref: AgentRef, handoff: protocol::AgentHandoff) 
             local_host_id: agent.local_host_id,
             agent_id: agent.agent_id,
         }));
-        state.viewing_chat.set(true);
+        state.show_chat();
     });
     view! {
         <div class="chat-card chat-card-system">
@@ -285,6 +285,9 @@ pub fn ChatView() -> impl IntoView {
 
     let start_cell = swipe_start.clone();
     let on_touch_start = move |ev: web_sys::TouchEvent| {
+        if crate::native::is_native() {
+            return;
+        }
         start_cell.set(
             ev.touches()
                 .get(0)
@@ -538,16 +541,47 @@ pub fn ChatView() -> impl IntoView {
         }
     };
 
+    if crate::native::is_native() {
+        let native_state = state.clone();
+        Effect::new(move |_| {
+            native_state
+                .native_chat_heading
+                .set((agent_name(), header_subtitle()));
+        });
+        let native_state = state.clone();
+        Effect::new(move |_| {
+            if let Some(action) = native_state.native_chat_action.get() {
+                native_state.native_chat_action.set(None);
+                use mobile_shell_types::native::NativeIntent;
+                match action {
+                    NativeIntent::RenameAgent => on_rename_open.run(()),
+                    NativeIntent::SessionSettings => on_open_session_settings.run(()),
+                    NativeIntent::CloseAgent => on_close_agent.run(()),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let s_pending = state.clone();
     let s_body = state.clone();
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let auto_scroll_pending = Rc::new(Cell::new(false));
+    let auto_scroll_timer = Rc::new(Cell::new(None::<TimeoutHandle>));
+    let cleanup_timer = send_wrapper::SendWrapper::new(auto_scroll_timer.clone());
+    on_cleanup(move || {
+        let pending_timer = cleanup_timer.take();
+        if let Some(timer) = pending_timer.take() {
+            timer.clear();
+        }
+    });
     let last_active_agent: Rc<RefCell<Option<AgentRef>>> = Rc::new(RefCell::new(None));
 
     let scroll_ref_for_auto = scroll_ref;
     let state_for_auto = state.clone();
     let pending_for_auto = auto_scroll_pending.clone();
+    let timer_for_auto = auto_scroll_timer.clone();
     let last_active_for_auto = last_active_agent.clone();
     Effect::new(move |_| {
         let active_agent = state_for_auto
@@ -613,7 +647,10 @@ pub fn ChatView() -> impl IntoView {
             track_active_chat_content(&state_for_auto, key);
         }
 
-        if user_scrolled_up.get_untracked() || pending_for_auto.get() {
+        if (crate::native::is_native() && !crate::native::chat_visible(&state_for_auto))
+            || user_scrolled_up.get_untracked()
+            || pending_for_auto.get()
+        {
             return;
         }
         let Some(el) = scroll_ref_for_auto.get_untracked() else {
@@ -622,8 +659,10 @@ pub fn ChatView() -> impl IntoView {
         pending_for_auto.set(true);
         let pending = pending_for_auto.clone();
         let active_for_scroll = state_for_auto.active_agent;
-        set_timeout(
+        let settled_timer = timer_for_auto.clone();
+        match set_timeout_with_handle(
             move || {
+                settled_timer.take();
                 pending.set(false);
                 log::debug!(
                     "chat auto-scroll: scrollTop={} clientHeight={} scrollHeight={}",
@@ -639,7 +678,19 @@ pub fn ChatView() -> impl IntoView {
                 }
             },
             std::time::Duration::from_millis(0),
-        );
+        ) {
+            Ok(timer) => timer_for_auto.set(Some(timer)),
+            Err(_) => {
+                pending_for_auto.set(false);
+                log::error!("Could not schedule transcript layout");
+                state_for_auto
+                    .mobile_shell_error
+                    .set(Some(crate::state::MobileShellError {
+                        code: protocol::MobileAccessErrorCode::Internal,
+                        message: "Could not schedule transcript layout".into(),
+                    }));
+            }
+        }
     });
 
     let scroll_ref_for_scroll = scroll_ref;

@@ -130,9 +130,17 @@ fn ScannerScreen() -> impl IntoView {
                 <p
                     class="pairing-instruction"
                     data-mobile-test="pairing-scanner-instruction"
-                    aria-label="Point your phone at the QR code shown in Tyde on your computer, under Settings, in the Mobile tab."
+                    aria-label=if crate::native::is_native() {
+                        "Scan the QR code in Tyde on your computer, under Settings, in the Mobile tab."
+                    } else {
+                        "Point your phone at the QR code shown in Tyde on your computer, under Settings, in the Mobile tab."
+                    }
                 >
-                    "Point your phone at the QR code shown in Tyde on your computer (Settings → Mobile)."
+                    {if crate::native::is_native() {
+                        "Scan the QR code in Tyde on your computer (Settings → Mobile)."
+                    } else {
+                        "Point your phone at the QR code shown in Tyde on your computer (Settings → Mobile)."
+                    }}
                 </p>
                 <div class="pairing-scanner-frame" data-mobile-test="pairing-scanner-frame">
                     <div class="pairing-scanner-reticle" aria-hidden="true"></div>
@@ -158,7 +166,7 @@ fn ScannerScreen() -> impl IntoView {
                     }}
                 </div>
                 <Button
-                    label="Paste pairing URI instead"
+                    label=if crate::native::is_native() { "Paste link" } else { "Paste pairing URI instead" }
                     variant=ButtonVariant::Secondary
                     full_width=true
                     data_mobile_test="pairing-scanner-paste"
@@ -184,7 +192,14 @@ fn ManualPasteScreen() -> impl IntoView {
         let raw = pasted.get_untracked();
         let trimmed = raw.trim().to_string();
         if trimmed.is_empty() {
-            error.set(Some("Paste a tyde-pair:// URI to continue.".to_string()));
+            error.set(Some(
+                if crate::native::is_native() {
+                    "Paste a pairing link to continue."
+                } else {
+                    "Paste a tyde-pair:// URI to continue."
+                }
+                .to_string(),
+            ));
             return;
         }
         pending.set(true);
@@ -202,7 +217,7 @@ fn ManualPasteScreen() -> impl IntoView {
     view! {
         <div class="view pairing-view">
             <div class="view-header">
-                <h1 class="view-title">"Paste pairing URI"</h1>
+                <h1 class="view-title">{if crate::native::is_native() { "Paste link" } else { "Paste pairing URI" }}</h1>
                 <button
                     class="header-action"
                     on:click=move |_| state_for_cancel.app_mode.set(AppMode::Workspace)
@@ -213,7 +228,8 @@ fn ManualPasteScreen() -> impl IntoView {
                 <textarea
                     class="pairing-paste-input"
                     rows=4
-                    placeholder="tyde-pair://..."
+                    placeholder=if crate::native::is_native() { "https://host/tyde/…" } else { "tyde-pair://..." }
+                    aria-label="Pairing link"
                     prop:value=move || pasted.get()
                     on:input=move |ev| pasted.set(event_target_value(&ev))
                 />
@@ -288,10 +304,12 @@ fn ServiceAuthScreen(
                 return;
             }
             match bridge::redeem_managed_and_connect(&qr_uri).await {
-                Ok(()) => {
-                    // The paired-hosts-changed event drives the picker; drop back
-                    // to the workspace so it renders the freshly paired host.
-                    state.app_mode.set(AppMode::Workspace);
+                Ok(local_host_id) => {
+                    if crate::native::is_native() {
+                        crate::native::open_host(&state, local_host_id);
+                    } else {
+                        state.app_mode.set(AppMode::Workspace);
+                    }
                 }
                 Err(RedeemOutcome::Auth(next)) => {
                     auth.set(next);
@@ -331,6 +349,22 @@ fn ServiceAuthScreen(
     // stashing the pairing URI so the flow resumes when the redirect returns.
     let qr_for_sign_in = qr_uri.clone();
     let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if crate::native::is_native() {
+            if busy.get_untracked() {
+                return;
+            }
+            busy.set(true);
+            spawn_local(async move {
+                let next = bridge::native_sign_in(provider).await;
+                let authenticated = matches!(next, MobileServiceAuthState::Authenticated { .. });
+                auth.set(next);
+                busy.set(false);
+                if authenticated {
+                    run.run(());
+                }
+            });
+            return;
+        }
         if let Err(error) = bridge::begin_tyggs_sign_in(provider, Some(&qr_for_sign_in)) {
             log::error!("failed to start Tyggs sign-in: {error}");
         }
@@ -390,6 +424,23 @@ fn ServiceAuthStatusScreen(initial_auth: MobileServiceAuthState) -> impl IntoVie
     });
 
     let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if crate::native::is_native() {
+            if busy.get_untracked() {
+                return;
+            }
+            busy.set(true);
+            spawn_local(async move {
+                auth.set(bridge::native_sign_in(provider).await);
+                busy.set(false);
+                if matches!(
+                    auth.get_untracked(),
+                    MobileServiceAuthState::Authenticated { .. }
+                ) {
+                    on_retry.run(());
+                }
+            });
+            return;
+        }
         if let Err(error) = bridge::begin_tyggs_sign_in(provider, None) {
             log::error!("failed to restart Tyggs sign-in: {error}");
         }
@@ -419,6 +470,48 @@ fn ServiceAuthStatusScreen(initial_auth: MobileServiceAuthState) -> impl IntoVie
                 </div>
             </div>
         </div>
+    }
+}
+
+#[component]
+pub(crate) fn NativeAuthRecoverySheet() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let pending = state.native_auth_recovery;
+    let open = Signal::derive(move || pending.with(Option::is_some));
+    let busy = Signal::derive(move || {
+        pending.with(|pending| pending.as_ref().is_some_and(|pending| pending.busy()))
+    });
+    crate::native::track_modal(open);
+    let retry_state = state.clone();
+    let retry = Callback::new(move |_: ()| {
+        crate::actions::native_retry_auth_and_reconnect(retry_state.clone())
+    });
+    let sign_in_state = state.clone();
+    let sign_in = Callback::new(move |provider| {
+        if let Some(pending) = pending.get_untracked() {
+            crate::actions::native_sign_in_and_reconnect(
+                sign_in_state.clone(),
+                pending.local_host_id,
+                provider,
+            );
+        }
+    });
+    view! {
+        <Show when=move || open.get()>
+            <div class="session-settings-backdrop" role="dialog" aria-modal="true" aria-label="Reconnect to Tyggs"
+                data-mobile-test="native-auth-recovery">
+                <div class="session-settings-sheet">
+                    <div class="session-settings-sheet-header">
+                        <h2 class="session-settings-sheet-title">"Reconnect"</h2>
+                        <Button label="Cancel" variant=ButtonVariant::Ghost disabled=busy
+                            data_mobile_test="native-auth-cancel" on_click=Callback::new(move |_: ()| pending.set(None)) />
+                    </div>
+                    {move || pending.get().map(|pending| view! {
+                        <ServiceAuthCard auth=pending.auth busy=busy.get() on_retry=retry on_sign_in=sign_in />
+                    })}
+                </div>
+            </div>
+        </Show>
     }
 }
 
@@ -595,6 +688,7 @@ fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView 
     let state_for_pair = state.clone();
     let state_for_cancel = state.clone();
     let label_for_pair = host_label.clone();
+    let native_origin = crate::native::is_native().then(|| crate::native::direct_origin(&qr_uri));
     let on_pair = Callback::new(move |_: ()| {
         let state = state_for_pair.clone();
         let qr_uri = qr_uri.clone();
@@ -606,7 +700,13 @@ fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView 
             }));
         leptos::task::spawn_local(async move {
             match crate::bridge::redeem_self_hosted_and_connect(&qr_uri).await {
-                Ok(()) => state.app_mode.set(AppMode::Workspace),
+                Ok(local_host_id) => {
+                    if crate::native::is_native() {
+                        crate::native::open_host(&state, local_host_id);
+                    } else {
+                        state.app_mode.set(AppMode::Workspace);
+                    }
+                }
                 Err(message) => state
                     .app_mode
                     .set(AppMode::Pairing(PairingScreen::Failed { message })),
@@ -624,9 +724,11 @@ fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView 
                 <div class="shell-flow">
                 <div class="pairing-card" data-mobile-test="pairing-self-hosted-confirm">
                     <p class="pairing-card-title">{host_label}</p>
-                    <p class="pairing-card-body">
-                        "This Tyde is hosting the app itself, so your phone talks to it directly."
-                    </p>
+                    {match native_origin {
+                        Some(Ok(origin)) => view! { <p class="pairing-host-origin">{origin}</p> }.into_any(),
+                        Some(Err(message)) => view! { <p class="pairing-error" role="alert">{message}</p> }.into_any(),
+                        None => view! { <p class="pairing-card-body">"This Tyde is hosting the app itself, so your phone talks to it directly."</p> }.into_any(),
+                    }}
                 </div>
                 <Button
                     label="Pair"
@@ -846,6 +948,98 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn native_camera_denial_is_actionable_without_raw_browser_details() {
+        use mobile_shell_types::native::NATIVE_BRIDGE_VERSION;
+        let boundary = js_sys::Function::new_with_args("version", r#"
+            const media = navigator.mediaDevices;
+            const oldMedia = Object.getOwnPropertyDescriptor(media, 'getUserMedia');
+            const oldDecoder = Object.getOwnPropertyDescriptor(window, 'BarcodeDetector');
+            const oldNative = Object.getOwnPropertyDescriptor(window, '__tydeNativeHost');
+            const oldJsQr = Object.getOwnPropertyDescriptor(window, 'jsQR');
+            let decoderConstructions = 0, cameraRequests = 0;
+            Object.defineProperty(media, 'getUserMedia', {configurable:true, value:() => {
+                ++cameraRequests;
+                return Promise.reject(new DOMException('Browser implementation details are not UI copy', 'NotAllowedError'));
+            }});
+            Object.defineProperty(window, 'BarcodeDetector', {configurable:true, value:class {
+                constructor() { ++decoderConstructions; throw new Error('An advertised platform decoder failed'); }
+            }});
+            Object.defineProperty(window, 'jsQR', {configurable:true, value:() => {throw new Error('Denied camera must not decode a frame');}});
+            Object.defineProperty(window, '__tydeNativeHost', {configurable:true, value:{version}});
+            const restore = () => {
+                for (const [target, key, old] of [[media, 'getUserMedia', oldMedia],
+                    [window, 'BarcodeDetector', oldDecoder], [window, 'jsQR', oldJsQr],
+                    [window, '__tydeNativeHost', oldNative]]) {
+                    if (old) Object.defineProperty(target, key, old); else delete target[key];
+                }
+            };
+            restore.observed = () => [decoderConstructions, cameraRequests];
+            return restore;
+        "#).call1(&wasm_bindgen::JsValue::NULL, &NATIVE_BRIDGE_VERSION.into()).unwrap()
+            .dyn_into::<js_sys::Function>().unwrap();
+        let container = make_container();
+        let state = AppState::new();
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <PairingFlow screen=PairingScreen::Scanner /> }
+        });
+        let rendered = js_sys::Function::new_with_args("root", r#"
+            return new Promise(resolve => {
+                const check = () => {
+                    const error = root.querySelector('[data-mobile-test="pairing-scanner-error"]');
+                    if (!error) return false;
+                    resolve(null); return true;
+                };
+                const observer = new MutationObserver(() => { if (check()) observer.disconnect(); });
+                observer.observe(root, {childList:true, subtree:true});
+                if (check()) observer.disconnect();
+            });
+        "#).call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(rendered))
+            .await
+            .unwrap();
+        let message = container
+            .query_selector("[data-mobile-test='pairing-scanner-error'] .pairing-error")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        let paste = container
+            .query_selector("[data-mobile-test='pairing-scanner-paste']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        paste.click();
+        next_tick().await;
+        let routed = state.app_mode.get_untracked() == AppMode::Pairing(PairingScreen::ManualPaste);
+        let observed = js_sys::Reflect::get(&boundary, &"observed".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap()
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+        let observed: Vec<u32> = serde_wasm_bindgen::from_value(observed).unwrap();
+        drop(handle);
+        container.remove();
+        boundary.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+        assert_eq!(
+            message, "Camera access is not allowed. Enable it in Settings, or use Paste link.",
+            "The actual camera API rejection must render a concise native state, not raw browser diagnostics"
+        );
+        assert!(
+            routed,
+            "Camera denial must leave the ordinary Paste link action usable"
+        );
+        assert_eq!(
+            observed,
+            vec![0, 1],
+            "Native scanning must use its one bundled decoder, never catch a selected platform decoder failure and substitute implementations"
+        );
+    }
+
     /// Read the announced role of a rendered element.
     fn role_of(container: &HtmlElement, test_id: &str) -> Option<String> {
         container
@@ -895,14 +1089,43 @@ mod wasm_tests {
     /// `PairingScreen::Failed` — the product state is literally named for the failure,
     /// so the screen has no excuse for staying silent.
     #[wasm_bindgen_test]
-    async fn pairing_failed_announces_the_failure() {
+    async fn pairing_failed_announces_failure_and_separates_native_recovery_controls() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let window = web_sys::window().unwrap();
+        let native = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &native,
+            &"version".into(),
+            &mobile_shell_types::native::NATIVE_BRIDGE_VERSION.into(),
+        )
+        .unwrap();
+        let post = js_sys::Function::new_with_args(
+            "endpoint,payload",
+            "return Promise.reject(new Error('Native operation was denied by the platform'))",
+        );
+        js_sys::Reflect::set(&native, &"post".into(), &post).unwrap();
+        js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
+        let failed = crate::native::call::<_, ()>(
+            mobile_shell_types::native::NativeEndpoint::SecretWrite,
+            &mobile_shell_types::native::NativeSecretWrite {
+                key: "tyde-web-boundary-test".into(),
+                value: "not-a-pairing-credential".into(),
+            },
+        )
+        .await;
+        // Restore the global boundary before any assertion can panic in Wasm.
+        js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
+        let failure = failed.unwrap_err();
+        let expected_failure =
+            "Native secret_write failed: Native operation was denied by the platform";
         let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
+        container.set_class_name("mobile-app");
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             provide_context(state);
             view! {
                 <PairingFlow screen=PairingScreen::Failed {
-                    message: "Could not reach the host.".to_owned(),
+                    message: failure.clone(),
                 } />
             }
         });
@@ -913,6 +1136,70 @@ mod wasm_tests {
             Some("alert"),
             "a failed pairing must announce why"
         );
+        let message = container.query_selector("[role='alert']").unwrap().unwrap();
+        assert_eq!(
+            message.text_content().as_deref(),
+            Some(expected_failure),
+            "A native Error rejection must retain the failing endpoint and safe platform reason in the real failure screen"
+        );
+        let retry = container
+            .query_selector("button[aria-label='Try again']")
+            .unwrap()
+            .unwrap();
+        let cancel = container
+            .query_selector("button[aria-label='Cancel']")
+            .unwrap()
+            .unwrap();
+        let gap =
+            || cancel.get_bounding_client_rect().top() - retry.get_bounding_client_rect().bottom();
+        for width in [390, 1024] {
+            container
+                .set_attribute("style", &format!("width:{width}px;height:844px"))
+                .unwrap();
+            next_tick().await;
+            let browser_gap = gap();
+            let browser_style = window.get_computed_style(&retry).unwrap().unwrap();
+            let font = browser_style.get_property_value("font").unwrap();
+            container.set_attribute("data-native-host", "").unwrap();
+            next_tick().await;
+            // Source06's actual failed-pairing capture showed touching controls.
+            // Browser context retains that old flow-root path; without the native
+            // stack rule, its unchanged gap also fails this native assertion.
+            assert!(
+                gap() >= 16.0 && gap() > browser_gap,
+                "Native recovery buttons need theme spacing, not the old touching stack"
+            );
+            assert!(
+                retry.get_bounding_client_rect().top()
+                    - message.get_bounding_client_rect().bottom()
+                    >= 16.0,
+                "The failure message must remain distinct from the recovery action"
+            );
+            assert!(
+                retry.get_bounding_client_rect().height() >= 44.0
+                    && cancel.get_bounding_client_rect().height() >= 44.0,
+                "Recovery controls must retain usable touch targets"
+            );
+            assert_eq!(
+                window
+                    .get_computed_style(&retry)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("font")
+                    .unwrap(),
+                font,
+                "Native spacing must not replace the existing theme's font and size roles"
+            );
+            container.remove_attribute("data-native-host").unwrap();
+            next_tick().await;
+            assert_eq!(
+                gap(),
+                browser_gap,
+                "Browser pairing layout remains unchanged"
+            );
+        }
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]

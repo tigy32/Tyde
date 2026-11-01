@@ -200,6 +200,10 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
             protocol::MessageSender::Error => ("error", "chat-message-error", "Error".to_string()),
         };
 
+    let native_label = crate::native::is_native().then(|| match &entry.message.sender {
+        protocol::MessageSender::Assistant { .. } => "Assistant message".to_owned(),
+        _ => format!("Message from {sender_name}"),
+    });
     let content = entry.message.content.clone();
     let images = entry.message.images.clone().unwrap_or_default();
     let has_reasoning = entry
@@ -227,7 +231,8 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
     let tool_requests = entry.tool_requests;
 
     view! {
-        <div class=format!("chat-message {sender_class}") data-mobile-test=sender_test>
+        <div class=format!("chat-message {sender_class}") data-mobile-test=sender_test
+            role=crate::native::is_native().then_some("article") aria-label=native_label>
             <div class="message-header">
                 <span class="sender-name">{sender_name}</span>
                 {

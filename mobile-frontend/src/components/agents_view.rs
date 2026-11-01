@@ -445,7 +445,6 @@ fn render_agents_body(
                         return view! {
                             <EmptyState
                                 title="No agents running"
-                                body="Tap below to start a new chat. Agents you spawn on your phone show up here and stay in sync with desktop."
                                 icon="\u{1F916}"
                                 cta_label="Start a chat"
                                 cta_test="agents-empty-cta"
@@ -746,9 +745,19 @@ fn agent_row(
             local_host_id: host_id_click.clone(),
             agent_id: agent_id_click.clone(),
         }));
-        state_for_click.viewing_chat.set(true);
+        state_for_click.show_chat();
     });
 
+    let selected_state = state.clone();
+    let selected_agent = agent_ref.clone();
+    let selected = move || {
+        (crate::native::is_native()
+            && selected_state
+                .active_agent
+                .get()
+                .is_some_and(|active| active.as_agent_ref() == selected_agent))
+        .then_some("page")
+    };
     let row_class = if indent {
         "list-row list-row-flush agent-child-row"
     } else {
@@ -763,7 +772,7 @@ fn agent_row(
             on_click=on_click
             aria_label=format!("Open chat with {name}")
         >
-            <div class=row_class>
+            <div class=row_class aria-current=selected>
                 <StatusDot
                     label=status_label.to_string()
                     tone=tone
@@ -1282,6 +1291,20 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='agents-empty']")
             .unwrap();
         assert!(empty.is_some(), "empty state must render when no agents");
+        let empty = empty.unwrap();
+        assert_eq!(
+            empty
+                .query_selector("h2")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("No agents running")
+        );
+        assert!(
+            empty.query_selector("p").unwrap().is_none(),
+            "The clear empty title and Start a chat action must not carry redundant device-specific helper copy"
+        );
         let cta = container
             .query_selector("[data-mobile-test='agents-empty-cta']")
             .unwrap();

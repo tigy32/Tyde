@@ -12,12 +12,13 @@ pub enum HostRelease {
         payload: WelcomePayload,
     },
     Rejected(RejectPayload),
+    NativeIncompatible(WelcomePayload),
 }
 
 impl HostRelease {
     fn target(&self) -> (Option<TydeReleaseVersion>, u32) {
         match self {
-            Self::Welcome { payload, .. } => {
+            Self::Welcome { payload, .. } | Self::NativeIncompatible(payload) => {
                 (payload.release_version.clone(), payload.protocol_version)
             }
             Self::Rejected(payload) => (
@@ -80,6 +81,10 @@ pub fn restore_selection(state: &AppState) {
 }
 
 pub fn install(state: AppState) {
+    if crate::native::is_native() {
+        install_native(state);
+        return;
+    }
     let generation = RwSignal::new(0u64);
     let input_state = state.clone();
     let inputs = Memo::new(move |_| {
@@ -175,4 +180,44 @@ pub fn install(state: AppState) {
             state.bundle_status.set(status);
         });
     });
+}
+
+fn install_native(state: AppState) {
+    Effect::new(move |_| {
+        let host = state.active_local_host_id.get();
+        let selected = (|| {
+            let storage = web_sys::window()
+                .ok_or(UnavailableReason::Storage)?
+                .local_storage()
+                .map_err(|_| UnavailableReason::Storage)?
+                .ok_or(UnavailableReason::Storage)?;
+            match &host {
+                Some(host) => storage.set_item("tyde.selected-host.v1", &host.0),
+                None => storage.remove_item("tyde.selected-host.v1"),
+            }
+            .map_err(|_| UnavailableReason::Storage)
+        })();
+        if let Err(reason) = selected {
+            state.bundle_status.set(BundleStatus::Unavailable(reason));
+            return;
+        }
+        let release = host
+            .as_ref()
+            .and_then(|host| state.host_releases.get().get(host).cloned());
+        let status = match release {
+            None => BundleStatus::Idle,
+            Some(HostRelease::Welcome { payload, .. }) if native_release_matches(&payload) => {
+                BundleStatus::Idle
+            }
+            Some(_) => BundleStatus::Unavailable(UnavailableReason::NativeVersion),
+        };
+        state.bundle_status.set(status);
+    });
+}
+
+pub fn native_release_matches(payload: &WelcomePayload) -> bool {
+    payload.protocol_version == protocol::PROTOCOL_VERSION
+        && payload.release_version.as_ref().is_some_and(|release| {
+            release.as_str() == mobile_shell_types::native::NATIVE_CLIENT_RELEASE
+        })
 }

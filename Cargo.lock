@@ -6006,6 +6006,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tyde-time",
+ "uuid",
 ]
 
 [[package]]

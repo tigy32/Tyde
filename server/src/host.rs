@@ -1331,13 +1331,14 @@ enum SpawnOperationOutcome {
 
 #[derive(Clone)]
 struct SpawnOperationTerminalClaim {
+    terminal: SpawnOperationTerminal,
     outcome: Arc<StdMutex<Option<SpawnOperationOutcome>>>,
     #[cfg(feature = "test-support")]
     publication_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
 }
 
 impl SpawnOperationTerminalClaim {
-    fn claim_success_at_publication(&self) -> bool {
+    fn claim_success_at_publication(&self, start: &AgentStartPayload) -> bool {
         let mut outcome = self
             .outcome
             .lock()
@@ -1346,6 +1347,24 @@ impl SpawnOperationTerminalClaim {
             false
         } else {
             *outcome = Some(SpawnOperationOutcome::Success);
+            // Publication owns creation, even if later post-fanout work is cancelled.
+            if self.terminal.request_stream.spawn_parent().is_some() {
+                match serde_json::to_value(start) {
+                    Ok(payload) => {
+                        if self
+                            .terminal
+                            .output_stream
+                            .send_value(FrameKind::AgentStart, payload)
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "creation terminal could not be delivered to its disconnected requester"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::error!(%error, "cannot serialize creation terminal"),
+                }
+            }
             true
         }
     }
@@ -1371,7 +1390,13 @@ impl SpawnOperationTerminalClaim {
             return;
         }
         *outcome = Some(match result {
-            Ok(Ok(_)) => SpawnOperationOutcome::Success,
+            Ok(Ok(_)) if self.terminal.request_stream.spawn_parent().is_none() => {
+                SpawnOperationOutcome::Success
+            }
+            Ok(Ok(_)) => SpawnOperationOutcome::Error(AppError::internal(
+                "spawn_agent",
+                anyhow!("creation completed without publication"),
+            )),
             Ok(Err(error)) => SpawnOperationOutcome::Error(error),
             Err(_) => SpawnOperationOutcome::Panicked,
         });
@@ -3807,9 +3832,6 @@ impl HostHandle {
             if !bootstrap_claimed {
                 continue;
             }
-            if let Some(terminal_claim) = state.spawn_publication_claims.get(&agent_id) {
-                terminal_claim.claim_success_at_publication();
-            }
             let agent_handle = state.registry.agent_handle(&agent_id).unwrap_or_else(|| {
                 panic!(
                     "registry missing handle for listed agent {} during host stream registration",
@@ -4057,6 +4079,11 @@ impl HostHandle {
                         subscriber.stream.clone(),
                     )
                 };
+                for agent_id in &bootstrap_agent_ids {
+                    if let (Some(claim), Some(handle)) = (state.spawn_publication_claims.get(agent_id), state.registry.agent_handle(agent_id)) {
+                        claim.claim_success_at_publication(&handle.snapshot());
+                    }
+                }
                 for pending in pending_new_agents {
                     if bootstrap_agent_ids.contains(&pending.start.agent_id) {
                         continue;
@@ -4089,6 +4116,9 @@ impl HostHandle {
                             state.agent_visibility.remove_host_stream(&host_path);
                             return Vec::new();
                         }
+                    }
+                    if let Some(claim) = state.spawn_publication_claims.get(&pending.start.agent_id) {
+                        claim.claim_success_at_publication(&pending.start);
                     }
                 }
                 for (kind, payload) in pending_frames {
@@ -4222,9 +4252,9 @@ impl HostHandle {
                             let claimed = state
                                 .spawn_publication_claims
                                 .get(&pending.start.agent_id)
-                                .is_some_and(
-                                    SpawnOperationTerminalClaim::claim_success_at_publication,
-                                );
+                                .is_some_and(|claim| {
+                                    claim.claim_success_at_publication(&pending.start)
+                                });
                             (attachment, claimed)
                         }),
                     )
@@ -6226,49 +6256,54 @@ impl HostHandle {
                         persistence: InitialAgentAliasPersistence::User,
                     });
                     return self
-                        .spawn_resolved_agent(ResolvedSpawnRequest {
-                            tyde_permissions: Default::default(),
-                            restoration: restoration.clone(),
-                            name: resolved_name,
-                            origin,
-                            custom_agent_id: payload.custom_agent_id.clone(),
-                            team_id: team_context.as_ref().map(|context| context.team_id.clone()),
-                            team_member_id: team_context
-                                .as_ref()
-                                .map(|context| context.team_member_id.clone()),
-                            workflow: workflow.clone(),
-                            parent_agent_id: payload.parent_agent_id,
-                            parent_session_id,
-                            project_id: payload.project_id.clone(),
-                            backend_kind: host_settings
-                                .default_backend
-                                .or_else(|| host_settings.enabled_backends.first().copied())
-                                .unwrap_or(protocol::BackendKind::Claude),
-                            launch_profile_id: None,
-                            workspace_roots: Vec::new(),
-                            initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
-                                message: prompt,
-                                images: None,
-                                origin: None,
-                                tool_response: None,
-                            }),
-                            cost_hint: None,
-                            session_settings: None,
-                            session_settings_schema: None,
-                            backend_config: Default::default(),
-                            acp_agent: None,
-                            resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
-                            resume_session_id: Some(session_id.clone()),
-                            fork_from_session_id: None,
-                            startup_warning: None,
-                            startup_failure: Some(AgentStartupFailure::unsupported(format!(
-                                "cannot resume missing session {}",
-                                session_id
-                            ))),
-                            initial_alias,
-                            use_mock_backend,
-                            mock_launch: None,
-                        })
+                        .spawn_resolved_agent(
+                            ResolvedSpawnRequest {
+                                tyde_permissions: Default::default(),
+                                restoration: restoration.clone(),
+                                name: resolved_name,
+                                origin,
+                                custom_agent_id: payload.custom_agent_id.clone(),
+                                team_id: team_context
+                                    .as_ref()
+                                    .map(|context| context.team_id.clone()),
+                                team_member_id: team_context
+                                    .as_ref()
+                                    .map(|context| context.team_member_id.clone()),
+                                workflow: workflow.clone(),
+                                parent_agent_id: payload.parent_agent_id,
+                                parent_session_id,
+                                project_id: payload.project_id.clone(),
+                                backend_kind: host_settings
+                                    .default_backend
+                                    .or_else(|| host_settings.enabled_backends.first().copied())
+                                    .unwrap_or(protocol::BackendKind::Claude),
+                                launch_profile_id: None,
+                                workspace_roots: Vec::new(),
+                                initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
+                                    message: prompt,
+                                    images: None,
+                                    origin: None,
+                                    tool_response: None,
+                                }),
+                                cost_hint: None,
+                                session_settings: None,
+                                session_settings_schema: None,
+                                backend_config: Default::default(),
+                                acp_agent: None,
+                                resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
+                                resume_session_id: Some(session_id.clone()),
+                                fork_from_session_id: None,
+                                startup_warning: None,
+                                startup_failure: Some(AgentStartupFailure::unsupported(format!(
+                                    "cannot resume missing session {}",
+                                    session_id
+                                ))),
+                                initial_alias,
+                                use_mock_backend,
+                                mock_launch: None,
+                            },
+                            operation_terminal_claim.clone(),
+                        )
                         .await;
                 };
                 if !session_record_is_resumable(&record, &backend_storage) {
@@ -6283,46 +6318,51 @@ impl HostHandle {
                         persistence: InitialAgentAliasPersistence::User,
                     });
                     return self
-                        .spawn_resolved_agent(ResolvedSpawnRequest {
-                            tyde_permissions: Default::default(),
-                            restoration: restoration.clone(),
-                            name: resolved_name,
-                            origin,
-                            custom_agent_id: record.custom_agent_id.clone(),
-                            team_id: team_context.as_ref().map(|context| context.team_id.clone()),
-                            team_member_id: team_context
-                                .as_ref()
-                                .map(|context| context.team_member_id.clone()),
-                            workflow: workflow.clone(),
-                            parent_agent_id: payload.parent_agent_id,
-                            parent_session_id,
-                            project_id: record.project_id.clone(),
-                            backend_kind: record.backend_kind,
-                            launch_profile_id: record.launch_profile_id.clone(),
-                            workspace_roots: record.workspace_roots.clone(),
-                            initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
-                                message: prompt,
-                                images: None,
-                                origin: None,
-                                tool_response: None,
-                            }),
-                            cost_hint: None,
-                            session_settings: None,
-                            session_settings_schema: None,
-                            backend_config: Default::default(),
-                            acp_agent: None,
-                            resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
-                            resume_session_id: Some(session_id.clone()),
-                            fork_from_session_id: None,
-                            startup_warning: None,
-                            startup_failure: Some(AgentStartupFailure::unsupported(format!(
-                                "cannot resume non-resumable session {}",
-                                session_id
-                            ))),
-                            initial_alias,
-                            use_mock_backend,
-                            mock_launch: None,
-                        })
+                        .spawn_resolved_agent(
+                            ResolvedSpawnRequest {
+                                tyde_permissions: Default::default(),
+                                restoration: restoration.clone(),
+                                name: resolved_name,
+                                origin,
+                                custom_agent_id: record.custom_agent_id.clone(),
+                                team_id: team_context
+                                    .as_ref()
+                                    .map(|context| context.team_id.clone()),
+                                team_member_id: team_context
+                                    .as_ref()
+                                    .map(|context| context.team_member_id.clone()),
+                                workflow: workflow.clone(),
+                                parent_agent_id: payload.parent_agent_id,
+                                parent_session_id,
+                                project_id: record.project_id.clone(),
+                                backend_kind: record.backend_kind,
+                                launch_profile_id: record.launch_profile_id.clone(),
+                                workspace_roots: record.workspace_roots.clone(),
+                                initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
+                                    message: prompt,
+                                    images: None,
+                                    origin: None,
+                                    tool_response: None,
+                                }),
+                                cost_hint: None,
+                                session_settings: None,
+                                session_settings_schema: None,
+                                backend_config: Default::default(),
+                                acp_agent: None,
+                                resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
+                                resume_session_id: Some(session_id.clone()),
+                                fork_from_session_id: None,
+                                startup_warning: None,
+                                startup_failure: Some(AgentStartupFailure::unsupported(format!(
+                                    "cannot resume non-resumable session {}",
+                                    session_id
+                                ))),
+                                initial_alias,
+                                use_mock_backend,
+                                mock_launch: None,
+                            },
+                            operation_terminal_claim.clone(),
+                        )
                         .await;
                 }
                 if record.parent_id.is_some() && record.parent_id != parent_session_id {
@@ -6616,44 +6656,47 @@ let custom_agents = &state.custom_agent_store;
                     let mut resolved_spawn_config = ResolvedSpawnConfig::failed_startup();
                     resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
                     return self
-                        .spawn_resolved_agent(ResolvedSpawnRequest {
-                            tyde_permissions: Default::default(),
-                            restoration: restoration.clone(),
-                            name: resolved_name,
-                            origin: AgentOrigin::User,
-                            custom_agent_id: payload.custom_agent_id,
-                            team_id: None,
-                            team_member_id: None,
-                            workflow: None,
-                            parent_agent_id: None,
-                            parent_session_id: None,
-                            project_id: payload.project_id,
-                            backend_kind: protocol::BackendKind::Claude,
-                            launch_profile_id: None,
-                            workspace_roots: Vec::new(),
-                            initial_input: Some(protocol::SendMessagePayload {
-                                message: prompt,
-                                images,
-                                origin: None,
-                                tool_response: None,
-                            }),
-                            cost_hint: None,
-                            session_settings: None,
-                            session_settings_schema: None,
-                            backend_config: Default::default(),
-                            acp_agent: None,
-                            resolved_spawn_config,
-                            resume_session_id: None,
-                            fork_from_session_id: None,
-                            startup_warning: None,
-                            startup_failure: Some(AgentStartupFailure::internal(format!(
-                                "cannot fork missing session {}",
-                                from_session_id
-                            ))),
-                            initial_alias,
-                            use_mock_backend,
-                            mock_launch: None,
-                        })
+                        .spawn_resolved_agent(
+                            ResolvedSpawnRequest {
+                                tyde_permissions: Default::default(),
+                                restoration: restoration.clone(),
+                                name: resolved_name,
+                                origin: AgentOrigin::User,
+                                custom_agent_id: payload.custom_agent_id,
+                                team_id: None,
+                                team_member_id: None,
+                                workflow: None,
+                                parent_agent_id: None,
+                                parent_session_id: None,
+                                project_id: payload.project_id,
+                                backend_kind: protocol::BackendKind::Claude,
+                                launch_profile_id: None,
+                                workspace_roots: Vec::new(),
+                                initial_input: Some(protocol::SendMessagePayload {
+                                    message: prompt,
+                                    images,
+                                    origin: None,
+                                    tool_response: None,
+                                }),
+                                cost_hint: None,
+                                session_settings: None,
+                                session_settings_schema: None,
+                                backend_config: Default::default(),
+                                acp_agent: None,
+                                resolved_spawn_config,
+                                resume_session_id: None,
+                                fork_from_session_id: None,
+                                startup_warning: None,
+                                startup_failure: Some(AgentStartupFailure::internal(format!(
+                                    "cannot fork missing session {}",
+                                    from_session_id
+                                ))),
+                                initial_alias,
+                                use_mock_backend,
+                                mock_launch: None,
+                            },
+                            operation_terminal_claim.clone(),
+                        )
                         .await;
                 };
                 tracing::warn!(
@@ -7896,7 +7939,11 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         request
     }
 
-    async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AppResult<AgentId> {
+    async fn spawn_resolved_agent(
+        &self,
+        request: ResolvedSpawnRequest,
+        operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
+    ) -> AppResult<AgentId> {
         let project_binding = if let Some(project_id) = request.project_id.as_ref() {
             Some(
                 self.project_catalog
@@ -8042,6 +8089,11 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                                     )
                                 },
                             );
+                            if let Some(claim) = operation_terminal_claim {
+                                state
+                                    .spawn_publication_claims
+                                    .insert(spawned.start.agent_id.clone(), claim);
+                            }
                             host.register_restart_handle(&spawned.handle);
                             let creation_guard = UnpublishedAgentGuard::new(
                                 host.clone(),
@@ -8189,7 +8241,19 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 break;
             };
             match delivery {
-                Ok((attachment, _)) => {
+                Ok((attachment, claimed)) => {
+                    if claimed {
+                        let claim = self
+                            .state
+                            .with({
+                                let agent_id = agent_id.clone();
+                                move |state| state.spawn_publication_claims.get(&agent_id).cloned()
+                            })
+                            .await;
+                        if let Some(claim) = claim {
+                            claim.wait_after_success_publication(claimed).await;
+                        }
+                    }
                     if let Some(attachment) = attachment {
                         deferred_attachments.push(attachment);
                     }
@@ -15431,7 +15495,7 @@ let project_id = &project_id;
             use_mock_backend,
             mock_launch: None,
         };
-        let coordinator_agent_id = self.spawn_resolved_agent(request).await?;
+        let coordinator_agent_id = self.spawn_resolved_agent(request, None).await?;
         self.workflow_note_agent(&run_id, coordinator_agent_id.clone(), true)
             .await
             .map_err(|error| {
@@ -18310,7 +18374,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
             mock_launch: None,
         };
         let agent_id = self
-            .spawn_resolved_agent(request)
+            .spawn_resolved_agent(request, None)
             .await
             .map_err(|error| error.message)?;
         tracing::info!(
@@ -22167,6 +22231,7 @@ fn spawn_host_spawn_operation_task(
                     };
                     let outcome = Arc::new(StdMutex::new(None));
                     let terminal_claim = SpawnOperationTerminalClaim {
+                        terminal: terminal.clone(),
                         outcome: Arc::clone(&outcome),
                         #[cfg(feature = "test-support")]
                         publication_test_gate: Arc::clone(&publication_test_gate),

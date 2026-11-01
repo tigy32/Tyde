@@ -149,17 +149,17 @@ pub fn HomeView() -> impl IntoView {
         <div class="view home-view" data-mobile-test="home-view">
             <div class="shell-flow">
                 <header class="home-hero">
-                    <p class="home-hero-greeting">"Welcome back"</p>
+                    <Show when=|| !crate::native::is_native()><p class="home-hero-greeting">"Welcome back"</p></Show>
                     <h1 class="home-hero-host">
                         {move || {
                             let (_, _, pill_tone, pill_label) = connection_tone.get();
                             view! {
                                 <span>{host_label}</span>
-                                <Pill
+                                <Show when=|| !crate::native::is_native()><Pill
                                     label=pill_label.to_string()
                                     tone=pill_tone
                                     data_mobile_test="home-connection-pill"
-                                />
+                                /></Show>
                             }
                         }}
                     </h1>
@@ -215,7 +215,7 @@ pub fn HomeView() -> impl IntoView {
                                         <p class="home-stat-label">"Sessions"</p>
                                     </div>
                                 </Card>
-                                <Card data_mobile_test="home-stat-host" dense=true>
+                                <Show when=|| !crate::native::is_native()>                                <Card data_mobile_test="home-stat-host" dense=true>
                                     <div class="home-stat-card">
                                         <div class="home-stat-value" style="font-size: var(--text-lg);">
                                             {move || {
@@ -225,11 +225,11 @@ pub fn HomeView() -> impl IntoView {
                                         </div>
                                         <p class="home-stat-label">"Connection"</p>
                                     </div>
-                                </Card>
+                                </Card></Show>
                             </div>
 
                             <div class="home-quick-actions">
-                                <p class="home-quick-actions-title">"Quick actions"</p>
+                                <Show when=|| !crate::native::is_native()><p class="home-quick-actions-title">"Quick actions"</p></Show>
                                 <Button
                                     label="New chat"
                                     variant=ButtonVariant::Primary
@@ -289,7 +289,7 @@ pub fn HomeView() -> impl IntoView {
                                             local_host_id: host_id.clone(),
                                             agent_id: agent_id.clone(),
                                         }));
-                                        s_row.viewing_chat.set(true);
+                                        s_row.show_chat();
                                     });
                                     view! {
                                         <Card
@@ -517,8 +517,15 @@ mod wasm_tests {
     /// reachable in either surface for screen readers.
     #[wasm_bindgen_test]
     async fn home_view_connection_status_appears_in_pill_and_dot() {
+        crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-x".to_owned());
         let container = make_container();
+        container.set_class_name("mobile-app");
+        container
+            .style()
+            .set_css_text("width:386px;height:700px;position:relative");
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_for_mount = state_handle.clone();
         let host_for_mount = host.clone();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -529,6 +536,7 @@ mod wasm_tests {
                 );
             });
             state.active_local_host_id.set(Some(host_for_mount.clone()));
+            *state_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! { <HomeView /> }
         });
@@ -546,6 +554,71 @@ mod wasm_tests {
             dot.get_attribute("aria-label").as_deref(),
             Some("Error"),
             "status dot must carry an accessible label for screen readers"
+        );
+        let state: AppState = state_handle.borrow().as_ref().unwrap().clone();
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host, ConnectionStatus::Connected);
+        });
+        next_tick().await;
+        let dot = container
+            .query_selector("[data-mobile-test='home-status-dot']")
+            .unwrap()
+            .unwrap();
+        let label = dot.next_element_sibling().unwrap();
+        assert_eq!(label.text_content().as_deref(), Some("Connected"));
+        assert_eq!(
+            dot.get_attribute("aria-label").as_deref(),
+            Some("Connected")
+        );
+        let window = web_sys::window().unwrap();
+        let style = |element: &web_sys::Element, property: &str| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value(property)
+                .unwrap()
+        };
+        let browser_gap =
+            label.get_bounding_client_rect().left() - dot.get_bounding_client_rect().right();
+        let browser_font = style(&label, "font-size");
+        let browser_dot = dot.get_bounding_client_rect();
+        container.set_attribute("data-native-host", "").unwrap();
+        for width in [320, 386, 669, 951] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            let dot_bounds = dot.get_bounding_client_rect();
+            let label_bounds = label.get_bounding_client_rect();
+            let spacing = style(container.unchecked_ref(), "--space-2")
+                .trim_end_matches("px")
+                .trim()
+                .parse::<f64>()
+                .unwrap();
+            assert!(
+                label_bounds.left() - dot_bounds.right() >= spacing,
+                "Native connection text must clear the status indicator and its halo at {width}px"
+            );
+            assert_eq!(
+                style(&label, "font-size"),
+                browser_font,
+                "Native status spacing must retain the existing theme text size"
+            );
+            assert_eq!(
+                (dot_bounds.width(), dot_bounds.height()),
+                (browser_dot.width(), browser_dot.height()),
+                "Native status spacing must retain the existing indicator size"
+            );
+        }
+        container.style().set_property("width", "386px").unwrap();
+        container.remove_attribute("data-native-host").unwrap();
+        next_tick().await;
+        assert_eq!(
+            label.get_bounding_client_rect().left() - dot.get_bounding_client_rect().right(),
+            browser_gap,
+            "Native status spacing must not change browser/PWA layout"
         );
     }
 }

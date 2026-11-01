@@ -1643,7 +1643,9 @@ pub fn ChatInput() -> impl IntoView {
         }
     });
 
+    let native_destination = state.native_chat_destination;
     let choose_photo_state = state.clone();
+    let photo_owner = Owner::current().unwrap();
     let on_photos_chosen = move |ev| {
         let input = event_target::<web_sys::HtmlInputElement>(&ev);
         let files = input.files();
@@ -1670,24 +1672,27 @@ pub fn ChatInput() -> impl IntoView {
             return;
         }
 
+        native_destination.set(None);
         loading_photos.set(true);
         attachment_error.set(None);
-        spawn_local(async move {
-            let mut added = Vec::new();
-            let mut errors = Vec::new();
-            for file in files {
-                match read_image_file(file).await {
-                    Ok(image) => added.push(image),
-                    Err(error) => errors.push(error),
+        photo_owner.with(|| {
+            leptos::task::spawn_local_scoped_with_cancellation(async move {
+                let mut added = Vec::new();
+                let mut errors = Vec::new();
+                for file in files {
+                    match read_image_file(file).await {
+                        Ok(image) => added.push(image),
+                        Err(error) => errors.push(error),
+                    }
                 }
-            }
-            if !added.is_empty() {
-                composer.images.update(|images| images.extend(added));
-            }
-            if !errors.is_empty() {
-                attachment_error.set(Some(errors.join(" ")));
-            }
-            loading_photos.set(false);
+                if !added.is_empty() {
+                    composer.images.update(|images| images.extend(added));
+                }
+                if !errors.is_empty() {
+                    attachment_error.set(Some(errors.join(" ")));
+                }
+                loading_photos.set(false);
+            })
         });
     };
 
@@ -1942,6 +1947,7 @@ pub fn ChatInput() -> impl IntoView {
                                             on:click=move |_| {
                                                 composer.images.update(|images| {
                                                     if index < images.len() {
+                                                        native_destination.set(None);
                                                         images.remove(index);
                                                     }
                                                 });
@@ -2357,6 +2363,103 @@ mod wasm_tests {
             connection_instance_id: 7,
             local_submission_id: LocalSubmissionId(id),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_input_recorder_distinguishes_dom_edits_and_cancellation_without_text() {
+        let state = AppState::new();
+        let container = make_container();
+        let mount_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        let host = include_str!("../../../ios/Tyde/TydeHostController.swift");
+        let script = host
+            .split_once("private static let inputDiagnosticScript = #\"\"\"\n")
+            .unwrap()
+            .1
+            .split_once("\n    \"\"\"#")
+            .unwrap()
+            .0;
+        // Constructed DOM events qualify the recorder, not an iOS keyboard.
+        let trace = js_sys::Function::new_with_args("root,script", r#"
+            const records = [], expected = 'a'.repeat(32);
+            const webkit = Object.getOwnPropertyDescriptor(window, 'webkit');
+            Object.defineProperty(window, 'webkit', {configurable:true, value:{messageHandlers: {
+                nativeInputDiagnostics: {postMessage: json => records.push(JSON.parse(json))}
+            }}});
+            const stop = Function('tydeInputExpected', 'return ' + script)(expected);
+            const field = root.querySelector('[data-mobile-test="chat-input"]');
+            field.focus();
+            field.value = expected.slice(0, 8);
+            if (field.value !== expected.slice(0, 8)) throw new Error('Recorder must forward the original setter');
+            field.addEventListener('keypress', event => event.preventDefault(), {once:true});
+            const keyAccepted = field.dispatchEvent(new KeyboardEvent('keypress', {
+                key:'a', bubbles:true, cancelable:true
+            }));
+            field.addEventListener('beforeinput', event => event.preventDefault(), {once:true});
+            const inputAccepted = field.dispatchEvent(new InputEvent('beforeinput', {
+                inputType:'insertText', data:expected, bubbles:true, cancelable:true
+            }));
+            field.value = 'z'.repeat(32);
+            field.value = expected;
+            if (field.value !== expected) throw new Error('Recorder must forward the complete setter');
+            let snapshot = null;
+            const snapshotInput = event => {
+                if (event.target === field) queueMicrotask(() => {snapshot = field.value;});
+            };
+            document.addEventListener('input', snapshotInput, true);
+            field.addEventListener('input', () => {field.value = expected.slice(0, 8);}, {once:true});
+            field.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:expected, bubbles:true}));
+            const other = document.createElement('textarea');
+            root.append(other);
+            other.value = 'b'.repeat(32);
+            other.focus();
+            other.dispatchEvent(new KeyboardEvent('keydown', {key:'b', bubbles:true}));
+            other.dispatchEvent(new InputEvent('input', {data:other.value, bubbles:true}));
+            return {records, expected, field, keyAccepted, inputAccepted, get snapshot() {return snapshot;}, restore:() => {
+                document.removeEventListener('input', snapshotInput, true);
+                stop();
+                if (webkit) Object.defineProperty(window, 'webkit', webkit);
+                else delete window.webkit;
+            }};
+        "#).call2(&wasm_bindgen::JsValue::NULL, &container, &script.into()).unwrap();
+        next_tick().await;
+        let observation = js_sys::Function::new_with_args("trace", r#"
+            const {records, expected, field, keyAccepted, inputAccepted, snapshot} = trace;
+            const require = (ok, context) => {if (!ok) throw new Error(context);};
+            try {
+                require(!keyAccepted && !inputAccepted, 'Recorder must forward cancellation unchanged');
+                require(field.value === expected, 'The mounted composer must retain its complete input');
+                require(records[0].phase === 'ready', 'Recorder must identify its start');
+                require(records.every((r, i) => r.sequence === i + 1), 'Recorder sequence must be contiguous');
+                require(records.some(r => r.phase === 'keypress' && r.composer), 'Record the character-event boundary');
+                require(records.some(r => r.phase === 'prevent_default' && r.keyKind === 'character'), 'Record character-event cancellation');
+                require(records.some(r => r.phase === 'prevent_default' && r.input === 'text'), 'Record beforeinput cancellation');
+                require(records.some(r => r.phase === 'setter' && r.length === 32 && !r.exactExpected && !r.expectedPrefix), 'Do not equate length with exact input');
+                require(records.some(r => r.phase === 'input' && r.length === 32 && r.exactExpected), 'Observe exact value before input handlers');
+                require(records.some(r => r.phase === 'setter' && r.setterBefore === 32 && r.setterBeforeExact && r.length === 8 && !r.exactExpected && r.expectedPrefix), 'Identify an actual shortening setter');
+                require(records.some(r => r.phase === 'setter' && r.setterBefore === 8 && r.length === 32 && r.exactExpected), 'Observe the composer restoring its complete stored draft');
+                require(snapshot !== null && records.some(r => r.phase === 'settled' && r.length === snapshot.length && r.exactExpected === (snapshot === expected) && r.expectedPrefix === expected.startsWith(snapshot)), 'The microtask record must match the independently observed DOM value');
+                require(records.some(r => r.phase === 'focusout' && r.composer), 'Observe composer focus loss');
+                require(records.some(r => r.phase === 'keydown' && !r.composer), 'Observe keys routed outside the composer');
+                for (const r of records) {
+                    require(JSON.stringify(r).length < 1024, 'Recorder must fit the native message limit');
+                    require(Number.isFinite(r.documentTime) && r.documentTime >= 0, 'Record a finite document timestamp');
+                    require(Object.entries(r).every(([k,v]) => v === null || typeof v === 'number' || typeof v === 'boolean' || ['phase','input','keyKind'].includes(k)), 'Trace must contain only scalars and event classifications');
+                    if (!r.composer) require(r.node === 0 && r.length === 0 && r.dataLength === 0 && r.exactExpected === null && r.matchesExpected === null, 'Never inspect another field value or key');
+                }
+                require(!JSON.stringify(records).includes(expected.slice(0, 8)), 'Trace must not contain input content');
+            } finally {trace.restore();}
+        "#).call1(&wasm_bindgen::JsValue::NULL, &trace);
+        // The real input handler consumed all32 before the fixture shortened the
+        // DOM value; its reactive projection correctly restores that full draft.
+        assert_eq!(state.chat_input.get_untracked(), "a".repeat(32));
+        drop(mount);
+        container.remove();
+        observation.unwrap();
     }
 
     #[wasm_bindgen_test]
@@ -3180,6 +3283,161 @@ mod wasm_tests {
             let selected = backend.query_selector("option:checked").unwrap().unwrap();
             assert_eq!(selected.text_content().unwrap_or_default(), label);
         }
+        crate::components::test_styles::ensure_styles_loaded();
+        container.set_class_name("mobile-app tws-shell");
+        container
+            .style()
+            .set_css_text("width:386px;height:700px;position:relative");
+        state.host_settings_by_host.update(|settings| {
+            settings
+                .get_mut(&LocalHostId("host-1".into()))
+                .unwrap()
+                .default_backend = Some(BackendKind::Claude);
+        });
+        next_tick().await;
+        let window = web_sys::window().unwrap();
+        let style = |element: &web_sys::Element, property: &str| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value(property)
+                .unwrap()
+        };
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap();
+        let capsule = container
+            .query_selector("[data-mobile-test='chat-input-capsule']")
+            .unwrap()
+            .unwrap();
+        let unfocused_capsule = style(&capsule, "box-shadow");
+        let browser_font = style(&backend, "font-size");
+        let browser_family = style(&backend, "font-family");
+        field.unchecked_ref::<HtmlElement>().focus().unwrap();
+        next_tick().await;
+        let browser_outline = (
+            style(&field, "outline-style"),
+            style(&field, "outline-width"),
+        );
+        container.set_attribute("data-native-host", "").unwrap();
+        next_tick().await;
+        let mut visual_failures = Vec::new();
+        for width in [320, 386, 820] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            let text = backend
+                .query_selector("option:checked")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap();
+            let probe = window
+                .document()
+                .unwrap()
+                .create_element("span")
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            probe.set_text_content(Some(&text));
+            probe
+                .style()
+                .set_css_text("position:absolute;white-space:pre;visibility:hidden");
+            for property in [
+                "font-family",
+                "font-size",
+                "font-weight",
+                "font-style",
+                "letter-spacing",
+            ] {
+                probe
+                    .style()
+                    .set_property(property, &style(&backend, property))
+                    .unwrap();
+            }
+            container.append_child(&probe).unwrap();
+            let padding = |property: &str| {
+                style(&backend, property)
+                    .trim_end_matches("px")
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            let available = f64::from(backend.client_width())
+                - padding("padding-left")
+                - padding("padding-right");
+            if rect(&probe).width() > available {
+                visual_failures.push(format!(
+                    "Native backend text is clipped at {width}px: text={}, available={available}",
+                    rect(&probe).width()
+                ));
+            }
+            if style(&backend, "font-size") != browser_font
+                || style(&backend, "font-family") != browser_family
+            {
+                visual_failures
+                    .push("Native backend must retain the existing theme font and size".into());
+            }
+            probe.remove();
+        }
+        let native_outline = (
+            style(&field, "outline-style"),
+            style(&field, "outline-width"),
+        );
+        web_sys::console::log_1(
+            &format!(
+                "native_composer_focus outline_style={} outline_width={} browser_style={} browser_width={}",
+                native_outline.0, native_outline.1, browser_outline.0, browser_outline.1
+            ).into(),
+        );
+        // CSS UI4/WPT outline-009: width no longer computes to zero for style none.
+        if native_outline.0 != "none" {
+            visual_failures.push(
+                "Native editing must not draw a second outline inside the focused capsule".into(),
+            );
+        }
+        if style(&capsule, "box-shadow") == unfocused_capsule {
+            visual_failures
+                .push("Native editing must retain a visible capsule focus treatment".into());
+        }
+        caret(&container)
+            .unchecked_ref::<HtmlElement>()
+            .focus()
+            .unwrap();
+        next_tick().await;
+        if style(&caret(&container), "outline-style") == "none"
+            || style(&caret(&container), "outline-width") == "0px"
+            || style(&capsule, "box-shadow") != unfocused_capsule
+        {
+            visual_failures.push(
+                "Keyboard-focused send actions need their own indicator, not a second capsule ring"
+                    .into(),
+            );
+        }
+        container.remove_attribute("data-native-host").unwrap();
+        field.unchecked_ref::<HtmlElement>().focus().unwrap();
+        next_tick().await;
+        if (
+            style(&field, "outline-style"),
+            style(&field, "outline-width"),
+        ) != browser_outline
+        {
+            visual_failures
+                .push("Native focus styling must not change browser focus styling".into());
+        }
+        container.remove_attribute("class").unwrap();
+        container.remove_attribute("style").unwrap();
+        state.host_settings_by_host.update(|settings| {
+            settings
+                .get_mut(&LocalHostId("host-1".into()))
+                .unwrap()
+                .default_backend = Some(BackendKind::Codex);
+        });
+        assert!(visual_failures.is_empty(), "{}", visual_failures.join("; "));
+
         backend.set_value("claude");
         backend
             .dispatch_event(&web_sys::Event::new("change").unwrap())

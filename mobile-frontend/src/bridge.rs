@@ -162,7 +162,7 @@ dispatch!(list_paired_hosts() -> Result<Vec<PairedHostSummary>, String>);
 dispatch!(list_paired_host_connection_statuses() -> Result<Vec<PairedHostConnectionStatusEvent>, String>);
 dispatch!(list_pending_host_lines() -> Result<Vec<HostLineEvent>, String>);
 dispatch!(classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String>);
-dispatch!(redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String>);
+dispatch!(redeem_self_hosted_and_connect(qr_uri: &str) -> Result<LocalHostId, String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
@@ -224,7 +224,7 @@ pub async fn probe_managed_auth() -> MobileServiceAuthState {
 
 /// Redeems a managed offer (`POST /pairings/redeem`) and connects to the
 /// managed relay.
-pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
+pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<LocalHostId, RedeemOutcome> {
     web::redeem_managed_and_connect(qr_uri).await
 }
 
@@ -278,3 +278,7 @@ dispatch_listen!(
     listen_submission_transport_outcome,
     SubmissionTransportOutcomeEvent
 );
+
+pub async fn native_sign_in(provider: AuthProvider) -> MobileServiceAuthState {
+    web::native_sign_in(provider).await
+}

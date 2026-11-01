@@ -53,6 +53,7 @@ const DEFAULT_HISTORY_LIMIT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ProtocolValidator {
+    creation_streams: HashMap<StreamPath, bool>,
     history_limit: usize,
     recent: VecDeque<ObservedFrame>,
     host_streams: HashMap<StreamPath, HostStreamState>,
@@ -99,6 +100,7 @@ impl ProtocolValidator {
         Self {
             history_limit: DEFAULT_HISTORY_LIMIT,
             recent: VecDeque::with_capacity(DEFAULT_HISTORY_LIMIT),
+            creation_streams: HashMap::new(),
             host_streams: HashMap::new(),
             agent_streams: HashMap::new(),
             project_streams: HashMap::new(),
@@ -113,6 +115,7 @@ impl ProtocolValidator {
         Self {
             history_limit: history_limit.max(1),
             recent: VecDeque::with_capacity(history_limit.max(1)),
+            creation_streams: HashMap::new(),
             host_streams: HashMap::new(),
             agent_streams: HashMap::new(),
             project_streams: HashMap::new(),
@@ -126,6 +129,9 @@ impl ProtocolValidator {
     pub fn validate_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
         self.record(envelope);
 
+        if let Some(parent) = envelope.stream.spawn_parent() {
+            return self.validate_creation_envelope(envelope, &parent);
+        }
         if envelope.stream.0.starts_with("/host/") {
             return self.validate_host_envelope(envelope);
         }
@@ -153,6 +159,56 @@ impl ProtocolValidator {
             return self.validate_voice_envelope(envelope);
         }
 
+        Ok(())
+    }
+
+    fn validate_creation_envelope(
+        &mut self,
+        envelope: &Envelope,
+        parent: &StreamPath,
+    ) -> Result<(), ProtocolViolation> {
+        if !self
+            .host_streams
+            .get(parent)
+            .is_some_and(|host| host.saw_bootstrap)
+        {
+            return Err(self.violation(envelope, None, "creation before parent bootstrap".into()));
+        }
+        let terminal = self.creation_streams.get(&envelope.stream).copied();
+        match envelope.kind {
+            FrameKind::SpawnAgent if terminal.is_none() && envelope.seq == 0 => {
+                let _: SpawnAgentPayload = envelope
+                    .parse_payload()
+                    .map_err(|e| self.violation(envelope, None, e.to_string()))?;
+                self.creation_streams.insert(envelope.stream.clone(), false);
+            }
+            FrameKind::AgentStart if terminal != Some(true) && envelope.seq == 0 => {
+                let _: AgentStartPayload = envelope
+                    .parse_payload()
+                    .map_err(|e| self.violation(envelope, None, e.to_string()))?;
+                self.creation_streams.insert(envelope.stream.clone(), true);
+            }
+            FrameKind::CommandError if terminal != Some(true) && envelope.seq == 0 => {
+                let error: CommandErrorPayload = envelope
+                    .parse_payload()
+                    .map_err(|e| self.violation(envelope, None, e.to_string()))?;
+                if error.stream != envelope.stream || error.request_kind != FrameKind::SpawnAgent {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "creation error must address its own SpawnAgent stream".into(),
+                    ));
+                }
+                self.creation_streams.insert(envelope.stream.clone(), true);
+            }
+            _ => {
+                return Err(self.violation(
+                    envelope,
+                    None,
+                    "creation stream accepts one spawn and one terminal".into(),
+                ));
+            }
+        }
         Ok(())
     }
 

@@ -8,6 +8,7 @@ extern "C" {
     #[wasm_bindgen(catch, js_name = attachImageViewer)]
     fn attach_image_viewer(
         dialog: &web_sys::HtmlDialogElement,
+        visibility: &js_sys::Function,
     ) -> Result<ImageViewerHandle, JsValue>;
 
     #[wasm_bindgen(method, catch)]
@@ -23,10 +24,14 @@ extern "C" {
 #[derive(Clone, Copy)]
 struct ImageViewerOpener(Callback<(Vec<protocol::ImageData>, usize, web_sys::Element)>);
 
+pub(super) fn image_opener() -> Callback<(Vec<protocol::ImageData>, usize, web_sys::Element)> {
+    expect_context::<ImageViewerOpener>().0
+}
+
 #[component]
 pub(super) fn ImageGallery(images: Vec<protocol::ImageData>) -> impl IntoView {
     let images = StoredValue::new(images);
-    let opener = expect_context::<ImageViewerOpener>();
+    let opener = image_opener();
     view! {
         <div class="chat-message-images" data-mobile-test="chat-message-images">
             {images.with_value(|items| items.iter().enumerate().map(|(index, image)| {
@@ -38,7 +43,7 @@ pub(super) fn ImageGallery(images: Vec<protocol::ImageData>) -> impl IntoView {
                         aria-label="Open image full size"
                         // Cancel mouse focus without suppressing WebKit's completed touch click.
                         on:mousedown=move |ev| ev.prevent_default()
-                        on:click=move |ev| opener.0.run((images.get_value(), index, event_target::<web_sys::Element>(&ev)))
+                        on:click=move |ev| opener.run((images.get_value(), index, event_target::<web_sys::Element>(&ev)))
                     >
                         <img class="chat-message-image" src=src alt="Chat image" loading="lazy" />
                     </button>
@@ -55,6 +60,11 @@ fn image_source(image: &protocol::ImageData) -> String {
 // Chat owns the modal, not a reactive transcript row. The open selection is
 // presentation state and retains its typed pixels while later messages render.
 pub(super) fn image_viewer() -> impl IntoView {
+    let open = RwSignal::new(false);
+    crate::native::track_modal(open);
+    let visibility = StoredValue::new_local(Closure::<dyn FnMut(bool)>::new(move |visible| {
+        open.set(visible)
+    }));
     let sources = RwSignal::new(Vec::<String>::new());
     let count = move || sources.with(Vec::len);
     let selected = RwSignal::new(0usize);
@@ -66,7 +76,9 @@ pub(super) fn image_viewer() -> impl IntoView {
         let Some(dialog) = dialog_ref.get() else {
             return;
         };
-        match attach_image_viewer(&dialog) {
+        match visibility.with_value(|visibility| {
+            attach_image_viewer(&dialog, visibility.as_ref().unchecked_ref())
+        }) {
             Ok(viewer) => handle.set_value(Some(viewer)),
             Err(_) => {
                 log::error!("Mobile image viewer could not attach");
@@ -125,7 +137,7 @@ pub(super) fn image_viewer() -> impl IntoView {
                 <div class="phone-image-stage">
                     <img
                         src=move || sources.with(|sources| sources.get(selected.get()).cloned())
-                        alt="Chat image, full size"
+                        alt="Image, full size"
                         draggable="false"
                     />
                     <p class="phone-image-error" role="alert" hidden>"This image could not be displayed."</p>

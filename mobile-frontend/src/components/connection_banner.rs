@@ -27,9 +27,16 @@ fn HostReconnectButton() -> impl IntoView {
         };
         log::info!("mobile_connection_control host={host} control=Reconnect button=clicked");
         reconnecting.set(true);
+        let state = state.clone();
         spawn_local(async move {
             if let Err(error) = bridge::reconnect_paired_host(&host).await {
                 log::error!("reconnect: reconnect_paired_host({host}) failed: {error}");
+                state
+                    .mobile_shell_error
+                    .set(Some(crate::state::MobileShellError {
+                        code: protocol::MobileAccessErrorCode::TransportFailed,
+                        message: format!("Could not reconnect: {error}"),
+                    }));
             }
             let _ = reconnecting.try_set(false);
         });
@@ -50,6 +57,43 @@ fn HostReconnectButton() -> impl IntoView {
     }
 }
 
+fn native_bundle_message(state: &AppState) -> Option<String> {
+    match state.bundle_status.get() {
+        // A fixed native package already exposes its typed compatibility rejection.
+        crate::bundle::BundleStatus::Unavailable(
+            crate::bridge::loader::UnavailableReason::NativeVersion,
+        ) if crate::native::is_native() => None,
+        status => status.message(),
+    }
+}
+
+#[component]
+fn HostRepairButton() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        <button type="button" class="connection-banner-action" data-mobile-test="connection-banner-repair"
+            on:click=move |_| state.app_mode.set(AppMode::Pairing(PairingScreen::Scanner))>
+            "Re-pair"
+        </button>
+    }
+}
+
+#[component]
+pub(crate) fn NativeCommandErrorRecovery() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! { {move || {
+        if !crate::native::is_native() || !matches!(state.app_mode.get(), AppMode::Workspace | AppMode::HostPicker) {
+            return ().into_any();
+        }
+        match state.active_host_connection_status() {
+            ConnectionStatus::NeedsAction { code, .. } if crate::state::needs_tyggs_sign_in(code) => connection_banner_auth_provider_buttons(),
+            ConnectionStatus::NeedsAction { .. } => view! { <HostRepairButton /> }.into_any(),
+            ConnectionStatus::Error(_) | ConnectionStatus::Disconnected | ConnectionStatus::Connecting => view! { <HostReconnectButton /> }.into_any(),
+            ConnectionStatus::Connected | ConnectionStatus::Bootstrapping | ConnectionStatus::UpdateRequired { .. } => ().into_any(),
+        }
+    } } }
+}
+
 /// Floating connection indicator. Healthy connections show a compact
 /// end-to-end round-trip measurement; states needing attention expand to a
 /// larger action pill.
@@ -61,13 +105,18 @@ pub fn ConnectionBanner() -> impl IntoView {
     let bundle_state = state.clone();
 
     view! {
-        <div class="connection-banner" data-mobile-test="connection-banner">
-            {move || bundle_state.bundle_status.get().message().map(|message| view! {
+        <div class="connection-banner" data-mobile-test="connection-banner"
+            hidden=move || crate::native::is_native() && state.mobile_shell_error.get().is_some()>
+            {move || native_bundle_message(&bundle_state).map(|message| view! {
                 <div class="connection-banner-inner error" role="status" data-mobile-test="bundle-sync">
                     <span class="status-text">{message}</span>
                 </div>
             })}
             {move || {
+                if crate::native::is_native()
+                    && (native_bundle_message(&status_state).is_some() || status_state.active_host_command_error().is_some()) {
+                    return ().into_any();
+                }
                 let status = status_state.active_host_connection_status();
                 match status {
                     ConnectionStatus::Connected => {
@@ -175,11 +224,11 @@ pub fn ConnectionBanner() -> impl IntoView {
                     // The web/PWA loader self-heals by rebooting into the host's
                     // published bundle.
                     ConnectionStatus::UpdateRequired { host_protocol, app_protocol, release_version } => {
-                        let message = crate::state::update_required_message(
-                            host_protocol,
-                            app_protocol,
-                            release_version.as_ref(),
-                        );
+                        let message = if crate::native::is_native() {
+                            "Update this app and host together to connect.".into()
+                        } else {
+                            crate::state::update_required_message(host_protocol, app_protocol, release_version.as_ref())
+                        };
                         view! {
                             <div
                                 class="connection-banner-inner error"
@@ -201,7 +250,6 @@ pub fn ConnectionBanner() -> impl IntoView {
                     // tycode.dev OAuth redirect; re-pair happens from the host list.
                     ConnectionStatus::NeedsAction { code, message } => {
                         let show_sign_in = crate::state::needs_tyggs_sign_in(code);
-                        let repair_state = status_state.clone();
                         view! {
                             <div
                                 class="connection-banner-inner error"
@@ -219,22 +267,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                                     // the tycode.dev-hosted Tyggs OAuth redirect.
                                     connection_banner_auth_provider_buttons()
                                 } else {
-                                    // RepairRequired → send the user to the scanner to
-                                    // re-pair this host through tycode.dev.
-                                    view! {
-                                        <button
-                                            type="button"
-                                            class="connection-banner-action"
-                                            data-mobile-test="connection-banner-repair"
-                                            on:click=move |_| {
-                                                repair_state.app_mode.set(
-                                                    AppMode::Pairing(PairingScreen::Scanner),
-                                                );
-                                            }
-                                        >
-                                            "Re-pair"
-                                        </button>
-                                    }.into_any()
+                                    view! { <HostRepairButton /> }.into_any()
                                 }}
                             </div>
                         }.into_any()
@@ -242,12 +275,15 @@ pub fn ConnectionBanner() -> impl IntoView {
                 }
             }}
             {move || {
-                let error = command_error_state.active_host_command_error();
+                let error = if crate::native::is_native() && native_bundle_message(&command_error_state).is_some() {
+                    None
+                } else { command_error_state.active_host_command_error() };
                 error.map(|msg| {
                     let dismiss_state = command_error_state.clone();
                     view! {
                         <div class="command-error-banner" role="alert">
                             <span class="error-text">{msg}</span>
+                            <NativeCommandErrorRecovery />
                             <button
                                 type="button"
                                 class="command-error-dismiss error-banner-dismiss"
@@ -266,6 +302,7 @@ pub fn ConnectionBanner() -> impl IntoView {
 }
 
 fn connection_banner_auth_provider_buttons() -> AnyView {
+    let native_sign_in_state = expect_context::<AppState>();
     match crate::bridge::tyggs_auth_providers() {
         Ok(providers) => view! {
             <span class="connection-banner-provider-actions">
@@ -278,6 +315,7 @@ fn connection_banner_auth_provider_buttons() -> AnyView {
                         } else {
                             connection_banner_auth_provider_test_id(provider)
                         };
+                        let native_state = native_sign_in_state.clone();
                         view! {
                             <button
                                 type="button"
@@ -286,6 +324,17 @@ fn connection_banner_auth_provider_buttons() -> AnyView {
                                 data-mobile-auth-provider=provider.as_str()
                                 aria-label=provider.sign_in_label()
                                 on:click=move |_| {
+                                    if crate::native::is_native() {
+                                        if let Some(host) = native_state.active_local_host_id.get_untracked() {
+                                            crate::actions::native_sign_in_and_reconnect(native_state.clone(), host, provider);
+                                        } else {
+                                            native_state.mobile_shell_error.set(Some(crate::state::MobileShellError {
+                                                code: protocol::MobileAccessErrorCode::Internal,
+                                                message: "No host is selected for sign-in".into(),
+                                            }));
+                                        }
+                                        return;
+                                    }
                                     if let Err(error) = crate::bridge::begin_tyggs_sign_in(provider, None) {
                                         log::error!("failed to start Tyggs sign-in: {error}");
                                     }

@@ -878,7 +878,9 @@ fn scheduler_metadata(envelope: &Envelope) -> (Vec<SchedulerToken>, Vec<Schedule
             | FrameKind::TerminalBootstrap
     );
     let mut prerequisites = Vec::new();
-    if envelope.stream.0.starts_with("/host/") && !is_bootstrap {
+    if let Some(parent) = envelope.stream.spawn_parent() {
+        prerequisites.push(SchedulerToken::Bootstrapped(parent));
+    } else if envelope.stream.0.starts_with("/host/") && !is_bootstrap {
         prerequisites.push(SchedulerToken::Bootstrapped(stream.clone()));
     } else if envelope.stream.0.starts_with("/agent/")
         || envelope.stream.0.starts_with("/terminal/")

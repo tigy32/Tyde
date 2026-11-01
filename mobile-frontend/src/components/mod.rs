@@ -31,6 +31,7 @@ pub use error_banner::MobileShellErrorBanner;
 pub use home_view::HomeView;
 pub use onboarding_view::OnboardingView;
 pub use paired_hosts_picker::PairedHostsPicker;
+pub(crate) use pairing_flow::NativeAuthRecoverySheet;
 pub use pairing_flow::PairingFlow;
 // Only the host-scoped surface is re-exported: `app.rs` mounts it as a top-level
 // view, which is what this list is for. `AgentPendingSubmissions` is chat-scoped

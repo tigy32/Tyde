@@ -1,0 +1,46 @@
+// !$*UTF8*$!
+{ archiveVersion = 1; classes = {}; objectVersion = 77; objects = {
+8BF729FFE074CAEE622C0292 = { isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Tyde/Assets.xcassets"; sourceTree = "<group>"; };
+F696CAA795D30DD4711792B4 = { isa = PBXBuildFile; fileRef = 8BF729FFE074CAEE622C0292; };
+5F2EA2997C7EB214A3EECC26 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tyde/AppDelegate.swift"; sourceTree = "<group>"; };
+E92AA4E2001F969190A9D292 = { isa = PBXBuildFile; fileRef = 5F2EA2997C7EB214A3EECC26; };
+8A367477AE01587FBE701F65 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tyde/AssetServer.swift"; sourceTree = "<group>"; };
+961DAA8BA9CC167569DC0C2A = { isa = PBXBuildFile; fileRef = 8A367477AE01587FBE701F65; };
+5FD0B05765130DFF0CDD633D = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tyde/TydeHostController.swift"; sourceTree = "<group>"; };
+AC0D9DF055A76099A62C1EF7 = { isa = PBXBuildFile; fileRef = 5FD0B05765130DFF0CDD633D; };
+D37FC0DD081D9F8E98A61182 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tyde/PlatformBridge.swift"; sourceTree = "<group>"; };
+D688F4AF76C6A7AB95110608 = { isa = PBXBuildFile; fileRef = D37FC0DD081D9F8E98A61182; };
+8165867365C2590224F05AA9 = { isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "Tyde/native-host.js"; sourceTree = "<group>"; };
+CB67264A6811A562A09B0E09 = { isa = PBXBuildFile; fileRef = 8165867365C2590224F05AA9; };
+9AC3B5AD93CBC0305C62F78F = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Tyde/Info.plist"; sourceTree = "<group>"; };
+B42247AA4FD26D261EF0EB13 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../target/ios-client/NativeBridge.swift"; sourceTree = "<group>"; };
+63BEBBC213B42F779592F685 = { isa = PBXBuildFile; fileRef = B42247AA4FD26D261EF0EB13; };
+4B5E57F6EB2F42B9039B3D1E = { isa = PBXFileReference; lastKnownFileType = folder; path = "../target/ios-client/Web"; sourceTree = "<group>"; };
+5BD48EACB37604D6B3477CE3 = { isa = PBXBuildFile; fileRef = 4B5E57F6EB2F42B9039B3D1E; };
+5CA4F3850CCC331AAF8A257D = { isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "../target/ios-client/Version.xcconfig"; sourceTree = "<group>"; };
+EB76B77103F36F34E5C884E0 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TydeUITests/NativeNavigationTests.swift"; sourceTree = "<group>"; };
+F52F0529D0872CC448DCE8A8 = { isa = PBXBuildFile; fileRef = EB76B77103F36F34E5C884E0; };
+A172CEDCAE47474B615C54D5 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = Tyde.app; sourceTree = BUILT_PRODUCTS_DIR; };
+4FF6303B0C4A88C0BEB95A1A = { isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = TydeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+0A3E27B8CA818264D75C8D81 = { isa = PBXGroup; children = (A172CEDCAE47474B615C54D5, 4FF6303B0C4A88C0BEB95A1A); name = Products; sourceTree = "<group>"; };
+AD936FCBED631FA67E05C3EA = { isa = PBXGroup; children = (8BF729FFE074CAEE622C0292, 5F2EA2997C7EB214A3EECC26, 8A367477AE01587FBE701F65, 5FD0B05765130DFF0CDD633D, D37FC0DD081D9F8E98A61182, 8165867365C2590224F05AA9, 9AC3B5AD93CBC0305C62F78F, B42247AA4FD26D261EF0EB13, 4B5E57F6EB2F42B9039B3D1E, 5CA4F3850CCC331AAF8A257D, EB76B77103F36F34E5C884E0, 0A3E27B8CA818264D75C8D81); sourceTree = "<group>"; };
+878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (E92AA4E2001F969190A9D292, 961DAA8BA9CC167569DC0C2A, AC0D9DF055A76099A62C1EF7, D688F4AF76C6A7AB95110608, 63BEBBC213B42F779592F685); runOnlyForDeploymentPostprocessing = 0; };
+41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (F696CAA795D30DD4711792B4, CB67264A6811A562A09B0E09, 5BD48EACB37604D6B3477CE3); runOnlyForDeploymentPostprocessing = 0; };
+B2298129A58493C45A5D7D9A = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (F52F0529D0872CC448DCE8A8); runOnlyForDeploymentPostprocessing = 0; };
+E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+28557525D9B40FEE6754FB60 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+1241936D4DD3AAD68FE7BFBD = { isa = PBXContainerItemProxy; containerPortal = 244210E48437B6556980A702; proxyType = 1; remoteGlobalIDString = 34A04005BCAF206EEC990BD9; remoteInfo = Tyde; };
+F26350DAFE3F19AABFD69AC4 = { isa = PBXTargetDependency; target = 34A04005BCAF206EEC990BD9; targetProxy = 1241936D4DD3AAD68FE7BFBD; };
+34A04005BCAF206EEC990BD9 = { isa = PBXNativeTarget; buildConfigurationList = 429643FC2242030B49D9DF4F; buildPhases = (878A52FC5FF6A57D50B7B870, E2AA269EB967A8853A258BFA, 41D311A605520FC7B8B9A980); buildRules = (); dependencies = (); name = Tyde; productName = Tyde; productReference = A172CEDCAE47474B615C54D5; productType = "com.apple.product-type.application"; };
+3A0C9CEF9D8F3BC090274361 = { isa = PBXNativeTarget; buildConfigurationList = 58D27FEC5A1213B77EBDD3A1; buildPhases = (B2298129A58493C45A5D7D9A, 28557525D9B40FEE6754FB60); buildRules = (); dependencies = (F26350DAFE3F19AABFD69AC4); name = TydeUITests; productName = TydeUITests; productReference = 4FF6303B0C4A88C0BEB95A1A; productType = "com.apple.product-type.bundle.ui-testing"; };
+E2EDCD14762CC2F70971BC55 = { isa = XCBuildConfiguration;  buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+E49449A51B1C1B61FFEBC152 = { isa = XCBuildConfiguration;  buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; name = Release; };
+D69E6ABAEE8D1F0F03292F91 = { isa = XCConfigurationList; buildConfigurations = (E2EDCD14762CC2F70971BC55, E49449A51B1C1B61FFEBC152); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+F2C149E797B6A8D3976B8651 = { isa = XCBuildConfiguration; baseConfigurationReference = 5CA4F3850CCC331AAF8A257D; buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.tyde.mobile.nativeqa; PRODUCT_NAME = Tyde; CURRENT_PROJECT_VERSION = 1; INFOPLIST_FILE = Tyde/Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; ENABLE_USER_SCRIPT_SANDBOXING = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
+027611F255F56D1812D56062 = { isa = XCBuildConfiguration; baseConfigurationReference = 5CA4F3850CCC331AAF8A257D; buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.tycode.tyde; DEVELOPMENT_TEAM = 743QY8VN34; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; VALIDATE_PRODUCT = YES; PRODUCT_NAME = Tyde; CURRENT_PROJECT_VERSION = 1; INFOPLIST_FILE = Tyde/Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; ENABLE_USER_SCRIPT_SANDBOXING = YES; }; name = Release; };
+429643FC2242030B49D9DF4F = { isa = XCConfigurationList; buildConfigurations = (F2C149E797B6A8D3976B8651, 027611F255F56D1812D56062); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+AC6BC420091659B5ED720E0A = { isa = XCBuildConfiguration;  buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.tyde.mobile.nativeqa.tests; PRODUCT_NAME = TydeUITests; GENERATE_INFOPLIST_FILE = YES; TEST_TARGET_NAME = Tyde; CODE_SIGN_STYLE = Automatic; }; name = Debug; };
+A659406E36691DCFE18B1FD4 = { isa = XCBuildConfiguration;  buildSettings = { SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; CLANG_ENABLE_MODULES = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.tyde.mobile.nativeqa.tests; PRODUCT_NAME = TydeUITests; GENERATE_INFOPLIST_FILE = YES; TEST_TARGET_NAME = Tyde; CODE_SIGN_STYLE = Automatic; }; name = Release; };
+58D27FEC5A1213B77EBDD3A1 = { isa = XCConfigurationList; buildConfigurations = (AC6BC420091659B5ED720E0A, A659406E36691DCFE18B1FD4); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+244210E48437B6556980A702 = { isa = PBXProject; attributes = { BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 2700; }; buildConfigurationList = D69E6ABAEE8D1F0F03292F91; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = AD936FCBED631FA67E05C3EA; productRefGroup = 0A3E27B8CA818264D75C8D81; projectDirPath = ""; projectRoot = ""; targets = (34A04005BCAF206EEC990BD9, 3A0C9CEF9D8F3BC090274361); };
+}; rootObject = 244210E48437B6556980A702; }

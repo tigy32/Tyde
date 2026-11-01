@@ -305,25 +305,7 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
                 "This {vendor} figure is stale and will update on the next successful reading."
             ),
         }),
-        BackendCapacityState::Unavailable { reason } => Some(match reason {
-            CapacityUnavailableReason::AwaitingFirstReport => format!(
-                "No report from {vendor} yet. This is not zero usage \u{2014} nothing has been \
-                 reported."
-            ),
-            // Covers both a vendor payload that failed validation and a Codex
-            // notification that arrived without the complete snapshot: the
-            // adapter discards it whole rather than publishing a partial one.
-            CapacityUnavailableReason::MalformedReport => format!(
-                "The last {vendor} report failed validation, so no figure is shown rather than a \
-                 guessed one. The values are not partially trusted."
-            ),
-            CapacityUnavailableReason::SourceUnreachable => {
-                format!("The {vendor} status source could not be reached.")
-            }
-            CapacityUnavailableReason::SourceTimedOut => {
-                format!("The {vendor} status source did not respond in time.")
-            }
-        }),
+        BackendCapacityState::Unavailable { .. } => None,
         BackendCapacityState::Unsupported { reason } => Some(match reason {
             CapacityUnsupportedReason::BackendNotInstalled => format!(
                 "{vendor} is not installed on this host, so there is no account to read quota from."
@@ -388,30 +370,6 @@ fn freshness_text(freshness: &CapacityFreshness) -> String {
             format_duration_ms(*threshold_ms),
         ),
     }
-}
-
-fn plan_text(report: &CapacityReport) -> String {
-    match &report.plan {
-        Some(plan) => format!("plan: {}", plan.label),
-        None => "plan not reported by this source".to_owned(),
-    }
-}
-
-/// The one bucket that owns a bar: the most constrained window the vendor gave
-/// a magnitude for. Credits and magnitude-less buckets are never eligible.
-///
-/// Returns the used figure with it, so no caller has to re-match the measure
-/// and invent a value for the arms that cannot occur.
-fn authoritative_bucket(report: &CapacityReport) -> Option<(&CapacityBucket, u8)> {
-    report
-        .buckets
-        .iter()
-        .filter_map(|bucket| match &bucket.measure {
-            CapacityMeasure::UsedPercent { used_percent, .. }
-            | CapacityMeasure::CreditUsage { used_percent, .. } => Some((bucket, *used_percent)),
-            CapacityMeasure::Credits { .. } | CapacityMeasure::ReportedWithoutMagnitude => None,
-        })
-        .max_by_key(|(_, used_percent)| *used_percent)
 }
 
 fn bucket_aria_label(bucket: &CapacityBucket, used_percent: u8) -> String {
@@ -559,6 +517,8 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     view! {
         <div
             class="capacity-card"
+            role="group"
+            aria-label=format!("{} subscription capacity", backend_label(kind))
             data-capacity-backend=format!("{kind:?}").to_lowercase()
             data-capacity-state=slug
         >
@@ -577,15 +537,15 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
                 })}
             </div>
             <div class="capacity-card-meta">
-                <span class="capacity-meta-item">{freshness}</span>
+                {report.map(|_| view! { <span class="capacity-meta-item">{freshness}</span> })}
                 <span class="capacity-meta-item">{format!("received {retrieved}")}</span>
-                {report.map(|report| view! {
+                {report.filter(|_| matches!(state, BackendCapacityState::Stale { .. })).map(|report| view! {
                     <span class="capacity-meta-item">
                         {format!("source: {}", source_label(report.source))}
                     </span>
                 })}
-                {report.map(|report| view! {
-                    <span class="capacity-meta-item">{plan_text(report)}</span>
+                {report.and_then(|report| report.plan.as_ref()).map(|plan| view! {
+                    <span class="capacity-meta-item">{format!("plan: {}", plan.label)}</span>
                 })}
             </div>
             {explanation.map(|text| view! {
@@ -603,92 +563,6 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
                     </>
                 }
             })}
-        </div>
-    }
-    .into_any()
-}
-
-/// The compact summary for one backend — mobile's parity with the desktop
-/// token-usage popup row. Exactly one bucket owns the bar; states with no
-/// report render as text, because an empty bar reads as "0% used".
-///
-/// It is explicitly labelled as *subscription* capacity so it can never be read
-/// as task token usage, which is a different measurement of a different thing.
-fn compact_row(snapshot: &BackendCapacitySnapshot) -> AnyView {
-    let kind = snapshot.backend_kind;
-    let vendor = backend_label(kind);
-    let state = &snapshot.state;
-    let slug = state_slug(state);
-    let freshness = freshness_text(&snapshot.freshness);
-
-    let body = match state_report(state) {
-        Some(report) => {
-            let coverage_note =
-                matches!(report.coverage, CapacityCoverage::RepresentativeBucketOnly)
-                    .then(|| "\u{26a0} only the binding limit is reported".to_owned());
-            match authoritative_bucket(report) {
-                Some((bucket, used_percent)) => {
-                    let other_count = report.buckets.len().saturating_sub(1);
-                    let more = (other_count > 0).then(|| format!("+{other_count} more below"));
-                    // Label + vendor type: "weekly limit" alone cannot tell
-                    // seven_day from seven_day_overage_included.
-                    let label = bucket_label_text(bucket);
-                    let vendor_id = bucket_vendor_id_text(&bucket.id);
-                    view! {
-                        <>
-                            <div class="capacity-compact-bucket">
-                                <span class="capacity-compact-label">{label}</span>
-                                <span class="capacity-compact-vendor">{vendor_id}</span>
-                                {percent_bar(bucket, used_percent)}
-                                <span class="capacity-compact-figures">
-                                    {format!("{used_percent}% used")}
-                                </span>
-                            </div>
-                            {more.map(|text| view! {
-                                <span class="capacity-compact-more">{text}</span>
-                            })}
-                            {coverage_note.map(|note| view! {
-                                <span class="capacity-compact-coverage">{note}</span>
-                            })}
-                        </>
-                    }
-                    .into_any()
-                }
-                // Claude acknowledging a limit without a utilization, or a
-                // credits-only Codex report. Text, never a bar: an empty bar
-                // would read as "0% used".
-                None => view! {
-                    <>
-                        <span class="capacity-compact-state">
-                            "no percentage limit reported"
-                        </span>
-                        {coverage_note.map(|note| view! {
-                            <span class="capacity-compact-coverage">{note}</span>
-                        })}
-                    </>
-                }
-                .into_any(),
-            }
-        }
-        None => {
-            let headline = state_headline(state, kind);
-            view! { <span class="capacity-compact-state">{headline}</span> }.into_any()
-        }
-    };
-
-    view! {
-        <div
-            class="capacity-compact"
-            data-capacity-state=slug
-            data-mobile-test="capacity-compact"
-            role="group"
-            aria-label=format!("Subscription capacity reported by {vendor}")
-        >
-            <div class="capacity-compact-title">
-                {format!("Subscription \u{b7} reported by {vendor}")}
-            </div>
-            {body}
-            <div class="capacity-compact-freshness">{freshness}</div>
         </div>
     }
     .into_any()
@@ -739,9 +613,6 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
             .map(|by_kind| by_kind.values().cloned().collect())
             .unwrap_or_default();
         // Reporting backends first (desktop does the same): the rows with a
-        // number are what the page is for. Backend name orders each group, so
-        // only gaining or losing a report moves a card.
-        // Reporting backends first (desktop does the same): the rows with a
         // number are what the page is for. The preference order breaks ties, so
         // only gaining or losing a report moves a card.
         snapshots.sort_by_key(|snapshot| {
@@ -754,12 +625,6 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
     view! {
         <div class="settings-section" data-mobile-test="settings-capacity">
             <h2 class="settings-section-title">"Subscription capacity"</h2>
-            <p class="settings-description">
-                "Quota reported by each backend for the account it is signed in to. Advisory only \
-                 \u{2014} Tyde never reroutes or downgrades backends based on it, and never infers \
-                 it from Tyde's own token usage. Both sources report passively, so there is \
-                 nothing to refresh."
-            </p>
             {move || {
                 let snapshots = snapshots.get();
                 if snapshots.is_empty() {
@@ -774,12 +639,7 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
                 }
                 view! {
                     <div class="capacity-cards">
-                        {snapshots.iter().map(|snapshot| view! {
-                            <>
-                                {compact_row(snapshot)}
-                                {snapshot_card(snapshot)}
-                            </>
-                        }).collect_view()}
+                        {snapshots.iter().map(snapshot_card).collect_view()}
                     </div>
                 }
                 .into_any()
@@ -805,6 +665,7 @@ mod wasm_tests {
 
     /// A phone-width viewport: the mobile layout must not clip or overlap here.
     fn make_container() -> HtmlElement {
+        crate::components::test_styles::ensure_styles_loaded();
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
@@ -1079,6 +940,34 @@ mod wasm_tests {
             5,
             "mobile renders one row per vendor bucket, same as desktop"
         );
+        assert_eq!(
+            count(&container, "[role='group']"),
+            3,
+            "Each typed provider snapshot has exactly one presentation, not a duplicate compact/detail pair"
+        );
+        for figure in ["30% used", "91% used", "82% used", "50% used"] {
+            assert_eq!(
+                text_of(&container).matches(figure).count(),
+                1,
+                "Each reported bucket's figure must appear once"
+            );
+        }
+        let elements = container
+            .query_selector_all(".capacity-card, .capacity-bar")
+            .unwrap();
+        for index in 0..elements.length() {
+            let element = elements
+                .item(index)
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            assert!(
+                element.get_bounding_client_rect().width() > 0.0
+                    && element.get_bounding_client_rect().right()
+                        <= container.get_bounding_client_rect().right(),
+                "The canonical provider card and every reported bar remain inside the phone-width viewport"
+            );
+        }
         // Name order alone would put ACP first; reporting backends lead.
         let cards = container.query_selector_all(".capacity-card").unwrap();
         assert_eq!(cards.length(), 3, "every backend still renders a card");
@@ -1169,13 +1058,13 @@ mod wasm_tests {
                 BackendCapacityState::Unavailable {
                     reason: CapacityUnavailableReason::AwaitingFirstReport,
                 },
-                "nothing has been reported",
+                "No report yet",
             ),
             (
                 BackendCapacityState::Unavailable {
                     reason: CapacityUnavailableReason::MalformedReport,
                 },
-                "failed validation",
+                "Report could not be read",
             ),
             (
                 BackendCapacityState::Unsupported {
@@ -1212,6 +1101,17 @@ mod wasm_tests {
                 text.contains(expected),
                 "mobile must explain the state; expected {expected:?}, got: {text}"
             );
+            assert_eq!(
+                count(&container, "[role='group']"),
+                1,
+                "A missing/error provider has one canonical state presentation"
+            );
+            assert_eq!(
+                text.matches(expected).count(),
+                1,
+                "Missing-data meaning must remain explicit without duplicated reporting prose"
+            );
+            assert!(!text.contains("0% used"), "No report is not zero usage");
             assert!(
                 query(&container, ".capacity-bar").is_none(),
                 "a state with no report must never draw a bar on mobile ({expected})"
@@ -1300,109 +1200,6 @@ mod wasm_tests {
         assert!(
             text.contains("2h ago") && text.contains("past the 1h freshness threshold"),
             "the server's freshness verdict is rendered verbatim: {text}"
-        );
-    }
-
-    /// The compact row is mobile's parity with the desktop popup row: one bar
-    /// for the most-constrained bucket, the rest collapsed to a count, and an
-    /// explicit "Subscription" label so it can never be read as task tokens.
-    /// The layout stacks at phone width without clipping.
-    #[wasm_bindgen_test]
-    async fn mobile_compact_row_is_labelled_and_stacks() {
-        let container = make_container();
-        let _handle = mount_with(&container, "h-cap-compact", vec![codex_known()]);
-        for _ in 0..4 {
-            next_tick().await;
-        }
-
-        let compact = query(&container, ".capacity-compact").expect("compact row renders");
-        let compact_text = compact.text_content().unwrap_or_default();
-
-        assert_eq!(compact.get_attribute("role").as_deref(), Some("group"));
-        let label = compact.get_attribute("aria-label").unwrap_or_default();
-        assert!(
-            label.contains("Subscription capacity"),
-            "the compact row must name itself as subscription capacity, got: {label}"
-        );
-        assert!(
-            compact_text.contains("Subscription"),
-            "the visible heading must say Subscription, got: {compact_text}"
-        );
-
-        // The most-constrained bucket wins the single bar: the 91% secondary
-        // (weekly) window, not the 30% primary (5h) one. The bar's bucket is
-        // named by both the server's label and the vendor's own type.
-        assert!(
-            compact_text.contains("91% used")
-                && compact_text.contains("subscription secondary limit")
-                && compact_text.contains("codex secondary"),
-            "the most-constrained bucket owns the bar and names itself, got: {compact_text}"
-        );
-        assert!(
-            !compact_text.contains("30% used") && !compact_text.contains("primary limit"),
-            "the other buckets must not also claim the bar, got: {compact_text}"
-        );
-        assert_eq!(
-            count(&compact, ".capacity-bar"),
-            1,
-            "exactly one bar in the compact row \u{2014} buckets are never merged"
-        );
-        assert!(
-            compact_text.contains("+2 more"),
-            "the remaining buckets collapse to a count, got: {compact_text}"
-        );
-
-        // Nothing clips or runs off the edge at a phone width.
-        //
-        // `get_bounding_client_rect` is unavailable in this crate — it returns a
-        // `DomRect`, and mobile-frontend does not enable that web-sys feature — but
-        // the assertion never needed a rect. `offset_*` (feature `HtmlElement`) and
-        // `client_width` (feature `Element`) are already enabled and carry the same
-        // layout facts. They are integers, so the edge checks below are exact and
-        // drop the 1px float epsilon the rect form had to carry.
-        //
-        // Every element here is statically positioned, so all `offset_*` values are
-        // measured against the same offset parent — the absolutely-positioned test
-        // container — and are directly comparable.
-        let viewport_width = container.client_width();
-        assert!(
-            viewport_width > 0,
-            "the test viewport must have layout width"
-        );
-
-        let compact_right = compact.offset_left() + compact.offset_width();
-        assert!(
-            compact_right <= viewport_width,
-            "the compact row must not overflow the {viewport_width}px viewport; \
-             its right edge is at {compact_right}"
-        );
-
-        let bar = query(&container, ".capacity-bar").expect("bar renders");
-        let bar_width = bar.offset_width();
-        assert!(bar_width > 0, "the bar must have real layout width");
-        let bar_right = bar.offset_left() + bar_width;
-        assert!(
-            bar_right <= viewport_width,
-            "the bar must stay inside the {viewport_width}px viewport; \
-             its right edge is at {bar_right}"
-        );
-
-        // The detail card stacks *below* the compact row, not beside it: its top
-        // edge must clear the compact row's bottom edge. The rect form only required
-        // `card.top >= compact.top`, which a side-by-side layout would satisfy too;
-        // clearing the bottom edge is the guarantee it was reaching for.
-        assert_eq!(
-            count(&container, ".capacity-card"),
-            1,
-            "one card for the one backend"
-        );
-        let card = query(&container, ".capacity-card").expect("card renders");
-        let card_top = card.offset_top();
-        let compact_bottom = compact.offset_top() + compact.offset_height();
-        assert!(
-            card_top >= compact_bottom,
-            "the detail card must stack under the compact row, not beside it; \
-             card top {card_top} vs compact bottom {compact_bottom}"
         );
     }
 }

@@ -841,6 +841,10 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     return Err(error.into());
                 }
 
+                if envelope.stream.spawn_parent().is_some() && envelope.seq != 0 {
+                    return Err(FrameError::Protocol("creation stream may be submitted only once".into()));
+                }
+
                 if voice_ingress.should_ignore_stale_audio(&envelope, &binary) {
                     tracing::debug!(
                         stream = %envelope.stream,
@@ -943,8 +947,13 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     )
                         .await;
                 if let Err(error) = route_result {
+                    let error_stream = if request_kind == FrameKind::SpawnAgent && request_stream.spawn_parent().as_ref() == Some(&host_stream) {
+                        host_output_stream.with_path(request_stream.clone())
+                    } else {
+                        host_output_stream.clone()
+                    };
                     emit_command_error(
-                        &host_output_stream,
+                        &error_stream,
                         request_stream,
                         request_kind,
                         request_id,

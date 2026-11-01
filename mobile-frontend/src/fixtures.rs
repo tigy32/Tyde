@@ -323,10 +323,10 @@ pub fn seed_state(state: &AppState) {
     match name.as_str() {
         "new-chat" => {
             state.active_agent.set(None);
-            state.viewing_chat.set(true);
+            state.show_chat();
         }
         "chat" | "chat-light" | "disconnected" | "error" | "voice" | "images" => {
-            state.viewing_chat.set(true);
+            state.show_chat();
         }
         _ => {
             state.active_tab.set(MobileTab::Home);

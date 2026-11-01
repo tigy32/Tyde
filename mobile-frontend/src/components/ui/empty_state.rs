@@ -8,7 +8,7 @@ use super::{Button, ButtonVariant};
 #[component]
 pub fn EmptyState(
     #[prop(into)] title: String,
-    #[prop(into)] body: String,
+    #[prop(optional, into)] body: String,
     #[prop(optional, into)] icon: Option<String>,
     #[prop(optional, into)] cta_label: Option<String>,
     #[prop(optional)] cta_test: Option<&'static str>,
@@ -24,7 +24,7 @@ pub fn EmptyState(
         <div class="ui-empty-state" role="status" data-mobile-test=test>
             <div class="ui-empty-state-icon" aria-hidden="true">{icon}</div>
             <h2 class="ui-empty-state-title">{title}</h2>
-            <p class="ui-empty-state-body">{body}</p>
+            {(!body.is_empty()).then(|| view! { <p class="ui-empty-state-body">{body}</p> })}
             {cta_label.map(|label| view! {
                 <Button
                     label=label

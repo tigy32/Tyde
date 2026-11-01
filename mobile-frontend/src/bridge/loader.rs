@@ -10,6 +10,7 @@ const SELECTION_KEY: &str = "tyde.selected-host.v1";
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     MissingRelease,
+    NativeVersion,
     Bridge,
     Storage,
     Manifest,
@@ -24,6 +25,9 @@ pub enum UnavailableReason {
 impl UnavailableReason {
     pub fn message(self) -> &'static str {
         match self {
+            Self::NativeVersion => {
+                "this native app bundles one reviewed client release; update the app and host to the same release and protocol"
+            }
             Self::MissingRelease => {
                 "the host did not advertise a release (development or unpublished build)"
             }

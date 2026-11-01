@@ -1176,7 +1176,15 @@ async fn connect_direct_once(
     record: &WebPairedHostRecord,
     direct: &super::store::DirectPairingRecord,
 ) -> Result<BoxedTransport, ConnectErr> {
-    let origin = super::direct::document_origin().map_err(ConnectErr::NeedsRepair)?;
+    let origin = if crate::native::is_native() {
+        direct.native_origin.clone().ok_or_else(|| {
+            ConnectErr::NeedsRepair(
+                "This native pairing has no approved host origin; pair this host again".into(),
+            )
+        })?
+    } else {
+        super::direct::document_origin().map_err(ConnectErr::NeedsRepair)?
+    };
     let token = super::store::load_device_token(&direct.device_token_key_id)
         .await
         .map_err(ConnectErr::NeedsRepair)?;

@@ -415,6 +415,48 @@ pub fn auth_providers() -> Result<Vec<AuthProvider>, String> {
     load_config().providers
 }
 
+pub async fn native_sign_in(provider: AuthProvider) -> MobileServiceAuthState {
+    let exchange = async {
+        if !auth_providers()?.contains(&provider) {
+            return Err("This sign-in provider is not enabled".into());
+        }
+        let request = mobile_shell_types::native::NativeAuthRequest {
+            provider: match provider {
+                AuthProvider::Apple => mobile_shell_types::native::NativeAuthProvider::Apple,
+                AuthProvider::Google => mobile_shell_types::native::NativeAuthProvider::Google,
+            },
+        };
+        let callback: String = crate::native::call(
+            mobile_shell_types::native::NativeEndpoint::Authenticate,
+            &request,
+        )
+        .await?;
+        let callback = web_sys::Url::new(&callback)
+            .map_err(|_| "Native authentication returned an invalid callback")?;
+        if callback.protocol() != "tyde-mobile:"
+            || callback.hostname() != "auth"
+            || callback.pathname() != "/callback"
+            || !callback.username().is_empty()
+            || !callback.password().is_empty()
+            || !callback.port().is_empty()
+        {
+            return Err("Native authentication callback destination is invalid".to_owned());
+        }
+        let result = capture_auth_callback(&callback)
+            .ok_or("Native authentication returned no callback result")?;
+        Ok(complete_auth_callback(&load_config(), result).await)
+    }
+    .await;
+    let result = match exchange {
+        Ok(state) => state,
+        Err(message) => MobileServiceAuthState::AuthFailed { message },
+    };
+    AUTH_CALLBACK_EXCHANGE.with(|exchange| {
+        *exchange.borrow_mut() = AuthCallbackExchange::Complete(Some(result.clone()))
+    });
+    result
+}
+
 /// The full-page URL that starts the Tyggs sign-in through `tycode.dev` for an
 /// explicitly selected, configured provider. `return_to` brings the browser back
 /// to the current app URL, where the appended one-time `handoffCode` is
@@ -499,7 +541,7 @@ fn strip_fragment_params(url: &web_sys::Url, keys: &[&str]) {
 /// cookie-authenticated), persists the durable managed pairing, and connects to
 /// the managed relay. Returns a [`RedeemOutcome`] on failure — never a fallback
 /// to a legacy/public broker.
-pub async fn redeem_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
+pub async fn redeem_and_connect(qr_uri: &str) -> Result<LocalHostId, RedeemOutcome> {
     let offer =
         parse_managed_offer(qr_uri).map_err(|message| RedeemOutcome::Terminal { message })?;
     let config = load_config();
@@ -602,8 +644,16 @@ async fn complete_handoff(
     let body = AuthSessionRequest {
         handoff_code: handoff_code.to_owned(),
         client: AuthClient {
-            kind: "mobile_web",
-            release_version: TYDE_VERSION.to_string(),
+            kind: if crate::native::is_native() {
+                AuthClientKind::NativeIos
+            } else {
+                AuthClientKind::MobileWeb
+            },
+            release_version: if crate::native::is_native() {
+                mobile_shell_types::native::NATIVE_CLIENT_RELEASE.into()
+            } else {
+                TYDE_VERSION.to_string()
+            },
             protocol_version: PROTOCOL_VERSION,
         },
     };
@@ -754,7 +804,7 @@ fn decode_uri_component(value: &str) -> String {
 async fn redeem_live(
     base_url: &str,
     offer: &ManagedMobilePairingQrPayload,
-) -> Result<(), RedeemOutcome> {
+) -> Result<LocalHostId, RedeemOutcome> {
     let body = RedeemRequest {
         offer_id: offer.offer_id.as_str().to_owned(),
         offer_secret: offer.offer_secret.clone(),
@@ -806,7 +856,7 @@ async fn redeem_live(
 async fn finish_redeem(
     offer: &ManagedMobilePairingQrPayload,
     result: RedeemResult,
-) -> Result<(), RedeemOutcome> {
+) -> Result<LocalHostId, RedeemOutcome> {
     let psk_store = IndexedDbPskStore;
     let psk_key_id = psk_store
         .store(&offer.psk)
@@ -847,16 +897,14 @@ async fn finish_redeem(
         return Err(RedeemOutcome::Terminal { message });
     }
 
-    if let Err(message) = super::connection::manager()
+    super::emit_paired_hosts_changed().await;
+    super::connection::manager()
         .connect(local_host_id.clone())
         .await
-    {
-        // The record is stored; a failed initial connect is a transport concern
-        // the connection manager surfaces and retries, not a redeem failure.
-        log::warn!("managed pairing stored but initial connect failed: {message}");
-    }
-    super::emit_paired_hosts_changed().await;
-    Ok(())
+        .map_err(|message| RedeemOutcome::Terminal {
+            message: format!("Pairing was saved, but connection could not start: {message}"),
+        })?;
+    Ok(local_host_id)
 }
 
 // ── Live HTTP: mint TURN credentials (reconnect) ────────────────────────────
@@ -1388,8 +1436,15 @@ struct AuthSessionRequest {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthClientKind {
+    MobileWeb,
+    NativeIos,
+}
+
+#[derive(Serialize)]
 struct AuthClient {
-    kind: &'static str,
+    kind: AuthClientKind,
     release_version: String,
     protocol_version: u32,
 }
@@ -1821,15 +1876,6 @@ mod wasm_tests {
                     .is_some_and(|managed| managed.device_id == "dev_stub")
             })
             .expect("a managed record must be stored");
-        let psk = IndexedDbPskStore
-            .load(
-                record
-                    .psk_keychain_key_id
-                    .as_ref()
-                    .expect("a managed pairing stores a PSK"),
-            )
-            .await
-            .expect("psk stored");
         // The scanned PSK is preserved for authenticated signaling.
         let psk = IndexedDbPskStore
             .load(

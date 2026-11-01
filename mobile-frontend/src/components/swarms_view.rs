@@ -53,8 +53,10 @@ fn send(
 #[component]
 pub fn SwarmsView(selected: RwSignal<Option<(LocalHostId, SwarmId)>>) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    let viewer = crate::native::is_native().then(crate::components::image_viewer::image_viewer);
     view! {
         <div class="mobile-swarms" data-mobile-test="swarms-view">
+            {viewer}
             {move || state.active_local_host_id.get().map(|host| view! { <SwarmErrors host=host swarm_id=None /> })}
             {move || match selected.get() {
                 Some((host, id)) if state.active_local_host_id.get().as_ref() == Some(&host) => view! {
@@ -299,7 +301,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
                         let open = move |_| {
                             let (host, _) = target.get_value();
                             open_state.active_agent.set(Some(crate::state::ActiveAgentRef { local_host_id: host, agent_id: agent_id.clone() }));
-                            open_state.viewing_chat.set(true);
+                            open_state.show_chat();
                         };
                         view! { <button type="button" class="mobile-swarm-member" data-mobile-test="swarm-member-open" on:click=open><strong>{member.spec.name.clone()}</strong><span>{member_label(&member)}" · Open →"</span></button> }.into_any()
                     }
@@ -571,7 +573,26 @@ fn SwarmSharedImage(
             {move || match outcome.get() {
                 Some(protocol::SwarmImageOutcome::Ready { data: Some(data), .. }) => {
                     let src = format!("data:{};base64,{}", data.media_type, data.data);
-                    view! { <a href=src.clone() target="_blank" rel="noopener" aria-label="Open shared image full size"><img src=src.clone() alt=image.with_value(|image| image.name.clone()) loading="lazy" on:error=move |_| error.set(Some("This browser could not display the shared image.".into())) /></a> }.into_any()
+                    if crate::native::is_native() {
+                        let opener = crate::components::image_viewer::image_opener();
+                        let data = StoredValue::new(data);
+                        let action = NodeRef::<leptos::html::Button>::new();
+                        view! {
+                            <button type="button" class="mobile-swarm-image-open" aria-label="Open shared image full size" node_ref=action
+                                on:click=move |_| {
+                                    let Some(target) = action.get() else {
+                                        error.set(Some("The shared image action could not open.".into()));
+                                        return;
+                                    };
+                                    opener.run((vec![data.get_value()], 0, target.into()));
+                                }>
+                                <img src=src alt=image.with_value(|image| image.name.clone()) loading="lazy"
+                                    on:error=move |_| error.set(Some("This image could not be displayed.".into())) />
+                            </button>
+                        }.into_any()
+                    } else {
+                        view! { <a href=src.clone() target="_blank" rel="noopener" aria-label="Open shared image full size"><img src=src.clone() alt=image.with_value(|image| image.name.clone()) loading="lazy" on:error=move |_| error.set(Some("This browser could not display the shared image.".into())) /></a> }.into_any()
+                    }
                 },
                 Some(protocol::SwarmImageOutcome::Failed { error: failure }) => view! { <p role="alert" class="mobile-swarm-error">{failure.message}<button type="button" class="mobile-swarm-link" on:click=move |_| read.run(())>"Retry image"</button></p> }.into_any(),
                 _ => view! { <p class="mobile-swarm-muted">"Loading shared image…"</p> }.into_any(),
@@ -1819,7 +1840,7 @@ pub(crate) mod wasm_tests {
         element(&container, "swarm-thread").click();
         tick().await;
         assert!(commands().iter().any(|command| matches!(command, SwarmCommandPayload::ReadImage { swarm_id, image_id } if *swarm_id == swarm.id && *image_id == shared_image.id)));
-        emit(&state, &host, &mut seq, FrameKind::SwarmImageNotify, &protocol::SwarmImageNotifyPayload { swarm_id: swarm.id.clone(), image_id: shared_image.id.clone(), outcome: protocol::SwarmImageOutcome::Ready { image: shared_image, data: Some(protocol::ImageData { media_type: "image/png".into(), data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFUlEQVR4nGPg3fKVJMQwqmFUA3YEAK1USJCnamHcAAAAAElFTkSuQmCC".into() }) } });
+        emit(&state, &host, &mut seq, FrameKind::SwarmImageNotify, &protocol::SwarmImageNotifyPayload { swarm_id: swarm.id.clone(), image_id: shared_image.id.clone(), outcome: protocol::SwarmImageOutcome::Ready { image: shared_image.clone(), data: Some(protocol::ImageData { media_type: "image/png".into(), data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAMCAIAAADkharWAAAAFUlEQVR4nGPg3fKVJMQwqmFUA3YEAK1USJCnamHcAAAAAElFTkSuQmCC".into() }) } });
         tick().await;
         let preview = container
             .query_selector("[data-mobile-test='swarm-image'] img")
@@ -1845,6 +1866,16 @@ pub(crate) mod wasm_tests {
             preview.natural_width(),
             16,
             "opened mobile threads display actual shared pixels"
+        );
+        let browser_image_action = container
+            .query_selector("[aria-label='Open shared image full size']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(browser_image_action.tag_name(), "A");
+        assert_eq!(
+            browser_image_action.get_attribute("target").as_deref(),
+            Some("_blank"),
+            "The native modal route must not alter browser/PWA image-link navigation"
         );
         {
             let buttons = container.query_selector_all("button").unwrap();
@@ -1968,5 +1999,117 @@ pub(crate) mod wasm_tests {
         );
         drop(handle);
         container.remove();
+
+        let window = web_sys::window().unwrap();
+        let restore = js_sys::Function::new_with_args("version", r#"
+            const had = Object.hasOwn(window, '__tydeNativeHost');
+            const previous = window.__tydeNativeHost;
+            window.__tydeNativeHost = {version, post(endpoint) {
+                if (endpoint !== 'presentation') return Promise.reject(new Error('Unexpected image fixture platform operation'));
+                return Promise.resolve(null);
+            }};
+            return () => { if (had) window.__tydeNativeHost = previous; else delete window.__tydeNativeHost; };
+        "#).call1(&wasm_bindgen::JsValue::NULL, &mobile_shell_types::native::NATIVE_BRIDGE_VERSION.into()).unwrap()
+            .dyn_into::<js_sys::Function>().unwrap();
+        state.active_local_host_id.set(Some(host.clone()));
+        state.active_tab.set(crate::state::MobileTab::Agents);
+        state.app_mode.set(crate::state::AppMode::Workspace);
+        let native_container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        native_container.set_class_name("mobile-app");
+        native_container
+            .set_attribute("data-native-host", "")
+            .unwrap();
+        document
+            .body()
+            .unwrap()
+            .append_child(&native_container)
+            .unwrap();
+        let mounted_state = state.clone();
+        let native_handle = leptos::mount::mount_to(native_container.clone(), move || {
+            provide_context(mounted_state.clone());
+            crate::native::install(mounted_state.clone());
+            let viewer = crate::components::image_viewer::image_viewer();
+            let target = StoredValue::new((host.clone(), swarm.id.clone()));
+            view! { <SwarmSharedImage target=target image=shared_image.clone() /> {viewer} }
+        });
+        let navigate = || {
+            let options = web_sys::CustomEventInit::new();
+            options.set_detail(
+                &serde_wasm_bindgen::to_value(&mobile_shell_types::native::NativeIntent::Settings)
+                    .unwrap(),
+            );
+            window
+                .dispatch_event(
+                    &web_sys::CustomEvent::new_with_event_init_dict("tyde-native-intent", &options)
+                        .unwrap(),
+                )
+                .unwrap();
+        };
+        let history_change = || {
+            js_sys::Function::new_no_args(
+            "return new Promise(resolve => window.addEventListener('popstate', () => resolve(null), {once:true}))"
+        ).call0(&wasm_bindgen::JsValue::NULL).unwrap()
+        };
+        let result: Result<(), String> = async {
+            tick().await;
+            let action = native_container.query_selector("[aria-label='Open shared image full size']").unwrap()
+                .ok_or("The native shared-image action must remain available")?;
+            if action.tag_name() != "BUTTON" || action.has_attribute("href") {
+                return Err("Native shared images must open the existing retained-document viewer, not request data-URL document navigation".into());
+            }
+            let action = action.dyn_into::<HtmlElement>().unwrap();
+            action.focus().unwrap();
+            action.click();
+            tick().await;
+            let dialog = native_container.query_selector("dialog[aria-label='Image viewer']").unwrap()
+                .ok_or("The native shared image must use the existing image dialog")?
+                .dyn_into::<web_sys::HtmlDialogElement>().unwrap();
+            if !dialog.open() { return Err("The full-size shared image must be visibly open after its real action".into()); }
+            let full = dialog.query_selector("img").unwrap().unwrap().dyn_into::<web_sys::HtmlImageElement>().unwrap();
+            wasm_bindgen_futures::JsFuture::from(full.decode()).await.map_err(|_| "Full-size shared pixels must decode")?;
+            let preview = action.query_selector("img").unwrap().unwrap().dyn_into::<web_sys::HtmlImageElement>().unwrap();
+            if full.natural_width() != 16 || full.src() != preview.src() {
+                return Err("The modal must present the exact typed server-delivered shared pixels".into());
+            }
+            navigate();
+            tick().await;
+            if state.active_tab.get_untracked() != crate::state::MobileTab::Agents {
+                return Err("Native global navigation must not activate beneath the shared-image modal".into());
+            }
+            let closed = history_change();
+            dialog.query_selector("[aria-label='Close image viewer']").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(closed)).await.unwrap();
+            tick().await;
+            if dialog.open() || !document.active_element().is_some_and(|element| element.is_same_node(Some(&action))) {
+                return Err("Close must retain the shared image and restore its original native action's focus".into());
+            }
+            navigate();
+            tick().await;
+            if state.active_tab.get_untracked() != crate::state::MobileTab::Settings {
+                return Err("Closing the image must restore normal native navigation".into());
+            }
+            Ok(())
+        }.await;
+        if let Some(dialog) = native_container.query_selector("dialog[open]").unwrap() {
+            let closed = history_change();
+            dialog
+                .query_selector("[aria-label='Close image viewer']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(closed))
+                .await
+                .unwrap();
+        }
+        drop(native_handle);
+        native_container.remove();
+        restore.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+        assert!(result.is_ok(), "{}", result.unwrap_err());
     }
 }

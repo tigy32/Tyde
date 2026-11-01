@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 94;
+pub const PROTOCOL_VERSION: u32 = 95;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -216,6 +216,33 @@ fn parse_version_component(component: Option<&str>, name: &str) -> Result<u32, S
 #[serde(transparent)]
 pub struct StreamPath(pub String);
 
+impl StreamPath {
+    pub fn is_host_root(&self) -> bool {
+        self.0
+            .strip_prefix("/host/")
+            .is_some_and(|connection| !connection.is_empty() && !connection.contains('/'))
+    }
+
+    /// A creation stream belongs to exactly one connection's host root.
+    pub fn spawn_child(&self, operation: uuid::Uuid) -> Result<Self, ProtocolTypeError> {
+        if self.is_host_root() {
+            Ok(Self(format!("{}/spawn/{operation}", self.0)))
+        } else {
+            Err(ProtocolTypeError::InvalidHostStream)
+        }
+    }
+
+    pub fn spawn_parent(&self) -> Option<Self> {
+        let (root, operation) = self.0.rsplit_once("/spawn/")?;
+        let connection = root.strip_prefix("/host/")?;
+        if connection.is_empty() || connection.contains('/') {
+            return None;
+        }
+        let id = uuid::Uuid::parse_str(operation).ok()?;
+        (id.to_string() == operation).then(|| Self(root.to_owned()))
+    }
+}
+
 impl fmt::Display for StreamPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -224,12 +251,14 @@ impl fmt::Display for StreamPath {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolTypeError {
+    InvalidHostStream,
     EmptyIdentifier { type_name: &'static str },
 }
 
 impl fmt::Display for ProtocolTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidHostStream => f.write_str("creation requires a connection host root"),
             Self::EmptyIdentifier { type_name } => {
                 write!(f, "{type_name} must not be empty")
             }

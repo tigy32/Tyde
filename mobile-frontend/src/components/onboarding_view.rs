@@ -24,6 +24,27 @@ pub fn OnboardingView() -> impl IntoView {
             .set(AppMode::Pairing(PairingScreen::ManualPaste));
     });
 
+    if crate::native::is_native() {
+        return view! {
+            <div class="view onboarding-view">
+                <div class="view-body">
+                    <div class="shell-flow">
+                        <h1 class="view-title">"Welcome to Tyde"</h1>
+                        <ol class="native-onboarding-steps">
+                            <li>"On your computer, open Settings → Mobile in Tyde."</li>
+                            <li>"Enable mobile connections and choose Start pairing."</li>
+                            <li>"Scan the code on your computer."</li>
+                        </ol>
+                        <div class="onboarding-actions">
+                            <Button label="Scan QR" variant=ButtonVariant::Primary full_width=true on_click=on_scan />
+                            <Button label="Paste link" variant=ButtonVariant::Secondary full_width=true on_click=on_paste />
+                        </div>
+                    </div>
+                </div>
+            </div>
+        }.into_any();
+    }
+
     view! {
         <div class="view onboarding-view">
             <div class="view-header">
@@ -78,6 +99,7 @@ pub fn OnboardingView() -> impl IntoView {
             </div>
         </div>
     }
+    .into_any()
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

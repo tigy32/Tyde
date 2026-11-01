@@ -68,6 +68,8 @@ pub struct WebPairedHostRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectPairingRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_origin: Option<String>,
     pub device_id: String,
     pub device_token_key_id: KeychainSecretId,
 }
@@ -77,6 +79,10 @@ impl WebPairedHostRecord {
         PairedHostSummary {
             local_host_id: self.local_host_id.clone(),
             host_label: self.host_label.clone(),
+            direct_origin: self
+                .direct
+                .as_ref()
+                .and_then(|direct| direct.native_origin.clone()),
             credential_fingerprint: self.credential_fingerprint.clone(),
             auto_connect: self.auto_connect,
             last_connected_at_ms: self.last_connected_at_ms,

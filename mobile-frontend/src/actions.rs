@@ -7,6 +7,51 @@ use crate::state::{
     AgentRef, AppState, HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectDiffState,
 };
 
+pub async fn spawn_chat(
+    state: &AppState,
+    host: &LocalHostId,
+    host_stream: protocol::StreamPath,
+    payload: &protocol::SpawnAgentPayload,
+    separate_composer: bool,
+) -> Result<Accepted, SendFrameError> {
+    let stream = if crate::native::is_native() {
+        let stream = host_stream
+            .spawn_child(uuid::Uuid::new_v4())
+            .map_err(|e| SendFrameError::Encoding(e.to_string()))?;
+        state
+            .native_chat_destination
+            .set(Some(crate::state::NativeChatDestination {
+                local_host_id: host.clone(),
+                stream: stream.clone(),
+                tab: state.active_tab.get_untracked(),
+                draft_id: state.chat_draft_id.get_untracked(),
+                source_agent: state.active_agent.get_untracked(),
+                created_agent: None,
+                source_draft: separate_composer.then(|| state.chat_input.get_untracked()),
+            }));
+        stream
+    } else {
+        host_stream
+    };
+    let result = send_frame(
+        host,
+        stream.clone(),
+        protocol::FrameKind::SpawnAgent,
+        payload,
+    )
+    .await;
+    if result.is_err()
+        && state
+            .native_chat_destination
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|target| target.local_host_id == *host && target.stream == stream)
+    {
+        state.native_chat_destination.set(None);
+    }
+    result
+}
+
 pub async fn spawn_new_chat(
     state: &AppState,
     message: String,
@@ -111,13 +156,7 @@ pub async fn spawn_new_chat(
         },
     };
 
-    let accepted = send_frame(
-        &host,
-        host_stream,
-        protocol::FrameKind::SpawnAgent,
-        &payload,
-    )
-    .await?;
+    let accepted = spawn_chat(state, &host, host_stream, &payload, false).await?;
 
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
@@ -188,13 +227,7 @@ pub async fn spawn_side_question(
         },
     };
 
-    send_frame(
-        &host,
-        host_stream,
-        protocol::FrameKind::SpawnAgent,
-        &payload,
-    )
-    .await
+    spawn_chat(state, &host, host_stream, &payload, true).await
 }
 
 /// Locate the agent's `instance_stream` so an outbound frame can be sent
@@ -427,10 +460,11 @@ pub fn begin_new_chat(state: &AppState) {
 /// question is answered; `spawn_new_chat` reads `active_project` when the first
 /// message is actually sent.
 pub fn open_new_chat(state: &AppState) {
+    state.chat_draft_id.set(uuid::Uuid::new_v4());
     state.project_picker_open.set(false);
     state.active_agent.set(None);
     state.chat_input.set(String::new());
-    state.viewing_chat.set(true);
+    state.show_chat();
 }
 
 pub async fn request_project_file(
@@ -963,4 +997,81 @@ pub async fn disable_push_notifications(state: &AppState) -> Result<(), String> 
         }
     }
     crate::push::disable().await
+}
+
+/// The reconnect sheet retains its explicit host and leaves the workspace mounted.
+pub fn native_sign_in_and_reconnect(
+    state: AppState,
+    host: LocalHostId,
+    provider: crate::bridge::AuthProvider,
+) {
+    if state
+        .native_auth_recovery
+        .with_untracked(|pending| pending.as_ref().is_some_and(|pending| pending.busy()))
+    {
+        return;
+    }
+    state
+        .native_auth_recovery
+        .set(Some(crate::state::NativeAuthRecovery {
+            local_host_id: host.clone(),
+            auth: protocol::MobileServiceAuthState::Authenticating,
+        }));
+    wasm_bindgen_futures::spawn_local(async move {
+        let auth = crate::bridge::native_sign_in(provider).await;
+        finish_native_auth_reconnect(&state, host, auth).await;
+    });
+}
+
+pub fn native_retry_auth_and_reconnect(state: AppState) {
+    let Some(pending) = state.native_auth_recovery.get_untracked() else {
+        return;
+    };
+    if pending.busy() {
+        return;
+    }
+    state
+        .native_auth_recovery
+        .set(Some(crate::state::NativeAuthRecovery {
+            local_host_id: pending.local_host_id.clone(),
+            auth: protocol::MobileServiceAuthState::Authenticating,
+        }));
+    wasm_bindgen_futures::spawn_local(async move {
+        let auth = crate::bridge::probe_managed_auth().await;
+        finish_native_auth_reconnect(&state, pending.local_host_id, auth).await;
+    });
+}
+
+async fn finish_native_auth_reconnect(
+    state: &AppState,
+    host: LocalHostId,
+    auth: protocol::MobileServiceAuthState,
+) {
+    let auth = match auth {
+        protocol::MobileServiceAuthState::Idle
+        | protocol::MobileServiceAuthState::Authenticating => {
+            protocol::MobileServiceAuthState::AuthFailed {
+                message: "Native authentication did not finish".into(),
+            }
+        }
+        result => result,
+    };
+    if matches!(auth, protocol::MobileServiceAuthState::Authenticated { .. }) {
+        state.native_auth_recovery.set(None);
+        if let Err(message) = crate::bridge::connect_paired_host(&host).await {
+            state
+                .mobile_shell_error
+                .set(Some(crate::state::MobileShellError {
+                    code: protocol::MobileAccessErrorCode::Internal,
+                    message,
+                }));
+        }
+    } else {
+        state
+            .native_auth_recovery
+            .set(Some(crate::state::NativeAuthRecovery {
+                local_host_id: host,
+                auth,
+            }));
+    }
 }

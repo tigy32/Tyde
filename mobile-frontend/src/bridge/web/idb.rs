@@ -143,6 +143,13 @@ async fn open_db() -> Result<IdbDatabase, String> {
 }
 
 pub async fn get(store: &str, key: &str) -> Result<Option<String>, String> {
+    if store == STORE_PSK && crate::native::is_native() {
+        return crate::native::call(
+            mobile_shell_types::native::NativeEndpoint::SecretRead,
+            &mobile_shell_types::native::NativeSecretKey { key: key.into() },
+        )
+        .await;
+    }
     let db = open_db().await?;
     let connection = DatabaseConnection(db.clone());
     let tx = db
@@ -163,6 +170,16 @@ pub async fn get(store: &str, key: &str) -> Result<Option<String>, String> {
 }
 
 pub async fn put(store: &str, key: &str, value: &str) -> Result<(), String> {
+    if store == STORE_PSK && crate::native::is_native() {
+        return crate::native::call(
+            mobile_shell_types::native::NativeEndpoint::SecretWrite,
+            &mobile_shell_types::native::NativeSecretWrite {
+                key: key.into(),
+                value: value.into(),
+            },
+        )
+        .await;
+    }
     let db = open_db().await?;
     let connection = DatabaseConnection(db.clone());
     let tx = db
@@ -178,6 +195,13 @@ pub async fn put(store: &str, key: &str, value: &str) -> Result<(), String> {
 }
 
 pub async fn delete(store: &str, key: &str) -> Result<(), String> {
+    if store == STORE_PSK && crate::native::is_native() {
+        return crate::native::call(
+            mobile_shell_types::native::NativeEndpoint::SecretDelete,
+            &mobile_shell_types::native::NativeSecretKey { key: key.into() },
+        )
+        .await;
+    }
     let db = open_db().await?;
     let connection = DatabaseConnection(db.clone());
     let tx = db

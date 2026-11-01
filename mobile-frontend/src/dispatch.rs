@@ -257,6 +257,40 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     return;
                 }
             };
+            if crate::native::is_native() && !crate::bundle::native_release_matches(&payload) {
+                let message =
+                    "This app and host use different releases. Update the app and host together."
+                        .to_owned();
+                report_protocol_error(
+                    state,
+                    host,
+                    bridge::ConnectionInvalidation::ProtocolViolation {
+                        message: message.clone(),
+                    },
+                );
+                clear_protocol_runtime(state, host);
+                state.connection_statuses.update(|map| {
+                    map.insert(
+                        host.clone(),
+                        ConnectionStatus::UpdateRequired {
+                            host_protocol: payload.protocol_version,
+                            app_protocol: protocol::PROTOCOL_VERSION,
+                            release_version: payload.release_version.clone(),
+                        },
+                    );
+                });
+                state.host_releases.update(|map| {
+                    map.insert(
+                        host.clone(),
+                        crate::bundle::HostRelease::NativeIncompatible(payload),
+                    );
+                });
+                state.mobile_shell_error.set(Some(MobileShellError {
+                    code: MobileAccessErrorCode::VersionMismatch,
+                    message,
+                }));
+                return;
+            }
             if state.host_stream_untracked(host).as_ref() == Some(&envelope.stream) {
                 log::info!(
                     "mobile_bundle_sync received live Welcome release_present={}",
@@ -403,6 +437,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     payload.operation, payload.stream, payload.message
                 );
                 log::error!("command error on {host}: {message}");
+                if matches!(payload.request_kind, FrameKind::SpawnAgent)
+                    && state
+                        .native_chat_destination
+                        .get_untracked()
+                        .as_ref()
+                        .is_some_and(|target| {
+                            target.local_host_id == *host
+                                && target.stream == envelope.stream
+                                && payload.stream == envelope.stream
+                        })
+                {
+                    state.native_chat_destination.set(None);
+                }
                 if matches!(payload.request_kind, FrameKind::LoadAgent) {
                     // A failed LoadAgent leaves the chat spinning forever
                     // because the bootstrap snapshot never arrives. Surface a
@@ -635,16 +682,16 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     activity,
                 );
 
-                // User-origin agents auto-open into the chat view — the user
-                // just asked for this one. BTW forks are User-origin too.
-                if matches!(origin, AgentOrigin::User)
+                if crate::native::is_native() {
+                    crate::native::open_created_chat(state);
+                } else if matches!(origin, AgentOrigin::User)
                     && !has_compaction_in_progress_for_host(state, host)
                 {
                     state.active_agent.set(Some(ActiveAgentRef {
                         local_host_id: host.clone(),
                         agent_id,
                     }));
-                    state.viewing_chat.set(true);
+                    state.show_chat();
                 }
             }
             Err(error) => log::error!(
@@ -657,7 +704,16 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
             Ok(payload) => {
-                apply_agent_start(state, host, &envelope.stream, payload);
+                if envelope.stream.spawn_parent().is_some() {
+                    crate::native::creation_published(
+                        state,
+                        host,
+                        &envelope.stream,
+                        payload.agent_id,
+                    );
+                } else {
+                    apply_agent_start(state, host, &envelope.stream, payload);
+                }
             }
             Err(error) => log::error!(
                 "failed to parse AgentStart host={} stream={} seq={}: {}",
@@ -2956,6 +3012,17 @@ fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
     });
 }
 
+fn clear_protocol_runtime(state: &AppState, host: &LocalHostId) {
+    state.host_streams.update(|map| {
+        map.remove(host);
+    });
+    state.active_connection_instance_ids.update(|map| {
+        map.remove(host);
+    });
+    crate::send::reset_seq_for_host(host);
+    reset_inbound_seq_for_host(host);
+}
+
 // Rejection stays sticky and tears down protocol runtime. Only the selected
 // host coordinator may prepare a release switch; a background host cannot reload.
 fn apply_reject(state: &AppState, host: &LocalHostId, stream: &StreamPath, payload: RejectPayload) {
@@ -2996,14 +3063,7 @@ fn apply_reject(state: &AppState, host: &LocalHostId, stream: &StreamPath, paylo
             // down so the sticky UpdateRequired leaves no dangling connection a
             // later transport event could reuse, and so a self-heal reload or a
             // post-update reconnect starts from a clean protocol session.
-            state.host_streams.update(|map| {
-                map.remove(host);
-            });
-            state.active_connection_instance_ids.update(|map| {
-                map.remove(host);
-            });
-            crate::send::reset_seq_for_host(host);
-            reset_inbound_seq_for_host(host);
+            clear_protocol_runtime(state, host);
         }
         RejectCode::InvalidHandshake => {
             state.connection_statuses.update(|map| {

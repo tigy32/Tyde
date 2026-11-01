@@ -22,6 +22,7 @@ use crate::state::{ActiveProjectRef, AppState, ProjectInfo, sort_project_infos};
 pub fn ProjectPicker() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let open = state.project_picker_open;
+    crate::native::track_modal(open);
 
     let projects_state = state.clone();
     let projects = Memo::new(move |_| {

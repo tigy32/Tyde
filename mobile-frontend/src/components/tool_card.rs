@@ -848,7 +848,7 @@ fn SendAgentMessageCard(
                 local_host_id: owner.local_host_id.clone(),
                 agent_id: agent_id.clone(),
             }));
-            state.viewing_chat.set(true);
+            state.show_chat();
         }
     });
 

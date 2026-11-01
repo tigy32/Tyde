@@ -13216,12 +13216,211 @@ async fn completed_spawn_is_not_reclassified_as_shutdown_cancellation() {
 }
 
 #[tokio::test]
+async fn creation_streams_isolate_new_fork_resume_and_rejection() {
+    let mut fixture = Fixture::new().await;
+    let (source, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Creation source".into()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".into()],
+                prompt: "source".into(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    let session = start.session_id.expect("source has a real mock session");
+    let mut peer = fixture.connect().await;
+    let mut last_stream = None;
+    for params in [
+        SpawnAgentParams::New {
+            workspace_roots: vec!["/tmp".into()],
+            prompt: "new".into(),
+            images: None,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            cost_hint: None,
+            access_mode: Default::default(),
+            session_settings: None,
+        },
+        SpawnAgentParams::Fork {
+            from_session_id: session.clone(),
+            prompt: "aside".into(),
+            images: None,
+            access_mode: None,
+        },
+        SpawnAgentParams::Resume {
+            session_id: session,
+            prompt: None,
+        },
+        SpawnAgentParams::Resume {
+            session_id: SessionId("absent-creation-session".into()),
+            prompt: None,
+        },
+        SpawnAgentParams::Fork {
+            from_session_id: SessionId("absent-fork-session".into()),
+            prompt: "missing source".into(),
+            images: None,
+            access_mode: None,
+        },
+    ] {
+        let child = fixture
+            .client
+            .spawn_agent_on_creation_stream(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: None,
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params,
+            })
+            .await
+            .expect("submit an independently addressed creation");
+        assert_ne!(Some(&child), last_stream.as_ref());
+        let mut descriptor = None;
+        let mut terminal = None;
+        while descriptor.is_none() || terminal.is_none() {
+            let event = fixture
+                .client
+                .next_event()
+                .await
+                .unwrap()
+                .expect("requester remains connected");
+            match event.kind {
+                FrameKind::NewAgent => {
+                    descriptor = Some(event.parse_payload::<NewAgentPayload>().unwrap())
+                }
+                FrameKind::AgentStart if event.stream == child => {
+                    terminal = Some(event.parse_payload::<AgentStartPayload>().unwrap())
+                }
+                FrameKind::CommandError => panic!(
+                    "unexpected creation rejection code={:?}",
+                    event.parse_payload::<CommandErrorPayload>().unwrap().code
+                ),
+                _ => {}
+            }
+        }
+        let descriptor = descriptor.unwrap();
+        assert_eq!(
+            terminal.unwrap().agent_id,
+            descriptor.agent_id,
+            "The operation publishes its exact agent, including an actionable failed-start card"
+        );
+        let observed = fixture::next_frame_matching_on(&mut peer, "peer discovery only", |event| {
+            assert!(
+                event.stream.spawn_parent().is_none(),
+                "A peer must never receive another connection's creation terminal"
+            );
+            event.kind == FrameKind::NewAgent
+                && event.parse_payload::<NewAgentPayload>().unwrap().agent_id == descriptor.agent_id
+        })
+        .await;
+        assert_ne!(
+            observed
+                .parse_payload::<NewAgentPayload>()
+                .unwrap()
+                .instance_stream,
+            descriptor.instance_stream,
+            "Creation must not borrow a peer's private instance stream"
+        );
+        last_stream = Some(child);
+    }
+    let rejected = fixture
+        .client
+        .spawn_agent_on_creation_stream(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: Some(source.new_agent.agent_id),
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: SessionId("invalid-parent-fork".into()),
+                prompt: "rejected".into(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await
+        .unwrap();
+    let error = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "matching creation rejection",
+        |event| event.stream == rejected,
+    )
+    .await;
+    assert_eq!(error.kind, FrameKind::CommandError);
+    let payload = error.parse_payload::<CommandErrorPayload>().unwrap();
+    assert_eq!(payload.stream, rejected);
+    assert_eq!(payload.request_kind, FrameKind::SpawnAgent);
+    assert_eq!(payload.code, CommandErrorCode::InvalidInput);
+    // Reuse is a protocol violation, not a second operation or a second terminal.
+    let reused = last_stream.unwrap();
+    protocol::write_envelope(
+        &mut fixture.client.writer,
+        &Envelope::from_payload(
+            reused,
+            FrameKind::SpawnAgent,
+            1,
+            &SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: None,
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: SessionId("reuse-must-not-create".into()),
+                    prompt: None,
+                },
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    // Observe actual wire EOF, not a client-side validator rejecting a second terminal.
+    while let Some(frame) = fixture
+        .client
+        .reader
+        .read_frame()
+        .await
+        .expect("Server rejection must close the real wire without a decoding error")
+    {
+        assert!(
+            frame.envelope.stream.spawn_parent().is_none(),
+            "Reusing a closed creation stream cannot produce another terminal"
+        );
+        assert_ne!(
+            frame.envelope.kind,
+            FrameKind::NewAgent,
+            "A reused creation stream cannot publish a second agent before closing"
+        );
+    }
+    peer.list_sessions(ListSessionsPayload::default())
+        .await
+        .unwrap();
+    fixture::next_frame_matching_on(
+        &mut peer,
+        "peer remains live after requester protocol rejection",
+        |event| event.kind == FrameKind::SessionList,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled() {
     let mut fixture = Fixture::new().await;
     let gate = fixture.install_spawn_operation_publication_test_gate();
-    fixture
+    let creation = fixture
         .client
-        .spawn_agent(SpawnAgentPayload {
+        .spawn_agent_on_creation_stream(SpawnAgentPayload {
             launch_context: protocol::AgentLaunchContext::Standard,
             name: Some("Published Spawn".to_owned()),
             custom_agent_id: None,
@@ -13240,8 +13439,34 @@ async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled(
         })
         .await
         .expect("submit spawn held immediately after NewAgent publication");
+    let mut publications = Vec::new();
+    let mut created = Vec::new();
+    while publications.is_empty() || created.is_empty() {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read creation result")
+            .expect("creation connection stays open");
+        match env.kind {
+            FrameKind::AgentStart if env.stream == creation => {
+                created.push(env.parse_payload::<AgentStartPayload>().unwrap().agent_id)
+            }
+            FrameKind::NewAgent => {
+                publications.push(env.parse_payload::<NewAgentPayload>().unwrap().agent_id)
+            }
+            FrameKind::CommandError => panic!(
+                "creation rejected before publication: {:?}",
+                env.parse_payload::<CommandErrorPayload>().unwrap().code
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        created, publications,
+        "The requester receives the exact published identity"
+    );
     gate.wait_until_entered().await;
-
     fixture.shutdown_spawn_operations().await;
     fixture
         .client
@@ -13249,7 +13474,6 @@ async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled(
         .await
         .expect("published spawn shutdown barrier");
 
-    let mut publications = 0;
     let mut terminals = 0;
     loop {
         let env = fixture
@@ -13259,14 +13483,25 @@ async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled(
             .expect("read post-publication shutdown event")
             .expect("connection remained open");
         match env.kind {
-            FrameKind::NewAgent => publications += 1,
+            FrameKind::AgentStart if env.stream == creation => {
+                created.push(env.parse_payload::<AgentStartPayload>().unwrap().agent_id)
+            }
+            FrameKind::NewAgent => {
+                publications.push(env.parse_payload::<NewAgentPayload>().unwrap().agent_id)
+            }
             FrameKind::CommandError => terminals += 1,
             FrameKind::SessionList => break,
             _ => {}
         }
     }
     assert_eq!(
-        publications, 1,
+        created.len(),
+        1,
+        "Only the requesting creation stream receives one published-agent terminal"
+    );
+    assert_eq!(
+        publications.len(),
+        1,
         "published spawn must remain visible exactly once"
     );
     assert_eq!(

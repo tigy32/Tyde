@@ -37,6 +37,7 @@ fn sheet_title(backend_kind: BackendKind) -> String {
 pub fn SessionSettingsSheet() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let open = state.session_settings_open;
+    crate::native::track_modal(open);
 
     // What the sheet is bound to: the host whose schema applies, the backend
     // that defines the fields, and whether edits land on an agent or the draft.

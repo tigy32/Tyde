@@ -355,15 +355,10 @@ async fn resume_session(
         },
     };
 
-    crate::send::send_frame(
-        host_id,
-        host_stream,
-        protocol::FrameKind::SpawnAgent,
-        &payload,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    crate::actions::spawn_chat(state, host_id, host_stream, &payload, true)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn delete_session(
@@ -553,6 +548,65 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
+        crate::components::test_styles::ensure_styles_loaded();
+        container.set_class_name("mobile-app tws-shell");
+        let window = web_sys::window().unwrap();
+        let style = |property: &str| {
+            window
+                .get_computed_style(&input)
+                .unwrap()
+                .unwrap()
+                .get_property_value(property)
+                .unwrap()
+        };
+        let browser_font = (style("font-family"), style("font-size"));
+        let unfocused_rim = style("box-shadow");
+        input.focus().unwrap();
+        let animations = js_sys::Function::new_with_args(
+            "element",
+            "return Promise.all(element.getAnimations().map(animation => animation.finished))",
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, &input)
+        .unwrap();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(animations))
+            .await
+            .unwrap();
+        next_tick().await;
+        let browser_outline = (style("outline-style"), style("outline-width"));
+        let editing_rim = style("box-shadow");
+        container.set_attribute("data-native-host", "").unwrap();
+        next_tick().await;
+        let native_outline = style("outline-style");
+        let native_rim = style("box-shadow");
+        let native_font = (style("font-family"), style("font-size"));
+        container.remove_attribute("data-native-host").unwrap();
+        next_tick().await;
+        let restored_browser_outline = (style("outline-style"), style("outline-width"));
+        container.remove_attribute("class").unwrap();
+        assert_ne!(
+            browser_outline.0, "none",
+            "The browser baseline must expose its existing outline before the native-only correction"
+        );
+        assert_eq!(
+            native_outline, "none",
+            "Native search must not paint a second outline around its focus rim"
+        );
+        assert_ne!(
+            editing_rim, unfocused_rim,
+            "Search editing must retain a visible focus treatment"
+        );
+        assert_eq!(
+            native_rim, editing_rim,
+            "Native search must retain the existing single editing rim"
+        );
+        assert_eq!(
+            native_font, browser_font,
+            "Native search must keep the existing theme fonts and sizes"
+        );
+        assert_eq!(
+            restored_browser_outline, browser_outline,
+            "Native focus styling must not change browser/PWA focus"
+        );
         input.set_value("code");
         let ev = web_sys::Event::new("input").unwrap();
         input.dispatch_event(&ev).unwrap();

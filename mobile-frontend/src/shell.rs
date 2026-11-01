@@ -43,11 +43,19 @@ fn bind_regions(
     root: &web_sys::HtmlElement,
     mounted: &RefCell<Option<MountedShell>>,
 ) -> Result<(), JsValue> {
-    let content = region(root, ".chat-messages, .view-body, .home-view")?;
-    let header = root
+    let active_root = if crate::native::is_native()
+        && root.query_selector(".native-workspace")?.is_some()
+    {
+        Some(region(root, "[data-native-shell-active]")?.unchecked_into::<web_sys::HtmlElement>())
+    } else {
+        None
+    };
+    let region_root = active_root.as_ref().unwrap_or(root);
+    let content = region(region_root, ".chat-messages, .view-body, .home-view")?;
+    let header = region_root
         .query_selector(".shell-header, .chat-header, .view-header:not(.shell-header > *)")?
         .unwrap_or(region(root, ".shell-empty-header")?);
-    let bottom = root
+    let bottom = region_root
         .query_selector(".chat-bottom-dock, .shell-bottom")?
         .unwrap_or(region(root, ".shell-empty-bottom")?);
     let flow = content
@@ -125,6 +133,11 @@ pub fn install(root: NodeRef<leptos::html::Div>) {
         let options = web_sys::MutationObserverInit::new();
         options.set_child_list(true);
         options.set_subtree(true);
+        options.set_attributes(true);
+        options.set_attribute_filter(&js_sys::Array::of2(
+            &"hidden".into(),
+            &"data-native-shell-active".into(),
+        ));
         observer
             .observe_with_options(&root, &options)
             .expect("observe mobile shell");

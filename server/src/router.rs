@@ -64,6 +64,21 @@ pub(crate) async fn route_client_envelope(
     origin: &ConnectionOrigin,
     envelope: Envelope,
 ) -> AppResult<()> {
+    if let Some(parent) = envelope.stream.spawn_parent() {
+        if parent != *connection_host_stream || envelope.kind != FrameKind::SpawnAgent {
+            return Err(AppError::protocol(
+                "spawn_agent",
+                "creation stream does not belong to this connection or command",
+            ));
+        }
+        let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;
+        validate_spawn_agent(&payload)?;
+        return host.start_spawn_agent_operation(
+            payload,
+            envelope.stream.clone(),
+            host_output_stream.with_path(envelope.stream),
+        );
+    }
     if envelope.stream == *connection_host_stream {
         match envelope.kind {
             FrameKind::SettingsWrite => {

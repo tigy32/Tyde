@@ -34,6 +34,8 @@ impl fmt::Display for KeychainSecretId {
 pub struct PairedHostSummary {
     pub local_host_id: LocalHostId,
     pub host_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_origin: Option<String>,
     pub credential_fingerprint: String,
     pub auto_connect: bool,
     pub last_connected_at_ms: Option<u64>,
@@ -82,3 +84,5 @@ pub struct MobileShellError {
 }
 
 pub type MobileShellErrorEvent = MobileShellError;
+
+pub mod native;

@@ -42,7 +42,7 @@ pub fn App() -> impl IntoView {
     provide_context(state.clone());
 
     crate::bundle::restore_selection(&state);
-    install_event_listeners(state.clone());
+    spawn_local(install_event_listeners(state.clone()));
     install_page_visibility_recovery(state.clone());
     install_app_mode_effect(state.clone());
     spawn_boot_pairing_handoff(state.clone());
@@ -65,14 +65,24 @@ pub fn FixtureApp() -> impl IntoView {
 pub(crate) fn AppSurface() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     crate::bundle::install(state.clone());
+    crate::native::install(state.clone());
     mirror_theme_to_document(state.clone());
     let root = NodeRef::<leptos::html::Div>::new();
     crate::shell::install(root);
+    let native_workspace = Memo::new(move |_| {
+        crate::native::is_native()
+            && match state.app_mode.get() {
+                AppMode::Workspace | AppMode::HostPicker => true,
+                AppMode::Pairing(_) => state.active_local_host_id.get().is_some(),
+                AppMode::Onboarding => false,
+            }
+    });
     view! {
         <div
             class="mobile-app tws-shell"
             node_ref=root
             data-theme=move || state.theme.get()
+            data-native-host=crate::native::is_native().then_some("")
             data-mobile-fixture={
                 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
                 { crate::fixtures::fixture_name() }
@@ -85,7 +95,12 @@ pub(crate) fn AppSurface() -> impl IntoView {
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />
+            {crate::native::is_native().then(|| view! { <components::NativeAuthRecoverySheet /> })}
             {move || {
+                // A Hosts/Back round trip must not dispose component-owned drafts.
+                if native_workspace.get() {
+                    return view! { <WorkspaceShell /> }.into_any();
+                }
                 let mode = state.app_mode.get();
                 match mode {
                     AppMode::Onboarding => view! { <components::OnboardingView /> }.into_any(),
@@ -97,6 +112,7 @@ pub(crate) fn AppSurface() -> impl IntoView {
                         <WorkspaceShell />
                     }
                     .into_any(),
+                    AppMode::HostPicker => view! { <components::PairedHostsPicker /> }.into_any(),
                 }
             }}
         </div>
@@ -121,6 +137,9 @@ fn foreground_recovery(background_ms: u64) -> ForegroundRecovery {
 
 #[cfg(target_arch = "wasm32")]
 fn install_page_visibility_recovery(state: AppState) {
+    if crate::native::is_native() {
+        return;
+    }
     use wasm_bindgen::{JsCast, closure::Closure};
 
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
@@ -139,19 +158,11 @@ fn install_page_visibility_recovery(state: AppState) {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         if hidden {
-            PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.set(Some(unix_time_ms())));
+            page_background();
             return;
         }
 
-        let Some(hidden_since_ms) = PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.take())
-        else {
-            return;
-        };
-        let background_ms = unix_time_ms().saturating_sub(hidden_since_ms);
-        let state = state_for_callback.clone();
-        spawn_local(async move {
-            recover_after_foreground(&state, background_ms).await;
-        });
+        page_foreground(state_for_callback.clone());
     });
     if let Err(error) = document
         .add_event_listener_with_callback("visibilitychange", callback.as_ref().unchecked_ref())
@@ -165,6 +176,26 @@ fn install_page_visibility_recovery(state: AppState) {
     }
     callback.forget();
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn page_background() {
+    PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.set(Some(unix_time_ms())));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn page_background() {}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn page_foreground(state: AppState) {
+    if let Some(hidden_since) = PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.take()) {
+        spawn_local(async move {
+            recover_after_foreground(&state, unix_time_ms().saturating_sub(hidden_since)).await;
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn page_foreground(_state: AppState) {}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn install_page_visibility_recovery(_state: AppState) {}
@@ -296,6 +327,9 @@ fn WorkspaceShell() -> impl IntoView {
 #[component]
 fn ActiveHostShell() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    if crate::native::is_native() {
+        return view! { <NativeWorkspace /> }.into_any();
+    }
     view! {
         <components::ConnectionBanner />
         <crate::voice::MobileVoiceRuntime />
@@ -327,6 +361,88 @@ fn ActiveHostShell() -> impl IntoView {
         </Show>
         // Outside the content column so the sheet covers the tab dock too: a
         // modal the user can navigate out from underneath is not modal.
+        <components::ProjectPicker />
+        <components::SessionSettingsSheet />
+    }
+    .into_any()
+}
+
+#[component]
+fn RetainedNativePane(tab: MobileTab, children: ChildrenFn) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let visited = RwSignal::new(false);
+    let visible_state = state.clone();
+    let visible = Signal::derive(move || {
+        let selected = visible_state.active_tab.get();
+        let chat = crate::native::chat_visible(&visible_state);
+        let split =
+            chat && visible_state.native_regular_width.get() && selected == MobileTab::Agents;
+        visible_state.app_mode.get() == AppMode::Workspace
+            && ((selected == tab && !chat) || (tab == MobileTab::Agents && split))
+    });
+    Effect::new(move |_| {
+        if visible.get() {
+            visited.set(true);
+        }
+    });
+    view! {
+        <div class="native-pane" class:native-agents-pane=tab == MobileTab::Agents hidden=move || !visible.get()
+            data-native-shell-active=move || (visible.get() && !crate::native::chat_visible(&state)).then_some("")>
+            <Show when=move || visited.get()>{children()}</Show>
+        </div>
+    }
+}
+
+#[component]
+fn NativeWorkspace() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let chat_visited = RwSignal::new(false);
+    let visit_state = state.clone();
+    Effect::new(move |_| {
+        if visit_state.viewing_chat.get() {
+            chat_visited.set(true);
+        }
+    });
+    let split_state = state.clone();
+    let visible_state = state.clone();
+    view! {
+        <div class="native-pane native-workspace-status" hidden=move || matches!(state.app_mode.get(), AppMode::Pairing(_))>
+            <components::ConnectionBanner />
+            <components::PendingSubmissions />
+        </div>
+        <crate::voice::MobileVoiceRuntime />
+        <div class="mobile-content native-workspace"
+            class:native-pairing=move || matches!(state.app_mode.get(), AppMode::Pairing(_))
+            class:native-split=move || {
+            crate::native::chat_visible(&split_state) && split_state.native_regular_width.get()
+                && split_state.active_tab.get() == MobileTab::Agents
+        }>
+            <RetainedNativePane tab=MobileTab::Home><components::HomeView /></RetainedNativePane>
+            <RetainedNativePane tab=MobileTab::Agents><components::AgentsView /></RetainedNativePane>
+            <RetainedNativePane tab=MobileTab::Sessions><components::SessionsView /></RetainedNativePane>
+            <RetainedNativePane tab=MobileTab::Settings><components::SettingsView /></RetainedNativePane>
+            <div class="native-pane" hidden=move || !matches!(state.app_mode.get(), AppMode::Pairing(_))
+                data-native-shell-active=move || matches!(state.app_mode.get(), AppMode::Pairing(_)).then_some("")>
+                {move || match state.app_mode.get() {
+                    AppMode::Pairing(screen) => view! { <components::PairingFlow screen=screen /> }.into_any(),
+                    _ => ().into_any(),
+                }}
+            </div>
+            <div class="native-pane" hidden=move || state.app_mode.get() != AppMode::HostPicker
+                data-native-shell-active=move || (state.app_mode.get() == AppMode::HostPicker).then_some("")>
+                <Show when=move || state.app_mode.get() == AppMode::HostPicker>
+                    <components::PairedHostsPicker />
+                </Show>
+            </div>
+            <div class="native-pane native-chat-pane" hidden={let state = state.clone(); move || !crate::native::chat_visible(&state)}
+                data-native-shell-active=move || crate::native::chat_visible(&visible_state).then_some("")>
+                <Show when=move || chat_visited.get()>
+                    <For each=move || vec![(state.active_agent.get().map(|active| active.as_agent_ref()), state.chat_draft_id.get())] key=Clone::clone let:_chat>
+                        <components::ChatView />
+                    </For>
+                </Show>
+            </div>
+        </div>
         <components::ProjectPicker />
         <components::SessionSettingsSheet />
     }
@@ -372,7 +488,7 @@ fn install_app_mode_effect(state: AppState) {
                     state.app_mode.set(AppMode::Workspace);
                 }
             }
-            AppMode::Workspace => {
+            AppMode::Workspace | AppMode::HostPicker => {
                 if hosts.is_empty() {
                     state.app_mode.set(AppMode::Onboarding);
                 }
@@ -473,135 +589,133 @@ fn report_shell_error(state: &AppState, code: MobileAccessErrorCode, message: St
         .set(Some(MobileShellError { code, message }));
 }
 
-fn install_event_listeners(state: AppState) {
-    spawn_local(async move {
-        let state_line = state.clone();
-        register_listener(
-            &state,
-            "host-line",
-            bridge::listen_host_line(move |event| handle_host_line_event(&state_line, event)).await,
-        );
+async fn install_event_listeners(state: AppState) {
+    let state_line = state.clone();
+    register_listener(
+        &state,
+        "host-line",
+        bridge::listen_host_line(move |event| handle_host_line_event(&state_line, event)).await,
+    );
 
-        let state_disconnected = state.clone();
-        register_listener(
-            &state,
-            "host-disconnected",
-            bridge::listen_host_disconnected(move |event| {
-                log::info!("host disconnected: {}", event.host_id);
-                let host = LocalHostId(event.host_id);
-                apply_disconnect(&state_disconnected, &host, None);
-            })
-            .await,
-        );
+    let state_disconnected = state.clone();
+    register_listener(
+        &state,
+        "host-disconnected",
+        bridge::listen_host_disconnected(move |event| {
+            log::info!("host disconnected: {}", event.host_id);
+            let host = LocalHostId(event.host_id);
+            apply_disconnect(&state_disconnected, &host, None);
+        })
+        .await,
+    );
 
-        let state_error = state.clone();
-        register_listener(
-            &state,
-            "host-error",
-            bridge::listen_host_error(move |event| {
-                log::error!("host error on {}: {}", event.host_id, event.message);
-                apply_host_error(&state_error, LocalHostId(event.host_id), event.message);
-            })
-            .await,
-        );
+    let state_error = state.clone();
+    register_listener(
+        &state,
+        "host-error",
+        bridge::listen_host_error(move |event| {
+            log::error!("host error on {}: {}", event.host_id, event.message);
+            apply_host_error(&state_error, LocalHostId(event.host_id), event.message);
+        })
+        .await,
+    );
 
-        let state_paired = state.clone();
-        register_listener(
-            &state,
-            "paired-hosts-changed",
-            bridge::listen_paired_hosts_changed(move |event| {
-                apply_paired_hosts_list(&state_paired, event.hosts);
-            })
-            .await,
-        );
+    let state_paired = state.clone();
+    register_listener(
+        &state,
+        "paired-hosts-changed",
+        bridge::listen_paired_hosts_changed(move |event| {
+            apply_paired_hosts_list(&state_paired, event.hosts);
+        })
+        .await,
+    );
 
-        let state_status = state.clone();
-        register_listener(
+    let state_status = state.clone();
+    register_listener(
+        &state,
+        "paired-host-connection-status",
+        bridge::listen_paired_host_connection_status(move |event| {
+            apply_connection_status(
+                &state_status,
+                event.local_host_id,
+                event.status,
+                event.connection_instance_id,
+            );
+        })
+        .await,
+    );
+
+    let state_shell_error = state.clone();
+    register_listener(
+        &state,
+        "mobile-shell-error",
+        bridge::listen_mobile_shell_error(move |error| {
+            log::error!("mobile shell error: {:?} {}", error.code, error.message);
+            state_shell_error.mobile_shell_error.set(Some(error));
+        })
+        .await,
+    );
+
+    register_listener(
+        &state,
+        "submission-transport-outcome",
+        listen_submission_outcomes(&state).await,
+    );
+
+    // Resolve selection before transport status replay can start any handshake.
+    match bridge::list_paired_hosts().await {
+        Ok(hosts) => apply_paired_hosts_list(&state, hosts),
+        Err(error) => {
+            report_shell_error(
+                &state,
+                MobileAccessErrorCode::Internal,
+                format!("Failed to load paired hosts: {error}"),
+            );
+            return;
+        }
+    }
+
+    let known_connection_instance_ids = state
+        .active_connection_instance_ids
+        .get_untracked()
+        .into_iter()
+        .map(
+            |(local_host_id, connection_instance_id)| bridge::KnownConnectionInstance {
+                local_host_id,
+                connection_instance_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    if let Err(error) = bridge::frontend_attached(&known_connection_instance_ids).await {
+        log::error!("frontend_attached failed: {error}");
+        report_shell_error(
             &state,
-            "paired-host-connection-status",
-            bridge::listen_paired_host_connection_status(move |event| {
+            MobileAccessErrorCode::Internal,
+            format!("Failed to refresh host connection after app attach: {error}"),
+        );
+    }
+
+    match bridge::list_paired_host_connection_statuses().await {
+        Ok(statuses) => {
+            for event in statuses {
                 apply_connection_status(
-                    &state_status,
+                    &state,
                     event.local_host_id,
                     event.status,
                     event.connection_instance_id,
                 );
-            })
-            .await,
-        );
-
-        let state_shell_error = state.clone();
-        register_listener(
-            &state,
-            "mobile-shell-error",
-            bridge::listen_mobile_shell_error(move |error| {
-                log::error!("mobile shell error: {:?} {}", error.code, error.message);
-                state_shell_error.mobile_shell_error.set(Some(error));
-            })
-            .await,
-        );
-
-        register_listener(
-            &state,
-            "submission-transport-outcome",
-            listen_submission_outcomes(&state).await,
-        );
-
-        // Resolve selection before transport status replay can start any handshake.
-        match bridge::list_paired_hosts().await {
-            Ok(hosts) => apply_paired_hosts_list(&state, hosts),
-            Err(error) => {
-                report_shell_error(
-                    &state,
-                    MobileAccessErrorCode::Internal,
-                    format!("Failed to load paired hosts: {error}"),
-                );
-                return;
             }
+            drain_pending_host_lines(state.clone());
         }
-
-        let known_connection_instance_ids = state
-            .active_connection_instance_ids
-            .get_untracked()
-            .into_iter()
-            .map(
-                |(local_host_id, connection_instance_id)| bridge::KnownConnectionInstance {
-                    local_host_id,
-                    connection_instance_id,
-                },
-            )
-            .collect::<Vec<_>>();
-        if let Err(error) = bridge::frontend_attached(&known_connection_instance_ids).await {
-            log::error!("frontend_attached failed: {error}");
+        Err(error) => {
+            log::error!("list_paired_host_connection_statuses failed: {error}");
             report_shell_error(
                 &state,
                 MobileAccessErrorCode::Internal,
-                format!("Failed to refresh host connection after app attach: {error}"),
+                format!("Failed to load paired host connection statuses: {error}"),
             );
         }
-
-        match bridge::list_paired_host_connection_statuses().await {
-            Ok(statuses) => {
-                for event in statuses {
-                    apply_connection_status(
-                        &state,
-                        event.local_host_id,
-                        event.status,
-                        event.connection_instance_id,
-                    );
-                }
-                drain_pending_host_lines(state.clone());
-            }
-            Err(error) => {
-                log::error!("list_paired_host_connection_statuses failed: {error}");
-                report_shell_error(
-                    &state,
-                    MobileAccessErrorCode::Internal,
-                    format!("Failed to load paired host connection statuses: {error}"),
-                );
-            }
-        }
-    });
+    }
 }
 
 fn handle_host_line_event(state: &AppState, event: bridge::HostLineEvent) {
@@ -1044,6 +1158,14 @@ fn apply_host_error(state: &AppState, host: LocalHostId, message: String) {
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
     state.disconnect_human_admissions(host);
+    if state
+        .native_chat_destination
+        .get_untracked()
+        .as_ref()
+        .is_some_and(|target| target.local_host_id == *host)
+    {
+        state.native_chat_destination.set(None);
+    }
     // A terminal rejection remains the sticky handshake verdict, even when
     // that rejected socket closes. A Welcome is authority only while live.
     state.host_releases.update(|m| {
@@ -1265,6 +1387,708 @@ mod wasm_tests {
         fn loader_no_target() -> bool;
         #[wasm_bindgen(js_name = restore)]
         fn restore_loader_boundary();
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_tabs_retain_mounted_draft_selection_and_search_without_web_navigation() {
+        use mobile_shell_types::native::{NATIVE_BRIDGE_VERSION, NativeIntent};
+        crate::components::test_styles::ensure_styles_loaded();
+        let _sends = bridge::test_capture_sends();
+        let window = web_sys::window().unwrap();
+        let native = js_sys::Object::new();
+        js_sys::Reflect::set(&native, &"version".into(), &NATIVE_BRIDGE_VERSION.into()).unwrap();
+        let post = js_sys::Function::new_with_args(
+            "endpoint,payload",
+            "if (endpoint === 'presentation') this.presentations.push(JSON.parse(payload)); return Promise.resolve(null)",
+        );
+        js_sys::Reflect::set(&native, &"post".into(), &post).unwrap();
+        js_sys::Reflect::set(&native, &"presentations".into(), &js_sys::Array::new()).unwrap();
+        js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
+        let state = AppState::new();
+        let host = fixture_host("native-navigation-host", "Native host");
+        let host_id = host.local_host_id.clone();
+        let mounted_state = state.clone();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <AppSurface /> }
+        });
+        // Wasm panics do not unwind. Restore the platform boundary before reporting failures.
+        let result: Result<(), String> = async {
+            let check = |condition: bool, message: &str| {
+                if condition { Ok(()) } else { Err(message.to_owned()) }
+            };
+            let find = |selector: &str| -> Result<web_sys::Element, String> {
+                container.query_selector(selector)
+                    .map_err(|_| "Invalid navigation test selector".to_owned())?
+                    .ok_or_else(|| format!("Missing native navigation control: {selector}"))
+            };
+            let projected = || -> Result<mobile_shell_types::native::NativePresentation, String> {
+                let values = js_sys::Reflect::get(&native, &"presentations".into())
+                    .map_err(|_| "Native presentations are unavailable")?;
+                let values = js_sys::Array::from(&values);
+                serde_wasm_bindgen::from_value(values.get(values.length().saturating_sub(1)))
+                    .map_err(|_| "Native presentation is invalid".into())
+            };
+            let navigate = |intent: NativeIntent| -> Result<(), String> {
+                let options = web_sys::CustomEventInit::new();
+                options.set_detail(&serde_wasm_bindgen::to_value(&intent).map_err(|_| "Invalid native intent")?);
+                let event = web_sys::CustomEvent::new_with_event_init_dict("tyde-native-intent", &options)
+                    .map_err(|_| "Could not create native intent")?;
+                window.dispatch_event(&event).map_err(|_| "Could not dispatch native intent")?;
+                Ok(())
+            };
+            install_page_visibility_recovery(state.clone());
+            PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(None));
+            js_sys::Function::new_no_args(r#"
+                const old = Object.getOwnPropertyDescriptor(document, 'hidden');
+                try {
+                    Object.defineProperty(document, 'hidden', {configurable:true, value:true});
+                    document.dispatchEvent(new Event('visibilitychange'));
+                } finally {
+                    if (old) Object.defineProperty(document, 'hidden', old);
+                    else delete document.hidden;
+                }
+            "#).call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            check(PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.get().is_none()),
+                "Document visibility must not be a second native lifecycle producer")?;
+            navigate(NativeIntent::Background)?;
+            check(PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.get().is_some()),
+                "UIKit background owns native connection recovery")?;
+            navigate(NativeIntent::Foreground)?;
+            check(PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.get().is_none()),
+                "UIKit foreground consumes the native recovery interval")?;
+            next_tick().await;
+            check(container.query_selector("[data-mobile-test='bottom-nav']").unwrap().is_none(),
+                "Only native packaging suppresses web global navigation")?;
+            check(!projected()?.workspace, "Onboarding must not expose native workspace navigation")?;
+            let onboarding = find(".onboarding-view .shell-flow")?;
+            check(onboarding.get_bounding_client_rect().width() <= 512.0,
+                "Large-screen native onboarding stays bounded")?;
+            let paste = container.query_selector_all(".onboarding-actions button").unwrap().item(1).unwrap();
+            check(paste.text_content().unwrap_or_default().trim() == "Paste link", "Native pairing uses concise link terminology")?;
+            let instructions = find(".native-onboarding-steps")?;
+            let scan = find(".onboarding-actions button")?;
+            check(scan.get_bounding_client_rect().top() - instructions.get_bounding_client_rect().bottom() >= 24.0,
+                "Primary action must be separated from onboarding guidance")?;
+            // Source21 iPad39 rendered edge-to-edge picker/link actions and two focus rims.
+            // Keep the same real screens/controls while comparing native styling with browser CSS.
+            let app = find(".mobile-app")?;
+            for width in [320, 390, 820, 1180] {
+                app.set_attribute("style", &format!("position:relative;width:{width}px;height:700px")).unwrap();
+                state.app_mode.set(AppMode::Workspace);
+                state.paired_hosts.set(vec![host.clone()]);
+                next_tick().await;
+                let picker = find(".picker-view .shell-flow")?;
+                let action = find(".picker-pair-another")?;
+                let picker_width = picker.get_bounding_client_rect().width();
+                check(picker_width > 0.0 && picker_width <= 512.0 && picker_width <= f64::from(width),
+                    "Native host picker keeps a compact-responsive bounded column")?;
+                check((picker.get_bounding_client_rect().left() + picker_width / 2.0
+                    - (app.get_bounding_client_rect().left() + f64::from(width) / 2.0)).abs() < 1.0,
+                    "Native host picker content is balanced around its window center")?;
+                check(action.get_bounding_client_rect().width() <= picker_width
+                    && action.get_bounding_client_rect().height() >= 44.0,
+                    "Host pairing actions stay within the column and remain touch usable")?;
+                state.app_mode.set(AppMode::Pairing(crate::state::PairingScreen::ManualPaste));
+                next_tick().await;
+                let flow = find(".pairing-view .shell-flow")?;
+                let field = find("textarea[aria-label='Pairing link']")?;
+                let button = find(".pairing-view button.ui-button-primary")?;
+                let computed = |element: &web_sys::Element, property: &str| {
+                    window.get_computed_style(element).unwrap().unwrap().get_property_value(property).unwrap()
+                };
+                app.remove_attribute("data-native-host").unwrap();
+                next_tick().await;
+                let browser_width = flow.get_bounding_client_rect().width();
+                let browser_font = computed(&field, "font");
+                app.set_attribute("data-native-host", "").unwrap();
+                next_tick().await;
+                let native_width = flow.get_bounding_client_rect().width();
+                check(native_width > 0.0 && native_width <= 512.0
+                    && (width < 820 || native_width < browser_width),
+                    "Native pairing must bound the same full-width layout observed on the old browser-style iPad screen")?;
+                check((flow.get_bounding_client_rect().left() + native_width / 2.0
+                    - (app.get_bounding_client_rect().left() + f64::from(width) / 2.0)).abs() < 1.0,
+                    "Native pairing shares the centered onboarding/host-picker column")?;
+                check(computed(&field, "font") == browser_font,
+                    "Native pairing preserves existing theme font and size roles")?;
+                let before_focus = computed(&field, "box-shadow");
+                field.unchecked_ref::<HtmlElement>().focus().unwrap();
+                next_tick().await;
+                // CSS keeps computed width independent of outline-style:none; assert paint.
+                check(computed(&field, "outline-style") == "none" && computed(&field, "box-shadow") != before_focus,
+                    "Native pairing editing has one visible contiguous focus rim, not a second offset outline")?;
+                check(button.get_bounding_client_rect().height() >= 44.0
+                    && button.get_bounding_client_rect().top() - field.get_bounding_client_rect().bottom() >= 16.0,
+                    "Bounded pairing retains separated, touch-friendly primary actions")?;
+                field.unchecked_ref::<HtmlElement>().blur().unwrap();
+                app.remove_attribute("data-native-host").unwrap();
+                next_tick().await;
+                check(flow.get_bounding_client_rect().width() == browser_width,
+                    "Native column styling does not change the browser/PWA layout")?;
+                app.set_attribute("data-native-host", "").unwrap();
+            }
+            app.remove_attribute("style").unwrap();
+            state.app_mode.set(AppMode::Workspace);
+            state.paired_hosts.set(vec![host.clone(), fixture_host("native-unselected-other", "Other host")]);
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(host_id.clone(), ConnectionStatus::NeedsAction {
+                    code: protocol::MobileAccessErrorCode::ServiceAuthRequired,
+                    message: "Sign in again".into(),
+                });
+            });
+            next_tick().await;
+            check(state.active_local_host_id.get_untracked().is_none(),
+                "The host chooser must exercise recovery before selection")?;
+            let unselected_picker = find(".picker-view")?;
+            find("[data-mobile-test='paired-host-sign-in']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let recovery = find("[data-mobile-test='native-auth-recovery']")?;
+            check(recovery.get_bounding_client_rect().height() > 0.0,
+                "Native sign-in failure must remain visible without a selected host")?;
+            find("[data-mobile-test='pairing-auth-failed']")?;
+            check(state.native_auth_recovery.with_untracked(|pending|
+                pending.as_ref().is_some_and(|pending| pending.local_host_id == host_id)),
+                "Recovery keeps the exact chooser host without selecting another")?;
+            find("[data-mobile-test='native-auth-cancel']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(find(".picker-view")?.is_same_node(Some(&unselected_picker))
+                && state.active_local_host_id.get_untracked().is_none()
+                && state.native_auth_recovery.get_untracked().is_none()
+                && !projected()?.modal,
+                "Cancel restores the same unselected chooser and its navigation")?;
+            state.connection_statuses.update(|statuses| { statuses.remove(&host_id); });
+            state.paired_hosts.set(vec![host.clone()]);
+            state.app_mode.set(AppMode::Pairing(crate::state::PairingScreen::Scanner));
+            next_tick().await;
+            let instruction = find("[data-mobile-test='pairing-scanner-instruction']")?;
+            check(instruction.text_content().unwrap().contains("Settings → Mobile")
+                && !instruction.text_content().unwrap().contains("phone")
+                && !instruction.get_attribute("aria-label").unwrap().contains("phone"),
+                "Native scan guidance names the real desktop QR location without assuming an iPhone")?;
+            state.app_mode.set(AppMode::Workspace);
+            state.active_local_host_id.set(Some(host_id.clone()));
+            state.paired_hosts.set(vec![host]);
+            next_tick().await;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            navigate(NativeIntent::NewChat)?;
+            next_tick().await;
+            check(projected()?.modal, "Project sheet must disable system navigation")?;
+            navigate(NativeIntent::Settings)?;
+            navigate(NativeIntent::Back)?;
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            check(projected()?.tab == mobile_shell_types::native::NativeTab::Agents && projected()?.modal,
+                "Native tab and Back cannot navigate beneath a modal")?;
+            find("[data-mobile-test='project-picker-none']")?
+                .dyn_into::<HtmlElement>().map_err(|_| "Project action is not clickable")?.click();
+            next_tick().await;
+            check(!projected()?.modal, "Closing the sheet restores native navigation")?;
+            let composer = find("[data-mobile-test='chat-input']")?
+                .dyn_into::<web_sys::HtmlTextAreaElement>().map_err(|_| "Composer is not editable")?;
+            state.draft_backend_override.set(Some(protocol::BackendKind::Claude));
+            let attach = js_sys::Function::new_with_args("root", r#"
+                return new Promise((resolve, reject) => {
+                    const observer = new MutationObserver(() => {
+                        if (root.querySelector('[data-mobile-test="chat-photo-tray"] img')) {
+                            observer.disconnect(); resolve();
+                        } else if (root.querySelector('[data-mobile-test="chat-photo-error"]')) {
+                            observer.disconnect(); reject(new Error('Photo attachment failed'));
+                        }
+                    });
+                    observer.observe(root, {childList:true, subtree:true, characterData:true});
+                    const bytes = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jXioAAAAASUVORK5CYII='), c => c.charCodeAt(0));
+                    const transfer = new DataTransfer();
+                    transfer.items.add(new File([bytes], 'draft.png', {type:'image/png'}));
+                    const input = root.querySelector('[data-mobile-test="chat-photo-input"]');
+                    input.files = transfer.files;
+                    input.dispatchEvent(new Event('change', {bubbles:true}));
+                });
+            "#);
+            let attached = attach.call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(attached))
+                .await.map_err(|_| "Real DOM photo attachment failed")?;
+            composer.set_value("Retained draft");
+            composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            composer.set_selection_range(2, 7).unwrap();
+            let photo = find("[data-mobile-test='chat-photo-tray'] img")?;
+            state.draft_custom_agent_id.set(Some(protocol::CustomAgentId("retained-native-custom".into())));
+            state.draft_session_settings.set(protocol::SessionSettingsValues(
+                [("model".into(), protocol::SessionSettingValue::String("retained-native-model".into()))].into_iter().collect()));
+            navigate(NativeIntent::Home)?;
+            next_tick().await;
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            check(projected()?.route == mobile_shell_types::native::NativeRoute::Hosts,
+                "Hosts must be a native navigation detail over the retained workspace")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            find("[data-mobile-test='paired-host-open']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
+                && composer.value() == "Retained draft"
+                && composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7)
+                && find("[data-mobile-test='chat-photo-tray'] img")?.is_same_node(Some(&photo)),
+                "Same-host Hosts/Back and Open trips retain the exact composer, selection and unsent photo")?;
+            check(state.draft_backend_override.get_untracked() == Some(protocol::BackendKind::Claude)
+                && state.draft_custom_agent_id.get_untracked() == Some(protocol::CustomAgentId("retained-native-custom".into()))
+                && !state.draft_session_settings.get_untracked().0.is_empty(),
+                "Same-host Open must preserve the draft's backend, custom agent and session settings")?;
+            navigate(NativeIntent::Home)?;
+            next_tick().await;
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            find(".picker-pair-another")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            find("[data-mobile-test='pairing-scanner-cancel']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
+                && composer.value() == "Retained draft"
+                && composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7)
+                && find("[data-mobile-test='chat-photo-tray'] img")?.is_same_node(Some(&photo)),
+                "Cancelling Pair another host must retain the same host's complete component-owned draft")?;
+            navigate(NativeIntent::Sessions)?;
+            next_tick().await;
+            let search = find("[data-mobile-test='sessions-search']")?
+                .dyn_into::<web_sys::HtmlInputElement>().map_err(|_| "Search is not editable")?;
+            search.set_value("Retained search");
+            search.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            navigate(NativeIntent::Settings)?;
+            next_tick().await;
+            let shell = find(".mobile-app")?.dyn_into::<HtmlElement>().unwrap();
+            let saved_style = shell.style().css_text();
+            let saved_statuses = state.connection_statuses.get_untracked();
+            for (width, height) in [(320, 520), (386, 700), (820, 540), (1024, 768)] {
+                shell.style().set_property("width", &format!("{width}px")).unwrap();
+                shell.style().set_property("height", &format!("{height}px")).unwrap();
+                navigate(if width >= 820 { NativeIntent::RegularWidth } else { NativeIntent::CompactWidth })?;
+                for status in [ConnectionStatus::Connected, ConnectionStatus::Disconnected] {
+                    state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), status); });
+                    for intent in [NativeIntent::Home, NativeIntent::Agents, NativeIntent::Sessions, NativeIntent::Settings] {
+                        navigate(intent)?;
+                        next_tick().await;
+                        let hud = find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect();
+                        let content = find(".mobile-content")?;
+                        check(hud.height() > 0.0 && content.get_bounding_client_rect().top() >= hud.bottom(),
+                            "Native connection feedback must reserve layout space above every screen")?;
+                        let controls = content.query_selector_all("button,input,textarea,select,a,[role='button'],[role='option']").unwrap();
+                        for index in 0..controls.length() {
+                            let control = controls.item(index).unwrap().dyn_into::<web_sys::Element>().unwrap();
+                            let bounds = control.get_bounding_client_rect();
+                            if bounds.width() > 0.0 && bounds.height() > 0.0 {
+                                check(bounds.right() <= hud.left() || bounds.left() >= hud.right()
+                                    || bounds.bottom() <= hud.top() || bounds.top() >= hud.bottom(),
+                                    "Native connection feedback must not cover an interactive control")?;
+                            }
+                        }
+                    }
+                }
+            }
+            shell.style().set_css_text(&saved_style);
+            state.connection_statuses.set(saved_statuses);
+            navigate(NativeIntent::CompactWidth)?;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer)),
+                "Native tab switches must not remount the composer")?;
+            check(composer.value() == "Retained draft", "Native tab switch preserves draft text")?;
+            find("[data-mobile-test='chat-photo-tray'] img")?;
+            check(composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7),
+                "Native tab switch preserves editor selection")?;
+            crate::actions::native_sign_in_and_reconnect(state.clone(), host_id.clone(), bridge::AuthProvider::Apple);
+            next_tick().await;
+            find("[data-mobile-test='native-auth-recovery']")?;
+            find("[data-mobile-test='native-auth-cancel']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer)) && composer.value() == "Retained draft",
+                "A failed native sign-in must not dispose the retained composer")?;
+            check(composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7),
+                "Cancelling auth recovery preserves editor selection")?;
+            navigate(NativeIntent::RegularWidth)?;
+            next_tick().await;
+            let agents = find("[data-mobile-test='agents-view']")?;
+            let width = agents.get_bounding_client_rect().width();
+            let pane = find(".native-agents-pane")?;
+            let workspace = find(".native-workspace")?;
+            check(width >= 280.0, &format!(
+                "Wide hierarchy remains touch usable: content={width}, pane={}, workspace={}, hidden={}, columns={}",
+                pane.get_bounding_client_rect().width(), workspace.get_bounding_client_rect().width(),
+                pane.has_attribute("hidden"), window.get_computed_style(&workspace).unwrap().unwrap()
+                    .get_property_value("grid-template-columns").unwrap()
+            ))?;
+            navigate(NativeIntent::CompactWidth)?;
+            next_tick().await;
+            check(agents.get_bounding_client_rect().height() == 0.0,
+                "Compact chat has no competing global sidebar")?;
+            navigate(NativeIntent::Sessions)?;
+            next_tick().await;
+            check(find("[data-mobile-test='sessions-search']")?.is_same_node(Some(&search)) && search.value() == "Retained search",
+                "Native tabs retain the session filter control and its text")?;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            check(agents.get_bounding_client_rect().height() > 0.0, "Back reveals the retained Agents hierarchy")?;
+            navigate(NativeIntent::NewChat)?;
+            next_tick().await;
+            find("[data-mobile-test='project-picker-none']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let fresh = find("[data-mobile-test='chat-input']")?
+                .dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+            check(!fresh.is_same_node(Some(&composer)) && fresh.value().is_empty(),
+                "An explicit new conversation owns a fresh complete composer")?;
+            check(container.query_selector("[data-mobile-test='chat-photo-tray']").unwrap().is_none(),
+                "A previous draft's photo must never transfer to a new conversation")?;
+
+            state.draft_backend_override.set(Some(protocol::BackendKind::Claude));
+            let hold_photo = js_sys::Function::new_with_args("root", r#"
+                return new Promise(started => {
+                    const original = File.prototype.arrayBuffer;
+                    File.prototype.arrayBuffer = function() {
+                        File.prototype.arrayBuffer = original;
+                        return original.call(this).then(buffer => new Promise(finish => {
+                            started(() => finish(buffer));
+                        }));
+                    };
+                    const transfer = new DataTransfer();
+                    transfer.items.add(new File(['photo'], 'pending.png', {type:'image/png'}));
+                    const input = root.querySelector('[data-mobile-test="chat-photo-input"]');
+                    input.files = transfer.files;
+                    input.dispatchEvent(new Event('change', {bubbles:true}));
+                });
+            "#);
+            let reading = hold_photo.call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+            let finish_read = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(reading))
+                .await.map_err(|_| "Could not observe the pending photo read")?
+                .dyn_into::<js_sys::Function>().map_err(|_| "Missing photo completion event")?;
+            navigate(NativeIntent::Back)?;
+            navigate(NativeIntent::NewChat)?;
+            next_tick().await;
+            find("[data-mobile-test='project-picker-none']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let after_pending_photo = find("[data-mobile-test='chat-input']")?;
+            check(!after_pending_photo.is_same_node(Some(&fresh)), "A pending file read cannot retain the discarded composer")?;
+            finish_read.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&after_pending_photo)) &&
+                container.query_selector("[data-mobile-test='chat-photo-tray']").unwrap().is_none(),
+                "Completing a discarded draft's read must not mutate the next composer")?;
+
+            let host_stream = make_host_stream();
+            state.host_streams.update(|streams| { streams.insert(host_id.clone(), host_stream.clone()); });
+            reset_inbound_seq_for_host(&host_id);
+            let mut settings = empty_host_settings();
+            settings.default_backend = Some(protocol::BackendKind::Claude);
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::HostSettings, 0,
+                    &protocol::HostSettingsPayload { settings, etag: Default::default(), configured_secrets: Vec::new() }).unwrap());
+            next_tick().await;
+            let new_composer = find("[data-mobile-test='chat-input']")?.dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+            new_composer.set_value("A new conversation request");
+            new_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            // Flush the input-driven disabled binding before requesting the real button action.
+            next_tick().await;
+            let send = find("[data-mobile-test='chat-send']")?;
+            check(!send.has_attribute("disabled"), "The entered new-chat draft must enable its actual Send button")?;
+            send.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let creation = state.native_chat_destination.get_untracked().ok_or("New chat must own its explicit creation stream")?;
+            check(creation.stream.spawn_parent().as_ref() == Some(&host_stream), "New chat must address its own connection's creation child")?;
+            let current = fixture_user_agent("current-chat", "current-session");
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 1, &current).unwrap());
+            next_tick().await;
+            check(state.active_agent.get_untracked().is_none(), "Discovery alone is not a new-chat completion")?;
+            let published: protocol::AgentStartPayload = serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(creation.stream, FrameKind::AgentStart, 0, &published).unwrap());
+            next_tick().await;
+            let current_composer = find("[data-mobile-test='chat-input']")?
+                .dyn_into::<web_sys::HtmlTextAreaElement>().map_err(|_| "Current composer is not editable")?;
+            current_composer.set_value("Current conversation draft");
+            current_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            current_composer.set_selection_range(2, 7).unwrap();
+            navigate(NativeIntent::Settings)?;
+            next_tick().await;
+            let background = fixture_user_agent("same-host-background-chat", "background-session");
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 2, &background).unwrap());
+            next_tick().await;
+            check(projected()?.tab == mobile_shell_types::native::NativeTab::Settings,
+                "An unrelated same-host user-agent announcement must not navigate the current tab")?;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&current_composer))
+                && current_composer.value() == "Current conversation draft"
+                && current_composer.selection_start().unwrap() == Some(2)
+                && current_composer.selection_end().unwrap() == Some(7)
+                && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
+                "An unrelated same-host announcement must retain the exact conversation, draft control and editor selection")?;
+            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let fork = state.native_chat_destination.get_untracked().ok_or("Fork + send must own a creation stream even with another chat open")?;
+            check(fork.source_agent.as_ref().map(|active| &active.agent_id) == Some(&current.agent_id), "Fork captures its actual source conversation")?;
+            // Fork settlement is NewChat-scoped: it retains the source composer until publication.
+            check(current_composer.value() == "Current conversation draft"
+                && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
+                "Pending Fork + send must retain its actual source conversation and complete draft")?;
+            let fork_frames = bridge::test_sent_lines().into_iter()
+                .filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+                .filter(|frame| frame.kind == FrameKind::SpawnAgent && frame.stream == fork.stream)
+                .collect::<Vec<_>>();
+            check(fork_frames.len() == 1 && matches!(fork_frames[0].parse_payload::<protocol::SpawnAgentPayload>().unwrap().params,
+                protocol::SpawnAgentParams::Fork { from_session_id, prompt, .. }
+                    if Some(&from_session_id) == current.session_id.as_ref() && prompt == "Current conversation draft"),
+                "Fork + send must admit exactly one operation with the actual source session and complete text")?;
+            current_composer.set_value("Draft written after the fork submission");
+            current_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            current_composer.set_selection_range(2, 7).unwrap();
+            let added = attach.call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(added))
+                .await.map_err(|_| "Could not attach the source draft's new photo")?;
+            let edited_photo = find("[data-mobile-test='chat-photo-tray'] img")?;
+            let forked = fixture_user_agent("published-fork", "published-fork-session");
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(fork.stream.clone(), FrameKind::AgentStart, 0,
+                    &serde_json::from_value::<protocol::AgentStartPayload>(serde_json::to_value(&forked).unwrap()).unwrap()).unwrap());
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 3, &forked).unwrap());
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&current_composer))
+                && current_composer.value() == "Draft written after the fork submission"
+                && current_composer.selection_start().unwrap() == Some(2)
+                && current_composer.selection_end().unwrap() == Some(7)
+                && find("[data-mobile-test='chat-photo-tray'] img")?.is_same_node(Some(&edited_photo))
+                && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
+                "The same non-superseded Fork completion must not discard later source text, selection or photos")?;
+            // A separate explicit creation is then superseded by Resume.
+            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let photo_fork = state.native_chat_destination.get_untracked().ok_or("A second explicit Fork owns its own operation")?;
+            find(".chat-photo-remove")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let photo_forked = fixture_user_agent("published-photo-fork", "published-photo-fork-session");
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(photo_fork.stream, FrameKind::AgentStart, 0,
+                    &serde_json::from_value::<protocol::AgentStartPayload>(serde_json::to_value(&photo_forked).unwrap()).unwrap()).unwrap());
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 4, &photo_forked).unwrap());
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&current_composer))
+                && current_composer.value() == "Draft written after the fork submission"
+                && container.query_selector("[data-mobile-test='chat-photo-tray']").unwrap().is_none()
+                && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
+                "A photo-only source edit must also retire automatic Fork navigation without changing its text or conversation")?;
+            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let superseded_fork = state.native_chat_destination.get_untracked().ok_or("The later Fork owns a distinct operation before Resume")?;
+            state.sessions.set(vec![crate::state::SessionInfo {
+                local_host_id: host_id.clone(), summary: protocol::SessionSummary {
+                    id: protocol::SessionId("requested-session".into()), backend_kind: protocol::BackendKind::Claude,
+                    launch_profile_id: None, workspace_roots: Vec::new(), project_id: None,
+                    alias: Some("Retained search".into()), user_alias: None, parent_id: None,
+                    created_at_ms: 0, updated_at_ms: 0, message_count: 0, token_count: None, resumable: true,
+                    compacted_from_session_id: None, compacted_to_session_id: None,
+                    compacted_at_ms: None, compaction_summary_preview: None,
+                },
+            }]);
+            navigate(NativeIntent::Sessions)?;
+            next_tick().await;
+            find("[data-mobile-test='session-resume']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(bridge::test_sent_lines().iter().any(|line| {
+                serde_json::from_str::<protocol::Envelope>(line).is_ok_and(|frame| frame.kind == FrameKind::SpawnAgent)
+            }), "The resume click must cross the production protocol-send seam")?;
+            check(projected()?.route == mobile_shell_types::native::NativeRoute::Root,
+                "Pending session resume must not relabel the existing chat as its result")?;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&current_composer)) &&
+                current_composer.value() == "Draft written after the fork submission",
+                "A pending session resume retains the current chat and its draft")?;
+            let failed_creation = state.native_chat_destination.get_untracked().ok_or("Resume must retain its operation")?;
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(failed_creation.stream.clone(), FrameKind::CommandError, 0,
+                    &protocol::CommandErrorPayload {
+                        workbench_reason: None, context: None, request_id: None, stream: failed_creation.stream.clone(),
+                        request_kind: FrameKind::SpawnAgent, operation: "resume".into(),
+                        code: protocol::CommandErrorCode::Internal, message: "Session could not resume".into(), fatal: false,
+                    }).unwrap());
+            next_tick().await;
+            check(projected()?.tab == mobile_shell_types::native::NativeTab::Agents &&
+                current_composer.value() == "Draft written after the fork submission",
+                "Failed resume leaves the original conversation intact")?;
+            navigate(NativeIntent::Sessions)?;
+            next_tick().await;
+            find("[data-mobile-test='session-resume']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let resumed = fixture_user_agent("resumed-chat", "requested-session");
+            let resume_creation = state.native_chat_destination.get_untracked().ok_or("The second Resume owns a distinct stream")?;
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(superseded_fork.stream, FrameKind::AgentStart, 0,
+                    &serde_json::from_value::<protocol::AgentStartPayload>(serde_json::to_value(&background).unwrap()).unwrap()).unwrap());
+            check(state.native_chat_destination.get_untracked().as_ref().map(|target| &target.stream) == Some(&resume_creation.stream), "A superseded fork's publication cannot consume the later Resume destination")?;
+            check(resume_creation.stream != failed_creation.stream, "Distinct requests cannot share a terminal stream")?;
+            let published: protocol::AgentStartPayload = serde_json::from_value(serde_json::to_value(&resumed).unwrap()).unwrap();
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(resume_creation.stream, FrameKind::AgentStart, 0, &published).unwrap());
+            next_tick().await;
+            check(state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id), "A publication receipt must wait for this subscriber's typed descriptor")?;
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 5, &resumed).unwrap());
+            next_tick().await;
+            let resumed_projection = projected()?;
+            check(resumed_projection.tab == mobile_shell_types::native::NativeTab::Sessions &&
+                resumed_projection.route == mobile_shell_types::native::NativeRoute::Chat && resumed_projection.title == "resumed-chat",
+                &format!("Only the matching server NewAgent commits the Sessions chat destination: tab={:?}, route={:?}, title_matches={}, pending={}",
+                    resumed_projection.tab, resumed_projection.route, resumed_projection.title == "resumed-chat",
+                    state.native_chat_destination.get_untracked().is_some()))?;
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(resumed.instance_stream.clone(), FrameKind::AgentActivityStats, 0,
+                    &protocol::AgentActivityStatsPayload {
+                        agent_id: resumed.agent_id.clone(), stats: protocol::AgentActivityStats {
+                            current_context_usage: Some(protocol::CurrentContextUsage::Known { input_tokens: 98, context_window: 100 }),
+                            ..Default::default()
+                        },
+                    }).unwrap());
+            next_tick().await;
+            let context = find("[data-mobile-test='chat-context-bar']")?;
+            check(context.get_attribute("aria-valuenow").as_deref() == Some("98") &&
+                context.get_bounding_client_rect().height() > 0.0,
+                "Native content retains visible accessible server context occupancy")?;
+            dispatch_envelope(&state, &host_id,
+                protocol::Envelope::from_payload(host_stream, FrameKind::Welcome, 6,
+                    &protocol::WelcomePayload {
+                        protocol_version: protocol::PROTOCOL_VERSION, tyde_version: protocol::TYDE_VERSION,
+                        release_version: Some(protocol::TydeReleaseVersion::parse("0.9.4-beta.12").unwrap()),
+                    }).unwrap());
+            next_tick().await;
+            // Actual30's approved single native error replaces the duplicate PWA loader paragraph.
+            let mismatch_visible = || container.query_selector("[data-mobile-test='mobile-shell-error-banner'][data-error-code='VersionMismatch']").unwrap()
+                .is_some_and(|banner| banner.get_bounding_client_rect().height() > 0.0
+                    && banner.text_content().unwrap().contains("Update the app and host together."))
+                && matches!(state.active_host_connection_status(), ConnectionStatus::UpdateRequired { .. });
+            check(mismatch_visible(), "Native release mismatch must visibly require an app/host update")?;
+            apply_disconnect(&state, &host_id, None);
+            next_tick().await;
+            check(mismatch_visible(), "Disconnect must not erase the native compatibility verdict")?;
+            // Actual27 iPad frames showed a fixed shell alert covering the pairing title/Cancel.
+            let mut error_failures = Vec::new();
+            let failure = state.mobile_shell_error.get_untracked().ok_or("Missing native release failure")?;
+            if failure.code != protocol::MobileAccessErrorCode::VersionMismatch {
+                error_failures.push("A rejected native release must retain the typed VersionMismatch reason".to_owned());
+            }
+            state.app_mode.set(AppMode::Pairing(crate::state::PairingScreen::ManualPaste));
+            for (width, height) in [(320, 700), (390, 390), (834, 700), (1210, 390)] {
+                // The runner report places this mounted root below its 437px viewport.
+                // Anchor the tested app on-screen before asserting actual pointer delivery.
+                app.set_attribute("style", &format!("position:fixed;top:0;left:0;width:{width}px;height:{height}px")).unwrap();
+                next_tick().await;
+                let banner = find("[data-mobile-test='mobile-shell-error-banner']")?;
+                let text = banner.text_content().unwrap_or_default();
+                if text.contains("TransportFailed") || text.contains("VersionMismatch") || text.contains("protocol validation failed") {
+                    error_failures.push("Native primary error copy must not expose a debug code or transport prefix".into());
+                }
+                if !text.contains("Update the app and host together") {
+                    error_failures.push("A native release failure must keep its actionable update reason".into());
+                }
+                let header = find(".pairing-view .view-header")?.get_bounding_client_rect();
+                let alert = banner.get_bounding_client_rect();
+                if alert.bottom() > header.top() {
+                    error_failures.push(format!("Native error covers pairing navigation at {width}x{height}: alert bottom={}, header top={}", alert.bottom(), header.top()));
+                }
+                let cancel = find(".pairing-view .header-action")?;
+                let bounds = cancel.get_bounding_client_rect();
+                if width == 320 {
+                    let hit = window.document().unwrap().element_from_point(
+                        (bounds.left()+bounds.width()/2.0) as f32,
+                        (bounds.top()+bounds.height()/2.0) as f32,
+                    );
+                    if !hit.is_some_and(|hit| cancel.contains(Some(&hit))) {
+                        let geometry = js_sys::Function::new_with_args("cancel", r#"
+                            const r = cancel.getBoundingClientRect();
+                            const at = document.elementFromPoint(r.x+r.width/2, r.y+r.height/2);
+                            const describe = el => el && ({tag:el.tagName, class:el.className,
+                                rect:el.getBoundingClientRect().toJSON(), display:getComputedStyle(el).display,
+                                visibility:getComputedStyle(el).visibility, pointer:getComputedStyle(el).pointerEvents});
+                            return JSON.stringify({cancel:describe(cancel), hit:describe(at),
+                                header:describe(cancel.closest('.view-header')), app:describe(cancel.closest('.mobile-app')),
+                                viewport:[innerWidth,innerHeight,scrollX,scrollY]});
+                        "#).call1(&wasm_bindgen::JsValue::NULL, &cancel).unwrap().as_string().unwrap();
+                        error_failures.push(format!("Native Cancel must receive pointer input while an error is visible: {geometry}"));
+                    }
+                }
+                let close = find("[data-mobile-test='mobile-shell-error-dismiss']")?.get_bounding_client_rect();
+                if close.width() < 44.0 || close.height() < 44.0 {
+                    error_failures.push("Native error dismissal needs a usable touch target".into());
+                }
+                let message = find(".mobile-shell-error-message")?;
+                if window.get_computed_style(&message).unwrap().unwrap().get_property_value("white-space").unwrap() == "nowrap" {
+                    error_failures.push("Native recovery instructions must wrap instead of clipping".into());
+                }
+            }
+            find(".pairing-view .header-action")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(state.app_mode.get_untracked() == AppMode::Workspace,
+                "A native error must not trap the user in pairing")?;
+            find("[data-mobile-test='mobile-shell-error-dismiss']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(state.mobile_shell_error.get_untracked().is_none()
+                && matches!(state.host_releases.get_untracked().get(&host_id), Some(crate::bundle::HostRelease::NativeIncompatible(_))),
+                "Dismissing presentation must not clear or bypass the typed compatibility verdict")?;
+            check(error_failures.is_empty(), &error_failures.join("; "))?;
+            Ok(())
+        }.await;
+        drop(handle);
+        container.remove();
+        PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(None));
+        js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+        let browser = make_container();
+        let browser_state = state.clone();
+        let browser_handle = mount_to(browser.clone(), move || {
+            provide_context(browser_state);
+            view! { <AppSurface /> }
+        });
+        next_tick().await;
+        // Browser chat deliberately has Back instead of global tabs. The native
+        // flow ended in chat, so exercise the existing browser navigation first.
+        assert!(
+            browser
+                .query_selector("[data-mobile-test='bottom-nav']")
+                .unwrap()
+                .is_none()
+        );
+        browser
+            .query_selector("[data-mobile-test='chat-back']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            browser
+                .query_selector("[data-mobile-test='bottom-nav']")
+                .unwrap()
+                .is_some()
+        );
+        drop(browser_handle);
+        browser.remove();
     }
 
     #[wasm_bindgen_test]
@@ -1629,6 +2453,634 @@ mod wasm_tests {
         drop(handle);
         container.remove();
         restore_loader_boundary();
+
+        // Pair completion must use its created ID, not the old selected record or a
+        // same-named row. Exercise the real Pair action, store and replay boundary.
+        use crate::bridge::web::tests_support::{
+            DirectPairingRecord, IndexedDbHostStore, WebPairedHostRecord,
+        };
+        use mobile_shell_types::native::{NATIVE_BRIDGE_VERSION, NativeIntent};
+        for native in [true, false] {
+            let _sends = bridge::test_capture_sends();
+            let previous_origin = "https://previous-host.example.test";
+            let old = WebPairedHostRecord {
+                local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
+                host_label: "Tyde Host".into(),
+                credential_fingerprint: "pair-selection-previous".into(),
+                auto_connect: false,
+                last_connected_at_ms: None,
+                psk_keychain_key_id: None,
+                managed: None,
+                direct: Some(DirectPairingRecord {
+                    native_origin: Some(previous_origin.into()),
+                    device_id: uuid::Uuid::new_v4().to_string(),
+                    device_token_key_id: mobile_shell_types::KeychainSecretId(
+                        "pair-selection-old-token".into(),
+                    ),
+                }),
+            };
+            IndexedDbHostStore.insert(old.clone()).await.unwrap();
+            let grant = protocol::MobileDirectPairResponse {
+                device_id: protocol::MobileDeviceId(uuid::Uuid::new_v4().to_string()),
+                device_token: protocol::MobileDeviceToken("pair-selection-test-token".into()),
+                host_label: "Tyde Host".into(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            };
+            let offer = mobile_pairing::DirectMobilePairingQrPayload::new(
+                protocol::PROTOCOL_VERSION,
+                protocol::TydeReleaseVersion::parse(
+                    mobile_shell_types::native::NATIVE_CLIENT_RELEASE,
+                )
+                .unwrap(),
+                protocol::MobilePairingOfferId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+                "pair-selection-test-offer".into(),
+                grant.host_label.clone(),
+                u64::MAX,
+            );
+            let uri = format!("https://127.0.0.1:9/tyde/#{}", offer.to_uri().unwrap());
+            let managed_pairing_id = uuid::Uuid::new_v4().to_string();
+            let managed_device_id = uuid::Uuid::new_v4().to_string();
+            let managed_response = serde_json::json!({
+                "pairing_id": managed_pairing_id, "device_id": managed_device_id,
+                "device_pairing_secret": "pair-selection-managed-fixture-secret"
+            });
+            let failed_pairing_id = uuid::Uuid::new_v4().to_string();
+            let failed_device_id = uuid::Uuid::new_v4().to_string();
+            let failed_managed_response = serde_json::json!({
+                "pairing_id": failed_pairing_id, "device_id": failed_device_id,
+                "device_pairing_secret": "pair-selection-managed-failed-read-secret"
+            });
+            let boundary = js_sys::Function::new_with_args("enabled,version,body,managedBody", r#"
+                const fetch = window.fetch;
+                const hadNative = Object.hasOwn(window, '__tydeNativeHost');
+                const previous = window.__tydeNativeHost;
+                const selection = localStorage.getItem('tyde.selected-host.v1');
+                const hadService = Object.hasOwn(window, '__TYDE_MOBILE_SERVICE__');
+                const previousService = window.__TYDE_MOBILE_SERVICE__;
+                let redeemStarted, releaseRedeem;
+                const redeemReady = new Promise(resolve => redeemStarted = resolve);
+                const secrets = new Map();
+                const native = {version, holdReads: true, failReads: false, pendingReads: [], post(endpoint, payload) {
+                    const request = JSON.parse(payload);
+                    if (endpoint === 'presentation') { this.presentation = request; return Promise.resolve(null); }
+                    if (endpoint === 'secret_write') { secrets.set(request.key, request.value); return Promise.resolve(null); }
+                    if (endpoint === 'secret_delete') { secrets.delete(request.key); return Promise.resolve(null); }
+                    if (endpoint === 'secret_read') {
+                        if (!secrets.has(request.key)) return Promise.reject(new Error('Fixture secret key is missing'));
+                        if (this.failReads) return Promise.reject(new Error('Platform denied the secret read'));
+                        // Direct token reads are downstream of actor startup; managed PSK reads are not.
+                        if (this.holdReads) return new Promise(resolve => this.pendingReads.push(resolve));
+                        return Promise.resolve(secrets.get(request.key));
+                    }
+                    return Promise.reject(new Error('Unexpected pairing fixture platform operation'));
+                }};
+                if (enabled) window.__tydeNativeHost = native;
+                else delete window.__tydeNativeHost;
+                window.fetch = request => {
+                    const path = new URL(request.url).pathname;
+                    if (request.method === 'POST' && path === '/tyde/pair') {
+                        return Promise.resolve(new Response(body, {status:200, headers:{'content-type':'application/json'}}));
+                    }
+                    if (request.method === 'POST' && path === '/api/tyde/mobile/v1/pairings/redeem') {
+                        return new Promise(resolve => {
+                            releaseRedeem = () => resolve(new Response(managedBody, {status:200}));
+                            redeemStarted();
+                        });
+                    }
+                    if (request.method === 'POST' && path.endsWith('/webrtc')) {
+                        return Promise.resolve(new Response(JSON.stringify({error:{code:'repair_required',message:'Fixture has no relay',retryable:false}}), {status:403}));
+                    }
+                    return Promise.reject(new Error('Unexpected pairing fixture HTTP request'));
+                };
+                const restore = () => {
+                    window.fetch = fetch;
+                    if (hadNative) window.__tydeNativeHost = previous;
+                    else delete window.__tydeNativeHost;
+                    if (selection === null) localStorage.removeItem('tyde.selected-host.v1');
+                    else localStorage.setItem('tyde.selected-host.v1', selection);
+                    if (hadService) window.__TYDE_MOBILE_SERVICE__ = previousService;
+                    else delete window.__TYDE_MOBILE_SERVICE__;
+                };
+                restore.beginManaged = (response, failReads) => {
+                    managedBody = response;
+                    restore.redeemReady = new Promise(resolve => redeemStarted = resolve);
+                    native.holdReads = false;
+                    native.failReads = failReads;
+                    window.__TYDE_MOBILE_SERVICE__ = {baseUrl:'https://pair-selection.example.test/api/tyde/mobile/v1'};
+                };
+                restore.releaseManaged = () => releaseRedeem();
+                return restore;
+            "#).call4(&wasm_bindgen::JsValue::NULL, &native.into(), &NATIVE_BRIDGE_VERSION.into(),
+                &serde_json::to_string(&grant).unwrap().into(), &managed_response.to_string().into()).unwrap();
+            let boundary = BrowserOverride(boundary);
+            let state = AppState::new();
+            state.paired_hosts.set(vec![old.summary()]);
+            state
+                .active_local_host_id
+                .set(Some(old.local_host_id.clone()));
+            state.active_tab.set(MobileTab::Settings);
+            if native {
+                state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                    local_host_id: old.local_host_id.clone(),
+                    agent_id: protocol::AgentId("old-host-chat".into()),
+                }));
+                state
+                    .active_project
+                    .set(Some(crate::state::ActiveProjectRef {
+                        local_host_id: old.local_host_id.clone(),
+                        project_id: protocol::ProjectId("previous-host-project".into()),
+                    }));
+                state
+                    .native_chat_destination
+                    .set(Some(crate::state::NativeChatDestination {
+                        local_host_id: old.local_host_id.clone(),
+                        stream: protocol::StreamPath(
+                            "/host/previous/spawn/00000000-0000-0000-0000-000000000001".into(),
+                        ),
+                        tab: MobileTab::Sessions,
+                        draft_id: state.chat_draft_id.get_untracked(),
+                        source_agent: state.active_agent.get_untracked(),
+                        created_agent: None,
+                        source_draft: Some(state.chat_input.get_untracked()),
+                    }));
+                state
+                    .draft_backend_override
+                    .set(Some(protocol::BackendKind::Claude));
+                state
+                    .draft_custom_agent_id
+                    .set(Some(protocol::CustomAgentId("previous-host-custom".into())));
+                state
+                    .draft_session_settings
+                    .set(protocol::SessionSettingsValues(
+                        [(
+                            "model".into(),
+                            protocol::SessionSettingValue::String("previous-host-model".into()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ));
+                state.chat_origin_tab.set(MobileTab::Agents);
+                state.viewing_chat.set(true);
+            }
+            state.app_mode.set(AppMode::Pairing(
+                crate::state::PairingScreen::SelfHostedConfirm {
+                    qr_uri: uri,
+                    host_label: grant.host_label.clone(),
+                },
+            ));
+            let paired_state = state.clone();
+            let paired = bridge::listen_paired_hosts_changed(move |event| {
+                apply_paired_hosts_list(&paired_state, event.hosts);
+            })
+            .await
+            .unwrap();
+            let status_state = state.clone();
+            let status = bridge::listen_paired_host_connection_status(move |event| {
+                apply_connection_status(
+                    &status_state,
+                    event.local_host_id,
+                    event.status,
+                    event.connection_instance_id,
+                );
+            })
+            .await
+            .unwrap();
+            let container = make_container();
+            let mounted = state.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(mounted);
+                view! { <AppSurface /> }
+            });
+            next_tick().await;
+            let result: Result<(), String> = async {
+                let mut ownership_failures = Vec::new();
+                let complete = js_sys::Function::new_with_args("root", r#"
+                    return new Promise(resolve => {
+                        const observer = new MutationObserver(() => {
+                            if (!root.querySelector('[data-mobile-test="pairing-self-hosted-confirm"], [data-mobile-test="pairing-self-hosted-progress"]')) {
+                                observer.disconnect(); resolve();
+                            }
+                        });
+                        observer.observe(root, {childList:true, subtree:true});
+                    });
+                "#).call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+                container.query_selector("button[aria-label='Pair']").unwrap()
+                    .ok_or("The direct confirmation must offer its real Pair action")?
+                    .dyn_into::<HtmlElement>().unwrap().click();
+                wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(complete)).await.unwrap();
+                if state.app_mode.get_untracked() != AppMode::Workspace {
+                    return Err("The direct Pair action did not complete into its workspace".into());
+                }
+                let created = IndexedDbHostStore.list().await.unwrap().into_iter()
+                    .find(|record| record.direct.as_ref().is_some_and(|direct| direct.device_id == grant.device_id.0))
+                    .ok_or("The Pair action must persist the redeemed device before navigation")?;
+                if native {
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id)
+                        || container.query_selector("[data-mobile-test='home-view']").unwrap().is_none() {
+                        return Err("Native Pair must open the newly created host's Home, not the previously selected host".into());
+                    }
+                    if state.active_project.get_untracked().is_some() || state.active_agent.get_untracked().is_some()
+                        || state.native_chat_destination.get_untracked().is_some()
+                        || state.draft_backend_override.get_untracked().is_some() || state.draft_custom_agent_id.get_untracked().is_some()
+                        || !state.draft_session_settings.get_untracked().0.is_empty() {
+                        return Err("Pair must retire previous-host project, draft options, chat selection and pending UI navigation without deleting its records".into());
+                    }
+                    if matches!(state.active_host_connection_status(), ConnectionStatus::Connected) {
+                        return Err("Pair completion must not fabricate Connected before Welcome/bootstrap".into());
+                    }
+                    apply_paired_hosts_list(&state, IndexedDbHostStore.list_summaries().await.unwrap());
+                    next_tick().await;
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id) {
+                        return Err("Persisted host-list replay must not steal the explicit Pair selection".into());
+                    }
+                    let intent = |intent: NativeIntent| {
+                        let options = web_sys::CustomEventInit::new();
+                        options.set_detail(&serde_wasm_bindgen::to_value(&intent).unwrap());
+                        web_sys::window().unwrap().dispatch_event(&web_sys::CustomEvent::new_with_event_init_dict("tyde-native-intent", &options).unwrap()).unwrap();
+                    };
+                    intent(NativeIntent::Hosts);
+                    next_tick().await;
+                    if container.query_selector(".picker-pair-another").unwrap().is_none()
+                        || state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id) {
+                        return Err("The native Hosts destination must expose Pair another host without clearing selection".into());
+                    }
+                    let platform = js_sys::Reflect::get(&web_sys::window().unwrap(), &"__tydeNativeHost".into()).unwrap();
+                    let projected: mobile_shell_types::native::NativePresentation = serde_wasm_bindgen::from_value(
+                        js_sys::Reflect::get(&platform, &"presentation".into()).unwrap()).unwrap();
+                    if projected.route != mobile_shell_types::native::NativeRoute::Hosts || !projected.workspace {
+                        return Err("The host chooser must project a native navigation detail, not hide system Back".into());
+                    }
+                    intent(NativeIntent::Back);
+                    next_tick().await;
+                    if state.app_mode.get_untracked() != AppMode::Workspace
+                        || container.query_selector("[data-mobile-test='home-view']").unwrap().is_none() {
+                        return Err("Native Back from Hosts must restore the selected host's Home".into());
+                    }
+                    intent(NativeIntent::Hosts);
+                    next_tick().await;
+                    container.query_selector(".picker-pair-another").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if container.query_selector("[data-mobile-test='pairing-scanner-paste']").unwrap().is_none() {
+                        return Err("Pair another host must open the normal scanner/Paste link route".into());
+                    }
+                    container.query_selector("[data-mobile-test='pairing-scanner-cancel']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id) {
+                        return Err("Cancel pairing must preserve the selected host".into());
+                    }
+                    let paired_stream = protocol::StreamPath("/host/paired-selection".into());
+                    state.host_streams.update(|streams| { streams.insert(created.local_host_id.clone(), paired_stream.clone()); });
+                    state.sessions.set(vec![fixture_session(&created.local_host_id, "paired-pending-session")]);
+                    intent(NativeIntent::Sessions);
+                    next_tick().await;
+                    container.query_selector("[data-mobile-test='session-resume']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if state.native_chat_destination.get_untracked().as_ref().map(|target| &target.local_host_id)
+                        != Some(&created.local_host_id) {
+                        return Err("A real Resume must retain its typed pending destination before host selection".into());
+                    }
+                    state.active_project.set(Some(crate::state::ActiveProjectRef {
+                        local_host_id: created.local_host_id.clone(), project_id: protocol::ProjectId("paired-host-project".into()),
+                    }));
+                    state.draft_backend_override.set(Some(protocol::BackendKind::Claude));
+                    state.draft_custom_agent_id.set(Some(protocol::CustomAgentId("paired-host-custom".into())));
+                    state.draft_session_settings.set(protocol::SessionSettingsValues(
+                        [("model".into(), protocol::SessionSettingValue::String("paired-host-model".into()))].into_iter().collect()));
+                    state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                        local_host_id: created.local_host_id.clone(), agent_id: protocol::AgentId("new-host-chat".into()),
+                    }));
+                    state.chat_origin_tab.set(MobileTab::Agents);
+                    state.viewing_chat.set(true);
+                    intent(NativeIntent::Agents);
+                    next_tick().await;
+                    let previous_composer = container.query_selector("[data-mobile-test='chat-input']").unwrap().unwrap()
+                        .dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+                    previous_composer.set_value("Unsent text belongs to the current host");
+                    previous_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+                    intent(NativeIntent::Hosts);
+                    next_tick().await;
+                    let rows = container.query_selector_all(".paired-host-card").unwrap();
+                    let rows = (0..rows.length()).map(|index| rows.item(index).unwrap().dyn_into::<web_sys::Element>().unwrap()).collect::<Vec<_>>();
+                    // Store events replay all records. Assert uniqueness for both exact owned identities,
+                    // rather than assuming unrelated flows left the shared database empty.
+                    let mut previous_open = None;
+                    for record in [&old, &created] {
+                        let origin = record.direct.as_ref().and_then(|direct| direct.native_origin.as_deref())
+                            .ok_or("A native direct pairing must preserve its validated origin")?;
+                        let matches = rows.iter().filter(|row| {
+                            row.query_selector("[data-mobile-test='paired-host-origin']").unwrap()
+                                .is_some_and(|text| text.text_content().as_deref() == Some(origin))
+                            && row.query_selector("[data-mobile-test='paired-host-identity']").unwrap()
+                                .is_some_and(|identity| identity.text_content().unwrap().contains(&record.credential_fingerprint))
+                        }).collect::<Vec<_>>();
+                        if matches.len() != 1 {
+                            return Err("Each of the two exact persisted same-label host identities must have exactly one visible chooser row".into());
+                        }
+                        let row = matches[0];
+                        let open = row.query_selector("[data-mobile-test='paired-host-open']").unwrap().unwrap();
+                        let delete = row.query_selector("[data-mobile-test='paired-host-forget']").unwrap().unwrap();
+                        let identity = format!("{}, {origin}, {}", record.host_label, record.credential_fingerprint);
+                        if row.query_selector(".paired-host-label").unwrap().unwrap().text_content().as_deref() != Some("Tyde Host")
+                            || open.get_attribute("aria-label").as_deref() != Some(format!("Open {identity}").as_str())
+                            || delete.get_attribute("aria-label").as_deref() != Some(format!("Delete pairing for {identity}").as_str()) {
+                            return Err("Both same-label host rows need exact, distinct visible identities and accessible Open/Delete actions".into());
+                        }
+                        if record.local_host_id == old.local_host_id { previous_open = Some(open); }
+                    }
+                    let open = previous_open.ok_or("The previous exact host must remain normally selectable")?;
+                    open.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&old.local_host_id)
+                        || state.app_mode.get_untracked() != AppMode::Workspace
+                        || container.query_selector("[data-mobile-test='home-view']").unwrap().is_none() {
+                        return Err("Open in the real chooser must use that exact record and restore Home".into());
+                    }
+                    if state.active_project.get_untracked().is_some() || state.native_chat_destination.get_untracked().is_some()
+                        || state.active_agent.get_untracked().is_some() {
+                        return Err("Cross-host Open must retire the previous project's and pending resume's UI ownership".into());
+                    }
+                    reset_inbound_seq_for_host(&created.local_host_id);
+                    let late = fixture_user_agent("late-paired-resume", "paired-pending-session");
+                    dispatch_envelope(&state, &created.local_host_id,
+                        protocol::Envelope::from_payload(paired_stream, FrameKind::NewAgent, 0, &late).unwrap());
+                    next_tick().await;
+                    if !state.agents.get_untracked().iter().any(|agent| agent.local_host_id == created.local_host_id && agent.agent_id == late.agent_id)
+                        || state.active_local_host_id.get_untracked().as_ref() != Some(&old.local_host_id)
+                        || state.active_agent.get_untracked().is_some() || state.viewing_chat.get_untracked() {
+                        return Err("A delayed server resume must retain its host's agent data without stealing the explicit other-host selection".into());
+                    }
+                    let previous_stream = protocol::StreamPath("/host/previous-selection".into());
+                    state.host_streams.update(|streams| { streams.insert(old.local_host_id.clone(), previous_stream.clone()); });
+                    state.sessions.set(vec![fixture_session(&old.local_host_id, "previous-resume")]);
+                    intent(NativeIntent::Sessions);
+                    next_tick().await;
+                    container.query_selector("[data-mobile-test='session-resume']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    let sent = bridge::test_sent_lines().into_iter().filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+                        .filter(|frame| frame.kind == FrameKind::SpawnAgent && frame.stream.spawn_parent().as_ref() == Some(&previous_stream)).collect::<Vec<_>>();
+                    if sent.len() != 1 || sent[0].parse_payload::<protocol::SpawnAgentPayload>().unwrap().project_id.is_some() {
+                        return Err("Resume must send through the selected host's real protocol seam without a different host's project".into());
+                    }
+                    intent(NativeIntent::Agents);
+                    next_tick().await;
+                    if state.viewing_chat.get_untracked() || container.query_selector("[data-mobile-test='chat-input']").unwrap()
+                        .is_some_and(|field| field.get_bounding_client_rect().height() > 0.0) {
+                        return Err("Opening another host must not expose or route Send to the previous host's conversation".into());
+                    }
+                    let existing = fixture_user_agent("other-host-existing-chat", "other-host-existing-session");
+                    dispatch_envelope(&state, &old.local_host_id,
+                        protocol::Envelope::from_payload(previous_stream.clone(), FrameKind::NewAgent, 0, &existing).unwrap());
+                    state.connection_statuses.update(|statuses| { statuses.insert(old.local_host_id.clone(), ConnectionStatus::Connected); });
+                    next_tick().await;
+                    container.query_selector("[role='button'][aria-label='Open chat with other-host-existing-chat']").unwrap()
+                        .ok_or("The selected host's existing conversation must be normally openable")?
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    let other_composer = container.query_selector("[data-mobile-test='chat-input']").unwrap().unwrap()
+                        .dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+                    if !other_composer.value().is_empty() {
+                        ownership_failures.push("Opening an existing conversation on a different host must not inherit the previous host's unsent text");
+                    }
+                    other_composer.set_value("Explicit text for this host only");
+                    other_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+                    next_tick().await;
+                    container.query_selector("[data-mobile-test='chat-send']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    // The primary send action is InterruptAndSend, carried by HumanInput.
+                    let sent = bridge::test_sent_lines().into_iter().filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+                        .filter(|frame| frame.kind == FrameKind::HumanInput).collect::<Vec<_>>();
+                    if sent.len() != 1 || sent[0].stream != existing.instance_stream
+                        || sent[0].parse_payload::<protocol::HumanInputPayload>().unwrap().input.message != "Explicit text for this host only"
+                        || sent[0].parse_payload::<protocol::HumanInputPayload>().unwrap().action != protocol::HumanInputAction::InterruptAndSend {
+                        ownership_failures.push("The primary send action in the normally opened conversation must address the exact selected host's agent stream with only its explicit text");
+                    }
+                    intent(NativeIntent::Back);
+                    next_tick().await;
+                    let mut settings = empty_host_settings();
+                    settings.default_backend = Some(protocol::BackendKind::Codex);
+                    settings.enabled_backends = vec![protocol::BackendKind::Codex];
+                    state.host_settings_by_host.update(|hosts| { hosts.insert(old.local_host_id.clone(), settings); });
+                    state.connection_statuses.update(|statuses| { statuses.insert(old.local_host_id.clone(), ConnectionStatus::Connected); });
+                    intent(NativeIntent::NewChat);
+                    next_tick().await;
+                    container.query_selector("[data-mobile-test='project-picker-none']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    let backend = container.query_selector("[data-mobile-test='new-chat-backend']").unwrap().unwrap()
+                        .dyn_into::<web_sys::HtmlSelectElement>().unwrap();
+                    let agent = container.query_selector("[data-mobile-test='new-chat-agent']").unwrap().unwrap()
+                        .dyn_into::<web_sys::HtmlSelectElement>().unwrap();
+                    let settings = container.query_selector("[data-mobile-test='new-chat-session-settings']").unwrap().unwrap();
+                    if !backend.value().is_empty() || agent.value() != "tyde-default"
+                        || !settings.text_content().unwrap().contains("Backend defaults") {
+                        return Err("The next host's displayed composer options must not contain previous-host configuration".into());
+                    }
+                    let composer = container.query_selector("[data-mobile-test='chat-input']").unwrap().unwrap()
+                        .dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+                    composer.set_value("A separate host's new conversation");
+                    composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+                    next_tick().await;
+                    container.query_selector("[data-mobile-test='chat-send']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    let frames = bridge::test_sent_lines().into_iter().filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+                        .filter(|frame| frame.kind == FrameKind::SpawnAgent && frame.stream.spawn_parent().as_ref() == Some(&previous_stream)).collect::<Vec<_>>();
+                    let payload = frames.last().ok_or("Send must cross the real protocol-send seam")?
+                        .parse_payload::<protocol::SpawnAgentPayload>().unwrap();
+                    if frames.len() != 2 || payload.custom_agent_id.is_some() || payload.project_id.is_some()
+                        || !matches!(payload.params, protocol::SpawnAgentParams::New { backend_kind: protocol::BackendKind::Codex, session_settings: None, .. }) {
+                        return Err("The next host's real SpawnAgent must not inherit a different host's custom agent, backend, model or project".into());
+                    }
+                } else if state.active_local_host_id.get_untracked().as_ref() != Some(&old.local_host_id)
+                    || state.active_tab.get_untracked() != MobileTab::Settings
+                    || container.query_selector("[data-mobile-test='bottom-nav']").unwrap().is_none()
+                    || container.query_selector("[data-mobile-test='paired-host-origin']").unwrap().is_some() {
+                    return Err("Native Pair navigation must not change the browser/PWA selection, tab or global navigation".into());
+                }
+                let selected_before_managed = state.active_local_host_id.get_untracked();
+                let tab_before_managed = state.active_tab.get_untracked();
+                complete_managed_pair_fixture(&state, &container, &boundary, &managed_response, false).await?;
+                let managed = IndexedDbHostStore.list().await.unwrap().into_iter()
+                    .find(|record| record.managed.as_ref().is_some_and(|managed| managed.pairing_id == managed_pairing_id && managed.device_id == managed_device_id))
+                    .ok_or("Managed success must persist the exact redeemed identity before native navigation")?;
+                if native {
+                    if state.app_mode.get_untracked() != AppMode::Workspace
+                        || state.active_local_host_id.get_untracked().as_ref() != Some(&managed.local_host_id)
+                        || state.active_tab.get_untracked() != MobileTab::Home
+                        || state.active_project.get_untracked().is_some() || state.native_chat_destination.get_untracked().is_some()
+                        || container.query_selector("[data-mobile-test='home-view']").unwrap().is_none() {
+                        return Err("Managed Pair completion must use its exact created typed record and the same native Home/ownership transition as direct Pair".into());
+                    }
+                    if matches!(state.active_host_connection_status(), ConnectionStatus::Connected) {
+                        return Err("Managed Pair selection must not invent a completed relay/bootstrap connection".into());
+                    }
+                    let stopped = js_sys::Function::new_with_args("root", r#"
+                        return new Promise(resolve => {
+                            const settled = () => root.querySelector('[data-mobile-test="connection-banner-needs-action"]');
+                            if (settled()) { resolve(); return; }
+                            const observer = new MutationObserver(() => {
+                                if (settled()) { observer.disconnect(); resolve(); }
+                            });
+                            observer.observe(root, {childList:true, subtree:true});
+                        });
+                    "#).call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
+                    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(stopped)).await.unwrap();
+                } else if state.active_local_host_id.get_untracked() != selected_before_managed
+                    || state.active_tab.get_untracked() != tab_before_managed
+                    || container.query_selector("[data-mobile-test='bottom-nav']").unwrap().is_none() {
+                    return Err("Returning a managed pairing identity must not alter the browser's existing selection/tab/navigation behavior".into());
+                }
+                if native {
+                    let selected = state.active_local_host_id.get_untracked();
+                    complete_managed_pair_fixture(&state, &container, &boundary, &failed_managed_response, true).await?;
+                    let saved = IndexedDbHostStore.list().await.unwrap().into_iter()
+                        .find(|record| record.managed.as_ref().is_some_and(|managed| managed.pairing_id == failed_pairing_id && managed.device_id == failed_device_id))
+                        .ok_or("A pre-actor Keychain failure must preserve the saved pairing for explicit recovery")?;
+                    let failure = container.query_selector("[data-mobile-test='pairing-failed-message']").unwrap();
+                    if !matches!(state.app_mode.get_untracked(), AppMode::Pairing(crate::state::PairingScreen::Failed { .. }))
+                        || failure.as_ref().and_then(|message| message.text_content()).as_deref()
+                            != Some("Pairing was saved, but connection could not start: Native secret_read failed: Platform denied the secret read")
+                        || state.active_local_host_id.get_untracked() != selected
+                        || !state.paired_hosts.get_untracked().iter().any(|host| host.local_host_id == saved.local_host_id) {
+                        return Err("Managed pre-actor platform failure must stay actionable, retain its pairing, and never navigate as a successful connection".into());
+                    }
+                    // Re-enter the production attach path with the persisted auto-connect record.
+                    state.mobile_shell_error.set(None);
+                    state.app_mode.set(AppMode::Workspace);
+                    install_event_listeners(state.clone()).await;
+                    next_tick().await;
+                    let error = container.query_selector("[data-mobile-test='mobile-shell-error-banner']").unwrap();
+                    let message = container.query_selector(".mobile-shell-error-message").unwrap();
+                    let diagnostics = format!("Startup failure: banner={}, code={:?}, message_present={}, denied_read_count={:?}, expected_prefix={:?}, saved_auto_connect={}",
+                        error.is_some(), error.as_ref().and_then(|banner| banner.get_attribute("data-error-code")),
+                        message.is_some(), message.as_ref().and_then(|message| message.text_content()).map(|text| text.matches("Native secret_read failed: Platform denied the secret read").count()),
+                        message.as_ref().and_then(|message| message.text_content()).map(|text| text.starts_with("Failed to refresh host connection after app attach: ")),
+                        saved.auto_connect);
+                    web_sys::console::log_1(&diagnostics.into());
+                    // Actual40 showed two visible failures: both saved managed records auto-connect.
+                    // Their actor/credential boundaries are settled before attachment, not timed.
+                    if error.as_ref().and_then(|banner| banner.get_attribute("data-error-code")).as_deref() != Some("Internal")
+                        || !message.as_ref().and_then(|message| message.text_content()).is_some_and(|text|
+                            text.starts_with("Failed to refresh host connection after app attach: ")
+                            && text.matches("Native secret_read failed: Platform denied the secret read").count() == 2) {
+                        ownership_failures.push("Both saved managed hosts' denied startup reads must remain visible through the real app-attach error boundary");
+                    }
+                    state.mobile_shell_error.set(None);
+                    state.active_local_host_id.set(Some(saved.local_host_id.clone()));
+                    state.connection_statuses.update(|statuses| { statuses.insert(saved.local_host_id.clone(), ConnectionStatus::Disconnected); });
+                    next_tick().await;
+                    let reconnect = container.query_selector("[data-mobile-test='connection-banner-reconnect']").unwrap()
+                        .ok_or("The saved disconnected host must offer the normal Reconnect action")?;
+                    let completed = js_sys::Function::new_with_args("button", r#"
+                        return new Promise(resolve => {
+                            const observer = new MutationObserver(records => {
+                                if (!button.disabled && records.some(record => record.oldValue !== null)) {
+                                    observer.disconnect(); resolve();
+                                }
+                            });
+                            observer.observe(button, {attributes:true, attributeFilter:['disabled'], attributeOldValue:true});
+                            button.click();
+                        });
+                    "#).call1(&wasm_bindgen::JsValue::NULL, &reconnect).unwrap();
+                    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(completed)).await.unwrap();
+                    next_tick().await;
+                    let failure = container.query_selector(".mobile-shell-error-message").unwrap();
+                    if failure.as_ref().and_then(|message| message.text_content()).as_deref()
+                        != Some("Could not reconnect: Native secret_read failed: Platform denied the secret read") {
+                        ownership_failures.push("The real Reconnect action must show its pre-actor native credential failure after command completion");
+                    }
+                }
+                if !ownership_failures.is_empty() { return Err(ownership_failures.join("; ")); }
+                Ok(())
+            }.await;
+            paired.remove();
+            status.remove();
+            drop(handle);
+            container.remove();
+            for record in IndexedDbHostStore.list().await.unwrap() {
+                if record.local_host_id == old.local_host_id
+                    || record
+                        .direct
+                        .as_ref()
+                        .is_some_and(|direct| direct.device_id == grant.device_id.0)
+                    || record.managed.as_ref().is_some_and(|managed| {
+                        (managed.pairing_id == managed_pairing_id
+                            && managed.device_id == managed_device_id)
+                            || (managed.pairing_id == failed_pairing_id
+                                && managed.device_id == failed_device_id)
+                    })
+                {
+                    bridge::forget_paired_host(&record.local_host_id)
+                        .await
+                        .unwrap();
+                }
+            }
+            drop(boundary);
+            assert!(result.is_ok(), "{}", result.unwrap_err());
+        }
+    }
+
+    async fn complete_managed_pair_fixture(
+        state: &AppState,
+        container: &HtmlElement,
+        boundary: &BrowserOverride,
+        response: &serde_json::Value,
+        fail_reads: bool,
+    ) -> Result<(), String> {
+        let begin = js_sys::Reflect::get(&boundary.0, &"beginManaged".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        begin
+            .call2(
+                &wasm_bindgen::JsValue::NULL,
+                &response.to_string().into(),
+                &fail_reads.into(),
+            )
+            .unwrap();
+        let mut offer = bridge::web::tests_support::sample_managed_payload();
+        offer.host_label = "Tyde Host".into();
+        offer.release_version =
+            protocol::TydeReleaseVersion::parse(mobile_shell_types::native::NATIVE_CLIENT_RELEASE)
+                .unwrap();
+        state
+            .app_mode
+            .set(AppMode::Pairing(crate::state::PairingScreen::ServiceAuth {
+                qr_uri: offer.to_uri().unwrap(),
+                host_label: offer.host_label.clone(),
+                auth: MobileServiceAuthState::Authenticated {
+                    expires_at_ms: u64::MAX,
+                },
+            }));
+        let ready = js_sys::Reflect::get(&boundary.0, &"redeemReady".into()).unwrap();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(ready))
+            .await
+            .unwrap();
+        let completed = js_sys::Function::new_with_args("root", r#"
+            if (!root.querySelector('[data-mobile-test="pairing-service-cancel"]')) throw new Error('Managed redemption must render its real in-flight screen');
+            return new Promise(resolve => {
+                const observer = new MutationObserver(() => {
+                    if (!root.querySelector('[data-mobile-test="pairing-service-cancel"]')) {
+                        observer.disconnect(); resolve();
+                    }
+                });
+                observer.observe(root, {childList:true, subtree:true});
+            });
+        "#).call1(&wasm_bindgen::JsValue::NULL, container).map_err(|_| "Managed in-flight view is missing")?;
+        let release = js_sys::Reflect::get(&boundary.0, &"releaseManaged".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        release.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(completed))
+            .await
+            .unwrap();
+        Ok(())
     }
 
     struct BrowserOverride(wasm_bindgen::JsValue);
@@ -1688,11 +3140,62 @@ mod wasm_tests {
         }
     }
 
+    fn fixture_user_agent(id: &str, session_id: &str) -> protocol::NewAgentPayload {
+        protocol::NewAgentPayload {
+            swarm_membership: None,
+            agent_id: protocol::AgentId(id.into()),
+            name: id.into(),
+            origin: protocol::AgentOrigin::User,
+            tyde_permissions: Default::default(),
+            backend_kind: protocol::BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            session_id: Some(protocol::SessionId(session_id.into())),
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: protocol::StreamPath(format!("/agent/{id}/instance")),
+            activity_summary: Default::default(),
+            activity: protocol::AgentActivity::Idle,
+            review_recipient: false,
+        }
+    }
+
+    fn fixture_session(host: &LocalHostId, id: &str) -> crate::state::SessionInfo {
+        crate::state::SessionInfo {
+            local_host_id: host.clone(),
+            summary: protocol::SessionSummary {
+                id: protocol::SessionId(id.into()),
+                backend_kind: protocol::BackendKind::Claude,
+                launch_profile_id: None,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                alias: Some("A resumable session".into()),
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                message_count: 0,
+                token_count: None,
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: None,
+            },
+        }
+    }
+
     fn fixture_host(id: &str, label: &str) -> PairedHostSummary {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
 
+            direct_origin: None,
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,
@@ -4451,6 +5954,7 @@ mod wasm_tests {
                         }
                         .into_any(),
                         AppMode::Workspace => view! { <WorkspaceShell /> }.into_any(),
+                        AppMode::HostPicker => view! { <components::PairedHostsPicker /> }.into_any(),
                     }
                 }}
             }

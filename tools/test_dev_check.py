@@ -1355,6 +1355,45 @@ class NativeBuildToolsContractTests(unittest.TestCase):
         self.assertEqual(module.child_exit_status(0), 0)
 
 
+class NativePairingChannelTests(unittest.TestCase):
+    def test_private_offer_delivery_crosses_real_process_and_fifo_without_disclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fifo = root / "pairing-input"
+            handoff = root / "private-handoff.json"
+            os.mkfifo(fifo, 0o600)
+            handoff.write_text(json.dumps({
+                "pairing_link": "https://owned.invalid/tyde/#private-fixture",
+                "expires_at_ms": 1793592000000,
+            }))
+            handoff.chmod(0o644)
+            command = [str(REPO_ROOT / "dev.sh"), "check", "--ios-offer", str(fifo), str(handoff)]
+            rejected = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("owner-only0600", rejected.stderr)
+            handoff.chmod(0o600)
+            reader = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import json,sys; expected=json.load(open(sys.argv[2])); "
+                 "actual=json.load(open(sys.argv[1])); "
+                 "print('MATCH' if actual == expected else 'MISMATCH')",
+                 str(fifo), str(handoff)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                delivered = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+                self.assertEqual(delivered.returncode, 0, delivered.stderr)
+                output, errors = reader.communicate()
+                self.assertEqual(reader.returncode, 0, errors)
+                self.assertEqual(output.strip(), "MATCH")
+                self.assertIn("Native pairing handoff delivered", delivered.stdout)
+                self.assertNotIn("private-fixture", delivered.stdout + delivered.stderr)
+            finally:
+                if reader.poll() is None:
+                    reader.terminate()
+                    reader.communicate()
+
+
 class DevCheckCacheTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

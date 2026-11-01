@@ -7,6 +7,7 @@ mod dispatch;
 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
 mod fixtures;
 mod markdown;
+mod native;
 mod push;
 mod send;
 mod shell;
@@ -19,6 +20,10 @@ fn main() {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Debug);
 
+    if let Err(message) = native::validate_environment() {
+        show_boot_error(&message);
+        return;
+    }
     let Some(root) = app_root() else {
         show_boot_error("Tyde Mobile could not mount: #app-root is missing");
         return;

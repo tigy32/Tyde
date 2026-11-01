@@ -733,12 +733,83 @@ run_check_stages() {
 check_usage() {
     cat <<'USAGE'
 Usage: ./dev.sh check [--explain-cache]
+       ./dev.sh check --ios-build
+       ./dev.sh check --ios-platform <owned-device-uuid>
+       ./dev.sh check --ios-pairing <owned-device-uuid>
+       ./dev.sh check --ios-paste-pairing <owned-device-uuid>
+       ./dev.sh check --ios-animation-diagnostics <owned-device-uuid>
+       ./dev.sh check --ios-animation-control <owned-device-uuid>
+       ./dev.sh check --ios-hosts-diagnostics <already-paired-owned-device-uuid>
+       ./dev.sh check --ios-offer <ready-fifo> <owner-only-handoff.json>
+       ./dev.sh check --ios-agents-diagnostics <already-paired-owned-device-uuid>
+       ./dev.sh check --ios-project-picker-diagnostics <already-paired-owned-device-uuid>
+       ./dev.sh check --ios-input-diagnostics <already-paired-owned-device-uuid>
+       ./dev.sh check --ios-simulator <already-paired-owned-device-uuid>
 
   --explain-cache Print current Git state/key without cleanup, network, or daemons
 USAGE
 }
 
 check() {
+    if [[ "${1:-}" == --ios-offer ]]; then
+        shift
+        tools/check-ios-client.sh --offer "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-platform ]]; then
+        [[ $# -eq 2 ]] || die "Use check --ios-platform <owned-device-uuid>"
+        tools/check-ios-client.sh --platform-only "$2"
+        return
+    fi
+    if [[ "${1:-}" == --ios-pairing ]]; then
+        shift
+        tools/check-ios-client.sh --pairing-only "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-paste-pairing ]]; then
+        shift
+        tools/check-ios-client.sh --paste-pairing-only "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-animation-diagnostics ]]; then
+        shift
+        tools/check-ios-client.sh --animation-diagnostics "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-animation-control ]]; then
+        shift
+        tools/check-ios-client.sh --animation-control "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-hosts-diagnostics ]]; then
+        shift
+        tools/check-ios-client.sh --hosts-diagnostics "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-build && $# -eq 1 ]]; then
+        tools/check-ios-client.sh --build-only
+        return
+    fi
+    if [[ "${1:-}" == --ios-simulator ]]; then
+        shift
+        tools/check-ios-client.sh "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-agents-diagnostics ]]; then
+        shift
+        tools/check-ios-client.sh --agents-diagnostics "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-project-picker-diagnostics ]]; then
+        shift
+        tools/check-ios-client.sh --project-picker-diagnostics "$@"
+        return
+    fi
+    if [[ "${1:-}" == --ios-input-diagnostics ]]; then
+        shift
+        tools/check-ios-client.sh --input-diagnostics "$@"
+        return
+    fi
     local mode="default"
     local repetitions=1
     local cache_state="miss"
@@ -852,6 +923,7 @@ usage() {
     printf 'Usage: %s check [--explain-cache]\n' "$0"
     printf '       %s rust-toolchain\n' "$0"
     printf '       %s release <command> [args]\n' "$0"
+    printf '       %s ios-bundle\n' "$0"
     printf '       %s mobile-direct-export ABS_NEW_DIRECTORY\n' "$0"
     printf '       %s mobile-bundle [--out DIR] [--version X.Y.Z]\n' "$0"
 }
@@ -874,6 +946,10 @@ case "${1:-}" in
     release)
         shift
         exec tools/release.sh "$@"
+        ;;
+    ios-bundle)
+        shift
+        exec tools/build-ios-client.sh "$@"
         ;;
     mobile-direct-export)
         shift

@@ -305,7 +305,7 @@ pub fn SettingsView() -> impl IntoView {
 
                 <PairedHostSection />
 
-                <NotificationsSection />
+                <Show when=|| !crate::native::is_native()><NotificationsSection /></Show>
 
                 <section class="settings-section" data-mobile-test="settings-host">
                     <h2 class="settings-section-title">"Host"</h2>
@@ -436,7 +436,9 @@ pub fn SettingsView() -> impl IntoView {
                             <span class="settings-value">"Tyde Mobile"</span>
                         </SettingsRow>
                         <SettingsRow label="Version">
-                            <span class="settings-value">"0.1.0"</span>
+                            <span class="settings-value">{if crate::native::is_native() {
+                                mobile_shell_types::native::NATIVE_CLIENT_RELEASE
+                            } else { "0.1.0" }}</span>
                         </SettingsRow>
                     </div>
                 </section>
@@ -1130,6 +1132,7 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: "Studio Mac".to_owned(),
+            direct_origin: None,
             credential_fingerprint: "SHA256:8f3c1d9e7b2a4c6e0f1a2b3c4d5e6f70".to_owned(),
             auto_connect: true,
             last_connected_at_ms: Some(0),

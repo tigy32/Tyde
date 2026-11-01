@@ -21,6 +21,7 @@ pub fn HostBrowser(
     on_select: Callback<protocol::HostAbsPath>,
 ) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    crate::native::track_modal(Signal::derive(|| true));
 
     // Current path the user has navigated to. Falls back to opened.root.
     let current_path: RwSignal<Option<protocol::HostAbsPath>> = RwSignal::new(None);
@@ -100,7 +101,7 @@ pub fn HostBrowser(
     });
 
     view! {
-        <div class="host-browser" role="dialog" aria-label="Host filesystem browser" data-mobile-test="host-browser">
+        <div class="host-browser" role="dialog" aria-modal="true" aria-label="Host filesystem browser" data-mobile-test="host-browser">
             <div class="host-browser-header">
                 <div class="host-browser-title">"Browse host"</div>
                 <Button

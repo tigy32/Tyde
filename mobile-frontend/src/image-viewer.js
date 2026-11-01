@@ -1,5 +1,5 @@
 // Interaction-only controller: image identity and bytes stay in the typed Rust gallery.
-export function attachImageViewer(dialog) {
+export function attachImageViewer(dialog, visibility) {
   const document = dialog.ownerDocument;
   const window = document.defaultView;
   const stage = dialog.querySelector('.phone-image-stage');
@@ -72,6 +72,7 @@ export function attachImageViewer(dialog) {
   };
   const show = () => {
     dialog.showModal();
+    visibility(true);
     reset();
   };
 
@@ -81,6 +82,7 @@ export function attachImageViewer(dialog) {
       show();
     } else if (dialog.open) {
       dialog.close();
+      visibility(false);
       reset();
       restore();
     }
@@ -166,6 +168,7 @@ export function attachImageViewer(dialog) {
       resize.disconnect();
       if (dialog.open) {
         dialog.close();
+        visibility(false);
         restore();
       }
       if (ownsEntry() && !traversing) window.history.back();

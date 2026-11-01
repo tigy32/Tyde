@@ -49,14 +49,18 @@ pub async fn scan_qr() -> Result<BarcodeScanResult, String> {
 
     let stream_promise = media_devices
         .get_user_media_with_constraints(&constraints)
-        .map_err(|error| format!("failed to request camera: {}", err_string(&error)))?;
+        .map_err(|error| camera_request_error(&error))?;
     let stream: MediaStream = JsFuture::from(stream_promise)
         .await
         .map_err(|error| {
-            format!(
-                "camera permission was denied or unavailable: {}",
-                err_string(&error)
-            )
+            if crate::native::is_native() {
+                camera_request_error(&error)
+            } else {
+                format!(
+                    "camera permission was denied or unavailable: {}",
+                    err_string(&error)
+                )
+            }
         })?
         .dyn_into()
         .map_err(|_| "getUserMedia did not return a MediaStream".to_owned())?;
@@ -125,6 +129,26 @@ pub async fn scan_qr() -> Result<BarcodeScanResult, String> {
 
     drop(guard);
     result.map(|content| BarcodeScanResult { content })
+}
+
+fn camera_request_error(error: &JsValue) -> String {
+    if !crate::native::is_native() {
+        return format!("failed to request camera: {}", err_string(error));
+    }
+    let name = error
+        .dyn_ref::<web_sys::DomException>()
+        .map(web_sys::DomException::name);
+    match name.as_deref() {
+        Some("NotAllowedError") => {
+            "Camera access is not allowed. Enable it in Settings, or use Paste link.".into()
+        }
+        Some("NotFoundError") => "No camera is available. Use Paste link.".into(),
+        Some("NotReadableError" | "AbortError") => {
+            "The camera could not start. Try again, or use Paste link.".into()
+        }
+        Some(name) => format!("The camera request failed ({name}). Use Paste link."),
+        None => "The camera request failed. Use Paste link.".into(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +247,12 @@ fn new_decoder(
     document: &web_sys::Document,
     capability: ScanCapability,
 ) -> Result<QrDecoder, String> {
+    if crate::native::is_native() {
+        if !capability.jsqr {
+            return Err("Bundled QR decoder is unavailable. Update the app.".into());
+        }
+        return Ok(QrDecoder::JsQr(JsQrDecoder::new(document)?));
+    }
     if capability.barcode_detector {
         match new_barcode_detector() {
             Ok(detector) => return Ok(QrDecoder::BarcodeDetector(detector)),
