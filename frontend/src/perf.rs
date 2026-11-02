@@ -12,10 +12,13 @@
 //! ```
 use host_config::diagnostics::{
     FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, MAX_UI_ACTIVITY, SlowUiWork,
-    UiActivityContext, UiFrameActivity, UiTaskWork, UiTransitionActivity,
+    UiActivityContext, UiFrameActivity, UiTaskProducerWork, UiTaskWork, UiTransitionActivity,
 };
-pub(crate) use host_config::diagnostics::{FrontendStartupPhase, UiOperation, UiTransition};
-use std::cell::RefCell;
+pub(crate) use host_config::diagnostics::{
+    FrontendStartupPhase, UiOperation, UiTaskProducer, UiTransition,
+};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -113,6 +116,26 @@ pub(crate) fn install_task_diagnostics() -> Result<(), any_spawner::ExecutorErro
     any_spawner::Executor::init_custom_executor(UiExecutor)
 }
 
+thread_local! {
+    static TASK_ORIGIN: Cell<UiTaskProducer> = const { Cell::new(UiTaskProducer::Unattributed) };
+}
+
+// Only the synchronous registration scope labels the future actually spawned
+// there. Polling a labeled task does not label unrelated or descendant tasks.
+pub(crate) struct TaskOrigin(UiTaskProducer);
+
+impl TaskOrigin {
+    pub(crate) fn enter(producer: UiTaskProducer) -> Self {
+        Self(TASK_ORIGIN.replace(producer))
+    }
+}
+
+impl Drop for TaskOrigin {
+    fn drop(&mut self) {
+        TASK_ORIGIN.set(self.0);
+    }
+}
+
 struct UiExecutor;
 
 impl any_spawner::CustomExecutor for UiExecutor {
@@ -124,6 +147,7 @@ impl any_spawner::CustomExecutor for UiExecutor {
     fn spawn_local(&self, future: any_spawner::PinnedLocalFuture<()>) {
         wasm_bindgen_futures::spawn_local(UiTask {
             future: Some(future),
+            producer: TASK_ORIGIN.get(),
         });
     }
 
@@ -131,6 +155,7 @@ impl any_spawner::CustomExecutor for UiExecutor {
 }
 
 struct UiTask {
+    producer: UiTaskProducer,
     future: Option<any_spawner::PinnedLocalFuture<()>>,
 }
 
@@ -138,7 +163,7 @@ impl Future for UiTask {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let _span = UiSpan::new(UiOperation::TaskPoll, 0, 1);
+        let _span = UiSpan::task(UiOperation::TaskPoll, self.producer);
         self.get_mut()
             .future
             .as_mut()
@@ -150,7 +175,7 @@ impl Future for UiTask {
 
 impl Drop for UiTask {
     fn drop(&mut self) {
-        let _span = UiSpan::new(UiOperation::TaskDrop, 0, 1);
+        let _span = UiSpan::task(UiOperation::TaskDrop, self.producer);
         // Field destruction otherwise happens after this scope has ended.
         drop(self.future.take());
     }
@@ -164,6 +189,7 @@ struct LocalMonitor {
     last_tick: f64,
     longest: Option<SlowUiWork>,
     task_work: TaskWork,
+    task_producers: BTreeMap<UiTaskProducer, TaskWork>,
     activity: ActivityContext,
     pending: u32,
     queue: VecDeque<FrontendDiagnostic>,
@@ -276,6 +302,7 @@ fn install_local_monitor(env: &JsValue) {
             m.last_tick = now;
             let longest_work = m.longest.take();
             let task_work = std::mem::take(&mut m.task_work).finish();
+            let producers = std::mem::take(&mut m.task_producers);
             (visible && interval >= 1250).then(|| FrontendDiagnostic::EventLoopGap {
                 interval_ms: interval,
                 expected_ms: 1000,
@@ -283,6 +310,13 @@ fn install_local_monitor(env: &JsValue) {
                 longest_work,
                 pending_bridge_calls: m.pending,
                 task_work,
+                task_producers: producers
+                    .into_iter()
+                    .map(|(producer, work)| UiTaskProducerWork {
+                        producer,
+                        work: work.finish(),
+                    })
+                    .collect(),
                 activity: m.activity.snapshot(now),
             })
         });
@@ -296,6 +330,7 @@ fn install_local_monitor(env: &JsValue) {
                 m.last_tick = now;
                 m.longest = None;
                 m.task_work = TaskWork::default();
+                m.task_producers.clear();
                 m.activity.clear();
             }
         });
@@ -311,6 +346,7 @@ fn install_local_monitor(env: &JsValue) {
             last_tick: started,
             longest: None,
             task_work: TaskWork::default(),
+            task_producers: BTreeMap::new(),
             activity: ActivityContext::default(),
             pending: 0,
             queue: VecDeque::new(),
@@ -458,6 +494,7 @@ pub(crate) struct UiSpan {
 struct LocalSpan {
     start: f64,
     operation: UiOperation,
+    producer: UiTaskProducer,
     waiting: bool,
     frame: Option<protocol::FrameKind>,
     bytes: usize,
@@ -484,12 +521,21 @@ impl UiSpan {
             Some(LocalSpan {
                 start,
                 operation,
+                producer: UiTaskProducer::Unattributed,
                 waiting,
                 frame,
                 bytes,
                 items,
             })
         })
+    }
+
+    fn task(operation: UiOperation, producer: UiTaskProducer) -> Self {
+        let mut span = Self::new(operation, 0, 1);
+        if let Some(local) = &mut span.local {
+            local.producer = producer;
+        }
+        span
     }
 
     pub(crate) fn new(operation: UiOperation, bytes: usize, items: usize) -> Self {
@@ -601,22 +647,31 @@ impl Drop for UiSpan {
             }
             let duration = local_monitor_now(&m.handle) - span.start;
             let duration_ms = millis(duration);
-            match span.operation {
-                UiOperation::TaskPoll => {
-                    m.task_work.summary.polls = m.task_work.summary.polls.saturating_add(1);
-                    m.task_work.poll_ms += duration;
-                    m.task_work.summary.longest_poll_ms =
-                        m.task_work.summary.longest_poll_ms.max(duration_ms);
-                    return;
+            if matches!(
+                span.operation,
+                UiOperation::TaskPoll | UiOperation::TaskDrop
+            ) {
+                for work in [
+                    &mut m.task_work,
+                    m.task_producers.entry(span.producer).or_default(),
+                ] {
+                    match span.operation {
+                        UiOperation::TaskPoll => {
+                            work.summary.polls = work.summary.polls.saturating_add(1);
+                            work.poll_ms += duration;
+                            work.summary.longest_poll_ms =
+                                work.summary.longest_poll_ms.max(duration_ms);
+                        }
+                        UiOperation::TaskDrop => {
+                            work.summary.drops = work.summary.drops.saturating_add(1);
+                            work.drop_ms += duration;
+                            work.summary.longest_drop_ms =
+                                work.summary.longest_drop_ms.max(duration_ms);
+                        }
+                        _ => unreachable!("only task scopes contribute to task work"),
+                    }
                 }
-                UiOperation::TaskDrop => {
-                    m.task_work.summary.drops = m.task_work.summary.drops.saturating_add(1);
-                    m.task_work.drop_ms += duration;
-                    m.task_work.summary.longest_drop_ms =
-                        m.task_work.summary.longest_drop_ms.max(duration_ms);
-                    return;
-                }
-                _ => {}
+                return;
             }
             if duration_ms >= 100
                 && m.longest

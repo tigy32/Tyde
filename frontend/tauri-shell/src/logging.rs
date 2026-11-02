@@ -6,6 +6,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 
+pub(crate) const UI_DIAGNOSTIC_TRACE_TARGET: &str = "tauri_shell::ui_diagnostic";
+
 pub(crate) const HOST_IO_TRACE_TARGET: &str = "tauri_shell::host_io";
 
 struct LoggingGuards {
@@ -51,6 +53,7 @@ fn init_logging(console_target: ConsoleTarget, file_prefix: &str) -> Result<(), 
         .with_line_number(true)
         .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
             metadata.target() != HOST_IO_TRACE_TARGET
+                && metadata.target() != UI_DIAGNOSTIC_TRACE_TARGET
         }));
 
     let (file_writer, file_guard) = build_file_writer(file_prefix)?;
@@ -181,6 +184,7 @@ impl DiagnosticSink {
         if let host_config::diagnostics::FrontendDiagnostic::EventLoopGap {
             longest_work,
             activity,
+            task_producers,
             ..
         } = &record.diagnostic
         {
@@ -188,6 +192,17 @@ impl DiagnosticSink {
                 || activity.transitions.len() > host_config::diagnostics::MAX_UI_ACTIVITY
             {
                 return Err("Local diagnostic activity exceeds its bound");
+            }
+            if task_producers.len() > host_config::diagnostics::MAX_UI_TASK_PRODUCERS {
+                return Err("Local diagnostic task producers exceed their bound");
+            }
+            for (index, work) in task_producers.iter().enumerate() {
+                if task_producers[..index]
+                    .iter()
+                    .any(|other| other.producer == work.producer)
+                {
+                    return Err("Local diagnostic repeats a task producer");
+                }
             }
             for frame in longest_work
                 .iter()
@@ -249,7 +264,7 @@ pub(crate) fn start_ui_diagnostics(app: &tauri::AppHandle) -> DiagnosticSink {
         while let Some(request) = receiver.recv().await {
             let result = match budget.admit() {
                 Some(native_dropped) => serde_json::to_string(&request.record)
-                    .map(|record| tracing::info!("ui.diagnostic layer=frontend native_dropped={native_dropped} record={record}"))
+                    .map(|record| tracing::info!(target: UI_DIAGNOSTIC_TRACE_TARGET, "ui.diagnostic layer=frontend native_dropped={native_dropped} record={record}"))
                     .map_err(|_| "Local diagnostic serialization failed"),
                 None => Ok(()),
             };

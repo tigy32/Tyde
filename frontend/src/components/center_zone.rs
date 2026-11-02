@@ -1214,6 +1214,8 @@ fn EditorPane(
     };
 
     // Keep the active tab scrolled into view inside its own strip.
+    let registration =
+        crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::TabStripVisibility);
     Effect::new(move |_| {
         let Some(active) = active_tab_id() else {
             return;
@@ -1242,6 +1244,7 @@ fn EditorPane(
             }
         });
     });
+    drop(registration);
 
     let tab_bar_class = move || {
         if state.tabs_enabled.get() {
@@ -2595,11 +2598,6 @@ mod wasm_tests {
         clock.tick();
         settle().await;
         let reset_records = log.records();
-        drop(clock);
-        drop(log);
-        drop(_handle);
-        drop(container);
-        settle().await;
 
         let diagnostic = &records.as_array().unwrap().last().unwrap()["diagnostic"];
         let transitions = diagnostic["activity"]["transitions"]
@@ -2632,6 +2630,79 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(opened["age_ms"], 3000);
         assert_eq!(transitions.last().unwrap()["age_ms"], 2000);
+        clock.reading_step(0.25);
+        for _ in 0..8 {
+            state.open_tab(
+                TabContent::empty_chat(),
+                "Private repeated tab".to_owned(),
+                true,
+            );
+            settle().await;
+            let close = tab_button_named(&container, "Private repeated tab")
+                .query_selector(".tab-close")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap();
+            close.click();
+            settle().await;
+        }
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let repeated = log.records();
+        let diagnostic = &repeated.as_array().unwrap().last().unwrap()["diagnostic"];
+        assert!(diagnostic["longest_work"].is_null());
+        let producers = diagnostic["task_producers"]
+            .as_array()
+            .expect("ordinary logs must retain actual task registration origins");
+        assert!(!producers.is_empty() && producers.len() <= 5);
+        for producer in [
+            "chat_scroll_restore",
+            "chat_auto_scroll",
+            "tab_strip_visibility",
+            "unattributed",
+        ] {
+            assert!(
+                producers.iter().any(|row| row["producer"] == producer),
+                "missing task origin {producer}"
+            );
+        }
+        let polls: u64 = producers
+            .iter()
+            .map(|row| row["work"]["polls"].as_u64().unwrap())
+            .sum();
+        let drops: u64 = producers
+            .iter()
+            .map(|row| row["work"]["drops"].as_u64().unwrap())
+            .sum();
+        assert_eq!(diagnostic["task_work"]["polls"], polls);
+        assert_eq!(diagnostic["task_work"]["drops"], drops);
+        let restore = producers
+            .iter()
+            .find(|row| row["producer"] == "chat_scroll_restore")
+            .unwrap();
+        assert!(restore["work"]["polls"].as_u64().unwrap() >= 8);
+        assert!(restore["work"]["drops"].as_u64().unwrap() >= 8);
+        assert!(restore["work"]["poll_ms"].as_u64().unwrap() > 0);
+        assert!(restore["work"]["longest_poll_ms"].as_u64().unwrap() < 100);
+        clock.visibility(false);
+        clock.visibility(true);
+        clock.reading_step(0.0);
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let reset = log.records();
+        assert_eq!(
+            reset.as_array().unwrap().last().unwrap()["diagnostic"]["task_producers"],
+            serde_json::json!([])
+        );
+        assert!(!repeated.to_string().contains("Private"));
+        drop(clock);
+        drop(log);
+        drop(_handle);
+        drop(container);
+        settle().await;
     }
 
     /// Bulk close keeps the non-closeable Home tab and activates it. The

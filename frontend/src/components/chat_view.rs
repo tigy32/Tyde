@@ -512,6 +512,8 @@ pub fn ChatView(
     let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
     let scroll_ref_for_restore = scroll_ref;
     let state_for_restore = state.clone();
+    let registration =
+        crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatScrollRestore);
     Effect::new(move |_| {
         if restored_initial_scroll_for_effect.get() {
             return;
@@ -543,6 +545,7 @@ pub fn ChatView(
             },
         );
     });
+    drop(registration);
 
     // Per-instance scroll + user-input listeners. Multiple `ChatView`s
     // can be mounted simultaneously (LRU hot set), so we can't use
@@ -871,6 +874,7 @@ pub fn ChatView(
     let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     let view_mounted_for_auto_scroll = view_mounted.clone();
     let state_for_auto_scroll = state.clone();
+    let registration = crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatAutoScroll);
     Effect::new(move |_| {
         let _len = messages_len.get();
         let _hv = heights_version.get();
@@ -932,6 +936,7 @@ pub fn ChatView(
             std::time::Duration::from_millis(0),
         );
     });
+    drop(registration);
 
     let tab_scroll_state_for_scroll_to_bottom = state.tab_scroll_state;
     let scroll_to_bottom = move |_| {
@@ -1262,6 +1267,7 @@ fn MeasuredRow(
     let slot: StoredValue<ObserverPair, LocalStorage> = StoredValue::new_local(None);
     let row_mounted_for_observer = row_mounted.clone();
 
+    let registration = crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatRowMeasure);
     Effect::new(move |_| {
         let Some(el) = node_ref.get() else {
             return;
@@ -1322,6 +1328,7 @@ fn MeasuredRow(
             slot.update_value(|s| *s = Some((observer, cb)));
         }
     });
+    drop(registration);
 
     on_cleanup(move || {
         row_mounted.store(false, Ordering::Relaxed);
@@ -5187,6 +5194,8 @@ mod wasm_tests {
                 user_scrolled_up: true,
             },
         );
+        let clock = LocalMonitorClock::install();
+        clock.reading_step(0.0);
         let container = make_container();
         let mount_state = state.clone();
         let handle = mount_to(container.clone(), move || {
@@ -5220,7 +5229,7 @@ mod wasm_tests {
             "the spacer must reserve geometry for unmounted rows"
         );
 
-        let clock = LocalMonitorClock::install();
+        clock.reading_step(150.0);
         let recorded = js_sys::eval(
             r#"
             (() => {
@@ -5266,6 +5275,21 @@ mod wasm_tests {
         js_sys::eval("window.__projectionRestoreInvoke()").unwrap();
         drop(clock);
         assert_eq!(local["diagnostic"]["event"], "event_loop_gap");
+        let producers = local["diagnostic"]["task_producers"].as_array().unwrap();
+        for producer in [
+            "chat_scroll_restore",
+            "chat_auto_scroll",
+            "chat_row_measure",
+        ] {
+            assert!(
+                producers
+                    .iter()
+                    .any(|row| row["producer"] == producer
+                        && row["work"]["polls"].as_u64().unwrap() > 0),
+                "the mounted transcript must retain its actual effect origin: {producer}"
+            );
+        }
+
         let task_work = &local["diagnostic"]["task_work"];
         assert!(task_work["polls"].as_u64().unwrap() > 0);
         assert!(task_work["poll_ms"].as_u64().unwrap() > 0);

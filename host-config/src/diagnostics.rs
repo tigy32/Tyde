@@ -41,6 +41,25 @@ pub struct UiTaskWork {
     pub longest_drop_ms: u32,
 }
 
+pub const MAX_UI_TASK_PRODUCERS: usize = 5;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiTaskProducer {
+    Unattributed,
+    ChatScrollRestore,
+    ChatAutoScroll,
+    ChatRowMeasure,
+    TabStripVisibility,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiTaskProducerWork {
+    pub producer: UiTaskProducer,
+    pub work: UiTaskWork,
+}
+
 pub const MAX_UI_ACTIVITY: usize = 4;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -148,6 +167,7 @@ pub enum FrontendDiagnostic {
         longest_work: Option<SlowUiWork>,
         pending_bridge_calls: u32,
         task_work: UiTaskWork,
+        task_producers: Vec<UiTaskProducerWork>,
         activity: UiActivityContext,
     },
 }

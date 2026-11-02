@@ -65,6 +65,41 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   are converted to whole milliseconds. They include deferred reactive rendering and
   cleanup after receive/dispatch returns. They remain separate from
   `longest_work` so an outer task does not hide a named inner projection.
+  `task_producers` partitions those same poll/drop observations by the actual
+  registration origin of selected Leptos effect futures. Each entry contains
+  `producer` and `work` (the same six counters/times as `task_work`). At most
+  five entries exist: `chat_scroll_restore`, `chat_auto_scroll`,
+  `chat_row_measure`, `tab_strip_visibility`, and `unattributed`. Origins are
+  captured synchronously around the real `Effect::new` call, before its future
+  is submitted to the existing executor, and retained until that future drops.
+  Later polls, including dependency checks that do not execute the callback,
+  keep that origin. Registration itself is not timed as blocking work.
+
+  The first three cover the initial chat scroll restoration, sticky-bottom
+  effect, and each mounted row's measurement-observer setup effect. The fourth
+  covers the pane's active-tab visibility effect. Deferred timeout/RAF/resize
+  callbacks are **not** included merely because an effect scheduled them.
+  Other effects, framework render tasks, direct wasm-bindgen tasks, native
+  producers, browser layout/GC and wake sources are not newly instrumented.
+  Executor tasks without one of these explicit registration scopes go into
+  `unattributed`; tasks bypassing this executor remain outside `task_work` too.
+  A task spawned while polling a labeled task does not inherit its origin.
+  No frame, most-recent action, stack, file path, task ID or signal dependency
+  is used to guess a producer. Counts identify task families, not individual
+  effect instances or the signal/action that woke them.
+
+  The counters include every completed poll/drop, not just >=100ms scopes.
+  This can distinguish repeated short measured effect work from a single long
+  poll while leaving `longest_work:null` truthful. Producer poll/drop counts
+  partition the corresponding `task_work` counts. Durations accumulate at
+  submillisecond precision before each bucket is truncated, so rounded bucket
+  times need not sum exactly to the independently rounded overall time. These
+  remain synchronous wall intervals, not CPU samples or stall-cause claims.
+  Every timer tick and visibility transition clears the producer counters;
+  a quiet tick emits nothing. A zero/absent bucket means no completed observation
+  in that window, not proof that the producer could not be involved. Older
+  records lacking `task_producers` have unknown coverage, not zero activity.
+
   `activity` supplies content-free context even when `longest_work` is null:
   the last four typed command attempts (`commands`), the latest host-dispatch
   start (`dispatch`), and the last four central project/tab transition starts
@@ -121,10 +156,13 @@ around the incident. These new lines are pasteable, content-free diagnostics:
 There is no upload, new diagnostic export/collection workflow, interaction
 listener, payload logging, DOM scan, stack sampling or always-on animation-frame
 loop. Normal one-second samples write nothing. Existing named call sites keep
-only a longest-duration aggregate and pending-wait count. The frontend has one
+only bounded aggregates and a pending-wait count. The frontend has one
 in-flight delivery, at most 16 queued records, and at most 32 admitted records
 per minute; native ingress and native dispatch each have a 32-line/minute
 budget. `dropped`/`native_dropped` report suppression on the next admitted line.
+Frontend diagnostic records use the file-only `tauri_shell::ui_diagnostic`
+target; its default INFO output bypasses the synchronous console writer and
+uses the same nonblocking file writer and loss reporting as host-I/O markers.
 The existing nonblocking tracing writer is bounded and lossy under saturation;
 these limits bound diagnostic contribution, not all pre-existing log traffic
 or total file bytes. Existing general logs can contain paths/IDs: do not assume
@@ -400,3 +438,28 @@ files to claim a real-server long-session reproduction. Retain explicit local
 capture exports with their exact client source/build and operation scope; no
 upload or automatic disk sink is added. These diagnostics cannot retrospectively
 explain earlier Mac timer gaps or establish that any candidate is their cause.
+
+## Task-origin attribution validation and limits
+
+The mounted tab-close flow opens and closes eight real empty chats under an
+injected fractional clock, preserving the existing Home/close/reset assertions.
+It checks short-poll origin/count partitioning, future retirement, explicit
+unattributed work, and visibility reset through the ordinary diagnostic bridge.
+The existing mounted long-transcript flow checks row-measure origin alongside
+rendered/windowed rows. These are browser-boundary checks, not fabricated
+backend events or performance requirements. No new test suite or benchmark is
+introduced. Native INFO file delivery is separately exercised with a disposable
+Linux Native instance and an injected performance clock; no busy loop, real
+sleep or CPU-speed assertion is required.
+
+The earlier 100ms named-span retention and aggregate-only task instrumentation
+explain this telemetry blind spot; they do not establish when the original
+freeze began. In the supplied beta19-bound Mac export, repeated short task
+polls occupy much of some long callback intervals despite null named work.
+Those records predate task-origin fields and cannot be retroactively assigned
+to any of the newly instrumented effect families. The export is sampled, not a
+complete runtime history. This change adds observation, not a Mac/auth stall fix.
+The reviewed standalone export script is unchanged; a future allowlist revision
+may retain only `task_producers[].producer` from the five values above and
+`work.{polls,poll_ms,longest_poll_ms,drops,drop_ms,longest_drop_ms}` as u32 numbers,
+with a maximum of five unique entries. Older/missing fields must remain unknown.
