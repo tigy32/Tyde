@@ -21339,10 +21339,14 @@ struct CodexRolloutTraceCursor {
 fn codex_rollout_trace_event(line: &[u8]) -> Result<Option<CodexRolloutTraceEvent>, String> {
     let record: Value =
         serde_json::from_slice(line).map_err(|error| format!("invalid JSON record: {error}"))?;
-    if record.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    let schema_version = record
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or("rollout trace record missing unsigned schema_version")?;
+    // Schema 2 adds history acceptance; code-cell ownership events are unchanged.
+    if !matches!(schema_version, 1 | 2) {
         return Err(format!(
-            "unsupported schema_version {:?}",
-            record.get("schema_version")
+            "unsupported rollout trace schema_version {schema_version}"
         ));
     }
     let Some(payload) = record.get("payload") else {

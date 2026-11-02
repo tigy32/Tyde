@@ -16512,19 +16512,36 @@ fn await_child_prompt(child_id: &protocol::AgentId) -> String {
     )
 }
 
-fn abandoned_child_await_prompt(child_id: &protocol::AgentId) -> String {
-    let child_task = "Run this exact foreground shell command and wait for it to finish: \
-        python3 -c \"import time; time.sleep(75); print('CHILD_READY')\". Then reply with exactly \
-        CHILD_READY and nothing else.";
+fn gated_child_await_prompt(child_id: &protocol::AgentId, cancel: bool) -> String {
+    let call = if cancel {
+        "const pending = tools[awaitName]({agent_ids});\n\
+         await tools[admitted[0].name]({});\n\
+         await yield_control();\nawait pending;"
+    } else {
+        "await tools[awaitName]({agent_ids});"
+    };
+    let finish = if cancel {
+        "When the cell yields, call functions.wait exactly once for that cell with terminate:true. \
+         This explicit native cancellation is mandatory. Do not wait for the pending MCP call."
+    } else {
+        "If the cell yields, use functions.wait to wait for that exact cell's completion. \
+         Never terminate or cancel this awaited cell."
+    };
+    let marker = if cancel {
+        ABANDONED_AWAIT_MARKER
+    } else {
+        AWAITED_MARKER
+    };
     format!(
-        "Use the Tyde agent-control tool whose name ends in `tyde_send_agent_message`, exactly \
-         once, passing agent_id \"{child_id}\" and this exact message: `{child_task}`. Then use \
-         one functions.exec code-mode cell to execute exactly this JavaScript:\n\nconst abandoned = \
-         tools.mcp__tyde_agent_await__tyde_await_agents({{agent_ids:[\"{child_id}\"]}});\nawait \
-         new Promise(resolve => setTimeout(resolve, 1000));\ntext(\"AWAIT_STARTED\");\n\nDo \
-         not await `abandoned`, do not call functions.wait, and do not call any other tool. When \
-         that cell returns, immediately reply with exactly {ABANDONED_AWAIT_MARKER} and nothing \
-         else."
+        "Use exactly one functions.exec code-mode cell to execute this JavaScript:\n\n\
+         const admitted = ALL_TOOLS.filter(t => t.name.endsWith(\"await_admitted\"));\n\
+         if (admitted.length !== 1) throw new Error(\"Expected one fixture admission tool\");\n\
+         const awaitName = admitted[0].name.replace(/await_admitted$/, \"tyde_await_agents\");\n\
+         if (!ALL_TOOLS.some(t => t.name === awaitName)) throw new Error(\"Missing fixture await tool\");\n\
+         const agent_ids = [\"{child_id}\"];\n{call}\n\n\
+         {finish} Then immediately reply with exactly {marker} and nothing else. \
+         Do not call any other tool. The fixture namespace above is mandatory; never use \
+         connected-app tools."
     )
 }
 
@@ -16542,17 +16559,15 @@ fn assert_abandoned_await_was_cancelled(turn: &Turn) {
         .collect::<Vec<_>>();
     let [completion] = completions.as_slice() else {
         panic!(
-            "{}: abandoned await has {} completions, expected exactly one: {:?}",
+            "{}: abandoned await has {} completions, expected exactly one",
             turn.label(),
             completions.len(),
-            turn.completion_summaries(),
         );
     };
     assert!(
         matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
-        "{}: abandoned await completed as {:?}, expected cancellation",
+        "{}: abandoned await must complete as cancellation",
         turn.label(),
-        completion.outcome,
     );
 }
 
@@ -16638,51 +16653,88 @@ fn real_codex_abandoned_agent_await() {
         |host| {
             Box::pin(async move {
                 host.install_agent_control().await;
-
-                let workspace = host.workspace().to_path_buf();
+                let held = host.hold_agent_awaits();
                 let agent = spawn_agent(host, &launch_prompt()).await;
                 let launched = collect_turn(host, &agent, &launch_prompt()).await;
                 assert_ready_handshake(&launched);
-                assert_clean_close(host, &agent).await;
-
-                let session = stored_session(host).await;
                 assert!(
-                    session.resumable,
-                    "{:?}: session is not resumable, so the rest of this scenario cannot run",
-                    host.backend()
+                    launched.events.iter().all(|event| !matches!(event,
+                        ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, protocol::MessageSender::Error))),
+                    "native rollout ownership must be available before exercising abandonment"
                 );
-                let resumed = resume_agent(host, &session.id).await;
 
-                let payload = unique_payload();
-                let child_prompt = child_prompt(&workspace, &payload);
-                let spawn_prompt =
-                    spawn_child_prompt(host.backend(), &host.workspace_roots(), &child_prompt);
-                let delegation = delegate(host, &resumed, &spawn_prompt, &child_prompt).await;
-                let child_id = delegation.child_agent().agent_id.clone();
-                let [spawned, child] = delegation.into_turns();
+                let (child_id, child) = host.start_await_child().await;
 
-                let prompt = abandoned_child_await_prompt(&child_id);
-                let abandoned = ask_through_final_response(
-                    host,
-                    &resumed,
-                    &prompt,
-                    ABANDONED_AWAIT_MARKER,
-                    Duration::from_secs(10),
-                )
+                let prompt = gated_child_await_prompt(&child_id, true);
+                send_prompt(host, &agent, &prompt).await;
+                let mut abandoned = host.turn(&prompt);
+                collect_turn_until(host, &mut abandoned, |event| {
+                    assert!(
+                        !matches!(event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, protocol::MessageSender::Error)),
+                        "backend reported an error during code-cell abandonment"
+                    );
+                    matches!(event, ChatEvent::StreamEnd(end)
+                        if end.message.content.contains(ABANDONED_AWAIT_MARKER))
+                })
                 .await;
-                assert_orphaned_await_shape(abandoned.turn());
-                assert_final_text_contains(abandoned.turn(), ABANDONED_AWAIT_MARKER);
                 assert!(
-                    abandoned.settled_in().is_some(),
-                    "{}: Codex produced its marked final response but did not report idle within \
-                     10 seconds; completions: {:?}",
-                    abandoned.turn().label(),
-                    abandoned.turn().completion_summaries(),
+                    !host
+                        .protocol_violations()
+                        .iter()
+                        .any(|code| code == "codex_rollout_ownership_unavailable"),
+                    "native ownership trace failed before the cancelled-cell final reply"
                 );
-                assert_abandoned_await_was_cancelled(abandoned.turn());
-                assert_universal_contract(std::slice::from_ref(abandoned.turn()));
-                assert_universal_contract(&[launched, spawned, child]);
-                assert_clean_close(host, &resumed).await;
+                collect_turn_until(host, &mut abandoned, |event| {
+                    matches!(event, ChatEvent::TypingStatusChanged(false))
+                })
+                .await;
+                assert_final_text_contains(&abandoned, ABANDONED_AWAIT_MARKER);
+                assert_abandoned_await_was_cancelled(&abandoned);
+
+                // An awaited cell still owns its foreground work until the MCP response.
+                let prompt = gated_child_await_prompt(&child_id, false);
+                send_prompt(host, &agent, &prompt).await;
+                let mut awaited = host.turn(&prompt);
+                collect_turn_until(host, &mut awaited, |event| {
+                    matches!(event, ChatEvent::ToolRequest(request)
+                        if matches!(request.tool_type, protocol::ToolRequestType::TydeAwaitAgents { .. }))
+                }).await;
+                assert!(
+                    !awaited
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
+                    "a genuinely active foreground await must not report idle"
+                );
+                host.wait_for_agent_awaits(2).await;
+                held.send_replace(false);
+                collect_turn_until(host, &mut awaited, |event| {
+                    matches!(event, ChatEvent::TypingStatusChanged(false))
+                })
+                .await;
+                assert_final_text_contains(&awaited, AWAITED_MARKER);
+                let request = awaited
+                    .tool_requests()
+                    .find(|request| {
+                        matches!(
+                            request.tool_type,
+                            protocol::ToolRequestType::TydeAwaitAgents { .. }
+                        )
+                    })
+                    .expect("active await request");
+                let completions = awaited
+                    .tool_completions()
+                    .filter(|completion| completion.tool_call_id == request.tool_call_id)
+                    .collect::<Vec<_>>();
+                assert!(
+                    matches!(completions.as_slice(), [completion]
+                    if matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. })),
+                    "the genuinely awaited call must succeed exactly once, not be cancelled"
+                );
+                assert_universal_contract(&[launched, child, abandoned, awaited]);
+                assert_clean_close(host, &agent).await;
             })
         },
     );

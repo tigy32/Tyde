@@ -597,7 +597,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProtocolViolationC
                     self.0 = Some(value.to_owned());
                 }
             }
-            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message"
+                    && format!("{value:?}") == "Codex rollout trace reader stopped"
+                {
+                    self.0 = Some("codex_rollout_ownership_unavailable".to_owned());
+                }
+            }
         }
         let mut code = ViolationCode(None);
         event.record(&mut code);
@@ -647,7 +653,8 @@ impl<B: Backend> Harness<B> {
                 .with(
                     ProtocolViolationCapture.with_filter(
                         tracing_subscriber::filter::Targets::new()
-                            .with_target(TURN_EMITTER_TARGET, tracing::Level::ERROR),
+                            .with_target(TURN_EMITTER_TARGET, tracing::Level::ERROR)
+                            .with_target("server::backend::codex", tracing::Level::ERROR),
                     ),
                 )
                 .with(
@@ -696,6 +703,67 @@ impl<B: Backend> Harness<B> {
 
     pub async fn install_agent_control(&mut self) {
         self.install_control_tools(false).await;
+    }
+
+    pub fn hold_agent_awaits(&self) -> tokio::sync::watch::Sender<bool> {
+        let held = self
+            .control
+            .as_ref()
+            .expect("agent control fixture")
+            .0
+            .await_held
+            .clone();
+        held.send_replace(true);
+        held
+    }
+
+    pub async fn wait_for_agent_awaits(&self, count: u64) {
+        self.control
+            .as_ref()
+            .expect("agent control fixture")
+            .0
+            .await_started
+            .subscribe()
+            .wait_for(|entered| *entered >= count)
+            .await
+            .expect("MCP await admission observation");
+    }
+
+    pub async fn start_await_child(&self) -> (protocol::AgentId, Turn) {
+        let service = &self.control.as_ref().expect("agent control fixture").0;
+        let mut changed = service.subscribe_changes();
+        let index = service.children.lock().expect("children").len();
+        let prompt = super::launch_prompt();
+        service
+            .spawn(
+                service.root_id.clone(),
+                serde_json::json!({
+                    "workspace_roots": self.workspace_roots(),
+                    "backend_kind": self.backend(),
+                    "prompt": prompt,
+                    "name": "await-child",
+                }),
+            )
+            .await
+            .expect("start a real await child through Backend");
+        loop {
+            {
+                let children = service.children.lock().expect("children");
+                let child = &children[index];
+                assert!(child.failure.is_none(), "real await child backend failed");
+                if child.idle {
+                    let mut turn = self.turn(&prompt);
+                    turn.events = child.events.clone();
+                    turn.model_requests = child.requests.clone();
+                    super::assert_ready_handshake(&turn);
+                    return (child.launch.agent_id.clone(), turn);
+                }
+            }
+            changed
+                .changed()
+                .await
+                .expect("real child lifecycle observation");
+        }
     }
 
     /// Agent control plus the Tychat agent's `tyde-tychat` messaging tool.
@@ -3562,93 +3630,6 @@ pub fn run_codex_scenario(name: &'static str, profile: Profile, scenario: CodexS
         .expect("spawn conformance thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-}
-
-pub struct FinalResponseSettlement {
-    turn: Turn,
-    settled_in: Option<Duration>,
-}
-
-impl FinalResponseSettlement {
-    pub fn turn(&self) -> &Turn {
-        &self.turn
-    }
-    pub fn settled_in(&self) -> Option<Duration> {
-        self.settled_in
-    }
-}
-
-pub async fn ask_through_final_response<B: Backend>(
-    host: &mut Harness<B>,
-    agent: &Agent,
-    prompt: &str,
-    final_marker: &str,
-    settle_window: Duration,
-) -> FinalResponseSettlement {
-    send_prompt(host, agent, prompt).await;
-    let mut turn = host.turn(prompt);
-    let mut final_at: Option<tokio::time::Instant> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
-    loop {
-        let until = final_at.map(|at| at + settle_window).unwrap_or(deadline);
-        let event = tokio::time::timeout_at(
-            until,
-            host.events.as_mut().expect("backend stream").recv_backend(),
-        )
-        .await;
-        let event = match event {
-            Ok(Some(event)) => event,
-            Ok(None) => panic!("{}: backend closed awaiting final response", turn.label()),
-            Err(_) if final_at.is_some() => {
-                return FinalResponseSettlement {
-                    turn,
-                    settled_in: None,
-                };
-            }
-            Err(_) => panic!("{}: final response did not arrive", turn.label()),
-        };
-        eprintln!(
-            "{} backend event {}",
-            turn.label(),
-            match &event {
-                BackendEvent::Chat(_) => "chat",
-                BackendEvent::ModelRequestTokenUsage(_) => "model_usage",
-                BackendEvent::Compaction(_) => "compaction",
-                BackendEvent::ResumeReplayComplete(_) => "resume_barrier",
-            }
-        );
-        match event {
-            BackendEvent::Chat(event) => {
-                if matches!(&event, ChatEvent::StreamEnd(end) if end.message.content.contains(final_marker))
-                {
-                    final_at = Some(tokio::time::Instant::now());
-                }
-                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
-                turn.events.push(event);
-                if idle && final_at.is_some() {
-                    return FinalResponseSettlement {
-                        turn,
-                        settled_in: final_at.map(|at| at.elapsed()),
-                    };
-                }
-            }
-            BackendEvent::ModelRequestTokenUsage(usage) => {
-                if usage
-                    .current_context_usage
-                    .as_ref()
-                    .and_then(|value| value.known())
-                    .is_some()
-                {
-                    turn.context_usage_event_positions.push(turn.events.len());
-                }
-                turn.model_requests.push(usage);
-            }
-            BackendEvent::Compaction(_) => {}
-            BackendEvent::ResumeReplayComplete(_) => {
-                panic!("unexpected resume boundary in live events")
-            }
-        }
-    }
 }
 
 pub async fn request_plan_approval<B: Backend>(

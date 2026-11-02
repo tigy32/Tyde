@@ -44,6 +44,8 @@ pub struct ControlService<B: Backend> {
     config: BackendSpawnConfig,
     base_url: String,
     changed: watch::Sender<u64>,
+    pub await_held: watch::Sender<bool>,
+    pub(super) await_started: watch::Sender<u64>,
     backend_type: std::marker::PhantomData<B>,
 }
 
@@ -65,6 +67,8 @@ impl<B: Backend> ControlService<B> {
             .await
             .expect("bind agent-control fixture");
         let (changed, _) = watch::channel(0);
+        let (await_held, _) = watch::channel(false);
+        let (await_started, _) = watch::channel(0);
         let service = Arc::new(Self {
             root_id: protocol::AgentId(uuid::Uuid::new_v4().to_string()),
             children: Mutex::new(Vec::new()),
@@ -72,6 +76,8 @@ impl<B: Backend> ControlService<B> {
             config,
             base_url: format!("http://{}", listener.local_addr().expect("fixture address")),
             changed,
+            await_held,
+            await_started,
             backend_type: std::marker::PhantomData,
         });
         let endpoint = |surface| {
@@ -175,7 +181,7 @@ impl<B: Backend> ControlService<B> {
             .ok_or_else(|| format!("{id} is not a direct child of {caller}"))
     }
 
-    async fn spawn(
+    pub(super) async fn spawn(
         self: &Arc<Self>,
         caller: protocol::AgentId,
         args: Value,
@@ -312,6 +318,14 @@ impl<B: Backend> ControlService<B> {
         for id in &ids {
             self.child_commands(&caller, id)?;
         }
+        self.await_started.send_modify(|count| *count += 1);
+        let mut held = self.await_held.subscribe();
+        while *held.borrow_and_update() {
+            tokio::select! {
+                _ = context.ct.cancelled() => return Err("agent await request cancelled".to_owned()),
+                result = held.changed() => result.map_err(|error| error.to_string())?,
+            }
+        }
         let mut changed = self.changed.subscribe();
         let progress_token = context.meta.get_progress_token();
         let mut progress = 0.0;
@@ -392,7 +406,7 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let definitions = match self.surface {
+        let mut definitions = match self.surface {
             Surface::Await => vec![(
                 "tyde_await_agents",
                 "Wait for a direct child to stop thinking.",
@@ -420,6 +434,14 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
                 ),
             ],
         };
+        if self.surface == Surface::Await && *self.service.await_held.borrow() {
+            definitions.push((
+                "await_admitted",
+                "Return once the pending agent await has entered the MCP server.",
+                json!({}),
+                vec![],
+            ));
+        }
         let tools = definitions
             .into_iter()
             .map(|(name, description, properties, required)| {
@@ -464,6 +486,15 @@ impl<B: Backend> ServerHandler for Endpoint<B> {
                         .expect("tychat messages")
                         .push(text);
                     Ok(json!({"status":"queued"}))
+                }
+                "await_admitted" if self.surface == Surface::Await => {
+                    self.service
+                        .await_started
+                        .subscribe()
+                        .wait_for(|count| *count > 0)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(json!({"admitted": true}))
                 }
                 "tyde_await_agents" if self.surface == Surface::Await => {
                     self.service.await_children(caller, args, context).await

@@ -2545,3 +2545,32 @@ halt that reported ordinary completion before checking its stop flag. The bridge
 now orders terminal publication after the actual native interrupt response and
 preserves cancellation only when admitted before that generation's terminal.
 Already-produced terminals are never rewritten to cancel a successor.
+
+## Codex rollout ownership schema compatibility
+
+The Tychat incident had three foreground Tyde awaits whose native code-cell
+owners explicitly terminated, followed by a native completed turn. None of the
+three requests received a canonical tool completion, so the adapter correctly
+continued withholding `TypingStatusChanged(false)` for what appeared to be open
+foreground work. This was not a UI projection defect, nor a reason to infer idle
+from the final reply or elapsed time.
+
+The actual ownership trace used schema 2. Tyde's reader accepted only schema 1,
+then stopped reading on that incompatibility. The original reader was introduced
+by `53466da71cb2071a61eae2a1a63b8ea8233fd18b` (2026-09-02). Codex commit
+`5b792948f9414288b9196ae0559f218439affe20`, committed 2026-10-23 at 00:45:20 UTC,
+bumped the raw trace schema to 2 when adding accepted-history records. The
+`tool_call_started`, `tool_call_ended` and terminal `code_cell_ended` ownership
+fields consumed here did not change. Both known schemas therefore use the same
+ownership projection; unknown or malformed schema versions still fail explicitly.
+Neither turn completion nor a yielded code cell sweeps genuinely active work.
+
+`real_codex_abandoned_agent_await` crosses the production Backend and real Codex
+MCP transport. It holds an await response at the fixture, confirms request
+admission through another MCP call, and explicitly cancels the owning code cell with native
+`functions.wait(terminate:true)` before that response. It requires exactly one cancellation and a final
+reply followed by backend idle. A second turn keeps an awaited request active
+until explicit fixture release, then requires normal completion and idle. This
+replaces the old 75-second child sleep, one-second admission guess and ten-second
+settlement threshold with event/state synchronization. Only Codex exposes the
+code-mode ownership trace this provider-specific scenario exercises.
