@@ -7046,6 +7046,34 @@ let custom_agents = &state.custom_agent_store;
         {
             request.tyde_permissions = protocol::AgentTydePermissions::Root;
         }
+        if origin != AgentOrigin::Tychat
+            && agent_control_mcp_capabilities_for_settings(&host_settings, agent_depth).scope
+                == protocol::types::AgentControlMcpScope::ReviewOnly
+            && request
+                .resolved_spawn_config
+                .mcp_servers
+                .iter()
+                .any(|server| {
+                    server.name == crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME
+                })
+        {
+            request.resolved_spawn_config.builtin_steering = format!(
+                "Tyde agent depth {agent_depth} has reached the configured maximum {} \
+                 (the root counts as depth 1). Further implementation delegation is unavailable. \
+                 Canonical configured review remains available: use tyde_preview_review and \
+                 tyde_review, then the review finding tools. Do not substitute inline or proxy \
+                 review for the configured mode or change host settings to bypass the depth limit.",
+                host_settings.tyde_agent_control_max_depth,
+            );
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str("\n\n");
+            request
+                .resolved_spawn_config
+                .builtin_steering
+                .push_str(crate::agent_control_mcp::TYDE_PERMISSIONS_INSTRUCTIONS);
+        }
         if request
             .resolved_spawn_config
             .mcp_servers
@@ -14671,6 +14699,35 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         registry.ai_suggestion(review_id, suggestion).await
     }
 
+    pub(crate) async fn agent_control_mcp_capabilities(
+        &self,
+        caller: &AgentId,
+    ) -> Result<protocol::types::AgentControlMcpCapabilities, String> {
+        let caller = caller.clone();
+        let (depth, start, settings_store) = self
+            .state
+            .with(move |state| {
+                let depth = state
+                    .registry
+                    .agent_depth(&caller)
+                    .ok_or("Cannot determine the caller's Tyde agent depth")?;
+                let start = state
+                    .registry
+                    .agent_handle(&caller)
+                    .ok_or("The calling agent is no longer open")?
+                    .snapshot();
+                Ok::<_, String>((depth, start, state.settings_store.clone()))
+            })
+            .await?;
+        let mut settings = settings_store.get().map_err(|error| error.to_string())?;
+        if start.origin == AgentOrigin::Tychat {
+            settings.tyde_agent_control_mcp_enabled = true;
+        }
+        Ok(agent_control_mcp_capabilities_for_settings(
+            &settings, depth,
+        ))
+    }
+
     async fn validate_sub_agent_depth(&self, parent_agent_id: &AgentId) -> Result<(), String> {
         let (parent_depth, settings_store) = {
             {
@@ -18810,7 +18867,6 @@ self.state.with(move |state| {
         if !settings.review.aspects.values().any(|r| r.enabled) {
             return Err("Add and enable aspects in Settings → Review first".to_owned());
         }
-        self.validate_sub_agent_depth(&caller).await?;
         self.agent_review_handle(&caller, None)
             .await?
             .request_review(caller, request_id, scope, mode)
@@ -22684,6 +22740,26 @@ fn spawn_host_workflow_catalog_task(
         .expect("failed to spawn workflow catalog worker thread");
 }
 
+fn agent_control_mcp_capabilities_for_settings(
+    settings: &settings_model::HostSettings,
+    depth: u8,
+) -> protocol::types::AgentControlMcpCapabilities {
+    use protocol::types::{AgentControlMcpCapabilities, AgentControlMcpScope};
+    let max_depth = settings.tyde_agent_control_max_depth;
+    let scope = if !settings.tyde_agent_control_mcp_enabled {
+        AgentControlMcpScope::Disabled
+    } else if depth >= max_depth {
+        AgentControlMcpScope::ReviewOnly
+    } else {
+        AgentControlMcpScope::Delegation
+    };
+    AgentControlMcpCapabilities {
+        depth,
+        max_depth,
+        scope,
+    }
+}
+
 pub(crate) fn startup_mcp_servers_for_settings(
     settings: &settings_model::HostSettings,
     workspace_roots: &[String],
@@ -22712,10 +22788,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
         });
     }
 
-    if settings.tyde_agent_control_mcp_enabled
-        && agent_depth < settings.tyde_agent_control_max_depth
-        && !agent_control_mcp.url.is_empty()
-    {
+    if settings.tyde_agent_control_mcp_enabled && !agent_control_mcp.url.is_empty() {
         servers.push(StartupMcpServer {
             name: crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME.to_string(),
             supports_parallel_tool_calls: true,

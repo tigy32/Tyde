@@ -126,13 +126,32 @@ This exactly follows the rewrite philosophy:
 And matches the proven debug MCP pattern:
 
 - server starts an HTTP MCP listener on `127.0.0.1:0`
-- when spawning an agent, if `tyde_agent_control_mcp_enabled` is true and the
-  agent is below `tyde_agent_control_max_depth`, the server adds the
-  agent-control MCP URL to `startup_mcp_servers`
-- depth counts the root agent as level 1; agents at the configured maximum
-  depth receive no agent-control or await tools, and the server rejects any
-  authenticated attempt to create another level
+- when spawning an agent, if `tyde_agent_control_mcp_enabled` is true, the
+  server registers canonical agent-control and await MCP servers
+- depth counts the root agent as level 1. Below `tyde_agent_control_max_depth`,
+  agents receive delegation tools and config MCP. At the maximum, they receive
+  only the read-only `tyde_config_get_permissions` self-query plus configured
+  review, preview and finding tools; no config MCP or recursive implementation
+  delegation. The self-query uses the same current role/guidance source as
+  config MCP and accepts no target agent or configuration arguments. Discovery and dispatch enforce the same scope,
+  and the spawn path independently rejects further implementation levels
+- configured reviewers use the existing dedicated reviewer path, not ordinary
+  implementation-spawn admission: native author forks remain enforced read-only
+  with agent delegation excluded and only review-feedback MCP
+- `tyde_spawn_agent` returns current server-owned `agent_control` capabilities:
+  root-inclusive `depth`, `max_depth`, and `scope` (`delegation`, `review_only`,
+  or `disabled`). This is not an MCP handshake or callable-tool attestation.
+  Leaf launch steering explains the same depth boundary
+- disabling agent-control MCP still omits its registration and rejects stale
+  ordinary callers; review enablement and unsupported-fork failures remain
+  independent
 - the agent discovers the MCP surface automatically
+
+The original registration boundary was introduced by `481fe84e` (2026-08-12).
+Review admission reused implementation depth in `847c4572` (2026-09-21), and
+config MCP gained the depth condition in `cf1b5c29` (2026-10-13). Together these
+made an allowed leaf worker unable to request its configured review; this was
+not evidence of a provider transport or authorization failure.
 
 ---
 

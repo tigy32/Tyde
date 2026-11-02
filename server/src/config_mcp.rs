@@ -516,9 +516,10 @@ impl TydeConfigMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let result = async {
             let caller = self.host.config_mcp_caller(&parts).await?;
-            let role = self.host.tyde_permissions_for_caller(caller.as_ref()).await?;
-            Ok::<_, String>(json!({"tyde_permissions": role, "guidance": crate::agent_control_mcp::tyde_permissions_guidance(role)}))
-        }.await;
+            crate::agent_control_mcp::current_permissions_response(&self.host, caller.as_ref())
+                .await
+        }
+        .await;
         match result {
             Ok(value) => ok_json(value),
             Err(error) => Ok(err_text(error)),

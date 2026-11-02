@@ -6092,6 +6092,7 @@ async fn review_modes_share_persisted_aspects_and_exact_source_assignments() {
     };
     let mut fixture = Fixture::new_with_runtime_config_and_settings_file(runtime, &json!({"settings": {
         "enabled_backends": ["claude", "codex", "grok"], "default_backend": "claude",
+        "tyde_agent_control_max_depth": 1,
         "review": {"enabled": true, "default_mode": "inline", "team": {
             "layout": "every_combination", "reviewers": [
                 {"id": "author", "name": "Current agent", "target": {"kind": "fork_current_agent"}},
@@ -6261,7 +6262,10 @@ async fn review_modes_share_persisted_aspects_and_exact_source_assignments() {
         json!({"request_id": "single", "mode": "single_reviewer"}),
     )
     .await;
-    assert!(!failed);
+    assert!(
+        !failed,
+        "A max-depth author must be admitted to configured review: {result}"
+    );
     assert_eq!(result["status"], "completed");
     let single = subscribe_review(&mut client, &review.id).await;
     assert_eq!(single.ai_reviewer.rounds[0].reviewers.len(), 1);
@@ -6787,4 +6791,187 @@ async fn review_feedback_reaches_agent_control_child_but_not_reviewer() {
     assert!(delivered.contains("The user completed a review with 2 comments."));
     assert_eq!(delivered.matches("First implementer comment.").count(), 1);
     assert_eq!(delivered.matches("Second implementer comment.").count(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires TYDE_RUN_REAL_AI_TESTS=1 and real Codex credentials"]
+async fn real_codex_leaf_requests_configured_native_review() {
+    tokio::time::timeout(Duration::from_secs(600), async {
+    assert_eq!(std::env::var("TYDE_RUN_REAL_AI_TESTS").as_deref(), Ok("1"));
+    let model =
+        std::env::var("TYDE_CODEX_TEST_MODEL").expect("Choose an explicit cheap Codex model");
+    let settings = json!({"settings": {
+        "enabled_backends": ["codex"], "default_backend": "codex",
+        "resume_previous_agents": false,
+        "tyde_agent_control_mcp_enabled": true, "tyde_agent_control_max_depth": 3,
+        "background_agent_features": {"auto_generate_agent_names": false},
+        "review": {"enabled": true, "default_mode": "single_reviewer", "aspects": {
+            "correctness": {"name": "Correctness", "enabled": true,
+                "instructions": "Read the diff using read_review_git. Check that the added extra function returns 2. If correct, finish without findings. Do not run builds, edit files, or delegate."}
+        }}
+    }});
+    let fixture =
+        Fixture::new_with_real_backend_and_settings_file(BackendKind::Codex, &settings.to_string())
+            .await;
+    let root = tempfile::tempdir().unwrap();
+    seed_repo(root.path());
+    let mut client = fixture.connect().await;
+    let project = create_project(&mut client, root.path()).await;
+    let mut parent = None;
+    let mut root_agent = None;
+    let mut workspace_review = None;
+    let mut author = None;
+    let mut author_session = None;
+    for depth in 1..=3 {
+        let prompt = if depth < 3 {
+            "Reply READY only. Do not use tools."
+        } else {
+            "This is a bounded MCP availability canary. Do not edit files, run commands, build, or spawn agents. Discover canonical Tyde tools. FIRST call tyde_config_get_permissions as a separate completed tool call. Read and obey its current role guidance before any other Tyde control. Only then call tyde_preview_review without changing the mode, then call tyde_review with request_id leaf-native-review and no mode override. Await its completion. Then call tyde_list_review_findings on the returned review_id with limit 1. Do not use inline or proxy review. Finish with DONE only after configured review completes."
+        };
+        client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some(format!("Codex leaf canary depth {depth}")),
+                custom_agent_id: None,
+                parent_agent_id: parent.clone(),
+                project_id: Some(project.id.clone()),
+                params: SpawnAgentParams::New {
+                    workspace_roots: project_roots(&project),
+                    prompt: prompt.to_owned(),
+                    images: None,
+                    backend_kind: BackendKind::Codex,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: Some(
+                        serde_json::from_value(json!({
+                            "model": {"string": model}, "reasoning_effort": {"string": "low"}
+                        }))
+                        .unwrap(),
+                    ),
+                },
+            })
+            .await
+            .unwrap();
+        let agent = expect_new_agent(&mut client, "real Codex canary startup").await;
+        let mut session = None;
+        let mut idle = false;
+        let mut tool_events = Vec::new();
+        next_frame_matching_on(&mut client, "real Codex canary settled", |env| {
+            if env.stream != agent.instance_stream {
+                return false;
+            }
+            match env.kind {
+                FrameKind::AgentStart => {
+                    session = env.parse_payload::<AgentStartPayload>().unwrap().session_id;
+                }
+                FrameKind::AgentBootstrap => {
+                    let bootstrap: protocol::AgentBootstrapPayload = env.parse_payload().unwrap();
+                    idle |= bootstrap.status == protocol::AgentControlStatus::Idle;
+                    for event in bootstrap.events {
+                        match event {
+                            AgentBootstrapEvent::AgentStart(start) => session = start.session_id,
+                            AgentBootstrapEvent::ChatEvent(event) => tool_events.push(event),
+                            _ => {}
+                        }
+                    }
+                }
+                FrameKind::ChatEvent => {
+                    let event = env.parse_payload::<ChatEvent>().unwrap();
+                    idle |= matches!(event, ChatEvent::TypingStatusChanged(false));
+                    tool_events.push(event);
+                }
+                FrameKind::AgentError => {
+                    panic!("Real Codex canary reported an agent error");
+                }
+                _ => {}
+            }
+            idle && session.is_some()
+        })
+        .await;
+        if depth == 3 {
+            let mut permission_call = None;
+            let mut permissions_read = false;
+            let mut preview_seen = false;
+            let mut review_seen = false;
+            for event in tool_events {
+                match event {
+                    ChatEvent::ToolRequest(request) if request.tool_name.ends_with("tyde_config_get_permissions") => {
+                        permission_call = Some(request.tool_call_id);
+                    }
+                    ChatEvent::ToolExecutionCompleted(completed)
+                        if permission_call.as_ref() == Some(&completed.tool_call_id) => {
+                        let protocol::ToolExecutionOutcome::Succeeded {
+                            result: protocol::ToolExecutionResult::Other { result }
+                        } = completed.outcome else {
+                            panic!("Leaf self-permission query must succeed");
+                        };
+                        let text = result["content"][0]["text"].as_str().expect("permission result text");
+                        let permissions: serde_json::Value = serde_json::from_str(text).expect("permission result JSON");
+                        assert_eq!(permissions["tyde_permissions"], "agent");
+                        assert!(permissions["guidance"].as_str().expect("role guidance").contains("own sub-agents"));
+                        permissions_read = true;
+                    }
+                    ChatEvent::ToolRequest(request) if request.tool_name.ends_with("tyde_preview_review") => {
+                        assert!(permissions_read, "The real leaf must read current permissions before preview");
+                        preview_seen = true;
+                    }
+                    ChatEvent::ToolRequest(request) if request.tool_name.ends_with("tyde_review") => {
+                        assert!(permissions_read && preview_seen, "The real leaf must read current permissions and preview before review");
+                        review_seen = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(permissions_read && preview_seen && review_seen,
+                "The real leaf must exercise permissions, preview and configured review in order");
+        }
+        if depth == 1 {
+            workspace_review = Some(create_review(&mut client, &project, &agent).await.id);
+            root_agent = Some(agent.clone());
+        }
+        parent = Some(agent.agent_id.clone());
+        author_session = session;
+        author = Some(agent);
+    }
+    let author = author.unwrap();
+    let caller = fixture.agent_control_caller(&author.agent_id).await;
+    let (failed, preview) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_preview_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed, "Leaf preview failed");
+    let plan: protocol::ReviewPlan = serde_json::from_value(preview).unwrap();
+    assert_eq!(plan.mode, protocol::ReviewMode::SingleReviewer);
+    assert_eq!(plan.assignments[0].fork_from_session_id, author_session);
+    let review_id = workspace_review.unwrap();
+    let review = subscribe_review(&mut client, &review_id).await;
+    let round = review
+        .ai_reviewer
+        .rounds
+        .iter()
+        .find(|round| round.request_id.as_deref() == Some("leaf-native-review"))
+        .expect("The real leaf author must invoke configured review itself");
+    assert_eq!(round.mode, Some(protocol::ReviewMode::SingleReviewer));
+    assert_eq!(round.requested_by.as_ref(), Some(&author.agent_id));
+    assert_eq!(round.reviewers.len(), 1);
+    assert_eq!(round.reviewers[0].status, ReviewAiReviewerStatus::Completed);
+    eprintln!(
+        "Real Codex leaf review: depth=3 max_depth=3 permissions_before_preview_and_review=true configured_native_review=completed reviewer_count=1 model={model}"
+    );
+    client
+        .close_agent(&root_agent.unwrap().instance_stream)
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut client, "owned real canary tree closed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|closed| closed.agent_id == author.agent_id)
+    })
+    .await;
+    }).await.expect("Real Codex leaf canary hung for ten minutes");
 }

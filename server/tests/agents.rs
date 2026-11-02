@@ -8391,8 +8391,10 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     let mut fixture = Fixture::new().await;
     let parent = spawn_agent_control_parent(&mut fixture, "depth-root").await;
     let parent_caller = fixture.agent_control_caller(&parent.agent_id).await;
-    let child_id = mcp_spawn_agent_as(
+    let child_response = mcp_tool_call_as(
         &parent_caller,
+        false,
+        "tyde_spawn_agent",
         json!({
             "workspace_roots": ["/tmp/depth-child"],
             "prompt": "depth two",
@@ -8401,6 +8403,14 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
         }),
     )
     .await;
+    let child_result = mcp_success_json(&child_response);
+    assert_eq!(
+        child_result["agent_control"],
+        json!({
+            "depth": 2, "max_depth": 3, "scope": "delegation"
+        })
+    );
+    let child_id = protocol::AgentId(child_result["agent_id"].as_str().unwrap().to_owned());
     let child =
         expect_replayed_new_agent(&mut fixture.client, &child_id, "depth child NewAgent").await;
     expect_agent_start_on_stream(
@@ -8417,8 +8427,10 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     .await;
 
     let child_caller = fixture.agent_control_caller(&child_id).await;
-    let grandchild_id = mcp_spawn_agent_as(
+    let grandchild_response = mcp_tool_call_as(
         &child_caller,
+        false,
+        "tyde_spawn_agent",
         json!({
             "workspace_roots": ["/tmp/depth-grandchild"],
             "prompt": "depth three",
@@ -8427,6 +8439,15 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
         }),
     )
     .await;
+    let grandchild_result = mcp_success_json(&grandchild_response);
+    assert_eq!(
+        grandchild_result["agent_control"],
+        json!({
+            "depth": 3, "max_depth": 3, "scope": "review_only"
+        })
+    );
+    let grandchild_id =
+        protocol::AgentId(grandchild_result["agent_id"].as_str().unwrap().to_owned());
     let grandchild = expect_replayed_new_agent(
         &mut fixture.client,
         &grandchild_id,
@@ -8452,15 +8473,83 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
         .await
         .expect("read depth-three agent");
     assert!(
-        !read
-            .events
-            .iter()
-            .any(|event| chat_event_contains(event, "startup_mcp_servers")),
-        "depth-three agents must not receive Tyde agent-control MCP tools: {:?}",
-        read.events
+        read.events.iter().any(|event| chat_event_contains(
+            event,
+            "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)]"
+        )),
+        "A leaf must retain review registration without config or delegation tools"
     );
 
+    assert!(
+        read.events.iter().any(|event| chat_event_contains(
+            event,
+            "Tyde agent depth 3 has reached the configured maximum 3 (the root counts as depth 1)"
+        )),
+        "The leaf must receive its truthful depth and review scope"
+    );
+    assert!(
+        !read.events.iter().any(|event| chat_event_contains(
+            event,
+            "Check `tyde_list_launch_options`, then spawn tasks"
+        )),
+        "The leaf must not receive implementation delegation guidance"
+    );
     let grandchild_caller = fixture.agent_control_caller(&grandchild_id).await;
+    let permissions = mcp_success_json(
+        &mcp_tool_call_as(
+            &grandchild_caller,
+            false,
+            "tyde_config_get_permissions",
+            json!({}),
+        )
+        .await,
+    );
+    assert_eq!(permissions["tyde_permissions"], "agent");
+    assert!(
+        permissions["guidance"]
+            .as_str()
+            .expect("current role guidance")
+            .contains("own sub-agents")
+    );
+    let listed = post_json_with_headers(
+        &grandchild_caller.url,
+        &[("Authorization", grandchild_caller.authorization.as_str())],
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    let mut names = listed["result"]["tools"]
+        .as_array()
+        .expect("leaf control tool inventory")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "tyde_config_get_permissions",
+            "tyde_edit_review_comment",
+            "tyde_list_review_findings",
+            "tyde_list_reviews",
+            "tyde_preview_review",
+            "tyde_read_review_finding",
+            "tyde_resolve_review_findings",
+            "tyde_review_history"
+        ]
+    );
+    let listed = post_json_with_headers(
+        &grandchild_caller.await_url,
+        &[("Authorization", grandchild_caller.authorization.as_str())],
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .expect("leaf await tool inventory")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["tyde_review"]);
     let error = mcp_spawn_agent_error_as(
         &grandchild_caller,
         json!({
@@ -8473,6 +8562,33 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     assert!(
         error.contains("depth limit of 3 reached"),
         "depth refusal must explain the configured limit: {error}"
+    );
+    let write = fixture
+        .client
+        .replace_setting("/tyde_agent_control_mcp_enabled", false, true)
+        .await
+        .expect("disable control in isolated fixture");
+    expect_settings_write_applied(&mut fixture.client, &write, "disable control").await;
+    let error = mcp_spawn_agent_error_as(
+        &parent_caller,
+        json!({
+            "workspace_roots": ["/tmp/disabled-child"], "prompt": "must be rejected",
+            "backend_kind": "claude"
+        }),
+    )
+    .await;
+    assert!(error.contains("disabled in host settings"));
+    let listed = post_json_with_headers(
+        &grandchild_caller.await_url,
+        &[("Authorization", grandchild_caller.authorization.as_str())],
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+    )
+    .await;
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .expect("disabled inventory")
+            .is_empty()
     );
 }
 
@@ -9024,6 +9140,20 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             env.stream == role_stream && env.kind == FrameKind::AgentTydePermissionsChanged
         })
         .await;
+        let permissions = mcp_success_json(
+            &mcp_tool_call_as(
+                &child_caller,
+                false,
+                "tyde_config_get_permissions",
+                json!({}),
+            )
+            .await,
+        );
+        assert_eq!(
+            permissions["tyde_permissions"],
+            serde_json::to_value(access).unwrap(),
+            "The self-query must read the current human-assigned role, not launch-time guidance"
+        );
         for await_surface in [false, true] {
             let url = if await_surface {
                 &child_caller.await_url

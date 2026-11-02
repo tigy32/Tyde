@@ -301,6 +301,22 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn new_with_real_backend_and_settings_file(
+        backend_kind: BackendKind,
+        settings: &str,
+    ) -> Self {
+        Self::new_with_store_files_inner(
+            server::HostRuntimeConfig::default(),
+            false,
+            Some(vec![backend_kind]),
+            false,
+            None,
+            Some(settings),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
     pub async fn new_with_test_backend(backend_kind: BackendKind) -> Self {
         Self::new_with_runtime_config_inner(
             server::HostRuntimeConfig::default(),

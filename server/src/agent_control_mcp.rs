@@ -69,7 +69,54 @@ pub(crate) fn tyde_permissions_guidance(role: protocol::AgentTydePermissions) ->
     }
 }
 
+pub(crate) async fn current_permissions_response(
+    host: &HostHandle,
+    caller: Option<&AgentId>,
+) -> Result<serde_json::Value, String> {
+    let role = host.tyde_permissions_for_caller(caller).await?;
+    Ok(json!({"tyde_permissions": role, "guidance": tyde_permissions_guidance(role)}))
+}
+
 pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.";
+
+fn agent_control_tool_allowed(
+    capabilities: &protocol::types::AgentControlMcpCapabilities,
+    tool: &str,
+) -> bool {
+    match capabilities.scope {
+        protocol::types::AgentControlMcpScope::Disabled => false,
+        protocol::types::AgentControlMcpScope::Delegation => true,
+        protocol::types::AgentControlMcpScope::ReviewOnly => matches!(
+            tool,
+            "tyde_config_get_permissions"
+                | "tyde_review"
+                | "tyde_preview_review"
+                | "tyde_list_reviews"
+                | "tyde_list_review_findings"
+                | "tyde_read_review_finding"
+                | "tyde_edit_review_comment"
+                | "tyde_resolve_review_findings"
+                | "tyde_review_history"
+        ),
+    }
+}
+
+fn agent_control_tool_denial(
+    capabilities: &protocol::types::AgentControlMcpCapabilities,
+) -> String {
+    match capabilities.scope {
+        protocol::types::AgentControlMcpScope::Disabled => {
+            "Tyde agent-control MCP is disabled in host settings".to_owned()
+        }
+        protocol::types::AgentControlMcpScope::ReviewOnly => format!(
+            "Tyde sub-agent depth limit of {} reached at root-inclusive depth {}; only self-permission and configured review tools are available",
+            capabilities.max_depth, capabilities.depth,
+        ),
+        protocol::types::AgentControlMcpScope::Delegation => {
+            "Tool is not available on this agent-control MCP endpoint".to_owned()
+        }
+    }
+}
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 const AWAIT_TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
@@ -603,6 +650,7 @@ pub(crate) struct SpawnAgentResult {
     pub project_id: Option<ProjectId>,
     name: String,
     status: AgentControlStatus,
+    agent_control: protocol::types::AgentControlMcpCapabilities,
 }
 
 #[derive(Debug, Serialize)]
@@ -1229,6 +1277,31 @@ pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> serde_json::
 
 #[tool_router]
 impl TydeAgentControlMcpServer {
+    #[tool(
+        description = "Read your own current human-assigned Tyde permissions and role guidance before using Tyde controls. Does not read or change host configuration or another agent's permissions.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tyde_config_get_permissions(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_config_get_permissions").await {
+                Ok(caller) => caller,
+                Err(error) => return Ok(err_text(error)),
+            };
+        match current_permissions_response(&self.host, Some(&caller)).await {
+            Ok(value) => ok_json(value),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
     #[tool(
         description = "Inline returns all selected aspect guidance to you for self-review, without spawning agents or creating findings. Single reviewer genuinely forks your native session, inheriting backend/model. Review team uses the configured source/layout schedule (per_aspect, per_reviewer, every_combination). Unsupported forks fail explicitly; no fresh-agent substitution. Use tyde_preview_review to inspect the actual schedule. Non-inline modes event-wait for advisory completion without a local work timer. Returns only review_id, completed/incomplete/failed status, new_finding_count and outstanding_count. Completed means reviewers finished, not approval or coverage. Use a new request_id for a follow-up; repeat the same request_id to reattach after cancellation without starting duplicate work. Findings are never injected into chat. List outstanding findings, read details by ID, edit text without resolving, or batch-resolve with concrete reasons. Failures are never clean reviews. Working tree is default; committed_range requires exact root/base_oid/tip_oid. No commits or stashes are created."
     )]
@@ -2396,6 +2469,18 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 None => (false, false),
             };
         let mut tools = self.tool_router.list_all();
+        if !swarm_caller
+            && let Some(parts) = context.extensions.get::<axum::http::request::Parts>()
+            && let Some(caller) = authenticated_caller_from_parts(&self.credentials, parts)
+                .map_err(|error| McpError::invalid_params(error, None))?
+        {
+            let capabilities = self
+                .host
+                .agent_control_mcp_capabilities(&caller)
+                .await
+                .map_err(|error| McpError::internal_error(error, None))?;
+            tools.retain(|tool| agent_control_tool_allowed(&capabilities, tool.name.as_ref()));
+        }
         tools.retain(|tool| match self.surface {
             AgentControlMcpSurface::Control => {
                 !matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
@@ -2529,6 +2614,13 @@ impl ServerHandler for TydeAgentControlMcpServer {
                                 }
                             }
                             Ok(false) => {
+                                let capabilities = match self.host.agent_control_mcp_capabilities(&caller).await {
+                                    Ok(capabilities) => capabilities,
+                                    Err(error) => return Ok(err_text(error)),
+                                };
+                                if !agent_control_tool_allowed(&capabilities, request.name.as_ref()) {
+                                    return Ok(err_text(agent_control_tool_denial(&capabilities)));
+                                }
                                 // Registered parked ordinary actors retain management authority;
                                 // closing/execution restrictions belong to their per-tool lifecycle checks.
                                 tracing::debug!(
@@ -2872,7 +2964,9 @@ pub(crate) async fn do_spawn_agent(
         .find(|start| start.agent_id == agent_id)
         .ok_or_else(|| format!("spawned agent {} missing from host registry", agent_id.0))?;
 
+    let agent_control = host.agent_control_mcp_capabilities(&agent_id).await?;
     Ok(SpawnAgentResult {
+        agent_control,
         agent_id,
         project_id: start.project_id,
         name: start.name,

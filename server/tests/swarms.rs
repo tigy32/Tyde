@@ -5159,6 +5159,31 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
     let swarm = scenario.launched(2).await;
     let mocks = controls(&scenario, &swarm).await;
     scenario.pause(&swarm.id).await;
+    // Ordinary delegation settings must not change an existing swarm's tool scope.
+    let write = scenario
+        .fixture
+        .client
+        .replace_setting("/tyde_agent_control_max_depth", 1, 3)
+        .await
+        .expect("set isolated depth boundary");
+    fixture::expect_settings_write_applied(
+        &mut scenario.fixture.client,
+        &write,
+        "set depth boundary",
+    )
+    .await;
+    let write = scenario
+        .fixture
+        .client
+        .replace_setting("/tyde_agent_control_mcp_enabled", false, true)
+        .await
+        .expect("disable ordinary control in isolated fixture");
+    fixture::expect_settings_write_applied(
+        &mut scenario.fixture.client,
+        &write,
+        "disable ordinary control",
+    )
+    .await;
     let first = &swarm.members[0];
     let second = &swarm.members[1];
     let caller = scenario
@@ -5454,6 +5479,27 @@ async fn authenticated_mcp_members_share_boards_without_author_spoofing_or_priva
     assert_eq!(shared.posts.len(), 1);
     assert!(shared.posts[0].id == reply.id);
 
+    // Restore ordinary settings before exercising the existing nonmember controls.
+    let write = scenario
+        .fixture
+        .client
+        .replace_setting("/tyde_agent_control_max_depth", 3, 1)
+        .await
+        .expect("restore isolated depth setting");
+    fixture::expect_settings_write_applied(&mut scenario.fixture.client, &write, "restore depth")
+        .await;
+    let write = scenario
+        .fixture
+        .client
+        .replace_setting("/tyde_agent_control_mcp_enabled", true, false)
+        .await
+        .expect("restore ordinary control setting");
+    fixture::expect_settings_write_applied(
+        &mut scenario.fixture.client,
+        &write,
+        "restore ordinary control",
+    )
+    .await;
     let normal_name = "Ordinary nonmember";
     scenario
         .fixture
