@@ -4773,6 +4773,7 @@ kbd {
 }
 
 .pinned-question-bar {
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--space-2);
@@ -4784,6 +4785,9 @@ kbd {
 }
 
 .pinned-question-dot {
+    position: relative;
+    z-index: 1;
+    pointer-events: none;
     flex: 0 0 6px;
     width: 6px;
     height: 6px;
@@ -4792,11 +4796,17 @@ kbd {
 }
 
 .pinned-question-title {
+    position: relative;
+    z-index: 1;
+    pointer-events: none;
     font-weight: 500;
     color: var(--text-primary);
 }
 
 .pinned-question-pager {
+    position: relative;
+    z-index: 1;
+    margin-right: 28px;
     display: inline-flex;
     align-items: center;
     gap: 4px;
@@ -4841,20 +4851,17 @@ kbd {
 .pinned-question-toggle {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    margin-left: auto;
-    width: 24px;
-    height: 24px;
-    padding: 0;
+    position: absolute;
+    inset: 0;
+    justify-content: flex-end;
+    width: 100%;
+    height: 100%;
+    padding: 0 var(--space-3);
     border: 0;
-    border-radius: 4px;
+    border-radius: 0;
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
-}
-
-.pinned-question-pager + .pinned-question-toggle {
-    margin-left: 4px;
 }
 
 .pinned-question-toggle:hover {

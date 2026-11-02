@@ -657,9 +657,9 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
     });
 
-    let pending_questions: Signal<Vec<protocol::ToolRequest>> = Signal::derive({
+    let pending_questions: Signal<Vec<protocol::ToolRequest>> = Memo::new({
         let state = state.clone();
-        move || {
+        move |_| {
             let Some(parent) = agent_ref.get() else {
                 return Vec::new();
             };
@@ -677,7 +677,8 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                 .pending_user_questions
                 .with(|map| map.get(&parent.agent_id).cloned().unwrap_or_default())
         }
-    });
+    })
+    .into();
     let has_questions = move || !pending_questions.with(|questions| questions.is_empty());
     let question_open = RwSignal::new(false);
     let active_question_call_id = RwSignal::new(None::<String>);
@@ -971,7 +972,12 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                     />
                 </Show>
                 <Show when=move || has_work() || !question_open.get()>
-                    <button type="button" class="inflight-tray-header" on:click=on_toggle>
+                    <button type="button" class="inflight-tray-header" on:click=on_toggle
+                        aria-expanded=move || {
+                            (has_work() && expanded.get()
+                                && (!has_questions() || question_open.get())).to_string()
+                        }
+                    >
                         <span
                             class="inflight-tray-chevron"
                             class:expanded=move || {
@@ -1058,9 +1064,12 @@ fn PinnedQuestionSection(
                 .unwrap_or(0)
         })
     });
-    let active_request = Signal::derive(move || {
+    // Pane focus and unrelated agent events must not rebuild an answer form
+    // between pointer-down and click, including its text-node hit target.
+    let active_request = Memo::new(move |_| {
+        let owner = agent_ref.get();
         let idx = active_index.get();
-        pending_questions.with(|questions| questions.get(idx).cloned())
+        pending_questions.with(|questions| questions.get(idx).cloned().map(|q| (owner, q)))
     });
 
     view! {
@@ -1143,7 +1152,7 @@ fn PinnedQuestionSection(
             </div>
             <div class="pinned-question-body" data-testid="pinned-question-body">
                 {move || {
-                    active_request.get().map(|request| {
+                    active_request.get().map(|(_, request)| {
                         crate::components::tool_card::ask_user_question::render(
                             agent_ref,
                             &request.tool_call_id,
@@ -4973,9 +4982,14 @@ mod wasm_tests {
         js_sys::eval(
             r#"
             window.__pinnedAnswerSends = 0;
+            window.__pinnedAnswerFrames = [];
+            window.__pinnedAnswerResolvers = [];
             window.__TAURI__.core.invoke = (command, args) => {
-                if (command === 'send_host_line' && JSON.parse(args.line).kind === 'human_input')
+                if (command === 'send_host_line' && JSON.parse(args.line).kind === 'human_input') {
                     window.__pinnedAnswerSends++;
+                    window.__pinnedAnswerFrames.push(JSON.parse(args.line));
+                    return new Promise(resolve => window.__pinnedAnswerResolvers.push(resolve));
+                }
                 return Promise.resolve();
             };
         "#,
@@ -5118,8 +5132,12 @@ mod wasm_tests {
         container.style().set_property("height", "720px").unwrap();
         let mount_state = state.clone();
         let handle = mount_to(container.clone(), move || {
+            let center_zone = mount_state.center_zone;
             provide_context(mount_state);
-            let agent_ref = Signal::derive(|| Some(parent_ref()));
+            let agent_ref = Signal::derive(move || {
+                center_zone.track();
+                Some(parent_ref())
+            });
             let q1_tool = Signal::derive(move || {
                 inline_q1_entry.with(|entry| entry.tool_requests[0].clone())
             });
@@ -5175,6 +5193,40 @@ mod wasm_tests {
         );
         assert_question_action_visible(&container);
         let height_state_2 = drawer.get_bounding_client_rect().height();
+        // Browser hit testing, rather than .click() on a span, exercises the
+        // label, whitespace and caret through the same native button.
+        for point in ["label", "space", "caret"] {
+            let hit = js_sys::Function::new_with_args(
+                "root, point",
+                r#"
+                const bar = root.querySelector('.pinned-question-bar');
+                bar.scrollIntoView({block: 'center'});
+                const toggle = bar.querySelector('button[aria-label="Collapse question"]');
+                const target = point === 'label' ? bar.querySelector('.pinned-question-title')
+                    : point === 'caret' ? bar.querySelector('svg') : bar;
+                const r = target.getBoundingClientRect();
+                const x = r.left + r.width / 2;
+                const hit = document.elementFromPoint(x, r.top + r.height / 2);
+                if (hit?.closest('button') !== toggle) return false;
+                toggle.focus();
+                if (document.activeElement !== toggle) return false;
+                hit.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                return true;
+            "#,
+            )
+            .call2(&wasm_bindgen::JsValue::NULL, &container, &point.into())
+            .unwrap();
+            assert_eq!(
+                hit.as_bool(),
+                Some(true),
+                "the entire header is one keyboard-focusable toggle: {point}"
+            );
+            settle_question_drawer(&container).await;
+            assert_eq!(count(&container, ".pinned-question-section"), 0);
+            tab.click();
+            settle_question_drawer(&container).await;
+            assert_eq!(count(&container, ".pinned-question-section"), 1);
+        }
 
         // State 3 (fully expanded): click activity tab to expand unchanged agents/commands beneath question.
         tab.click();
@@ -5315,6 +5367,18 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<web_sys::HtmlButtonElement>()
             .unwrap();
+        let text_hit_target = submit_btn.first_child().expect("submit label hit target");
+        state.center_zone.update(|_| {});
+        state.agents.update(|_| {});
+        state.pending_user_questions.update(|_| {});
+        settle_question_drawer(&container).await;
+        assert!(
+            submit_btn
+                .first_child()
+                .unwrap()
+                .is_same_node(Some(&text_hit_target)),
+            "pane focus and unrelated updates must preserve the native click hit target"
+        );
         submit_btn.click();
         settle_question_drawer(&container).await;
         assert!(
@@ -5340,6 +5404,87 @@ mod wasm_tests {
             Some(1.0),
             "pinned and inline controls emit exactly one answer together"
         );
+
+        let first: protocol::HumanInputPayload = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__pinnedAnswerFrames[0].payload)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.input.message, "Decision: us-west");
+        let stream = parent_agent().instance_stream;
+        crate::dispatch::clear_stream_seq_for_tests("host-1", &stream);
+        let verdict = |seq, id, status| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "host-1",
+                Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::HumanInputStatus,
+                    seq,
+                    &protocol::HumanInputStatusPayload {
+                        agent_id: parent_id.clone(),
+                        id,
+                        status,
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        verdict(
+            0,
+            first.id.clone(),
+            protocol::HumanInputStatus::Refused {
+                reason: "Fixture answer refused".to_owned(),
+            },
+        );
+        settle_question_drawer(&container).await;
+        assert!(!submit_btn.disabled() && !inline_submit.disabled());
+        assert!(text(&container).contains("Fixture answer refused"));
+        assert_eq!(
+            q1_first_opt.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        js_sys::eval("window.__pinnedAnswerResolvers[0]()").unwrap();
+        settle_question_drawer(&container).await;
+        assert!(
+            !submit_btn.disabled(),
+            "late IPC success cannot erase refusal or relock the draft"
+        );
+        inline_submit.click();
+        settle_question_drawer(&container).await;
+        assert_eq!(
+            js_sys::eval("window.__pinnedAnswerSends").unwrap().as_f64(),
+            Some(2.0)
+        );
+        let second: protocol::HumanInputPayload = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__pinnedAnswerFrames[1].payload)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first.id, second.id);
+        verdict(
+            1,
+            first.id,
+            protocol::HumanInputStatus::Accepted { warning: None },
+        );
+        settle_question_drawer(&container).await;
+        assert!(
+            submit_btn.disabled(),
+            "an old verdict cannot settle the new submission"
+        );
+        verdict(
+            2,
+            second.id,
+            protocol::HumanInputStatus::Accepted { warning: None },
+        );
+        js_sys::eval("window.__pinnedAnswerResolvers[1]()").unwrap();
+        settle_question_drawer(&container).await;
+        assert!(submit_btn.disabled() && inline_submit.disabled());
+        assert!(!text(&container).contains("Fixture answer refused"));
 
         // Server completes q-1 -> pinned drawer retires q-1 and advances to q-2 with its draft intact.
         apply_chat_event_from(
@@ -5378,6 +5523,67 @@ mod wasm_tests {
             Some("true"),
             "q-2 draft selection remains intact after q-1 resolves"
         );
+        let custom = container
+            .query_selector(".pinned-question-body input")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        custom.set_value("Fixture free text");
+        custom
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        settle_question_drawer(&container).await;
+        state.center_zone.update(|_| {});
+        state.pending_user_questions.update(|_| {});
+        settle_question_drawer(&container).await;
+        assert_eq!(custom.value(), "Fixture free text");
+        let submit = container
+            .query_selector(".pinned-question-body .ask-question-submit")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        submit.click();
+        settle_question_drawer(&container).await;
+        assert_eq!(
+            js_sys::eval("window.__pinnedAnswerSends").unwrap().as_f64(),
+            Some(3.0)
+        );
+        let third: protocol::HumanInputPayload = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__pinnedAnswerFrames[2].payload)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            third.input.message,
+            "Decision: blue-green, Fixture free text"
+        );
+        // Unmount the originating copy before its IPC settles.
+        container
+            .query_selector(".pinned-question-toggle")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        settle_question_drawer(&container).await;
+        js_sys::eval("window.__pinnedAnswerResolvers[2]()").unwrap();
+        settle_question_drawer(&container).await;
+        tab.click();
+        settle_question_drawer(&container).await;
+        assert!(
+            container
+                .query_selector(".pinned-question-body .ask-question-submit")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+                .disabled()
+        );
+
         let inline_q1_text = container
             .query_selector(".inline-q1-host")
             .unwrap()
@@ -5461,6 +5667,37 @@ mod wasm_tests {
                 .with_untracked(|map| map[&parent_id].len()),
             1,
             "paging history cannot populate the live question inbox"
+        );
+        state
+            .chat_appearance
+            .set(crate::appearance::ChatAppearance::Current);
+        next_tick().await;
+        let activity_header = container
+            .query_selector(".inflight-tray-header")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(count(&container, ".pinned-question-section"), 1);
+        assert_eq!(count(&container, ".inflight-tray-body"), 0);
+        assert_eq!(
+            activity_header.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "an open question must not announce collapsed activity as expanded"
+        );
+        activity_header.click();
+        next_tick().await;
+        assert_eq!(count(&container, ".inflight-tray-body"), 1);
+        assert_eq!(
+            activity_header.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        activity_header.click();
+        next_tick().await;
+        assert_eq!(count(&container, ".inflight-tray-body"), 0);
+        assert_eq!(
+            activity_header.get_attribute("aria-expanded").as_deref(),
+            Some("false")
         );
     }
 }

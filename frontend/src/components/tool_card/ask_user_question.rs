@@ -18,7 +18,7 @@ use protocol::{
 };
 use wasm_bindgen_futures::spawn_local;
 
-use crate::send::send_frame;
+use crate::send::{new_human_input, send_frame};
 use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
 /// Compose the chosen answers into the message sent back to the agent. One line
@@ -81,11 +81,12 @@ struct QuestionState {
     note: RwSignal<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AnswerSendStatus {
-    delivered: RwSignal<bool>,
-    sending: RwSignal<bool>,
-    send_error: RwSignal<Option<String>>,
+    submission: ArcRwSignal<Option<(String, protocol::HumanInputId)>>,
+    delivered: ArcRwSignal<bool>,
+    sending: ArcRwSignal<bool>,
+    send_error: ArcRwSignal<Option<String>>,
 }
 
 fn structured_response(
@@ -153,6 +154,12 @@ fn AskUserQuestionCard(
             })
             .collect(),
     );
+    let send_status = AnswerSendStatus {
+        submission: draft.submission,
+        delivered: draft.delivered.clone(),
+        sending: draft.sending.clone(),
+        send_error: draft.send_error.clone(),
+    };
     let delivered = RwSignal::from(draft.delivered);
     let sending = RwSignal::from(draft.sending);
     let send_error = RwSignal::from(draft.send_error);
@@ -235,19 +242,30 @@ fn AskUserQuestionCard(
                     return;
                 }
             };
-            sending.set(true);
-            send_answer(
-                host_id,
-                stream,
-                tool_call_id.clone(),
-                message,
-                structured_answers,
-                AnswerSendStatus {
-                    delivered,
-                    sending,
-                    send_error,
+            let payload = match new_human_input(
+                protocol::HumanInputAction::Send,
+                SendMessagePayload {
+                    message: message.clone(),
+                    images: None,
+                    origin: None,
+                    tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                        tool_call_id: tool_call_id.clone(),
+                        answer: message,
+                        structured_answers,
+                    }),
                 },
-            );
+            ) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    send_error.set(Some(error));
+                    return;
+                }
+            };
+            send_status
+                .submission
+                .set(Some((host_id.clone(), payload.id.clone())));
+            sending.set(true);
+            send_answer(host_id, stream, payload, send_status.clone());
         }
     };
 
@@ -460,39 +478,30 @@ fn answer_target(
 fn send_answer(
     host_id: String,
     stream: StreamPath,
-    tool_call_id: String,
-    message: String,
-    structured_answers: Option<Vec<protocol::UserQuestionAnswer>>,
+    payload: protocol::HumanInputPayload,
     status: AnswerSendStatus,
 ) {
-    let AnswerSendStatus {
-        delivered,
-        sending,
-        send_error,
-    } = status;
     spawn_local(async move {
-        let payload = SendMessagePayload {
-            message: message.clone(),
-            images: None,
-            origin: None,
-            tool_response: Some(SendMessageToolResponse::AskUserQuestion {
-                tool_call_id,
-                answer: message,
-
-                structured_answers,
-            }),
-        };
-        match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
-            Ok(()) => {
-                delivered.set(true);
-                send_error.set(None);
-            }
+        let result = send_frame(&host_id, stream, FrameKind::HumanInput, &payload).await;
+        // A server verdict or completion can arrive before native IPC returns,
+        // and the card can unmount while the transport is pending.
+        if !status.sending.get_untracked()
+            || status
+                .submission
+                .with_untracked(|submission| submission.as_ref() != Some(&(host_id, payload.id)))
+        {
+            return;
+        }
+        match result {
+            Ok(()) => status.delivered.set(true),
             Err(error) => {
                 log::error!("ask_user_question: failed to send answer: {error}");
-                send_error.set(Some(format!("Could not send answer: {error}. Try again.")));
+                status
+                    .send_error
+                    .set(Some(format!("Could not send answer: {error}")));
             }
         }
-        sending.set(false);
+        status.sending.set(false);
     });
 }
 

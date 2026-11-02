@@ -1340,6 +1340,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse new_agent payload: {error}"),
             ),
         },
+        FrameKind::HumanInputStatus => {
+            match envelope.parse_payload::<protocol::HumanInputStatusPayload>() {
+                Ok(payload) => state.apply_question_answer_status(host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("Failed to parse human input status: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
             Ok(payload) => {
                 log::info!(
@@ -6438,6 +6450,7 @@ pub fn apply_chat_event_from(
                 data.outcome
             );
             let call_id = data.tool_call_id.clone();
+            state.complete_question_draft(&agent_id, &call_id);
             state.pending_user_questions.update(|map| {
                 if let Some(entries) = map.get_mut(&agent_id) {
                     entries.retain(|entry| entry.tool_call_id != call_id);

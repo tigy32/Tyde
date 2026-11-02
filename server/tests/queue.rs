@@ -854,24 +854,74 @@ async fn pending_user_question_survives_bootstrap_past_history_tail_and_retires_
     );
     drop(observer);
 
+    let answer_input = |id: &str, answer: &str| protocol::HumanInputPayload {
+        id: protocol::HumanInputId(id.to_owned()),
+        action: protocol::HumanInputAction::Send,
+        input: SendMessagePayload {
+            message: answer.to_owned(),
+            images: None,
+            origin: None,
+            tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                tool_call_id: question.tool_call_id.clone(),
+                answer: answer.to_owned(),
+                structured_answers: None,
+            }),
+        },
+    };
+    let refused = answer_input("empty-question-answer", "");
     fixture
         .client
-        .send_message_payload(
-            &agent.stream,
-            SendMessagePayload {
-                message: "Region: us-west".to_owned(),
-                images: None,
-                origin: None,
-                tool_response: Some(SendMessageToolResponse::AskUserQuestion {
-                    tool_call_id: question.tool_call_id.clone(),
-                    answer: "Region: us-west".to_owned(),
-                    structured_answers: None,
-                }),
-            },
-        )
+        .human_input(&agent.stream, refused.clone())
         .await
-        .expect("submit answer to pinned question");
-    let answered = fixture.finish_turn(&agent).await;
+        .unwrap();
+    let status: protocol::HumanInputStatusPayload = fixture.next_frame_matching(
+        "question answer refusal transfers no custody", |env| {
+            assert!(
+                env.kind != FrameKind::AgentError || env.stream != agent.stream,
+                "a rejected question answer must return typed custody, not an uncorrelated agent error"
+            );
+            env.kind == FrameKind::HumanInputStatus && env.parse_payload::<protocol::HumanInputStatusPayload>()
+                .is_ok_and(|p| p.id == refused.id)
+        },
+    ).await.parse_payload().unwrap();
+    assert!(matches!(
+        status.status,
+        protocol::HumanInputStatus::Refused { .. }
+    ));
+    let accepted = answer_input("accepted-question-answer", "Region: us-west");
+    fixture
+        .client
+        .human_input(&agent.stream, accepted.clone())
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    let mut accepted_status = false;
+    let mut active = false;
+    let mut idle = false;
+    while !(accepted_status && idle) {
+        let frame = fixture
+            .next_frame_matching("answer acceptance and completion", |_| true)
+            .await;
+        if frame.kind == FrameKind::HumanInputStatus {
+            let status: protocol::HumanInputStatusPayload = frame.parse_payload().unwrap();
+            if status.id == accepted.id {
+                assert!(matches!(
+                    status.status,
+                    protocol::HumanInputStatus::Accepted { warning: None }
+                ));
+                accepted_status = true;
+            }
+        }
+        if frame.stream == agent.stream && frame.kind == FrameKind::ChatEvent {
+            match frame.parse_payload::<ChatEvent>().unwrap() {
+                ChatEvent::TypingStatusChanged(true) => active = true,
+                ChatEvent::TypingStatusChanged(false) if active => idle = true,
+                _ => {}
+            }
+        }
+        frames.push(frame);
+    }
+    let answered = fixture::Turn { frames };
     answered.assert_stream_end_contains("region answer processed");
     assert_eq!(
         answered
@@ -887,6 +937,26 @@ async fn pending_user_question_survives_bootstrap_past_history_tail_and_retires_
         1,
         "answering the pinned question must complete it once"
     );
+
+    fixture
+        .client
+        .human_input(&agent.stream, accepted.clone())
+        .await
+        .unwrap();
+    let status: protocol::HumanInputStatusPayload = fixture
+        .next_frame_matching("duplicate identity retains accepted custody", |env| {
+            env.kind == FrameKind::HumanInputStatus
+                && env
+                    .parse_payload::<protocol::HumanInputStatusPayload>()
+                    .is_ok_and(|p| p.id == accepted.id)
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    assert!(matches!(
+        status.status,
+        protocol::HumanInputStatus::Accepted { .. }
+    ));
 
     let (mut after_answer, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
         fixture.host_for_test(),

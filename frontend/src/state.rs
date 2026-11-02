@@ -3080,6 +3080,7 @@ pub struct UserQuestionItemDraft {
 #[derive(Clone, Debug)]
 pub struct UserQuestionDraftState {
     pub questions: Vec<UserQuestionItemDraft>,
+    pub submission: ArcRwSignal<Option<(String, protocol::HumanInputId)>>,
     pub delivered: ArcRwSignal<bool>,
     pub sending: ArcRwSignal<bool>,
     pub send_error: ArcRwSignal<Option<String>>,
@@ -3123,6 +3124,7 @@ impl UserQuestionDraftState {
             .collect();
         Self {
             questions: items,
+            submission: ArcRwSignal::new(None),
             delivered: ArcRwSignal::new(false),
             sending: ArcRwSignal::new(false),
             send_error: ArcRwSignal::new(None),
@@ -7467,6 +7469,56 @@ impl AppState {
             drafts.insert(key, draft.clone());
         }
         draft
+    }
+
+    pub fn apply_question_answer_status(
+        &self,
+        host_id: &str,
+        payload: protocol::HumanInputStatusPayload,
+    ) {
+        let drafts = self
+            .user_question_drafts
+            .lock()
+            .expect("question drafts mutex poisoned");
+        for ((agent_id, _), draft) in drafts.iter() {
+            if agent_id.as_ref() != Some(&payload.agent_id)
+                || draft.submission.with_untracked(|submission| {
+                    submission
+                        .as_ref()
+                        .is_none_or(|(host, id)| host != host_id || id != &payload.id)
+                })
+            {
+                continue;
+            }
+            draft.sending.set(false);
+            match &payload.status {
+                protocol::HumanInputStatus::Accepted { warning } => {
+                    draft.delivered.set(true);
+                    draft.send_error.set(warning.clone());
+                }
+                protocol::HumanInputStatus::Refused { reason } => {
+                    draft.delivered.set(false);
+                    draft.send_error.set(Some(reason.clone()));
+                }
+                protocol::HumanInputStatus::Unconfirmed { reason } => {
+                    draft.delivered.set(true);
+                    draft.send_error.set(Some(reason.clone()));
+                }
+            }
+        }
+    }
+
+    pub fn complete_question_draft(&self, agent_id: &AgentId, tool_call_id: &str) {
+        let mut drafts = self
+            .user_question_drafts
+            .lock()
+            .expect("question drafts mutex poisoned");
+        if let Some(draft) = drafts.remove(&(Some(agent_id.clone()), tool_call_id.to_owned())) {
+            draft.submission.set(None);
+            draft.sending.set(false);
+            draft.delivered.set(false);
+            draft.send_error.set(None);
+        }
     }
 
     pub fn clear_agent_question_drafts(&self, agent_id: &AgentId) {

@@ -678,6 +678,11 @@ pub(crate) async fn route_client_envelope(
                 let payload: protocol::HumanInputPayload = parse_payload(&envelope, "human_input")?;
                 let id = payload.id.clone();
                 let action = payload.action;
+                let requires_status = action == protocol::HumanInputAction::InterruptAndSend
+                    || matches!(
+                        payload.input.tool_response,
+                        Some(protocol::SendMessageToolResponse::AskUserQuestion { .. })
+                    );
                 let input = (|| {
                     if !matches!(
                         payload.input.origin,
@@ -711,7 +716,7 @@ pub(crate) async fn route_client_envelope(
                 let input = match input {
                     Ok(input) => input,
                     Err(error) => {
-                        if action == protocol::HumanInputAction::InterruptAndSend {
+                        if requires_status {
                             send_human_input_status(
                                 host_output_stream,
                                 agent_id,
@@ -1922,11 +1927,14 @@ async fn deliver_agent_input(
     host_output_stream: &Stream,
     human: Option<(protocol::HumanInputId, protocol::HumanInputAction)>,
 ) {
-    // Atomic mobile input transfers custody by typed status. Existing Send/Steer
-    // consumers render AgentError, so their refusals and warnings must stay there.
-    let status_id = human.as_ref().and_then(|(id, action)| match action {
-        protocol::HumanInputAction::InterruptAndSend => Some(id.clone()),
-        protocol::HumanInputAction::Send | protocol::HumanInputAction::Steer => None,
+    // Question answers and atomic mobile input transfer custody by typed
+    // status. Ordinary chat and plan answers still render their existing errors.
+    let is_question_answer = matches!(&input,
+        AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload)
+            if matches!(payload.tool_response, Some(protocol::SendMessageToolResponse::AskUserQuestion { .. })));
+    let status_id = human.as_ref().and_then(|(id, action)| {
+        (is_question_answer || *action == protocol::HumanInputAction::InterruptAndSend)
+            .then(|| id.clone())
     });
     match host
         .deliver_swarm_private_input(&agent_id, &input, status_id.clone())

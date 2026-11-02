@@ -329,24 +329,14 @@ pub async fn send_frame_unreported<T: Serialize>(
     };
     let human_payload = match human_input {
         Some(input) if matches!(input.origin, None | Some(protocol::MessageOrigin::User)) => {
-            let mut bytes = [0_u8; 16];
-            web_sys::window()
-                .ok_or("Browser window is unavailable")?
-                .crypto()
-                .map_err(|_| "Browser crypto is unavailable")?
-                .get_random_values_with_u8_array(&mut bytes)
-                .map_err(|_| "Cannot create human input identity")?;
-            Some(protocol::HumanInputPayload {
-                id: protocol::HumanInputId(
-                    bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
-                ),
-                action: if kind == FrameKind::SteerMessage {
+            Some(new_human_input(
+                if kind == FrameKind::SteerMessage {
                     protocol::HumanInputAction::Steer
                 } else {
                     protocol::HumanInputAction::Send
                 },
                 input,
-            })
+            )?)
         }
         _ => None,
     };
@@ -392,6 +382,24 @@ pub async fn send_frame_unreported<T: Serialize>(
             Err(e)
         }
     }
+}
+
+pub(crate) fn new_human_input(
+    action: protocol::HumanInputAction,
+    input: protocol::SendMessagePayload,
+) -> Result<protocol::HumanInputPayload, String> {
+    let mut bytes = [0_u8; 16];
+    web_sys::window()
+        .ok_or("Browser window is unavailable")?
+        .crypto()
+        .map_err(|_| "Browser crypto is unavailable")?
+        .get_random_values_with_u8_array(&mut bytes)
+        .map_err(|_| "Cannot create human input identity")?;
+    Ok(protocol::HumanInputPayload {
+        id: protocol::HumanInputId(bytes.iter().map(|byte| format!("{byte:02x}")).collect()),
+        action,
+        input,
+    })
 }
 
 /// Send an Agents-view preference mutation to the primary local host. The

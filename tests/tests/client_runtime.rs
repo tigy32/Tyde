@@ -1526,7 +1526,10 @@ async fn next_new_agent_event(
     loop {
         match next_host_event(events, context).await {
             HostEvent::NewAgent(agent) => return agent,
-            HostEvent::AgentsViewPreferencesNotify(_) | HostEvent::TaskTokenUsage(_) => {}
+            // Session-list snapshots arrive independently of spawn admission.
+            HostEvent::AgentsViewPreferencesNotify(_)
+            | HostEvent::TaskTokenUsage(_)
+            | HostEvent::SessionList(_) => {}
             event => panic!(
                 "expected NewAgent before {context}; got {:?}",
                 std::mem::discriminant(&event)

@@ -244,6 +244,19 @@ async fn connection_resumes_projects_and_commands_without_new_bootstrap() {
     let (_, wire) = attach(&fixture, &registry, &session, Some(id)).await;
     let old_result = old_wire.attachment.await.expect("old attachment task");
     assert!(old_result.is_ok() || !session.is_closed());
+    // Joining the local attachment does not settle the peer's replacement
+    // fence. Observe a round trip on the new wire before aborting the old relay.
+    client
+        .project_rename(protocol::ProjectRenamePayload {
+            id: project.id.clone(),
+            name: "Replacement wire ready".into(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut client, "replacement wire round trip", |e| {
+        assert_ne!(e.kind, FrameKind::HostBootstrap);
+        e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "Replacement wire ready")
+    }).await;
     old_wire.relay.abort();
     client
         .project_rename(protocol::ProjectRenamePayload {
