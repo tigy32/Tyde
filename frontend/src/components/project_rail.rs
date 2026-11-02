@@ -2564,17 +2564,28 @@ mod wasm_tests {
             .unwrap()
             .unwrap();
         assert!(
-            browser
+            !browser
                 .text_content()
                 .unwrap()
                 .contains("Could not open project")
         );
         assert!(
-            browser
+            !browser
                 .text_content()
                 .unwrap()
                 .contains("Could not reorder projects")
         );
+        // Fresh pickers hide unrelated failures, not their canonical diagnostic records.
+        assert!(state.project_operations.with(|operations| {
+            [
+                "/project-operation/open-failed",
+                "/project-operation/reorder-failed",
+            ]
+            .iter()
+            .all(|stream| {
+                operations.contains_key(&("host-a".into(), protocol::StreamPath((*stream).into())))
+            })
+        }));
         button(&container, "Cancel").click();
         next_tick().await;
         assert!(

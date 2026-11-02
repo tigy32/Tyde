@@ -451,3 +451,62 @@ assert the settled snapshot after same-stream command completion rather than
 pairing each command with the next notification. Canonical transient targets
 resolve through actual pending/public session bindings; persisted unpin state
 must agree with a fresh bootstrap.
+
+## Explicit Create/Add root selection
+
+The folder picker distinguishes its editable target from the directory being
+listed. Opening the picker does not select the initial directory. Typing or
+pasting a path selects that target without requiring Enter; Enter and directory
+rows only browse. Selecting the displayed directory explicitly permits home.
+Late directory listings never replace an edited target. Empty input cannot
+submit. The dialog shows the target and whether it creates a project or adds a
+root to a named project.
+
+`HostBrowseSubmit` carries the target and typed intent on the connection-owned
+browse stream. The host validates the directory, then uses normal catalog
+admission and persistence. `HostBrowseOperation` associates the owned browse
+stream with its canonical operation stream before the worker starts. The picker derives lifecycle only
+from the existing `ProjectOperation` event map: admitted is not committed.
+Failed attempts remain editable; warning-free commitment closes the picker.
+Committed warnings remain visible until Close, with editing and resubmission
+disabled. Closing an admitted attempt does not cancel it. Reopened pickers
+ignore events from closed streams and do not render historical host-wide
+project failures. Duplicate
+preflight derives from the host's emitted project catalog; the store's duplicate
+guard remains authoritative, including races after preflight.
+
+### Confirmed regression history
+
+- `44392cfc` introduced the browser's separate address draft, committed only by
+  Enter, while confirmation read `current_path`, even after the input was
+  cleared. Authored April 15, 2026 at 21:22:12 PDT; committed April 16 at
+  15:21:32 PDT. The parent did not contain `host_browser.rs`.
+- `8392085b` copied that behavior into Add Root. Authored April 24 at 12:48:12
+  PDT; committed at 12:50:37 PDT. `44cccbd98` changed its opening location to
+  ProjectRoots on June 11 (authored 01:31:00, committed 01:31:17 PDT).
+- `edde2684` introduced nonblocking catalog admission (authored October 19 at
+  17:47:25, committed October 20 at 08:23:50 PDT). A duplicate can be admitted
+  and subsequently fail persistence; this is not itself a lifecycle defect.
+- `d0e40291` added host/project-wide operation details to the browser, allowing
+  unrelated Create failures into new pickers while excluding their own Add
+  Root failures. Authored October 26 at 04:27:44 PDT; committed at 05:33:08 PDT.
+
+Isolated Linux Native reproduction on November 2 confirmed typed and pasted
+Create drafts selected the previously listed folder; typed Add selected an
+existing root and failed the duplicate guard; unrelated pickers displayed old
+Create errors. Corrected Add after Enter succeeded: no lockup was established.
+A real DOM regression against the original picker failed because confirmation
+bypassed target validation (870 other wasm tests passed).
+These observations do not establish the customer's input sequence, onset time,
+or any macOS, authentication, or freeze diagnosis. Baseline native artifacts:
+`/home/tyggs/tyde-evidence/root-picker-flow-20261102/BASELINE-RESULT.json`.
+
+Existing DOM flows were updated where they encoded the superseded behavior:
+listing a folder alone enabled confirmation, onboarding clicked “Open Project
+Here” and expected a direct Create command, and a fresh picker displayed old
+Create/Reorder failures. The rendered picker now requires explicit selection,
+submits typed intent, and hides unrelated history without deleting its canonical
+diagnostics. The flows retain pointer-hit, layout, catalog-authority, and
+admitted-versus-committed assertions. Early stale assertions left a modal mounted;
+subsequent hit-test failures explicitly identified that browser overlay covering
+otherwise unrelated controls. Those geometry assertions were not changed.

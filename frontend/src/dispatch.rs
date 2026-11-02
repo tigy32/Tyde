@@ -615,6 +615,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::CommandError => match envelope.parse_payload::<CommandErrorPayload>() {
             Ok(payload) => {
+                if payload.stream.0.starts_with("/browse/") {
+                    if let Some(dialog) = active_browse_dialog(state, host_id, &payload.stream) {
+                        dialog.awaiting_submission.set(false);
+                        dialog.loading.set(false);
+                        dialog.error.set(Some(HostBrowseErrorPayload {
+                            path: protocol::HostAbsPath(String::new()),
+                            code: protocol::HostBrowseErrorCode::Internal,
+                            message: payload.message,
+                        }));
+                    }
+                    return;
+                }
                 let message = format!(
                     "{} failed on {}: {}",
                     payload.operation, payload.stream, payload.message
@@ -1806,9 +1818,16 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                                 | protocol::ProjectOperationState::Failed { .. }
                         )
                     );
+                    let picker_owns = state.browse_dialog.with_untracked(|dialog| {
+                        dialog.as_ref().is_some_and(|dialog| {
+                            dialog.host_id.get_untracked() == host_id
+                                && dialog.operation.get_untracked().as_ref()
+                                    == Some(&payload.stream)
+                        })
+                    });
                     state.project_operations.update(|operations| {
                     let key = (host_id.to_owned(), payload.stream.clone());
-                    if matches!(&payload.state, protocol::ProjectOperationState::Committed { warnings } if warnings.is_empty()) {
+                    if !picker_owns && matches!(&payload.state, protocol::ProjectOperationState::Committed { warnings } if warnings.is_empty()) {
                         operations.remove(&key);
                     } else {
                         operations.insert(key, payload);
@@ -2725,6 +2744,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::HostBrowseOperation => match envelope.parse_payload::<StreamPath>() {
+            Ok(operation) => {
+                if let Some(dialog) = active_browse_dialog(state, host_id, &envelope.stream) {
+                    dialog.operation.set(Some(operation));
+                }
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("Invalid browse operation reference: {error}"),
+            ),
+        },
         FrameKind::HostBrowseError => match envelope.parse_payload::<HostBrowseErrorPayload>() {
             Ok(payload) => dispatch_browse_error(state, host_id, &envelope.stream, payload),
             Err(error) => report_dispatch_error(
@@ -4474,6 +4507,7 @@ fn dispatch_browse_error(
     };
     dialog.error.set(Some(payload));
     dialog.loading.set(false);
+    dialog.awaiting_submission.set(false);
 }
 
 fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {

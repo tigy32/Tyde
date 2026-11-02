@@ -1148,6 +1148,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::TerminalError
         | FrameKind::HostBrowseOpened
         | FrameKind::HostBrowseError
+        | FrameKind::HostBrowseSubmit
+        | FrameKind::HostBrowseOperation
         | FrameKind::SwarmCommand
         | FrameKind::SwarmErrorNotify
         | FrameKind::CommandError

@@ -1090,6 +1090,9 @@ impl ProtocolValidator {
             FrameKind::HostBrowseList => {
                 parse_host_payload::<HostBrowseListPayload>(self, envelope, "HostBrowseList")
             }
+            FrameKind::HostBrowseSubmit => {
+                parse_host_payload::<crate::HostBrowseSubmitPayload>(self, envelope, "HostBrowseSubmit")
+            }
             FrameKind::HostBrowseClose => {
                 parse_host_payload::<HostBrowseClosePayload>(self, envelope, "HostBrowseClose")
             }
@@ -1706,6 +1709,11 @@ impl ProtocolValidator {
                 &self.recent,
                 envelope,
                 "HostBrowseEntries",
+            ),
+            FrameKind::HostBrowseOperation => parse_stream_payload::<crate::StreamPath>(
+                &self.recent,
+                envelope,
+                "HostBrowseOperation",
             ),
             FrameKind::HostBrowseError => parse_stream_payload::<HostBrowseErrorPayload>(
                 &self.recent,

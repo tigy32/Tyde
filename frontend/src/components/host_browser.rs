@@ -4,8 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     FrameKind, HostAbsPath, HostBrowseClosePayload, HostBrowseErrorCode, HostBrowseErrorPayload,
-    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectFileKind, StreamPath,
+    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, ProjectFileKind, StreamPath,
 };
 
 use crate::send::send_frame;
@@ -191,6 +190,8 @@ fn open_browser_for(
         entries: ArcRwSignal::new(Vec::new()),
         error: ArcRwSignal::new(None),
         loading: ArcRwSignal::new(true),
+        operation: ArcRwSignal::new(None),
+        awaiting_submission: ArcRwSignal::new(false),
     };
     state.browse_dialog.set(Some(dialog));
 
@@ -286,6 +287,17 @@ fn close_dialog(state: &AppState) {
         return;
     };
     state.browse_dialog.set(None);
+    if let Some(operation) = dialog.operation.get_untracked() {
+        let key = (dialog.host_id.get_untracked(), operation);
+        state.project_operations.update(|operations| {
+            if operations.get(&key).is_some_and(|operation| {
+                matches!(&operation.state,
+                protocol::ProjectOperationState::Committed { warnings } if warnings.is_empty())
+            }) {
+                operations.remove(&key);
+            }
+        });
+    }
 
     let host_id = dialog.host_id.get_untracked();
     let browse_stream = dialog.browse_stream.get_untracked();
@@ -347,6 +359,8 @@ fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String
         dialog_for_batch.entries.set(Vec::new());
         dialog_for_batch.error.set(None);
         dialog_for_batch.loading.set(true);
+        dialog_for_batch.operation.set(None);
+        dialog_for_batch.awaiting_submission.set(false);
     });
 
     // Sequence Start-on-new before Close-on-old inside one task. If Close
@@ -421,6 +435,58 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let error = dialog.error.clone();
     let loading = dialog.loading.clone();
     let include_hidden = dialog.include_hidden.clone();
+    let address_input = RwSignal::new(String::new());
+    let submission = {
+        let state = state.clone();
+        let host = host_id_signal.clone();
+        let operation = dialog.operation.clone();
+        Signal::derive(move || {
+            let host = host.get();
+            operation.get().and_then(|stream| {
+                state.project_operations.with(|operations| {
+                    operations
+                        .get(&(host, stream))
+                        .map(|operation| operation.state.clone())
+                })
+            })
+        })
+    };
+    let target_locked = {
+        let awaiting = dialog.awaiting_submission.clone();
+        Signal::derive(move || {
+            awaiting.get()
+                || matches!(
+                    submission.get(),
+                    Some(
+                        protocol::ProjectOperationState::Admitted
+                            | protocol::ProjectOperationState::Running { .. }
+                            | protocol::ProjectOperationState::Committed { .. }
+                    )
+                )
+        })
+    };
+    {
+        let state = state.clone();
+        let awaiting = dialog.awaiting_submission.clone();
+        Effect::new(move |_| {
+            if submission.get().is_some() {
+                awaiting.set(false);
+            }
+            if matches!(
+                submission.get(),
+                Some(protocol::ProjectOperationState::Committed { warnings }) if warnings.is_empty()
+            ) {
+                close_dialog(&state);
+            }
+        });
+    }
+    {
+        let host = host_id_signal.clone();
+        Effect::new(move |_| {
+            host.track();
+            address_input.set(String::new());
+        });
+    }
 
     let navigate_to = {
         let state = state.clone();
@@ -428,7 +494,17 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         let browse_stream_signal = browse_stream_signal.clone();
         let include_hidden = include_hidden.clone();
         let loading = loading.clone();
-        move |path: HostAbsPath| {
+        let error = error.clone();
+        let operation = dialog.operation.clone();
+        move |path: HostAbsPath, select: bool| {
+            if loading.get_untracked() || target_locked.get_untracked() {
+                return;
+            }
+            if select {
+                address_input.set(path.0.clone());
+            }
+            error.set(None);
+            operation.set(None);
             loading.set(true);
             send_list(
                 state.clone(),
@@ -439,29 +515,6 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
             );
         }
     };
-
-    let address_input: RwSignal<String> = RwSignal::new(String::new());
-
-    let path_display = {
-        let current_path = current_path.clone();
-        move || {
-            current_path
-                .get()
-                .map(|p| p.0)
-                .unwrap_or_else(|| "…".to_owned())
-        }
-    };
-
-    // Sync the address bar with current_path. When switching hosts resets
-    // current_path to None, also clear the bar so the previous host's path
-    // doesn't linger while the new host loads.
-    {
-        let current_path = current_path.clone();
-        Effect::new(move |_| match current_path.get() {
-            Some(path) => address_input.set(path.0),
-            None => address_input.set(String::new()),
-        });
-    }
 
     let state_for_close = state.clone();
     let on_cancel = move |_| close_dialog(&state_for_close);
@@ -480,7 +533,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         let navigate_to = navigate_to.clone();
         move |_| {
             if let Some(p) = parent.get_untracked() {
-                navigate_to(p);
+                navigate_to(p, true);
             }
         }
     };
@@ -492,7 +545,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         move |_| {
             include_hidden.update(|v| *v = !*v);
             if let Some(p) = current_path.get_untracked() {
-                navigate_to(p);
+                navigate_to(p, false);
             }
         }
     };
@@ -503,62 +556,80 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
             if ev.key() == "Enter" {
                 let typed = address_input.get_untracked();
                 let trimmed = typed.trim();
-                if trimmed.starts_with('/') {
-                    navigate_to(HostAbsPath(trimmed.to_owned()));
-                } else {
-                    log::warn!("browser address must be absolute: {trimmed}");
+                if !trimmed.is_empty() {
+                    navigate_to(HostAbsPath(typed), true);
                 }
             }
         }
     };
 
-    let state_for_confirm = state.clone();
-    let current_path_for_confirm = current_path.clone();
-    let dialog_purpose = dialog.purpose.clone();
-    let host_id_for_confirm = host_id_signal.clone();
-    let loading_for_confirm = loading.clone();
-    let on_confirm = move |_| {
-        if loading_for_confirm.get_untracked() {
-            return;
-        }
-        let Some(path) = current_path_for_confirm.get_untracked() else {
-            crate::notices::report_error(
-                crate::notices::NoticeScope::Browser,
-                "Tyde cannot use this folder because no folder is selected.",
-            );
-            return;
-        };
-        match dialog_purpose.clone() {
-            BrowsePurpose::OpenProject { .. } => {
-                let name = path
-                    .0
-                    .rsplit('/')
-                    .find(|segment| !segment.is_empty())
-                    .unwrap_or(&path.0)
-                    .to_owned();
-                let host_id = host_id_for_confirm.get_untracked();
-                crate::actions::submit_project_mutation(
-                    &state_for_confirm,
-                    host_id,
-                    protocol::ProjectMutation::Create(ProjectCreatePayload {
-                        name,
-                        roots: vec![protocol::ProjectRootPath(path.0)],
-                    }),
-                );
-                close_dialog(&state_for_confirm);
+    let duplicate = {
+        let state = state.clone();
+        let host = host_id_signal.clone();
+        Memo::new(move |_| {
+            let target = address_input.get();
+            let host = host.get();
+            state.projects.with(|projects| {
+                projects
+                    .iter()
+                    .find(|entry| {
+                        entry.host_id == host
+                            && entry
+                                .project
+                                .root_paths()
+                                .iter()
+                                .any(|root| root.0 == target)
+                    })
+                    .map(|entry| format!("Already registered in project “{}”.", entry.project.name))
+            })
+        })
+    };
+    let on_confirm = {
+        let state = state.clone();
+        let dialog = dialog.clone();
+        move |_| {
+            let target = address_input.get_untracked();
+            if target_locked.get_untracked()
+                || dialog.loading.get_untracked()
+                || target.trim().is_empty()
+                || duplicate.get_untracked().is_some()
+            {
+                return;
             }
-            BrowsePurpose::AddRoot { project_id } => {
-                let host_id = host_id_for_confirm.get_untracked();
-                crate::actions::submit_project_mutation(
-                    &state_for_confirm,
-                    host_id,
-                    protocol::ProjectMutation::AddRoot(ProjectAddRootPayload {
-                        id: project_id,
-                        root: protocol::ProjectRootPath(path.0),
-                    }),
-                );
-                close_dialog(&state_for_confirm);
-            }
+            dialog.awaiting_submission.set(true);
+            dialog.error.set(None);
+            dialog.operation.set(None);
+            let intent = match &dialog.purpose {
+                BrowsePurpose::OpenProject { .. } => protocol::HostBrowseIntent::CreateProject,
+                BrowsePurpose::AddRoot { project_id } => protocol::HostBrowseIntent::AddRoot {
+                    project_id: project_id.clone(),
+                },
+            };
+            let state = state.clone();
+            let host = dialog.host_id.get_untracked();
+            let stream = dialog.browse_stream.get_untracked();
+            let awaiting_submission = dialog.awaiting_submission.clone();
+            spawn_local(async move {
+                if let Err(error) = crate::send::send_frame_unreported(
+                    &host,
+                    stream.clone(),
+                    FrameKind::HostBrowseSubmit,
+                    &protocol::HostBrowseSubmitPayload {
+                        path: HostAbsPath(target),
+                        intent,
+                    },
+                )
+                .await
+                {
+                    awaiting_submission.set(false);
+                    surface_transport_error(
+                        &state,
+                        &host,
+                        &stream,
+                        format!("Cannot submit folder: {error}"),
+                    );
+                }
+            });
         }
     };
 
@@ -672,7 +743,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     class="browser-host-select"
                     prop:value=move || host_id_for_value.get()
                     on:change=on_change
-                    disabled=!allow_host_switch
+                    disabled=move || !allow_host_switch || target_locked.get()
                     title="Choose host"
                 >
                     {options}
@@ -716,7 +787,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         } else {
                             format!("{}/{}", base.0, entry_name)
                         };
-                        navigate_to(HostAbsPath(joined));
+                        navigate_to(HostAbsPath(joined), true);
                     };
                     let icon = match entry.kind {
                         ProjectFileKind::Directory => "📁",
@@ -742,7 +813,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
             error.get().map(|e| {
                 view! {
                     <div class="browser-error">
-                        {format!("{}: {}", format_error_code(&e.code), e.message)}
+                        {e.message}
                     </div>
                 }
             })
@@ -771,23 +842,66 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
 
     let can_go_up = {
         let parent = parent.clone();
-        move || parent.get().is_some()
+        {
+            let loading = loading.clone();
+            move || parent.get().is_some() && !loading.get() && !target_locked.get()
+        }
     };
 
     let can_confirm = {
-        let current_path = current_path.clone();
         let loading = loading.clone();
-        move || current_path.get().is_some() && !loading.get()
+        move || {
+            !address_input.get().trim().is_empty()
+                && !loading.get()
+                && !target_locked.get()
+                && duplicate.get().is_none()
+        }
     };
-
+    let title = {
+        let state = state.clone();
+        let host = host_id_signal.clone();
+        let purpose = dialog.purpose.clone();
+        move || match &purpose {
+            BrowsePurpose::OpenProject { .. } => "Create Project".to_owned(),
+            BrowsePurpose::AddRoot { project_id } => {
+                let host = host.get();
+                state
+                    .projects
+                    .with(|projects| {
+                        projects
+                            .iter()
+                            .find(|entry| entry.host_id == host && &entry.project.id == project_id)
+                            .map(|entry| format!("Add Root to “{}”", entry.project.name))
+                    })
+                    .unwrap_or_else(|| format!("Add Root to {project_id}"))
+            }
+        }
+    };
     let confirm_label = match &dialog.purpose {
-        BrowsePurpose::OpenProject { .. } => "Open Project Here",
+        BrowsePurpose::OpenProject { .. } => "Create Project",
         BrowsePurpose::AddRoot { .. } => "Add Root",
     };
+    let current_for_select = current_path.clone();
+    let error_for_select = error.clone();
+    let operation_for_select = dialog.operation.clone();
+    let select_current = move |_| {
+        if let Some(path) = current_for_select.get_untracked() {
+            address_input.set(path.0);
+            error_for_select.set(None);
+            operation_for_select.set(None);
+        }
+    };
+    let current_for_label = current_path.clone();
+    let current_for_disable = current_path.clone();
+    let operation_for_edit = dialog.operation.clone();
+    let error_for_edit = error.clone();
+    let loading_for_hidden = loading.clone();
+    let loading_for_select = loading.clone();
 
     view! {
         <div class="browser-backdrop" on:click=on_backdrop on:keydown=on_modal_keydown tabindex="0">
             <div class="browser-modal" role="dialog" aria-modal="true" aria-label="Folder browser" node_ref=dialog_ref on:click=|ev| ev.stop_propagation()>
+                <h2>{title}</h2>
                 <div class="browser-header">
                     <button
                         class="browser-btn"
@@ -801,24 +915,43 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         node_ref=address_ref
                         type="text"
                         prop:value=move || address_input.get()
-                        on:input=move |ev| address_input.set(event_target_value(&ev))
+                        on:input=move |ev| {
+                            address_input.set(event_target_value(&ev));
+                            error_for_edit.set(None);
+                            operation_for_edit.set(None);
+                        }
+                        disabled=move || target_locked.get()
                         on:keydown=on_address_keydown
                         spellcheck="false"
                         {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
                         autocapitalize="none"
                         autocomplete="off"
                     />
-                    <button class="browser-btn" on:click=on_toggle_hidden>{hidden_label}</button>
+                    <button class="browser-btn" on:click=on_toggle_hidden disabled=move || loading_for_hidden.get() || target_locked.get()>{hidden_label}</button>
                 </div>
                 <div class="browser-host-row">{dropdown_view}</div>
-                <div class="browser-path">{path_display}</div>
+                <button class="browser-btn browser-path" on:click=select_current
+                    disabled=move || current_for_disable.get().is_none() || loading_for_select.get() || target_locked.get()>
+                    {move || current_for_label.get().map(|path| format!("Select {}", path.0))}
+                </button>
+                <output class="browser-path" aria-label="Selected folder">{move || address_input.get()}</output>
+                {move || (!target_locked.get()).then(|| duplicate.get()).flatten().map(|message| view! { <p role="alert">{message}</p> })}
                 <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
-                {move || view! { <crate::notices::ProjectOperationDetails host=host_id_signal.get() /> }}
+                {move || submission.get().and_then(|state| match state {
+                    protocol::ProjectOperationState::Failed { message, .. } => Some(view! { <p role="alert">{message}</p> }.into_any()),
+                    protocol::ProjectOperationState::Admitted | protocol::ProjectOperationState::Running { .. } => Some(view! { <p role="status">"Saving…"</p> }.into_any()),
+                    protocol::ProjectOperationState::Committed { warnings } => (!warnings.is_empty()).then(|| view! {
+                        <div role="alert">
+                            <p>"Saved with warnings. Do not repeat this action."</p>
+                            {warnings.into_iter().map(|warning| view! { <p>{warning.message}</p> }).collect_view()}
+                        </div>
+                    }.into_any()),
+                })}
                 {error_view}
                 {loading_view}
                 <div class="browser-entries">{entries_view}</div>
                 <div class="browser-footer">
-                    <button class="browser-btn" on:click=on_cancel>"Cancel"</button>
+                    <button class="browser-btn" on:click=on_cancel>{move || if target_locked.get() { "Close" } else { "Cancel" }}</button>
                     <button
                         class="browser-btn browser-btn-primary"
                         on:click=on_confirm
@@ -845,14 +978,626 @@ fn human_size(n: u64) -> String {
     }
 }
 
-fn format_error_code(code: &protocol::HostBrowseErrorCode) -> &'static str {
-    use protocol::HostBrowseErrorCode::*;
-    match code {
-        NotFound => "Not found",
-        NotADirectory => "Not a directory",
-        PermissionDenied => "Permission denied",
-        SymlinkLoop => "Symlink loop",
-        TooLarge => "Directory too large",
-        Internal => "Internal error",
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::wasm_test_support::mount_to;
+    use wasm_bindgen_test::*;
+    use web_sys::{HtmlElement, HtmlInputElement};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn tick() {
+        leptos::task::tick().await;
+    }
+
+    fn button(container: &HtmlElement, label: &str) -> HtmlElement {
+        let nodes = container.query_selector_all("button").unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().unwrap_or_default() == label)
+            .unwrap_or_else(|| panic!("missing button: {label}"))
+    }
+
+    fn input(container: &HtmlElement, value: &str) {
+        let input: HtmlInputElement = container
+            .query_selector("input[aria-label='Folder path']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value(value);
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+    }
+
+    fn frames() -> Vec<protocol::Envelope> {
+        serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__picker_frames)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn fixture(purpose: BrowsePurpose) -> (AppState, BrowseDialogState, HtmlElement) {
+        js_sys::eval(
+            r#"
+            window.__picker_frames = [];
+            window.__TAURI__ = { core: { invoke: (cmd, args) => {
+                if (cmd === 'send_host_line') window.__picker_frames.push(JSON.parse(args.line));
+                return Promise.resolve();
+            } } };
+        "#,
+        )
+        .unwrap();
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("picker-host".into(), StreamPath("/host/picker".into()));
+        });
+        let dialog = BrowseDialogState {
+            host_id: ArcRwSignal::new("picker-host".into()),
+            browse_stream: ArcRwSignal::new(StreamPath("/browse/picker-test".into())),
+            purpose,
+            include_hidden: ArcRwSignal::new(false),
+            platform: ArcRwSignal::new(Some(protocol::HostPlatform::Linux)),
+            separator: ArcRwSignal::new('/'),
+            home: ArcRwSignal::new(Some(HostAbsPath("/isolated/home".into()))),
+            current_path: ArcRwSignal::new(Some(HostAbsPath("/isolated/home".into()))),
+            parent: ArcRwSignal::new(Some(HostAbsPath("/isolated".into()))),
+            entries: ArcRwSignal::new(Vec::new()),
+            error: ArcRwSignal::new(None),
+            loading: ArcRwSignal::new(false),
+            operation: ArcRwSignal::new(None),
+            awaiting_submission: ArcRwSignal::new(false),
+        };
+        state.browse_dialog.set(Some(dialog.clone()));
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container: HtmlElement = document.create_element("div").unwrap().dyn_into().unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        (state, dialog, container)
+    }
+
+    #[wasm_bindgen_test]
+    async fn typed_target_without_enter_never_submits_opening_home() {
+        let (state, _, container) = fixture(BrowsePurpose::OpenProject {
+            allow_host_switch: false,
+        });
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <HostBrowser /> }
+        });
+        tick().await;
+        input(&container, "/isolated/typed-project");
+        tick().await;
+        let buttons = container.query_selector_all("button").unwrap();
+        let confirm = (0..buttons.length())
+            .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|b| {
+                b.text_content().unwrap_or_default().contains("Project")
+                    && b.text_content().unwrap_or_default() != "Cancel"
+            })
+            .unwrap();
+        confirm.click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &StreamPath("/browse/picker-test".into())).await;
+        crate::send::settle_stream("picker-host", &StreamPath("/host/picker".into())).await;
+        let sent = frames();
+        assert!(
+            !sent
+                .iter()
+                .any(|frame| frame.kind == FrameKind::ProjectCreate),
+            "confirmation must not bypass browse target validation"
+        );
+        assert!(
+            sent.iter()
+                .any(|frame| frame.kind.to_string() == "host_browse_submit"
+                    && frame
+                        .payload
+                        .to_string()
+                        .contains("/isolated/typed-project")),
+            "typed target must reach the browse submission boundary without Enter"
+        );
+        drop(handle);
+        container.remove();
+    }
+    fn receive<T: serde::Serialize>(state: &AppState, seq: u64, kind: FrameKind, payload: &T) {
+        crate::dispatch::dispatch_envelope(
+            state,
+            "picker-host",
+            protocol::Envelope::from_payload(
+                StreamPath("/browse/picker-test".into()),
+                kind,
+                seq,
+                payload,
+            )
+            .unwrap(),
+        );
+    }
+
+    fn operation(
+        state: &AppState,
+        host_seq: u64,
+        browse_seq: Option<u64>,
+        stream: &str,
+        status: protocol::ProjectOperationState,
+    ) {
+        let stream = StreamPath(stream.into());
+        if let Some(seq) = browse_seq {
+            receive(state, seq, FrameKind::HostBrowseOperation, &stream);
+        }
+        crate::dispatch::dispatch_envelope(
+            state,
+            "picker-host",
+            protocol::Envelope::from_payload(
+                StreamPath("/host/picker".into()),
+                FrameKind::ProjectOperation,
+                host_seq,
+                &protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".into()),
+                    stream,
+                    mutation: protocol::ProjectMutation::Create(protocol::ProjectCreatePayload {
+                        name: "Target".into(),
+                        roots: vec![protocol::ProjectRootPath("/isolated/pasted-target".into())],
+                    }),
+                    state: status,
+                },
+            )
+            .unwrap(),
+        );
+    }
+
+    fn enabled(container: &HtmlElement, label: &str) -> bool {
+        !button(container, label).has_attribute("disabled")
+    }
+
+    #[wasm_bindgen_test]
+    async fn draft_survives_initial_listing_and_failed_attempt_can_succeed() {
+        use protocol::ProjectOperationState;
+        let (state, dialog, container) = fixture(BrowsePurpose::OpenProject {
+            allow_host_switch: false,
+        });
+        crate::dispatch::clear_host_seqs("picker-host");
+        dialog.current_path.set(None);
+        dialog.loading.set(true);
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <HostBrowser /> }
+        });
+        tick().await;
+        assert!(
+            !enabled(&container, "Create Project"),
+            "opening is not a selection"
+        );
+        input(&container, "/isolated/pasted-target");
+        receive(
+            &state,
+            0,
+            FrameKind::BrowseBootstrap,
+            &protocol::BrowseBootstrapPayload {
+                opened: protocol::HostBrowseOpenedPayload {
+                    home: HostAbsPath("/isolated/home".into()),
+                    root: HostAbsPath("/".into()),
+                    separator: '/',
+                    platform: protocol::HostPlatform::Linux,
+                },
+                listing: protocol::BrowseBootstrapListing::Entries {
+                    entries: protocol::HostBrowseEntriesPayload {
+                        path: HostAbsPath("/isolated/home".into()),
+                        parent: Some(HostAbsPath("/isolated".into())),
+                        entries: vec![],
+                    },
+                },
+            },
+        );
+        tick().await;
+        let field: HtmlInputElement = container
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            field.value(),
+            "/isolated/pasted-target",
+            "late bootstrap must not overwrite a draft"
+        );
+        button(&container, "Create Project").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        assert!(
+            state.browse_dialog.get_untracked().is_some(),
+            "bridge send is not commitment"
+        );
+        operation(
+            &state,
+            0,
+            Some(1),
+            "/project-operation/attempt-a",
+            ProjectOperationState::Admitted,
+        );
+        tick().await;
+        assert!(
+            state.browse_dialog.get_untracked().is_some(),
+            "admission is not commitment"
+        );
+        assert!(!enabled(&container, "Create Project"));
+        operation(
+            &state,
+            1,
+            None,
+            "/project-operation/attempt-a",
+            ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Conflict,
+                message: "Attempt failed at persistence".into(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Attempt failed at persistence")
+        );
+        assert!(enabled(&container, "Create Project"));
+        input(&container, "");
+        tick().await;
+        assert!(
+            !enabled(&container, "Create Project"),
+            "clearing cannot select the opening directory"
+        );
+        input(&container, "/isolated/corrected-target");
+        tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Attempt failed at persistence")
+        );
+        button(&container, "Create Project").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        let sent = frames();
+        let targets: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame.kind == FrameKind::HostBrowseSubmit)
+            .map(|frame| {
+                frame
+                    .parse_payload::<protocol::HostBrowseSubmitPayload>()
+                    .unwrap()
+                    .path
+                    .0
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["/isolated/pasted-target", "/isolated/corrected-target"]
+        );
+        operation(
+            &state,
+            2,
+            Some(2),
+            "/project-operation/attempt-b",
+            ProjectOperationState::Committed { warnings: vec![] },
+        );
+        tick().await;
+        assert!(state.browse_dialog.get_untracked().is_none());
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        drop(handle);
+        container.remove();
+
+        for purpose in [
+            BrowsePurpose::OpenProject {
+                allow_host_switch: false,
+            },
+            BrowsePurpose::AddRoot {
+                project_id: protocol::ProjectId("picker-project".into()),
+            },
+        ] {
+            let label = match &purpose {
+                BrowsePurpose::OpenProject { .. } => "Create Project",
+                BrowsePurpose::AddRoot { .. } => "Add Root",
+            };
+            let (state, dialog, container) = fixture(purpose);
+            crate::dispatch::clear_host_seqs("picker-host");
+            let mount_state = state.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(mount_state.clone());
+                view! { <HostBrowser /> }
+            });
+            tick().await;
+            input(&container, "/isolated/committed-target");
+            tick().await;
+            button(&container, label).click();
+            tick().await;
+            crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+            let confirm = button(&container, label);
+            let dismiss = button(&container, "Close");
+            let field: HtmlInputElement = container
+                .query_selector("input[aria-label='Folder path']")
+                .unwrap()
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            operation(
+                &state,
+                0,
+                Some(0),
+                "/project-operation/committed-warning",
+                ProjectOperationState::Committed {
+                    warnings: vec![protocol::ProjectOperationWarning {
+                        stage: protocol::ProjectOperationStage::Fanout,
+                        message: "Project saved, but subscription publication failed".into(),
+                    }],
+                },
+            );
+            tick().await;
+            let text = container.text_content().unwrap();
+            let retained = state.browse_dialog.get_untracked().is_some();
+            let disabled = confirm.has_attribute("disabled") && field.disabled();
+            confirm.click();
+            tick().await;
+            crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+            let submissions = frames()
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::HostBrowseSubmit)
+                .count();
+            dismiss.click();
+            tick().await;
+            crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+            let dismissed = state.browse_dialog.get_untracked().is_none();
+            drop(handle);
+            container.remove();
+            assert!(dismissed, "Close must dismiss the committed warning");
+            assert!(
+                retained,
+                "committed warnings must remain visible until dismissed"
+            );
+            assert!(text.contains("Project saved, but subscription publication failed"));
+            assert!(text.contains("Close") && !text.contains("Cancel"));
+            assert!(disabled, "a committed mutation must never offer retry");
+            assert_eq!(
+                submissions, 1,
+                "committed warnings must not resubmit the mutation"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn add_root_preflight_browse_invalid_correction_home_and_cancel() {
+        let project_id = protocol::ProjectId("picker-project".into());
+        let (state, dialog, container) = fixture(BrowsePurpose::AddRoot {
+            project_id: project_id.clone(),
+        });
+        crate::dispatch::clear_host_seqs("picker-host");
+        state.projects.update(|projects| {
+            projects.push(crate::state::ProjectInfo {
+                host_id: "picker-host".into(),
+                project: protocol::Project {
+                    id: project_id.clone(),
+                    name: "Selected project".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone {
+                        roots: vec![protocol::ProjectRootPath("/isolated/registered".into())],
+                    },
+                },
+            })
+        });
+        // A historical failure on the same host is not this dialog's attempt.
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "picker-host",
+            protocol::Envelope::from_payload(
+                StreamPath("/host/picker".into()),
+                FrameKind::ProjectOperation,
+                0,
+                &protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".into()),
+                    stream: StreamPath("/project-operation/old".into()),
+                    mutation: protocol::ProjectMutation::Create(protocol::ProjectCreatePayload {
+                        name: "Old".into(),
+                        roots: vec![protocol::ProjectRootPath("/isolated/other".into())],
+                    }),
+                    state: protocol::ProjectOperationState::Failed {
+                        code: protocol::CommandErrorCode::Conflict,
+                        message: "Unrelated historical error".into(),
+                        cleanup_may_be_partial: false,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <HostBrowser /> }
+        });
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Add Root to “Selected project”")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Unrelated historical error")
+        );
+        input(&container, "/isolated/registered");
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Already registered")
+        );
+        assert!(!enabled(&container, "Add Root"));
+        input(&container, "/isolated/missing");
+        let field: HtmlInputElement = container
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_key("Enter");
+        field
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                    .unwrap(),
+            )
+            .unwrap();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        assert!(
+            frames()
+                .iter()
+                .all(|frame| frame.kind != FrameKind::HostBrowseSubmit),
+            "Enter only browses"
+        );
+        receive(
+            &state,
+            0,
+            FrameKind::HostBrowseError,
+            &HostBrowseErrorPayload {
+                path: HostAbsPath("/isolated/missing".into()),
+                code: HostBrowseErrorCode::NotFound,
+                message: "Missing directory".into(),
+            },
+        );
+        tick().await;
+        assert_eq!(
+            field.value(),
+            "/isolated/missing",
+            "a failed browse cannot select the prior directory"
+        );
+        input(&container, "/isolated/pasted-root");
+        tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Missing directory")
+        );
+        button(&container, "Add Root").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        let sent = frames();
+        let submitted = sent
+            .iter()
+            .find(|frame| frame.kind == FrameKind::HostBrowseSubmit)
+            .unwrap()
+            .parse_payload::<protocol::HostBrowseSubmitPayload>()
+            .unwrap();
+        assert_eq!(submitted.path.0, "/isolated/pasted-root");
+        assert!(
+            matches!(submitted.intent, protocol::HostBrowseIntent::AddRoot { project_id: id } if id == project_id)
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "picker-host",
+            protocol::Envelope::from_payload(
+                StreamPath("/host/picker".into()),
+                FrameKind::CommandError,
+                1,
+                &protocol::CommandErrorPayload {
+                    stream: dialog.browse_stream.get_untracked(),
+                    request_kind: FrameKind::HostBrowseSubmit,
+                    operation: "host_browse_submit".into(),
+                    code: protocol::CommandErrorCode::Internal,
+                    message: "Unknown submission failure".into(),
+                    workbench_reason: None,
+                    fatal: false,
+                    request_id: None,
+                    context: None,
+                },
+            )
+            .unwrap(),
+        );
+        tick().await;
+        assert!(
+            enabled(&container, "Add Root"),
+            "typed command errors must release pending presentation"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Unknown submission failure")
+        );
+        input(&container, "/isolated/corrected-root");
+        tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Unknown submission failure")
+        );
+        button(&container, "Add Root").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        button(&container, "Close").click();
+        tick().await;
+        operation(
+            &state,
+            2,
+            Some(1),
+            "/project-operation/closed-attempt",
+            protocol::ProjectOperationState::Failed {
+                code: protocol::CommandErrorCode::Conflict,
+                message: "Late closed-attempt error".into(),
+                cleanup_may_be_partial: false,
+            },
+        );
+        assert!(state.browse_dialog.get_untracked().is_none());
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        drop(handle);
+        container.remove();
+
+        let (state, dialog, container) = fixture(BrowsePurpose::OpenProject {
+            allow_host_switch: false,
+        });
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <HostBrowser /> }
+        });
+        tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Late closed-attempt error")
+        );
+        button(&container, "Select /isolated/home").click();
+        tick().await;
+        assert!(
+            enabled(&container, "Create Project"),
+            "intentional home remains selectable"
+        );
+        button(&container, "Create Project").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        assert!(frames().iter().any(|frame| {
+            frame.kind == FrameKind::HostBrowseSubmit
+                && frame
+                    .parse_payload::<protocol::HostBrowseSubmitPayload>()
+                    .unwrap()
+                    .path
+                    .0
+                    == "/isolated/home"
+        }));
+        button(&container, "Close").click();
+        tick().await;
+        crate::send::settle_stream("picker-host", &dialog.browse_stream.get_untracked()).await;
+        drop(handle);
+        container.remove();
     }
 }

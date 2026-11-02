@@ -6972,6 +6972,16 @@ mod wasm_tests {
             },
         );
         next_tick().await;
+        // Explicit selection preserves the pointer test without reintroducing auto-selection.
+        let buttons = container.query_selector_all("button").unwrap();
+        let select = (0..buttons.length())
+            .filter_map(|i| buttons.item(i))
+            .find(|node| node.text_content().as_deref() == Some("Select /tmp/added"))
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        select.click();
+        next_tick().await;
         let browser_button = container
             .query_selector(".browser-btn-primary")
             .unwrap()
@@ -6980,7 +6990,7 @@ mod wasm_tests {
             .unwrap();
         assert!(
             !browser_button.disabled(),
-            "A real folder response must enable selection before hit-testing"
+            "Explicit folder selection must enable confirmation before hit-testing"
         );
         let bounds = browser_button.get_bounding_client_rect();
         let hit = document()
@@ -7034,16 +7044,48 @@ mod wasm_tests {
             .unwrap()
             .click();
         next_tick().await;
-        assert!(
-            recorded_frames(&calls)
-                .iter()
-                .any(|(kind, payload, _)| kind == "project_add_root"
-                    && payload["root"] == "/tmp/added"
-                    && payload["id"] == "alpha")
-        );
+        assert!(recorded_frames(&calls).iter().any(|(kind, payload, _)| kind
+            == "host_browse_submit"
+            && payload["path"] == "/tmp/added"
+            && payload["intent"]["kind"] == "add_root"
+            && payload["intent"]["project_id"] == "alpha"));
         assert!(
             !editor.text_content().unwrap().contains("/tmp/added"),
             "The editor waits for authoritative roots"
+        );
+        let operation = StreamPath("/project-operation/sidebar-add-root".into());
+        dispatch_frame(
+            &state,
+            "local",
+            browse.browse_stream.get_untracked(),
+            FrameKind::HostBrowseOperation,
+            2,
+            &operation,
+        );
+        let mutation = protocol::ProjectMutation::AddRoot(protocol::ProjectAddRootPayload {
+            id: ProjectId("alpha".into()),
+            root: ProjectRootPath("/tmp/added".into()),
+        });
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectOperation,
+            1,
+            &protocol::ProjectOperationPayload {
+                host_id: protocol::HostFilterId("local".into()),
+                stream: operation.clone(),
+                mutation: mutation.clone(),
+                state: protocol::ProjectOperationState::Admitted,
+            },
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".browser-modal")
+                .unwrap()
+                .is_some(),
+            "Admission is not commitment"
         );
         let mut updated = state
             .projects
@@ -7063,11 +7105,25 @@ mod wasm_tests {
             "local",
             StreamPath("/host/local".into()),
             FrameKind::ProjectNotify,
-            1,
+            2,
             &protocol::ProjectNotifyPayload::Upsert { project: updated },
         );
         next_tick().await;
         assert!(editor.text_content().unwrap().contains("/tmp/added"));
+        dispatch_frame(
+            &state,
+            "local",
+            StreamPath("/host/local".into()),
+            FrameKind::ProjectOperation,
+            3,
+            &protocol::ProjectOperationPayload {
+                host_id: protocol::HostFilterId("local".into()),
+                stream: operation,
+                mutation,
+                state: protocol::ProjectOperationState::Committed { warnings: vec![] },
+            },
+        );
+        next_tick().await;
         assert!(
             container
                 .query_selector(".browser-modal")
@@ -7095,7 +7151,7 @@ mod wasm_tests {
             "local",
             StreamPath("/host/local".into()),
             FrameKind::ProjectNotify,
-            2,
+            4,
             &protocol::ProjectNotifyPayload::Upsert { project: child },
         );
         next_tick().await;
@@ -7361,7 +7417,7 @@ mod wasm_tests {
             "local",
             StreamPath("/host/local".into()),
             FrameKind::ProjectNotify,
-            3,
+            5,
             &protocol::ProjectNotifyPayload::Delete {
                 project: gamma.clone(),
             },

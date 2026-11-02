@@ -3421,6 +3421,8 @@ pub struct BrowseDialogState {
     pub entries: ArcRwSignal<Vec<HostBrowseEntry>>,
     pub error: ArcRwSignal<Option<HostBrowseErrorPayload>>,
     pub loading: ArcRwSignal<bool>,
+    pub operation: ArcRwSignal<Option<StreamPath>>,
+    pub awaiting_submission: ArcRwSignal<bool>,
 }
 
 /// Snapshot of center-zone UI state for a single project. Persisted while the

@@ -8149,3 +8149,176 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
         protocol::ChatEvent::StreamEnd(end) if end.message.content.contains("Continue after final restart"))),
         "the persisted conversation must remain usable after final restart");
 }
+
+#[tokio::test]
+async fn browse_submission_scopes_failures_and_commits_exact_targets() {
+    use protocol::{
+        HostBrowseIntent, HostBrowseSubmitPayload, ProjectOperationPayload, ProjectOperationState,
+    };
+    async fn settle(
+        client: &mut client::Connection,
+        browse: &StreamPath,
+        close: bool,
+    ) -> ProjectOperationState {
+        let reference = expect_browse_event(
+            client,
+            browse,
+            FrameKind::HostBrowseOperation,
+            "owned operation reference",
+        )
+        .await;
+        let operation: StreamPath = reference.parse_payload().unwrap();
+        assert!(operation.0.starts_with("/project-operation/"));
+        if close {
+            client.host_browse_close(browse).await.unwrap();
+        }
+        let event = next_frame_matching_on(client, "canonical operation terminal state", |env| {
+            env.kind == FrameKind::ProjectOperation
+                && env
+                    .parse_payload::<ProjectOperationPayload>()
+                    .is_ok_and(|payload| {
+                        payload.stream == operation
+                            && matches!(
+                                payload.state,
+                                ProjectOperationState::Committed { .. }
+                                    | ProjectOperationState::Failed { .. }
+                            )
+                    })
+        })
+        .await;
+        event
+            .parse_payload::<ProjectOperationPayload>()
+            .unwrap()
+            .state
+    }
+    let mut fixture = Fixture::new().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let opening = dirs.path().join("opening");
+    let target = dirs.path().join("typed-target");
+    let added = dirs.path().join("pasted-root");
+    for path in [&opening, &target, &added] {
+        fs::create_dir(path).unwrap();
+    }
+    let stream = browse_stream("submission-flow");
+    open_browse_and_read_initial(
+        &mut fixture.client,
+        stream.clone(),
+        HostBrowseInitial::Path {
+            path: HostAbsPath(opening.to_string_lossy().into_owned()),
+        },
+    )
+    .await;
+    for invalid in [
+        String::new(),
+        "relative".into(),
+        dirs.path().join("missing").to_string_lossy().into_owned(),
+    ] {
+        fixture
+            .client
+            .host_browse_submit(
+                &stream,
+                HostBrowseSubmitPayload {
+                    path: HostAbsPath(invalid),
+                    intent: HostBrowseIntent::CreateProject,
+                },
+            )
+            .await
+            .unwrap();
+        let error = expect_command_error(&mut fixture.client, "invalid selection rejected").await;
+        assert_eq!(error.stream, stream);
+        assert_eq!(error.request_kind, FrameKind::HostBrowseSubmit);
+    }
+    let target_root = ProjectRootPath(target.to_string_lossy().into_owned());
+    fixture
+        .client
+        .host_browse_submit(
+            &stream,
+            HostBrowseSubmitPayload {
+                path: HostAbsPath(target_root.0.clone()),
+                intent: HostBrowseIntent::CreateProject,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        settle(&mut fixture.client, &stream, false).await,
+        ProjectOperationState::Committed { .. }
+    ));
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let project = bootstrap
+        .projects
+        .iter()
+        .find(|project| project.root_paths() == vec![target_root.clone()])
+        .unwrap();
+    assert!(!bootstrap.projects.iter().any(|project| {
+        project
+            .root_paths()
+            .iter()
+            .any(|root| root.0 == opening.to_string_lossy())
+    }));
+    // Bypass UI preflight: the authoritative persistence guard must still reject duplicates.
+    fixture
+        .client
+        .host_browse_submit(
+            &stream,
+            HostBrowseSubmitPayload {
+                path: HostAbsPath(target_root.0.clone()),
+                intent: HostBrowseIntent::AddRoot {
+                    project_id: project.id.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        settle(&mut fixture.client, &stream, false).await,
+        ProjectOperationState::Failed {
+            code: CommandErrorCode::Conflict,
+            ..
+        }
+    ));
+    fixture
+        .client
+        .host_browse_submit(
+            &stream,
+            HostBrowseSubmitPayload {
+                path: HostAbsPath(added.to_string_lossy().into_owned()),
+                intent: HostBrowseIntent::AddRoot {
+                    project_id: project.id.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            settle(&mut fixture.client, &stream, true).await,
+            ProjectOperationState::Committed { .. }
+        ),
+        "closing after admission must not cancel the operation"
+    );
+    let cancelled = browse_stream("cancelled-selection");
+    open_browse_and_read_initial(
+        &mut fixture.client,
+        cancelled.clone(),
+        HostBrowseInitial::Path {
+            path: HostAbsPath(opening.to_string_lossy().into_owned()),
+        },
+    )
+    .await;
+    fixture.client.host_browse_close(&cancelled).await.unwrap();
+    let (_, after) = fixture.connect_fresh_host_with_bootstrap().await;
+    let updated = after.projects.iter().find(|p| p.id == project.id).unwrap();
+    assert_eq!(
+        updated.root_paths(),
+        vec![
+            target_root,
+            ProjectRootPath(added.to_string_lossy().into_owned())
+        ]
+    );
+    assert_eq!(
+        after.projects.len(),
+        bootstrap.projects.len(),
+        "cancel must not create a project"
+    );
+}

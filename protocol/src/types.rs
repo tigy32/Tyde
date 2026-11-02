@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 95;
+pub const PROTOCOL_VERSION: u32 = 96;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1151,6 +1151,8 @@ pub enum FrameKind {
     HostBrowseStart,
     HostBrowseList,
     HostBrowseClose,
+    HostBrowseSubmit,
+    HostBrowseOperation,
     TerminalCreate,
     TerminalSend,
     TerminalResize,
@@ -1382,6 +1384,8 @@ impl fmt::Display for FrameKind {
             Self::HostBrowseStart => f.write_str("host_browse_start"),
             Self::HostBrowseList => f.write_str("host_browse_list"),
             Self::HostBrowseClose => f.write_str("host_browse_close"),
+            Self::HostBrowseSubmit => f.write_str("host_browse_submit"),
+            Self::HostBrowseOperation => f.write_str("host_browse_operation"),
             Self::TerminalCreate => f.write_str("terminal_create"),
             Self::TerminalSend => f.write_str("terminal_send"),
             Self::TerminalResize => f.write_str("terminal_resize"),
@@ -8471,6 +8475,19 @@ pub enum HostBrowseInitial {
 pub struct HostBrowseListPayload {
     pub path: HostAbsPath,
     pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseSubmitPayload {
+    pub path: HostAbsPath,
+    pub intent: HostBrowseIntent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostBrowseIntent {
+    CreateProject,
+    AddRoot { project_id: ProjectId },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

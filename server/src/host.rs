@@ -8329,7 +8329,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
     ) -> AppResult<()> {
         drop(
             self.project_catalog
-                .admit(mutation, None, Some(output))
+                .admit(mutation, None, Some(output), None)
                 .await?,
         );
         Ok(())
@@ -8341,7 +8341,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         base: Option<BaseRevision>,
     ) -> AppResult<project_catalog::CatalogResult> {
         self.project_catalog
-            .admit(mutation, base, None)
+            .admit(mutation, base, None, None)
             .await?
             .await
             .map_err(|_| AppError::conflict("project_operation", "project worker stopped"))?
@@ -16835,6 +16835,80 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
             Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
             Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
         }
+        Ok(())
+    }
+
+    pub(crate) async fn submit_browse_dir(
+        &self,
+        connection_host_stream: &StreamPath,
+        browse_stream_path: &StreamPath,
+        payload: protocol::HostBrowseSubmitPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "host_browse_submit";
+        let owner = connection_host_stream.clone();
+        let path = browse_stream_path.clone();
+        let output = self
+            .state
+            .with(move |state| {
+                state
+                    .browse_streams
+                    .get(&(owner, path))
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::not_found(
+                            OPERATION,
+                            "Browse stream is closed or belongs to another connection",
+                        )
+                    })
+            })
+            .await?;
+        if !std::path::Path::new(&payload.path.0).is_absolute() {
+            return Err(AppError::invalid(
+                OPERATION,
+                "Choose an absolute folder path",
+            ));
+        }
+        let metadata = tokio::fs::metadata(&payload.path.0)
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, "Cannot open selected folder", error)
+            })?;
+        if !metadata.is_dir() {
+            return Err(AppError::invalid(
+                OPERATION,
+                "Selected path is not a folder",
+            ));
+        }
+        drop(
+            tokio::fs::read_dir(&payload.path.0)
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, "Cannot read selected folder", error)
+                })?,
+        );
+        let mutation = match payload.intent {
+            protocol::HostBrowseIntent::CreateProject => {
+                let name = std::path::Path::new(&payload.path.0)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| payload.path.0.clone());
+                protocol::ProjectMutation::Create(ProjectCreatePayload {
+                    name,
+                    roots: vec![protocol::ProjectRootPath(payload.path.0)],
+                })
+            }
+            protocol::HostBrowseIntent::AddRoot { project_id } => {
+                protocol::ProjectMutation::AddRoot(ProjectAddRootPayload {
+                    id: project_id,
+                    root: protocol::ProjectRootPath(payload.path.0),
+                })
+            }
+        };
+        drop(
+            self.project_catalog
+                .admit(mutation, None, None, Some(output))
+                .await?,
+        );
         Ok(())
     }
 

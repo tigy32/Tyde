@@ -472,6 +472,39 @@ impl Connection {
         Ok(())
     }
 
+    pub async fn host_browse_submit(
+        &mut self,
+        stream: &StreamPath,
+        payload: protocol::HostBrowseSubmitPayload,
+    ) -> Result<(), FrameError> {
+        self.send_browse_payload(stream, FrameKind::HostBrowseSubmit, &payload)
+            .await
+    }
+
+    pub async fn host_browse_close(&mut self, stream: &StreamPath) -> Result<(), FrameError> {
+        self.send_browse_payload(
+            stream,
+            FrameKind::HostBrowseClose,
+            &protocol::HostBrowseClosePayload {},
+        )
+        .await
+    }
+
+    async fn send_browse_payload<T: serde::Serialize>(
+        &mut self,
+        stream: &StreamPath,
+        kind: FrameKind,
+        payload: &T,
+    ) -> Result<(), FrameError> {
+        let seq = self.outgoing_seq.get(stream).copied().ok_or_else(|| {
+            FrameError::Protocol("Browse command requires an opened stream".into())
+        })?;
+        let envelope =
+            Envelope::from_payload(stream.clone(), kind, seq, payload).map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn delete_session(
         &mut self,
         payload: DeleteSessionPayload,
@@ -2082,15 +2115,18 @@ impl Connection {
                     let _: protocol::HostBrowseEntriesPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::HostBrowseOperation => {
+                    let _: StreamPath = envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::HostBrowseError => {
                     let _: protocol::HostBrowseErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 other => {
-                    panic!(
+                    return Err(FrameError::Protocol(format!(
                         "unexpected server frame kind {} on browse stream {}",
                         other, envelope.stream
-                    );
+                    )));
                 }
             }
         } else if envelope.stream.0.starts_with("/terminal/") {

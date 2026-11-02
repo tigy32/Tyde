@@ -1343,6 +1343,12 @@ pub(crate) async fn route_client_envelope(
                 host.list_browse_dir(connection_host_stream, &stream_path, payload)
                     .await?;
             }
+            FrameKind::HostBrowseSubmit => {
+                let payload: protocol::HostBrowseSubmitPayload =
+                    parse_payload(&envelope, "host_browse_submit")?;
+                host.submit_browse_dir(connection_host_stream, &stream_path, payload)
+                    .await?;
+            }
             FrameKind::HostBrowseClose => {
                 let _: HostBrowseClosePayload = parse_payload(&envelope, "host_browse_close")?;
                 host.close_browse_stream(connection_host_stream, &stream_path)

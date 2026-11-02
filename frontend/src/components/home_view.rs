@@ -1907,14 +1907,62 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
-        button(&browser, "Open Project Here").click();
+        // A listing is not a selection, and bridge completion is not commitment.
+        assert!(button(&browser, "Create Project").disabled());
+        button(&browser, "Select /tmp/demo").click();
         next_tick().await;
+        button(&browser, "Create Project").click();
+        next_tick().await;
+        let browse_stream = state
+            .browse_dialog
+            .get_untracked()
+            .unwrap()
+            .browse_stream
+            .get_untracked();
+        crate::send::settle_stream("local", &browse_stream).await;
         assert_eq!(
-            sent(&calls, "project_create")[0]["payload"]["roots"][0],
+            sent(&calls, "host_browse_submit")[0]["payload"]["path"],
             "/tmp/demo"
         );
+        assert_eq!(
+            sent(&calls, "host_browse_submit")[0]["payload"]["intent"]["kind"],
+            "create_project"
+        );
+        assert!(state.browse_dialog.get_untracked().is_some());
+        let operation = StreamPath("/project-operation/onboarding-create".into());
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "local",
+            protocol::Envelope::from_payload(
+                browse_stream,
+                protocol::FrameKind::HostBrowseOperation,
+                0,
+                &operation,
+            )
+            .unwrap(),
+        );
         add_project(&state, "local");
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "local",
+            protocol::Envelope::from_payload(
+                StreamPath("/host".into()),
+                protocol::FrameKind::ProjectOperation,
+                1,
+                &protocol::ProjectOperationPayload {
+                    host_id: protocol::HostFilterId("local".into()),
+                    stream: operation,
+                    mutation: protocol::ProjectMutation::Create(protocol::ProjectCreatePayload {
+                        name: "demo".into(),
+                        roots: vec![ProjectRootPath("/tmp/demo".into())],
+                    }),
+                    state: protocol::ProjectOperationState::Committed { warnings: vec![] },
+                },
+            )
+            .unwrap(),
+        );
         next_tick().await;
+        assert!(state.browse_dialog.get_untracked().is_none());
         let radio: web_sys::HtmlInputElement = guide(&container)
             .query_selector("input[name='getting-started-project']")
             .unwrap()

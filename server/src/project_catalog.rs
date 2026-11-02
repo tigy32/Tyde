@@ -92,6 +92,7 @@ enum Command {
         mutation: ProjectMutation,
         base: Option<BaseRevision>,
         output: Option<Stream>,
+        browse_output: Option<Stream>,
         reply: oneshot::Sender<AppResult<Completion>>,
     },
     Bind {
@@ -352,6 +353,7 @@ impl ProjectCatalogHandle {
         mutation: ProjectMutation,
         base: Option<BaseRevision>,
         output: Option<Stream>,
+        browse_output: Option<Stream>,
     ) -> AppResult<Completion> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -359,6 +361,7 @@ impl ProjectCatalogHandle {
                 mutation,
                 base,
                 output,
+                browse_output,
                 reply,
             })
             .map_err(|_| AppError::conflict("project_admission", "project catalog stopped"))?;
@@ -580,7 +583,7 @@ impl ProjectCatalogActor {
                             next_creation = Some((reached, release, prepared));
                             let _ = installed.send(());
                         }
-                        Command::Admit { mutation, base, output, reply } => {
+                        Command::Admit { mutation, base, output, browse_output, reply } => {
                             let operation = mutation_name(&mutation);
                             if stopping { let _ = reply.send(Err(AppError::conflict(operation, "project catalog is stopping"))); continue; }
                             let Some(handle) = self.handle.upgrade() else { let _ = reply.send(Err(AppError::conflict(operation, "project catalog stopped"))); continue; };
@@ -593,6 +596,15 @@ impl ProjectCatalogActor {
                             let Some(worker_host) = host.upgrade() else { let _ = reply.send(Err(AppError::conflict(operation, "host stopped"))); continue; };
                             let stream = StreamPath(format!("/project-operation/{}", Uuid::new_v4()));
                             let progress = ProjectOperationPayload { host_id: HostFilterId(LOCAL_HOST_ID.to_owned()), stream: stream.clone(), mutation: mutation.clone(), state: ProjectOperationState::Admitted };
+                            if let Some(browse) = browse_output {
+                                let reference = match serde_json::to_value(&stream) {
+                                    Ok(reference) => reference,
+                                    Err(error) => { let _ = reply.send(Err(AppError::internal(operation, error))); continue; }
+                                };
+                                if browse.send_value(FrameKind::HostBrowseOperation, reference).is_err() {
+                                    let _ = reply.send(Err(AppError::conflict(operation, "Browse output is closed"))); continue;
+                                }
+                            }
                             let (result, response) = oneshot::channel();
                             tracing::info!(target: "tyde::project_operation", operation, stage = "admission", resource_count = resources.len(), active_count = active.len() + 1, accepted = true, "catalog mutation admitted");
                             active.insert(stream.clone(), Pending { progress, resources, result, output, committed: None, destructive: false });
