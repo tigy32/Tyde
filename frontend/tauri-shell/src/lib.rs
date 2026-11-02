@@ -932,7 +932,8 @@ async fn connect_host(
     tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.connect event=task_start");
     let configured_host = state
         .host_store
-        .get(&host_id)?
+        .get(&host_id)
+        .await?
         .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
     state
         .router
@@ -1038,7 +1039,8 @@ async fn probe_configured_host_lifecycle(
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     let configured_host = state
         .host_store
-        .get(&host_id)?
+        .get(&host_id)
+        .await?
         .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
     remote_bootstrap::probe_configured_host_lifecycle(app, configured_host).await
 }
@@ -1051,7 +1053,8 @@ async fn ensure_configured_host_ready(
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     let configured_host = state
         .host_store
-        .get(&host_id)?
+        .get(&host_id)
+        .await?
         .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
     remote_bootstrap::ensure_configured_host_ready(app, configured_host).await
 }
@@ -1064,24 +1067,25 @@ async fn force_upgrade_managed_host(
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     let configured_host = state
         .host_store
-        .get(&host_id)?
+        .get(&host_id)
+        .await?
         .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
     remote_bootstrap::force_upgrade_managed_host(app, configured_host).await
 }
 
 #[tauri::command]
-fn list_configured_hosts(
+async fn list_configured_hosts(
     state: tauri::State<'_, ShellState>,
 ) -> Result<ConfiguredHostStore, String> {
-    state.host_store.list()
+    state.host_store.list().await
 }
 
 #[tauri::command]
-fn upsert_configured_host(
+async fn upsert_configured_host(
     state: tauri::State<'_, ShellState>,
     request: UpsertConfiguredHostRequest,
 ) -> Result<ConfiguredHostStore, String> {
-    state.host_store.upsert(request)
+    state.host_store.upsert(request).await
 }
 
 #[tauri::command]
@@ -1094,15 +1098,15 @@ async fn remove_configured_host(
     let _ = state.router.disconnect(host_id.clone()).await;
     #[cfg(not(target_os = "windows"))]
     media_result?;
-    state.host_store.remove(&host_id)
+    state.host_store.remove(&host_id).await
 }
 
 #[tauri::command]
-fn set_selected_host(
+async fn set_selected_host(
     state: tauri::State<'_, ShellState>,
     host_id: Option<String>,
 ) -> Result<ConfiguredHostStore, String> {
-    state.host_store.set_selected_host(host_id)
+    state.host_store.set_selected_host(host_id).await
 }
 
 #[tauri::command]
@@ -1512,6 +1516,21 @@ pub fn run() {
         phase.finish();
     }
 
+    // Validate persisted hosts before constructing the UI, never from setup
+    // or an invoke callback. All disk access belongs to the store worker.
+    let phase = logging::startup(logging::StartupPhase::HostStore);
+    let host_store = match tauri::async_runtime::block_on(async {
+        HostStore::load(HostStore::default_path()?).await
+    }) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!("Native startup failed phase=HostStore");
+            eprintln!("Failed to initialize host store: {error}");
+            std::process::exit(1);
+        }
+    };
+    phase.finish();
+
     tracing::info!("starting tyde shell");
 
     let quit_confirmation = Arc::new(QuitConfirmation::default());
@@ -1751,13 +1770,7 @@ pub fn run() {
             app.handle()
                 .run_on_main_thread(|| tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.config event=ui_thread"))?;
             app.manage(logging::start_ui_diagnostics(app.handle()));
-            let phase = logging::startup(logging::StartupPhase::HostStore);
             tracing::info!("setup: spawning host and router");
-            let host_store_path =
-                host_store::HostStore::default_path().map_err(std::io::Error::other)?;
-            let host_store =
-                host_store::HostStore::load(host_store_path).map_err(std::io::Error::other)?;
-            phase.finish();
             let router = ProxyRouterHandle::new();
             let ui_debug = Arc::new(devtools::UiDebugBridgeState::default());
             let ui_debug_addr =
@@ -1807,12 +1820,6 @@ pub fn run() {
                 #[cfg(not(target_os = "windows"))]
                 voice_media,
             });
-            #[cfg(desktop)]
-            {
-                let phase = logging::startup(logging::StartupPhase::Updates);
-                updates::init(app.handle())?;
-                phase.finish();
-            }
             #[cfg(target_os = "linux")]
             if let Some(window) = app.get_webview_window("main") {
                 logging::observe_web_process(&window)?;
@@ -1828,6 +1835,18 @@ pub fn run() {
         .build(context)
         .expect("failed to build desktop shell");
     build_phase.finish();
+    #[cfg(desktop)]
+    {
+        // Registration and persisted preferences must be ready before event
+        // dispatch, but their disk read must not run inside the setup callback.
+        let phase = logging::startup(logging::StartupPhase::Updates);
+        if let Err(error) = tauri::async_runtime::block_on(updates::init(app.handle())) {
+            tracing::error!("Native startup failed phase=Updates");
+            eprintln!("Failed to initialize app updates: {error}");
+            std::process::exit(1);
+        }
+        phase.finish();
+    }
     if let Err(error) = devtools::announce_application_directories(&app) {
         tracing::error!("Native startup failed phase=ApplicationDirectories");
         eprintln!("DEV instance application directories were not announced: {error}");

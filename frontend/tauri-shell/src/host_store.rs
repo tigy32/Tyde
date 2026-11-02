@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use devtools_protocol::CONFIGURED_HOST_STORE_PATH_ENV;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 pub use host_config::{
@@ -12,6 +13,21 @@ pub use host_config::{
 
 #[derive(Debug, Clone)]
 pub struct HostStore {
+    commands: mpsc::UnboundedSender<StoreCommand>,
+}
+
+type Reply<T> = oneshot::Sender<Result<T, String>>;
+
+#[derive(Debug)]
+enum StoreCommand {
+    List(Reply<ConfiguredHostStore>),
+    Get(String, Reply<Option<ConfiguredHost>>),
+    Upsert(UpsertConfiguredHostRequest, Reply<ConfiguredHostStore>),
+    Remove(String, Reply<ConfiguredHostStore>),
+    Select(Option<String>, Reply<ConfiguredHostStore>),
+}
+
+struct DiskStore {
     path: PathBuf,
 }
 
@@ -23,9 +39,88 @@ struct StoreFile {
 }
 
 impl HostStore {
-    pub fn load(path: PathBuf) -> Result<Self, String> {
-        let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+    pub async fn load(path: PathBuf) -> Result<Self, String> {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let (ready, initialized) = oneshot::channel();
+        // One blocking owner keeps each read/modify/sync/rename indivisible,
+        // including when an invoke's caller stops waiting for its reply.
+        std::thread::Builder::new()
+            .name("configured-host-store".to_owned())
+            .spawn(move || {
+                let result = DiskStore::read_from_disk(&path).map(|_| ());
+                let failed = result.is_err();
+                if ready.send(result).is_err() || failed {
+                    return;
+                }
+                let store = DiskStore { path };
+                while let Some(command) = receiver.blocking_recv() {
+                    match command {
+                        StoreCommand::List(reply) => {
+                            let _ = reply.send(store.list());
+                        }
+                        StoreCommand::Get(id, reply) => {
+                            let _ = reply.send(store.get(&id));
+                        }
+                        StoreCommand::Upsert(request, reply) => {
+                            let _ = reply.send(store.upsert(request));
+                        }
+                        StoreCommand::Remove(id, reply) => {
+                            let _ = reply.send(store.remove(&id));
+                        }
+                        StoreCommand::Select(id, reply) => {
+                            let _ = reply.send(store.set_selected_host(id));
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("Failed to start host store worker: {error}"))?;
+        initialized
+            .await
+            .map_err(|_| "Host store worker stopped during initialization".to_owned())??;
+        Ok(Self { commands })
+    }
+
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(Reply<T>) -> StoreCommand,
+    ) -> Result<T, String> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(command(reply))
+            .map_err(|_| "Host store worker stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "Host store worker stopped before replying".to_owned())?
+    }
+
+    pub async fn list(&self) -> Result<ConfiguredHostStore, String> {
+        self.request(StoreCommand::List).await
+    }
+
+    pub async fn get(&self, host_id: &str) -> Result<Option<ConfiguredHost>, String> {
+        self.request(|reply| StoreCommand::Get(host_id.to_owned(), reply))
+            .await
+    }
+
+    pub async fn upsert(
+        &self,
+        request: UpsertConfiguredHostRequest,
+    ) -> Result<ConfiguredHostStore, String> {
+        self.request(|reply| StoreCommand::Upsert(request, reply))
+            .await
+    }
+
+    pub async fn remove(&self, host_id: &str) -> Result<ConfiguredHostStore, String> {
+        self.request(|reply| StoreCommand::Remove(host_id.to_owned(), reply))
+            .await
+    }
+
+    pub async fn set_selected_host(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<ConfiguredHostStore, String> {
+        self.request(|reply| StoreCommand::Select(host_id, reply))
+            .await
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -40,8 +135,10 @@ impl HostStore {
             .join(".tyde")
             .join("configured_hosts.json"))
     }
+}
 
-    pub fn list(&self) -> Result<ConfiguredHostStore, String> {
+impl DiskStore {
+    fn list(&self) -> Result<ConfiguredHostStore, String> {
         Self::read_from_disk(&self.path)
     }
 

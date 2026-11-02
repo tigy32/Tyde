@@ -1581,3 +1581,58 @@ and every temporal state was observed while held. In particular:
 Missing evidence, an unobserved transient state, or an unexplained `N/A` means
 the backend is not certified. Any `FAIL`, `BLOCKED`, or `NOT TESTED` row also
 means the backend is not certified and must be reported explicitly.
+
+### Desktop saved-host disk boundary (Linux Native)
+
+Use an isolated, attested Native dev instance, not a browser-only client. This
+checks saved-host persistence scheduling, not SSH authentication or the cause
+of a long-lived-session stall.
+
+1. Through real Tauri IPC, create two Manual hosts, edit a label and select a
+   host. Read the configured-host file independently after each acknowledged
+   write; it must match the returned store. A second list must reread external
+   file edits, not an in-memory copy.
+2. Replace only that instance's configured-host file with a FIFO. Keep a writer
+   open without supplying bytes. Install an inotify open watch, then start a
+   `list_configured_hosts` invoke without awaiting it in the evaluation that
+   launches it. Wait for the reader's open event: disk work is now held by an
+   explicit event gate, not an elapsed-time assumption.
+3. While the read is held, complete a synchronous `mark_frontend_ready` invoke
+   (a native UI-thread round trip), open Settings, switch Appearance/Hosts,
+   and await animation frames. The saved-host invoke must remain unsettled.
+   Record the existing content-free thread markers: invokes dispatch on the
+   UI thread, but host-store reads/writes must use a distinct worker thread.
+4. Restore a regular configured-host file, supply valid JSON to the FIFO,
+   and close its writer. Await the pending invoke. Exercise concurrent host
+   upserts, selection, removal (including removing the selected host), and
+   list again; no acknowledged mutation may be lost.
+5. Through IPC, verify that invalid labels/transports, local-host removal and
+   missing host selection still reject. Substitute malformed JSON, an
+   unreadable path (a directory), and a directory at the temporary-file path
+   to provoke parse/read/write failures. Failed writes must leave the original
+   file intact. Restore the file and verify subsequent CRUD succeeds.
+6. Exercise app-update settings with automatic checking disabled: configure,
+   dismiss, and reread `updates.json` independently. Failed writes must reject
+   without changing the prior preferences. Reload the Native frontend to
+   verify host selection is read back. Update preferences are read at native
+   startup, not frontend reload. Check actual Native process starts against
+   retained owned preferences: saved values must load, while malformed JSON
+   and an unreadable file must preserve the existing error/automatic-off state.
+
+A per-operation ten-minute hung watchdog may release the FIFO for cleanup and
+report failure. It is not a responsiveness threshold. No sleeps, retry-to-green,
+CPU-speed assertions, backend turns, or changes to auth/lifecycle behavior are
+needed. Always restore/remove the owned FIFO and join its writer; stop the
+owned instance/controller/display after collecting evidence.
+
+Scheduling audit: saved-host list/upsert/select were synchronous invokes;
+remove/connect/probe/ensure/upgrade also called the same synchronous store.
+They now all await one disk-owning worker, with no cached store or async lock.
+The complete read/modify/sync/rename stays serialized even if a caller abandons
+its reply. Initial host validation is awaited before UI construction. Update
+preferences were also read in the UI setup callback; initialization now awaits
+a blocking worker before event dispatch. Existing update configure/dismiss,
+connection/disconnection, lifecycle SSH, feedback and external-link handlers
+already run asynchronously; their persistence, network/process operations and
+error ordering are unchanged. Retry is in-memory notification only. Native
+image reads already use blocking workers. Theme and layout are untouched.

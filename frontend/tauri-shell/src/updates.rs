@@ -525,9 +525,8 @@ async fn restart_application(
     Ok(())
 }
 
-pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let preferences_path = app.path().app_config_dir()?.join("updates.json");
-    let (preferences, error) = match std::fs::read(&preferences_path) {
+fn read_preferences(path: &std::path::Path) -> (UpdatePreferences, Option<String>) {
+    match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(preferences) => (preferences, None),
             Err(error) => (
@@ -548,7 +547,14 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             },
             Some(format!("Update preferences could not be read: {error}")),
         ),
-    };
+    }
+}
+
+pub async fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let preferences_path = app.path().app_config_dir()?.join("updates.json");
+    let path = preferences_path.clone();
+    let (preferences, error) =
+        tauri::async_runtime::spawn_blocking(move || read_preferences(&path)).await?;
     app.manage(Updates {
         inner: Mutex::new(Inner {
             status: AppUpdateStatus {
