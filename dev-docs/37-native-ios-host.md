@@ -31,10 +31,13 @@ Debug retains `dev.tyde.mobile.nativeqa`, its existing data and its independent
 Keychain service; the preview is a separate install, not a QA-data migration.
 No additional entitlements, Associated Domains or push capability are requested.
 The marketing version comes from the existing generated release metadata;
-the Xcode app target owns its build number (`CURRENT_PROJECT_VERSION`). Initial
-preview version is0.9.6/build1 (packaged release0.9.6-beta.19). Allocate a new
-tracked build number for each subsequent upload; asset packaging must not
-silently reset it to1. Do not let an
+the Xcode app target owns its build number (`CURRENT_PROJECT_VERSION`). Apple
+rejected the 0.9.6 build 1 upload because the marketing icon had an alpha
+channel (90717). The next Release upload of this same packaged 0.9.6-beta.19
+source is build 2. Debug stays build 1. Allocate a new tracked build number for
+each subsequent upload; asset packaging must not silently reset it to 1. The
+App Store icon is the opaque 1024 RGB `AppIcon.png` and must not gain an alpha
+channel. Do not let an
 export tool rewrite the reviewed version/build identity.
 
 Known preview limits: normal pairing/bootstrap passed on the retained iPad with

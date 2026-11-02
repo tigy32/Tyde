@@ -1414,6 +1414,13 @@ class DevCheckCacheTests(unittest.TestCase):
         )
         (self.root / "tools").mkdir()
         shutil.copy2(REPO_ROOT / "tools/check-resources.py", self.root / "tools")
+        shutil.copy2(REPO_ROOT / "tools/check_ios_app_icon.py", self.root / "tools")
+        icon = self.root / "ios/Tyde/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+        icon.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO_ROOT / "ios/Tyde/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+            icon,
+        )
         shutil.copy2(
             REPO_ROOT / "tools" / "run-nextest-binary.sh",
             self.root / "tools" / "run-nextest-binary.sh",

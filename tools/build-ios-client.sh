@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 output="$PWD/target/ios-client"
 mkdir -p "$output"
+python3 tools/check_ios_app_icon.py
 python3 tools/ios-source-manifest.py write
 cargo run --quiet -p mobile-shell-types --bin native-bindings > "$output/NativeBridge.swift"
 cargo run --quiet -p mobile-shell-types --bin native-bindings -- --metadata > "$output/build-metadata.json"

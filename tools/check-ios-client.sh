@@ -105,6 +105,7 @@ fi
 [[ -z "${TYDE_IOS_PAIRING_URL:-}" && -z "${TEST_RUNNER_TYDE_IOS_PAIRING_URL:-}" ]] || {
     echo 'Do not pre-issue a pairing URL; wait for driver READY, then use --ios-offer' >&2; exit 1;
 }
+python3 tools/check_ios_app_icon.py
 python3 tools/ios-source-manifest.py verify
 result="$PWD/target/ios-results/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$result"
