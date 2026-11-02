@@ -23,6 +23,10 @@ from errors, tool results, or history above it. Reproduce backend contract
 violations in real conformance and fix the adapter, not shared server/UI
 workarounds.
 
+**No blocking I/O on the desktop UI thread.** Keep filesystem, network and
+subprocess waits out of UI callbacks and synchronous Tauri handlers. Use async
+I/O or an owned blocking worker; deliver completion and errors asynchronously.
+
 Never impose arbitrary timeouts on local work; wait for completion,
 cancellation, or a real error.
 

@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use tracing_appender::non_blocking::NonBlocking;
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 
+pub(crate) const HOST_IO_TRACE_TARGET: &str = "tauri_shell::host_io";
+
 struct LoggingGuards {
     _file_guard: WorkerGuard,
+    file_losses: ErrorCounter,
 }
 
 static LOGGING_GUARDS: OnceLock<LoggingGuards> = OnceLock::new();
@@ -46,9 +48,13 @@ fn init_logging(console_target: ConsoleTarget, file_prefix: &str) -> Result<(), 
         .with_target(true)
         .with_thread_ids(true)
         .with_thread_names(true)
-        .with_line_number(true);
+        .with_line_number(true)
+        .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() != HOST_IO_TRACE_TARGET
+        }));
 
     let (file_writer, file_guard) = build_file_writer(file_prefix)?;
+    let file_losses = file_writer.error_counter();
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false)
@@ -64,6 +70,7 @@ fn init_logging(console_target: ConsoleTarget, file_prefix: &str) -> Result<(), 
         .map_err(|err| format!("failed to initialize tracing subscriber: {err}"))?;
     let _ = LOGGING_GUARDS.set(LoggingGuards {
         _file_guard: file_guard,
+        file_losses,
     });
 
     Ok(())
@@ -254,8 +261,16 @@ pub(crate) fn start_ui_diagnostics(app: &tauri::AppHandle) -> DiagnosticSink {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut budget = LogBudget::new();
+        let mut reported_file_losses = 0;
         loop {
             ticks.tick().await;
+            if let Some(guards) = LOGGING_GUARDS.get() {
+                let dropped = guards.file_losses.dropped_lines();
+                if dropped != reported_file_losses {
+                    tracing::warn!(target: HOST_IO_TRACE_TARGET, file_dropped_lines = dropped, "host.config event=log_loss");
+                    reported_file_losses = dropped;
+                }
+            }
             let queued = std::time::Instant::now();
             let (done, mut completion) = tokio::sync::oneshot::channel();
             if app

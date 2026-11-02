@@ -547,6 +547,7 @@ async fn launch_server(ssh_destination: &str, version: &TydeReleaseVersion) -> R
 }
 
 async fn ssh_capture(ssh_destination: &str, remote_command: &str) -> Result<String, String> {
+    tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.connect event=ssh_capture_start");
     let output = server::process_env::command("ssh")?
         .arg("-T")
         .arg(ssh_destination)

@@ -929,6 +929,7 @@ async fn connect_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<(), String> {
+    tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.connect event=task_start");
     let configured_host = state
         .host_store
         .get(&host_id)?
@@ -1268,6 +1269,17 @@ where
     let voice_output_handler: Box<dyn Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync> =
         Box::new(tauri::generate_handler![voice_media_push_output]);
     move |invoke| {
+        let command = invoke.message.command();
+        if matches!(
+            command,
+            "list_configured_hosts"
+                | "upsert_configured_host"
+                | "set_selected_host"
+                | "connect_host"
+                | "ensure_configured_host_ready"
+        ) {
+            tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, command, "host.config event=invoke_dispatch");
+        }
         if invoke.message.command() == "voice_media_push_output" {
             voice_output_handler(invoke)
         } else {
@@ -1736,6 +1748,8 @@ pub fn run() {
                 devtools::attest_native_state(app, identity).map_err(std::io::Error::other)?;
             }
             let setup_phase = logging::startup(logging::StartupPhase::Setup);
+            app.handle()
+                .run_on_main_thread(|| tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.config event=ui_thread"))?;
             app.manage(logging::start_ui_diagnostics(app.handle()));
             let phase = logging::startup(logging::StartupPhase::HostStore);
             tracing::info!("setup: spawning host and router");

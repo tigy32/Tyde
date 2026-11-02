@@ -130,6 +130,7 @@ impl HostStore {
     }
 
     fn read_from_disk(path: &Path) -> Result<ConfiguredHostStore, String> {
+        tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.config event=disk_read");
         let store = match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let file = serde_json::from_str::<StoreFile>(&contents).map_err(|err| {
@@ -158,6 +159,7 @@ impl HostStore {
     }
 
     fn save(path: &Path, store: &ConfiguredHostStore) -> Result<(), String> {
+        tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.config event=disk_write");
         let json = serde_json::to_string_pretty(&StoreFile {
             hosts: store.hosts.clone(),
             selected_host_id: store.selected_host_id.clone(),

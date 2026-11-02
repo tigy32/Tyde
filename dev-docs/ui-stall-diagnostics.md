@@ -353,6 +353,30 @@ a long pending wait is not synchronous work. They do not identify a native
 GC/JIT/allocation producer, prove causation, or establish that an unobserved
 original freeze is fixed.
 
+## Desktop connection and saved-host thread tracing
+
+With the existing `RUST_LOG=info,tauri_shell=debug` filter, native tracing emits
+content-free, file-only `host.config` markers for UI-thread dispatch, selected saved-host
+IPC entry points, and host-store disk reads/writes. `host.connect` marks the
+connection task and managed SSH capture entry. The existing tracing formatter
+records the actual thread name/ID; compare these with `event=ui_thread`, which
+runs through Tauri's main-thread dispatcher. No host IDs, destinations, paths,
+credentials, payloads or error text are added by these markers.
+
+The dedicated `tauri_shell::host_io` target bypasses the synchronous console
+writer and uses the existing bounded non-blocking file writer. The existing
+native probe tick reports cumulative file-queue loss as `event=log_loss` after
+loss changes; a missing marker is not proof that no operation ran. No new log
+worker, queue, monitor or timer is added.
+
+These are execution-context observations, not an inferred connection status or
+new telemetry sink. Markers add no timer, wait or state reconstruction. Disk
+entry on a UI thread identifies a blocking-I/O exposure, not its duration or
+proof that it caused a particular authentication failure. An SSH operation can
+remain pending off-thread while unrelated UI work completes. Preserve the
+actual action/settlement and thread evidence before attributing a whole-app
+hang; Linux observations alone do not establish Mac keychain/askpass behavior.
+
 ## Long-session reproduction bounds
 
 The mounted Chrome long-transcript flow exercises 200 generated payload rows,
