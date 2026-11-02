@@ -128,13 +128,8 @@
     position: relative;
 }
 
-/* Later rows of a stretch keep their time and copy action, out of the flow
-   until the row is hovered or focused. */
+/* Later rows reveal their time and copy action on hover or keyboard focus. */
 .chat-view[data-chat-chrome="ink"] .ink-continuation .chat-card-footer {
-    position: absolute;
-    top: 0;
-    right: 0;
-    z-index: 1;
     margin: 0;
     padding: 0 0 0 10px;
     border-radius: 6px;
@@ -142,6 +137,21 @@
     opacity: 0;
     pointer-events: none;
     transition: opacity 120ms ease;
+}
+
+/* Reserve space after Flow content so revealing controls never covers prose
+   or moves the transcript. Notebook retains its existing positioned byline. */
+.chat-view[data-chat-appearance="ink"] .ink-continuation .chat-card-footer {
+    order: 1;
+    align-self: flex-end;
+    margin-top: 4px;
+}
+
+.chat-view[data-chat-appearance="notebook"] .ink-continuation .chat-card-footer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
 }
 
 .chat-view[data-chat-chrome="ink"] .ink-continuation:is(:hover, :focus-within) .chat-card-footer {
@@ -1725,14 +1735,26 @@
     padding: 20px clamp(18px, 3%, 40px) 24px;
 }
 
-.chat-view[data-chat-appearance="ink"] .chat-card-user {
+.chat-view[data-chat-appearance="ink"] :is(.chat-card-user, .chat-card-agent) {
     width: 100%;
     max-width: none;
     margin-left: 0;
     padding: 18px 0 0;
+    border: 0;
     border-top: 1px solid var(--border-primary);
     border-radius: 0;
     background: transparent;
+}
+
+.chat-view[data-chat-appearance="ink"] .chat-card-system .chat-card-body {
+    margin-inline: 0;
+    width: auto;
+    text-align: left;
+    font-style: normal;
+}
+
+.chat-view[data-chat-appearance="ink"] :is(.tool-read-file-icon, .tool-result-file-icon) {
+    display: none;
 }
 
 .chat-view[data-chat-appearance="ink"] .chat-card-user .chat-card-phase {

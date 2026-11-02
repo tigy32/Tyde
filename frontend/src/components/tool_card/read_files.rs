@@ -18,14 +18,22 @@ pub(crate) fn render(
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,
     mode: ToolOutputMode,
+    show_single_file: bool,
 ) -> AnyView {
     let ToolRequestType::ReadFiles { file_paths } = req else {
         unreachable!("read_files::render dispatched on non-ReadFiles request");
     };
 
-    let request_view = render_request(file_paths, mode);
+    let request_view =
+        if show_single_file && matches!(result, Some(ToolExecutionResult::ReadFiles { .. })) {
+            None
+        } else {
+            render_request(file_paths, mode, show_single_file)
+        };
     let result_view = match result {
-        Some(ToolExecutionResult::ReadFiles { files }) => Some(render_result(files, mode)),
+        Some(ToolExecutionResult::ReadFiles { files }) => {
+            Some(render_result(files, mode, show_single_file))
+        }
         Some(_) | None => None,
     };
 
@@ -38,13 +46,17 @@ pub(crate) fn render(
     .into_any()
 }
 
-fn render_request(file_paths: &[String], mode: ToolOutputMode) -> Option<impl IntoView> {
+fn render_request(
+    file_paths: &[String],
+    mode: ToolOutputMode,
+    show_single_file: bool,
+) -> Option<impl IntoView> {
     // Only show request-side rows pre-completion. Once the result arrives we
     // render the richer file-with-size list instead.
     if mode == ToolOutputMode::Summary {
         return None;
     }
-    if mode == ToolOutputMode::Compact && file_paths.len() == 1 {
+    if mode == ToolOutputMode::Compact && file_paths.len() == 1 && !show_single_file {
         // Header detail already shows the single path.
         return None;
     }
@@ -77,11 +89,15 @@ fn render_request(file_paths: &[String], mode: ToolOutputMode) -> Option<impl In
     })
 }
 
-fn render_result(files: &[protocol::FileInfo], mode: ToolOutputMode) -> impl IntoView {
+fn render_result(
+    files: &[protocol::FileInfo],
+    mode: ToolOutputMode,
+    show_single_file: bool,
+) -> impl IntoView {
     if mode == ToolOutputMode::Summary {
         return view! { <span></span> }.into_any();
     }
-    if mode == ToolOutputMode::Compact && files.len() == 1 {
+    if mode == ToolOutputMode::Compact && files.len() == 1 && !show_single_file {
         // Header detail shows path + size already.
         return view! { <span></span> }.into_any();
     }
@@ -165,7 +181,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn summary_renders_no_rows() {
         let r = result(3);
-        let container = mount(move || render(&req(3), Some(&r), ToolOutputMode::Summary));
+        let container = mount(move || render(&req(3), Some(&r), ToolOutputMode::Summary, false));
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), 0);
     }
@@ -173,17 +189,24 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn compact_under_cap_shows_all_rows() {
         let r = result(3);
-        let container = mount(move || render(&req(3), Some(&r), ToolOutputMode::Compact));
+        let container = mount(move || render(&req(3), Some(&r), ToolOutputMode::Compact, false));
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), 3);
         assert!(!text(&container).contains("more"));
         assert_optional_sizes(&container, 3);
+
+        let single = result(1);
+        let flow = mount(move || render(&req(1), Some(&single), ToolOutputMode::Compact, true));
+        next_tick().await;
+        assert_eq!(count(&flow, ".tool-result-file"), 1);
+        assert_eq!(count(&flow, ".tool-read-file-row"), 0);
+        assert_optional_sizes(&flow, 1);
     }
 
     #[wasm_bindgen_test]
     async fn compact_over_cap_caps_with_more_line() {
         let r = result(20);
-        let container = mount(move || render(&req(20), Some(&r), ToolOutputMode::Compact));
+        let container = mount(move || render(&req(20), Some(&r), ToolOutputMode::Compact, false));
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), COMPACT_MAX_ROWS);
         assert!(text(&container).contains("+12 more"));
@@ -192,7 +215,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn full_shows_all_rows() {
         let r = result(20);
-        let container = mount(move || render(&req(20), Some(&r), ToolOutputMode::Full));
+        let container = mount(move || render(&req(20), Some(&r), ToolOutputMode::Full, false));
         next_tick().await;
         assert_eq!(count(&container, ".tool-result-file"), 20);
         assert_optional_sizes(&container, 20);

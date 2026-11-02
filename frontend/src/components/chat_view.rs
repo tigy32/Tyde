@@ -3168,10 +3168,13 @@ mod wasm_tests {
             model: Some("claude-test".to_owned()),
         }));
         dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
-            text: "All done.".to_owned(),
+            text: "All done. The message must remain readable when its copy control appears."
+                .to_owned(),
         }));
         dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
-            message: assistant("All done."),
+            message: assistant(
+                "All done. The message must remain readable when its copy control appears.",
+            ),
         }));
 
         let text_of = |element: &Element| element.text_content().unwrap_or_default();
@@ -3352,6 +3355,80 @@ mod wasm_tests {
         }
         cards[1].set_open(false);
         parent.insert_before(&cards[1], next.as_ref()).unwrap();
+
+        let reply = visible(".chat-card-assistant")
+            .into_iter()
+            .find(|card| text_of(card).starts_with("All done."))
+            .expect("continuation prose after the tools");
+        let reply_row = reply.closest(".virt-row").unwrap().unwrap();
+        let reply_parent = reply_row.parent_node().unwrap();
+        let reply_next = reply_row.next_sibling();
+        frame_document
+            .query_selector(".chat-view")
+            .unwrap()
+            .unwrap()
+            .append_child(&reply_row)
+            .unwrap();
+        let body = reply.query_selector(".chat-card-body").unwrap().unwrap();
+        let footer = reply.query_selector(".chat-card-footer").unwrap().unwrap();
+        let copy = reply
+            .query_selector("button[aria-label='Copy message']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let root = frame_document.document_element().unwrap();
+        root.set_attribute("style", "--font-sans:monospace;--base-font-size:15px")
+            .unwrap();
+        for theme in ["light", "dark"] {
+            root.set_attribute("data-theme", theme).unwrap();
+            for width in [360, 800] {
+                frame
+                    .set_attribute("style", &format!("width:{width}px;height:240px;border:0"))
+                    .unwrap();
+                settle().await;
+                let rest = body.get_bounding_client_rect();
+                let rest_height = reply.get_bounding_client_rect().height();
+                copy.focus().unwrap();
+                settle().await;
+                assert!(copy.matches(":focus").unwrap());
+                assert_eq!(
+                    frame_window
+                        .get_computed_style(&footer)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("pointer-events")
+                        .unwrap(),
+                    "auto",
+                    "keyboard focus reveals the same controls as hover"
+                );
+                let text = body.get_bounding_client_rect();
+                let controls = footer.get_bounding_client_rect();
+                assert!(
+                    controls.top() >= text.bottom(),
+                    "revealed metadata must not cover continuation prose at {width}px in {theme}"
+                );
+                assert!(
+                    controls.right() <= reply.get_bounding_client_rect().right() + 0.5,
+                    "revealed controls stay inside the transcript"
+                );
+                assert_eq!(
+                    text.top(),
+                    rest.top(),
+                    "revealing controls never moves text"
+                );
+                assert_eq!(text.height(), rest.height());
+                assert_eq!(reply.get_bounding_client_rect().height(), rest_height);
+                assert_eq!(
+                    body.text_content().unwrap().trim(),
+                    "All done. The message must remain readable when its copy control appears."
+                );
+                copy.blur().unwrap();
+            }
+        }
+        reply_parent
+            .insert_before(&reply_row, reply_next.as_ref())
+            .unwrap();
         frame.remove();
         settle().await;
 

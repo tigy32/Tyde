@@ -1034,7 +1034,14 @@ fn render_body(
     match req {
         ToolRequestType::ModifyFile { .. } => modify_file::render(req, result, mode).into_any(),
         ToolRequestType::RunCommand { .. } => run_command::render(req, result, mode).into_any(),
-        ToolRequestType::ReadFiles { .. } => read_files::render(req, result, mode).into_any(),
+        ToolRequestType::ReadFiles { .. } => read_files::render(
+            req,
+            result,
+            mode,
+            expect_context::<AppState>().chat_appearance.get()
+                == crate::appearance::ChatAppearance::Ink,
+        )
+        .into_any(),
         ToolRequestType::SearchTypes { .. } => search_types::render(req, result, mode).into_any(),
         ToolRequestType::GetTypeDocs { .. } => get_type_docs::render(req, result, mode).into_any(),
         // The Tyde orchestration tools own their presentation end to end: a sent

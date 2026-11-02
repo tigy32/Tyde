@@ -1548,6 +1548,93 @@ mod wasm_tests {
             agent_row.query_selector("img").unwrap().is_none(),
             "No sender avatar"
         );
+
+        let style = window.document().unwrap().create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../ink-chat.css")));
+        window
+            .document()
+            .unwrap()
+            .head()
+            .unwrap()
+            .append_child(&style)
+            .unwrap();
+        for message in [&*agent, &*system] {
+            message.set_class_name("chat-view");
+            message.set_attribute("data-chat-chrome", "ink").unwrap();
+            message
+                .set_attribute("data-chat-appearance", "ink")
+                .unwrap();
+        }
+        let system_body = system.query_selector(".chat-card-body").unwrap().unwrap();
+        let system_header = system.query_selector(".chat-card-header").unwrap().unwrap();
+        let body = agent_row
+            .query_selector(".chat-card-body")
+            .unwrap()
+            .unwrap();
+        let header = agent_row
+            .query_selector(".chat-card-header")
+            .unwrap()
+            .unwrap();
+        for width in [800, 360] {
+            for message in [&*agent, &*system] {
+                message
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+            }
+            next_tick().await;
+            let css = window.get_computed_style(&agent_row).unwrap().unwrap();
+            assert_eq!(
+                css.get_property_value("border-left-width").unwrap(),
+                "0px",
+                "Flow agent input has no accent stripe against its text"
+            );
+            assert_eq!(
+                css.get_property_value("background-color").unwrap(),
+                "rgba(0, 0, 0, 0)",
+                "Flow agent input belongs to the continuous transcript, not a filled card"
+            );
+            let row = agent_row.get_bounding_client_rect();
+            let byline = header.get_bounding_client_rect();
+            let text = body.get_bounding_client_rect();
+            assert!(
+                byline.top() - row.top() >= 18.0,
+                "Input has breathing room below its turn divider"
+            );
+            assert!(
+                (text.left() - byline.left()).abs() < 1.0,
+                "Input and attribution share a gutter"
+            );
+            assert!(
+                text.right() <= row.right() + 0.5,
+                "Agent input stays inside a narrow pane"
+            );
+            assert_eq!(
+                sender(&agent),
+                "UI worker · Agent",
+                "Flow retains agent attribution"
+            );
+            assert_eq!(body.text_content().unwrap().trim(), "Ready for review.");
+            let system_css = window.get_computed_style(&system_body).unwrap().unwrap();
+            assert_eq!(
+                system_css.get_property_value("font-style").unwrap(),
+                "normal"
+            );
+            assert_eq!(system_css.get_property_value("text-align").unwrap(), "left");
+            assert!(
+                (system_body.get_bounding_client_rect().left()
+                    - system_header.get_bounding_client_rect().left())
+                .abs()
+                    < 1.0,
+                "System notices share the transcript gutter with their attribution"
+            );
+            assert_eq!(sender(&system), "System");
+            assert_eq!(
+                system_body.text_content().unwrap().trim(),
+                "Workspace changed"
+            );
+        }
+        style.remove();
     }
 
     #[wasm_bindgen_test]

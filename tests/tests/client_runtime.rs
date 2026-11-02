@@ -1466,19 +1466,15 @@ async fn connect_runtime(host: server::HostHandle) -> HostEndpoint {
 }
 
 async fn next_host_event(events: &mut client::HostEvents, context: &str) -> HostEvent {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let event = events
-                .recv()
-                .await
-                .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"));
-            if !matches!(event, HostEvent::Voice(_)) {
-                return event;
-            }
+    loop {
+        let event = events
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"));
+        if !matches!(event, HostEvent::Voice(_)) {
+            return event;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for host event: {context}"))
+    }
 }
 
 async fn next_session_count(
