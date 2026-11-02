@@ -129,6 +129,46 @@ async fn fresh_reconnect_pages_large_agent_history_without_losing_messages() {
     session.close();
 }
 
+struct HandshakeGate<W> {
+    writer: W,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    released: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HandshakeGate<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        if let Some(released) = &mut self.released {
+            match std::future::Future::poll(std::pin::Pin::new(released), cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+                }
+                std::task::Poll::Ready(Ok(())) => self.released = None,
+            }
+        }
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
 impl Wire {
     async fn drop_transport(self) {
         self.relay.abort();
@@ -148,11 +188,10 @@ async fn attach(
 ) -> (uuid::Uuid, Wire) {
     let (wire, relay, downlink) = fixture.recovery_wire_controlled(registry.clone());
     let (mut reader, mut writer) = tokio::io::split(wire);
-    let (id, received, _) = server::recovery::connect(&mut reader, &mut writer, id, session)
+    let (id, transport, _) = server::recovery::connect(&mut reader, &mut writer, id, session)
         .await
         .expect("attach recovery wire");
-    let session = session.clone();
-    let attachment = tokio::spawn(session.attach(reader, writer, received));
+    let attachment = tokio::spawn(transport.run(reader, writer));
     (
         id,
         Wire {
@@ -241,11 +280,95 @@ async fn connection_resumes_projects_and_commands_without_new_bootstrap() {
     // Replace a still-open socket, as happens when only one side has detected
     // an outage. Cleanup of the old attachment must leave its replacement live.
     let old_wire = wire;
-    let (_, wire) = attach(&fixture, &registry, &session, Some(id)).await;
-    let old_result = old_wire.attachment.await.expect("old attachment task");
+    eprintln!("Recovery protocol milestone: phase=old-wire-output-held");
+    old_wire.downlink.send(false).expect("hold old downlink");
+    client
+        .project_rename(protocol::ProjectRenamePayload {
+            id: project.id.clone(),
+            name: "In flight before handshake".into(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut other, "in-flight command executed before handover", |e| {
+        e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "In flight before handshake")
+    }).await;
+
+    eprintln!("Recovery protocol milestone: phase=in-flight-command-observed");
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (wire, relay, downlink) =
+        fixture.recovery_wire_with_writer(registry.clone(), |writer| HandshakeGate {
+            writer,
+            entered: Some(entered),
+            released: Some(released),
+        });
+    let (mut reader, mut writer) = tokio::io::split(wire);
+    let (_, transport, _) = server::recovery::connect(&mut reader, &mut writer, Some(id), &session)
+        .await
+        .expect("replacement handshake");
+    observed.await.expect("handshake reached flush barrier");
+    eprintln!("Recovery protocol milestone: phase=replacement-handshake-held");
+    old_wire.downlink.send_replace(true);
+    let mut old_attachment = old_wire.attachment;
+    // An in-flight result may finish on the old wire or replay on the new one.
+    // If it finishes on the old wire, a following command proves its ACK was
+    // delivered before releasing the replacement handshake's flush barrier.
+    let old_result = tokio::select! {
+        result = &mut old_attachment => Some(result.expect("old attachment task")),
+        _ = next_frame_matching_on(&mut client, "in-flight result on old wire", |e| {
+            assert_ne!(e.kind, FrameKind::HostBootstrap);
+            e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "In flight before handshake")
+        }) => None,
+    };
+    client
+        .project_rename(protocol::ProjectRenamePayload {
+            id: project.id.clone(),
+            name: "Queued during handshake".into(),
+        })
+        .await
+        .unwrap();
+    if old_result.is_none() {
+        tokio::select! {
+            result = &mut old_attachment => panic!("old wire ended before acknowledgement barrier: {:?}", result.expect("old attachment task").err().map(|error| error.kind())),
+            _ = next_frame_matching_on(&mut other, "old-wire acknowledgement barrier", |e| {
+                e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "Queued during handshake")
+            }) => {},
+        }
+    }
+    eprintln!(
+        "Recovery protocol milestone: phase=old-wire-result-settled replay_needed={}",
+        old_result.is_some()
+    );
+    release.send(()).expect("release peer handshake");
+    let mut attachment = tokio::spawn(transport.run(reader, writer));
+    let replay = async {
+        if old_result.is_some() {
+            next_frame_matching_on(&mut client, "in-flight result replayed on replacement", |e| {
+                assert_ne!(e.kind, FrameKind::HostBootstrap);
+                e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "In flight before handshake")
+            }).await;
+        }
+        next_frame_matching_on(&mut client, "command queued during handshake", |e| {
+            assert_ne!(e.kind, FrameKind::HostBootstrap);
+            e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "Queued during handshake")
+        }).await;
+    };
+    tokio::select! {
+        result = &mut attachment => panic!("replacement ended before replay: {:?}", result.expect("attachment task").err().map(|error| error.kind())),
+        _ = replay => {},
+    }
+    eprintln!("Recovery protocol milestone: phase=replacement-replay-observed");
+    let wire = Wire {
+        relay,
+        downlink,
+        attachment,
+    };
+    let old_result = match old_result {
+        Some(result) => result,
+        None => old_attachment.await.expect("old attachment task"),
+    };
     assert!(old_result.is_ok() || !session.is_closed());
-    // Joining the local attachment does not settle the peer's replacement
-    // fence. Observe a round trip on the new wire before aborting the old relay.
+    // Observe the replacement's real round trip before removing the old relay.
     client
         .project_rename(protocol::ProjectRenamePayload {
             id: project.id.clone(),
@@ -258,6 +381,7 @@ async fn connection_resumes_projects_and_commands_without_new_bootstrap() {
         e.kind == FrameKind::ProjectNotify && matches!(e.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project }) if project.name == "Replacement wire ready")
     }).await;
     old_wire.relay.abort();
+    let _ = old_wire.relay.await;
     client
         .project_rename(protocol::ProjectRenamePayload {
             id: project.id.clone(),
@@ -320,15 +444,22 @@ async fn expired_and_overflowed_sessions_require_a_fresh_bootstrap() {
             })
             .await;
             wire.drop_transport().await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            registry
+                .wait_for_session_closed(id)
+                .await
+                .expect("remote session expiry");
         }
         let (new_wire, relay) = fixture.recovery_wire(registry);
         let (mut reader, mut writer) = tokio::io::split(new_wire);
-        let error = server::recovery::connect(&mut reader, &mut writer, Some(id), &session)
+        let (resume_probe, probe_logical) = Session::new();
+        let error = server::recovery::connect(&mut reader, &mut writer, Some(id), &resume_probe)
             .await
             .expect_err("lost replay cannot resume");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         relay.abort();
+        let _ = relay.await;
+        resume_probe.close();
+        drop(probe_logical);
         session.close();
     }
     let (_, bootstrap) = fixture.connect_with_bootstrap().await;

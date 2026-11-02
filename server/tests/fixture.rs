@@ -550,6 +550,19 @@ impl Fixture {
         tokio::task::JoinHandle<()>,
         tokio::sync::watch::Sender<bool>,
     ) {
+        self.recovery_wire_with_writer(registry, |writer| writer)
+    }
+
+    #[allow(dead_code)]
+    pub fn recovery_wire_with_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+        &self,
+        registry: server::recovery::Registry,
+        wrap: impl FnOnce(tokio::io::WriteHalf<tokio::io::DuplexStream>) -> W + Send + 'static,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (client, uplink) = tokio::io::duplex(8192);
         let (downlink, server) = tokio::io::duplex(8192);
@@ -578,6 +591,7 @@ impl Fixture {
         let host = self.host.clone();
         tokio::spawn(async move {
             let (reader, writer) = tokio::io::split(server);
+            let writer = wrap(writer);
             if let Some(logical) = registry
                 .accept(reader, writer)
                 .await

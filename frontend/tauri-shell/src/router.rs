@@ -744,7 +744,7 @@ async fn setup_recovery(
     let (session, logical) = server::recovery::Session::new();
     let handshake =
         server::recovery::connect(&mut setup.reader, &mut setup.writer, None, &session).await;
-    let (id, mut received, mut tail) = match handshake {
+    let (id, mut transport, mut tail) = match handshake {
         Ok(handshake) => handshake,
         Err(error) => {
             session.close();
@@ -774,7 +774,7 @@ async fn setup_recovery(
         let mut recovering = false;
         loop {
             let attached_at = std::time::Instant::now();
-            let attachment = session.clone().attach(setup.reader, setup.writer, received);
+            let attachment = transport.run(setup.reader, setup.writer);
             tokio::pin!(attachment);
             let result = if recovering {
                 context.status(false, 0, 0, "Connected — catching up…".into());
@@ -846,9 +846,9 @@ async fn setup_recovery(
                 )
                 .await;
                 match handshake {
-                    Ok((_, next_received, next_tail)) => {
+                    Ok((_, next_transport, next_tail)) => {
                         setup = next;
-                        received = next_received;
+                        transport = next_transport;
                         tail = next_tail;
                         break;
                     }

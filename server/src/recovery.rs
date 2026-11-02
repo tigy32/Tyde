@@ -56,7 +56,13 @@ impl Drop for AttachmentLease {
     fn drop(&mut self) {
         self.token.cancel();
         let mut detached = self.session.detached.lock().expect("detach time poisoned");
-        if self.session.generation.load(Ordering::Acquire) == self.generation {
+        let current_generation = self.session.generation.load(Ordering::Acquire);
+        #[cfg(feature = "test-support")]
+        eprintln!(
+            "Recovery lease ended: lease_generation={} current_generation={current_generation}",
+            self.generation
+        );
+        if current_generation == self.generation {
             *detached = Some(Instant::now());
         }
     }
@@ -64,9 +70,14 @@ impl Drop for AttachmentLease {
 
 enum Delivery {
     Fence {
-        received: u64,
+        received: Option<u64>,
         token: CancellationToken,
         reply: oneshot::Sender<io::Result<AttachmentLease>>,
+    },
+    Handshake {
+        generation: u64,
+        received: u64,
+        reply: oneshot::Sender<io::Result<()>>,
     },
     Record {
         generation: u64,
@@ -229,54 +240,60 @@ impl Session {
         }
     }
 
-    pub async fn attach<R, W>(
-        self: Arc<Self>,
-        reader: R,
-        writer: W,
-        received: u64,
-    ) -> io::Result<()>
-    where
-        R: AsyncRead + Unpin + Send,
-        W: AsyncWrite + Unpin + Send,
-    {
+    async fn reserve_attachment(
+        self: &Arc<Self>,
+        received: Option<u64>,
+    ) -> io::Result<AttachmentLease> {
         let token = CancellationToken::new();
         let (reply, fenced) = oneshot::channel();
+        if self.is_closed() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "resume unavailable: session closed",
+            ));
+        }
         self.delivery
             .send(Delivery::Fence {
                 received,
-                token: token.clone(),
+                token,
                 reply,
             })
             .await
-            .map_err(|_| invalid("recovery delivery actor stopped"))?;
-        let lease = fenced
-            .await
-            .map_err(|_| invalid("recovery delivery fence lost"))??;
-        let generation = lease.generation;
-        self.changed.notify_waiters();
-        let reader = self.read_wire(reader, generation, &token);
-        let writer = self.write_wire(writer, received, &token);
-        tokio::pin!(reader, writer);
-        let result = tokio::select! {
-            _ = self.closed.cancelled() => Err(invalid("resume unavailable: session closed")),
-            result = &mut reader => result,
-            result = &mut writer => {
-                token.cancel();
-                // Finish an envelope already being delivered before detaching.
-                tokio::select! {
-                    _ = self.closed.cancelled() => {},
-                    _ = &mut reader => {},
+            .map_err(|_| {
+                if self.is_closed() {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "resume unavailable: session closed",
+                    )
+                } else {
+                    invalid("recovery delivery actor stopped")
                 }
-                result
-            },
-        };
-        token.cancel();
-        if self.generation.load(Ordering::Acquire) == generation
-            && result
-                .as_ref()
-                .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
-        {
-            self.close();
+            })?;
+        let result = fenced.await.map_err(|_| {
+            if self.is_closed() {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "resume unavailable: session closed",
+                )
+            } else {
+                invalid("recovery delivery fence lost")
+            }
+        })?;
+        #[cfg(feature = "test-support")]
+        match &result {
+            Ok(lease) => eprintln!(
+                "Recovery attachment fenced: generation={} received={received:?}",
+                lease.generation
+            ),
+            Err(error) => {
+                let replay = self.replay.lock().expect("replay poisoned");
+                eprintln!(
+                    "Recovery fence rejected: received={received:?} first={} tail={} error_kind={:?}",
+                    replay.first,
+                    replay.next,
+                    error.kind()
+                );
+            }
         }
         result
     }
@@ -367,12 +384,17 @@ impl Session {
                     }
                     let result = (|| {
                         if self.is_closed() {
-                            return Err(invalid("resume unavailable: session closed"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "resume unavailable: session closed",
+                            ));
                         }
-                        self.replay
-                            .lock()
-                            .expect("replay poisoned")
-                            .acknowledge(received)?;
+                        if let Some(received) = received {
+                            self.replay
+                                .lock()
+                                .expect("replay poisoned")
+                                .acknowledge(received)?;
+                        }
                         let mut detached = self.detached.lock().expect("detach time poisoned");
                         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
                         if let Some(old) = self
@@ -391,6 +413,30 @@ impl Session {
                             token,
                         })
                     })();
+                    let _ = reply.send(result);
+                }
+                Delivery::Handshake {
+                    generation,
+                    received,
+                    reply,
+                } => {
+                    let result = if self.generation.load(Ordering::Acquire) != generation {
+                        Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "recovery handshake superseded",
+                        ))
+                    } else {
+                        let result = self
+                            .replay
+                            .lock()
+                            .expect("replay poisoned")
+                            .acknowledge(received);
+                        if result.is_err() {
+                            self.close();
+                        }
+                        self.changed.notify_waiters();
+                        result
+                    };
                     let _ = reply.send(result);
                 }
                 Delivery::Record {
@@ -467,6 +513,59 @@ impl Session {
     }
 }
 
+pub struct Attachment {
+    lease: AttachmentLease,
+    received: u64,
+}
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Attachment").finish_non_exhaustive()
+    }
+}
+
+impl Attachment {
+    pub async fn run<R, W>(self, reader: R, writer: W) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let generation = self.lease.generation;
+        let session = &self.lease.session;
+        let token = &self.lease.token;
+        let reader = session.read_wire(reader, generation, token);
+        let writer = session.write_wire(writer, self.received, token);
+        tokio::pin!(reader, writer);
+        let result = tokio::select! {
+            _ = session.closed.cancelled() => Err(invalid("resume unavailable: session closed")),
+            result = &mut reader => result,
+            result = &mut writer => {
+                token.cancel();
+                // Finish an envelope already being delivered before detaching.
+                tokio::select! {
+                    _ = session.closed.cancelled() => {},
+                    _ = &mut reader => {},
+                }
+                result
+            },
+        };
+        token.cancel();
+        #[cfg(feature = "test-support")]
+        eprintln!(
+            "Recovery attachment completed: generation={generation} error_kind={:?}",
+            result.as_ref().err().map(io::Error::kind)
+        );
+        if session.generation.load(Ordering::Acquire) == generation
+            && result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+        {
+            session.close();
+        }
+        result
+    }
+}
+
 async fn write_record<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
@@ -494,6 +593,19 @@ impl Default for Registry {
 }
 
 impl Registry {
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_session_closed(&self, id: Uuid) -> io::Result<()> {
+        let session = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| invalid("recovery session missing"))?;
+        session.closed().await;
+        Ok(())
+    }
+
     #[cfg(feature = "test-support")]
     pub async fn wait_for_output_capacity_pressure(&self, id: Uuid) -> io::Result<()> {
         let session = self
@@ -559,17 +671,24 @@ impl Registry {
                 (id, sessions.get(&id).cloned(), None)
             }
         };
-        let Some(session) = session.filter(|session| {
-            session
-                .replay
-                .lock()
-                .expect("replay poisoned")
-                .acknowledge(received)
-                .is_ok()
-        }) else {
+        let Some(session) = session else {
             writer.write_u8(0).await?;
             writer.flush().await?;
             return Ok(None);
+        };
+        let lease = match session.reserve_attachment(Some(received)).await {
+            Ok(lease) => lease,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::NotFound
+                ) =>
+            {
+                writer.write_u8(0).await?;
+                writer.flush().await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
         writer.write_u8(1).await?;
         writer.write_all(id.as_bytes()).await?;
@@ -577,7 +696,7 @@ impl Registry {
         writer.write_u64(session.tail()).await?;
         writer.flush().await?;
         tokio::spawn(async move {
-            if let Err(error) = session.attach(reader, writer, received).await {
+            if let Err(error) = (Attachment { lease, received }).run(reader, writer).await {
                 tracing::info!(%error, "resumable transport detached");
             }
         });
@@ -589,8 +708,11 @@ pub async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
     id: Option<Uuid>,
-    session: &Session,
-) -> io::Result<(Uuid, u64, u64)> {
+    session: &Arc<Session>,
+) -> io::Result<(Uuid, Attachment, u64)> {
+    // Both peers fence the old wire before publishing a receive snapshot.
+    // Otherwise a late old-wire ACK can invalidate an accepted handshake.
+    let lease = session.reserve_attachment(None).await?;
     timeout(Duration::from_secs(15), async {
         writer.write_all(MAGIC).await?;
         writer
@@ -612,16 +734,20 @@ pub async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         let received = reader.read_u64().await?;
         let tail = reader.read_u64().await?;
-        if let Err(error) = session
-            .replay
-            .lock()
-            .expect("replay poisoned")
-            .acknowledge(received)
-        {
-            session.close();
-            return Err(error);
-        }
-        Ok((returned_id, received, tail))
+        let (reply, acknowledged) = oneshot::channel();
+        session
+            .delivery
+            .send(Delivery::Handshake {
+                generation: lease.generation,
+                received,
+                reply,
+            })
+            .await
+            .map_err(|_| invalid("recovery delivery actor stopped"))?;
+        acknowledged
+            .await
+            .map_err(|_| invalid("recovery handshake acknowledgement lost"))??;
+        Ok((returned_id, Attachment { lease, received }, tail))
     })
     .await
     .map_err(io::Error::other)?

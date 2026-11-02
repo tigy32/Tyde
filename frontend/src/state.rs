@@ -3277,6 +3277,136 @@ pub struct ProjectInfo {
     pub project: Project,
 }
 
+// One catalog owns the records. Field triggers carry no project/name values:
+// unchanged names must not wake every mounted (including hidden) History row.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectCatalog {
+    records: StoredValue<Vec<ProjectInfo>>,
+    changed: Trigger,
+    name_subscribers: StoredValue<HashMap<ActiveProjectRef, std::sync::Weak<ArcTrigger>>>,
+}
+
+impl ProjectCatalog {
+    fn new() -> Self {
+        Self {
+            records: StoredValue::new(Vec::new()),
+            changed: Trigger::new(),
+            name_subscribers: StoredValue::new(HashMap::new()),
+        }
+    }
+
+    pub fn with<T>(&self, read: impl FnOnce(&Vec<ProjectInfo>) -> T) -> T {
+        self.changed.track();
+        self.with_untracked(read)
+    }
+
+    pub fn with_untracked<T>(&self, read: impl FnOnce(&Vec<ProjectInfo>) -> T) -> T {
+        self.records.with_value(read)
+    }
+
+    pub fn get(&self) -> Vec<ProjectInfo> {
+        self.with(Clone::clone)
+    }
+
+    pub fn get_untracked(&self) -> Vec<ProjectInfo> {
+        self.with_untracked(Clone::clone)
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub fn set(&self, records: Vec<ProjectInfo>) {
+        self.update(|current| *current = records);
+    }
+
+    pub fn update(&self, update: impl FnOnce(&mut Vec<ProjectInfo>)) {
+        let previous = self.get_untracked();
+        self.records.update_value(update);
+        let notifications = self.records.with_value(|records| {
+            if records == &previous {
+                return None;
+            }
+            let names = |records: &[ProjectInfo]| {
+                records
+                    .iter()
+                    .map(|info| {
+                        (
+                            (info.host_id.clone(), info.project.id.clone()),
+                            info.project.name.clone(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            let previous_names = names(&previous);
+            let current_names = names(records);
+            let mut changed = Vec::new();
+            self.name_subscribers.update_value(|subscribers| {
+                subscribers.retain(|key, weak| match weak.upgrade() {
+                    Some(subscriber) => {
+                        let key = (key.host_id.clone(), key.project_id.clone());
+                        if previous_names.get(&key) != current_names.get(&key) {
+                            changed.push(subscriber);
+                        }
+                        true
+                    }
+                    None => false,
+                });
+            });
+            Some(changed)
+        });
+        if let Some(notifications) = notifications {
+            for subscriber in notifications {
+                subscriber.notify();
+            }
+            self.changed.notify();
+        }
+    }
+
+    pub fn name(
+        self,
+        project: impl Fn() -> Option<ActiveProjectRef> + Send + Sync + 'static,
+    ) -> Signal<Option<String>> {
+        // The row owns its subscription; the catalog keeps only a weak lease.
+        let lease = StoredValue::new(None::<(ActiveProjectRef, Arc<ArcTrigger>)>);
+        Signal::derive(move || {
+            let Some(key) = project() else {
+                lease.set_value(None);
+                return None;
+            };
+            let current = lease.with_value(|lease| {
+                lease
+                    .as_ref()
+                    .filter(|(subscribed, _)| subscribed == &key)
+                    .map(|(_, trigger)| trigger.clone())
+            });
+            let trigger = match current {
+                Some(trigger) => trigger,
+                None => {
+                    let current = self.name_subscribers.with_value(|subscribers| {
+                        subscribers.get(&key).and_then(std::sync::Weak::upgrade)
+                    });
+                    match current {
+                        Some(trigger) => trigger,
+                        None => {
+                            let trigger = Arc::new(ArcTrigger::new());
+                            self.name_subscribers.update_value(|subscribers| {
+                                subscribers.insert(key.clone(), Arc::downgrade(&trigger));
+                            });
+                            trigger
+                        }
+                    }
+                }
+            };
+            lease.set_value(Some((key.clone(), trigger.clone())));
+            trigger.track();
+            self.with_untracked(|records| {
+                records
+                    .iter()
+                    .find(|info| info.host_id == key.host_id && info.project.id == key.project_id)
+                    .map(|info| info.project.name.clone())
+            })
+        })
+    }
+}
+
 // Agent-list presentation follows the explicit workbench parent, without
 // changing the agent's project/workspace used by navigation and commands.
 pub fn agent_ui_project_id<'a>(
@@ -3782,7 +3912,7 @@ pub struct AppState {
     /// chat. Off by default: the voice band is the voice conversation's
     /// home, and mixing it into the agent thread was reported as confusing.
     pub voice_transcript_in_chat: RwSignal<bool>,
-    pub projects: RwSignal<Vec<ProjectInfo>>,
+    pub projects: ProjectCatalog,
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
@@ -4443,7 +4573,7 @@ impl AppState {
             voice_finish_pending: RwSignal::new(false),
             voice_band_collapsed: RwSignal::new(false),
             voice_transcript_in_chat: RwSignal::new(false),
-            projects: RwSignal::new(Vec::new()),
+            projects: ProjectCatalog::new(),
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),

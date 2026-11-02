@@ -198,3 +198,13 @@ success-output = "final"
 filter = 'binary_id(server::agents_view_preferences) & test(agents_view_preferences_agent_pins_canonicalize_and_persist_session_targets)'
 success-output = "final"
 retries = 0
+
+# Retain content-free lifecycle evidence for the socket-replacement failure.
+[[profile.default.overrides]]
+filter = 'binary_id(server::recovery) & test(connection_resumes_projects_and_commands_without_new_bootstrap)'
+success-output = "final"
+
+[[profile.ci.overrides]]
+filter = 'binary_id(server::recovery) & test(connection_resumes_projects_and_commands_without_new_bootstrap)'
+success-output = "final"
+retries = 0

@@ -646,21 +646,17 @@ fn session_card(
             .is_some_and(|s| matches!(s, ConnectionStatus::Connected))
     });
 
-    // Reactive project name: resolve the session's `project_id` against
-    // `state.projects` at render time so a rename (which updates
-    // `state.projects` via `ProjectNotify`) immediately re-renders this
-    // badge. Sessions without a project_id, or whose project is no longer
-    // in `state.projects`, render no badge.
-    let project_state = state.clone();
-    let project_host_for_name = session_host_id.clone();
-    let project_name = Memo::new(move |_| {
-        let pid = session_project_id.get()?;
-        project_state.projects.with(|projects| {
-            projects
-                .iter()
-                .find(|p| p.host_id == project_host_for_name && p.project.id == pid)
-                .map(|p| p.project.name.clone())
+    let project_host = session_host_id.clone();
+    let name = state.projects.name(move || {
+        session_project_id.get().map(|project_id| ActiveProjectRef {
+            host_id: project_host.clone(),
+            project_id,
         })
+    });
+    let project_name = Memo::new(move |_| {
+        #[cfg(all(test, target_arch = "wasm32"))]
+        wasm_tests::observe_project_name_read();
+        name.get()
     });
 
     // Clone before closures move session_id, session_host_id, and state.
@@ -897,6 +893,7 @@ mod wasm_tests {
     type CardOwners = std::collections::HashMap<(String, SessionId), (u32, u32)>;
     thread_local! {
         static CARD_OWNERS: std::cell::RefCell<Option<CardOwners>> = const { std::cell::RefCell::new(None) };
+        static PROJECT_NAME_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     struct ObserveCardOwners;
@@ -931,6 +928,10 @@ mod wasm_tests {
                 });
             });
         }
+    }
+
+    pub(super) fn observe_project_name_read() {
+        PROJECT_NAME_READS.set(PROJECT_NAME_READS.get() + 1);
     }
 
     fn conversation_card(container: &HtmlElement, title: &str) -> web_sys::Element {
@@ -1272,6 +1273,240 @@ mod wasm_tests {
             retained_visible,
             "the retained expanded conversation must be visible when History is shown again"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_changes_only_wake_history_for_changed_names() {
+        use crate::state::{ProjectInfo, sort_project_infos};
+        use protocol::{Project, ProjectId, ProjectNotifyPayload, ProjectRootPath, ProjectSource};
+
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        let project = |id: &str, name: &str, order| Project {
+            id: ProjectId(id.to_owned()),
+            name: name.to_owned(),
+            sort_order: order,
+            source: ProjectSource::Standalone {
+                roots: vec![ProjectRootPath(format!("/owned/{id}"))],
+            },
+        };
+        let mut alpha = project("shared", "Alpha", 0);
+        let mut beta = project("other", "Beta", 1);
+        let remote = project("shared", "Remote", 0);
+        state.projects.set(vec![
+            ProjectInfo {
+                host_id: "host-a".to_owned(),
+                project: alpha.clone(),
+            },
+            ProjectInfo {
+                host_id: "host-a".to_owned(),
+                project: beta.clone(),
+            },
+            ProjectInfo {
+                host_id: "host-b".to_owned(),
+                project: remote.clone(),
+            },
+        ]);
+        state.sessions.set(
+            [
+                ("host-a", "alpha-session", "Alpha conversation", "shared"),
+                ("host-a", "beta-session", "Beta conversation", "other"),
+                ("host-b", "remote-session", "Remote conversation", "shared"),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (host, id, title, pid))| {
+                let mut session = listed_session(host, id, 2, index as u64);
+                session.summary.user_alias = Some(title.to_owned());
+                session.summary.project_id = Some(ProjectId(pid.to_owned()));
+                session
+            })
+            .collect(),
+        );
+        let (container, handle) = mount_panel(state.clone());
+        settle().await;
+        let card = conversation_card(&container, "Alpha conversation");
+        let badge = card
+            .query_selector(".session-card-project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(badge.text_content().as_deref(), Some("Alpha"));
+        container.style().set_property("display", "none").unwrap();
+        let mut seq = 0;
+        let mut notify = |host: &str, payload: ProjectNotifyPayload| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                host,
+                protocol::Envelope::from_payload(
+                    StreamPath("/catalog".to_owned()),
+                    FrameKind::ProjectNotify,
+                    seq,
+                    &payload,
+                )
+                .unwrap(),
+            );
+            seq += 1;
+        };
+        PROJECT_NAME_READS.set(0);
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: alpha.clone(),
+            },
+        );
+        settle().await;
+        assert_eq!(
+            PROJECT_NAME_READS.get(),
+            0,
+            "equal catalog records must not wake hidden History"
+        );
+
+        if let ProjectSource::Standalone { roots } = &mut alpha.source {
+            roots.push(ProjectRootPath("/owned/extra".to_owned()));
+        }
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: alpha.clone(),
+            },
+        );
+        alpha.sort_order = 1;
+        beta.sort_order = 0;
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: alpha.clone(),
+            },
+        );
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: beta.clone(),
+            },
+        );
+        let transient = project("transient", "Transient", 2);
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: transient.clone(),
+            },
+        );
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Delete { project: transient },
+        );
+        settle().await;
+        assert_eq!(
+            PROJECT_NAME_READS.get(),
+            0,
+            "root/order/unrelated lifecycle changes must not schedule History name work"
+        );
+        let badge_after = card
+            .query_selector(".session-card-project")
+            .unwrap()
+            .unwrap();
+        assert!(
+            badge.is_same_node(Some(&badge_after)),
+            "unchanged badge retains its actual DOM"
+        );
+
+        alpha.name = "Renamed Alpha".to_owned();
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: alpha.clone(),
+            },
+        );
+        settle().await;
+        assert_eq!(
+            PROJECT_NAME_READS.get(),
+            1,
+            "only the affected host/project name may reevaluate"
+        );
+        assert_eq!(
+            card.query_selector(".session-card-project")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Renamed Alpha")
+        );
+        assert_eq!(
+            conversation_card(&container, "Remote conversation")
+                .query_selector(".session-card-project")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Remote")
+        );
+        PROJECT_NAME_READS.set(0);
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Delete {
+                project: alpha.clone(),
+            },
+        );
+        settle().await;
+        assert_eq!(PROJECT_NAME_READS.get(), 1);
+        assert!(
+            card.query_selector(".session-card-project")
+                .unwrap()
+                .is_none()
+        );
+        notify(
+            "host-a",
+            ProjectNotifyPayload::Upsert {
+                project: alpha.clone(),
+            },
+        );
+        settle().await;
+        assert_eq!(
+            PROJECT_NAME_READS.get(),
+            2,
+            "same-key reappearance must reconnect the existing row"
+        );
+        container.style().remove_property("display").unwrap();
+        assert!(card.get_bounding_client_rect().height() > 0.0);
+        assert_eq!(
+            card.query_selector(".session-card-project")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Renamed Alpha")
+        );
+        assert!(card.is_same_node(Some(&conversation_card(&container, "Alpha conversation"))));
+
+        PROJECT_NAME_READS.set(0);
+        let mut reconnect = remote;
+        reconnect.name = "Reconnected Remote".to_owned();
+        state.projects.update(|projects| {
+            projects.retain(|info| info.host_id != "host-b");
+            projects.push(ProjectInfo {
+                host_id: "host-b".to_owned(),
+                project: reconnect,
+            });
+            sort_project_infos(projects);
+        });
+        settle().await;
+        assert_eq!(
+            PROJECT_NAME_READS.get(),
+            1,
+            "catalog replacement must update its host without waking other hosts"
+        );
+        assert_eq!(
+            conversation_card(&container, "Remote conversation")
+                .query_selector(".session-card-project")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Reconnected Remote")
+        );
+        drop(handle);
+        container.remove();
     }
 
     /// A reconnect is a new server-side stream with no subscription on it.

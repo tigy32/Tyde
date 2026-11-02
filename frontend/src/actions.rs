@@ -5,7 +5,7 @@ use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AppState, ComposerHandle, FileResourceKey, OpenTarget,
     PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination, SidebarTab, TabContent,
-    TabId, sort_project_infos,
+    TabId,
 };
 
 use protocol::{
@@ -1582,31 +1582,6 @@ pub fn reorder_projects(
         insert_index += 1;
     }
     reordered_ids.insert(insert_index, dragged_id);
-
-    let scope_for_update = scope.clone();
-    state.projects.update(|projects| {
-        for project in projects.iter_mut() {
-            if project.host_id != host_id.as_str() {
-                continue;
-            }
-            let in_scope = match &scope_for_update {
-                ProjectReorderScope::TopLevel => !project.project.is_workbench(),
-                ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
-                    project.project.parent_project_id() == Some(parent_project_id)
-                }
-            };
-            if !in_scope {
-                continue;
-            }
-            if let Some(index) = reordered_ids
-                .iter()
-                .position(|id| *id == project.project.id)
-            {
-                project.project.sort_order = index as u64;
-            }
-        }
-        sort_project_infos(projects);
-    });
 
     let payload = ProjectReorderPayload {
         scope,
