@@ -659,6 +659,22 @@ over.
 
 ---
 
+### History row lifetimes
+
+History keys saved conversations by host and session, including when the panel
+is CSS-hidden. Summary count/date updates change reactive row fields without
+replacing unrelated card owners, disclosure state or DOM identity. Refreshes
+and filtering still follow the authoritative session list; no local summary
+cache or inferred session state is introduced.
+
+The former unkeyed collection existed in the repository's initial
+`4075229f886e1f12e6936974c3cd4866c536eb89` snapshot (2026-04-13). A mounted-DOM
+summary update reproduced an unrelated disclosure resetting while History was
+hidden. The existing first-page flow now covers host-scoped identity, reorder,
+updated counts and retained owners. This is source-pattern ancestry and a
+bounded presentation defect, not proof of the reported19.7s stall's cause or
+introduction.
+
 ### Saved-menu action isolation
 
 Saved-row menu items stop their own click before closing the menu. During

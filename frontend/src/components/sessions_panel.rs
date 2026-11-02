@@ -143,6 +143,25 @@ pub fn SessionsPanel() -> impl IntoView {
         })
     });
 
+    let session_keys = Memo::new(move |_| {
+        filtered_sessions.with(|sessions| {
+            sessions
+                .iter()
+                .map(|session| (session.host_id.clone(), session.summary.id.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    let session_positions = Memo::new(move |_| {
+        session_keys.with(|keys| {
+            keys.iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, key)| (key, index))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+    });
+    let sessions_empty = Memo::new(move |_| session_keys.with(Vec::is_empty));
+
     let on_search = move |ev: leptos::ev::Event| {
         let val = event_target_value(&ev);
         search.set(val);
@@ -423,8 +442,7 @@ pub fn SessionsPanel() -> impl IntoView {
             </div>
             <div class="panel-content">
                 {move || {
-                    let sessions = filtered_sessions.get();
-                    if sessions.is_empty() {
+                    if sessions_empty.get() {
                         let msg = if search.get().is_empty() {
                             "No saved sessions"
                         } else {
@@ -438,11 +456,21 @@ pub fn SessionsPanel() -> impl IntoView {
                             {load_more_buttons(state.clone(), rendered_hosts)}
                         }.into_any()
                     } else {
+                        let row_state = state.clone();
                         view! {
                             <div class="session-card-list">
-                                {sessions.into_iter().map(|session| {
-                                    session_card(state.clone(), session)
-                                }).collect_view()}
+                                <For
+                                    each=move || session_keys.get()
+                                    key=|key| key.clone()
+                                    children=move |key| {
+                                        let lookup = key.clone();
+                                        let session = Memo::new(move |_| {
+                                            session_positions.with(|positions| positions.get(&lookup).copied())
+                                                .map(|index| filtered_sessions.with(|sessions| sessions[index].clone()))
+                                        });
+                                        session_card(row_state.clone(), key, session)
+                                    }
+                                />
                                 {load_more_buttons(state.clone(), rendered_hosts)}
                             </div>
                         }.into_any()
@@ -555,22 +583,57 @@ fn format_turn_count(turns: u32) -> String {
     }
 }
 
-fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
-    let title = session_title(&session);
-
-    let full_id = session.summary.id.0.clone();
-    let backend = session.summary.backend_kind;
-    let last_active = format_date(session.summary.updated_at_ms);
-    let workspace = session.summary.workspace_roots.join(" · ");
-    // The store increments this once per persisted assistant stream (a
-    // StreamEnd), never for the user's own message, so it counts responses and
-    // not messages. Labelled for what it is rather than inheriting a name that
-    // overstates it.
-    let turn_count = session.summary.message_count;
-    let session_id = session.summary.id.clone();
-    let resumable = session.summary.resumable;
-    let session_host_id = session.host_id.clone();
-    let session_project_id = session.summary.project_id.clone();
+fn session_card(
+    state: AppState,
+    key: (String, protocol::SessionId),
+    session: Memo<Option<SessionInfo>>,
+) -> impl IntoView {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    wasm_tests::observe_card_owner(&key);
+    let (session_host_id, session_id) = key;
+    let full_id = session_id.0.clone();
+    // None is the keyed row's removal tick, not a second source of summary data.
+    let title = Memo::new(move |_| session.with(|session| session.as_ref().map(session_title)));
+    let backend = Memo::new(move |_| {
+        session.with(|session| session.as_ref().map(|session| session.summary.backend_kind))
+    });
+    let last_active = Memo::new(move |_| {
+        session.with(|session| {
+            session
+                .as_ref()
+                .map(|session| format_date(session.summary.updated_at_ms))
+        })
+    });
+    let workspace = Memo::new(move |_| {
+        session
+            .with(|session| {
+                session
+                    .as_ref()
+                    .map(|session| session.summary.workspace_roots.join(" · "))
+            })
+            .filter(|workspace| !workspace.is_empty())
+    });
+    let turn_count = Memo::new(move |_| {
+        session.with(|session| {
+            session
+                .as_ref()
+                .map(|session| session.summary.message_count)
+        })
+    });
+    let resumable = Memo::new(move |_| {
+        session.with(|session| {
+            session
+                .as_ref()
+                .is_some_and(|session| session.summary.resumable)
+        })
+    });
+    let session_project_id = Memo::new(move |_| {
+        session.with(|session| {
+            session
+                .as_ref()
+                .and_then(|session| session.summary.project_id.clone())
+        })
+    });
 
     // Per-row connection status keyed on this session's host, not the selected host.
     let host_id_for_connected = session_host_id.clone();
@@ -590,16 +653,15 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     // in `state.projects`, render no badge.
     let project_state = state.clone();
     let project_host_for_name = session_host_id.clone();
-    let project_id_for_name = session_project_id.clone();
-    let project_name = move || {
-        let pid = project_id_for_name.as_ref()?;
+    let project_name = Memo::new(move |_| {
+        let pid = session_project_id.get()?;
         project_state.projects.with(|projects| {
             projects
                 .iter()
-                .find(|p| p.host_id == project_host_for_name && &p.project.id == pid)
+                .find(|p| p.host_id == project_host_for_name && p.project.id == pid)
                 .map(|p| p.project.name.clone())
         })
-    };
+    });
 
     // Clone before closures move session_id, session_host_id, and state.
     let delete_host_id = session_host_id.clone();
@@ -629,20 +691,26 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let resume_state = state.clone();
     let resume_sid = session_id.clone();
     let resume_host = session_host_id.clone();
-    let resume_project_id = session_project_id.clone();
-    let do_resume = std::rc::Rc::new(move || {
+    let do_resume = std::sync::Arc::new(move || {
+        let Some(session) = session.get_untracked() else {
+            return;
+        };
+        if !session.summary.resumable {
+            return;
+        }
         resume_session(
             &resume_state,
             resume_host.clone(),
-            backend,
+            session.summary.backend_kind,
             resume_sid.clone(),
-            resume_project_id.clone(),
+            session.summary.project_id,
         );
     });
 
     let do_resume2 = do_resume.clone();
+    let menu_resume = do_resume.clone();
     let on_click = move |_: web_sys::MouseEvent| {
-        if !is_connected.get() || !resumable {
+        if !is_connected.get() || !resumable.get() {
             return;
         }
         do_resume();
@@ -651,7 +719,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let on_keydown_card = move |ev: web_sys::KeyboardEvent| {
         if matches!(ev.key().as_str(), "Enter" | " ") {
             ev.prevent_default();
-            if !is_connected.get() || !resumable {
+            if !is_connected.get() || !resumable.get() {
                 return;
             }
             do_resume2();
@@ -664,23 +732,10 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let expanded = RwSignal::new(false);
     let card_menu: CardMenuPosition = RwSignal::new(None);
     let menu_delete = do_delete.clone();
-    let menu_resume_state = state.clone();
-    let menu_resume_host = session_host_id.clone();
-    let menu_resume_sid = session_id.clone();
-    let menu_resume_project = session_project_id.clone();
-    let menu_resume = move || {
-        resume_session(
-            &menu_resume_state,
-            menu_resume_host.clone(),
-            backend,
-            menu_resume_sid.clone(),
-            menu_resume_project.clone(),
-        );
-    };
     let show_backend_labels = state.sidebar_backend_labels;
-    let details_title = title.clone();
+    let details_title = title;
     let disabled_class = move || {
-        if !is_connected.get() || !resumable {
+        if !is_connected.get() || !resumable.get() {
             "session-card disabled"
         } else {
             "session-card"
@@ -691,7 +746,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
         <div
             class=disabled_class
             node_ref=card_anchor
-            data-sidebar-backend=backend_label(backend)
+            data-sidebar-backend=move || backend.get().map(backend_label)
             data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
@@ -726,30 +781,30 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                     {move || if expanded.get() { "\u{25BE}" } else { "\u{25B8}" }}
                 </button>
                 <span class="session-card-status" aria-label="Saved conversation">"◷"</span>
-                <span class="session-card-title">{title}</span>
+                <span class="session-card-title">{move || title.get()}</span>
                 <Show when=move || show_backend_labels.get()>
-                    <span class={format!("{} sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
+                    <span class=move || backend.get().map(|backend| format!("{} sidebar-backend-label", backend_class(backend)))>{move || backend.get().map(backend_label)}</span>
                 </Show>
             </div>
             <div class="sidebar-card-details"
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
-                <strong>{details_title}</strong>
-                <div>{backend_label(backend)}</div>
+                <strong>{move || details_title.get()}</strong>
+                <div>{move || backend.get().map(backend_label)}</div>
             <div class="session-card-meta">
-                <span class="session-card-date" title="Last active">{last_active}</span>
-                {move || project_name().map(|n| view! {
+                <span class="session-card-date" title="Last active">{move || last_active.get()}</span>
+                {move || project_name.get().map(|n| view! {
                     <span class="session-card-project">{n}</span>
                 })}
-                {(!workspace.is_empty()).then(|| view! {
+                {move || workspace.get().map(|workspace| view! {
                     <span class="session-card-workspace">{workspace}</span>
                 })}
                 <span
                     class="session-card-msgs"
                     title="Assistant responses persisted for this session, including \
                            any that were cancelled or failed part-way"
-                >{format_turn_count(turn_count)}</span>
+                >{move || turn_count.get().map(format_turn_count)}</span>
             </div>
             <div class="session-card-id">{full_id}</div>
                 <div>
@@ -778,7 +833,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                     let resume = menu_resume.clone();
                     move || {
                         let resume = resume.clone();
-                        (is_connected.get() && resumable).then(|| view! {
+                        (is_connected.get() && resumable.get()).then(|| view! {
                             <button
                                 type="button"
                                 class="context-menu-item"
@@ -838,6 +893,55 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    type CardOwners = std::collections::HashMap<(String, SessionId), (u32, u32)>;
+    thread_local! {
+        static CARD_OWNERS: std::cell::RefCell<Option<CardOwners>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ObserveCardOwners;
+
+    impl ObserveCardOwners {
+        fn start() -> Self {
+            CARD_OWNERS.with_borrow_mut(|owners| *owners = Some(CardOwners::new()));
+            Self
+        }
+    }
+
+    impl Drop for ObserveCardOwners {
+        fn drop(&mut self) {
+            CARD_OWNERS.with_borrow_mut(|owners| *owners = None);
+        }
+    }
+
+    pub(super) fn observe_card_owner(key: &(String, SessionId)) {
+        let key = key.clone();
+        let observing = CARD_OWNERS.with_borrow_mut(|owners| {
+            owners.as_mut().is_some_and(|owners| {
+                owners.entry(key.clone()).or_default().0 += 1;
+                true
+            })
+        });
+        if observing {
+            on_cleanup(move || {
+                CARD_OWNERS.with_borrow_mut(|owners| {
+                    if let Some(owners) = owners {
+                        owners.entry(key).or_default().1 += 1;
+                    }
+                });
+            });
+        }
+    }
+
+    fn conversation_card(container: &HtmlElement, title: &str) -> web_sys::Element {
+        let titles = container.query_selector_all(".session-card-title").unwrap();
+        (0..titles.length())
+            .filter_map(|index| titles.item(index))
+            .find(|element| element.text_content().as_deref() == Some(title))
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+            .and_then(|element| element.closest(".session-card").ok().flatten())
+            .expect("the rendered conversation must exist")
+    }
 
     async fn next_tick() {
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
@@ -1036,11 +1140,14 @@ mod wasm_tests {
         state.selected_host_id.set(Some("host-a".to_owned()));
         // Bootstrap left a stale row: the session existed at connect time with
         // no completed turns.
-        state
-            .sessions
-            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+        let _owners = ObserveCardOwners::start();
+        let mut updated = listed_session("host-a", "session-1", 0, 100);
+        updated.summary.user_alias = Some("Updated conversation".to_owned());
+        let mut retained = listed_session("host-b", "session-1", 2, 200);
+        retained.summary.user_alias = Some("Retained conversation".to_owned());
+        state.sessions.set(vec![retained, updated]);
 
-        let (container, _handle) = mount_panel(state.clone());
+        let (container, handle) = mount_panel(state.clone());
         settle().await;
 
         assert_eq!(
@@ -1073,6 +1180,97 @@ mod wasm_tests {
             1,
             "and asked exactly once — the request must not repeat while the \
              connection is unchanged"
+        );
+
+        let retained = conversation_card(&container, "Retained conversation");
+        let updated = conversation_card(&container, "Updated conversation");
+        for card in [&retained, &updated] {
+            card.query_selector("button[aria-label='Show conversation details']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+        }
+        settle().await;
+        // History stays mounted under CSS hiding, exactly like SidebarPanels.
+        container.style().set_property("display", "none").unwrap();
+        let update = protocol::Envelope::from_payload(
+            StreamPath("/host-1".to_owned()),
+            FrameKind::SessionSummaryCountUpdated,
+            0,
+            &protocol::SessionSummaryCountUpdatedPayload {
+                session_id: SessionId("session-1".to_owned()),
+                assistant_turn_count: 4,
+                updated_at_ms: 500,
+            },
+        )
+        .expect("build typed summary update");
+        crate::dispatch::dispatch_envelope(&state, "host-a", update);
+        settle().await;
+        let retained_after = conversation_card(&container, "Retained conversation");
+        let updated_after = conversation_card(&container, "Updated conversation");
+        let retained_owners = CARD_OWNERS.with_borrow(|owners| {
+            owners.as_ref().unwrap()[&("host-b".to_owned(), SessionId("session-1".to_owned()))]
+        });
+        console_log!(
+            "History summary preservation: unrelated_identity={} unrelated_expanded={} owner_mounts={} owner_cleanups={}",
+            retained.is_same_node(Some(&retained_after)),
+            retained_after.get_attribute("data-expanded").as_deref() == Some("true"),
+            retained_owners.0,
+            retained_owners.1,
+        );
+        let retained_expanded =
+            retained_after.get_attribute("data-expanded").as_deref() == Some("true");
+        let retained_identity = retained.is_same_node(Some(&retained_after));
+        let updated_identity = updated.is_same_node(Some(&updated_after));
+        let updated_expanded =
+            updated_after.get_attribute("data-expanded").as_deref() == Some("true");
+        let updated_count = updated_after
+            .text_content()
+            .unwrap_or_default()
+            .contains("4 responses");
+        let retained_count = retained_after
+            .text_content()
+            .unwrap_or_default()
+            .contains("2 responses");
+        container.style().remove_property("display").unwrap();
+        let retained_visible = retained_after.get_bounding_client_rect().height() > 0.0;
+        // Keep a failing regression from leaving its mounted fixture behind.
+        drop(handle);
+        container.remove();
+        assert!(
+            retained_expanded,
+            "one summary update must preserve the unrelated conversation's disclosure while History is hidden"
+        );
+        assert!(
+            retained_identity,
+            "the unrelated conversation must retain its DOM identity"
+        );
+        assert!(
+            updated_identity,
+            "a count/date update must retain the updated conversation's DOM identity"
+        );
+        assert_eq!(
+            retained_owners,
+            (1, 0),
+            "hidden History must not recreate or retire an unrelated card's reactive owner"
+        );
+        assert!(
+            updated_expanded,
+            "the updated conversation must also preserve its disclosure"
+        );
+        assert!(
+            updated_count,
+            "the server's changed count must render on its existing row"
+        );
+        assert!(
+            retained_count,
+            "the unrelated server count must remain unchanged"
+        );
+        assert!(
+            retained_visible,
+            "the retained expanded conversation must be visible when History is shown again"
         );
     }
 
