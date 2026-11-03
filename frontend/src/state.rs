@@ -4098,15 +4098,8 @@ pub struct AppState {
     /// gets no sign the first one was heard. Cleared by `OperationCancelled`, by
     /// any typing transition, and by agent teardown.
     pub interrupt_pending: RwSignal<HashSet<AgentId>>,
-    /// Agents whose most recent turn ended in cancellation rather than
-    /// completion, so the agent card can withhold the success affordance.
-    ///
-    /// Per-*turn* state, deliberately separate from the transcript row the same
-    /// `OperationCancelled` event produces. The two were one record, which
-    /// forced the visible notice to be dropped wholesale at the next turn in
-    /// order to reset this flag — and that is what left the notice with no
-    /// position of its own. Cleared by the next `TypingStatusChanged(true)` or
-    /// `StreamStart`, by bootstrap, and by teardown.
+    /// Current server-owned cancellation outcome, separate from its notice.
+    /// Cleared by typed working, replaced by bootstrap, removed on teardown.
     pub last_turn_cancelled: RwSignal<HashSet<AgentId>>,
     pub browse_dialog: RwSignal<Option<BrowseDialogState>>,
     /// Per-project snapshots of center-zone state. Updated whenever the user
@@ -4178,6 +4171,7 @@ pub struct AppState {
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentId, bool>>,
+    pub agents_with_background_work: RwSignal<HashSet<ActiveAgentRef>>,
     /// Agents the server reports as `AgentActivity::AwaitingUser`: an open
     /// question or plan approval that only the user can answer.
     pub agent_awaiting_user: RwSignal<HashSet<AgentId>>,
@@ -4673,6 +4667,7 @@ impl AppState {
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
+            agents_with_background_work: RwSignal::new(HashSet::new()),
             agent_awaiting_user: RwSignal::new(HashSet::new()),
             launch_profile_catalog: RwSignal::new(HashMap::new()),
             session_schemas: RwSignal::new(HashMap::new()),
@@ -5205,6 +5200,12 @@ impl AppState {
     fn finalize_compaction_close(&self, host_id: &str, agent_id: &AgentId) {
         self.agents.update(|agents| {
             agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == *agent_id));
+        });
+        self.agents_with_background_work.update(|agents| {
+            agents.remove(&ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+            });
         });
         self.chat_rows.update(|map| {
             map.remove(agent_id);
@@ -7108,6 +7109,9 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        self.agents_with_background_work.update(|agents| {
+            agents.retain(|agent| agent.host_id != host_id);
+        });
         // Paging metadata describes one subscriber snapshot. Carrying it across
         // a disconnect would leave History offering a continuation cursor from
         // a generation the new connection knows nothing about.

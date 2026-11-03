@@ -4765,7 +4765,7 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                             flush_pending_agent_attaches(
                                 &event_log,
-                                Some(&replay_state),
+                                &replay_state,
                                 &mut latest_output,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
@@ -5084,7 +5084,7 @@ pub(crate) fn spawn_agent_actor(
                 .await;
                 flush_pending_agent_attaches(
                     &event_log,
-                    Some(&replay_state),
+                    &replay_state,
                     &mut latest_output,
                     latest_slash_commands.as_ref(),
                     &mut subscribers,
@@ -5105,6 +5105,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut current_start,
                     &start_tx,
                     &mut event_log,
+                    &replay_state,
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
@@ -5266,7 +5267,7 @@ pub(crate) fn spawn_agent_actor(
                 .await;
                 flush_pending_agent_attaches(
                     &event_log,
-                    Some(&replay_state),
+                    &replay_state,
                     &mut latest_output,
                     latest_slash_commands.as_ref(),
                     &mut subscribers,
@@ -5282,6 +5283,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut current_start,
                     &start_tx,
                     &mut event_log,
+                    &replay_state,
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
@@ -5514,7 +5516,7 @@ pub(crate) fn spawn_agent_actor(
             .await;
             flush_pending_agent_attaches(
                 &event_log,
-                Some(&replay_state),
+                &replay_state,
                 &mut latest_output,
                 latest_slash_commands.as_ref(),
                 &mut subscribers,
@@ -5530,6 +5532,7 @@ pub(crate) fn spawn_agent_actor(
                 &mut current_start,
                 &start_tx,
                 &mut event_log,
+                &replay_state,
                 &mut latest_output,
                 &mut subscribers,
                 &mut pending_inputs,
@@ -5607,7 +5610,7 @@ pub(crate) fn spawn_agent_actor(
         if !resume_replay_gate_pending {
             flush_pending_agent_attaches(
                 &event_log,
-                Some(&replay_state),
+                &replay_state,
                 &mut latest_output,
                 latest_slash_commands.as_ref(),
                 &mut subscribers,
@@ -5719,6 +5722,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut current_start,
                     &start_tx,
                     &mut event_log,
+                    &replay_state,
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_inputs,
@@ -6938,7 +6942,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             flush_pending_agent_attaches(
                                 &event_log,
-                                None,
+                                &replay_state,
                                 &mut latest_output,
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
@@ -6958,6 +6962,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut current_start,
                                 &start_tx,
                                 &mut event_log,
+                                &replay_state,
                                 &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_inputs,
@@ -7048,6 +7053,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut current_start,
                             &start_tx,
                             &mut event_log,
+                            &replay_state,
                             &mut latest_output,
                             &mut subscribers,
                             &mut pending_inputs,
@@ -7369,7 +7375,7 @@ pub(crate) fn spawn_agent_actor(
                                             .await;
                                             flush_pending_agent_attaches(
                                                 &event_log,
-                                                None,
+                                                &replay_state,
                                                 &mut latest_output,
                                                 latest_slash_commands.as_ref(),
                                                 &mut subscribers,
@@ -7385,6 +7391,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut current_start,
                                                 &start_tx,
                                                 &mut event_log,
+                                                &replay_state,
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
@@ -7452,7 +7459,7 @@ pub(crate) fn spawn_agent_actor(
                                     status_handle.settle_restoration();
                                     flush_pending_agent_attaches(
                                         &event_log,
-                                        Some(&replay_state),
+                                        &replay_state,
                                         &mut latest_output,
                                         latest_slash_commands.as_ref(),
                                         &mut subscribers,
@@ -7519,7 +7526,7 @@ pub(crate) fn spawn_agent_actor(
                                     .await;
                                     flush_pending_agent_attaches(
                                         &event_log,
-                                        None,
+                                        &replay_state,
                                         &mut latest_output,
                                         latest_slash_commands.as_ref(),
                                         &mut subscribers,
@@ -7539,6 +7546,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut current_start,
                                         &start_tx,
                                         &mut event_log,
+                                        &replay_state,
                                         &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_inputs,
@@ -8409,6 +8417,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut current_start,
                                     &start_tx,
                                     &mut event_log,
+                                    &replay_state,
                                     &mut latest_output,
                                     &mut subscribers,
                                     &mut pending_inputs,
@@ -9470,6 +9479,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut current_start,
                                                 &start_tx,
                                                 &mut event_log,
+                                                &replay_state,
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
@@ -10101,6 +10111,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut current_start,
                                                 &start_tx,
                                                 &mut event_log,
+                                                &replay_state,
                                                 &mut latest_output,
                                                 &mut subscribers,
                                                 &mut pending_inputs,
@@ -11734,6 +11745,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut current_start,
                                 &start_tx,
                                 &mut event_log,
+                                &replay_state,
                                 &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_inputs,
@@ -11899,7 +11911,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             attach_subscriber_with_latest_output(
                                 &event_log,
-                                Some(&replay_state),
+                                &replay_state,
                                 latest_output.output(),
                                 &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
@@ -12162,6 +12174,7 @@ pub(crate) fn spawn_relay_agent_actor(
                     &mut current_start,
                     &start_tx,
                     &mut event_log,
+                    &replay_state,
                     &mut latest_output,
                     &mut subscribers,
                     &mut rx,
@@ -12310,6 +12323,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             &mut current_start,
                             &start_tx,
                             &mut event_log,
+                            &replay_state,
                             &mut latest_output,
                             &mut subscribers,
                             &mut rx,
@@ -12794,7 +12808,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::Attach(attachment) => {
                             attach_subscriber_with_latest_output(
                                 &event_log,
-                                Some(&replay_state),
+                                &replay_state,
                                 latest_output.output(),
                                 &status_handle.snapshot().await,
                                 latest_slash_commands.as_ref(),
@@ -13912,6 +13926,7 @@ async fn park_terminal_agent(
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut AgentEventLog,
+    replay_state: &AgentReplayState,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     pending_inputs: &mut VecDeque<AgentInput>,
@@ -14089,7 +14104,7 @@ async fn park_terminal_agent(
             AgentCommand::Attach(attachment) => {
                 attach_subscriber_with_latest_output(
                     event_log,
-                    None,
+                    replay_state,
                     latest_output.output(),
                     &status_handle.snapshot().await,
                     None,
@@ -14214,6 +14229,7 @@ async fn park_relay_terminal_agent(
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut AgentEventLog,
+    replay_state: &AgentReplayState,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -14389,7 +14405,7 @@ async fn park_relay_terminal_agent(
             AgentCommand::Attach(attachment) => {
                 attach_subscriber_with_latest_output(
                     event_log,
-                    None,
+                    replay_state,
                     latest_output.output(),
                     &status_handle.snapshot().await,
                     None,
@@ -15302,6 +15318,11 @@ async fn append_chat_event_with_transcript_metadata(
     };
     let event = projected.as_ref();
     let replay_len_before = event_log.len();
+    match event {
+        ChatEvent::OperationCancelled(_) => replay_state.operation_cancelled = true,
+        ChatEvent::TypingStatusChanged(true) => replay_state.operation_cancelled = false,
+        _ => {}
+    }
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
     let persistence = if event_log.len() == replay_len_before
         && replay_state.active_stream.is_some()
@@ -16145,7 +16166,7 @@ async fn upsert_activity_stats_snapshot(
 
 async fn flush_pending_agent_attaches(
     event_log: &AgentEventLog,
-    replay_state: Option<&AgentReplayState>,
+    replay_state: &AgentReplayState,
     latest_output: &mut AgentControlLatestOutput,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
@@ -16395,7 +16416,7 @@ async fn send_initial_follow_up_or_park(
     .await;
     flush_pending_agent_attaches(
         context.event_log,
-        None,
+        context.replay_state,
         context.latest_output,
         context.latest_slash_commands,
         context.subscribers,
@@ -16411,6 +16432,7 @@ async fn send_initial_follow_up_or_park(
         context.current_start,
         context.start_tx,
         context.event_log,
+        context.replay_state,
         context.latest_output,
         context.subscribers,
         context.pending_inputs,
@@ -16476,6 +16498,7 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
         context.current_start,
         context.start_tx,
         context.event_log,
+        context.replay_state,
         context.latest_output,
         context.subscribers,
         context.pending_inputs,
@@ -16830,7 +16853,6 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::OperationCancelled(_) => {
-            replay_state.operation_cancelled = true;
             if let Some(stream) = replay_state.active_stream.take() {
                 for tool_event in stream.tool_events {
                     push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
@@ -16841,7 +16863,6 @@ fn record_chat_event_for_replay(
         ChatEvent::TypingStatusChanged(typing) => {
             replay_state.typing = *typing;
             if *typing {
-                replay_state.operation_cancelled = false;
                 replay_state.resume_history_settled_idle = false;
             } else if let Some(stream) = replay_state.active_stream.take() {
                 tracing::warn!("discarding an unterminated response when the agent became idle");
@@ -18255,7 +18276,7 @@ fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
 
 fn attach_subscriber_with_latest_output(
     event_log: &AgentEventLog,
-    replay_state: Option<&AgentReplayState>,
+    replay_state: &AgentReplayState,
     latest_output: &AgentControlOutput,
     status: &registry::AgentStatus,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
@@ -18311,8 +18332,10 @@ fn attach_subscriber_with_latest_output(
             ChatEvent::SlashCommandsChanged(catalog.clone()),
         ));
     }
-    let history_entries =
-        filtered_session_history_entries_from_log(event_log.initial_history_log(), replay_state);
+    let history_entries = filtered_session_history_entries_from_log(
+        event_log.initial_history_log(),
+        Some(replay_state),
+    );
     let history_tail = initial_history_tail_entries(&history_entries);
     if let Some((oldest_tail_seq, _)) = history_tail.first() {
         let prior_history_count = event_log.prior_message_count(*oldest_tail_seq);
@@ -18328,7 +18351,7 @@ fn attach_subscriber_with_latest_output(
             .into_iter()
             .map(|(_, event)| AgentBootstrapEvent::ChatEvent(event)),
     );
-    if let Some(replay_state) = replay_state {
+    if !status.terminated {
         events.extend(
             replay_state
                 .active_stream_events()
@@ -18365,9 +18388,7 @@ fn attach_subscriber_with_latest_output(
     let pending_user_questions = if status.terminated {
         Vec::new()
     } else {
-        replay_state
-            .map(|state| state.pending_user_questions.clone())
-            .unwrap_or_default()
+        replay_state.pending_user_questions.clone()
     };
     let bootstrap_event_count = events.len();
     let payload = serde_json::to_value(AgentBootstrapPayload {
@@ -18376,6 +18397,7 @@ fn attach_subscriber_with_latest_output(
         activity: status.activity(),
         status: status.status(),
         error: status.last_error.clone(),
+        last_turn_cancelled: replay_state.operation_cancelled,
         pending_user_questions,
     })
     .expect("failed to serialize AgentBootstrap payload");

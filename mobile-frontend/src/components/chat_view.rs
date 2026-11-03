@@ -2247,6 +2247,7 @@ mod wasm_tests {
                     tool_call_id: "background-check".to_owned(), execution_mode: protocol::ToolExecutionMode::Background, cancellable: false,
                     update: protocol::ToolProgressUpdate::Other { payload: serde_json::json!({"description": "Restored running command"}) },
                 }))], latest_output: Default::default(), activity: protocol::AgentActivity::Idle,
+                last_turn_cancelled: false,
                 pending_user_questions: Vec::new(),
             },
         ).unwrap());
@@ -4837,6 +4838,7 @@ mod wasm_tests {
                     )],
                     latest_output: Default::default(),
                     activity: protocol::AgentActivity::Idle,
+                    last_turn_cancelled: false,
                     pending_user_questions: Vec::new(),
                 },
             )

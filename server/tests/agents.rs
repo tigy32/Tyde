@@ -6295,6 +6295,19 @@ async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
         .await
         .expect("queue cancellation follow-up");
     assert_working_with_queue(&mut fixture, &agent, &["after cancellation"]).await;
+    let (mut reconnect, snapshot) = fixture.connect_with_bootstrap().await;
+    let entry = bootstrapped_agent(&snapshot, &agent.new_agent.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut reconnect,
+        &entry.instance_stream,
+        "current cancellation outcome",
+    )
+    .await;
+    assert!(
+        replay.last_turn_cancelled,
+        "a held cancellation is current even before backend idle"
+    );
+
     idle_gate.release_one();
     let event = fixture
         .next_chat_event_matching(&agent, "cancelled backend idle", |_| true)
@@ -6306,6 +6319,19 @@ async fn agent_recovers_from_backend_errors_without_losing_stream_identity() {
         "mock backend response to: after cancellation",
     )
     .await;
+
+    let (mut reconnect, snapshot) = fixture.connect_with_bootstrap().await;
+    let entry = bootstrapped_agent(&snapshot, &agent.new_agent.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut reconnect,
+        &entry.instance_stream,
+        "successful turn supersedes cancellation",
+    )
+    .await;
+    assert!(
+        !replay.last_turn_cancelled,
+        "historical cancellation must not describe the successful current turn"
+    );
 
     fixture
         .client
@@ -12463,9 +12489,33 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     )
     .await;
     assert_eq!(working.activity, protocol::AgentActivity::Thinking);
+    assert!(working.last_turn_cancelled);
     idle_gate.release_one();
     expect_typing_false_on_stream(&mut fixture.client, &child.instance_stream).await;
-    wait_for_agent_control_status(&caller, &child.agent_id, "idle").await;
+
+    fixture
+        .mock_by_id(&parent.agent_id)
+        .await
+        .close_stream()
+        .await;
+    // A closed account is emitted only after relay EOF stops its actor timing;
+    // an idle but live child still has an open phase.
+    expect_task_token_usage_matching(
+        &mut fixture.client,
+        &parent.agent_id,
+        "cancelled native child reached terminal relay",
+        |usage| {
+            usage.timing.accounts.iter().any(|entry| {
+                entry.agent_id == child.agent_id
+                    && entry
+                        .account
+                        .phases
+                        .last()
+                        .is_some_and(|phase| phase.end != protocol::TaskTimePhaseEnd::Open)
+            })
+        },
+    )
+    .await;
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     let replayed_child = bootstrapped_agent(&bootstrap, &child.agent_id);
@@ -12476,6 +12526,10 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     )
     .await;
     assert_eq!(replay.activity, protocol::AgentActivity::Idle);
+    assert!(
+        replay.last_turn_cancelled,
+        "parked native relay must retain the live cancellation outcome"
+    );
     let replayed_chat = replay
         .events
         .iter()

@@ -275,6 +275,7 @@ pub fn prime_agent_stream_for_tests(
             activity: protocol::AgentActivity::Idle,
             status: protocol::AgentControlStatus::Idle,
             error: None,
+            last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
         },
     )
@@ -1114,6 +1115,35 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse session_settings payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::AgentBackgroundWorkNotify => {
+            match envelope.parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>() {
+                Ok(payload) => {
+                    let agent_ref = ActiveAgentRef {
+                        host_id: host_id.to_owned(),
+                        agent_id: payload.agent_id,
+                    };
+                    log::info!(
+                        "dispatch agent_background_work_notify host={} has_background_work={}",
+                        host_id,
+                        payload.has_background_work
+                    );
+                    state.agents_with_background_work.update(|agents| {
+                        if payload.has_background_work {
+                            agents.insert(agent_ref);
+                        } else {
+                            agents.remove(&agent_ref);
+                        }
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_background_work_notify payload: {error}"),
                 ),
             }
         }
@@ -5157,6 +5187,12 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agents.update(|agents| {
         agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
     });
+    state.agents_with_background_work.update(|agents| {
+        agents.remove(&ActiveAgentRef {
+            host_id: host_id.to_owned(),
+            agent_id: agent_id.clone(),
+        });
+    });
     state.chat_rows.update(|map| {
         map.remove(&agent_id);
     });
@@ -6280,17 +6316,6 @@ pub fn apply_chat_event_from(
             // workers as if current. Bootstrap replay runs through this same
             // reducer, so replayed history segments identically.
             if matches!(message.sender, protocol::MessageSender::User) {
-                // Receiving work is itself an active-turn transition. In
-                // particular, backend-native children are registered with
-                // their prompt before the backend can emit its first typing or
-                // stream event. Treating the absence of that later event as
-                // idleness makes a newly registered child flash Completed
-                // while it is still starting. The backend's explicit
-                // TypingStatusChanged(false), cancellation, or fatal error
-                // remains the terminal authority.
-                state.agent_turn_active.update(|map| {
-                    map.insert(agent_id.clone(), true);
-                });
                 state.orchestration.update(|map| {
                     if let Some(log) = map.get_mut(&agent_id) {
                         log.retain(is_root_orchestration_record);
@@ -6319,13 +6344,6 @@ pub fn apply_chat_event_from(
                 agent_id,
                 data.model
             );
-            // A response is being produced, so whatever cancelled the previous
-            // turn is no longer the agent's current outcome. Some backends open
-            // a stream without a preceding typing transition, so this is not
-            // redundant with the `TypingStatusChanged(true)` arm above.
-            state.last_turn_cancelled.update(|set| {
-                set.remove(&agent_id);
-            });
             let mut streaming = StreamingState::new(data.agent, data.model);
             streaming.after_row = state.chat_rows.with_untracked(|rows| {
                 rows.get(&agent_id)
@@ -6595,9 +6613,6 @@ pub fn apply_chat_event_from(
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
-            state.agent_turn_active.update(|map| {
-                map.remove(&agent_id);
-            });
             // The interrupt has been answered; the request is no longer in
             // flight and the composer's Cancel control can re-arm for the next
             // turn.
@@ -6612,9 +6627,11 @@ pub fn apply_chat_event_from(
                     log.push(OrchestrationRecord::Cancelled);
                 }
             });
-            state.last_turn_cancelled.update(|set| {
-                set.insert(agent_id.clone());
-            });
+            if source == ChatEventSource::Live {
+                state.last_turn_cancelled.update(|set| {
+                    set.insert(agent_id.clone());
+                });
+            }
             state.push_chat_notice(
                 agent_id.clone(),
                 ChatNotice::OperationCancelled {
@@ -7151,6 +7168,18 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_map.insert(binding.member_id.clone(), binding);
         }
     });
+    state.agents_with_background_work.update(|agents| {
+        agents.retain(|agent| agent.host_id != host_id);
+        agents.extend(
+            payload
+                .agents_with_background_work
+                .into_iter()
+                .map(|agent_id| ActiveAgentRef {
+                    host_id: host_id.to_owned(),
+                    agent_id,
+                }),
+        );
+    });
     // Drop any agents the snapshot doesn't know about and upsert the rest
     // without opening tabs or stealing focus. The live `NewAgent` arm is
     // the only place that runs the auto-tab / compaction side effects.
@@ -7418,6 +7447,14 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
 }
 
 fn set_agent_activity(state: &AppState, agent_id: &AgentId, activity: protocol::AgentActivity) {
+    if activity == protocol::AgentActivity::Thinking {
+        state.last_turn_cancelled.update(|agents| {
+            agents.remove(agent_id);
+        });
+    }
+    state.interrupt_pending.update(|agents| {
+        agents.remove(agent_id);
+    });
     state.agent_turn_active.update(|map| {
         if activity == protocol::AgentActivity::Thinking {
             map.insert(agent_id.clone(), true);
@@ -7632,6 +7669,13 @@ fn apply_agent_bootstrap(
             }
         });
         set_agent_activity(state, &agent_id, payload.activity);
+        state.last_turn_cancelled.update(|agents| {
+            if payload.last_turn_cancelled {
+                agents.insert(agent_id.clone());
+            } else {
+                agents.remove(&agent_id);
+            }
+        });
         if payload.activity != protocol::AgentActivity::Thinking {
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);

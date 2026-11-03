@@ -757,15 +757,12 @@ fn live_agent_status(state: &AppState, owner: &AgentRef, agent_id: &AgentId) -> 
             let typing = state
                 .agent_turn_active
                 .with(|map| map.get(&agent_ref).copied().unwrap_or(false));
-            let streaming = state
-                .streaming_text
-                .with(|map| map.contains_key(&agent_ref));
             let awaiting = state
                 .agent_awaiting_user
                 .with(|set| set.contains(&agent_ref));
             if awaiting {
                 LiveAgentStatus::AwaitingUser
-            } else if typing || streaming {
+            } else if typing {
                 LiveAgentStatus::Running
             } else {
                 LiveAgentStatus::Idle
@@ -4495,13 +4492,73 @@ mod wasm_tests {
     /// derived from server-owned state — never a fabricated one.
     #[wasm_bindgen_test]
     async fn pending_await_card_shows_live_agent_status() {
-        let container = mount_card_with_setup(await_entry(None), with_child_agent);
-        next_tick().await;
-
-        let body = container.text_content().unwrap_or_default();
-        assert!(body.contains("Agent state bugs"), "agent named: {body}");
-        // Started, not typing, not streaming → Idle.
-        assert!(body.contains("Idle"), "live status derived: {body}");
+        let (container, state) = mount_card_with_state(await_entry(None), |state| {
+            crate::dispatch::prime_host_for_tests(state, &owner_ref().local_host_id);
+            with_child_agent(state);
+        });
+        let host = owner_ref().local_host_id;
+        let target = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-sub".into()),
+        };
+        crate::dispatch::apply_chat_event(
+            &state,
+            &target,
+            protocol::ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "claude".into(),
+                model: None,
+            }),
+        );
+        crate::dispatch::apply_chat_event(
+            &state,
+            &target,
+            protocol::ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                text: "retained response".into(),
+            }),
+        );
+        for (seq, activity, label) in [
+            (0, protocol::AgentActivity::Thinking, "Running"),
+            (1, protocol::AgentActivity::Idle, "Idle"),
+            (
+                2,
+                protocol::AgentActivity::AwaitingUser,
+                "Needs your answer",
+            ),
+            (3, protocol::AgentActivity::Thinking, "Running"),
+            (4, protocol::AgentActivity::Idle, "Idle"),
+        ] {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &host,
+                protocol::Envelope::from_payload(
+                    StreamPath("/host/host-1".into()),
+                    protocol::FrameKind::AgentTurnStateNotify,
+                    seq,
+                    &protocol::AgentTurnStateNotifyPayload {
+                        agent_id: target.agent_id.clone(),
+                        activity,
+                    },
+                )
+                .unwrap(),
+            );
+            next_tick().await;
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&target)),
+                "response retention is not lifecycle"
+            );
+            let body = container.text_content().unwrap_or_default();
+            assert!(body.contains("Agent state bugs"));
+            assert!(
+                body.contains(label),
+                "typed status must render {label}: {body}"
+            );
+            if label != "Running" {
+                assert!(!body.contains("Running"));
+            }
+        }
+        container.remove();
     }
 
     /// An agent this client has no record of renders an explicit `Unknown`

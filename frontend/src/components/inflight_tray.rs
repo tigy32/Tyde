@@ -242,8 +242,7 @@ fn persist_expanded(expanded: bool) {
 }
 
 /// Live status of one first-class child agent, derived from server-owned
-/// state (`agents`, `agent_turn_active`, `streaming_text`) — the same
-/// derivation the old spawn/await card rows used, now in exactly one place.
+/// startup, activity and compaction state.
 #[derive(Clone, PartialEq)]
 enum ChildAgentStatus {
     Starting,
@@ -394,19 +393,6 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
             if *agent_id != parent.agent_id {
                 continue;
             }
-            let completed = state
-                .chat_row_for_tool(agent_id, &call_id.0)
-                .and_then(|row| row.message_entry().cloned())
-                .is_some_and(|entry| {
-                    entry.with(|entry| {
-                        entry.tool_requests.iter().any(|tool| {
-                            tool.request.tool_call_id == call_id.0 && tool.result.is_some()
-                        })
-                    })
-                });
-            if completed {
-                continue;
-            }
             let progress = progress.get();
             match progress.update {
                 ToolProgressUpdate::Workflow(run) => {
@@ -449,14 +435,6 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
     });
     snapshot.counts.queued = snapshot.queued.len();
     snapshot
-}
-
-/// Whether the tray would show any running work for this agent: child
-/// agents, workflows, native sub-agents, or backgrounded commands. The
-/// sidebar uses the same answer so its status and the tray never disagree
-/// about what is still in flight.
-pub(crate) fn has_running_background_work(state: &AppState, agent: &ActiveAgentRef) -> bool {
-    compute_snapshot(state, agent).counts.running > 0
 }
 
 #[component]

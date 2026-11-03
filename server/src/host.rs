@@ -25959,11 +25959,8 @@ fn publish_agent_background_work(
     })
     .expect("serialize agent background work");
     let prefix = format!("/agent/{agent_id}/");
-    tracing::debug!(agent_id = %agent_id, has_background_work, "mobile background work status");
+    tracing::debug!(agent_id = %agent_id, has_background_work, "agent background work status");
     state.host_streams.retain(|_, subscriber| {
-        if subscriber.agent_replay != AgentReplayMode::Lazy {
-            return true;
-        }
         if !subscriber
             .known_agent_streams
             .iter()

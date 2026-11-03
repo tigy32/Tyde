@@ -24,15 +24,14 @@ use crate::components::swarm_view::{lifecycle_label, member_is_working, open_swa
 use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ContextCompactionUiState, ProjectInfo, StreamingState, TabContent, agent_ui_project_id,
-    sort_project_infos,
+    ContextCompactionUiState, ProjectInfo, TabContent, agent_ui_project_id, sort_project_infos,
 };
 
 fn agent_passes_filters(
     agent: &AgentInfo,
     filters: &AgentsPanelFilters,
     matches_project: bool,
-    streaming: &HashMap<AgentId, StreamingState>,
+    background_work: &HashSet<ActiveAgentRef>,
     turn_active: &HashMap<AgentId, bool>,
     awaiting_user: &HashSet<AgentId>,
     lowercase_query: &str,
@@ -45,7 +44,10 @@ fn agent_passes_filters(
     }
     if filters.hide_inactive {
         let is_active = !agent.started
-            || streaming.contains_key(&agent.agent_id)
+            || background_work.contains(&ActiveAgentRef {
+                host_id: agent.host_id.clone(),
+                agent_id: agent.agent_id.clone(),
+            })
             || turn_active.get(&agent.agent_id).copied().unwrap_or(false)
             || awaiting_user.contains(&agent.agent_id);
         if !is_active {
@@ -343,8 +345,7 @@ pub(crate) enum DerivedAgentState {
     /// a cancelled turn is *not* a completed one, and rendering it with the
     /// success check told users their interrupt had produced a finished result.
     /// Cleared by the next turn: the reducer drops the agent from
-    /// `last_turn_cancelled` on the next `TypingStatusChanged(true)` or
-    /// `StreamStart`.
+    /// `last_turn_cancelled` on the next authoritative working transition.
     Cancelled,
     /// The server owns a compaction request but is waiting for a safe point.
     /// Distinct from `Compacting`: "queued behind the current turn" is the
@@ -357,7 +358,6 @@ pub(crate) enum DerivedAgentState {
 /// The per-agent liveness maps [`derive_agent_state`] reads, borrowed from
 /// [`AppState`] signals for the duration of one derivation.
 struct AgentLiveness<'a> {
-    streaming: &'a HashMap<AgentId, StreamingState>,
     turn_active: &'a HashMap<AgentId, bool>,
     awaiting_user: &'a HashSet<AgentId>,
     compaction: &'a HashMap<AgentId, CompactionOldInfo>,
@@ -370,23 +370,20 @@ pub(crate) fn derive_agent_state(state: &AppState, agent: &AgentInfo) -> Derived
     state.compaction_in_progress.with(|compaction| {
         state.context_compactions.with(|context_compaction| {
             state.agent_turn_active.with(|turn_active| {
-                state.streaming_text.with(|streaming| {
-                    state.last_turn_cancelled.with(|last_turn_cancelled| {
-                        state.interrupt_pending.with(|interrupt_pending| {
-                            state.agent_awaiting_user.with(|awaiting_user| {
-                                derive_from_liveness(
-                                    agent,
-                                    &AgentLiveness {
-                                        streaming,
-                                        turn_active,
-                                        awaiting_user,
-                                        compaction,
-                                        context_compaction,
-                                        last_turn_cancelled,
-                                        interrupt_pending,
-                                    },
-                                )
-                            })
+                state.last_turn_cancelled.with(|last_turn_cancelled| {
+                    state.interrupt_pending.with(|interrupt_pending| {
+                        state.agent_awaiting_user.with(|awaiting_user| {
+                            derive_from_liveness(
+                                agent,
+                                &AgentLiveness {
+                                    turn_active,
+                                    awaiting_user,
+                                    compaction,
+                                    context_compaction,
+                                    last_turn_cancelled,
+                                    interrupt_pending,
+                                },
+                            )
                         })
                     })
                 })
@@ -397,7 +394,6 @@ pub(crate) fn derive_agent_state(state: &AppState, agent: &AgentInfo) -> Derived
 
 fn derive_from_liveness(agent: &AgentInfo, liveness: &AgentLiveness<'_>) -> DerivedAgentState {
     let AgentLiveness {
-        streaming,
         turn_active,
         awaiting_user,
         compaction,
@@ -434,8 +430,7 @@ fn derive_from_liveness(agent: &AgentInfo, liveness: &AgentLiveness<'_>) -> Deri
         return DerivedAgentState::AwaitingUser;
     }
     let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
-    let streaming_open = streaming.contains_key(&agent.agent_id);
-    if typing || streaming_open {
+    if typing {
         // Still running, but the user has asked it to stop. Reporting plain
         // Thinking here hides that the interrupt was accepted at all.
         if interrupt_pending.contains(&agent.agent_id) {
@@ -453,25 +448,28 @@ fn derive_from_liveness(agent: &AgentInfo, liveness: &AgentLiveness<'_>) -> Deri
     }
 }
 
-/// [`derive_agent_state`] plus the one input it cannot see: whether the
-/// in-flight tray still has running work for this agent. An idle agent
-/// waiting on that work is reported as [`DerivedAgentState::BackgroundWork`].
 pub(crate) fn derive_agent_state_with_background(
     state: &AppState,
     agent: &AgentInfo,
 ) -> DerivedAgentState {
     let derived = derive_agent_state(state, agent);
-    if derived != DerivedAgentState::Idle {
+    if !matches!(
+        derived,
+        DerivedAgentState::Idle | DerivedAgentState::Cancelled
+    ) {
         return derived;
     }
     let agent_ref = ActiveAgentRef {
         host_id: agent.host_id.clone(),
         agent_id: agent.agent_id.clone(),
     };
-    if crate::components::inflight_tray::has_running_background_work(state, &agent_ref) {
+    if state
+        .agents_with_background_work
+        .with(|agents| agents.contains(&agent_ref))
+    {
         DerivedAgentState::BackgroundWork
     } else {
-        DerivedAgentState::Idle
+        derived
     }
 }
 
@@ -1610,12 +1608,7 @@ fn sidebar_agents(state: &AppState, filters: &AgentsPanelFilters, query: &str) -
     let projects = state.projects.get();
     let pins = state.agents_view_preferences.get().pins.pinned;
 
-    // Read the noisy maps in place via `with` rather than cloning
-    // them up-front. The Memo re-runs on every keystroke in the
-    // panel-search input, and cloning the streaming/turn-active
-    // HashMaps + the full agents Vec on each keystroke was the
-    // dominant per-keystroke cost in the audit.
-    state.streaming_text.with(|streaming_map| {
+    state.agents_with_background_work.with(|background_work| {
         state.agent_turn_active.with(|turn_active_map| {
             state.agent_awaiting_user.with(|awaiting_user| {
                 state.agents.with(|agents| {
@@ -1645,7 +1638,7 @@ fn sidebar_agents(state: &AppState, filters: &AgentsPanelFilters, query: &str) -
                                                 )
                                         }
                                     },
-                                    streaming_map,
+                                    background_work,
                                     turn_active_map,
                                     awaiting_user,
                                     query,
@@ -4938,6 +4931,13 @@ mod wasm_tests {
                 message: "Operation cancelled".to_owned(),
             }),
         );
+        // Backend cancellation ends with its authoritative idle signal.
+        crate::dispatch::apply_chat_event(
+            &state,
+            "local",
+            &agent_id,
+            protocol::ChatEvent::TypingStatusChanged(false),
+        );
         for _ in 0..3 {
             next_tick().await;
         }
@@ -4993,6 +4993,93 @@ mod wasm_tests {
                 .contains("Cancelled"),
             "the cancelled outcome describes the last turn only and must reset"
         );
+
+        let stream = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.agent_id == agent_id)
+                .unwrap()
+                .instance_stream
+                .clone()
+        });
+        let mut bootstrap = protocol::AgentBootstrapPayload {
+            events: vec![
+                protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::OperationCancelled(
+                    protocol::OperationCancelledData {
+                        message: "Earlier cancellation".into(),
+                    },
+                )),
+                protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::StreamStart(
+                    protocol::StreamStartData {
+                        agent: "codex".into(),
+                        model: None,
+                    },
+                )),
+                protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::StreamEnd(
+                    protocol::StreamEndData {
+                        message: protocol::ChatMessage {
+                            origin: None,
+                            message_id: None,
+                            timestamp: 1,
+                            sender: protocol::MessageSender::Assistant {
+                                agent: "codex".into(),
+                            },
+                            content: "A later successful turn".into(),
+                            reasoning: None,
+                            tool_calls: vec![],
+                            model_info: None,
+                            token_usage: None,
+                            context_breakdown: None,
+                            images: None,
+                        },
+                    },
+                )),
+            ],
+            latest_output: Default::default(),
+            activity: protocol::AgentActivity::Idle,
+            status: protocol::AgentControlStatus::Idle,
+            error: None,
+            last_turn_cancelled: false,
+            pending_user_questions: vec![],
+        };
+        crate::dispatch::apply_agent_bootstrap_for_test(
+            &state,
+            "local",
+            &stream,
+            bootstrap.clone(),
+        );
+        next_tick().await;
+        assert_eq!(
+            agent_card_el(&container, "a1")
+                .query_selector(".agent-card-status")
+                .unwrap()
+                .unwrap()
+                .get_attribute("title")
+                .as_deref(),
+            Some("Idle"),
+            "history cannot override the current outcome"
+        );
+        bootstrap.events.clear();
+        for (cancelled, label) in [(true, "Cancelled"), (false, "Idle")] {
+            bootstrap.last_turn_cancelled = cancelled;
+            crate::dispatch::apply_agent_bootstrap_for_test(
+                &state,
+                "local",
+                &stream,
+                bootstrap.clone(),
+            );
+            next_tick().await;
+            assert_eq!(
+                agent_card_el(&container, "a1")
+                    .query_selector(".agent-card-status")
+                    .unwrap()
+                    .unwrap()
+                    .get_attribute("title")
+                    .as_deref(),
+                Some(label),
+                "bootstrap outcome does not require a retained notice"
+            );
+        }
     }
 
     /// A turn that ends with a backgrounded command still running is not a
@@ -5004,6 +5091,7 @@ mod wasm_tests {
     async fn idle_card_with_running_background_command_is_not_shown_as_done() {
         let container = make_container();
         let state = make_app_state("local");
+        crate::dispatch::prime_host_for_tests(&state, "local");
         push_agent(&state, "local", "a1", "Background Runner", true);
         let agent_id = AgentId("a1".to_owned());
         let _handle = mount_panel(&container, state.clone());
@@ -5034,6 +5122,20 @@ mod wasm_tests {
             class.contains("completed"),
             "idle uses the completed style: {class}"
         );
+
+        let background = |seq, has_background_work| {
+            dispatch_frame(
+                &state,
+                "local",
+                StreamPath("/host/local".into()),
+                FrameKind::AgentBackgroundWorkNotify,
+                seq,
+                &protocol::AgentBackgroundWorkNotifyPayload {
+                    agent_id: agent_id.clone(),
+                    has_background_work,
+                },
+            );
+        };
 
         // The model runs a command in the background and ends its turn.
         let apply = |event: protocol::ChatEvent| {
@@ -5089,6 +5191,7 @@ mod wasm_tests {
                 },
             },
         ));
+        background(0, true);
         apply(protocol::ChatEvent::TypingStatusChanged(false));
         for _ in 0..3 {
             next_tick().await;
@@ -5145,6 +5248,7 @@ mod wasm_tests {
                 },
             ),
         ));
+        background(1, false);
         for _ in 0..3 {
             next_tick().await;
         }
@@ -5169,12 +5273,216 @@ mod wasm_tests {
                 },
             },
         ));
+        background(2, true);
         apply(protocol::ChatEvent::TypingStatusChanged(true));
         for _ in 0..3 {
             next_tick().await;
         }
         let (title, _, _) = status_of(&container);
         assert_eq!(title, "Thinking", "a live turn outranks background work");
+        apply(protocol::ChatEvent::OperationCancelled(
+            protocol::OperationCancelledData {
+                message: "Cancelled".into(),
+            },
+        ));
+        next_tick().await;
+        assert_eq!(
+            status_of(&container).0,
+            "Thinking",
+            "cancellation outcome is not backend idle"
+        );
+        apply(protocol::ChatEvent::TypingStatusChanged(false));
+        next_tick().await;
+        assert_eq!(
+            status_of(&container).0,
+            "Background work",
+            "foreground cancellation does not finish background work"
+        );
+        background(3, false);
+        next_tick().await;
+        assert_eq!(status_of(&container).0, "Cancelled");
+        for (seq, activity, label) in [
+            (4, protocol::AgentActivity::Thinking, "Thinking"),
+            (5, protocol::AgentActivity::Idle, "Idle"),
+        ] {
+            dispatch_frame(
+                &state,
+                "local",
+                StreamPath("/host/local".into()),
+                FrameKind::AgentTurnStateNotify,
+                seq,
+                &protocol::AgentTurnStateNotifyPayload {
+                    agent_id: agent_id.clone(),
+                    activity,
+                },
+            );
+            next_tick().await;
+            assert_eq!(
+                status_of(&container).0,
+                label,
+                "typed working resets the prior outcome"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn activity_authority_survives_stale_response_and_reconnect() {
+        use crate::dispatch::restore_fixtures::{restore_agent_payload, restore_bootstrap};
+
+        let container = make_container();
+        let state = make_app_state("h");
+        crate::dispatch::prime_host_for_tests(&state, "h");
+        let id = AgentId("authority".to_owned());
+        let mut agent = restore_agent_payload(&id.0, None);
+        agent.session_id = Some(protocol::SessionId("authority-fixture".into()));
+        agent.activity = protocol::AgentActivity::Thinking;
+        let mut bootstrap = restore_bootstrap(
+            vec![BackendKind::Codex],
+            Default::default(),
+            vec![],
+            vec![agent.clone()],
+        );
+        let host_stream = StreamPath("/host/h".to_owned());
+        dispatch_frame(
+            &state,
+            "h",
+            host_stream.clone(),
+            FrameKind::HostBootstrap,
+            0,
+            &bootstrap,
+        );
+        let handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let row = agent_card_el(&container, &id.0);
+        let status = row.query_selector(".agent-card-status").unwrap().unwrap();
+        assert_eq!(status.get_attribute("title").as_deref(), Some("Thinking"));
+        crate::dispatch::apply_chat_event(
+            &state,
+            "h",
+            &id,
+            protocol::ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "codex".into(),
+                model: None,
+            }),
+        );
+        crate::dispatch::apply_chat_event(
+            &state,
+            "h",
+            &id,
+            protocol::ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                text: "retained response".into(),
+            }),
+        );
+        for (seq, activity, label) in [
+            (1, protocol::AgentActivity::Idle, "Idle"),
+            (2, protocol::AgentActivity::Thinking, "Thinking"),
+            (
+                3,
+                protocol::AgentActivity::AwaitingUser,
+                "Needs your answer",
+            ),
+            (4, protocol::AgentActivity::Idle, "Idle"),
+        ] {
+            dispatch_frame(
+                &state,
+                "h",
+                host_stream.clone(),
+                FrameKind::AgentTurnStateNotify,
+                seq,
+                &protocol::AgentTurnStateNotifyPayload {
+                    agent_id: id.clone(),
+                    activity,
+                },
+            );
+            next_tick().await;
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&id)),
+                "response retention is not lifecycle"
+            );
+            assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+            assert!(
+                row.is_same_node(Some(&agent_card_el(&container, &id.0))),
+                "same-ID updates preserve the row"
+            );
+        }
+        crate::dispatch::apply_chat_event(
+            &state,
+            "h",
+            &id,
+            protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+                sender: protocol::MessageSender::User,
+                content: "Historical input is not live activity".into(),
+                origin: None,
+                message_id: None,
+                timestamp: 1,
+                reasoning: None,
+                tool_calls: vec![],
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        );
+        next_tick().await;
+        assert_eq!(status.get_attribute("title").as_deref(), Some("Idle"));
+        for (seq, activity, label) in [
+            (0, protocol::AgentActivity::Thinking, "Thinking"),
+            (1, protocol::AgentActivity::Idle, "Idle"),
+        ] {
+            dispatch_frame(
+                &state,
+                "h",
+                agent.instance_stream.clone(),
+                FrameKind::AgentActivityChanged,
+                seq,
+                &protocol::AgentActivityChangedPayload { activity },
+            );
+            next_tick().await;
+            assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+        }
+        // With no transcript tool/child, the server's distinct background flag
+        // alone must keep real work visible, and false must remove it.
+        for (seq, has_background_work, label) in [(5, true, "Background work"), (6, false, "Idle")]
+        {
+            dispatch_frame(
+                &state,
+                "h",
+                host_stream.clone(),
+                FrameKind::AgentBackgroundWorkNotify,
+                seq,
+                &protocol::AgentBackgroundWorkNotifyPayload {
+                    agent_id: id.clone(),
+                    has_background_work,
+                },
+            );
+            next_tick().await;
+            assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+        }
+        agent.activity = protocol::AgentActivity::Idle;
+        bootstrap.agents = vec![agent];
+        for (seq, background, label) in [
+            (7, vec![id.clone()], "Background work"),
+            (8, vec![], "Idle"),
+        ] {
+            bootstrap.agents_with_background_work = background;
+            dispatch_frame(
+                &state,
+                "h",
+                host_stream.clone(),
+                FrameKind::HostBootstrap,
+                seq,
+                &bootstrap,
+            );
+            next_tick().await;
+            assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+            assert!(row.is_same_node(Some(&agent_card_el(&container, &id.0))));
+        }
+        drop(handle);
+        container.remove();
     }
 
     fn text_position(text: &str, needle: &str) -> usize {
@@ -9446,6 +9754,20 @@ mod wasm_tests {
                 },
             },
         ));
+        let background = |active| {
+            state.agents_with_background_work.update(|agents| {
+                let owner = ActiveAgentRef {
+                    host_id: "local".into(),
+                    agent_id: dragged_id.clone(),
+                };
+                if active {
+                    agents.insert(owner);
+                } else {
+                    agents.remove(&owner);
+                }
+            })
+        };
+        background(true);
         next_tick().await;
         assert_drag_status("Background work", "\u{29D7}");
         apply(protocol::ChatEvent::TypingStatusChanged(true));
@@ -9459,16 +9781,19 @@ mod wasm_tests {
         state.agent_awaiting_user.update(|awaiting| {
             awaiting.remove(&dragged_id);
         });
+        background(false);
         apply(protocol::ChatEvent::OperationCancelled(
             protocol::OperationCancelledData {
                 message: "Operation cancelled".to_owned(),
             },
         ));
+        apply(protocol::ChatEvent::TypingStatusChanged(false));
         next_tick().await;
         assert_drag_status("Cancelled", "\u{2298}");
         apply(protocol::ChatEvent::TypingStatusChanged(true));
         next_tick().await;
         assert_drag_status("Thinking", "\u{25F7}");
+        background(true);
         apply(protocol::ChatEvent::TypingStatusChanged(false));
         next_tick().await;
         assert_drag_status("Background work", "\u{29D7}");
@@ -9482,6 +9807,7 @@ mod wasm_tests {
                 },
             ),
         ));
+        background(false);
         next_tick().await;
         assert_drag_status("Idle", "\u{2713}");
         dispatch_key(&parent, "Escape");

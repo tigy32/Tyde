@@ -3942,6 +3942,7 @@ mod wasm_tests {
             events: Vec::new(),
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
         };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
@@ -4917,6 +4918,7 @@ mod wasm_tests {
             ],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
         };
         dispatch_envelope(
@@ -5759,6 +5761,7 @@ mod wasm_tests {
             )],
             latest_output: Default::default(),
             activity: protocol::AgentActivity::Idle,
+            last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
         };
         dispatch_envelope(

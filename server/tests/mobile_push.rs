@@ -637,6 +637,25 @@ async fn only_agents_the_user_started_notify() {
         serde_json::from_slice(&keys.decrypt(&first.body)).expect("notification");
     assert_eq!(first.agent_name, "orchestrator");
 
+    // The normal eager desktop connection must receive the same typed
+    // authority as lazy mobile clients, without inspecting child transcripts.
+    let mut desktop = fixture.connect().await;
+    async fn expect_background_state(
+        client: &mut client::Connection,
+        parent: &protocol::AgentId,
+        expected: bool,
+    ) {
+        fixture::next_frame_matching_on(client, "eager canonical background state", |env| {
+            env.kind == FrameKind::AgentBackgroundWorkNotify
+                && env
+                    .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+                    .is_ok_and(|state| {
+                        state.agent_id == *parent && state.has_background_work == expected
+                    })
+        })
+        .await;
+    }
+
     let caller = fixture.agent_control_caller(&parent_id).await;
     let child_gate = MockGateHandle::new();
     let reservation = fixture
@@ -658,6 +677,19 @@ async fn only_agents_the_user_started_notify() {
                 .is_ok_and(|p| p.agent_id == parent_id && p.has_background_work)
     })
     .await;
+    expect_background_state(&mut desktop, &parent_id, true).await;
+    let (_, reconnect) = fixture.connect_with_bootstrap().await;
+    assert!(reconnect.agents_with_background_work.contains(&parent_id));
+    assert_eq!(
+        reconnect
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == parent_id)
+            .expect("parent in reconnect snapshot")
+            .activity,
+        protocol::AgentActivity::Idle,
+        "background work must not turn the parent's idle foreground into Thinking"
+    );
     fixture
         .client
         .send_message(&parent.stream, "check child".to_owned())
@@ -686,6 +718,10 @@ async fn only_agents_the_user_started_notify() {
                 .is_ok_and(|p| p.agent_id == parent_id && !p.has_background_work)
     })
     .await;
+
+    expect_background_state(&mut desktop, &parent_id, false).await;
+    let (_, reconnect) = fixture.connect_with_bootstrap().await;
+    assert!(!reconnect.agents_with_background_work.contains(&parent_id));
 
     let root = fixture.store_dir().join("mobile-push-swarm-workspace");
     std::fs::create_dir(&root).expect("create actual swarm push workspace");

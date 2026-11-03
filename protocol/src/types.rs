@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 96;
+pub const PROTOCOL_VERSION: u32 = 97;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -2387,6 +2387,8 @@ pub struct AgentBootstrapPayload {
     pub latest_output: AgentControlOutput,
     /// Authoritative activity after replaying `events`.
     pub activity: AgentActivity,
+    /// Current cancellation outcome, independent of historical notices.
+    pub last_turn_cancelled: bool,
     /// Authoritative unanswered `AskUserQuestion` requests in request order,
     /// retained across transcript tail truncation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
