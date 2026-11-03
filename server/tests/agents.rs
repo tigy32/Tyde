@@ -8391,6 +8391,98 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     let mut fixture = Fixture::new().await;
     let parent = spawn_agent_control_parent(&mut fixture, "depth-root").await;
     let parent_caller = fixture.agent_control_caller(&parent.agent_id).await;
+    // Exercise the same aggregate tools/list that managed provider startup uses.
+    // Separate endpoint calls cannot detect a cross-server tool-name collision.
+    let bridge_directory = tempfile::tempdir().expect("managed MCP directory");
+    let descriptor_path = bridge_directory
+        .path()
+        .join(server::mcp_bridge::DESCRIPTOR_FILE_NAME);
+    let config_url = fixture.config_mcp_http_url().await;
+    let descriptor = server::mcp_bridge::BridgeDescriptor {
+        servers: [
+            ("tyde-agent-control", &parent_caller.url),
+            ("tyde-agent-await", &parent_caller.await_url),
+            ("tyde-config", &config_url),
+        ]
+        .into_iter()
+        .map(|(name, url)| server::mcp_bridge::BridgeServerConfig {
+            name: name.to_owned(),
+            transport: server::mcp_bridge::BridgeTransport::Http {
+                url: url.clone(),
+                headers: [(
+                    "Authorization".to_owned(),
+                    parent_caller.authorization.clone(),
+                )]
+                .into(),
+            },
+        })
+        .collect(),
+        supports_parallel_tool_calls: false,
+    };
+    std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+    use tyde_process_env::launch::{AsyncCommandGroup, ProcessStdio};
+    let mut command = tyde_process_env::command(
+        std::env::var_os("TYDE_TEST_PROCESS_EXECUTABLE").expect("check-provisioned server binary"),
+    )
+    .expect("managed MCP command");
+    command
+        .arg(server::mcp_bridge::BRIDGE_SUBCOMMAND)
+        .env(server::mcp_bridge::DESCRIPTOR_ENV, &descriptor_path)
+        .env("TMPDIR", bridge_directory.path())
+        .stdin(ProcessStdio::Piped)
+        .stdout(ProcessStdio::Piped)
+        .stderr(ProcessStdio::Inherit);
+    let transport = command
+        .group_spawn()
+        .await
+        .expect("managed MCP process")
+        .into_owned_pipes()
+        .expect("managed MCP pipes");
+    let bridge = ().serve(transport).await.expect("managed MCP initialize");
+    let tools = bridge
+        .list_all_tools()
+        .await
+        .expect("normal managed server set must list without duplicate rejection");
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(names.len(), tools.len(), "Every managed tool has one owner");
+    for name in [
+        "tyde_config_get_permissions",
+        "tyde_get_permissions",
+        "tyde_spawn_agent",
+        "tyde_review",
+    ] {
+        assert!(names.contains(name), "Managed startup must retain {name}");
+    }
+    for name in ["tyde_config_get_permissions", "tyde_get_permissions"] {
+        let result = bridge
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: name.into(),
+                arguments: Some(serde_json::Map::new()),
+                task: None,
+            })
+            .await
+            .expect("managed permissions call");
+        assert_eq!(result.is_error, Some(false));
+        let RawContent::Text(text) = &result.content[0].raw else {
+            panic!("permission text")
+        };
+        let permissions: Value = serde_json::from_str(&text.text).expect("permission JSON");
+        assert_eq!(
+            permissions["tyde_permissions"], "agent",
+            "Bridge routing must preserve caller authentication"
+        );
+        assert!(
+            permissions["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("own sub-agents")
+        );
+    }
+    bridge.cancel().await.expect("close managed MCP client");
     let child_response = mcp_tool_call_as(
         &parent_caller,
         false,
@@ -8496,13 +8588,7 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     );
     let grandchild_caller = fixture.agent_control_caller(&grandchild_id).await;
     let permissions = mcp_success_json(
-        &mcp_tool_call_as(
-            &grandchild_caller,
-            false,
-            "tyde_config_get_permissions",
-            json!({}),
-        )
-        .await,
+        &mcp_tool_call_as(&grandchild_caller, false, "tyde_get_permissions", json!({})).await,
     );
     assert_eq!(permissions["tyde_permissions"], "agent");
     assert!(
@@ -8527,8 +8613,8 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
     assert_eq!(
         names,
         vec![
-            "tyde_config_get_permissions",
             "tyde_edit_review_comment",
+            "tyde_get_permissions",
             "tyde_list_review_findings",
             "tyde_list_reviews",
             "tyde_preview_review",
@@ -9141,13 +9227,7 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         })
         .await;
         let permissions = mcp_success_json(
-            &mcp_tool_call_as(
-                &child_caller,
-                false,
-                "tyde_config_get_permissions",
-                json!({}),
-            )
-            .await,
+            &mcp_tool_call_as(&child_caller, false, "tyde_get_permissions", json!({})).await,
         );
         assert_eq!(
             permissions["tyde_permissions"],
@@ -13740,7 +13820,7 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
              [steering: {}] [builtin_steering: {}] mock backend response to: {prompt}",
             fixture.bootstrap.steering[0].content.replace('\n', "\\n"),
             // The mock's startup summary renders newlines as literal \n.
-            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
+            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )
     };
     let expected = [

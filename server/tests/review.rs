@@ -6826,7 +6826,7 @@ async fn real_codex_leaf_requests_configured_native_review() {
         let prompt = if depth < 3 {
             "Reply READY only. Do not use tools."
         } else {
-            "This is a bounded MCP availability canary. Do not edit files, run commands, build, or spawn agents. Discover canonical Tyde tools. FIRST call tyde_config_get_permissions as a separate completed tool call. Read and obey its current role guidance before any other Tyde control. Only then call tyde_preview_review without changing the mode, then call tyde_review with request_id leaf-native-review and no mode override. Await its completion. Then call tyde_list_review_findings on the returned review_id with limit 1. Do not use inline or proxy review. Finish with DONE only after configured review completes."
+            "This is a bounded MCP availability canary. Do not edit files, run commands, build, or spawn agents. Discover canonical Tyde tools. FIRST call tyde_get_permissions as a separate completed tool call. Read and obey its current role guidance before any other Tyde control. Only then call tyde_preview_review without changing the mode, then call tyde_review with request_id leaf-native-review and no mode override. Await its completion. Then call tyde_list_review_findings on the returned review_id with limit 1. Do not use inline or proxy review. Finish with DONE only after configured review completes."
         };
         client
             .spawn_agent(SpawnAgentPayload {
@@ -6896,7 +6896,7 @@ async fn real_codex_leaf_requests_configured_native_review() {
             let mut review_seen = false;
             for event in tool_events {
                 match event {
-                    ChatEvent::ToolRequest(request) if request.tool_name.ends_with("tyde_config_get_permissions") => {
+                    ChatEvent::ToolRequest(request) if request.tool_name.ends_with("tyde_get_permissions") => {
                         permission_call = Some(request.tool_call_id);
                     }
                     ChatEvent::ToolExecutionCompleted(completed)

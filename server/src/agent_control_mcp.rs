@@ -77,7 +77,7 @@ pub(crate) async fn current_permissions_response(
     Ok(json!({"tyde_permissions": role, "guidance": tyde_permissions_guidance(role)}))
 }
 
-pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, call tyde_config_get_permissions and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.";
+pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.";
 
 fn agent_control_tool_allowed(
     capabilities: &protocol::types::AgentControlMcpCapabilities,
@@ -88,7 +88,7 @@ fn agent_control_tool_allowed(
         protocol::types::AgentControlMcpScope::Delegation => true,
         protocol::types::AgentControlMcpScope::ReviewOnly => matches!(
             tool,
-            "tyde_config_get_permissions"
+            "tyde_get_permissions"
                 | "tyde_review"
                 | "tyde_preview_review"
                 | "tyde_list_reviews"
@@ -1286,16 +1286,16 @@ impl TydeAgentControlMcpServer {
             open_world_hint = false
         )
     )]
-    async fn tyde_config_get_permissions(
+    async fn tyde_get_permissions(
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let caller =
-            match require_authenticated_caller(self, &parts, "tyde_config_get_permissions").await {
-                Ok(caller) => caller,
-                Err(error) => return Ok(err_text(error)),
-            };
+        let caller = match require_authenticated_caller(self, &parts, "tyde_get_permissions").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
         match current_permissions_response(&self.host, Some(&caller)).await {
             Ok(value) => ok_json(value),
             Err(error) => Ok(err_text(error)),
@@ -2428,7 +2428,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_review on the await server to run configured advisory reviewers and return completion/counts in one call. Use ID-scoped list/read/edit/resolve tools on this server; full audit history is bounded and on demand. Completion is not approval. Review results never arrive as injected messages. Read your current Tyde permissions with tyde_config_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_review on the await server to run configured advisory reviewers and return completion/counts in one call. Use ID-scoped list/read/edit/resolve tools on this server; full audit history is bounded and on demand. Completion is not approval. Review results never arrive as injected messages. Read your current Tyde permissions with tyde_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
             }
             AgentControlMcpSurface::Await => {
                 "Long-running tools without local work timers: tyde_await_agents waits for direct children; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."

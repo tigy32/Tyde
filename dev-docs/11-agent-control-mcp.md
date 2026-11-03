@@ -130,10 +130,12 @@ And matches the proven debug MCP pattern:
   server registers canonical agent-control and await MCP servers
 - depth counts the root agent as level 1. Below `tyde_agent_control_max_depth`,
   agents receive delegation tools and config MCP. At the maximum, they receive
-  only the read-only `tyde_config_get_permissions` self-query plus configured
+  only the read-only `tyde_get_permissions` self-query plus configured
   review, preview and finding tools; no config MCP or recursive implementation
   delegation. The self-query uses the same current role/guidance source as
-  config MCP and accepts no target agent or configuration arguments. Discovery and dispatch enforce the same scope,
+  config MCP and accepts no target agent or configuration arguments. Config MCP
+  retains its distinct `tyde_config_get_permissions` tool: public tool names
+  must be unique across the normal managed server set. Discovery and dispatch enforce the same scope,
   and the spawn path independently rejects further implementation levels
 - configured reviewers use the existing dedicated reviewer path, not ordinary
   implementation-spawn admission: native author forks remain enforced read-only
