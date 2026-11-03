@@ -17,7 +17,7 @@
 //
 // Bump LOADER_CACHE when the precache list or shell logic changes.
 
-const LOADER_CACHE = "tyde-loader-v11";
+const LOADER_CACHE = "tyde-loader-v12";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with loader.js
 
 // Paths are relative to the SW scope (`/tyde/`).
@@ -26,6 +26,8 @@ const SHELL_ASSETS = [
   "./index.html",
   "./mobile-service-config.js",
   "./loader.js",
+  "./native-bootstrap.js",
+  "./native-service.js",
   "./loader.css",
   "./cbor.js",
   "./pairing.js",
@@ -81,19 +83,19 @@ self.addEventListener("fetch", (event) => {
   if (isManifest(url)) return;
 
   if (isVersionedBundle(url)) {
-    event.respondWith(bundleCacheFirst(request));
+    event.respondWith(bundleCacheFirst(request, event.clientId));
     return;
   }
 
   // Loader shell (including navigations): network-first.
   if (request.mode === "navigate" || isShellAsset(url)) {
-    event.respondWith(networkFirst(request, LOADER_CACHE));
+    event.respondWith(shellResponse(request, event.clientId));
   }
 });
 
 function isShellAsset(url) {
   return (
-    /\/(index\.html|mobile-service-config\.js|loader\.(js|css)|cbor\.js|pairing\.js|pairing-ui\.js|styles\.js|manifest-policy\.js|integrity\.js|vendor\/jsqr\.js|manifest\.webmanifest)$/.test(
+    /\/(index\.html|mobile-service-config\.js|loader\.(js|css)|native-bootstrap\.js|native-service\.js|cbor\.js|pairing\.js|pairing-ui\.js|styles\.js|manifest-policy\.js|integrity\.js|vendor\/jsqr\.js|manifest\.webmanifest)$/.test(
       url.pathname,
     ) || url.pathname.endsWith("/")
   );
@@ -102,11 +104,24 @@ function isShellAsset(url) {
 // Cache-first READ for immutable versioned bundles. On a miss, fetch from the
 // network and return it WITHOUT caching — only the page (post SRI-verify) is
 // allowed to populate this cache.
-async function bundleCacheFirst(request) {
+async function bundleCacheFirst(request, clientId) {
   const cache = await caches.open(BUNDLE_CACHE);
-  const cached = await cache.match(request);
+  const client = clientId ? await self.clients.get(clientId) : null;
+  const native = client && new URL(client.url).searchParams.get("native") === "1";
+  const cached = await cache.match(request, native ? {ignoreVary:true} : {});
   if (cached) return cached;
+  if (native && /\.(m?js|wasm)$/.test(new URL(request.url).pathname) &&
+      !(request.destination === "" && request.headers.get("x-tyde-asset-verification") === "1")) {
+    return Response.error();
+  }
   return fetch(request);
+}
+
+async function shellResponse(request, clientId) {
+  const client = clientId ? await self.clients.get(clientId) : null;
+  if (new URL(request.url).searchParams.get("native") === "1" ||
+      (client && new URL(client.url).searchParams.get("native") === "1")) return fetch(request);
+  return networkFirst(request, LOADER_CACHE);
 }
 
 async function networkFirst(request, cacheName) {

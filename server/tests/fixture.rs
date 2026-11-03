@@ -163,8 +163,22 @@ pub struct Fixture {
     #[allow(dead_code)]
     host: server::HostHandle,
     #[allow(dead_code)]
-    session_store_dir: tempfile::TempDir,
+    session_store_dir: FixtureStore,
     antigravity_conversations_dir: tempfile::TempDir,
+}
+
+enum FixtureStore {
+    Owned(tempfile::TempDir),
+    External(PathBuf),
+}
+
+impl FixtureStore {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Owned(directory) => directory.path(),
+            Self::External(path) => path,
+        }
+    }
 }
 
 // Every integration binary includes this shared fixture; UDS launch flows use it.
@@ -456,12 +470,58 @@ impl Fixture {
     }
 
     async fn new_with_store_files_inner(
+        runtime_config: server::HostRuntimeConfig,
+        skip_real_backend_probe: bool,
+        enabled_backends: Option<Vec<BackendKind>>,
+        use_mock_backend: bool,
+        store_files: Option<(&str, &str, Option<&str>)>,
+        settings_file: Option<&str>,
+    ) -> Self {
+        Self::new_at_store(
+            runtime_config,
+            skip_real_backend_probe,
+            enabled_backends,
+            use_mock_backend,
+            store_files,
+            settings_file,
+            FixtureStore::Owned(tempfile::tempdir().expect("create session tempdir")),
+        )
+        .await
+    }
+
+    // The upgrade driver owns this directory across two real server processes.
+    #[allow(dead_code)]
+    pub async fn new_at_existing_store(path: PathBuf) -> Self {
+        Self::new_at_existing_store_with_runtime_config(path, server::HostRuntimeConfig::default())
+            .await
+    }
+
+    // Shared fixture compiles per integration binary; only the upgrade flow uses this.
+    #[allow(dead_code)]
+    pub async fn new_at_existing_store_with_runtime_config(
+        path: PathBuf,
+        config: server::HostRuntimeConfig,
+    ) -> Self {
+        Self::new_at_store(
+            config,
+            true,
+            None,
+            true,
+            None,
+            None,
+            FixtureStore::External(path),
+        )
+        .await
+    }
+
+    async fn new_at_store(
         mut runtime_config: server::HostRuntimeConfig,
         skip_real_backend_probe: bool,
         enabled_backends: Option<Vec<BackendKind>>,
         use_mock_backend: bool,
         store_files: Option<(&str, &str, Option<&str>)>,
         settings_file: Option<&str>,
+        session_store_dir: FixtureStore,
     ) -> Self {
         init_tracing();
 
@@ -478,7 +538,6 @@ impl Fixture {
             BackendKind::Antigravity,
             antigravity_conversations_dir.path().to_path_buf(),
         );
-        let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");

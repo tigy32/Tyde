@@ -191,6 +191,7 @@ class PairingCborFieldDecoder {
     let v = null;
     let protocolVersion = null;
     let releaseVersionRaw = null;
+    let offerId = null, offerSecret = null;
     for (let i = 0; i < len; i++) {
       const key = this.readTextOrNull(1);
       if (key === "v") {
@@ -199,12 +200,16 @@ class PairingCborFieldDecoder {
         protocolVersion = this.readIntegerOrNull(1);
       } else if (key === "release_version") {
         releaseVersionRaw = this.readTextOrNull(1);
+      } else if (key === "offer_id") {
+        offerId = this.readTextOrNull(1);
+      } else if (key === "offer_secret") {
+        offerSecret = this.readTextOrNull(1);
       } else {
         this.skipItem(1);
       }
     }
 
-    return { v, protocolVersion, releaseVersionRaw };
+    return { v, protocolVersion, releaseVersionRaw, offerId, offerSecret };
   }
 
   readHeader(depth) {
@@ -345,7 +350,7 @@ class PairingCborFieldDecoder {
 // `releaseVersion` is the validated/normalized string, or `null` if the field
 // is absent or fails validation (`releaseVersionRaw` preserves the original for
 // diagnostics).
-export function parsePairingUri(uri) {
+export function parsePairingUri(uri, nativeBootstrap = false) {
   if (typeof uri !== "string") {
     throw new Error("pairing URI must be a string");
   }
@@ -360,8 +365,8 @@ export function parsePairingUri(uri) {
   }
 
   const bytes = base64urlToBytes(encoded);
-  const { v, protocolVersion, releaseVersionRaw } = decodePairingLoaderFields(bytes);
+  const { v, protocolVersion, releaseVersionRaw, offerId, offerSecret } = decodePairingLoaderFields(bytes);
   const releaseVersion = validateReleaseVersion(releaseVersionRaw);
 
-  return { v, protocolVersion, releaseVersion, releaseVersionRaw };
+  return { v, protocolVersion, releaseVersion, releaseVersionRaw, ...(nativeBootstrap ? {offerId, offerSecret} : {}) };
 }

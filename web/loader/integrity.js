@@ -25,7 +25,7 @@ function bytesToBase64(bytes) {
 
 // Verifies a single artifact. Returns true on a digest match. When `cache` is
 // provided, the verified Response is stored under `url` on success.
-async function verifyOne(artifact, fetchImpl, subtle, cache) {
+async function verifyOne(artifact, fetchImpl, subtle, cache, requireCache) {
   const m = /^sha(256|384|512)-(.+)$/.exec(artifact.integrity);
   if (!m) return false;
   const algo = HASH_ALGO[m[1]];
@@ -33,7 +33,8 @@ async function verifyOne(artifact, fetchImpl, subtle, cache) {
 
   // `no-store`: bypass any cache so we hash exactly what the server returns now,
   // and never trust a possibly-poisoned cached copy during verification.
-  const response = await fetchImpl(artifact.url, { cache: "no-store" });
+  const response = await fetchImpl(artifact.url, { cache: "no-store",
+    ...(requireCache ? { redirect: "error", headers: { "x-tyde-asset-verification": "1" } } : {}) });
   if (!response || !response.ok) return false;
 
   // Clone before consuming the body so the verified bytes can be cached intact.
@@ -47,6 +48,7 @@ async function verifyOne(artifact, fetchImpl, subtle, cache) {
     try {
       await cache.put(artifact.url, toCache);
     } catch {
+      if (requireCache) return false;
       // Caching is an optimization; a failure to persist must not fail the
       // boot (the bytes were already verified in-memory).
     }
@@ -62,7 +64,7 @@ export async function verifyArtifacts(artifacts, options = {}) {
   const subtle =
     options.subtle || (globalThis.crypto && globalThis.crypto.subtle);
   const cache = options.cache || null;
-  if (typeof fetchImpl !== "function" || !subtle) {
+  if (typeof fetchImpl !== "function" || !subtle || (options.requireCache && !cache)) {
     return { ok: false, failures: artifacts.map((a) => a.url) };
   }
 
@@ -70,7 +72,7 @@ export async function verifyArtifacts(artifacts, options = {}) {
   for (const artifact of artifacts) {
     let ok = false;
     try {
-      ok = await verifyOne(artifact, fetchImpl, subtle, cache);
+      ok = await verifyOne(artifact, fetchImpl, subtle, cache, options.requireCache === true);
     } catch {
       ok = false;
     }

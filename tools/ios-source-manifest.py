@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind the native executable bundle to the exact reviewed source inputs."""
+"""Bind the native bootstrap resources to the exact reviewed source inputs."""
 import hashlib
 import json
 from pathlib import Path

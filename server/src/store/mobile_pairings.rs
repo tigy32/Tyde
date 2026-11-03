@@ -39,6 +39,8 @@ pub struct MobilePairings {
 /// stolen pairings file cannot redeem an offer it did not watch being made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveDirectMobilePairing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_descriptor: Option<protocol::MobileClientBootstrapDescriptor>,
     pub offer_id: MobilePairingOfferId,
     pub secret_hash: String,
     pub created_at_ms: u64,
@@ -165,6 +167,10 @@ impl fmt::Debug for MobilePairingRecord {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveManagedMobilePairingCredential {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_descriptor: Option<protocol::MobileClientBootstrapDescriptor>,
+    #[serde(skip)]
+    pub bootstrap_generation: Option<u64>,
     pub host_offer_token: String,
     pub pairing_url: String,
     pub expires_at_ms: u64,

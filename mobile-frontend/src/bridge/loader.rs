@@ -11,6 +11,13 @@ const SELECTION_KEY: &str = "tyde.selected-host.v1";
 pub enum UnavailableReason {
     MissingRelease,
     NativeVersion,
+    HostChanged,
+    Bootstrap,
+    BootstrapTransport,
+    AuthenticationRequired,
+    PassRequired,
+    PairingRevoked,
+    BootstrapBaseline,
     Bridge,
     Storage,
     Manifest,
@@ -25,12 +32,17 @@ pub enum UnavailableReason {
 impl UnavailableReason {
     pub fn message(self) -> &'static str {
         match self {
-            Self::NativeVersion => {
-                "this native app bundles one reviewed client release; update the app and host to the same release and protocol"
+            Self::MissingRelease => "the host did not provide a client release",
+            Self::NativeVersion => "this client requires a different native bridge; update the app",
+            Self::HostChanged => {
+                "the host client changed; finish or save your work and return Home"
             }
-            Self::MissingRelease => {
-                "the host did not advertise a release (development or unpublished build)"
-            }
+            Self::AuthenticationRequired => "sign in to connect to your host",
+            Self::PassRequired => "a Tyggs Pass is required to connect",
+            Self::PairingRevoked => "this pairing is unavailable; re-pair from the host",
+            Self::BootstrapBaseline => "update Tyde host to support native client bootstrap",
+            Self::BootstrapTransport => "the host discovery connection is temporarily unavailable",
+            Self::Bootstrap => "the current host client could not be resolved",
             Self::Bridge => "this page has no compatible release loader",
             Self::Storage => "the browser could not persist the handoff",
             Self::Manifest => "the fresh release manifest could not be fetched",
@@ -176,4 +188,59 @@ fn persisted(value: Result<JsValue, UnavailableReason>) -> Result<(), Unavailabl
         BrowserOutcome::Unavailable { reason } => Err(reason),
         _ => Err(UnavailableReason::Bridge),
     }
+}
+
+pub fn native_reload_allowed(
+    allowed: bool,
+    pairing: bool,
+    handoff_complete: bool,
+    pairing_safe: bool,
+) -> Result<(), UnavailableReason> {
+    persisted(call(
+        "nativeReloadAllowed",
+        &[
+            allowed.into(),
+            pairing.into(),
+            handoff_complete.into(),
+            pairing_safe.into(),
+        ],
+    ))
+}
+
+pub async fn native_admission(method: &str, value: &str) -> BrowserOutcome {
+    let result = match call(method, &[value.into()]) {
+        Ok(value) => match value.dyn_into::<js_sys::Promise>() {
+            Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .map_err(|_| UnavailableReason::Bootstrap),
+            Err(_) => Err(UnavailableReason::Bridge),
+        },
+        Err(error) => Err(error),
+    };
+    outcome(result)
+}
+
+pub fn native_welcome_matches(descriptor: &protocol::MobileClientBootstrapDescriptor) -> bool {
+    let Ok(value) = serde_wasm_bindgen::to_value(descriptor) else {
+        return false;
+    };
+    matches!(
+        outcome(call("nativeConfirmWelcome", &[value])),
+        BrowserOutcome::Matching
+    )
+}
+
+pub async fn native_pairing_saved(host: &LocalHostId) -> Result<(), String> {
+    match native_admission("nativePairingSaved", &host.0).await {
+        BrowserOutcome::Matching => Ok(()),
+        BrowserOutcome::Unavailable { reason } => Err(reason.message().into()),
+        _ => Err("Native pairing handoff did not complete".into()),
+    }
+}
+
+pub fn native_owns_host(host: &LocalHostId) -> Result<bool, String> {
+    call("nativeOwnsHost", &[host.0.as_str().into()])
+        .map_err(|reason| reason.message().to_owned())?
+        .as_bool()
+        .ok_or_else(|| "Native client ownership response is invalid".into())
 }

@@ -12,6 +12,12 @@ export function install() {
   window.__tydeLoader = {
     bootVersion: () => "0.9.4-beta.11",
     cancelHostSwitch: () => {},
+    nativeReloadAllowed: () => ({status:'matching'}),
+    nativeOwnsHost: () => true,
+    nativeConfirmWelcome: () => ({status:'matching'}),
+    nativeAdmitHost: async () => ({status:'matching'}),
+    nativePreparePairing: async () => ({status:'matching'}),
+    nativePairingSaved: async () => ({status:'matching'}),
     selectHost: host => {
       const target = JSON.parse(localStorage.getItem("tyde.loader.host-target.v1") || "null");
       if (target && target.host !== host) localStorage.removeItem("tyde.loader.host-target.v1");

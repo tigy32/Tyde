@@ -1560,8 +1560,59 @@ pub struct HelloPayload {
     pub platform: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MobileClientBootstrapDescriptor {
+    pub bootstrap_version: u32,
+    #[schemars(with = "String")]
+    pub host_release_version: TydeReleaseVersion,
+    pub protocol_version: u32,
+    pub transport_protocol_version: u32,
+    #[schemars(with = "String")]
+    pub client_release_version: TydeReleaseVersion,
+    pub artifact_set_sha256: String,
+    pub native_bridge_abi: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MobileDirectBootstrapRequest {
+    pub native_bridge_abi: u32,
+    #[serde(default)]
+    #[schemars(with = "Option<String>")]
+    pub offer_id: Option<MobilePairingOfferId>,
+    #[serde(default)]
+    pub offer_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    content = "id",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MobileBootstrapBinding {
+    Offer(#[schemars(with = "String")] MobilePairingOfferId),
+    Pairing(String),
+    Device(#[schemars(with = "String")] MobileDeviceId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MobileBootstrapResolution {
+    pub binding: MobileBootstrapBinding,
+    pub descriptor: MobileClientBootstrapDescriptor,
+    pub generation: u64,
+    pub registered_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub resolved_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WelcomePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mobile_client_bootstrap: Option<MobileClientBootstrapDescriptor>,
     pub protocol_version: u32,
     pub tyde_version: Version,
     /// Exact, prerelease-capable host build version used by the web client to
@@ -3494,6 +3545,8 @@ pub enum MobileAccessErrorCode {
     TransportFailed,
     UnknownDevice,
     RevokedDevice,
+    BootstrapUnknown,
+    NativeAbiIncompatible,
     VersionMismatch,
     Internal,
 }

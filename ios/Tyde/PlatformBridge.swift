@@ -23,19 +23,30 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
     }
     private var authentication = AuthenticationState.idle
     private var httpTasks: [UInt32: Task<NativeHttpResponse, Error>] = [:]
+    private var clientSecretKeys: Set<String>?
+    private var document = UUID()
+    private func retireDocument() {
+        document = UUID()
+        for task in httpTasks.values { task.cancel() }
+        httpTasks.removeAll()
+        if case .active(let session, _) = authentication { session.cancel() }
+        authentication = .idle
+    }
+    func beginBootstrap() { retireDocument(); clientSecretKeys = nil }
+    func suspendClient() { retireDocument(); clientSecretKeys = [] }
+
     private let networking = NativeNetworking()
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "platform")
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping (Any?, String?) -> Void) {
         guard message.frameInfo.isMainFrame,
-              message.frameInfo.securityOrigin.protocol == "http",
-              message.frameInfo.securityOrigin.host == "127.0.0.1",
-              message.frameInfo.securityOrigin.port == 18736,
+              ClientBootstrap.permits(message.frameInfo.securityOrigin),
               let endpoint = NativeEndpoint(rawValue: message.name),
               let json = message.body as? String, let data = json.data(using: .utf8) else {
             replyHandler(nil, "Untrusted native bridge message")
             return
         }
+        let submittedDocument = document
         let decoder = JSONDecoder()
         do {
             switch endpoint {
@@ -45,9 +56,11 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
                 let task = Task { try await networking.send(request) }
                 httpTasks[request.id] = task
                 Task { @MainActor in
-                    defer { httpTasks.removeValue(forKey: request.id) }
+                    defer { if document == submittedDocument { httpTasks.removeValue(forKey: request.id) } }
                     do {
-                        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(try await task.value))
+                        let value = try await task.value
+                        guard document == submittedDocument else { throw CancellationError() }
+                        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(value))
                         replyHandler(object, nil)
                     } catch { reject(endpoint, error, replyHandler) }
                 }
@@ -63,6 +76,7 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
         } catch { reject(endpoint, error, replyHandler); return }
         Task { @MainActor in
             do {
+                guard document == submittedDocument else { throw CancellationError() }
                 switch endpoint {
                 case .presentation:
                     let state = try decoder.decode(NativePresentation.self, from: data)
@@ -71,20 +85,37 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
                     replyHandler(NSNull(), nil)
                 case .http, .http_cancel:
                     throw HostError("Native HTTP dispatch invariant failed")
+                case .secret_scope:
+                    let scope = try decoder.decode(NativeSecretScope.self, from: data)
+                    guard scope.keys.count <= 3 else { throw HostError("Native client secret scope is invalid") }
+                    for key in scope.keys { _ = try secretQuery(key) }
+                    let requested = Set(scope.keys)
+                    if let current = clientSecretKeys, !requested.isSubset(of: current) {
+                        throw HostError("Native client secret scope cannot expand")
+                    }
+                    clientSecretKeys = requested
+                    replyHandler(NSNull(), nil)
                 case .secret_read:
                     let key = try decoder.decode(NativeSecretKey.self, from: data)
+                    try authorizeSecret(key.key)
                     replyHandler(try readSecret(key.key).map { $0 as Any } ?? NSNull(), nil)
                 case .secret_write:
                     let value = try decoder.decode(NativeSecretWrite.self, from: data)
+                    if clientSecretKeys != nil && !clientSecretKeys!.contains(value.key) {
+                        guard try readSecret(value.key) == nil else { throw HostError("Native client cannot replace another pairing secret") }
+                        clientSecretKeys!.insert(value.key)
+                    }
                     try writeSecret(key: value.key, value: value.value)
                     replyHandler(NSNull(), nil)
                 case .secret_delete:
                     let key = try decoder.decode(NativeSecretKey.self, from: data)
+                    try authorizeSecret(key.key)
                     try deleteSecret(key.key)
                     replyHandler(NSNull(), nil)
                 case .authenticate:
                     let request = try decoder.decode(NativeAuthRequest.self, from: data)
                     let callback = try await authenticate(request)
+                    guard document == submittedDocument else { throw CancellationError() }
                     replyHandler(callback, nil)
                 }
             } catch { reject(endpoint, error, replyHandler) }
@@ -106,6 +137,10 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
         // Only controlled reasons and framework codes; never keys, values, URLs or userInfo.
         logger.error("Native \(endpoint.rawValue, privacy: .public) failed: \(reason, privacy: .public)")
         replyHandler(nil, reason)
+    }
+
+    private func authorizeSecret(_ key: String) throws {
+        if let keys = clientSecretKeys, !keys.contains(key) { throw HostError("Native client cannot access another pairing secret") }
     }
 
     private func secretQuery(_ key: String) throws -> [String: Any] {
@@ -163,11 +198,13 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
               window.windowScene?.activationState == .foregroundActive else {
             throw HostError("A native sign-in is already active or no app window is available")
         }
+        let owner = document
         let anchor = AuthenticationAnchor(window: window)
         authentication = .starting
         let url: URL
         do { url = try await networking.startAuthentication(provider: request.provider) }
-        catch { authentication = .idle; throw error }
+        catch { if document == owner { authentication = .idle }; throw error }
+        guard document == owner else { throw CancellationError() }
         guard presentingController?.viewIfLoaded?.window === anchor.window,
               anchor.window.windowScene?.activationState == .foregroundActive else {
             authentication = .idle
@@ -176,7 +213,11 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
         return try await withCheckedThrowingContinuation { continuation in
             let session = ASWebAuthenticationSession(url: url, callback: .customScheme("tyde-mobile")) { [weak self] callback, error in
                 Task { @MainActor in
-                    self?.authentication = .idle
+                    guard let self, self.document == owner else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    self.authentication = .idle
                     guard let callback, callback.scheme == "tyde-mobile", callback.host == "auth", callback.path == "/callback" else {
                         continuation.resume(throwing: HostError(error == nil ? "Native authentication callback is invalid" : "Native sign-in was cancelled or failed"))
                         return
@@ -202,7 +243,7 @@ final class NativeNetworking: NSObject, URLSessionTaskDelegate {
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
 
     func startAuthentication(provider: NativeAuthProvider) async throws -> URL {
-        var components = URLComponents(string: "https://tycode.dev/api/tyde/mobile/v1/auth/native/start")!
+        var components = URLComponents(url: URL(string: "/api/tyde/mobile/v1/auth/native/start", relativeTo: ClientBootstrap.origin)!.absoluteURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "provider", value: provider.rawValue)]
         let (_, response) = try await session.data(for: URLRequest(url: components.url!))
         guard let response = response as? HTTPURLResponse else { throw HostError("Native authentication start returned no HTTP response") }
@@ -223,11 +264,11 @@ final class NativeNetworking: NSObject, URLSessionTaskDelegate {
 
     func send(_ input: NativeHttpRequest) async throws -> NativeHttpResponse {
         guard let url = URL(string: input.url), url.scheme == "https", url.user == nil, url.password == nil, url.fragment == nil,
-              (url.host == "tycode.dev" && url.port == nil && url.path.hasPrefix("/api/tyde/mobile/v1/"))
-                || (url.host != nil && url.path == "/tyde/pair" && input.method == .post) else {
+              (ClientBootstrap.permits(url) && url.path.hasPrefix("/api/tyde/mobile/v1/"))
+                || (url.host != nil && ["/tyde/pair", "/tyde/bootstrap"].contains(url.path) && input.method == .post) else {
             throw HostError("Native HTTP destination is not permitted")
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = input.method == .get ? "GET" : "POST"
         request.httpBody = input.body.map { Data($0.utf8) }
         for (name, value) in input.headers {

@@ -1,7 +1,7 @@
 (() => {
     "use strict";
-    if (window !== window.top || window.location.origin !== "http://127.0.0.1:18736") {
-        throw new Error("Native client loaded outside its bundled origin");
+    if (window !== window.top || window.location.origin !== tydeNativeBootstrapOrigin) {
+        throw new Error("Native client loaded outside its trusted publisher origin");
     }
     const post = (endpoint, payload) => {
         const handler = window.webkit.messageHandlers[endpoint];
@@ -9,18 +9,14 @@
         return handler.postMessage(payload);
     };
     Object.defineProperty(window, "__tydeNativeHost", {
-        value: Object.freeze({ version: tydeNativeBridgeVersion, post }), writable: false, configurable: false
-    });
-    Object.defineProperty(window, "__TYDE_MOBILE_SERVICE__", {
-        value: Object.freeze({ baseUrl: "https://tycode.dev/api/tyde/mobile/v1", providers: ["apple", "google"] }), writable: false
+        value: Object.freeze({ version: tydeNativeBridgeVersion, bootstrapVersion: tydeNativeBootstrapVersion, shellRelease: tydeNativeShellRelease, scopeSecrets: keys => post(tydeNativeSecretScopeEndpoint, JSON.stringify({keys})), post }), writable: false, configurable: false
     });
     const localFetch = window.fetch.bind(window);
     let nextRequestId = 1;
     window.fetch = async (input, options) => {
         const request = new Request(input, options);
         const url = new URL(request.url);
-        if (url.origin === tydeNativeAssetOrigin) return localFetch(request);
-        if (url.origin === window.location.origin) throw new Error("Bundled resources require the app-owned transport");
+        if (url.origin === window.location.origin && !url.pathname.startsWith("/api/tyde/mobile/v1/")) return localFetch(request);
         if (url.protocol !== "https:") throw new Error("Native networking requires HTTPS");
         const method = request.method.toLowerCase();
         if (method !== "get" && method !== "post") throw new Error("Native HTTP method is not permitted");

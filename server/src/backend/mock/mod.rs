@@ -107,10 +107,13 @@ impl MockDiscovery {
 const MOCK_MODEL: &str = "mock";
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "test-support", derive(serde::Serialize, serde::Deserialize))]
 struct MockSessionRecord {
     workspace_roots: Vec<String>,
     prompts: Vec<String>,
+    #[cfg_attr(feature = "test-support", serde(skip))]
     resume_continuation: Option<(gate::MockGate, gate::MockGate)>,
+    #[cfg_attr(feature = "test-support", serde(skip))]
     resume_replay: Option<MockResumeReplay>,
     /// Sticky across resume and fork.
     user_bubbles: bool,
@@ -175,6 +178,61 @@ pub fn session_instructions(session_id: &SessionId) -> Option<String> {
 fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
     static STORE: OnceLock<Mutex<HashMap<String, MockSessionRecord>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Real providers keep native session state outside Tyde. The in-process mock
+// needs an explicit, private handover when a sim replaces the server process.
+#[cfg(feature = "test-support")]
+pub fn save_sessions_for_restart(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
+    let bytes = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| "mock provider store poisoned")?;
+        if store.is_empty()
+            || store.values().any(|record| {
+                record.resume_continuation.is_some() || record.resume_replay.is_some()
+            })
+        {
+            return Err(
+                "mock process handover requires actual sessions without in-process replay gates"
+                    .into(),
+            );
+        }
+        serde_json::to_vec(&*store).map_err(|_| "cannot encode actual mock provider state")?
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "cannot create private mock provider checkpoint")?;
+    file.write_all(&bytes)
+        .map_err(|_| "cannot save private mock provider checkpoint")?;
+    file.sync_all()
+        .map_err(|_| "cannot commit private mock provider checkpoint".to_owned())
+}
+
+#[cfg(feature = "test-support")]
+pub fn restore_sessions_for_restart(path: &std::path::Path) -> Result<usize, String> {
+    let bytes = std::fs::read(path).map_err(|_| "cannot read actual mock provider checkpoint")?;
+    let records: HashMap<String, MockSessionRecord> =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid private mock provider checkpoint")?;
+    let count = records.len();
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| "mock provider store poisoned")?;
+    if count == 0 || records.keys().any(|session| store.contains_key(session)) {
+        return Err(
+            "mock provider checkpoint is empty or collides with live provider state".into(),
+        );
+    }
+    store.extend(records);
+    Ok(count)
 }
 
 pub struct MockBackend {

@@ -19,7 +19,15 @@ impl HostRelease {
     fn target(&self) -> (Option<TydeReleaseVersion>, u32) {
         match self {
             Self::Welcome { payload, .. } | Self::NativeIncompatible(payload) => {
-                (payload.release_version.clone(), payload.protocol_version)
+                let release = if crate::native::is_native() {
+                    payload
+                        .mobile_client_bootstrap
+                        .as_ref()
+                        .map(|descriptor| descriptor.client_release_version.clone())
+                } else {
+                    payload.release_version.clone()
+                };
+                (release, payload.protocol_version)
             }
             Self::Rejected(payload) => (
                 payload.release_version.clone(),
@@ -56,11 +64,12 @@ impl BundleStatus {
 }
 
 fn safe_to_reload(state: &AppState) -> bool {
-    // Home has no composer/editor. Local attachments and queued edits belong
-    // to ChatView, so empty global text alone never grants reload permission.
+    // Native retained panes expose their actual unsaved owners. A completed
+    // retained conversation is not itself unsaved work; browser policy is unchanged.
     state.app_mode.get() == AppMode::Workspace
         && state.active_tab.get() == MobileTab::Home
-        && !state.viewing_chat.get()
+        && (!state.viewing_chat.get()
+            || (crate::native::is_native() && crate::native::can_leave_workspace(state)))
         && state.boot_handoff_complete.get()
         && !state.project_picker_open.get()
         && !state.session_settings_open.get()
@@ -81,10 +90,6 @@ pub fn restore_selection(state: &AppState) {
 }
 
 pub fn install(state: AppState) {
-    if crate::native::is_native() {
-        install_native(state);
-        return;
-    }
     let generation = RwSignal::new(0u64);
     let input_state = state.clone();
     let inputs = Memo::new(move |_| {
@@ -92,13 +97,35 @@ pub fn install(state: AppState) {
         let release = host
             .as_ref()
             .and_then(|host| input_state.host_releases.get().get(host).cloned());
-        (host, release, safe_to_reload(&input_state))
+        let mode = input_state.app_mode.get();
+        let handoff_complete = input_state.boot_handoff_complete.get();
+        let safe = safe_to_reload(&input_state)
+            || (crate::native::is_native()
+                && mode == AppMode::Onboarding
+                && handoff_complete
+                && input_state.chat_input.get().is_empty()
+                && input_state.pending_submissions.get().is_empty());
+        (
+            host,
+            release,
+            safe,
+            matches!(mode, AppMode::Pairing(_)),
+            handoff_complete,
+            crate::native::can_leave_workspace(&input_state),
+        )
     });
     on_cleanup(move || {
         let _ = loader::cancel();
     });
     Effect::new(move |_| {
-        let (host, release, safe) = inputs.get();
+        let (host, release, safe, pairing, handoff_complete, pairing_safe) = inputs.get();
+        if crate::native::is_native()
+            && let Err(reason) =
+                loader::native_reload_allowed(safe, pairing, handoff_complete, pairing_safe)
+        {
+            state.bundle_status.set(BundleStatus::Unavailable(reason));
+            return;
+        }
         let next = generation.get_untracked() + 1;
         generation.set(next);
         let _ = loader::cancel();
@@ -182,42 +209,20 @@ pub fn install(state: AppState) {
     });
 }
 
-fn install_native(state: AppState) {
-    Effect::new(move |_| {
-        let host = state.active_local_host_id.get();
-        let selected = (|| {
-            let storage = web_sys::window()
-                .ok_or(UnavailableReason::Storage)?
-                .local_storage()
-                .map_err(|_| UnavailableReason::Storage)?
-                .ok_or(UnavailableReason::Storage)?;
-            match &host {
-                Some(host) => storage.set_item("tyde.selected-host.v1", &host.0),
-                None => storage.remove_item("tyde.selected-host.v1"),
-            }
-            .map_err(|_| UnavailableReason::Storage)
-        })();
-        if let Err(reason) = selected {
-            state.bundle_status.set(BundleStatus::Unavailable(reason));
-            return;
-        }
-        let release = host
-            .as_ref()
-            .and_then(|host| state.host_releases.get().get(host).cloned());
-        let status = match release {
-            None => BundleStatus::Idle,
-            Some(HostRelease::Welcome { payload, .. }) if native_release_matches(&payload) => {
-                BundleStatus::Idle
-            }
-            Some(_) => BundleStatus::Unavailable(UnavailableReason::NativeVersion),
-        };
-        state.bundle_status.set(status);
-    });
-}
-
 pub fn native_release_matches(payload: &WelcomePayload) -> bool {
     payload.protocol_version == protocol::PROTOCOL_VERSION
-        && payload.release_version.as_ref().is_some_and(|release| {
-            release.as_str() == mobile_shell_types::native::NATIVE_CLIENT_RELEASE
-        })
+        && payload
+            .mobile_client_bootstrap
+            .as_ref()
+            .is_some_and(|descriptor| {
+                payload.release_version.as_ref() == Some(&descriptor.host_release_version)
+                    && descriptor.protocol_version == protocol::PROTOCOL_VERSION
+                    && descriptor.client_release_version.as_str()
+                        == mobile_shell_types::native::NATIVE_CLIENT_RELEASE
+                    && descriptor.transport_protocol_version
+                        == protocol::MOBILE_RTC_PROTOCOL_VERSION
+                    && descriptor.native_bridge_abi
+                        == mobile_shell_types::native::NATIVE_BRIDGE_VERSION
+                    && loader::native_welcome_matches(descriptor)
+            })
 }

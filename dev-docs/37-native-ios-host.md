@@ -5,9 +5,12 @@ Tyde's native app is a remote client, not a phone-hosted server or agent CLI.
 application is not an iOS target. Native APNs and a Swift rewrite of the mobile
 screens are not part of this feature.
 
-## Early TestFlight preview
+## Historical early TestFlight preview
 
-The user authorizes an early preview with known gaps while native QA continues;
+The following describes the earlier bundled-client preview, not authorization
+to distribute the thin-shell candidate below.
+
+The user authorized an early preview with known gaps while native QA continues;
 complete chat/four-layout acceptance is not a preview-publication prerequisite.
 This does not mark any historical RED, core chat or the whole feature passed.
 Canonical committed-source validation and configured review still apply. The
@@ -180,62 +183,49 @@ new creation contract requires a genuine protocol95 host.
 
 ## Assets, origin and credentials
 
-`./dev.sh ios-bundle` builds local reviewed executables, generates Swift bindings,
-records exact package release/protocol/bridge versions, hashes every asset,
-creates CSP and binds the result to a source manifest. Xcode consumes
-`target/ios-client`. It never includes the PWA downloadable release-switch loader.
-The native package marker requires the native bridge; a missing/mismatched host
-fails at boot, not as a browser-mode substitute. Host release/protocol mismatch
-fails visibly; the app never downloads another executable client.
+`./dev.sh ios-bundle` packages only the generated native bridge, installed
+shell release, bootstrap version and trusted loader origin. Its source manifest
+and bridge hash bind these resources to reviewed source. No full JS/Wasm client
+or global Tyde wire schema is bundled into the shell.
 
-The document keeps the stable `http://127.0.0.1:18736` origin for its existing
-app-scoped IndexedDB and bridge permissions, but does not bind or request that
-TCP endpoint. `WKWebView.loadSimulatedRequest` loads the hash-verified packaged
-HTML at that origin. The immutable resource listener always asks the OS for one
-loopback port, before loading the document. Independent Simulator processes can
-coexist; there is no port search, alternate-port retry, shared asset service,
-run queue, storage migration or copied credentials.
+The native document loads `https://tycode.dev/tyde/?native=1`. The canonical PWA
+loader has an explicit native entry: before executing a full client it resolves
+a fresh authenticated host descriptor, then selects that exact published client
+release. The publisher manifest must permit its native ABI, match global and
+transport protocols and the complete executable-set digest. Every executable's
+SRI is verified and placed in the controlling worker's verified cache before
+import. Missing, stale, revoked, mismatched or unavailable targets fail visibly;
+there is no latest-client or old-client fallback. Browser/PWA admission and
+loading policy remain unchanged.
 
-Native packaging moves the generated module bootstrap into a bundled module,
-resolves its exact hashed Wasm relative to that module, and substitutes only the
-assigned resource origin into script/style URLs and the document's early CSP
-meta. Cross-origin resources use anonymous CORS and existing integrity hashes;
-the listener requires its exact Host and the canonical document Origin. It does
-not serve HTML. A packaged Blob worker keeps voice's worker same-origin, while
-worklets use the assigned resource origin. Browser packaging/media stay unchanged.
-The native fetch seam permits only this resource transport or existing typed
-HTTPS networking; document-origin HTTP is an explicit error, never a peer request.
-All bridge/input/media permission checks still require the original main-frame
-origin. Unexpected bundle format, missing templates, integrity, listener and
-native platform failures surface explicitly. The image CSP permits HTTPS for
-reused Markdown images; executable scripts remain restricted to packaged assets.
-Element image loads do not pass through the JavaScript fetch bridge. The native
-test driver observes a
-real platform error as a terminal failure instead of waiting only for navigation.
+A complete direct HTTPS pairing link supplies origin and offer authority, not
+release authority. Paired direct hosts resolve `/tyde/bootstrap` with their
+retained device credential. Private/SSH managed hosts register their actual
+client descriptor with Service; mobile resolves it with its retained pairing
+HMAC and owning authenticated session. Registration uses generation CAS and a
+bounded lease; renewals stop on error. Reconnect resolves again before opening
+the normal authenticated transport. The server's Welcome confirms the selected
+descriptor before bootstrap. Host behavior/status still belongs to that full
+client and the normal server wire protocol, never Swift.
 
-External HTTP uses the app's sandbox-scoped URLSession: the managed API or pinned
-HTTPS direct-pair endpoint only, no redirect following. Direct protocol WebSockets
-and managed WebRTC continue through the existing Wasm transport/handshake.
-Direct host origins come from the complete scanned HTTPS pairing link and are
-shown before redemption. Browser records still use their document origin; native
-records require their own pinned origin, never an inferred host.
+The same full-client document retains its AppState, drafts and native navigation
+until an actual target or host change requires a deliberate document lifecycle.
+An unsafe draft/chat transition is refused, not silently discarded to reload.
+Bootstrap can access pairing secrets to choose a host; before client execution
+the bridge seals reads/replacements to that selected client's secret handles.
+A provisional navigation suspends reads until the next committed bootstrap.
+Host summaries remain IndexedDB data and Keychain contains secrets. The trusted
+origin differs from historical loopback installs: no silent credential migration
+or published beta20/native3 compatibility is claimed.
 
-Pairing secrets go through the existing secret-store seam to app-scoped Keychain,
-WhenUnlocked/ThisDeviceOnly. Host summaries remain in origin-scoped IndexedDB;
-they contain key references, not secret copies. No primary app/browser credentials,
-profiles or sessions are imported. Explicit user-activated HTTP, HTTPS and mailto
-links open in the external application, matching the reused Markdown renderer;
-they never replace the retained document. HTTP links do not enable HTTP pairing,
-platform bridge requests or embedded document navigation. The original native
-allowlist omitted HTTP and incorrectly turned a supported content link into a
-platform-error overlay; only that explicit external-link branch is corrected.
-Unexpected document navigation and web-process termination still fail explicitly.
-Native acceptance must activate an actual rendered HTTP link, observe external
-application opening, then return to the same retained chat/document/draft and
-connection without a platform-error overlay, reload or new pairing. No new typing
-episode is needed merely to prepare that link; use genuine existing chat content.
-Camera/microphone prompts are restricted to the bundled main frame. Native
-push is not implemented; PWA-only notification advice is not shown in native.
+Only trusted main-frame bootstrap navigation and media requests receive native
+capabilities. Explicit content links open externally. Service and pinned direct
+HTTPS HTTP remain URLSession operations without redirects; protocol WebSockets,
+WebRTC, framing, crypto, auth and sequence checks are unchanged. Bridge changes
+can require an App Store update; ordinary host/client release changes do not.
+The loader is remotely delivered code, not an App Review-policy exemption.
+No App Review approval, production authentication, real RTC/TURN, Swift/Keychain
+or physical fold coverage follows from Linux boundary checks.
 
 ## Native failure diagnostics
 
@@ -893,3 +883,64 @@ assignment that overrode this opt-in; removing it restores one canonical policy,
 not a claim that Safari discovery is repaired. Inspect only the owned app and content-free
 geometry/styles; no storage/credential/text capture or inspector styling edits.
 Original native typing and keyboard ownership remain untouched.
+
+### Published executable authority
+
+The server's native descriptor resolves its actual release in the fixed trusted
+`https://tycode.dev/tyde/manifest.json` catalog. It validates that record's actual
+protocol, transport and native bridge ABI and hashes the complete sorted
+executable/SRI map. Independently built embedded direct-host assets are not
+assumed byte-identical to the CDN. The native shell still fetches policy freshly
+and verifies every executable SRI before import. Missing publication is an
+explicit native admission failure; local/PWA direct hosting remains unchanged.
+The sim uses an owned HTTPS publisher/proxy/CA at that same canonical URL, not a
+production network override or a fabricated artifact descriptor.
+
+### Immutable installed-shell guard
+
+`tests/fixtures/native-bootstrap-integrated-v1.tar.gz` retains the integrated
+ABI6 shell candidate (UI78 public layout/sidebar contract plus typed listener
+readiness). The earlier `native-bootstrap-shell-v1` bytes remain an unreleased
+prototype, not the accepted baseline. The archive contains generated Swift,
+the actual bundled native bridge and a consumer contract generated from those
+same Rust native types. The canonical real-DOM/server flow validates actual
+client requests and native intents against that unchanged archived contract,
+including its closed enums and required fields; it never regenerates the old
+contract from current source. It does not execute Swift Codable/UIKit or claim
+native Keychain, input, window resize or physical fold coverage.
+
+The same coarse flow covers exact published assets, retained pairing and core
+conversation through real process/store handover, host switching with an
+inactive saved record, unsafe-draft refusal before redemption, publication
+hold/failure/recovery, native auth/revocation actions, and fail-closed pack
+faults. Source-upgrade evidence additionally supplies hash-checked real older
+server and full-client artifacts. These are compatible unpublished source
+candidates, not a claim that published beta20/native3 supports the new baseline.
+The first supported release is the release containing this bootstrap/ABI and
+Service contract; ordinary global wire releases do not ratchet that minimum.
+
+The same flow advances only an injected monotonic clock beyond a discovery
+lease while leaving the real offer clock unchanged. Exactly one redemption
+then uses fresh paired-device authority. Managed admission also holds the
+real publisher through two unchanged-source restarts: one with a registered
+pending offer and one with an offer created during the hold. Both must
+complete normally after publication, without replacing their QR or inventing
+registration from the old request.
+
+### Explicit isolated QA build
+
+Production bootstrap/publisher remains canonical. For a dedicated normally
+trusted HTTPS QA origin, `./dev.sh ios-bundle --qa-origin HTTPS_ORIGIN` binds
+the same loader, app-bound domain, native HTTP/auth authority and integrity
+manifest at build time. Its Debug-only resources fail compilation in Release
+and identify the separate Tyde QA bundle. There is no runtime origin selector,
+trust override, loader fork or old-client fallback.
+
+`./dev.sh mobile-direct-export ABS_NEW_DIRECTORY --qa-origin HTTPS_ORIGIN`
+builds the existing bounded source-linked host with its publisher catalog at
+that same origin. The server build refuses QA configuration in Release. Use
+the normal direct bundle layout under `/tyde/`, with the actual source-built
+versioned assets and manifest/SRI identities; never overwrite a published
+release record. A dedicated QA catalog may expose these genuine unreleased
+source candidates without a production deployment. Reuse the identified QA
+app binary across host revisions. GUI interaction remains device-scoped MCP.

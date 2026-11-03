@@ -100,7 +100,7 @@ else
     exit 2
 fi
 [[ -f target/ios-client/Web/native-manifest.json && -f target/ios-client/NativeBridge.swift ]] || {
-    echo 'Prepare exact bundled assets with ./dev.sh ios-bundle before native validation' >&2; exit 1;
+    echo 'Prepare native bootstrap resources with ./dev.sh ios-bundle before native validation' >&2; exit 1;
 }
 [[ -z "${TYDE_IOS_PAIRING_URL:-}" && -z "${TEST_RUNNER_TYDE_IOS_PAIRING_URL:-}" ]] || {
     echo 'Do not pre-issue a pairing URL; wait for driver READY, then use --ios-offer' >&2; exit 1;

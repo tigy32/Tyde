@@ -91,6 +91,7 @@ async fn handshake_rejects_wrong_first_frame_kind() {
 
     let stream = StreamPath(format!("/host/{}", Uuid::new_v4()));
     let payload = WelcomePayload {
+        mobile_client_bootstrap: None,
         protocol_version: PROTOCOL_VERSION,
         tyde_version: TYDE_VERSION,
         release_version: None,

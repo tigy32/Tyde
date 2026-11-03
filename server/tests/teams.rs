@@ -1358,6 +1358,31 @@ async fn team_describe_includes_default_agent_member() {
         stream: new_agent.instance_stream.clone(),
         new_agent: new_agent.clone(),
     };
+    // The provider gate only confirms enqueueing; observe server commitment
+    // before testing a different subscriber's bootstrap snapshot.
+    let (mut witness, witness_bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "team-question-commit-witness",
+    )
+    .await;
+    let witness_stream = &witness_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("team agent in witness bootstrap")
+        .instance_stream;
+    fixture::send_load_agent_on(&mut witness, witness_stream).await;
+    fixture::next_chat_event_matching_on(
+        &mut witness,
+        witness_stream,
+        "async question committed by server",
+        |event| {
+            matches!(event, protocol::ChatEvent::ToolRequest(request)
+            if request.tool_call_id == "team-async-question")
+        },
+    )
+    .await;
+    drop(witness);
     let (mut observer, host_bootstrap) = fixture::connect_mobile_client_with_bootstrap(
         fixture.host_for_test(),
         "team-question-observer",

@@ -17,6 +17,8 @@ import {
   resolveLatestBootTarget,
   resolveServedClientBootTarget,
   selectBootUrls,
+  artifactSetSha256,
+  nativeBridgeCompatible,
 } from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
 import { resolveBundleStylesheets } from "./styles.js";
@@ -79,8 +81,13 @@ export const HOST_TARGET_KEY = "tyde.loader.host-target.v1";
 export const FOLLOW_MIGRATION_KEY = "tyde.loader.follow-host.v1";
 const SWITCH_ATTEMPTS_KEY = "tyde.loader.switch-attempts.v1";
 let executingTarget = null;
+let nativeRuntime = null;
 let preparation = null;
 let preparationSerial = 0;
+
+function nativeHost() {
+  return typeof window === "undefined" ? null : window.__tydeNativeHost;
+}
 
 function unavailable(reason) { return { status: "unavailable", reason }; }
 
@@ -90,13 +97,22 @@ export function cancelHostSwitch() {
 }
 
 export async function prepareHostSwitch(version, protocolVersion, host) {
+  let nativeDescriptor = null;
+  if (nativeHost()) {
+    try {
+      if (!nativeRuntime) return unavailable("bootstrap");
+      nativeDescriptor = await nativeRuntime.switchTarget(host);
+      version = nativeDescriptor.client_release_version;
+      protocolVersion = nativeDescriptor.protocol_version;
+    } catch { return unavailable("bootstrap"); }
+  }
   cancelHostSwitch();
   const operation = {
     ticket: ++preparationSerial, controller: new AbortController(),
     version, protocolVersion, host, ready: false,
   };
   preparation = operation;
-  const timeout = setTimeout(() => operation.controller.abort(), 30000);
+  const timeout = nativeHost() ? null : setTimeout(() => operation.controller.abort(), 30000);
   try {
     const response = await fetch(MANIFEST_URL, {
       cache: "no-store", signal: operation.controller.signal,
@@ -107,9 +123,12 @@ export async function prepareHostSwitch(version, protocolVersion, host) {
       return unavailable(target.reason === "not-in-manifest" ? "unpublished" : "policy");
     }
     if (!checkProtocolCompatibility(protocolVersion, target).ok) return unavailable("protocol");
+    if (nativeHost() && !nativeBridgeCompatible(target, nativeHost().version)) return unavailable("native_version");
+    if (nativeDescriptor && (await artifactSetSha256(target.artifacts) !== nativeDescriptor.artifact_set_sha256 || target.transportProtocolVersion !== nativeDescriptor.transport_protocol_version)) return unavailable("integrity");
     if (!selectBootUrls(target).ok) return unavailable("integrity");
     const verified = await verifyArtifacts(target.artifacts, {
       cache: await openBundleCache(),
+      requireCache: !!nativeHost(),
       fetchImpl: (url, options) => fetch(url, { ...options, signal: operation.controller.signal }),
     });
     if (preparation !== operation) return unavailable("cancelled");
@@ -121,7 +140,7 @@ export async function prepareHostSwitch(version, protocolVersion, host) {
   } catch {
     return unavailable(preparation !== operation ? "cancelled" : "manifest");
   } finally {
-    clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
 }
 
@@ -164,6 +183,7 @@ export function selectHost(host) {
       localStorage.removeItem(HOST_TARGET_KEY);
       console.info("tyde_bundle_switch retired deselected target");
     }
+    if (nativeRuntime) nativeRuntime.select(host);
     return { status: "matching" };
   } catch { return unavailable("storage"); }
 }
@@ -254,6 +274,13 @@ function setError(message, detail) {
   show("error");
   if (ui.errorMessage) ui.errorMessage.textContent = message;
   if (ui.errorDetail) ui.errorDetail.textContent = detail || "";
+  if (nativeHost() && nativeRuntime && !ui.error.querySelector('[data-native-bootstrap-hosts]')) {
+    const hosts = document.createElement('button');
+    hosts.type = 'button'; hosts.className = 'btn secondary'; hosts.textContent = 'Hosts';
+    hosts.dataset.nativeBootstrapHosts = '';
+    hosts.addEventListener('click', () => nativeRuntime.recoverHosts());
+    ui.error.querySelector('.card').append(hosts);
+  }
 }
 
 // The loader chrome (#loader-shell) and the app's mount target (#app-root) are
@@ -306,7 +333,7 @@ async function fetchManifest() {
   // blocked/minSupported revocations), so it must never be served from a stale
   // cache. The service worker also refuses to cache it (see sw.js) — a forced
   // outage fails closed rather than letting a stale allowlist permit a boot.
-  const response = await fetch(MANIFEST_URL, { cache: "no-store" });
+  const response = await fetch(MANIFEST_URL, { cache: "no-store", ...(nativeHost() ? {redirect:"error"} : {}) });
   if (!response.ok) {
     throw new Error(`manifest fetch failed: HTTP ${response.status}`);
   }
@@ -349,6 +376,10 @@ async function deleteCachedArtifacts(target) {
 // nonexistent name). Both URLs are the artifacts integrity.js already verified
 // and cached, so the import reads exactly those verified bytes.
 async function bootTarget(target, followsSelectedHost = false) {
+  if (nativeHost() && !target.nativeBridgeVersions?.includes(nativeHost().version)) {
+    setError("Update the app: this host client requires a different native bridge.", "");
+    return;
+  }
   show("booting");
   if (ui.bootingVersion) ui.bootingVersion.textContent = target.version;
 
@@ -359,7 +390,7 @@ async function bootTarget(target, followsSelectedHost = false) {
   const cache = await openBundleCache();
   let result;
   try {
-    result = await verifyArtifacts(target.artifacts, { cache });
+    result = await verifyArtifacts(target.artifacts, { cache, requireCache: !!nativeHost() });
   } catch (err) {
     result = { ok: false, failures: [String(err && err.message ? err.message : err)] };
   }
@@ -400,6 +431,7 @@ async function bootTarget(target, followsSelectedHost = false) {
   try {
     // Same-origin ES module — permitted by `script-src 'self'`. The SW serves
     // the verified, cached bytes for this `/tyde/v<ver>/…` path.
+    if (target.nativeBeforeExecute) await target.nativeBeforeExecute();
     const mod = await import(urls.entryUrl);
     const initFn = mod && (mod.default || mod.init);
     if (typeof initFn !== "function") {
@@ -492,9 +524,10 @@ function setUpBootHandoff() {
 // Fetches the resolved version's own index.html, extracts its same-origin
 // `<link rel="stylesheet">` tags (confined to the version directory, SRI
 // preserved), and injects them into the loader document so the booted app has
-// its CSS. Best-effort: any failure is swallowed — the app still boots, just
-// unstyled, which is strictly better than aborting the boot.
+// its CSS. Native requires the actual styled client before execution;
+// the existing browser/PWA best-effort policy remains unchanged.
 async function injectBundleStyles(target) {
+  const native = !!nativeHost();
   try {
     const indexPath = target.path + "index.html";
     const origin = typeof location !== "undefined" ? location.origin : null;
@@ -504,7 +537,10 @@ async function injectBundleStyles(target) {
       : "https://loader.invalid" + indexPath;
 
     const response = await fetch(indexPath, { cache: "no-store" });
-    if (!response.ok) return;
+    if (!response.ok) {
+      if (native) throw new Error("The published client stylesheet index is unavailable");
+      return;
+    }
     const html = await response.text();
 
     const sheets = resolveBundleStylesheets(html, {
@@ -512,6 +548,10 @@ async function injectBundleStyles(target) {
       versionPath: target.path,
       origin,
     });
+
+    if (native && (sheets.length === 0 || sheets.some(sheet => !sheet.integrity))) {
+      throw new Error("The published native client styles are incomplete");
+    }
 
     const existing = new Set(
       Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((l) =>
@@ -529,11 +569,18 @@ async function injectBundleStyles(target) {
       // how the bundle's own index.html loads it.
       if (sheet.integrity) link.integrity = sheet.integrity;
       if (sheet.crossorigin !== null) link.crossOrigin = sheet.crossorigin;
-      document.head.appendChild(link);
+      if (native) {
+        await new Promise((resolve, reject) => {
+          link.addEventListener('load', resolve, {once:true});
+          link.addEventListener('error', () => reject(new Error("The published native client styles failed to load")), {once:true});
+          document.head.appendChild(link);
+        });
+      } else document.head.appendChild(link);
       existing.add(sheet.href);
     }
-  } catch {
-    // Styling is best-effort; never block the boot on it.
+  } catch (error) {
+    if (native) throw error;
+    // Browser/PWA styling policy is unchanged.
   }
 }
 
@@ -649,6 +696,42 @@ export async function hasStoredPairedHosts(factory = indexedDbFactory()) {
 
 // WebPairedHostRecord uses camelCase (bridge/web/store.rs). Unknown/corrupt
 // storage must not invalidate a known target; only a readable list can do so.
+async function storedPairedHostRecords() {
+  const factory = indexedDbFactory();
+  if (!factory) throw new Error("Paired host storage is unavailable");
+  const db = await openWebStoreDb(factory);
+  try {
+    const raw = await idbGet(db, WEB_HOSTS_STORE, WEB_HOSTS_KEY);
+    if (raw === undefined || raw === null) return [];
+    const records = JSON.parse(raw);
+    if (!Array.isArray(records) || !records.every(record => typeof record?.localHostId === "string")) {
+      throw new Error("Paired host storage is invalid");
+    }
+    return records;
+  } finally { db.close(); }
+}
+
+async function removeStoredPairedHost(record) {
+  const db = await openWebStoreDb(indexedDbFactory());
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(WEB_HOSTS_STORE, "readwrite");
+      const store = tx.objectStore(WEB_HOSTS_STORE);
+      const request = store.get(WEB_HOSTS_KEY);
+      request.onsuccess = () => {
+        try {
+          const records = JSON.parse(request.result);
+          const current = records.find(item => item.localHostId === record.localHostId);
+          if (JSON.stringify(current) !== JSON.stringify(record)) throw new Error('Pairing changed during removal');
+          store.put(JSON.stringify(records.filter(item => item.localHostId !== record.localHostId)), WEB_HOSTS_KEY);
+        } catch { tx.abort(); }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onabort = tx.onerror = () => reject(new Error('Pairing removal could not commit'));
+    });
+  } finally { db.close(); }
+}
+
 async function storedPairedHostIds() {
   let db;
   try {
@@ -1085,7 +1168,7 @@ function grabVideoFrame() {
   return ctx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
 }
 
-async function startScan(manifest) {
+async function startScan(manifest, nativeOffer = null) {
   const hasCamera =
     navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function";
   if (!hasCamera) {
@@ -1108,7 +1191,7 @@ async function startScan(manifest) {
     await ui.video.play();
 
     let detector = null;
-    if (hasDetector) {
+    if (hasDetector && !nativeOffer) {
       try {
         // eslint-disable-next-line no-undef
         detector = new BarcodeDetector({ formats: ["qr_code"] });
@@ -1119,7 +1202,8 @@ async function startScan(manifest) {
 
     const onDecoded = async (value) => {
       stopScan();
-      await handlePairingUri(extractPairingUri(value) ?? value, manifest);
+      if (nativeOffer) await nativeOffer(value);
+      else await handlePairingUri(extractPairingUri(value) ?? value, manifest);
     };
 
     const tick = async () => {
@@ -1217,6 +1301,32 @@ export async function routePairingFragment(fragment, manifest, standalone) {
 
 // --- Service worker --------------------------------------------------------
 
+async function requireNativeAssetWorker() {
+  if (!("serviceWorker" in navigator)) throw new Error("Verified asset delivery requires WebKit service workers");
+  const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+  await registration.update();
+  const worker = registration.installing || registration.waiting || registration.active;
+  if (!worker) throw new Error("Verified asset worker is unavailable");
+  if (worker.state !== "activated") {
+    await new Promise((resolve, reject) => {
+      const changed = () => {
+        if (worker.state === "activated") { worker.removeEventListener("statechange", changed); resolve(); }
+        if (worker.state === "redundant") { worker.removeEventListener("statechange", changed); reject(new Error("Verified asset worker failed")); }
+      };
+      worker.addEventListener("statechange", changed); changed();
+    });
+  }
+  if (navigator.serviceWorker.controller !== worker) {
+    await new Promise(resolve => {
+      const changed = () => {
+        if (navigator.serviceWorker.controller === worker) { navigator.serviceWorker.removeEventListener("controllerchange", changed); resolve(); }
+      };
+      navigator.serviceWorker.addEventListener("controllerchange", changed); changed();
+    });
+  }
+  if (worker.scriptURL !== new URL("./sw.js", location.href).href) throw new Error("Untrusted asset worker");
+}
+
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   // Registered relative to the loader scope so it controls `/tyde/`.
@@ -1281,7 +1391,50 @@ async function init() {
     bootVersion: () => executingTarget?.version ?? null,
     prepareHostSwitch, cancelHostSwitch, commitHostSwitch, confirmHostRelease,
     selectHost, recordHostRelease,
+    nativeAdmitHost: host => nativeRuntime.admitHost(host),
+    nativePairingSaved: host => nativeRuntime.pairingSaved(host),
+    nativeConfirmWelcome: descriptor => nativeRuntime.confirmWelcome(descriptor),
+    nativePreparePairing: uri => nativeRuntime.preparePairing(uri),
+    nativeForgetHost: host => nativeRuntime.forgetHost(host),
+    nativeReloadAllowed: (allowed, pairing, handoffComplete, pairingSafe) => { nativeRuntime.setReloadAllowed(allowed, pairing, handoffComplete, pairingSafe); return { status: "matching" }; },
+    nativeOwnsHost: host => nativeRuntime.ownsHost(host),
   };
+
+  if (nativeHost()) {
+    document.documentElement.dataset.tydeNativeBootstrap = '';
+    ui.pasteInput.setAttribute('aria-label', 'Pairing link');
+    ui.pasteInput.placeholder = 'Pairing link';
+    ui.connectButton.textContent = 'Continue';
+    try {
+      const pendingPairing = capturePairingFragmentFromUrl(window.location, window.history);
+      await requireNativeAssetWorker();
+      const { startNativeBootstrap } = await import("./native-bootstrap.js");
+      nativeRuntime = await startNativeBootstrap({
+        installRuntime: runtime => { nativeRuntime = runtime; },
+        pendingPairing, readHosts: storedPairedHostRecords, removeHost: removeStoredPairedHost,
+        scan: offer => {
+          const capability = detectScanCapability(window, navigator);
+          const state = applyPairingUi(pairingUiState(capability));
+          if (ui.scanButton && state.scanAvailable) ui.scanButton.addEventListener("click", () => void startScan(null, offer));
+        },
+        fetchManifest, resolveBootTarget, checkProtocolCompatibility,
+        prepareHostSwitch, commitHostSwitch,
+        boot: async (target, host, uri) => {
+          nativeRuntime = target.runtime;
+          delete target.runtime;
+          if (host) localStorage.setItem(SELECTED_HOST_KEY, host);
+          if (uri) { localStorage.removeItem(SELECTED_HOST_KEY); stashPairingUri(uri); }
+          await bootTarget({ ...target, exactTarget: true, handoff: !!host }, true);
+        },
+        selected: () => localStorage.getItem(SELECTED_HOST_KEY),
+        clearPairing: () => { clearPendingFragment(); sessionStorage.removeItem(PAIR_URI_KEY); },
+        show, error: message => setError(message, ""),
+      });
+    } catch {
+      setError("The native host client could not start.", "");
+    }
+    return;
+  }
 
   registerServiceWorker();
 

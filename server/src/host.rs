@@ -440,6 +440,9 @@ pub struct HostRuntimeConfig {
     pub backend_probe_workspace_root: Option<PathBuf>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
     pub mobile_managed_service_base_url: Option<String>,
+    /// Tests keep the canonical publisher URL but supply an owned HTTPS transport.
+    #[cfg(feature = "test-support")]
+    pub mobile_bootstrap_http: Option<reqwest::Client>,
     /// Disable automatic real-provider discovery for server simulations.
     /// Explicit per-backend probe programs remain available to the fixture.
     pub skip_real_backend_probe: bool,
@@ -499,6 +502,8 @@ impl Default for HostRuntimeConfig {
             backend_probe_workspace_root: None,
             mobile_pairing_ttl: None,
             mobile_managed_service_base_url: None,
+            #[cfg(feature = "test-support")]
+            mobile_bootstrap_http: None,
             skip_real_backend_probe: false,
             agents_view_preferences_primary: true,
             #[cfg(any(test, feature = "test-support"))]
@@ -20567,6 +20572,8 @@ fn spawn_host_inner(
                 .mobile_pairing_ttl
                 .unwrap_or(crate::mobile_access::DEFAULT_PAIRING_TTL),
             managed_service_base_url: runtime_config.mobile_managed_service_base_url,
+            #[cfg(feature = "test-support")]
+            bootstrap_http: runtime_config.mobile_bootstrap_http,
         },
     )?;
 

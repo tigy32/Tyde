@@ -119,6 +119,7 @@ pub fn prime_host_with_bootstrap_for_tests(
 
     let host_stream = StreamPath(format!("/host/{}", host.0));
     let welcome = BootstrapWelcome {
+        mobile_client_bootstrap: None,
         protocol_version: PROTOCOL_VERSION,
         tyde_version: TYDE_VERSION,
         release_version: None,
@@ -258,9 +259,12 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 }
             };
             if crate::native::is_native() && !crate::bundle::native_release_matches(&payload) {
-                let message =
-                    "This app and host use different releases. Update the app and host together."
-                        .to_owned();
+                let message = if payload.mobile_client_bootstrap.is_none() {
+                    "Update Tyde host to support native client bootstrap."
+                } else {
+                    "The host changed its client target. Return Home to load its exact client."
+                }
+                .to_owned();
                 report_protocol_error(
                     state,
                     host,
@@ -4592,6 +4596,7 @@ mod wasm_tests {
                 FrameKind::Welcome,
                 0,
                 &protocol::WelcomePayload {
+                    mobile_client_bootstrap: None,
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
                     release_version: None,

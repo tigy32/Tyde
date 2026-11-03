@@ -410,6 +410,7 @@ pub fn ChatView() -> impl IntoView {
     // we don't push a partial edit through to the bridge on every keystroke.
     let rename_editing: RwSignal<bool> = RwSignal::new(false);
     let rename_draft: RwSignal<String> = RwSignal::new(String::new());
+    crate::native::track_unsaved(rename_editing);
 
     let s_rename_open = state.clone();
     let on_rename_open = Callback::new(move |_: ()| {

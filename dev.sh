@@ -686,9 +686,10 @@ run_check_stages() {
             npm ci --ignore-scripts --no-audit --no-fund
     # Avoid host /tmp churn, inherited Git roots, and long Unix socket paths.
     mkdir -p "$native_temp_dir"
+    export TYDE_NATIVE_CURRENT_CLIENT="$PWD/$RUN_DIR/native-current-client"
     run_stage "cargo nextest run" "$repetitions" \
         env TMPDIR="$native_temp_dir" \
-            cargo nextest run
+            tools/run-native-check.sh
 
     n_wasm=$((STAGE_NUMBER + 1))
     n_loader=$((STAGE_NUMBER + 2))
@@ -953,7 +954,7 @@ case "${1:-}" in
         ;;
     mobile-direct-export)
         shift
-        [[ $# -eq 1 && "$1" == /* ]] || die "mobile-direct-export requires one absolute new directory"
+        [[ ( $# -eq 1 || $# -eq 3 ) && "$1" == /* ]] || die "mobile-direct-export requires an absolute new directory and optional --qa-origin HTTPS_ORIGIN"
         [[ -z "$(git status --porcelain)" ]] || die "commit the completed workbench before export"
         verify_active_rust_toolchain "$(rust_toolchain_channel)"
         set_sccache_environment

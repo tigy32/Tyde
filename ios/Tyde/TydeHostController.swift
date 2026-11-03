@@ -68,9 +68,7 @@ private final class NativeInputDiagnostics: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         do {
             guard message.frameInfo.isMainFrame,
-                  message.frameInfo.securityOrigin.protocol == "http",
-                  message.frameInfo.securityOrigin.host == "127.0.0.1",
-                  message.frameInfo.securityOrigin.port == 18736,
+                  ClientBootstrap.permits(message.frameInfo.securityOrigin),
                   let json = message.body as? String, json.utf8.count < 1024,
                   let data = json.data(using: .utf8) else {
                 throw HostError("Untrusted native input diagnostic")
@@ -113,7 +111,6 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     private var failureMessages: [String] = []
     private var failureOverlay: UIView?
     private var failureText: UITextView?
-    private let assets = AssetServer()
     private let platform = PlatformBridge()
     private var webView: WKWebView!
     private var roots: [NativeTab: ContentController] = [:]
@@ -182,15 +179,11 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.limitsNavigationsToAppBoundDomains = true
         platform.onPresentation = { [weak self] state in self?.render(state) }
         platform.presentingController = self
-        for endpoint in [NativeEndpoint.presentation, .http, .http_cancel, .authenticate, .secret_read, .secret_write, .secret_delete] {
+        for endpoint in [NativeEndpoint.presentation, .http, .http_cancel, .authenticate, .secret_scope, .secret_read, .secret_write, .secret_delete] {
             configuration.userContentController.addScriptMessageHandler(platform, contentWorld: .page, name: endpoint.rawValue)
-        }
-        guard let bridgeURL = Bundle.main.url(forResource: "native-host", withExtension: "js"),
-              let bridge = try? String(contentsOf: bridgeURL, encoding: .utf8) else {
-            fail("Native bridge resource is missing")
-            return
         }
         #if DEBUG
         if ProcessInfo.processInfo.environment["TYDE_IOS_INPUT_DIAGNOSTICS"] == "1" {
@@ -236,24 +229,24 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         tabs.viewControllers = [navigations[.home]!, navigations[.agents]!, navigations[.sessions]!, navigations[.settings]!]
         showContainer(entry)
         attach(to: entry)
-        do {
-            try assets.start(onReady: { [weak self] document in
+        Task { @MainActor [weak self] in
+            do {
+                let (url, bridge) = try await Task.detached { try ClientBootstrap.load() }.value
                 guard let self else { return }
                 if !plainWebKitControl {
-                    let bootstrap = "const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)'; const tydeNativeAssetOrigin = '\(document.assetOrigin.absoluteString)';\n" + bridge
+                    let bootstrap = "const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
                     configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
                 }
                 for script in startupScripts { configuration.userContentController.addUserScript(script) }
-                var data = document.data
                 #if DEBUG
-                if plainWebKitControl { data = Data(Self.plainWebKitDocument(pairing: plainManualControl).utf8) }
+                if plainWebKitControl {
+                    self.webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: Self.plainWebKitDocument(pairing: false))
+                    return
+                }
                 #endif
-                self.logger.notice("Native asset transport port=\(document.transportPort, privacy: .public); document origin retained")
-                self.webView.loadSimulatedRequest(URLRequest(url: AssetServer.origin.appendingPathComponent("index.html")), response: document.response, responseData: data)
-            }, onFailure: { [weak self] error in
-                self?.fail("Bundled client listener failed: " + error.localizedDescription)
-            })
-        } catch { fail(error.localizedDescription) }
+                self.webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
+            } catch { self?.fail("Native bootstrap could not start") }
+        }
     }
 
     #if DEBUG
@@ -417,7 +410,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         defer { applyingPresentation = false }
         logger.debug("Native projection tab=\(state.tab.rawValue, privacy: .public) route=\(state.route.rawValue, privacy: .public) workspace=\(state.workspace)")
         presentation = state
-        ready = true
+        ready = state.client_ready
         #if DEBUG
         navigationDiagnostics?.record(.projection, window: view.window, state: state, ready: ready)
         let observeApplied = { [self] in
@@ -595,15 +588,44 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); fail("Invalid web navigation"); return }
-        if url == AssetServer.origin.appendingPathComponent("index.html") && !ready {
-            decisionHandler(.allow)
-        } else if navigationAction.navigationType == .linkActivated, ["http", "https", "mailto"].contains(url.scheme), url.user == nil, url.password == nil {
+        #if DEBUG
+        let targetExists = navigationAction.targetFrame != nil
+        let targetMain = navigationAction.targetFrame?.isMainFrame == true
+        let sourceMain = navigationAction.sourceFrame.isMainFrame
+        let entryEqual = url.absoluteString == ClientBootstrap.entry.absoluteString
+        let schemeMatches = url.scheme == "https"
+        let hostMatches = url.host == ClientBootstrap.origin.host
+        let portMatches = (url.port ?? 443) == (ClientBootstrap.origin.port ?? 443)
+        let noCredentials = url.user == nil && url.password == nil
+        let pathMatches = url.path == "/tyde/"
+        let entryPathMatches = url.path == ClientBootstrap.entry.path
+        let encodedPathMatches = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath == "/tyde/"
+        let queryMatches = url.query == "native=1"
+        let canonicalEntryMatches = ClientBootstrap.permitsEntry(url)
+        let blank = url.absoluteString == "about:blank"
+        let empty = url.absoluteString.isEmpty
+        let hasQuery = url.query != nil
+        let hasFragment = url.fragment != nil
+        logger.notice("Native navigation decision type=\(navigationAction.navigationType.rawValue) target=\(targetExists) targetMain=\(targetMain) sourceMain=\(sourceMain) entry=\(entryEqual) https=\(schemeMatches) host=\(hostMatches) port=\(portMatches) credentialsAbsent=\(noCredentials) path=\(pathMatches) entryPath=\(entryPathMatches) encodedPath=\(encodedPathMatches) query=\(queryMatches) canonicalEntry=\(canonicalEntryMatches) blank=\(blank) empty=\(empty) hasQuery=\(hasQuery) hasFragment=\(hasFragment)")
+        #endif
+        if navigationAction.navigationType == .linkActivated, ["http", "https", "mailto"].contains(url.scheme), url.user == nil, url.password == nil {
             decisionHandler(.cancel)
             UIApplication.shared.open(url, options: [:]) { [weak self] opened in if !opened { self?.fail("External link could not open") } }
+
+        } else if ClientBootstrap.permitsEntry(url) {
+            platform.suspendClient()
+            decisionHandler(.allow)
         } else {
             decisionHandler(.cancel)
             fail("Unexpected document navigation was blocked; the client was retained")
         }
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard webView.url?.host == ClientBootstrap.origin.host else { fail("Untrusted native document"); return }
+        ready = false
+        lastLayout = nil
+        platform.beginBootstrap()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -614,15 +636,15 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         }
     }
 
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail("Bundled client navigation failed") }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail("Bundled client could not load") }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail("Native client navigation failed") }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail("Native client could not load") }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         ready = false
         fail("The web content process ended. Reopen Tyde to reconnect; unsent in-memory changes may be lost.")
     }
 
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-        decisionHandler(origin.protocol == "http" && origin.host == "127.0.0.1" && origin.port == 18736 && frame.isMainFrame ? .prompt : .deny)
+        decisionHandler(ClientBootstrap.permits(origin) && frame.isMainFrame ? .prompt : .deny)
     }
 
     private func fail(_ message: String) {

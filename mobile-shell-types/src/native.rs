@@ -13,6 +13,10 @@ macro_rules! native_enum {
                 formatter.write_str(match self { $(Self::$variant => $wire,)+ })
             }
         }
+        impl NativeWire for $name {
+            fn swift_type() -> String { stringify!($name).into() }
+            fn contract() -> serde_json::Value { serde_json::json!({"type":"string", "enum":[$($wire),+]}) }
+        }
         impl $name {
             pub fn swift() -> String {
                 concat!("enum ", stringify!($name), ": String, Codable, Hashable {\n",
@@ -27,11 +31,23 @@ macro_rules! native_struct {
         #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(deny_unknown_fields)]
         pub struct $name { $(pub $field: $ty),+ }
+        impl NativeWire for $name {
+            fn swift_type() -> String { stringify!($name).into() }
+            fn contract() -> serde_json::Value {
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+                $(properties.insert(stringify!($field).into(), <$ty as NativeWire>::contract());
+                  if !<$ty as NativeWire>::optional() { required.push(stringify!($field)); })+
+                // Swift Codable ignores unknown fields, but requires its known
+                // fields and closed enum values. This freezes that consumer ABI.
+                serde_json::json!({"type":"object", "properties":properties, "required":required})
+            }
+        }
         impl $name {
             pub fn swift() -> String {
                 let mut output = concat!("struct ", stringify!($name), ": Codable {\n").to_owned();
                 $(output.push_str(&format!("    let {}: {}\n", stringify!($field),
-                    swift_type(stringify!($ty)))) ;)+
+                    <$ty as NativeWire>::swift_type())) ;)+
                 output.push_str("}\n");
                 output
             }
@@ -39,25 +55,75 @@ macro_rules! native_struct {
     };
 }
 
-fn swift_type(ty: &str) -> String {
-    let ty = ty.replace(' ', "");
-    match ty.as_str() {
-        "String" => "String".into(),
-        "bool" => "Bool".into(),
-        "u32" => "UInt32".into(),
-        "u16" => "UInt16".into(),
-        "std::collections::BTreeMap<String,String>" => "[String: String]".into(),
-        _ => match ty
-            .strip_prefix("Option<")
-            .and_then(|ty| ty.strip_suffix('>'))
-        {
-            Some(inner) => format!("{}?", swift_type(inner)),
-            None => ty,
-        },
+trait NativeWire {
+    fn swift_type() -> String;
+    fn contract() -> serde_json::Value;
+    fn optional() -> bool {
+        false
+    }
+}
+impl NativeWire for String {
+    fn swift_type() -> String {
+        "String".into()
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"string"})
+    }
+}
+impl NativeWire for bool {
+    fn swift_type() -> String {
+        "Bool".into()
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"boolean"})
+    }
+}
+impl NativeWire for u32 {
+    fn swift_type() -> String {
+        "UInt32".into()
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"integer","minimum":0,"maximum":u32::MAX})
+    }
+}
+impl NativeWire for u16 {
+    fn swift_type() -> String {
+        "UInt16".into()
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"integer","minimum":0,"maximum":u16::MAX})
+    }
+}
+impl<T: NativeWire> NativeWire for Option<T> {
+    fn swift_type() -> String {
+        format!("{}?", T::swift_type())
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"anyOf":[T::contract(),{"type":"null"}]})
+    }
+    fn optional() -> bool {
+        true
+    }
+}
+impl<T: NativeWire> NativeWire for Vec<T> {
+    fn swift_type() -> String {
+        format!("[{}]", T::swift_type())
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"array","items":T::contract()})
+    }
+}
+impl<T: NativeWire> NativeWire for std::collections::BTreeMap<String, T> {
+    fn swift_type() -> String {
+        format!("[String: {}]", T::swift_type())
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"object","additionalProperties":T::contract()})
     }
 }
 
 pub const NATIVE_BRIDGE_VERSION: u32 = 6;
+pub const NATIVE_BOOTSTRAP_VERSION: u32 = 1;
 pub const NATIVE_CLIENT_RELEASE: &str = env!("TYDE_NATIVE_CLIENT_RELEASE");
 
 native_enum!(NativeTab { Home = "home", Agents = "agents", Sessions = "sessions", Settings = "settings" });
@@ -74,13 +140,13 @@ native_enum!(NativeIntent {
 });
 native_enum!(NativeEndpoint {
     Presentation = "presentation", Http = "http", HttpCancel = "http_cancel", Authenticate = "authenticate",
-    SecretRead = "secret_read", SecretWrite = "secret_write", SecretDelete = "secret_delete"
+    SecretScope = "secret_scope", SecretRead = "secret_read", SecretWrite = "secret_write", SecretDelete = "secret_delete"
 });
 native_enum!(NativeAuthProvider { Apple = "apple", Google = "google" });
 native_enum!(NativeHttpMethod { Get = "get", Post = "post" });
 
 native_struct!(NativePresentation {
-    version: [u32], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
+    version: [u32], client_ready: [bool], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
     title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme],
     sidebar_available: [bool], sidebar_open: [bool]
 });
@@ -95,6 +161,7 @@ native_struct!(NativeHttpResponse {
     body: [String]
 });
 native_struct!(NativeSecretKey { key: [String] });
+native_struct!(NativeSecretScope { keys: [Vec<String>] });
 native_struct!(NativeSecretWrite {
     key: [String],
     value: [String]
@@ -108,9 +175,8 @@ pub fn swift_source() -> String {
         "// Generated from mobile-shell-types/src/native.rs. Do not edit.\nimport Foundation\n\nlet nativeBridgeVersion: UInt32 = {NATIVE_BRIDGE_VERSION}\n\n"
     );
     output.push_str(&format!(
-        "let nativeClientRelease = \"{}\"\nlet nativeProtocolVersion: UInt32 = {}\n\n",
-        NATIVE_CLIENT_RELEASE,
-        protocol::PROTOCOL_VERSION
+        "let nativeShellRelease = \"{}\"\nlet nativeBootstrapVersion: UInt32 = {}\n\n",
+        NATIVE_CLIENT_RELEASE, NATIVE_BOOTSTRAP_VERSION
     ));
     for definition in [
         NativeTab::swift(),
@@ -126,6 +192,7 @@ pub fn swift_source() -> String {
         NativeHttpCancel::swift(),
         NativeHttpResponse::swift(),
         NativeSecretKey::swift(),
+        NativeSecretScope::swift(),
         NativeSecretWrite::swift(),
         NativeAuthRequest::swift(),
     ] {
@@ -133,4 +200,22 @@ pub fn swift_source() -> String {
         output.push('\n');
     }
     output
+}
+
+/// Generated alongside Swift, then frozen once with the first accepted shell.
+/// The real DOM guard consumes that old artifact, never today's regenerated ABI.
+pub fn wire_contract() -> serde_json::Value {
+    serde_json::json!({"bridge_version":NATIVE_BRIDGE_VERSION, "bootstrap_version":NATIVE_BOOTSTRAP_VERSION,
+        "intents":NativeIntent::contract(),
+        "requests":{
+            (NativeEndpoint::Presentation.to_string()):NativePresentation::contract(),
+            (NativeEndpoint::Http.to_string()):NativeHttpRequest::contract(),
+            (NativeEndpoint::HttpCancel.to_string()):NativeHttpCancel::contract(),
+            (NativeEndpoint::Authenticate.to_string()):NativeAuthRequest::contract(),
+            (NativeEndpoint::SecretScope.to_string()):NativeSecretScope::contract(),
+            (NativeEndpoint::SecretRead.to_string()):NativeSecretKey::contract(),
+            (NativeEndpoint::SecretWrite.to_string()):NativeSecretWrite::contract(),
+            (NativeEndpoint::SecretDelete.to_string()):NativeSecretKey::contract()
+        }
+    })
 }

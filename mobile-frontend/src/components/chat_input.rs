@@ -1197,6 +1197,12 @@ pub fn ChatInput() -> impl IntoView {
     let loading_photos = RwSignal::new(false);
     let submitting = composer.submitting;
     let queued_edit = RwSignal::new(None::<QueuedEditDraft>);
+    crate::native::track_unsaved(Signal::derive(move || {
+        !composer.images.get().is_empty()
+            || loading_photos.get()
+            || submitting.get()
+            || queued_edit.get().is_some()
+    }));
     let queued_edit_focus_return = RwSignal::new(None::<QueuedRowRef>);
 
     let do_send = {

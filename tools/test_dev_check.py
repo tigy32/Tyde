@@ -1414,6 +1414,12 @@ class DevCheckCacheTests(unittest.TestCase):
         )
         (self.root / "tools").mkdir()
         shutil.copy2(REPO_ROOT / "tools/check-resources.py", self.root / "tools")
+        shutil.copy2(REPO_ROOT / "tools/run-native-check.sh", self.root / "tools")
+        (self.root / "tools/build-mobile-web-bundle.sh").write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"$2\"\n", encoding="utf-8"
+        )
+        (self.root / "tools/build-mobile-web-bundle.sh").chmod(0o755)
+
         shutil.copy2(REPO_ROOT / "tools/check_ios_app_icon.py", self.root / "tools")
         icon = self.root / "ios/Tyde/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
         icon.parent.mkdir(parents=True)

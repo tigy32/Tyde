@@ -403,12 +403,20 @@ if (opts.blocked !== undefined) {
   manifest.blocked = list;
 }
 
+const nativeBridge = existsSync(join(opts.dist, "index.html"))
+  ? readFileSync(join(opts.dist, "index.html"), "utf8").match(/<meta\s+name="tyde-native-bridge"\s+content="([1-9][0-9]*)"\s*\/?>/)
+  : null;
+
+const rtcMatch = readFileSync(protocolSource, "utf8").match(/pub const MOBILE_RTC_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)/);
+if (nativeBridge && !rtcMatch) fail("native-capable client has no transport protocol metadata");
+
 // (Re)write this version's record.
 manifest.versions[version] = {
   path: base,
   entry: entryUrl,
   integrity: entryIntegrity,
   protocolVersion,
+  ...(nativeBridge ? { nativeBridgeVersions: [Number(nativeBridge[1])], transportProtocolVersion: Number(rtcMatch[1]) } : {}),
   ...(existsSync(join(opts.dist, "index.html")) &&
     /<meta\s+name="tyde-follow-selected-host"\s+content="1"\s*\/?>/.test(
       readFileSync(join(opts.dist, "index.html"), "utf8"),

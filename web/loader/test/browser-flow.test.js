@@ -74,7 +74,7 @@ test("installed storage migrates once, then follows exact targets without losing
     if(!checked.ok) throw new Error('fixture integrity failure');
     await (await import(target.entry)).default();
     document.getElementById('loader-shell').hidden=true;`;
-  const assets = new Set(["index.html", "loader.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "vendor/jsqr.js", "icons/icon.svg"]);
+  const assets = new Set(["index.html", "loader.js", "native-bootstrap.js", "native-service.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "vendor/jsqr.js", "icons/icon.svg"]);
   const server = createServer(async (req, res) => {
     try {
       const path = new URL(req.url, "http://fixture.invalid").pathname;
@@ -98,7 +98,7 @@ test("installed storage migrates once, then follows exact targets without losing
       if (!path.startsWith("/tyde/") || !assets.has(asset)) { res.statusCode=404;res.end();return; }
       let body = await readFile(new URL(asset, root));
       if (legacy && asset === "loader.js") body = Buffer.from(legacyLoader);
-      if (legacy && asset === "sw.js") body = Buffer.from(body.toString().replace("tyde-loader-v11", "tyde-loader-v9"));
+      if (legacy && asset === "sw.js") body = Buffer.from(body.toString().replace("tyde-loader-v12", "tyde-loader-v9"));
       res.setHeader("Content-Type", asset.endsWith(".js") ? "text/javascript" : asset.endsWith(".css") ? "text/css" : asset.endsWith(".svg") ? "image/svg+xml" : asset.endsWith(".html") ? "text/html" : "application/json");
       res.end(body);
     } catch { res.statusCode=500;res.end("fixture failure"); }
@@ -172,7 +172,7 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}worker.addEventListener('statechange',()=>{if(worker.state==='activated'){done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
-    assert.ok(cacheNames.includes("tyde-loader-v11"),"updated worker precaches the new root shell");
+    assert.ok(cacheNames.includes("tyde-loader-v12"),"updated worker precaches the new root shell");
     assert.ok(!cacheNames.includes("tyde-loader-v9"),"updated worker retires only the old shell cache");
     const retained = await evaluateAsync(`const done=arguments[arguments.length-1];const r=indexedDB.open('tyde-mobile',1);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['paired_hosts','psk']);const a=tx.objectStore('paired_hosts').get('all');const b=tx.objectStore('psk').get('retained-key');tx.oncomplete=()=>{done([a.result,b.result]);db.close();};};`);
     assert.ok(retained[0]===JSON.stringify([{localHostId:"retained-host"},{localHostId:"second-host"},{localHostId:"third-host"}]) && retained[1]==="fixture-only-key","pairing and key stores remain byte-identical");

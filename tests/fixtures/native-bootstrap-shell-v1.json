@@ -1,0 +1,13 @@
+{
+  "status": "UNRELEASED_THIN_SHELL_CANDIDATE",
+  "source_commit": "6780c6cf58d58c858c4aa7ea82eacbb278a9ff93",
+  "source_inputs_sha256": "4a144d88643e523222a8cbb7191795c774dc1947690bf5610aa78cff80b636ab",
+  "shell_release": "0.9.6-beta.22",
+  "bootstrap_version": 1,
+  "native_bridge_abi": 6,
+  "archive_sha256": "45e2e1e1ae529cd27eb745b83f00091dfd77f03e6bff669a3a8eedb0037e0752",
+  "bridge_sha256": "2ac1a431a6833989019dde8c3defbfee6d11a40058e1fe8251bd2cc5ef46a0ec",
+  "trusted_bootstrap": "https://tycode.dev/tyde/?native=1",
+  "global_protocol_in_shell": false,
+  "limits": "Frozen once from actual source. Native Swift/bootstrap/bridge, no full Web/Wasm client. Linux execution is bridge emulation, not signed iOS, Keychain, Air, production OAuth or App Review acceptance."
+}

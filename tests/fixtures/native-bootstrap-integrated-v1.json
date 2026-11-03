@@ -1,0 +1,20 @@
+{
+  "status": "UNRELEASED_INTEGRATED_THIN_SHELL_CANDIDATE",
+  "source_commit": "1f72505b48a725cf1b12951fb930c387bcf8dd4c",
+  "ui_public_base": "ce8b2f63106cf80c8fc41f146f87feef6e3b69ca",
+  "source_inputs_sha256": "65a9204a5f0c9684615aeff55fa010a1bbe7c582ac58fb7902d562425f308367",
+  "shell_release": "0.9.6-beta.22",
+  "bootstrap_version": 1,
+  "native_bridge_abi": 6,
+  "archive_sha256": "e5d0516e3e684ccca66b124027637e44b70124a62b42e1b950ba059d02201854",
+  "bridge_sha256": "2ac1a431a6833989019dde8c3defbfee6d11a40058e1fe8251bd2cc5ef46a0ec",
+  "native_contract_sha256": "848ef3c4fc1cc102a85d892e6febe9a3529b0d0f08fa7e01c2c6a9f1250baddd",
+  "trusted_bootstrap": "https://tycode.dev/tyde/?native=1",
+  "global_protocol_in_shell": false,
+  "superseded_unreleased_prototype": {
+    "archive": "native-bootstrap-shell-v1.tar.gz",
+    "archive_sha256": "45e2e1e1ae529cd27eb745b83f00091dfd77f03e6bff669a3a8eedb0037e0752",
+    "reason": "Before combined UI78 ABI6/listener readiness and frozen native consumer schema; all original bytes/custody/evidence preserved."
+  },
+  "limits": "Unreleased source candidate, not installed/signed app. Frozen generated Swift types, native bridge, schema and source; no global server wire or full Web/Wasm. Real DOM guard validates requests against these unchanged first-consumer shapes, not a schema regenerated from the current client. Not UIKit/Swift/Keychain/RTC/OAuth/CDN/production TLS/physical fold or App Review proof."
+}

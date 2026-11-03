@@ -57,6 +57,8 @@ readonly -a LOADER_SHELL_KEYS=(
   "sw.js"
   "mobile-service-config.js"
   "loader.js"
+  "native-bootstrap.js"
+  "native-service.js"
   "loader.css"
   "cbor.js"
   "pairing.js"

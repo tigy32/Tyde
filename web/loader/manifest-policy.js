@@ -203,6 +203,7 @@ export function resolveBootTarget(version, manifest) {
     integrity: entry.integrity,
     artifacts,
     protocolVersion,
+    ...(entry.nativeBridgeVersions ? { nativeBridgeVersions: entry.nativeBridgeVersions, transportProtocolVersion: entry.transportProtocolVersion } : {}),
   };
 }
 
@@ -309,4 +310,21 @@ export function selectBootUrls(target) {
   }
 
   return { ok: true, entryUrl, wasmUrl: wasm.url };
+}
+
+
+export async function artifactSetSha256(artifacts) {
+  const sorted = artifacts.map(({url, integrity}) => ({url, integrity})).sort((a,b) => a.url < b.url ? -1 : a.url > b.url ? 1 : 0);
+  if (!sorted.length || sorted.some((item,i) => !/^[\x21-\x7e]+$/.test(item.url) || !/^[\x21-\x7e]+$/.test(item.integrity) || (i && sorted[i-1].url === item.url))) {
+    throw new Error("Invalid executable artifact set");
+  }
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(sorted)));
+  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2,"0")).join("");
+}
+
+export function nativeBridgeCompatible(target, abi) {
+  return Array.isArray(target.nativeBridgeVersions) && target.nativeBridgeVersions.length > 0 &&
+    target.nativeBridgeVersions.every(value => Number.isInteger(value) && value > 0 && value <= 0xffffffff) &&
+    target.nativeBridgeVersions.includes(abi) && Number.isInteger(target.transportProtocolVersion) &&
+    target.transportProtocolVersion > 0 && target.transportProtocolVersion <= 0xffffffff;
 }

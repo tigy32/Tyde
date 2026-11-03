@@ -412,6 +412,21 @@ impl ConnectionManager {
         self.connect(local_host_id).await
     }
 
+    pub fn disconnect_others(&self, selected: &LocalHostId) -> Result<(), String> {
+        let active = self
+            .inner
+            .borrow()
+            .active
+            .keys()
+            .filter(|host| *host != selected)
+            .cloned()
+            .collect::<Vec<_>>();
+        for host in active {
+            self.disconnect(host)?;
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&self, local_host_id: LocalHostId) -> Result<(), String> {
         let active = self
             .inner
@@ -1149,6 +1164,42 @@ async fn connect_once(
     record: &WebPairedHostRecord,
     psk: Option<&PreSharedKey>,
 ) -> Result<BoxedTransport, ConnectErr> {
+    if crate::native::is_native() {
+        match crate::bridge::loader::native_admission("nativeAdmitHost", &record.local_host_id.0)
+            .await
+        {
+            crate::bridge::loader::BrowserOutcome::Matching => {}
+            crate::bridge::loader::BrowserOutcome::Unavailable { reason } => {
+                return Err(ConnectErr::ManagedCredentials(ManagedCredentialError {
+                    code: match reason {
+                        crate::bridge::loader::UnavailableReason::BootstrapTransport => {
+                            MobileAccessErrorCode::ServiceUnavailable
+                        }
+                        crate::bridge::loader::UnavailableReason::AuthenticationRequired => {
+                            MobileAccessErrorCode::ServiceAuthRequired
+                        }
+                        crate::bridge::loader::UnavailableReason::PassRequired => {
+                            MobileAccessErrorCode::PassRequired
+                        }
+                        crate::bridge::loader::UnavailableReason::PairingRevoked => {
+                            MobileAccessErrorCode::RepairRequired
+                        }
+                        _ => MobileAccessErrorCode::VersionMismatch,
+                    },
+                    message: reason.message().into(),
+                    retryable: reason
+                        == crate::bridge::loader::UnavailableReason::BootstrapTransport,
+                }));
+            }
+            _ => {
+                return Err(ConnectErr::ManagedCredentials(ManagedCredentialError {
+                    code: MobileAccessErrorCode::VersionMismatch,
+                    message: "The exact host client is loading".into(),
+                    retryable: false,
+                }));
+            }
+        }
+    }
     // Direct first: a host that serves this bundle itself is reached over the
     // origin the bundle came from, with no broker and no credentials to mint.
     if let Some(direct) = record.direct.as_ref() {
@@ -1195,10 +1246,21 @@ async fn connect_direct_once(
     .await
     {
         Ok(Ok(stream)) => Ok(Box::new(stream) as BoxedTransport),
-        Ok(Err(message)) => Err(ConnectErr::NeedsRepair(format!(
-            "\"{}\": {message}",
-            record.host_label
-        ))),
+        Ok(Err(message)) => {
+            if crate::native::is_native() {
+                // Each native retry revalidates bootstrap authority; a socket
+                // loss itself cannot establish that the pairing was revoked.
+                Err(ConnectErr::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Authenticated direct transport could not open",
+                )))
+            } else {
+                Err(ConnectErr::NeedsRepair(format!(
+                    "\"{}\": {message}",
+                    record.host_label
+                )))
+            }
+        }
         Err(_) => Err(ConnectErr::Timeout),
     }
 }

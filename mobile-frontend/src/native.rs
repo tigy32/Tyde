@@ -122,6 +122,30 @@ pub fn track_modal(open: impl Into<Signal<bool>>) {
     on_cleanup(move || sources.update(|sources| sources.retain(|source| *source != open)));
 }
 
+pub fn track_unsaved(open: impl Into<Signal<bool>>) {
+    if !is_native() {
+        return;
+    }
+    let sources = expect_context::<AppState>().native_unsaved_sources;
+    let open = open.into();
+    sources.update(|sources| sources.push(open));
+    on_cleanup(move || sources.update(|sources| sources.retain(|source| *source != open)));
+}
+
+pub fn can_leave_workspace(state: &AppState) -> bool {
+    state.chat_input.get().is_empty()
+        && state.pending_submissions.get().is_empty()
+        && state.draft_session_settings.get().0.is_empty()
+        && state.draft_backend_override.get().is_none()
+        && state.draft_custom_agent_id.get().is_none()
+        && !state.project_picker_open.get()
+        && !state.session_settings_open.get()
+        && matches!(state.voice_ui.get(), crate::voice::MobileVoiceState::Idle)
+        && !state
+            .native_unsaved_sources
+            .with(|sources| sources.iter().any(|source| source.get()))
+}
+
 fn modal_open(state: &AppState) -> bool {
     state
         .native_modal_sources
@@ -253,6 +277,17 @@ pub fn open_created_chat(state: &AppState) {
 }
 
 pub fn open_host(state: &AppState, local_host_id: LocalHostId) {
+    let changed = state.active_local_host_id.get_untracked().as_ref() != Some(&local_host_id);
+    if changed
+        && !matches!(state.app_mode.get_untracked(), AppMode::Pairing(_))
+        && !untrack(|| can_leave_workspace(state))
+    {
+        report(
+            state,
+            "Finish or save your current work before switching hosts".into(),
+        );
+        return;
+    }
     batch(|| {
         let changed = state.active_local_host_id.get_untracked().as_ref() != Some(&local_host_id);
         if state
@@ -335,6 +370,7 @@ fn presentation(state: &AppState) -> NativePresentation {
     };
     NativePresentation {
         version: NATIVE_BRIDGE_VERSION,
+        client_ready: true,
         workspace: matches!(
             state.app_mode.get(),
             AppMode::Workspace | AppMode::HostPicker
@@ -379,16 +415,6 @@ pub fn direct_origin(qr_uri: &str) -> Result<String, String> {
         return Err("Native direct pairing requires an HTTPS host link without credentials or query parameters".into());
     }
     Ok(url.origin())
-}
-
-pub fn check_host_release(release: &protocol::TydeReleaseVersion) -> Result<(), String> {
-    if is_native() && release.as_str() != mobile_shell_types::native::NATIVE_CLIENT_RELEASE {
-        return Err(
-            "This native app bundles a different host release. Update the app and host together."
-                .into(),
-        );
-    }
-    Ok(())
 }
 
 pub fn validate_environment() -> Result<(), String> {

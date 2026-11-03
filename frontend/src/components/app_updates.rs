@@ -421,6 +421,7 @@ mod wasm_tests {
             protocol::FrameKind::Welcome,
             0,
             &protocol::WelcomePayload {
+                mobile_client_bootstrap: None,
                 protocol_version: protocol::PROTOCOL_VERSION,
                 tyde_version: protocol::TYDE_VERSION,
                 release_version: Some(version),

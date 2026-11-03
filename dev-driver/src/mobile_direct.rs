@@ -241,6 +241,11 @@ struct Request {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     Configure,
+    TransitionOrigin {
+        previous: PathBuf,
+        previous_run: PathBuf,
+        origin_path: PathBuf,
+    },
     SetOrigin {
         previous: PathBuf,
         origin_path: PathBuf,
@@ -283,6 +288,8 @@ struct Receipt {
     superseded_receipt_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     standalone_attestation: Option<StandaloneAttestation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_transition_seed_sha256: Option<String>,
 }
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -1037,6 +1044,73 @@ async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
     let mut previous_sha256 = None;
     let previous = match &request.operation {
         Operation::Configure => None,
+        Operation::TransitionOrigin {
+            previous,
+            previous_run,
+            ..
+        } => {
+            let Endpoint::Standalone(target) = &endpoint else {
+                return Err("origin transition requires attested standalone UDS".into());
+            };
+            let old_bytes = read_private(previous_run)?;
+            let old: StandaloneRunConfig = decode(&old_bytes)?;
+            let bytes = read_private(previous)?;
+            previous_sha256 = Some(digest(&bytes));
+            let receipt: Receipt = decode(&bytes)?;
+            require(
+                receipt.run_sha256 == digest(&old_bytes)
+                    && receipt.ready_sha256.is_none()
+                    && matches!(receipt.phase, Phase::Configured | Phase::OriginSet)
+                    && receipt.offer.is_none()
+                    && receipt.superseded_receipt_sha256.is_none(),
+                "transition requires an actual unoffered standalone receipt",
+            )?;
+            require(
+                old.expected.protocol_version == expected.protocol_version
+                    && old.expected.tyde_version == expected.tyde_version
+                    && old.expected.release_version == expected.release_version
+                    && old.expected.project_dir == expected.project_dir
+                    && old.bundle_dir == bundle_dir
+                    && old.inventory == bundle_inventory
+                    && old.target.socket_path == target.socket_path
+                    && old.target.store_environment == target.store_environment,
+                "transition must retain the exact stores, project and immutable bundle",
+            )?;
+            let store_hash = digest(
+                &serde_json::to_vec(&old.target.store_environment)
+                    .map_err(|_| "cannot encode transition store custody")?,
+            );
+            require(
+                matches!(&receipt.standalone_attestation,
+                Some(StandaloneAttestation::LinuxUds { pid, uid, start_ticks, executable_sha256, store_environment_sha256, .. })
+                    if *pid == old.target.pid && *uid == unsafe { libc::geteuid() }
+                        && *start_ticks == old.target.start_ticks
+                        && executable_sha256 == &old.target.executable_sha256
+                        && store_environment_sha256 == &store_hash),
+                "old standalone receipt is not bound to its actual process/stores",
+            )?;
+            require(
+                receipt.welcome == adapter.welcome && receipt.settings == adapter.settings,
+                "preserved host identity/settings differ from transition seed",
+            )?;
+            require(
+                receipt.mobile_access.paired_devices.is_empty()
+                    && !matches!(
+                        receipt.mobile_access.pairing,
+                        MobilePairingState::Active { .. }
+                    )
+                    && adapter.mobile_access.paired_devices.is_empty()
+                    && matches!(adapter.mobile_access.pairing, MobilePairingState::Idle)
+                    && adapter.hosting_matches(Some(count))?,
+                "origin transition requires unchanged Online hosting with no devices or offers",
+            )?;
+            let mut claimed = previous.as_os_str().to_os_string();
+            claimed.push(".used");
+            reserve(Path::new(&claimed))?
+                .sync_all()
+                .map_err(|_| "cannot claim transition seed")?;
+            Some(receipt)
+        }
         Operation::SetOrigin { previous, .. }
         | Operation::Offer { previous, .. }
         | Operation::Revoke { previous }
@@ -1067,7 +1141,16 @@ async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
     let mut superseded_receipt_sha256 = previous
         .as_ref()
         .and_then(|p| p.superseded_receipt_sha256.clone());
+    let mut origin_transition_seed_sha256 = previous
+        .as_ref()
+        .and_then(|p| p.origin_transition_seed_sha256.clone());
     let phase = match request.operation {
+        Operation::TransitionOrigin { origin_path, .. } => {
+            let origin: String = decode(&read_private(&origin_path)?)?;
+            adapter.set_origin(&origin, count).await?;
+            origin_transition_seed_sha256 = previous_sha256.clone();
+            Phase::OriginSet
+        }
         Operation::Configure => {
             adapter.require_configurable()?;
             if standalone {
@@ -1090,9 +1173,12 @@ async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
         Operation::Offer { offer_path, .. } => {
             let prior = previous.as_ref().ok_or("offer requires previous receipt")?;
             require(
-                matches!(prior.phase, Phase::OriginSet | Phase::Offered)
-                    && prior.superseded_receipt_sha256.is_none(),
-                "offer requires origin receipt or one original offered receipt",
+                match prior.phase {
+                    Phase::OriginSet | Phase::Offered => prior.superseded_receipt_sha256.is_none(),
+                    Phase::Reoffered => prior.superseded_receipt_sha256.is_some(),
+                    _ => false,
+                },
+                "offer requires origin receipt or an intact offered receipt chain",
             )?;
             require(
                 adapter.hosting_matches(Some(count))?
@@ -1100,7 +1186,7 @@ async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
                 "directory host is not the same Online listener",
             )?;
             let mut file = reserve(&offer_path)?;
-            let (payload, phase) = if prior.phase == Phase::Offered {
+            let (payload, phase) = if matches!(prior.phase, Phase::Offered | Phase::Reoffered) {
                 let old = prior.offer.as_ref().ok_or("receipt has no prior offer")?;
                 require(
                     matches!(&prior.mobile_access.pairing,
@@ -1165,6 +1251,7 @@ async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
             offer,
             superseded_receipt_sha256,
             standalone_attestation: adapter.standalone_attestation,
+            origin_transition_seed_sha256,
         },
     )?;
     println!("mobile-direct: completed");

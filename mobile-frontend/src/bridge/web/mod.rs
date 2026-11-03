@@ -95,6 +95,16 @@ pub fn take_pending_pairing_uri() -> Option<String> {
 /// loader self-heal reboot the legacy path uses, then returns an error so this
 /// bundle never proceeds.
 pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String> {
+    if crate::native::is_native() {
+        match super::loader::native_admission("nativePreparePairing", qr_uri).await {
+            super::loader::BrowserOutcome::Matching => {}
+            super::loader::BrowserOutcome::Unavailable { reason } => {
+                return Err(reason.message().into());
+            }
+            _ => return Err("The exact host client is loading".into()),
+        }
+    }
+
     if let Some(version) = mobile_pairing_qr_protocol_version(qr_uri)
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?
         && version != PROTOCOL_VERSION
@@ -102,9 +112,6 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
         log::info!(
             "mobile_pairing_schema_handoff host_protocol={version} client_protocol={PROTOCOL_VERSION}"
         );
-        if crate::native::is_native() {
-            return Err("This native app and host use different protocols. Update the app and host together.".into());
-        }
         request_loader_repair(qr_uri);
         return Err(
             "Switching to the client for this host. If this page does not reload, open the \
@@ -116,12 +123,10 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
     match offer {
         MobilePairingQrOffer::ManagedService(payload) => {
-            crate::native::check_host_release(&payload.release_version)?;
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::ManagedService { host_label })
         }
         MobilePairingQrOffer::Direct(payload) => {
-            crate::native::check_host_release(&payload.release_version)?;
             if crate::native::is_native() {
                 crate::native::direct_origin(qr_uri)?;
             }
@@ -187,6 +192,12 @@ pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<LocalHostId,
         return Err(message);
     }
 
+    if crate::native::is_native() {
+        connection::manager().disconnect_others(&local_host_id)?;
+        super::loader::native_pairing_saved(&local_host_id).await?;
+        super::loader::save_selection(Some(&local_host_id))
+            .map_err(|reason| reason.message().to_owned())?;
+    }
     emit_paired_hosts_changed().await;
     connection::manager().connect(local_host_id.clone()).await?;
     Ok(local_host_id)
@@ -228,6 +239,13 @@ pub async fn disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), S
 }
 
 pub async fn forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String> {
+    if crate::native::is_native() {
+        return match super::loader::native_admission("nativeForgetHost", &local_host_id.0).await {
+            super::loader::BrowserOutcome::Reloading => Ok(()),
+            super::loader::BrowserOutcome::Unavailable { reason } => Err(reason.message().into()),
+            _ => Err("Native pairing removal did not start".into()),
+        };
+    }
     let host_store = IndexedDbHostStore;
     let record = host_store
         .get(local_host_id)
@@ -381,6 +399,15 @@ pub async fn frontend_attached(
     let records = IndexedDbHostStore.list().await?;
     let mut failures = Vec::new();
     for record in records.into_iter().filter(|record| record.auto_connect) {
+        if crate::native::is_native()
+            && (!super::loader::native_owns_host(&record.local_host_id)?
+                || super::loader::read_selection()
+                    .map_err(|reason| reason.message().to_owned())?
+                    .as_ref()
+                    != Some(&record.local_host_id))
+        {
+            continue;
+        }
         if let Err(error) = manager.connect(record.local_host_id.clone()).await {
             log::error!("auto-connect for {} failed: {error}", record.local_host_id);
             failures.push(error);

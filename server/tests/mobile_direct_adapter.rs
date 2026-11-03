@@ -140,7 +140,16 @@ async fn typed_adapter_drives_real_server_directory_offer_revoke_disable() {
 async fn standalone_uds_driver_attests_real_peer_and_configures_without_dev_ready() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
-    use tyde_dev_driver::mobile_direct::{StandaloneTarget, run_uds};
+    use tyde_dev_driver::mobile_direct::StandaloneTarget;
+    // The expanded debug flow had a >1MiB poll frame, then nested the CLI's
+    // large protocol futures. Keep each CLI operation's state on the heap.
+    fn run_uds(
+        args: &[String],
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = tyde_dev_driver::mobile_direct::Result<()>> + '_>,
+    > {
+        Box::pin(tyde_dev_driver::mobile_direct::run_uds(args))
+    }
     server::install_default_crypto_provider();
     let package: serde_json::Value =
         serde_json::from_str(include_str!("../../package.json")).unwrap();
@@ -321,6 +330,46 @@ async fn standalone_uds_driver_attests_real_peer_and_configures_without_dev_read
     assert!(
         after.settings.mobile_direct_public_origin.as_deref() == Some("https://standalone.invalid")
     );
+    // A fresh case attests current kernel/store custody, then consumes the old
+    // unoffered receipt without rewriting its bytes or replaying configure.
+    let prior_bytes = std::fs::read(&origin_receipt).unwrap();
+    let resumed_run = private.path().join("resumed-run.json");
+    save(&resumed_run, &config);
+    let transitioned = private.path().join("transitioned.json");
+    let transition_request = private.path().join("transition.json");
+    let new_origin = private.path().join("new-origin.json");
+    save(&new_origin, &serde_json::json!("https://recovered.invalid"));
+    save(
+        &transition_request,
+        &serde_json::json!({"run":resumed_run,"operation":{
+        "kind":"transition_origin","previous":origin_receipt,"previous_run":run,"origin_path":new_origin}}),
+    );
+    run_uds(&[
+        transition_request.to_string_lossy().into_owned(),
+        transitioned.to_string_lossy().into_owned(),
+    ])
+    .await
+    .expect("explicit attested origin transition preserves configured host");
+    assert!(
+        std::fs::read(&origin_receipt).unwrap() == prior_bytes,
+        "transition must not rewrite historical receipts"
+    );
+    let transition: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&transitioned).unwrap()).unwrap();
+    assert!(
+        transition["phase"] == "origin_set"
+            && transition["origin_transition_seed_sha256"].is_string()
+    );
+    let (_, recovered) = fixture.connect_with_bootstrap().await;
+    assert!(
+        recovered.settings.mobile_direct_public_origin.as_deref()
+            == Some("https://recovered.invalid")
+            && recovered.projects == after.projects
+            && recovered.mobile_access.paired_devices.is_empty(),
+        "origin transition must preserve the actual project/devices and publish its CAS result"
+    );
+    let run = resumed_run;
+    let origin_receipt = transitioned;
     let offer_path = private.path().join("offer.json");
     let offer_request = private.path().join("offer-request.json");
     let offered = private.path().join("offered.json");

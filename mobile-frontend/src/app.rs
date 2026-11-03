@@ -69,14 +69,21 @@ pub(crate) fn AppSurface() -> impl IntoView {
     mirror_theme_to_document(state.clone());
     let root = NodeRef::<leptos::html::Div>::new();
     crate::shell::install(root);
-    let native_workspace = Memo::new(move |_| {
-        crate::native::is_native()
-            && match state.app_mode.get() {
+    let native_layout = Memo::new(move |previous: Option<&(bool, bool)>| {
+        let mode = state.app_mode.get();
+        let pairing = matches!(mode, AppMode::Pairing(_));
+        let workspace = crate::native::is_native()
+            && match mode {
                 AppMode::Workspace | AppMode::HostPicker => true,
-                AppMode::Pairing(_) => state.active_local_host_id.get().is_some(),
+                AppMode::Pairing(_) => match previous {
+                    Some((workspace, true)) => *workspace,
+                    _ => state.active_local_host_id.get_untracked().is_some(),
+                },
                 AppMode::Onboarding => false,
-            }
+            };
+        (workspace, pairing)
     });
+    let native_workspace = Memo::new(move |_| native_layout.get().0);
     view! {
         <div
             class="mobile-app tws-shell"
@@ -1401,6 +1408,7 @@ mod wasm_tests {
         );
         js_sys::Reflect::set(&native, &"post".into(), &post).unwrap();
         js_sys::Reflect::set(&native, &"presentations".into(), &js_sys::Array::new()).unwrap();
+        install_loader_boundary();
         js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
         let state = AppState::new();
         let host = fixture_host("native-navigation-host", "Native host");
@@ -2073,6 +2081,7 @@ mod wasm_tests {
             dispatch_envelope(&state, &host_id,
                 protocol::Envelope::from_payload(host_stream, FrameKind::Welcome, 6,
                     &protocol::WelcomePayload {
+ mobile_client_bootstrap: None,
                         protocol_version: protocol::PROTOCOL_VERSION, tyde_version: protocol::TYDE_VERSION,
                         release_version: Some(protocol::TydeReleaseVersion::parse("0.9.4-beta.12").unwrap()),
                     }).unwrap());
@@ -2080,9 +2089,9 @@ mod wasm_tests {
             // Actual30's approved single native error replaces the duplicate PWA loader paragraph.
             let mismatch_visible = || container.query_selector("[data-mobile-test='mobile-shell-error-banner'][data-error-code='VersionMismatch']").unwrap()
                 .is_some_and(|banner| banner.get_bounding_client_rect().height() > 0.0
-                    && banner.text_content().unwrap().contains("Update the app and host together."))
+                    && banner.text_content().unwrap().contains("Update Tyde host to support native client bootstrap."))
                 && matches!(state.active_host_connection_status(), ConnectionStatus::UpdateRequired { .. });
-            check(mismatch_visible(), "Native release mismatch must visibly require an app/host update")?;
+            check(mismatch_visible(), "A host without the bootstrap baseline must visibly require a host update")?;
             apply_disconnect(&state, &host_id, None);
             next_tick().await;
             check(mismatch_visible(), "Disconnect must not erase the native compatibility verdict")?;
@@ -2103,7 +2112,7 @@ mod wasm_tests {
                 if text.contains("TransportFailed") || text.contains("VersionMismatch") || text.contains("protocol validation failed") {
                     error_failures.push("Native primary error copy must not expose a debug code or transport prefix".into());
                 }
-                if !text.contains("Update the app and host together") {
+                if !text.contains("Update Tyde host to support native client bootstrap") {
                     error_failures.push("A native release failure must keep its actionable update reason".into());
                 }
                 let header = find(".pairing-view .view-header")?.get_bounding_client_rect();
@@ -2157,6 +2166,7 @@ mod wasm_tests {
         container.remove();
         PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(None));
         js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
+        restore_loader_boundary();
         assert!(result.is_ok(), "{}", result.unwrap_err());
         let browser = make_container();
         let browser_state = state.clone();
@@ -2218,6 +2228,7 @@ mod wasm_tests {
                 FrameKind::Welcome,
                 0,
                 &protocol::WelcomePayload {
+                    mobile_client_bootstrap: None,
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
                     release_version: Some(
@@ -2406,6 +2417,7 @@ mod wasm_tests {
                 FrameKind::Welcome,
                 0,
                 &protocol::WelcomePayload {
+                    mobile_client_bootstrap: None,
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
                     release_version: Some(
@@ -2430,6 +2442,7 @@ mod wasm_tests {
                 FrameKind::Welcome,
                 0,
                 &protocol::WelcomePayload {
+                    mobile_client_bootstrap: None,
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
                     release_version: None,
@@ -2442,7 +2455,8 @@ mod wasm_tests {
             container
                 .text_content()
                 .unwrap()
-                .contains("did not advertise a release")
+                // MissingRelease now names the client explicitly; absence must remain visible.
+                .contains("did not provide a client release")
         );
         assert_eq!(loader_preparations(), 4);
         state.active_local_host_id.set(Some(background));
@@ -2517,6 +2531,7 @@ mod wasm_tests {
                 FrameKind::Welcome,
                 0,
                 &protocol::WelcomePayload {
+                    mobile_client_bootstrap: None,
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
                     release_version: Some(
@@ -2561,6 +2576,9 @@ mod wasm_tests {
         };
         use mobile_shell_types::native::{NATIVE_BRIDGE_VERSION, NativeIntent};
         for native in [true, false] {
+            if native {
+                install_loader_boundary();
+            }
             let _sends = bridge::test_capture_sends();
             let previous_origin = "https://previous-host.example.test";
             let old = WebPairedHostRecord {
@@ -2620,6 +2638,7 @@ mod wasm_tests {
                 let redeemStarted, releaseRedeem;
                 const redeemReady = new Promise(resolve => redeemStarted = resolve);
                 const secrets = new Map();
+                const deniedReads = new Map();
                 const native = {version, holdReads: true, failReads: false, pendingReads: [], post(endpoint, payload) {
                     const request = JSON.parse(payload);
                     if (endpoint === 'presentation') { this.presentation = request; return Promise.resolve(null); }
@@ -2627,7 +2646,10 @@ mod wasm_tests {
                     if (endpoint === 'secret_delete') { secrets.delete(request.key); return Promise.resolve(null); }
                     if (endpoint === 'secret_read') {
                         if (!secrets.has(request.key)) return Promise.reject(new Error('Fixture secret key is missing'));
-                        if (this.failReads) return Promise.reject(new Error('Platform denied the secret read'));
+                        if (this.failReads) {
+                            deniedReads.set(request.key, (deniedReads.get(request.key) || 0) + 1);
+                            return Promise.reject(new Error('Platform denied the secret read'));
+                        }
                         // Direct token reads are downstream of actor startup; managed PSK reads are not.
                         if (this.holdReads) return new Promise(resolve => this.pendingReads.push(resolve));
                         return Promise.resolve(secrets.get(request.key));
@@ -2661,6 +2683,7 @@ mod wasm_tests {
                     if (hadService) window.__TYDE_MOBILE_SERVICE__ = previousService;
                     else delete window.__TYDE_MOBILE_SERVICE__;
                 };
+                restore.deniedReads = deniedReads;
                 restore.beginManaged = (response, failReads) => {
                     managedBody = response;
                     restore.redeemReady = new Promise(resolve => redeemStarted = resolve);
@@ -2890,8 +2913,20 @@ mod wasm_tests {
                         }
                         if record.local_host_id == old.local_host_id { previous_open = Some(open); }
                     }
-                    let open = previous_open.ok_or("The previous exact host must remain normally selectable")?;
-                    open.dyn_into::<HtmlElement>().unwrap().click();
+                    let open = previous_open.ok_or("The previous exact host must remain normally selectable")?.dyn_into::<HtmlElement>().unwrap();
+                    open.click();
+                    next_tick().await;
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id) || !previous_composer.is_connected() || state.chat_input.get_untracked().is_empty() {
+                        return Err("A host switch must not erase an unsent mounted draft before loader safety is evaluated".into());
+                    }
+                    // Explicitly finish/discard this fixture's owned draft before exercising the original cross-host routing guarantee.
+                    state.chat_input.set(String::new());
+                    state.draft_session_settings.set(Default::default());
+                    state.draft_backend_override.set(None);
+                    state.draft_custom_agent_id.set(None);
+                    state.viewing_chat.set(false);
+                    state.mobile_shell_error.set(None);
+                    open.click();
                     next_tick().await;
                     if state.active_local_host_id.get_untracked().as_ref() != Some(&old.local_host_id)
                         || state.app_mode.get_untracked() != AppMode::Workspace
@@ -2945,6 +2980,50 @@ mod wasm_tests {
                     if !other_composer.value().is_empty() {
                         ownership_failures.push("Opening an existing conversation on a different host must not inherit the previous host's unsent text");
                     }
+                    if !crate::native::can_leave_workspace(&state) {
+                        return Err("The empty existing conversation must be safe before Rename opens".into());
+                    }
+                    intent(NativeIntent::RenameAgent);
+                    next_tick().await;
+                    let rename = container.query_selector("[data-mobile-test='chat-rename-input']").unwrap()
+                        .ok_or("Native Rename must expose the actual retained edit")?
+                        .dyn_into::<web_sys::HtmlInputElement>().unwrap();
+                    rename.set_value("Retained rename text");
+                    rename.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+                    intent(NativeIntent::Home);
+                    next_tick().await;
+                    if crate::native::can_leave_workspace(&state) || !rename.is_connected() {
+                        return Err("Native Home must retain Rename and keep the client unsafe to replace".into());
+                    }
+                    intent(NativeIntent::Hosts);
+                    next_tick().await;
+                    let destination = created.direct.as_ref().unwrap().native_origin.as_deref().unwrap();
+                    let cards = container.query_selector_all(".paired-host-card").unwrap();
+                    let target = (0..cards.length()).map(|index| cards.item(index).unwrap().dyn_into::<web_sys::Element>().unwrap())
+                        .find(|row| row.query_selector("[data-mobile-test='paired-host-origin']").unwrap()
+                            .is_some_and(|node| node.text_content().as_deref() == Some(destination)))
+                        .ok_or("The other exact persisted host must remain in the chooser")?;
+                    target.query_selector("[data-mobile-test='paired-host-open']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if state.active_local_host_id.get_untracked().as_ref() != Some(&old.local_host_id)
+                        || !rename.is_connected() || rename.value() != "Retained rename text" {
+                        return Err("An explicit cross-host Open must not discard the retained Rename edit".into());
+                    }
+                    intent(NativeIntent::Agents);
+                    next_tick().await;
+                    let retained_rename = container.query_selector("[data-mobile-test='chat-rename-input']").unwrap()
+                        .ok_or("Returning to Agents must restore the same Rename edit")?;
+                    if !retained_rename.is_same_node(Some(&rename)) {
+                        return Err("The Rename input owner must not remount across native tabs/Hosts".into());
+                    }
+                    container.query_selector("[data-mobile-test='chat-rename-cancel']").unwrap().unwrap()
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if !crate::native::can_leave_workspace(&state) {
+                        return Err("Explicit Rename Cancel must release its unsaved-work fence".into());
+                    }
+                    state.mobile_shell_error.set(None);
                     other_composer.set_value("Explicit text for this host only");
                     other_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
                     next_tick().await;
@@ -3052,6 +3131,8 @@ mod wasm_tests {
                     // Re-enter the production attach path with the persisted auto-connect record.
                     state.mobile_shell_error.set(None);
                     state.app_mode.set(AppMode::Workspace);
+                    let denied_reads = js_sys::Reflect::get(&boundary.0, &"deniedReads".into()).unwrap().dyn_into::<js_sys::Map>().unwrap();
+                    denied_reads.clear();
                     install_event_listeners(state.clone()).await;
                     next_tick().await;
                     let error = container.query_selector("[data-mobile-test='mobile-shell-error-banner']").unwrap();
@@ -3062,13 +3143,16 @@ mod wasm_tests {
                         message.as_ref().and_then(|message| message.text_content()).map(|text| text.starts_with("Failed to refresh host connection after app attach: ")),
                         saved.auto_connect);
                     web_sys::console::log_1(&diagnostics.into());
-                    // Actual40 showed two visible failures: both saved managed records auto-connect.
-                    // Their actor/credential boundaries are settled before attachment, not timed.
+                    // The real run reports one denied read: native attach now owns only
+                    // the selected host. Retained inactive pairings must not be started.
                     if error.as_ref().and_then(|banner| banner.get_attribute("data-error-code")).as_deref() != Some("Internal")
                         || !message.as_ref().and_then(|message| message.text_content()).is_some_and(|text|
                             text.starts_with("Failed to refresh host connection after app attach: ")
-                            && text.matches("Native secret_read failed: Platform denied the secret read").count() == 2) {
-                        ownership_failures.push("Both saved managed hosts' denied startup reads must remain visible through the real app-attach error boundary");
+                            && text.matches("Native secret_read failed: Platform denied the secret read").count() == 1)
+                        || state.active_local_host_id.get_untracked().as_ref() != Some(&managed.local_host_id)
+                        || denied_reads.size() != 1
+                        || denied_reads.get(&managed.psk_keychain_key_id.as_ref().unwrap().0.clone().into()).as_f64() != Some(1.0) {
+                        ownership_failures.push("Only the selected managed host's denied startup read must surface; inactive pairing secrets must remain unread");
                     }
                     state.mobile_shell_error.set(None);
                     state.active_local_host_id.set(Some(saved.local_host_id.clone()));
@@ -3115,12 +3199,25 @@ mod wasm_tests {
                                 && managed.device_id == failed_device_id)
                     })
                 {
-                    bridge::forget_paired_host(&record.local_host_id)
-                        .await
-                        .unwrap();
+                    if native {
+                        // This is fixture teardown after unmount, not a user Delete.
+                        // Native Delete is bootstrap-owned and covered across real
+                        // documents in the retained-shell server/DOM scenario.
+                        IndexedDbHostStore
+                            .remove(&record.local_host_id)
+                            .await
+                            .unwrap();
+                    } else {
+                        bridge::forget_paired_host(&record.local_host_id)
+                            .await
+                            .unwrap();
+                    }
                 }
             }
             drop(boundary);
+            if native {
+                restore_loader_boundary();
+            }
             assert!(result.is_ok(), "{}", result.unwrap_err());
         }
     }

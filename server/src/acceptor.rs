@@ -45,6 +45,17 @@ pub async fn accept<S>(config: &ServerConfig, stream: S) -> Result<Connection, H
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    accept_mobile(config, stream, None).await
+}
+
+pub(crate) async fn accept_mobile<S>(
+    config: &ServerConfig,
+    stream: S,
+    mobile_client_bootstrap: Option<protocol::MobileClientBootstrapDescriptor>,
+) -> Result<Connection, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
@@ -142,6 +153,7 @@ where
     }
 
     let welcome = WelcomePayload {
+        mobile_client_bootstrap,
         protocol_version: config.protocol_version,
         tyde_version: config.tyde_version,
         release_version: crate::host_release_version(),

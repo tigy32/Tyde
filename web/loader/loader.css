@@ -240,7 +240,8 @@ a.btn {
   background: var(--bg-elev);
   color: var(--fg);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 14px;
+  /* Smaller editable text makes WKWebView zoom the document on focus. */
+  font-size: 16px;
   line-height: 1.5;
   padding: 12px 14px;
   resize: vertical;
@@ -291,4 +292,10 @@ a.btn {
   .spinner {
     animation: none;
   }
+}
+
+html[data-tyde-native-bootstrap] #pair-status,
+html[data-tyde-native-bootstrap] #paste-label,
+html[data-tyde-native-bootstrap] #error-detail {
+  display: none;
 }

@@ -33,7 +33,6 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::ServerConfig;
-use crate::accept;
 use crate::connection::run_mobile_connection;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
@@ -244,6 +243,8 @@ pub(crate) struct MobileAccessInit {
     pub(crate) initial_settings: HostSettings,
     pub(crate) pairing_ttl: Duration,
     pub(crate) managed_service_base_url: Option<String>,
+    #[cfg(feature = "test-support")]
+    pub(crate) bootstrap_http: Option<reqwest::Client>,
 }
 
 pub(crate) fn spawn_mobile_access_actor(
@@ -271,6 +272,25 @@ pub(crate) type BoxedMobileTransport = Box<dyn MobileTransport + Unpin>;
 
 pub(crate) enum MobileAccessCommand {
     Shutdown,
+    BootstrapPublication {
+        generation: u64,
+        result: Result<protocol::MobileClientBootstrapDescriptor, MobileAccessCommandFailure>,
+        finished: bool,
+    },
+    BootstrapOfferRegistered {
+        registration_id: Uuid,
+        publication_generation: u64,
+        offer_id: MobilePairingOfferId,
+        descriptor: protocol::MobileClientBootstrapDescriptor,
+        result: Result<u64, MobileAccessCommandFailure>,
+    },
+    BootstrapOfferRegistrationFailed {
+        offer_id: MobilePairingOfferId,
+    },
+    BootstrapRegistrationFailed {
+        device_id: MobileDeviceId,
+        registration_id: Uuid,
+    },
     RegisterBootstrapSubscriber {
         stream: Stream,
         reply: oneshot::Sender<Result<MobileAccessStatePayload, StreamClosed>>,
@@ -296,6 +316,13 @@ pub(crate) enum MobileAccessCommand {
             oneshot::Sender<Result<protocol::MobileDirectPairResponse, MobileAccessCommandFailure>>,
     },
     /// A direct-hosting WebSocket is presenting a device token.
+    ResolveDirectBootstrap {
+        request: protocol::MobileDirectBootstrapRequest,
+        token: Option<String>,
+        reply: oneshot::Sender<
+            Result<protocol::MobileBootstrapResolution, MobileAccessCommandFailure>,
+        >,
+    },
     AuthenticateDirectDevice {
         token: String,
         reply: oneshot::Sender<Option<MobileDeviceId>>,
@@ -419,6 +446,8 @@ impl MobileAccessCommandFailure {
             MobileAccessErrorCode::TransportFailed => "transport_failed",
             MobileAccessErrorCode::UnknownDevice => "unknown_device",
             MobileAccessErrorCode::RevokedDevice => "revoked_device",
+            MobileAccessErrorCode::BootstrapUnknown => "bootstrap_unknown",
+            MobileAccessErrorCode::NativeAbiIncompatible => "native_abi_incompatible",
             MobileAccessErrorCode::VersionMismatch => "version_mismatch",
             MobileAccessErrorCode::Internal => "internal",
         }
@@ -428,6 +457,12 @@ impl MobileAccessCommandFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AcceptTaskKey {
     Device(MobileDeviceId),
+}
+
+struct BootstrapWaiter {
+    request: protocol::MobileDirectBootstrapRequest,
+    token: Option<String>,
+    reply: oneshot::Sender<Result<protocol::MobileBootstrapResolution, MobileAccessCommandFailure>>,
 }
 
 pub(crate) struct MobileAccessActor {
@@ -455,6 +490,16 @@ pub(crate) struct MobileAccessActor {
     agent_status_transitions: Option<broadcast::Receiver<AgentStatusTransition>>,
     idle_notifier_task: Option<JoinHandle<()>>,
     direct_hosting: DirectHostingState,
+    bootstrap_descriptor:
+        Result<protocol::MobileClientBootstrapDescriptor, MobileAccessCommandFailure>,
+    bootstrap_fetch: Option<JoinHandle<()>>,
+    bootstrap_generation: u64,
+    bootstrap_waiters: Vec<BootstrapWaiter>,
+    native_direct_offer: Option<MobilePairingOfferId>,
+    bootstrap_http: Option<reqwest::Client>,
+    bootstrap_tasks: HashMap<MobileDeviceId, (Uuid, JoinHandle<()>)>,
+    bootstrap_offer_registration: Option<(Uuid, JoinHandle<()>)>,
+    pending_managed_offer: Option<(StreamPath, MobilePairingOfferPayload)>,
 }
 
 /// The direct mobile web server is deliberately independent of
@@ -598,6 +643,104 @@ struct ManagedServiceBaseUrl {
 }
 
 impl ManagedMobileServiceClient {
+    async fn register_bootstrap(
+        &self,
+        endpoint: &str,
+        offer_token: Option<&str>,
+        pairing: Option<&ManagedMobilePairingCredential>,
+        descriptor: &protocol::MobileClientBootstrapDescriptor,
+        expected_generation: Option<u64>,
+    ) -> Result<u64, ManagedServiceError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Generation {
+            generation: u64,
+        }
+        #[derive(Serialize)]
+        struct Registration<'a> {
+            expected_generation: u64,
+            descriptor: &'a protocol::MobileClientBootstrapDescriptor,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            generation: u64,
+            registered_at_ms: u64,
+            expires_at_ms: u64,
+        }
+        let authorize = |request: reqwest::RequestBuilder,
+                         method: &str,
+                         body: &[u8]|
+         -> Result<reqwest::RequestBuilder, ManagedServiceError> {
+            match (offer_token, pairing) {
+                (Some(token), None) => Ok(request.bearer_auth(token)),
+                (None, Some(pairing)) => Ok(request.header(
+                    "x-tycode-pairing-auth",
+                    pairing_auth_header(
+                        &pairing.host_pairing_secret,
+                        method,
+                        &self.base.path_for(endpoint),
+                        body,
+                        PairingRole::Host,
+                        &pairing.pairing_id,
+                    )?,
+                )),
+                _ => Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::Internal,
+                    "Bootstrap registration has no unique authority",
+                )),
+            }
+        };
+        let current = match expected_generation {
+            Some(generation) => Generation { generation },
+            None => {
+                let response = authorize(self.http.get(self.base.url_for(endpoint)), "GET", &[])?
+                    .send()
+                    .await
+                    .map_err(ManagedServiceError::transport)?;
+                parse_managed_response(response).await?
+            }
+        };
+        if current.generation >= 9_007_199_254_740_991 {
+            return Err(ManagedServiceError::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "Bootstrap generation is exhausted",
+            ));
+        }
+        let body = serde_json::to_vec(&Registration {
+            expected_generation: current.generation,
+            descriptor,
+        })
+        .map_err(|_| {
+            ManagedServiceError::new(
+                MobileAccessErrorCode::Internal,
+                "Bootstrap registration could not be encoded",
+            )
+        })?;
+        let response = authorize(
+            self.http
+                .post(self.base.url_for(endpoint))
+                .header("content-type", "application/json"),
+            "POST",
+            &body,
+        )?
+        .body(body)
+        .send()
+        .await
+        .map_err(ManagedServiceError::transport)?;
+        let receipt: Receipt = parse_managed_response(response).await?;
+        if receipt.generation != current.generation + 1
+            || receipt.expires_at_ms <= receipt.registered_at_ms
+            || receipt.expires_at_ms - receipt.registered_at_ms > 120_000
+        {
+            return Err(ManagedServiceError::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "Bootstrap registration receipt is invalid",
+            ));
+        }
+        Ok(receipt.generation)
+    }
+
     async fn mint_host_rtc_credentials(
         &self,
         record: &MobilePairingRecord,
@@ -972,6 +1115,10 @@ enum ManagedErrorCode {
     VersionMismatch,
     ServiceUnavailable,
     RateLimited,
+    BootstrapUnknown,
+    BootstrapStale,
+    BootstrapConflict,
+    NativeAbiIncompatible,
     Internal,
 }
 
@@ -1019,7 +1166,11 @@ impl ManagedErrorBody {
             ManagedErrorCode::RepairRequired => MobileAccessErrorCode::RepairRequired,
             ManagedErrorCode::PairingRevoked => MobileAccessErrorCode::RevokedDevice,
             ManagedErrorCode::VersionMismatch => MobileAccessErrorCode::VersionMismatch,
-            ManagedErrorCode::ServiceUnavailable
+            ManagedErrorCode::NativeAbiIncompatible => MobileAccessErrorCode::NativeAbiIncompatible,
+            ManagedErrorCode::BootstrapUnknown
+            | ManagedErrorCode::BootstrapStale
+            | ManagedErrorCode::BootstrapConflict
+            | ManagedErrorCode::ServiceUnavailable
             | ManagedErrorCode::RateLimited
             | ManagedErrorCode::Internal => MobileAccessErrorCode::ServiceUnavailable,
         };
@@ -1130,6 +1281,15 @@ impl MobileAccessActor {
             init.pairings_store.save(&pairings)?;
         }
         let managed_service = ManagedMobileServiceClient::new(init.managed_service_base_url)?;
+        #[cfg(feature = "test-support")]
+        let bootstrap_http = init.bootstrap_http;
+        #[cfg(not(feature = "test-support"))]
+        let bootstrap_http = Some(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Cannot initialize the trusted mobile publisher client")?,
+        );
         let legacy_repair_changed = mark_legacy_pairings_repair_required(&mut pairings);
         if legacy_repair_changed {
             init.pairings_store.save(&pairings)?;
@@ -1189,10 +1349,25 @@ impl MobileAccessActor {
             agent_status_transitions: Some(init.agent_status_transitions),
             idle_notifier_task: None,
             direct_hosting: DirectHostingState::Disabled,
+            bootstrap_descriptor: Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "Native publication is being resolved",
+            )),
+            bootstrap_fetch: None,
+            bootstrap_generation: 0,
+            bootstrap_waiters: Vec::new(),
+            native_direct_offer: None,
+            bootstrap_http,
+            bootstrap_tasks: HashMap::new(),
+            bootstrap_offer_registration: None,
+            pending_managed_offer: None,
         })
     }
 
     async fn run(mut self) {
+        if self.settings.enable_mobile_connections || self.settings.mobile_direct_hosting_enabled {
+            self.refresh_bootstrap_descriptor();
+        }
         self.spawn_idle_notifier();
         self.apply_direct_hosting();
         if self.settings.enable_mobile_connections {
@@ -1204,6 +1379,104 @@ impl MobileAccessActor {
                 MobileAccessCommand::Shutdown => {
                     self.shutdown_runtime_state().await;
                     break;
+                }
+                MobileAccessCommand::BootstrapPublication {
+                    generation,
+                    result,
+                    finished,
+                } => {
+                    if generation != self.bootstrap_generation {
+                        continue;
+                    }
+                    if finished {
+                        self.bootstrap_fetch = None;
+                    }
+                    let changed = self.bootstrap_descriptor != result;
+                    self.bootstrap_descriptor = result;
+                    if changed {
+                        if self.mobile_pairings_lease.is_some() {
+                            self.retire_changed_client_offer().await;
+                            self.resume_managed_pairing_handoff_if_needed().await;
+                        }
+                        for (_, (_, task)) in self.bootstrap_tasks.drain() {
+                            task.abort();
+                        }
+                        for record in self.pairings.devices.clone().iter().filter(|record| {
+                            record.state != MobileDeviceState::Revoked
+                                && record.state != MobileDeviceState::RepairRequired
+                        }) {
+                            self.spawn_bootstrap_registration(record);
+                        }
+                    }
+                    for BootstrapWaiter {
+                        request,
+                        token,
+                        reply,
+                    } in std::mem::take(&mut self.bootstrap_waiters)
+                    {
+                        let _ =
+                            reply.send(self.resolve_direct_bootstrap(request, token.as_deref()));
+                    }
+                    self.fan_out_state().await;
+                }
+                MobileAccessCommand::BootstrapOfferRegistered {
+                    registration_id,
+                    publication_generation,
+                    offer_id,
+                    descriptor,
+                    result,
+                } => {
+                    if !self
+                        .bootstrap_offer_registration
+                        .as_ref()
+                        .is_some_and(|(current, _)| *current == registration_id)
+                    {
+                        continue;
+                    }
+                    self.bootstrap_offer_registration = None;
+                    if publication_generation != self.bootstrap_generation
+                        || self.bootstrap_descriptor.as_ref().ok() != Some(&descriptor)
+                        || !self.settings.enable_mobile_connections
+                        || self.mobile_pairings_lease.is_none()
+                    {
+                        continue;
+                    }
+                    self.complete_managed_offer_registration(offer_id, descriptor, result)
+                        .await;
+                }
+                MobileAccessCommand::BootstrapOfferRegistrationFailed { offer_id } => {
+                    if self
+                        .pairings
+                        .active_pairing
+                        .as_ref()
+                        .is_some_and(|active| active.offer_id == offer_id)
+                    {
+                        self.connection_status = MobileConnectionStatus::Error {
+                            code: MobileAccessErrorCode::ServiceUnavailable,
+                            message:
+                                "Pairing client registration failed; cancel and create a new offer"
+                                    .into(),
+                        };
+                        self.fan_out_state().await;
+                    }
+                }
+                MobileAccessCommand::BootstrapRegistrationFailed {
+                    device_id,
+                    registration_id,
+                } => {
+                    if self
+                        .bootstrap_tasks
+                        .get(&device_id)
+                        .is_none_or(|(current, _)| *current != registration_id)
+                    {
+                        continue;
+                    }
+                    self.bootstrap_tasks.remove(&device_id);
+                    self.connection_status = MobileConnectionStatus::Error {
+                        code: MobileAccessErrorCode::ServiceUnavailable,
+                        message: "Current host client registration failed; mobile bootstrap is unavailable".into(),
+                    };
+                    self.fan_out_state().await;
                 }
                 MobileAccessCommand::RegisterBootstrapSubscriber { stream, reply } => {
                     let result = self.register_bootstrap_subscriber(stream).await;
@@ -1224,6 +1497,29 @@ impl MobileAccessActor {
                 MobileAccessCommand::RedeemDirectPairing { request, reply } => {
                     let result = self.redeem_direct_pairing(*request).await;
                     let _ = reply.send(result);
+                }
+                MobileAccessCommand::ResolveDirectBootstrap {
+                    request,
+                    token,
+                    reply,
+                } => {
+                    let result = self.resolve_direct_bootstrap(request.clone(), token.as_deref());
+                    let publication_error = self.bootstrap_descriptor.as_ref().err();
+                    if self.bootstrap_http.is_some()
+                        && result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|error| Some(error) == publication_error)
+                    {
+                        self.bootstrap_waiters.push(BootstrapWaiter {
+                            request,
+                            token,
+                            reply,
+                        });
+                        self.refresh_bootstrap_descriptor();
+                    } else {
+                        let _ = reply.send(result);
+                    }
                 }
                 MobileAccessCommand::AuthenticateDirectDevice { token, reply } => {
                     let _ = reply.send(self.authenticate_direct_device(&token));
@@ -1366,9 +1662,89 @@ impl MobileAccessActor {
         self.bootstrap_subscribers.clear();
     }
 
+    fn refresh_bootstrap_descriptor(&mut self) {
+        if self.bootstrap_fetch.is_some() {
+            return;
+        }
+        let Some(http) = self.bootstrap_http.clone() else {
+            self.bootstrap_descriptor = Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::BootstrapUnknown,
+                "Native publication is not configured in this simulation",
+            ));
+            return;
+        };
+        self.bootstrap_generation += 1;
+        let generation = self.bootstrap_generation;
+        let tx = self.tx.clone();
+        self.bootstrap_fetch = Some(tokio::spawn(async move {
+            let mut retry = ACCEPT_RECONNECT_INITIAL;
+            loop {
+                let result = published_bootstrap_descriptor(&http).await;
+                let finished = !matches!(&result, Err(error) if error.code == MobileAccessErrorCode::ServiceUnavailable);
+                if tx
+                    .send(MobileAccessCommand::BootstrapPublication {
+                        generation,
+                        result,
+                        finished,
+                    })
+                    .is_err()
+                    || finished
+                {
+                    return;
+                }
+                // Publication is an online product dependency. Retry transient reads,
+                // never a failed authenticated Service CAS write or a local asset fallback.
+                sleep(retry).await;
+                retry = (retry * 2).min(ACCEPT_RECONNECT_MAX);
+            }
+        }));
+    }
+
+    async fn retire_changed_client_offer(&mut self) {
+        if self.bootstrap_descriptor.is_err() {
+            return;
+        }
+        let current = self.bootstrap_descriptor.as_ref().ok();
+        let changed = self
+            .pairings
+            .active_pairing
+            .as_ref()
+            .and_then(|active| {
+                active
+                    .managed
+                    .as_ref()
+                    .filter(|managed| {
+                        managed
+                            .bootstrap_descriptor
+                            .as_ref()
+                            .is_some_and(|descriptor| Some(descriptor) != current)
+                    })
+                    .map(|_| active.offer_id.clone())
+            })
+            .or_else(|| {
+                self.pairings
+                    .active_direct_pairing
+                    .as_ref()
+                    .filter(|active| {
+                        self.native_direct_offer.as_ref() != Some(&active.offer_id)
+                            && active
+                                .bootstrap_descriptor
+                                .as_ref()
+                                .is_some_and(|descriptor| Some(descriptor) != current)
+                    })
+                    .map(|active| active.offer_id.clone())
+            });
+        if let Some(offer) = changed {
+            self.cancel_pairing(&offer).await;
+        }
+    }
+
     async fn apply_settings(&mut self, settings: HostSettings) {
         let was_enabled = self.settings.enable_mobile_connections;
         self.settings = settings;
+        if self.settings.enable_mobile_connections && self.bootstrap_descriptor.is_err() {
+            self.refresh_bootstrap_descriptor();
+        }
         let direct_hosting_before = self.direct_hosting_status();
         self.apply_direct_hosting();
         let direct_hosting_changed = self.direct_hosting_status() != direct_hosting_before;
@@ -1520,8 +1896,9 @@ impl MobileAccessActor {
             }
         }
 
+        self.retire_changed_client_offer().await;
         self.spawn_managed_device_accepts_if_needed();
-        self.resume_managed_pairing_handoff_if_needed();
+        self.resume_managed_pairing_handoff_if_needed().await;
     }
 
     async fn disable_mobile_access(&mut self) {
@@ -1695,7 +2072,9 @@ impl MobileAccessActor {
                 .await;
             return;
         }
+        self.native_direct_offer = Some(offer_id.clone());
         self.pairings.active_direct_pairing = Some(ActiveDirectMobilePairing {
+            bootstrap_descriptor: self.bootstrap_descriptor.clone().ok(),
             offer_id: offer_id.clone(),
             secret_hash: token_hash(&secret),
             created_at_ms,
@@ -1734,6 +2113,13 @@ impl MobileAccessActor {
         code: MobileAccessErrorCode,
         message: String,
     ) {
+        if self
+            .pending_managed_offer
+            .as_ref()
+            .is_some_and(|(_, offer)| offer.offer_id == offer_id)
+        {
+            self.pending_managed_offer = None;
+        }
         self.pairing = MobilePairingState::Failed {
             offer_id,
             code,
@@ -1817,6 +2203,7 @@ impl MobileAccessActor {
         // Single use: the offer is spent even though the device has not
         // connected yet.
         self.pairings.active_direct_pairing = None;
+        self.native_direct_offer = None;
         self.pairings_store
             .save(&self.pairings)
             .map_err(|message| {
@@ -1833,6 +2220,99 @@ impl MobileAccessActor {
             device_token: protocol::MobileDeviceToken(token),
             host_label: "Tyde Host".to_owned(),
             protocol_version: PROTOCOL_VERSION,
+        })
+    }
+
+    fn resolve_direct_bootstrap(
+        &self,
+        request: protocol::MobileDirectBootstrapRequest,
+        token: Option<&str>,
+    ) -> Result<protocol::MobileBootstrapResolution, MobileAccessCommandFailure> {
+        let failure = |code, message: &str| MobileAccessCommandFailure::new(code, message);
+        if !self.settings.enable_mobile_connections || !self.settings.mobile_direct_hosting_enabled
+        {
+            return Err(failure(
+                MobileAccessErrorCode::InvalidConfig,
+                "Mobile hosting is disabled",
+            ));
+        }
+        let now = now_ms()
+            .map_err(|_| failure(MobileAccessErrorCode::Internal, "Host clock is unavailable"))?;
+        let (binding, expires_at_ms) = match (token, request.offer_id, request.offer_secret) {
+            (Some(token), None, None) => {
+                let device = self.authenticate_direct_device(token).ok_or_else(|| {
+                    failure(
+                        MobileAccessErrorCode::RevokedDevice,
+                        "This device pairing is unavailable",
+                    )
+                })?;
+                (
+                    protocol::MobileBootstrapBinding::Device(device),
+                    now.saturating_add(120_000),
+                )
+            }
+            (None, Some(offer_id), Some(secret)) => {
+                let active = self
+                    .pairings
+                    .active_direct_pairing
+                    .as_ref()
+                    .ok_or_else(|| {
+                        failure(
+                            MobileAccessErrorCode::PairingRejected,
+                            "This offer is no longer current",
+                        )
+                    })?;
+                if active.offer_id != offer_id
+                    || now >= active.expires_at_ms
+                    || !constant_time_eq(
+                        active.secret_hash.as_bytes(),
+                        token_hash(&secret).as_bytes(),
+                    )
+                {
+                    return Err(failure(
+                        MobileAccessErrorCode::PairingRejected,
+                        "This offer is invalid or expired",
+                    ));
+                }
+                self.bootstrap_descriptor.as_ref().map_err(Clone::clone)?;
+                // A freshly issued offer belongs to this running host even if
+                // publication completed after its QR was created. Persisted
+                // offers still require their original target to match.
+                if self.native_direct_offer.as_ref() != Some(&offer_id)
+                    && active.bootstrap_descriptor.as_ref()
+                        != self.bootstrap_descriptor.as_ref().ok()
+                {
+                    return Err(failure(
+                        MobileAccessErrorCode::PairingRejected,
+                        "This host client changed; create a new pairing offer",
+                    ));
+                }
+                (
+                    protocol::MobileBootstrapBinding::Offer(offer_id),
+                    active.expires_at_ms.min(now.saturating_add(120_000)),
+                )
+            }
+            _ => {
+                return Err(failure(
+                    MobileAccessErrorCode::InvalidConfig,
+                    "Bootstrap requires one pairing authority",
+                ));
+            }
+        };
+        let descriptor = self.bootstrap_descriptor.as_ref().map_err(Clone::clone)?;
+        if request.native_bridge_abi != descriptor.native_bridge_abi {
+            return Err(failure(
+                MobileAccessErrorCode::NativeAbiIncompatible,
+                "This client requires a different native bridge",
+            ));
+        }
+        Ok(protocol::MobileBootstrapResolution {
+            binding,
+            descriptor: descriptor.clone(),
+            generation: 1,
+            registered_at_ms: now,
+            expires_at_ms,
+            resolved_at_ms: now,
         })
     }
 
@@ -1958,6 +2438,8 @@ impl MobileAccessActor {
             created_at_ms,
             key_fingerprint,
             managed: Some(ActiveManagedMobilePairingCredential {
+                bootstrap_descriptor: self.bootstrap_descriptor.clone().ok(),
+                bootstrap_generation: None,
                 host_offer_token: response.host_offer_token,
                 pairing_url: pairing_url.clone(),
 
@@ -1987,16 +2469,30 @@ impl MobileAccessActor {
         };
         self.connection_status = MobileConnectionStatus::Connecting;
         self.schedule_pairing_ttl(offer_id.clone(), response.expires_at_ms);
-        self.spawn_offer_poll(credential);
+        self.pending_managed_offer = Some((
+            requester,
+            MobilePairingOfferPayload {
+                offer_id,
+                qr_uri: MobilePairingQrUri(pairing_url),
+                expires_at_ms: response.expires_at_ms,
+            },
+        ));
+        self.resume_managed_pairing_handoff_if_needed().await;
         self.fan_out_state().await;
+        if self.bootstrap_descriptor.is_err() {
+            self.publish_pending_managed_offer().await;
+        }
+    }
 
-        let Some(stream) = self.subscribers.get(&requester).cloned() else {
+    async fn publish_pending_managed_offer(&mut self) {
+        let Some((requester, offer)) = self.pending_managed_offer.take() else {
             return;
         };
-        let offer = MobilePairingOfferPayload {
-            offer_id,
-            qr_uri: MobilePairingQrUri(pairing_url),
-            expires_at_ms: response.expires_at_ms,
+        if self.active_pairing_offer_id() != Some(&offer.offer_id) {
+            return;
+        }
+        let Some(stream) = self.subscribers.get(&requester).cloned() else {
+            return;
         };
         if send_mobile_pairing_offer(&stream, &offer).await.is_err() {
             self.subscribers.remove(&requester);
@@ -2066,6 +2562,9 @@ impl MobileAccessActor {
             .accept_tasks
             .remove(&AcceptTaskKey::Device(device_id.clone()))
         {
+            task.abort();
+        }
+        if let Some((_, task)) = self.bootstrap_tasks.remove(device_id) {
             task.abort();
         }
         if let Some(task) = self.connected_tasks.remove(device_id) {
@@ -2566,6 +3065,15 @@ impl MobileAccessActor {
             return;
         }
         self.pairings = persisted_pairings;
+        if let Some(record) = self
+            .pairings
+            .devices
+            .iter()
+            .find(|record| record.device_id == device_id)
+            .cloned()
+        {
+            self.spawn_bootstrap_registration(&record);
+        }
         self.pairing = MobilePairingState::Consumed {
             offer_id: offer_id.clone(),
         };
@@ -2852,7 +3360,7 @@ impl MobileAccessActor {
         }
     }
 
-    fn resume_managed_pairing_handoff_if_needed(&mut self) {
+    async fn resume_managed_pairing_handoff_if_needed(&mut self) {
         if let Some(pending) = self.pairings.pending_handoff_ack.clone() {
             self.schedule_handoff_ack_retry(
                 pending.offer_id,
@@ -2862,11 +3370,142 @@ impl MobileAccessActor {
             );
             return;
         }
-        if let Some(active) = self.pairings.active_pairing.clone()
+        if let Some(mut active) = self.pairings.active_pairing.clone()
+            && let Some(managed) = &active.managed
+        {
+            let Ok(descriptor) = self.bootstrap_descriptor.clone() else {
+                // Keep browser handoff polling independent of native publication,
+                // without renewing a descriptor that has not been confirmed yet.
+                let polling = active.managed.as_mut().expect("managed offer");
+                polling.bootstrap_descriptor = None;
+                polling.bootstrap_generation = None;
+                self.spawn_offer_poll(active);
+                return;
+            };
+            if managed
+                .bootstrap_descriptor
+                .as_ref()
+                .is_some_and(|previous| previous != &descriptor)
+            {
+                self.cancel_pairing(&active.offer_id).await;
+                return;
+            }
+            if let Some(task) = self.offer_poll_task.take() {
+                task.abort();
+            }
+            if let Some((_, task)) = self.bootstrap_offer_registration.take() {
+                task.abort();
+            }
+            let service = self.managed_service.clone();
+            let tx = self.tx.clone();
+            let offer_id = active.offer_id.clone();
+            let token = managed.host_offer_token.clone();
+            let registration_id = Uuid::new_v4();
+            let publication_generation = self.bootstrap_generation;
+            let task = tokio::spawn(async move {
+                let endpoint = format!("/host/offers/{}/bootstrap", offer_id.as_str());
+                let result = service
+                    .register_bootstrap(&endpoint, Some(&token), None, &descriptor, None)
+                    .await
+                    .map_err(|error| {
+                        MobileAccessCommandFailure::new(
+                            error.code,
+                            "Current host client registration could not resume",
+                        )
+                    });
+                let _ = tx.send(MobileAccessCommand::BootstrapOfferRegistered {
+                    registration_id,
+                    publication_generation,
+                    offer_id,
+                    descriptor,
+                    result,
+                });
+            });
+            self.bootstrap_offer_registration = Some((registration_id, task));
+        }
+    }
+
+    async fn complete_managed_offer_registration(
+        &mut self,
+        offer_id: MobilePairingOfferId,
+        descriptor: protocol::MobileClientBootstrapDescriptor,
+        result: Result<u64, MobileAccessCommandFailure>,
+    ) {
+        if let Some(mut active) = self.pairings.active_pairing.clone()
+            && active.offer_id == offer_id
             && active.managed.is_some()
         {
+            let generation = match result {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.fail_pairing(offer_id, error.code, error.message).await;
+                    return;
+                }
+            };
+            let registration = active.managed.as_mut().expect("managed offer");
+            registration.bootstrap_descriptor = Some(descriptor);
+            registration.bootstrap_generation = Some(generation);
+            self.pairings.active_pairing = Some(active.clone());
+            if let Err(message) = self.pairings_store.save(&self.pairings) {
+                self.fail_pairing(
+                    active.offer_id,
+                    MobileAccessErrorCode::StoreLoadFailed,
+                    message,
+                )
+                .await;
+                return;
+            }
             self.spawn_offer_poll(active);
+            self.publish_pending_managed_offer().await;
         }
+    }
+
+    fn spawn_bootstrap_registration(&mut self, record: &MobilePairingRecord) {
+        if !self.settings.enable_mobile_connections {
+            return;
+        }
+        if self
+            .pairings
+            .pending_handoff_ack
+            .as_ref()
+            .is_some_and(|pending| pending.device_id == record.device_id)
+        {
+            return;
+        }
+        if self.bootstrap_tasks.contains_key(&record.device_id) {
+            return;
+        }
+        let (Ok(descriptor), Some(managed)) = (&self.bootstrap_descriptor, &record.managed) else {
+            return;
+        };
+        let descriptor = descriptor.clone();
+        let managed = managed.clone();
+        let service = self.managed_service.clone();
+        let tx = self.tx.clone();
+        let device_id = record.device_id.clone();
+        let registration_id = Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            let endpoint = format!("/pairings/{}/bootstrap", managed.pairing_id);
+            let mut generation = None;
+            loop {
+                let result = service
+                    .register_bootstrap(&endpoint, None, Some(&managed), &descriptor, generation)
+                    .await;
+                if let Ok(next) = result {
+                    generation = Some(next);
+                } else {
+                    let _ = tx.send(MobileAccessCommand::BootstrapRegistrationFailed {
+                        device_id,
+                        registration_id,
+                    });
+                    return;
+                }
+                // Product lease renewal, not test synchronization or a retry of a failed write.
+                sleep(Duration::from_secs(60)).await;
+            }
+        });
+        self.bootstrap_tasks
+            .insert(record.device_id.clone(), (registration_id, task));
     }
 
     fn spawn_device_accept(&mut self, device_id: MobileDeviceId) {
@@ -2888,6 +3527,7 @@ impl MobileAccessActor {
         {
             return;
         }
+        self.spawn_bootstrap_registration(&record);
         let task = spawn_device_accept_task(self.tx.clone(), self.managed_service.clone(), record);
         self.accept_tasks.insert(key, task);
     }
@@ -2903,6 +3543,7 @@ impl MobileAccessActor {
             device_id.clone(),
             instance_id,
             stream,
+            self.bootstrap_descriptor.clone().ok(),
         ));
         self.connected_tasks
             .insert(device_id, ConnectedMobileTask { instance_id, task });
@@ -2928,6 +3569,9 @@ impl MobileAccessActor {
             self.managed_service.clone(),
             credential.offer_id,
             managed.host_offer_token,
+            managed
+                .bootstrap_descriptor
+                .zip(managed.bootstrap_generation),
             initial_delay,
         ));
     }
@@ -2994,6 +3638,11 @@ impl MobileAccessActor {
         retired.active_direct_pairing = None;
         self.pairings_store.save(&retired)?;
         self.pairings = retired;
+        self.native_direct_offer = None;
+        self.pending_managed_offer = None;
+        if let Some((_, task)) = self.bootstrap_offer_registration.take() {
+            task.abort();
+        }
         if let Some(task) = self.pairing_ttl_task.take() {
             task.abort();
         }
@@ -3008,6 +3657,17 @@ impl MobileAccessActor {
     }
 
     fn abort_all_tasks(&mut self) {
+        if let Some((_, task)) = self.bootstrap_offer_registration.take() {
+            task.abort();
+        }
+        if let Some(task) = self.bootstrap_fetch.take() {
+            task.abort();
+        }
+        self.bootstrap_generation += 1;
+        self.bootstrap_waiters.clear();
+        for (_, (_, task)) in self.bootstrap_tasks.drain() {
+            task.abort();
+        }
         for (_, task) in self.accept_tasks.drain() {
             task.abort();
         }
@@ -3103,10 +3763,13 @@ fn spawn_offer_poll_task(
     managed_service: ManagedMobileServiceClient,
     offer_id: MobilePairingOfferId,
     host_offer_token: String,
+    bootstrap: Option<(protocol::MobileClientBootstrapDescriptor, u64)>,
     initial_delay: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         sleep(initial_delay).await;
+        let mut bootstrap = bootstrap;
+        let mut renew_at = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             let result = managed_service
                 .poll_host_offer(&offer_id, &host_offer_token)
@@ -3114,6 +3777,34 @@ fn spawn_offer_poll_task(
             match result {
                 Ok(response) => match managed_handoff_from_poll_response(&offer_id, response) {
                     Ok(ManagedPollOutcome::Pending) => {
+                        if tokio::time::Instant::now() >= renew_at
+                            && let Some((descriptor, generation)) = bootstrap.take()
+                        {
+                            let endpoint = format!("/host/offers/{}/bootstrap", offer_id.as_str());
+                            match managed_service
+                                .register_bootstrap(
+                                    &endpoint,
+                                    Some(&host_offer_token),
+                                    None,
+                                    &descriptor,
+                                    Some(generation),
+                                )
+                                .await
+                            {
+                                Ok(next) => {
+                                    bootstrap = Some((descriptor, next));
+                                    renew_at =
+                                        tokio::time::Instant::now() + Duration::from_secs(60);
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(
+                                        MobileAccessCommand::BootstrapOfferRegistrationFailed {
+                                            offer_id: offer_id.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         sleep(OFFER_POLL_INTERVAL).await;
                     }
                     Ok(ManagedPollOutcome::Redeemed(handoff)) => {
@@ -3299,8 +3990,9 @@ async fn bridge_authenticated_mobile(
     device_id: MobileDeviceId,
     connection_instance_id: u64,
     stream: BoxedMobileTransport,
+    descriptor: Option<protocol::MobileClientBootstrapDescriptor>,
 ) {
-    match accept(&ServerConfig::current(), stream).await {
+    match crate::acceptor::accept_mobile(&ServerConfig::current(), stream, descriptor).await {
         Ok(connection) => {
             if let Err(err) = run_mobile_connection(connection, host, device_id.clone()).await {
                 tracing::warn!(device_id = %device_id, error = ?err, "mobile Tyde connection ended with frame error");
@@ -3505,4 +4197,34 @@ where
     }) {
         tracing::error!(error = %err, "failed to spawn mobile access worker thread");
     }
+}
+
+async fn published_bootstrap_descriptor(
+    http: &reqwest::Client,
+) -> Result<protocol::MobileClientBootstrapDescriptor, MobileAccessCommandFailure> {
+    let transport = || {
+        MobileAccessCommandFailure::new(
+            MobileAccessErrorCode::ServiceUnavailable,
+            "Trusted mobile publication is temporarily unavailable",
+        )
+    };
+    let incompatible =
+        |message| MobileAccessCommandFailure::new(MobileAccessErrorCode::BootstrapUnknown, message);
+    let mut response = http
+        .get(env!("TYDE_NATIVE_PUBLISHER_URL"))
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .send()
+        .await
+        .map_err(|_| transport())?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(transport());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| transport())? {
+        if bytes.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+            return Err(incompatible("Published mobile catalog is too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    MobileWebAssets::published_bootstrap_descriptor(&bytes).map_err(incompatible)
 }

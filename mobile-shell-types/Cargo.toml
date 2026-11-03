@@ -5,8 +5,6 @@ edition.workspace = true
 [dependencies]
 protocol = { path = "../protocol", default-features = false }
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
 
 [build-dependencies]

@@ -326,3 +326,27 @@ or qualify a native application. Keep the reserved HTTPS origin on the same
 actual host/listener and perform the owner's publisher-readiness checks before
 issuing the one JIT offer. Never pass standalone inputs to `mobile-direct` or
 construct DEV Ready to make a different mode accept them.
+
+### Explicit origin recovery after a process restart
+
+For an already configured disposable host, a new standalone run may use
+`transition_origin` with `previous`, `previous_run` and `origin_path`. It attests
+the current live kernel peer/image/stores normally, then verifies the original
+unoffered Configured/OriginSet receipt against its original private run. Exact
+store environment, socket, project, immutable bundle/inventory, Welcome and
+persisted settings must match; current hosting must be Online with no agents,
+sessions, devices or pairing offer. It claims the old receipt once through its
+normal `.used` marker, never rewrites it or invents old process liveness, and
+CAS-writes only the new public origin. The new OriginSet receipt binds current
+process custody and `origin_transition_seed_sha256`; subsequent offer/revoke/
+disable uses that new run and executable. No automatic recovery/fallback or
+reuse of failed/claimed/offered receipts. Original Configure/DEV guards remain.
+
+An expired-unused `Reoffered` receipt can seed the next `offer` operation,
+without a renewal-count limit. Every step freshly attests the same live peer,
+stores, run, settings and Online listener; requires the prior receipt's exact
+Active offer with no devices, actual elapsed UTC expiry and current authoritative
+Expired/Idle retirement; and claims the immediately preceding receipt once.
+The next receipt links `superseded_receipt_sha256` to that preceding receipt's
+exact hash. Preserve every original receipt, claim and payload. No TTL extension,
+clock substitution, old-seed reuse or clearing of failed claims is supported.

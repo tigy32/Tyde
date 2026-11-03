@@ -149,6 +149,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         protocol_version: PROTOCOL_VERSION,
         tyde_version: TYDE_VERSION,
         release_version: None,
+        mobile_client_bootstrap: None,
     };
     let mut bootstrap = BootstrapHostPayload {
         workbench_support: Default::default(),

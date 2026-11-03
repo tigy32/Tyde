@@ -810,7 +810,11 @@ async fn redeem_live(
         offer_secret: offer.offer_secret.clone(),
         device_label: "Tyde Mobile".to_owned(),
         device_nonce: nonce(),
-        release_version: TYDE_VERSION.to_string(),
+        release_version: if crate::native::is_native() {
+            mobile_shell_types::native::NATIVE_CLIENT_RELEASE.into()
+        } else {
+            TYDE_VERSION.to_string()
+        },
         protocol_version: PROTOCOL_VERSION,
         transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
     };
@@ -897,6 +901,19 @@ async fn finish_redeem(
         return Err(RedeemOutcome::Terminal { message });
     }
 
+    if crate::native::is_native() {
+        super::connection::manager()
+            .disconnect_others(&local_host_id)
+            .map_err(|message| RedeemOutcome::Terminal { message })?;
+        crate::bridge::loader::native_pairing_saved(&local_host_id)
+            .await
+            .map_err(|message| RedeemOutcome::Terminal { message })?;
+        crate::bridge::loader::save_selection(Some(&local_host_id)).map_err(|reason| {
+            RedeemOutcome::Terminal {
+                message: reason.message().into(),
+            }
+        })?;
+    }
     super::emit_paired_hosts_changed().await;
     super::connection::manager()
         .connect(local_host_id.clone())

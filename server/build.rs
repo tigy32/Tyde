@@ -20,6 +20,35 @@ const MAX_EMBEDDED_FILES: usize = 4096;
 const MAX_EMBEDDED_BYTES: u64 = 128 * 1024 * 1024;
 
 fn main() {
+    println!("cargo::rerun-if-env-changed=TYDE_NATIVE_QA_ORIGIN");
+    let publisher = match std::env::var("TYDE_NATIVE_QA_ORIGIN") {
+        Ok(origin) => {
+            assert_eq!(
+                std::env::var("PROFILE").as_deref(),
+                Ok("debug"),
+                "QA native publication requires a Debug build"
+            );
+            let parsed = url::Url::parse(&origin).expect("explicit QA HTTPS origin");
+            assert!(
+                parsed.scheme() == "https"
+                    && parsed.host_str().is_some()
+                    && parsed.host_str() != Some("tycode.dev")
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.path() == "/"
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none(),
+                "QA native publication requires a separate HTTPS origin"
+            );
+            parsed
+                .join("tyde/manifest.json")
+                .expect("QA publication URL")
+                .to_string()
+        }
+        Err(std::env::VarError::NotPresent) => "https://tycode.dev/tyde/manifest.json".to_owned(),
+        Err(_) => panic!("QA native publication origin must be Unicode"),
+    };
+    println!("cargo::rustc-env=TYDE_NATIVE_PUBLISHER_URL={publisher}");
     println!("cargo::rerun-if-env-changed=TYDE_MOBILE_BUNDLE_DIR");
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));

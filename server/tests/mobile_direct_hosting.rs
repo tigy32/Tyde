@@ -844,3 +844,1199 @@ async fn direct_websocket_refuses_an_unknown_device_token() {
         "an unauthenticated upgrade must be refused"
     );
 }
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ThinServiceSession {
+    endpoint: String,
+    cookie: String,
+    service_commit: String,
+}
+struct ThinRegistrationFault {
+    offer_path: String,
+    pairing: std::sync::OnceLock<String>,
+    failed: std::sync::atomic::AtomicBool,
+}
+struct ThinRegistrationHold {
+    path: std::sync::OnceLock<String>,
+    held: std::sync::atomic::AtomicBool,
+    arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::Notify,
+}
+struct ThinService {
+    session: ThinServiceSession,
+    registrations: tokio::sync::mpsc::UnboundedReceiver<String>,
+    failure_scope: std::sync::Arc<std::sync::OnceLock<ThinRegistrationFault>>,
+    failed_registrations: tokio::sync::mpsc::UnboundedReceiver<()>,
+    held_registration: std::sync::Arc<std::sync::OnceLock<ThinRegistrationHold>>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for ThinService {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl ThinService {
+    async fn start(file: &std::path::Path) -> Self {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            extract::{Request, State},
+            response::Response,
+        };
+        #[derive(Clone)]
+        struct Proxy {
+            origin: String,
+            http: reqwest::Client,
+            completed: tokio::sync::mpsc::UnboundedSender<String>,
+            failure_scope: std::sync::Arc<std::sync::OnceLock<ThinRegistrationFault>>,
+            failed_registrations: tokio::sync::mpsc::UnboundedSender<()>,
+            held_registration: std::sync::Arc<std::sync::OnceLock<ThinRegistrationHold>>,
+        }
+        async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
+            let (parts, body) = request.into_parts();
+            let body = to_bytes(body, 1024 * 1024)
+                .await
+                .expect("bounded private Service request");
+            let path = parts.uri.path_and_query().expect("Service path").as_str();
+            let registration = parts.method == axum::http::Method::POST
+                && parts.uri.path().ends_with("/bootstrap");
+            if registration
+                && let Some(hold) = proxy.held_registration.get()
+                && hold.path.get().is_some_and(|path| parts.uri.path() == path)
+                && !hold.held.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                hold.arrived.send(()).expect("owned registration arrival");
+                hold.release.notified().await;
+            }
+            if registration
+                && let Some(fault) = proxy.failure_scope.get()
+                && fault.pairing.get().is_some_and(|pairing| {
+                    parts.uri.path() == format!("/api/tyde/mobile/v1/pairings/{pairing}/bootstrap")
+                })
+                && !fault.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = proxy.failed_registrations.send(());
+                return Response::builder().status(503).body(Body::empty()).unwrap();
+            }
+            let mut headers = parts.headers;
+            headers.remove(axum::http::header::HOST);
+            let response = proxy
+                .http
+                .request(parts.method, format!("{}{path}", proxy.origin))
+                .headers(headers)
+                .body(body)
+                .send()
+                .await
+                .unwrap_or_else(|_| panic!("actual local Service command failed"));
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = response
+                .bytes()
+                .await
+                .unwrap_or_else(|_| panic!("actual Service response did not complete"));
+            if status.is_success()
+                && let Some(fault) = proxy.failure_scope.get()
+                && parts.uri.path() == fault.offer_path
+            {
+                let response: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("actual offer poll JSON");
+                if let Some(pairing) = response["pairing_id"].as_str() {
+                    if let Some(previous) = fault.pairing.get() {
+                        assert!(previous == pairing, "actual offer binding must not change");
+                    } else {
+                        assert!(
+                            fault.pairing.set(pairing.to_owned()).is_ok(),
+                            "one authoritative offer binding"
+                        );
+                    }
+                }
+            }
+            if status.is_success()
+                && parts.uri.path() == "/api/tyde/mobile/v1/host/offers"
+                && let Some(hold) = proxy.held_registration.get()
+            {
+                let created: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("actual Service offer response");
+                let offer = created["offer_id"]
+                    .as_str()
+                    .expect("actual created offer identity");
+                if hold.path.get().is_none() {
+                    assert!(
+                        hold.path
+                            .set(format!("/api/tyde/mobile/v1/host/offers/{offer}/bootstrap"))
+                            .is_ok(),
+                        "one actual fresh offer binding"
+                    );
+                }
+            }
+            if registration && status.is_success() {
+                let _ = proxy.completed.send(parts.uri.path().to_owned());
+            }
+            let mut result = Response::new(Body::from(bytes));
+            *result.status_mut() = status;
+            *result.headers_mut() = headers;
+            result
+        }
+        let mut session: ThinServiceSession = serde_json::from_slice(
+            &tokio::fs::read(file)
+                .await
+                .expect("private routed Service fixture file"),
+        )
+        .expect("routed Service fixture schema");
+        assert!(
+            session.service_commit == "c9d701823b2fb6bfefb1adc0e3fb4f8dee7c2fdd",
+            "Service fixture source must match routed source"
+        );
+        let url = url::Url::parse(&session.endpoint).expect("routed endpoint URL");
+        let host: std::net::IpAddr = url
+            .host_str()
+            .expect("local fixture host")
+            .parse()
+            .expect("literal loopback fixture");
+        assert!(
+            url.scheme() == "http" && host.is_loopback(),
+            "integration is scoped to the routed local Service fixture"
+        );
+        let (completed, registrations) = tokio::sync::mpsc::unbounded_channel();
+        let (failed_tx, failed_registrations) = tokio::sync::mpsc::unbounded_channel();
+        let failure_scope = std::sync::Arc::new(std::sync::OnceLock::new());
+        let held_registration = std::sync::Arc::new(std::sync::OnceLock::new());
+        let proxy = Proxy {
+            origin: url.origin().ascii_serialization(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            completed,
+            failure_scope: failure_scope.clone(),
+            failed_registrations: failed_tx,
+            held_registration: held_registration.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        session.endpoint = format!(
+            "http://{}/api/tyde/mobile/v1",
+            listener.local_addr().unwrap()
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(forward).with_state(proxy))
+                .await
+                .expect("owned transparent Service transport");
+        });
+        Self {
+            session,
+            registrations,
+            failure_scope,
+            failed_registrations,
+            held_registration,
+            task,
+        }
+    }
+    fn hold_next_offer_registration(&self) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        let (arrived, receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            self.held_registration
+                .set(ThinRegistrationHold {
+                    path: std::sync::OnceLock::new(),
+                    held: std::sync::atomic::AtomicBool::new(false),
+                    arrived,
+                    release: tokio::sync::Notify::new(),
+                })
+                .is_ok(),
+            "one explicit registration hold"
+        );
+        receiver
+    }
+    fn fail_pairing_registration(&self, offer: &protocol::MobilePairingOfferId) {
+        assert!(
+            self.failure_scope
+                .set(ThinRegistrationFault {
+                    offer_path: format!("/api/tyde/mobile/v1/host/offers/{}", offer.as_str()),
+                    pairing: std::sync::OnceLock::new(),
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                })
+                .is_ok(),
+            "one resource-scoped registration failure"
+        );
+    }
+    async fn registered(&mut self, pairing: &str) {
+        self.registered_path(format!("/api/tyde/mobile/v1/pairings/{pairing}/bootstrap"))
+            .await;
+    }
+    async fn registered_path(&mut self, expected: String) {
+        while let Some(path) = self.registrations.recv().await {
+            if path == expected {
+                return;
+            }
+        }
+        panic!("actual host registration transport ended before receipt");
+    }
+}
+
+async fn thin_managed_offer(fixture: &mut Fixture) -> protocol::MobilePairingQrUri {
+    send_host_payload(
+        &mut fixture.client,
+        FrameKind::MobilePairingStart,
+        &MobilePairingStartPayload { direct: false },
+    )
+    .await;
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "actual managed offer registered",
+        |event| {
+            assert!(
+                event.kind != FrameKind::CommandError,
+                "real host rejected managed offer creation"
+            );
+            if event.kind == FrameKind::MobileAccessState {
+                assert!(
+                    !matches!(
+                        event
+                            .parse_payload::<MobileAccessStatePayload>()
+                            .unwrap()
+                            .pairing,
+                        MobilePairingState::Failed { .. }
+                    ),
+                    "real host failed managed offer registration"
+                );
+            }
+            event.kind == FrameKind::MobilePairingOffer
+        },
+    )
+    .await
+    .parse_payload::<MobilePairingOfferPayload>()
+    .unwrap()
+    .qr_uri
+}
+
+// The first native ABI is retained while current full clients are built from
+// actual source. A configured older executable additionally proves process,
+// store, wire and asset handover; it is never emulated by editing versions.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ThinLaunch {
+    control: std::net::SocketAddr,
+    challenge: String,
+    store: std::path::PathBuf,
+    bundle: std::path::PathBuf,
+    origin: String,
+    service: Option<String>,
+    publisher: ThinPublisher,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ThinPublisher {
+    proxy: String,
+    certificate: String,
+}
+impl ThinPublisher {
+    fn client(&self) -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::HeaderName::from_static("x-tyde-native-publication-sim"),
+                reqwest::header::HeaderValue::from_static("1"),
+            )]))
+            .proxy(reqwest::Proxy::https(&self.proxy).expect("owned publisher transport"))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(self.certificate.as_bytes())
+                    .expect("owned publisher CA"),
+            )
+            .build()
+            .expect("owned HTTPS publisher client")
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ThinControl {
+    Ready {
+        challenge: String,
+        address: String,
+        protocol: u32,
+        release: String,
+    },
+    Offer {
+        qr_uri: protocol::MobilePairingQrUri,
+    },
+    DirectOffer,
+    ManagedOffer,
+    Stop {
+        expected_devices: usize,
+    },
+    Stopped {
+        session: protocol::SessionId,
+        devices: Vec<protocol::MobileDeviceId>,
+    },
+}
+
+struct ThinChannel {
+    read: tokio::io::Lines<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    write: tokio::net::tcp::OwnedWriteHalf,
+}
+impl ThinChannel {
+    fn new(socket: tokio::net::TcpStream) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let (read, write) = socket.into_split();
+        Self {
+            read: tokio::io::BufReader::new(read).lines(),
+            write,
+        }
+    }
+    async fn send(&mut self, value: &ThinControl) {
+        use tokio::io::AsyncWriteExt;
+        self.write
+            .write_all(format!("{}\n", serde_json::to_string(value).unwrap()).as_bytes())
+            .await
+            .expect("private host control write");
+    }
+    async fn receive(&mut self) -> ThinControl {
+        let line = self
+            .read
+            .next_line()
+            .await
+            .expect("private host control read")
+            .expect("owned host exited before its event");
+        serde_json::from_str(&line).unwrap_or_else(|_| panic!("invalid private host event"))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ThinBaselineCustody {
+    source_commit: String,
+    protocol_version: u32,
+    executable: std::path::PathBuf,
+    executable_sha256: String,
+    client_archive: std::path::PathBuf,
+    client_archive_sha256: String,
+}
+struct ThinSource {
+    custody: Option<ThinBaselineCustody>,
+    bundle: Option<tempfile::TempDir>,
+    executable: std::path::PathBuf,
+    directory: std::path::PathBuf,
+    expected_protocol: u32,
+}
+impl ThinSource {
+    async fn load(record: Option<&std::path::Path>, current: &std::path::Path) -> Self {
+        use sha2::Digest;
+        let (custody, bundle, executable, directory, expected_protocol) = match record {
+            Some(record) => {
+                let custody: ThinBaselineCustody = serde_json::from_slice(
+                    &tokio::fs::read(record)
+                        .await
+                        .expect("baseline custody file"),
+                )
+                .expect("baseline custody schema");
+                for (file, expected) in [
+                    (&custody.executable, &custody.executable_sha256),
+                    (&custody.client_archive, &custody.client_archive_sha256),
+                ] {
+                    let bytes = tokio::fs::read(file)
+                        .await
+                        .expect("retained source artifact");
+                    assert!(
+                        format!("{:x}", sha2::Sha256::digest(bytes)) == *expected,
+                        "retained source artifact differs from custody"
+                    );
+                }
+                assert!(
+                    custody.protocol_version != protocol::PROTOCOL_VERSION,
+                    "cross-source proof requires genuinely different wire revisions"
+                );
+                let bundle = tempfile::tempdir().unwrap();
+                assert!(
+                    tokio::process::Command::new("tar")
+                        .arg("-xzf")
+                        .arg(&custody.client_archive)
+                        .arg("-C")
+                        .arg(bundle.path())
+                        .status()
+                        .await
+                        .unwrap()
+                        .success()
+                );
+                let directory = bundle.path().to_owned();
+                let executable = custody.executable.clone();
+                let expected = custody.protocol_version;
+                (Some(custody), Some(bundle), executable, directory, expected)
+            }
+            None => (
+                None,
+                None,
+                std::env::current_exe().expect("current checked test executable"),
+                current.to_owned(),
+                protocol::PROTOCOL_VERSION,
+            ),
+        };
+        Self {
+            custody,
+            bundle,
+            executable,
+            directory,
+            expected_protocol,
+        }
+    }
+}
+struct ThinBaseline {
+    child: tokio::process::Child,
+    control: ThinChannel,
+    address: String,
+    release: String,
+}
+impl ThinBaseline {
+    async fn start(
+        source: &ThinSource,
+        store: &std::path::Path,
+        origin: &str,
+        service: Option<&str>,
+        publisher: &ThinPublisher,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let challenge = uuid::Uuid::new_v4().to_string();
+        let launch = ThinLaunch {
+            control: listener.local_addr().unwrap(),
+            challenge: challenge.clone(),
+            store: store.to_owned(),
+            bundle: source.directory.clone(),
+            origin: origin.into(),
+            service: service.map(str::to_owned),
+            publisher: publisher.clone(),
+        };
+        let mut child = tokio::process::Command::new(&source.executable)
+            .args([
+                "--exact",
+                "native_shell_loads_exact_clients_with_retained_pairing",
+                "--nocapture",
+            ])
+            .env(
+                "TYDE_THIN_BASELINE_CONTROL",
+                serde_json::to_string(&launch).unwrap(),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned actual server process");
+        let (socket, _) = tokio::select! {socket=listener.accept()=>socket.expect("private process control"),status=child.wait()=>panic!("source process exited before readiness; success={}",status.expect("source exit event").success())};
+        let mut control = ThinChannel::new(socket);
+        let ThinControl::Ready {
+            challenge: received,
+            address,
+            protocol: wire,
+            release,
+        } = control.receive().await
+        else {
+            panic!("expected actual source readiness")
+        };
+        assert!(
+            received == challenge && wire == source.expected_protocol,
+            "source readiness must belong to its checked executable"
+        );
+        Self {
+            child,
+            control,
+            address,
+            release,
+        }
+    }
+    async fn offer(&mut self) -> protocol::MobilePairingQrUri {
+        self.control.send(&ThinControl::DirectOffer).await;
+        let ThinControl::Offer { qr_uri } = self.control.receive().await else {
+            panic!("expected actual source offer")
+        };
+        qr_uri
+    }
+    async fn managed_offer(&mut self) -> protocol::MobilePairingQrUri {
+        self.control.send(&ThinControl::ManagedOffer).await;
+        let ThinControl::Offer { qr_uri } = self.control.receive().await else {
+            panic!("expected actual managed offer")
+        };
+        qr_uri
+    }
+    async fn stop(
+        &mut self,
+        expected_devices: usize,
+    ) -> (protocol::SessionId, Vec<protocol::MobileDeviceId>) {
+        self.control
+            .send(&ThinControl::Stop { expected_devices })
+            .await;
+        let ThinControl::Stopped { session, devices } = self.control.receive().await else {
+            panic!("expected actual source checkpoint")
+        };
+        assert!(
+            self.child.wait().await.unwrap().success(),
+            "source process must exit before store takeover"
+        );
+        (session, devices)
+    }
+}
+
+fn thin_release() -> String {
+    serde_json::from_str::<serde_json::Value>(include_str!("../../package.json")).unwrap()["version"].as_str().unwrap().to_owned()
+}
+async fn thin_fixture(
+    store: std::path::PathBuf,
+    bundle: &std::path::Path,
+    origin: &str,
+    service: Option<&str>,
+    publisher: &ThinPublisher,
+) -> (Fixture, fixture::TestAgent) {
+    use server::backend::mock::{MockScript, MockTurn};
+    eprintln!("NATIVE_BOUNDARY initializing real host");
+    let mut fixture = Fixture::new_at_existing_store_with_runtime_config(
+        store,
+        server::HostRuntimeConfig {
+            mobile_managed_service_base_url: service.map(str::to_owned),
+            mobile_bootstrap_http: Some(publisher.client()),
+            ..Default::default()
+        },
+    )
+    .await;
+    eprintln!("NATIVE_BOUNDARY spawning protocol fixture agent");
+    let agent = fixture
+        .spawn_scripted(
+            "Retained compatibility chat",
+            MockScript::one(MockTurn::text("Compatibility response"))
+                .then(MockTurn::text("Compatibility follow-up response")),
+        )
+        .await;
+    eprintln!("NATIVE_BOUNDARY awaiting provider completion event");
+    fixture
+        .next_chat_event_matching(&agent, "settled native conversation", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    if fixture.bootstrap.settings.mobile_direct_hosting_enabled {
+        eprintln!("NATIVE_BOUNDARY validating unchanged restored host settings");
+        let settings = &fixture.bootstrap.settings;
+        assert!(
+            settings.enable_mobile_connections
+                && settings.mobile_direct_bundle_dir.as_deref() == bundle.to_str()
+                && settings.mobile_direct_public_origin.as_deref() == Some(origin),
+            "owned process restart must preserve the actual configured host"
+        );
+        assert!(
+            matches!(
+                fixture.bootstrap.mobile_access.direct_hosting,
+                MobileDirectHostingStatus::Online { .. }
+            ),
+            "restored direct hosting must be ready, not reconfigured with cold-store CAS values"
+        );
+    } else {
+        eprintln!("NATIVE_BOUNDARY enabling real direct hosting in the fresh store");
+        enable_direct_hosting(&mut fixture.client, bundle.to_str().unwrap()).await;
+        fixture
+            .client
+            .replace_setting(
+                "/mobile_direct_public_origin",
+                Some(origin),
+                Some("https://tyde.test.internal"),
+            )
+            .await
+            .unwrap();
+        fixture::next_frame_matching_on(&mut fixture.client, "native origin committed", |event| {
+            event.kind == FrameKind::HostSettings
+                && event
+                    .parse_payload::<settings_model::HostSettingsPayload>()
+                    .is_ok_and(|p| {
+                        p.settings.mobile_direct_public_origin.as_deref() == Some(origin)
+                    })
+        })
+        .await;
+    }
+    eprintln!("NATIVE_BOUNDARY real host ready");
+    (fixture, agent)
+}
+async fn thin_identity(
+    fixture: &Fixture,
+    agent: &fixture::TestAgent,
+    expected_devices: usize,
+) -> (protocol::SessionId, Vec<protocol::MobileDeviceId>) {
+    eprintln!("NATIVE_BOUNDARY awaiting paired identity bootstrap");
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    eprintln!("NATIVE_BOUNDARY paired identity bootstrap complete");
+    let session = state
+        .agents
+        .iter()
+        .find(|current| current.agent_id == agent.new_agent.agent_id)
+        .and_then(|current| current.session_id.clone());
+    tokio::fs::write(fixture.store_dir().join("native-checkpoint-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"provider_session_present":session.is_some(),
+            "expected_devices":expected_devices,"actual_devices":state.mobile_access.paired_devices.len(),
+            "managed_mobile_enabled":state.settings.enable_mobile_connections,
+            "pairing_active":matches!(state.mobile_access.pairing,MobilePairingState::Active{..})})).unwrap()).await.unwrap();
+    let session = session.expect("actual initialized provider session");
+    let devices = state
+        .mobile_access
+        .paired_devices
+        .iter()
+        .map(|device| device.device_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        devices.len() == expected_devices,
+        "native client must pair once before source handover"
+    );
+    (session, devices)
+}
+async fn thin_child(config: ThinLaunch) {
+    let mut control = ThinChannel::new(
+        tokio::net::TcpStream::connect(config.control)
+            .await
+            .unwrap(),
+    );
+    let checkpoint = config.store.join("mock-provider-checkpoint.json");
+    if tokio::fs::try_exists(&checkpoint).await.unwrap() {
+        server::backend::mock::restore_sessions_for_restart(&checkpoint)
+            .expect("actual owned-process provider checkpoint");
+        // The next checkpoint is create-new, not an overwrite of its donor.
+        tokio::fs::rename(
+            &checkpoint,
+            config.store.join(format!(
+                "consumed-provider-checkpoint-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        )
+        .await
+        .expect("preserve consumed actual provider checkpoint");
+    }
+    let (mut fixture, agent) = thin_fixture(
+        config.store,
+        &config.bundle,
+        &config.origin,
+        config.service.as_deref(),
+        &config.publisher,
+    )
+    .await;
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    control
+        .send(&ThinControl::Ready {
+            challenge: config.challenge,
+            address: online_addr(&state.mobile_access.direct_hosting),
+            protocol: protocol::PROTOCOL_VERSION,
+            release: thin_release(),
+        })
+        .await;
+    let expected_devices = loop {
+        match control.receive().await {
+            ThinControl::DirectOffer => {
+                control
+                    .send(&ThinControl::Offer {
+                        qr_uri: start_direct_pairing(&mut fixture.client).await.qr_uri,
+                    })
+                    .await;
+            }
+            ThinControl::ManagedOffer => {
+                control
+                    .send(&ThinControl::Offer {
+                        qr_uri: thin_managed_offer(&mut fixture).await,
+                    })
+                    .await
+            }
+            ThinControl::Stop { expected_devices } => break expected_devices,
+            _ => panic!("unexpected private source-control command"),
+        }
+    };
+    let (session, devices) = thin_identity(&fixture, &agent, expected_devices).await;
+    fixture
+        .host_for_test()
+        .shutdown_for_restart()
+        .await
+        .expect("actual host checkpoint");
+    server::backend::mock::save_sessions_for_restart(
+        &fixture.store_dir().join("mock-provider-checkpoint.json"),
+    )
+    .expect("actual private provider checkpoint");
+    control
+        .send(&ThinControl::Stopped { session, devices })
+        .await;
+    // This is an explicitly owned one-case child process. Exit after the
+    // durable checkpoint, before dropping its desktop subscriber cancels a QR.
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn native_shell_loads_exact_clients_with_retained_pairing() {
+    use server::backend::mock::MockTurn;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    server::install_default_crypto_provider();
+    server::set_host_release_version(&thin_release());
+    if let Some(config) = std::env::var_os("TYDE_THIN_BASELINE_CONTROL") {
+        let config = serde_json::from_str(&config.to_string_lossy())
+            .unwrap_or_else(|_| panic!("invalid private source configuration"));
+        thin_child(config).await;
+        return;
+    }
+    let current = std::path::PathBuf::from(
+        std::env::var_os("TYDE_NATIVE_CURRENT_CLIENT")
+            .expect("canonical check must build the actual current client"),
+    );
+    let mut service = match std::env::var_os("TYDE_THIN_NATIVE_SERVICE") {
+        Some(file) => Some(ThinService::start(std::path::Path::new(&file)).await),
+        None => None,
+    };
+    let store = tempfile::tempdir().unwrap();
+    let baseline_record =
+        std::env::var_os("TYDE_THIN_NATIVE_BASELINE").map(std::path::PathBuf::from);
+    let source = ThinSource::load(baseline_record.as_deref(), &current).await;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let evidence_root = root.join("target/thin-native-proof");
+    tokio::fs::create_dir_all(&evidence_root).await.unwrap();
+    let evidence = tempfile::tempdir_in(&evidence_root).unwrap().keep();
+    let mut child = tokio::process::Command::new("node")
+        .arg("tools/native-client-upgrade.mjs")
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("actual frozen shell driver");
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    async fn send(input: &mut tokio::process::ChildStdin, value: serde_json::Value) {
+        input
+            .write_all(format!("{value}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    async fn event(
+        output: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+        expected: &str,
+    ) -> serde_json::Value {
+        let line = output
+            .next_line()
+            .await
+            .expect("private driver event read")
+            .expect("native driver exited before event");
+        let value: serde_json::Value =
+            serde_json::from_str(&line).unwrap_or_else(|_| panic!("invalid private driver event"));
+        assert!(
+            value["event"].as_str() == Some(expected),
+            "driver reached an unexpected boundary"
+        );
+        value
+    }
+    send(&mut input,serde_json::json!({"current_bundle":current,"baseline_bundle":source.bundle.as_ref().map(|b|b.path()),"evidence":evidence,"service":service.as_ref().map(|s|&s.session)})).await;
+    let ready = event(&mut output, "ready").await;
+    let publisher: ThinPublisher =
+        serde_json::from_value(ready["publisher"].clone()).expect("real publisher transport");
+    let mut baseline = ThinBaseline::start(
+        &source,
+        store.path(),
+        "https://native-host.test",
+        service.as_ref().map(|s| s.session.endpoint.as_str()),
+        &publisher,
+    )
+    .await;
+    event(&mut output, "publisher-held").await;
+    let independent = reqwest::Client::new();
+    assert!(
+        independent
+            .get(format!("http://{}/tyde/", baseline.address))
+            .send()
+            .await
+            .expect("PWA while publisher held")
+            .status()
+            .is_success(),
+        "PWA hosting must not await native publication"
+    );
+    let authority = independent
+        .post(format!("http://{}/tyde/bootstrap", baseline.address))
+        .json(&protocol::MobileDirectBootstrapRequest {
+            native_bridge_abi: 6,
+            offer_id: None,
+            offer_secret: None,
+        })
+        .send()
+        .await
+        .expect("actor while publisher held");
+    assert!(
+        authority.status() == 400,
+        "mobile actor must reject missing authority while publication is held"
+    );
+    // Existing direct/PWA pairing must issue its real QR while publication is held.
+    let qr_uri = baseline.offer().await;
+    send(&mut input, serde_json::json!({"event":"release-publisher"})).await;
+    event(&mut output, "publisher-released").await;
+    let actual_offer = DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&qr_uri.0))
+        .expect("actual direct offer");
+    let incompatible = reqwest::Client::new()
+        .post(format!("http://{}/tyde/bootstrap", baseline.address))
+        .json(&protocol::MobileDirectBootstrapRequest {
+            native_bridge_abi: 0,
+            offer_id: Some(actual_offer.offer_id),
+            offer_secret: Some(actual_offer.offer_secret),
+        })
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("real incompatible ABI request failed"));
+    assert!(
+        incompatible.status() == 403 && header(&incompatible, "cache-control") == "no-store",
+        "incompatible ABI must be refused before execution"
+    );
+    assert!(
+        incompatible
+            .json::<protocol::MobileDirectErrorResponse>()
+            .await
+            .expect("typed refusal")
+            .code
+            == protocol::MobileAccessErrorCode::NativeAbiIncompatible,
+        "refusal must distinguish app ABI from host baseline"
+    );
+    send(
+        &mut input,
+        serde_json::json!({"qr_uri":qr_uri,"release":baseline.release,"address":baseline.address}),
+    )
+    .await;
+    event(&mut output, "paired").await;
+    let managed_pairing = if let Some(service) = &mut service {
+        let qr_uri = baseline.managed_offer().await;
+        send(&mut input,serde_json::json!({"event":"managed-offer","qr_uri":qr_uri,"release":baseline.release,"phase":"before"})).await;
+        let saved = event(&mut output, "managed-saved").await;
+        let pairing = saved["pairing_id"]
+            .as_str()
+            .expect("private pairing binding")
+            .to_owned();
+        service.registered(&pairing).await;
+        send(
+            &mut input,
+            serde_json::json!({"event":"managed-registered"}),
+        )
+        .await;
+        event(&mut output, "managed-verified").await;
+        Some(pairing)
+    } else {
+        None
+    };
+    eprintln!("NATIVE_BOUNDARY checkpointing and terminating the actual source process");
+    let (session, devices) = baseline.stop(if service.is_some() { 2 } else { 1 }).await;
+    eprintln!("NATIVE_BOUNDARY source process exited; awaiting actual unavailable discovery");
+    send(&mut input, serde_json::json!({"event":"host-stopped"})).await;
+    event(&mut output, "offline").await;
+    server::backend::mock::restore_sessions_for_restart(
+        &store.path().join("mock-provider-checkpoint.json"),
+    )
+    .expect("restore actual provider records");
+    send(
+        &mut input,
+        serde_json::json!({"event":"restart-publication"}),
+    )
+    .await;
+    event(&mut output, "publication-fault-armed").await;
+    let mut fixture = Fixture::new_at_existing_store_with_runtime_config(
+        store.path().to_owned(),
+        server::HostRuntimeConfig {
+            mobile_managed_service_base_url: service.as_ref().map(|s| s.session.endpoint.clone()),
+            mobile_bootstrap_http: Some(publisher.client()),
+            ..Default::default()
+        },
+    )
+    .await;
+    event(&mut output, "publication-host-failed").await;
+    if source.custody.is_some() {
+        let previous = fixture.bootstrap.settings.mobile_direct_bundle_dir.clone();
+        let write = fixture
+            .client
+            .replace_setting(
+                "/mobile_direct_bundle_dir",
+                Some(current.to_str().unwrap()),
+                previous,
+            )
+            .await
+            .unwrap();
+        fixture::expect_settings_write_applied(
+            &mut fixture.client,
+            &write,
+            "current source bundle configuration committed",
+        )
+        .await;
+    }
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert!(
+        state
+            .mobile_access
+            .paired_devices
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect::<Vec<_>>()
+            == devices,
+        "source takeover must retain real paired identities"
+    );
+    let restored = fixture
+        .restored_agents(&state, std::slice::from_ref(&session))
+        .await;
+    let agent = restored.get(&session).expect("retained provider restored");
+    fixture
+        .mock_by_id(&agent.agent_id)
+        .await
+        .enqueue(MockTurn::text("Compatibility post-upgrade response"))
+        .await;
+    let title = "Retained chat after source upgrade";
+    fixture
+        .client
+        .set_agent_name(&agent.instance_stream, title.into())
+        .await
+        .unwrap();
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "replacement title committed",
+        |event| {
+            event.kind == FrameKind::AgentRenamed
+                && event
+                    .parse_payload::<protocol::AgentRenamedPayload>()
+                    .is_ok_and(|p| p.agent_id == agent.agent_id && p.name == title)
+        },
+    )
+    .await;
+    if let (Some(service), Some(pairing)) = (&mut service, &managed_pairing) {
+        service.registered(pairing).await;
+    }
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    send(&mut input,serde_json::json!({"address":online_addr(&state.mobile_access.direct_hosting),"release":thin_release(),"title":title})).await;
+    let upgraded = event(&mut output, "upgraded").await;
+    tokio::fs::write(evidence.join("publication-ownership-recovery-proof.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "canonical_publisher_https": true, "held_response": true, "independent_pwa_http_success": true,
+        "independent_actor_authority_rejection": true, "replacement_publisher_503_observed": true,
+        "recovered_publication": true, "same_retained_store": true, "fresh_reply_after_recovery": true,
+        "limit": "Owned HTTPS publisher and real local hosts. No production CDN/TLS or RTC claim."
+    })).unwrap()).await.unwrap();
+    if source.custody.is_some() {
+        assert!(
+            upgraded["documents"].as_u64() == Some(2),
+            "different clients require one deliberate client lifecycle change"
+        );
+    }
+    if let Some(service) = &mut service {
+        let current_source = ThinSource::load(None, &current).await;
+        let lifecycle_store = tempfile::tempdir_in(&evidence).unwrap().keep();
+        eprintln!("NATIVE_BOUNDARY starting owned current managed-lifecycle witness");
+        let mut witness = ThinBaseline::start(
+            &current_source,
+            &lifecycle_store,
+            "https://lifecycle-host.test",
+            Some(&service.session.endpoint),
+            &publisher,
+        )
+        .await;
+        let seed = witness.offer().await;
+        let seed = DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&seed.0)).unwrap();
+        let admission = reqwest::Client::new()
+            .post(format!("http://{}/tyde/bootstrap", witness.address))
+            .json(&protocol::MobileDirectBootstrapRequest {
+                native_bridge_abi: 6,
+                offer_id: Some(seed.offer_id),
+                offer_secret: Some(seed.offer_secret),
+            })
+            .send()
+            .await
+            .expect("current witness publication ready");
+        assert!(
+            admission.status().is_success(),
+            "witness must publish its actual client before making a registered offer"
+        );
+        let mut held = service.hold_next_offer_registration();
+        witness.control.send(&ThinControl::ManagedOffer).await;
+        held.recv()
+            .await
+            .expect("fresh managed-offer bootstrap registration held");
+        let authority = reqwest::Client::new()
+            .post(format!("http://{}/tyde/bootstrap", witness.address))
+            .bearer_auth("invalid-disposable-device")
+            .json(&protocol::MobileDirectBootstrapRequest {
+                native_bridge_abi: 6,
+                offer_id: None,
+                offer_secret: None,
+            })
+            .send()
+            .await
+            .expect("independent command during fresh offer registration");
+        assert!(
+            authority.status() == reqwest::StatusCode::FORBIDDEN,
+            "fresh managed-offer registration must not block independent mobile actor authority"
+        );
+        service
+            .held_registration
+            .get()
+            .unwrap()
+            .release
+            .notify_one();
+        // ManagedOffer is already in flight; consume its completion without
+        // issuing the separate DirectOffer command from witness.offer().
+        let ThinControl::Offer { qr_uri } = witness.control.receive().await else {
+            panic!("expected the held managed offer completion")
+        };
+        let mut pending = Some(qr_uri);
+        tokio::fs::write(evidence.join("held-service-registration-proof.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"real_service_registration_held":true,
+                "fresh_offer_creation_after_known_publication":true,"offer_binding_from_actual_create_response":true,
+                "direct_actor_authority_settled_before_release":true,"http_status":403,
+                "offer_delivered_after_registration":true,
+                "synchronization":"actual registration arrival and explicit release; no sleeps/time thresholds"})).unwrap()).await.unwrap();
+        eprintln!("NATIVE_BOUNDARY initial managed offer is pending; checkpointing witness");
+        witness.stop(0).await;
+        eprintln!("NATIVE_BOUNDARY managed witness process exited with its real pending offer");
+        for (phase, expected_devices) in [("after", 1), ("held", 2), ("failed_registration", 3)] {
+            send(
+                &mut input,
+                serde_json::json!({"event":"arm-managed-publication","phase":phase}),
+            )
+            .await;
+            event(&mut output, "managed-publication-armed").await;
+            witness = ThinBaseline::start(
+                &current_source,
+                &lifecycle_store,
+                "https://lifecycle-host.test",
+                Some(&service.session.endpoint),
+                &publisher,
+            )
+            .await;
+            event(&mut output, "managed-publication-held").await;
+            eprintln!("NATIVE_BOUNDARY managed publication held phase={phase}");
+            let qr_uri = match pending.take() {
+                Some(pending) => pending,
+                None => witness.managed_offer().await,
+            };
+            let offer = mobile_pairing::ManagedMobilePairingQrPayload::from_uri(
+                pairing_uri_fragment(&qr_uri.0),
+            )
+            .expect("actual managed lifecycle offer");
+            // The old publication completed before the prior process exited.
+            // Only a new completed registration after this release can admit the probe.
+            while service.registrations.try_recv().is_ok() {}
+            send(&mut input,serde_json::json!({"event":"resume-managed-publication","address":witness.address,"qr_uri":qr_uri,"release":thin_release(),"phase":phase})).await;
+            event(&mut output, "managed-publication-released").await;
+            service
+                .registered_path(format!(
+                    "/api/tyde/mobile/v1/host/offers/{}/bootstrap",
+                    offer.offer_id.as_str()
+                ))
+                .await;
+            eprintln!("NATIVE_BOUNDARY current managed offer registration completed phase={phase}");
+            if phase == "failed_registration" {
+                service.fail_pairing_registration(&offer.offer_id);
+            }
+            send(
+                &mut input,
+                serde_json::json!({"event":"managed-offer-registered"}),
+            )
+            .await;
+            let saved = event(&mut output, "managed-saved").await;
+            let outcome = if phase == "failed_registration" {
+                service
+                    .failed_registrations
+                    .recv()
+                    .await
+                    .expect("actual scoped paired registration returned503");
+                "managed-registration-failed"
+            } else {
+                service
+                    .registered(
+                        saved["pairing_id"]
+                            .as_str()
+                            .expect("private current binding"),
+                    )
+                    .await;
+                "managed-registered"
+            };
+            send(&mut input, serde_json::json!({"event":outcome})).await;
+            event(&mut output, "managed-verified").await;
+            witness.stop(expected_devices).await;
+        }
+        tokio::fs::write(evidence.join("managed-publication-lifecycle-proof.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "real_host_process_exits":4,"unchanged_pending_offer_resumed":true,"offer_created_while_publication_held":true,
+            "same_installed_shell":true,"canonical_pairing_completions":2,
+            "limit":"Real local Service and production mobile actor; no RTC or native platform claim."
+        })).unwrap()).await.unwrap();
+    }
+    let second_store = tempfile::tempdir().unwrap();
+    let mut second = ThinBaseline::start(
+        &source,
+        second_store.path(),
+        "https://second-host.test",
+        None,
+        &publisher,
+    )
+    .await;
+    let qr_uri = second.offer().await;
+    send(
+        &mut input,
+        serde_json::json!({"address":second.address,"qr_uri":qr_uri,"release":second.release}),
+    )
+    .await;
+    event(&mut output, "need-third-offer").await;
+    send(
+        &mut input,
+        serde_json::json!({"qr_uri":second.offer().await}),
+    )
+    .await;
+    let switched = event(&mut output, "switched").await;
+    assert!(
+        switched["pair_requests"].as_u64() == Some(3),
+        "host switching cannot re-pair an existing identity"
+    );
+    let device_id = protocol::MobileDeviceId(
+        switched["device_id"]
+            .as_str()
+            .expect("private retained device binding")
+            .to_owned(),
+    );
+    fixture::send_host_payload(
+        &mut fixture.client,
+        FrameKind::MobileDeviceRevoke,
+        &protocol::MobileDeviceRevokePayload {
+            device_id: device_id.clone(),
+        },
+    )
+    .await;
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "real owner revocation committed",
+        |event| {
+            event.kind == FrameKind::MobileAccessState
+                && event
+                    .parse_payload::<MobileAccessStatePayload>()
+                    .is_ok_and(|state| {
+                        state
+                            .paired_devices
+                            .iter()
+                            .all(|device| device.device_id != device_id)
+                    })
+        },
+    )
+    .await;
+    send(&mut input, serde_json::json!({"event":"revoked"})).await;
+    event(&mut output, "revocation-verified").await;
+    send(&mut input, serde_json::json!({"event":"finish"})).await;
+    event(&mut output, "done").await;
+    drop(input);
+    assert!(
+        child.wait().await.unwrap().success(),
+        "actual frozen shell flow failed"
+    );
+    second.stop(2).await;
+    if let Some(custody) = &source.custody {
+        let current_source = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .await
+            .unwrap();
+        let current_source = String::from_utf8(current_source.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(
+            current_source != custody.source_commit,
+            "cross-source proof requires distinct commits"
+        );
+        tokio::fs::write(evidence.join("source-upgrade-proof.json"),serde_json::to_vec_pretty(&serde_json::json!({"baseline_source":custody.source_commit,"recipient_source":current_source,"baseline_protocol":custody.protocol_version,"recipient_protocol":protocol::PROTOCOL_VERSION,"baseline_client_archive_sha256":custody.client_archive_sha256,"same_store":true,"actual_provider_records":true,"retained_devices":devices.len(),"pair_requests":switched["pair_requests"],"documents":switched["documents"]})).unwrap()).await.unwrap();
+    }
+    eprintln!(
+        "Native shell/client process boundaries passed; proof directory={}",
+        evidence.display()
+    );
+}

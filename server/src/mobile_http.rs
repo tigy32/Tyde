@@ -173,6 +173,102 @@ impl MobileWebAssets {
         Ok(Self { files })
     }
 
+    pub(crate) fn published_bootstrap_descriptor(
+        bytes: &[u8],
+    ) -> Result<protocol::MobileClientBootstrapDescriptor, String> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            versions: BTreeMap<String, serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Client {
+            protocol_version: u32,
+            transport_protocol_version: u32,
+            native_bridge_versions: Vec<u32>,
+            entry: String,
+            integrity: String,
+            artifacts: BTreeMap<String, String>,
+        }
+        let host_release =
+            crate::host_release_version().ok_or("Host release identity is unavailable")?;
+        let catalog: Catalog =
+            serde_json::from_slice(bytes).map_err(|_| "Published mobile catalog is invalid")?;
+        let record = catalog
+            .versions
+            .get(&host_release.to_string())
+            .ok_or("This host release has no published mobile client")?;
+        let entry: Client = serde_json::from_value(record.clone())
+            .map_err(|_| "Published mobile client is incompatible")?;
+        if entry.protocol_version != protocol::PROTOCOL_VERSION
+            || entry.transport_protocol_version != protocol::MOBILE_RTC_PROTOCOL_VERSION
+        {
+            return Err("Published mobile client protocol does not match this host".into());
+        }
+        if !entry.native_bridge_versions.contains(&6) {
+            return Err("Published mobile client native ABI is incompatible".into());
+        }
+        let mut artifacts = BTreeMap::from([(entry.entry.clone(), entry.integrity.clone())]);
+        for (url, integrity) in &entry.artifacts {
+            if artifacts.insert(url.clone(), integrity.clone()).is_some() {
+                return Err("Published executable manifest has duplicate URLs".into());
+            }
+        }
+        if !artifacts.keys().any(|url| url.ends_with(".wasm")) {
+            return Err("Published executable manifest has no Wasm client".into());
+        }
+        #[derive(serde::Serialize)]
+        struct Artifact<'a> {
+            url: &'a str,
+            integrity: &'a str,
+        }
+        let prefix = format!("/tyde/v{host_release}/");
+        let canonical = artifacts
+            .iter()
+            .map(|(url, integrity)| {
+                if !url.is_ascii()
+                    || !integrity.is_ascii()
+                    || !url.starts_with(&prefix)
+                    || url.contains("..")
+                    || url.contains(['?', '#', '\\'])
+                {
+                    return Err("Published executable URL is outside its release");
+                }
+                let (algorithm, digest) = integrity
+                    .split_once('-')
+                    .ok_or("Published executable digest is invalid")?;
+                let length = match algorithm {
+                    "sha256" => 32,
+                    "sha384" => 48,
+                    "sha512" => 64,
+                    _ => return Err("Published executable digest algorithm is unsupported"),
+                };
+                if base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .map_err(|_| "Published executable digest is invalid")?
+                    .len()
+                    != length
+                {
+                    return Err("Published executable digest is invalid");
+                }
+                Ok(Artifact { url, integrity })
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        let canonical = serde_json::to_vec(&canonical)
+            .map_err(|_| "Published executable identity could not be encoded")?;
+        Ok(protocol::MobileClientBootstrapDescriptor {
+            bootstrap_version: 1,
+            host_release_version: host_release.clone(),
+            protocol_version: protocol::PROTOCOL_VERSION,
+            transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
+            client_release_version: host_release,
+            artifact_set_sha256: format!("{:x}", Sha256::digest(canonical)),
+            native_bridge_abi: 6,
+        })
+    }
+
     pub(crate) fn asset_count(&self) -> usize {
         self.files.len()
     }
@@ -554,6 +650,56 @@ fn direct_error(status: StatusCode, code: MobileAccessErrorCode, message: &str) 
     response
 }
 
+async fn bootstrap(
+    State(state): State<MobileHttpState>,
+    headers: HeaderMap,
+    Json(request): Json<protocol::MobileDirectBootstrapRequest>,
+) -> Response {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let (reply, result) = oneshot::channel();
+    if state
+        .mobile_access
+        .send(MobileAccessCommand::ResolveDirectBootstrap {
+            request,
+            token,
+            reply,
+        })
+        .is_err()
+    {
+        return direct_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MobileAccessErrorCode::Internal,
+            "Host bootstrap is unavailable",
+        );
+    }
+    let mut response = match result.await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => {
+            let (code, message) = error.into_parts();
+            let status = match code {
+                MobileAccessErrorCode::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                MobileAccessErrorCode::InvalidConfig => StatusCode::BAD_REQUEST,
+                _ => StatusCode::FORBIDDEN,
+            };
+            direct_error(status, code, &message)
+        }
+        Err(_) => direct_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MobileAccessErrorCode::Internal,
+            "Host bootstrap stopped",
+        ),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    apply_common_headers(&mut response);
+    response
+}
+
 /// Exchanges a pairing offer secret for a durable device token.
 async fn pair(
     State(state): State<MobileHttpState>,
@@ -664,6 +810,7 @@ fn router(
 ) -> Router {
     Router::new()
         .route(PAIR_PATH, post(pair))
+        .route("/tyde/bootstrap", post(bootstrap))
         .route(WS_PATH, get(websocket))
         .fallback(serve)
         .with_state(MobileHttpState {
