@@ -111,6 +111,8 @@ pub fn session_passes_filters(
     true
 }
 
+const HISTORY_PAGE_SIZE: usize = 128;
+
 #[component]
 pub fn SessionsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -161,6 +163,45 @@ pub fn SessionsPanel() -> impl IntoView {
         })
     });
     let sessions_empty = Memo::new(move |_| session_keys.with(Vec::is_empty));
+    let requested_page = RwSignal::new(0usize);
+    Effect::new(move |_| {
+        search.track();
+        current_filters.track();
+        state.active_project.track();
+        requested_page.set(0);
+    });
+    let last_page = Memo::new(move |_| {
+        session_keys.with(|keys| keys.len().saturating_sub(1) / HISTORY_PAGE_SIZE)
+    });
+    Effect::new(move |_| {
+        let last = last_page.get();
+        if requested_page.get_untracked() > last {
+            requested_page.set(last);
+        }
+    });
+    let page = Memo::new(move |_| requested_page.get().min(last_page.get()));
+    let content = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        page.track();
+        if let Some(content) = content.get() {
+            content.set_scroll_top(0);
+        }
+    });
+    let visible_keys = Memo::new(move |_| {
+        let start = page.get() * HISTORY_PAGE_SIZE;
+        session_keys.with(|keys| {
+            let _diagnostic = crate::perf::UiSpan::new(
+                crate::perf::UiOperation::HistoryPageProjection,
+                0,
+                keys.len(),
+            );
+            keys.iter()
+                .skip(start)
+                .take(HISTORY_PAGE_SIZE)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
 
     let on_search = move |ev: leptos::ev::Event| {
         let val = event_target_value(&ev);
@@ -440,7 +481,7 @@ pub fn SessionsPanel() -> impl IntoView {
                     "Refresh"
                 </button>
             </div>
-            <div class="panel-content">
+            <div class="panel-content" node_ref=content>
                 {move || {
                     if sessions_empty.get() {
                         let msg = if search.get().is_empty() {
@@ -460,7 +501,7 @@ pub fn SessionsPanel() -> impl IntoView {
                         view! {
                             <div class="session-card-list">
                                 <For
-                                    each=move || session_keys.get()
+                                    each=move || visible_keys.get()
                                     key=|key| key.clone()
                                     children=move |key| {
                                         let lookup = key.clone();
@@ -471,6 +512,22 @@ pub fn SessionsPanel() -> impl IntoView {
                                         session_card(row_state.clone(), key, session)
                                     }
                                 />
+                                <Show when=move || { last_page.get() > 0 }>
+                                    <nav class="session-pages" aria-label="Saved sessions pages">
+                                        <button
+                                            class="session-load-more"
+                                            aria-label="Previous saved sessions"
+                                            disabled=move || page.get() == 0
+                                            on:click=move |_| requested_page.set(page.get_untracked().saturating_sub(1))
+                                        >"Previous"</button>
+                                        <button
+                                            class="session-load-more"
+                                            aria-label="Next saved sessions"
+                                            disabled=move || page.get() == last_page.get()
+                                            on:click=move |_| requested_page.set((page.get_untracked() + 1).min(last_page.get_untracked()))
+                                        >"Next"</button>
+                                    </nav>
+                                </Show>
                                 {load_more_buttons(state.clone(), rendered_hosts)}
                             </div>
                         }.into_any()
@@ -588,6 +645,7 @@ fn session_card(
     key: (String, protocol::SessionId),
     session: Memo<Option<SessionInfo>>,
 ) -> impl IntoView {
+    let _diagnostic = crate::perf::UiSpan::new(crate::perf::UiOperation::HistoryCardBuild, 0, 1);
     #[cfg(all(test, target_arch = "wasm32"))]
     wasm_tests::observe_card_owner(&key);
     let (session_host_id, session_id) = key;
@@ -1124,6 +1182,7 @@ mod wasm_tests {
     }
 
     fn connect(state: &AppState, host_id: &str, stream: &str) {
+        crate::dispatch::reset_inbound_state_for_host(host_id);
         state.host_streams.update(|streams| {
             streams.insert(host_id.to_owned(), StreamPath(stream.to_owned()));
         });
@@ -1237,6 +1296,21 @@ mod wasm_tests {
             .text_content()
             .unwrap_or_default()
             .contains("2 responses");
+        console_log!(
+            "History count projection: canonical={} updated_four={} updated_zero={} retained_two={}",
+            state.sessions.with_untracked(|sessions| sessions
+                .iter()
+                .find(|session| session.host_id == "host-a")
+                .unwrap()
+                .summary
+                .message_count),
+            updated_count,
+            updated_after
+                .text_content()
+                .unwrap_or_default()
+                .contains("0 responses"),
+            retained_count,
+        );
         container.style().remove_property("display").unwrap();
         let retained_visible = retained_after.get_bounding_client_rect().height() > 0.0;
         // Keep a failing regression from leaving its mounted fixture behind.
@@ -1275,6 +1349,225 @@ mod wasm_tests {
             retained_visible,
             "the retained expanded conversation must be visible when History is shown again"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn large_history_pages_bound_hidden_cards_and_keep_all_results_reachable() {
+        use protocol::{
+            ProjectId, SessionListCursor, SessionListGeneration, SessionListPageInfo,
+            SessionListScope,
+        };
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        connect(&state, "host-a", "/host-1");
+        let saved = |index: usize| {
+            let mut session = listed_session(
+                "host-a",
+                &format!("saved-{index}"),
+                2,
+                (5000 - index) as u64,
+            );
+            session.summary.alias = Some(format!("Saved {index:04}"));
+            session.summary.project_id = Some(ProjectId("project-a".to_owned()));
+            session
+        };
+        state.sessions.set((0..4000).map(saved).collect());
+        let cursor = SessionListCursor {
+            generation: SessionListGeneration(7),
+            offset: 4000,
+        };
+        state.session_list_pages.update(|pages| {
+            pages.insert(
+                (
+                    "host-a".to_owned(),
+                    crate::state::session_list_scope_key(SessionListScope::AllSessions),
+                ),
+                SessionListPageInfo {
+                    scope: SessionListScope::AllSessions,
+                    cursor: SessionListCursor {
+                        offset: 3872,
+                        ..cursor
+                    },
+                    limit: Some(128),
+                    total_count: 4128,
+                    status: SessionListPageStatus::More {
+                        next_cursor: cursor,
+                    },
+                },
+            );
+        });
+        let (container, handle) = mount_panel(state.clone());
+        container.style().set_property("display", "none").unwrap();
+        settle().await;
+        let cards = || {
+            container
+                .query_selector_all(".session-card")
+                .unwrap()
+                .length()
+        };
+        let click = |label: &str| {
+            container
+                .query_selector(&format!("button[aria-label='{label}']"))
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+        };
+        let search = |query: &str| {
+            let input = container
+                .query_selector("input[placeholder='Filter sessions...']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap();
+            input.set_value(query);
+            input
+                .dispatch_event(&web_sys::Event::new("input").unwrap())
+                .unwrap();
+        };
+        assert_eq!(
+            cards(),
+            128,
+            "hidden History must not mount the whole saved library"
+        );
+        assert!(container.text_content().unwrap().contains("Saved 0000"));
+        assert!(!container.text_content().unwrap().contains("Saved 0128"));
+        click("Next saved sessions");
+        settle().await;
+        assert_eq!(cards(), 128);
+        assert!(container.text_content().unwrap().contains("Saved 0128"));
+        assert!(!container.text_content().unwrap().contains("Saved 0000"));
+        click("Previous saved sessions");
+        settle().await;
+        assert!(container.text_content().unwrap().contains("Saved 0000"));
+        search("Saved 3999");
+        settle().await;
+        assert_eq!(
+            cards(),
+            1,
+            "search must include loaded rows outside the current presentation page"
+        );
+        assert!(container.text_content().unwrap().contains("Saved 3999"));
+        assert!(
+            container
+                .query_selector("nav[aria-label='Saved sessions pages']")
+                .unwrap()
+                .is_none()
+        );
+        search("");
+        settle().await;
+        click("Next saved sessions");
+        settle().await;
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("project-a".to_owned()),
+        }));
+        settle().await;
+        assert!(
+            container.text_content().unwrap().contains("Saved 0000"),
+            "changing project resets the presentation page"
+        );
+        click("Next saved sessions");
+        settle().await;
+        container
+            .query_selector("[data-test='session-load-more']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        settle().await;
+        assert_eq!(
+            list_sessions_limits().last(),
+            Some(&Some(128)),
+            "server continuation keeps its authoritative limit"
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "host-a",
+            protocol::Envelope::from_payload(
+                StreamPath("/host-1".to_owned()),
+                FrameKind::SessionList,
+                0,
+                &protocol::SessionListPayload {
+                    sessions: (4000..4128).map(|index| saved(index).summary).collect(),
+                    page: SessionListPageInfo {
+                        scope: SessionListScope::AllSessions,
+                        cursor,
+                        limit: Some(128),
+                        total_count: 4128,
+                        status: SessionListPageStatus::Complete,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        settle().await;
+        assert_eq!(state.sessions.with_untracked(Vec::len), 4128);
+        assert_eq!(cards(), 128);
+        search("Saved 4127");
+        settle().await;
+        assert_eq!(cards(), 1);
+        assert!(container.text_content().unwrap().contains("Saved 4127"));
+        search("");
+        settle().await;
+        click("Next saved sessions");
+        settle().await;
+        state
+            .sessions
+            .update(|sessions| sessions.retain(|session| session.summary.id.0 == "saved-0"));
+        settle().await;
+        assert_eq!(
+            cards(),
+            1,
+            "removing the last page must not leave a blank view"
+        );
+        assert!(container.text_content().unwrap().contains("Saved 0000"));
+        state.sessions.set((0..300).map(saved).collect());
+        settle().await;
+        assert!(
+            container.text_content().unwrap().contains("Saved 0000"),
+            "new arrivals must not resurrect an obsolete page selection"
+        );
+        container.style().remove_property("display").unwrap();
+        let content = container
+            .query_selector(".panel-content")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        content.style().set_property("height", "240px").unwrap();
+        content.style().set_property("overflow-y", "auto").unwrap();
+        console_log!(
+            "History scroll fixture before bounding: client={} scroll={}",
+            content.client_height(),
+            content.scroll_height()
+        );
+        content.style().set_property("max-height", "240px").unwrap();
+        console_log!(
+            "History scroll fixture after bounding: client={} scroll={}",
+            content.client_height(),
+            content.scroll_height()
+        );
+        content.set_scroll_top(content.scroll_height());
+        assert!(content.scroll_top() > 0);
+        click("Next saved sessions");
+        settle().await;
+        assert_eq!(
+            content.scroll_top(),
+            0,
+            "new pages start at their first row"
+        );
+        assert!(
+            conversation_card(&container, "Saved 0128")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0
+        );
+        drop(handle);
+        container.remove();
     }
 
     #[wasm_bindgen_test]

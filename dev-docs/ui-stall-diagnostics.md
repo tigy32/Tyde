@@ -51,6 +51,8 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   | `chat_ink_layout`, `chat_virtual_window` | 0 | loaded rows supplied to calculation |
   | `agents_sidebar_projection` | 0 | projected agent rows |
   | `history_project_name` | 0 | 1 card-name memo evaluation |
+  | `history_page_projection` | 0 | loaded, filtered session keys supplied to the page projection |
+  | `history_card_build` | 0 | 1 card constructor (not subsequent DOM mount/layout) |
 
   No IDs, labels, paths, payloads or command arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
@@ -509,3 +511,56 @@ request is warranted until a released client actually includes these metrics.
 The beta.19 report predates origin and synchronous-work fields; neither can
 retroactively identify its 19.679s work producer. This is attribution coverage,
 not a behavioral fix or an introduction date for the original incident.
+
+## Nov 3 remaining desktop investigation
+
+The uploaded Nov 3 report's post-beta20 11.823-second timer interval remains
+unattributed. Its 10.986-second aggregate poll wall time is not CPU time;
+178,511 polls and the nearby project switch identify neither work nor cause.
+`longest_work` is null and producer/sync fields are absent. The 32 MiB sampled
+export omitted 94,226,818 source bytes. The earlier 19.679-second aggregate
+incident is also open. No shared cause or resolution is inferred.
+
+On Linux, an isolated native instance of `2e76e100` exercised real server,
+Tauri IPC and WebKitGTK DOM boundaries with owned fixtures and no backend
+turns. Creating/switching a 100,001-file nested project rendered 128 explorer
+entries; a flat 100,001-file Git project received an 8,316,812-byte bootstrap
+(measured receive span 338 ms). Browsing the flat directory returned the
+explicit 5,000-entry enumeration error; a separate native UI-thread round
+trip completed while its unsuccessful-listing observation was pending.
+These observations do not prove the absence of other stalls.
+
+A separate confirmed defect: inserting 4,000 nonresumable saved summaries
+into that instance's SQLite store and pressing real History Refresh mounted
+4,000 cards even with History hidden. The capture recorded a 4,279 ms frame
+interval and 86,996 overwritten detailed records. A native DOM assertion of
+at most 128 cards failed with 4,000. The unbounded History renderer is present
+in the repository's initial `4075229f` tree, first locally tagged `v0.8.0`;
+it is not newly introduced by the recent keyed-row/name-fanout changes.
+This reproduction is not causal attribution for either customer incident.
+
+History now renders at most 128 loaded summaries per presentation page.
+Previous/Next change only the rendered window; filtering/search still examine
+all loaded summaries, and server Load more retains its own cursor/limit.
+Changed query, filters or project reset the presentation page; removals clamp
+it and page navigation resets scroll. Server ownership, backend behavior,
+connection/authentication and the full-replay protocol remain unchanged.
+Card-construction and page-projection spans remain available locally; neither
+claims to measure subsequent browser layout or all deferred reactive work.
+
+The fixed native instance mounted 128 cards from the same 4,000-summary
+SQLite fixture. Next changed the visible range, and search reached the oldest
+summary outside that range. Native screenshot inspection confirmed the page
+controls in the existing History layout. The deterministic DOM regression
+also covers server continuation, project reset, shrinking/re-expanding lists
+and scroll reset without elapsed-time pass/fail conditions.
+
+The first full gate exposed two test-fixture defects, not grounds to loosen
+product assertions. The new paging flow accepted a continuation at sequence
+zero; a later test reused that host/stream with a new `AppState` but the
+thread-local inbound validator still expected sequence one, so its count
+update was rejected before the reducer. The connection fixture now resets
+inbound state at the same fresh-connection boundary as production. The scroll
+flow also bounds its viewport with `max-height`, rather than assuming flex
+layout honors a requested height. Its positive-scroll and page-reset assertions
+remain unchanged; content-free geometry/count diagnostics are retained.

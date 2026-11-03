@@ -77,6 +77,8 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::ChatTabBinding => "chat_tab_binding",
         UiOperation::AgentsSidebarProjection => "agents_sidebar_projection",
         UiOperation::HistoryProjectName => "history_project_name",
+        UiOperation::HistoryPageProjection => "history_page_projection",
+        UiOperation::HistoryCardBuild => "history_card_build",
         UiOperation::TaskPoll => "task_poll",
         UiOperation::TaskDrop => "task_drop",
         UiOperation::ProjectSwitch => "project_switch",

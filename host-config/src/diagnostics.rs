@@ -23,6 +23,8 @@ pub enum UiOperation {
     ChatTabBinding,
     AgentsSidebarProjection,
     HistoryProjectName,
+    HistoryPageProjection,
+    HistoryCardBuild,
     TaskPoll,
     TaskDrop,
     ProjectSwitch,
