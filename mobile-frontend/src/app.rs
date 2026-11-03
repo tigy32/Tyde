@@ -375,8 +375,7 @@ fn RetainedNativePane(tab: MobileTab, children: ChildrenFn) -> impl IntoView {
     let visible = Signal::derive(move || {
         let selected = visible_state.active_tab.get();
         let chat = crate::native::chat_visible(&visible_state);
-        let split =
-            chat && visible_state.native_regular_width.get() && selected == MobileTab::Agents;
+        let split = crate::native::sidebar_visible(&visible_state);
         visible_state.app_mode.get() == AppMode::Workspace
             && ((selected == tab && !chat) || (tab == MobileTab::Agents && split))
     });
@@ -414,8 +413,7 @@ fn NativeWorkspace() -> impl IntoView {
         <div class="mobile-content native-workspace"
             class:native-pairing=move || matches!(state.app_mode.get(), AppMode::Pairing(_))
             class:native-split=move || {
-            crate::native::chat_visible(&split_state) && split_state.native_regular_width.get()
-                && split_state.active_tab.get() == MobileTab::Agents
+            crate::native::sidebar_visible(&split_state)
         }>
             <RetainedNativePane tab=MobileTab::Home><components::HomeView /></RetainedNativePane>
             <RetainedNativePane tab=MobileTab::Agents><components::AgentsView /></RetainedNativePane>
@@ -1669,7 +1667,8 @@ mod wasm_tests {
             for (width, height) in [(320, 520), (386, 700), (820, 540), (1024, 768)] {
                 shell.style().set_property("width", &format!("{width}px")).unwrap();
                 shell.style().set_property("height", &format!("{height}px")).unwrap();
-                navigate(if width >= 820 { NativeIntent::RegularWidth } else { NativeIntent::CompactWidth })?;
+                navigate(if width >= 820 && width > height { NativeIntent::RegularLandscape }
+                    else if width >= 820 { NativeIntent::RegularWidth } else { NativeIntent::CompactWidth })?;
                 for status in [ConnectionStatus::Connected, ConnectionStatus::Disconnected] {
                     state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), status); });
                     for intent in [NativeIntent::Home, NativeIntent::Agents, NativeIntent::Sessions, NativeIntent::Settings] {
@@ -1712,7 +1711,7 @@ mod wasm_tests {
                 "A failed native sign-in must not dispose the retained composer")?;
             check(composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7),
                 "Cancelling auth recovery preserves editor selection")?;
-            navigate(NativeIntent::RegularWidth)?;
+            navigate(NativeIntent::RegularLandscape)?;
             next_tick().await;
             let agents = find("[data-mobile-test='agents-view']")?;
             let width = agents.get_bounding_client_rect().width();
@@ -1724,6 +1723,63 @@ mod wasm_tests {
                 pane.has_attribute("hidden"), window.get_computed_style(&workspace).unwrap().unwrap()
                     .get_property_value("grid-template-columns").unwrap()
             ))?;
+            let retained_agent = state.active_agent.get_untracked();
+            let filter = find("[data-mobile-test='agents-search']")?
+                .dyn_into::<web_sys::HtmlInputElement>().map_err(|_| "Agent filter is not editable")?;
+            filter.set_value("Retained filter");
+            filter.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            let transcript = find("[data-mobile-test='chat-messages']")?;
+            for (intent, expected_open, expected_available) in [
+                (NativeIntent::ToggleSidebar, false, true),
+                (NativeIntent::RegularWidth, false, false),
+                (NativeIntent::CompactWidth, false, false),
+                (NativeIntent::RegularLandscape, false, true),
+                (NativeIntent::ToggleSidebar, true, true),
+                (NativeIntent::RegularWidth, false, false),
+                (NativeIntent::RegularLandscape, true, true),
+                (NativeIntent::CompactWidth, false, false),
+                (NativeIntent::RegularLandscape, true, true),
+            ] {
+                navigate(intent)?;
+                next_tick().await;
+                let presentation = projected()?;
+                let visible = agents.get_bounding_client_rect().height() > 0.0;
+                check(visible == expected_open && presentation.sidebar_open == expected_open,
+                    "Toggle closes/reopens the hierarchy and layout changes preserve the user's choice")?;
+                check(presentation.sidebar_available == expected_available,
+                    "Only expanded landscape offers the pinned hierarchy")?;
+                check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
+                    && composer.value() == "Retained draft"
+                    && state.active_agent.get_untracked() == retained_agent
+                    && find("[data-mobile-test='chat-messages']")?.is_same_node(Some(&transcript))
+                    && find("[data-mobile-test='agents-search']")?.is_same_node(Some(&filter))
+                    && filter.value() == "Retained filter",
+                    "Layout and sidebar transitions retain composer, transcript, selection and filter DOM")?;
+            }
+            let swarm = crate::components::fixture_swarm();
+            state.swarms_by_host.update(|hosts| {
+                hosts.insert(host_id.clone(), std::collections::HashMap::from([(swarm.id.clone(), swarm)]));
+            });
+            next_tick().await;
+            find("[data-mobile-test='agents-segment-swarms']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(filter.get_bounding_client_rect().height() == 0.0,
+                "The Agents filter is not offered for the unrelated Swarms list")?;
+            find("[data-mobile-test='agents-segment-agents']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(find("[data-mobile-test='agents-search']")?.is_same_node(Some(&filter))
+                && filter.value() == "Retained filter" && filter.get_bounding_client_rect().height() >= 44.0,
+                "Returning to Agents restores its retained, touch-usable filter")?;
+            filter.set_value("");
+            filter.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            state.swarms_by_host.update(|hosts| { hosts.remove(&host_id); });
+            state.session_settings_open.set(true);
+            next_tick().await;
+            navigate(NativeIntent::ToggleSidebar)?;
+            next_tick().await;
+            check(projected()?.modal && projected()?.sidebar_open,
+                "A modal blocks native sidebar navigation without losing its open state")?;
+            state.session_settings_open.set(false);
             navigate(NativeIntent::CompactWidth)?;
             next_tick().await;
             check(agents.get_bounding_client_rect().height() == 0.0,
@@ -1832,6 +1888,50 @@ mod wasm_tests {
                 && current_composer.selection_end().unwrap() == Some(7)
                 && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
                 "An unrelated same-host announcement must retain the exact conversation, draft control and editor selection")?;
+            let agent_ref = crate::state::AgentRef { local_host_id: host_id.clone(), agent_id: current.agent_id.clone() };
+            state.agent_loaded.update(|loaded| { loaded.insert(agent_ref.clone()); });
+            for index in 0..30 {
+                state.push_chat_message_entry(&agent_ref, crate::state::ChatMessageEntry {
+                    message: protocol::ChatMessage {
+                        origin: None, message_id: None, timestamp: index,
+                        sender: protocol::MessageSender::User,
+                        content: format!("Retained transcript row {index}\nA second line\nA third line"),
+                        reasoning: None, tool_calls: Vec::new(), model_info: None,
+                        token_usage: None, context_breakdown: None, images: None,
+                    }, tool_requests: Vec::new(),
+                });
+            }
+            next_tick().await;
+            let scroller = find("[data-mobile-test='chat-messages']")?.dyn_into::<HtmlElement>().unwrap();
+            scroller.set_scroll_top(200);
+            scroller.dispatch_event(&web_sys::Event::new("scroll").unwrap()).unwrap();
+            check(scroller.scroll_top() == 200, "The rendered transcript is genuinely scrollable")?;
+            let saved_layout = shell.style().css_text();
+            for (width, height, layout, sidebar) in [(951, 669, NativeIntent::RegularLandscape, true),
+                (669, 951, NativeIntent::RegularWidth, false), (466, 678, NativeIntent::CompactWidth, false),
+                (951, 669, NativeIntent::RegularLandscape, true)] {
+                shell.style().set_property("width", &format!("{width}px")).unwrap();
+                shell.style().set_property("height", &format!("{height}px")).unwrap();
+                navigate(layout)?;
+                next_tick().await;
+                check(scroller.scroll_top() == 200
+                    && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&current_composer))
+                    && current_composer.value() == "Current conversation draft"
+                    && current_composer.selection_start().unwrap() == Some(2)
+                    && current_composer.selection_end().unwrap() == Some(7)
+                    && state.active_agent.get_untracked().as_ref().map(|agent| &agent.agent_id) == Some(&current.agent_id),
+                    "DOM size changes retain the same selected conversation, scroll offset and draft selection")?;
+                check((agents.get_bounding_client_rect().height() > 0.0) == sidebar,
+                    "The DOM hierarchy is pinned only in expanded landscape")?;
+                let send = find("[data-mobile-test='chat-send']")?.get_bounding_client_rect();
+                let bounds = shell.get_bounding_client_rect();
+                check(send.left() >= bounds.left() && send.right() <= bounds.right()
+                    && send.top() >= bounds.top() && send.bottom() <= bounds.bottom(),
+                    "Send remains inside the resized DOM viewport")?;
+            }
+            shell.style().set_css_text(&saved_layout);
+            navigate(NativeIntent::CompactWidth)?;
+            next_tick().await;
             find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
             next_tick().await;
             find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();

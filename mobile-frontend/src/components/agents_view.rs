@@ -88,6 +88,7 @@ pub fn AgentsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let segment: RwSignal<AgentsSegment> = RwSignal::new(AgentsSegment::Agents);
     let hide_sub_agents = RwSignal::new(restore_hide_sub_agents());
+    let search = RwSignal::new(String::new());
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
     let selected_swarm = RwSignal::new(None::<(LocalHostId, SwarmId)>);
     let open_swarm = Callback::new(move |target: (LocalHostId, SwarmId)| {
@@ -127,6 +128,14 @@ pub fn AgentsView() -> impl IntoView {
                 />
                 </Show>
             </header>
+            {crate::native::is_native().then(|| view! {
+                <div class="search-bar" hidden=move || segment.get() != AgentsSegment::Agents>
+                    <input type="search" placeholder="Filter agents" aria-label="Filter agents"
+                        autocapitalize="none" autocomplete="off" spellcheck="false"
+                        data-mobile-test="agents-search" prop:value=move || search.get()
+                        on:input=move |event| search.set(event_target_value(&event)) />
+                </div>
+            })}
             <Show when=move || has_swarms.get()>
             <div class="agents-segmented" role="tablist" aria-label="Agents and swarms" data-mobile-test="agents-segmented">
                 {
@@ -168,7 +177,7 @@ pub fn AgentsView() -> impl IntoView {
                     }
                     view! {
                         <AgentRestorationNotice />
-                        {render_agents_body(&state, hide_sub_agents, collapsed_parents, open_swarm)}
+                        {render_agents_body(&state, hide_sub_agents, collapsed_parents, open_swarm, search)}
                         <Show when=move || !has_swarms.get()>
                             <LegacyTeams />
                         </Show>
@@ -394,6 +403,7 @@ fn render_agents_body(
     hide_sub_agents: RwSignal<bool>,
     collapsed_parents: RwSignal<HashSet<AgentId>>,
     open_swarm: Callback<(LocalHostId, SwarmId)>,
+    search: RwSignal<String>,
 ) -> AnyView {
     let state = state.clone();
     view! {
@@ -479,7 +489,24 @@ fn render_agents_body(
                             projects
                         })
                         .unwrap_or_default();
-                    let sections = project_sections(visible_agents, swarms, &projects);
+                    let mut sections = project_sections(visible_agents, swarms, &projects);
+                    let query = search.get().trim().to_lowercase();
+                    if !query.is_empty() {
+                        for section in &mut sections {
+                            if section.label.to_lowercase().contains(&query) {
+                                continue;
+                            }
+                            section.groups.retain(|(parent, children)| {
+                                parent.name.to_lowercase().contains(&query)
+                                    || children.iter().any(|child| child.name.to_lowercase().contains(&query))
+                            });
+                            section.swarms.retain(|swarm| swarm.name.to_lowercase().contains(&query));
+                        }
+                        sections.retain(|section| !section.groups.is_empty() || !section.swarms.is_empty());
+                        if sections.is_empty() {
+                            return view! { <EmptyState title="No matching agents" data_mobile_test="agents-search-empty" /> }.into_any();
+                        }
+                    }
 
                     view! {
                         <div>
@@ -812,6 +839,7 @@ fn agent_row(
                 {(child_count > 0).then(|| {
                     let agent_id_for_toggle = agent_id.clone();
                     let agent_id_for_icon = agent_id.clone();
+                    let agent_id_for_expanded = agent_id.clone();
                     let on_toggle = move |ev: web_sys::MouseEvent| {
                         ev.stop_propagation();
                         let id = agent_id_for_toggle.clone();
@@ -832,6 +860,7 @@ fn agent_row(
                                 type="button"
                                 class="agent-child-collapse"
                                 aria-label="Toggle sub-agents"
+                                aria-expanded=move || (!collapsed_parents.with(|collapsed| collapsed.contains(&agent_id_for_expanded))).to_string()
                                 data-mobile-test="agent-child-collapse"
                                 on:click=on_toggle
                                 on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()

@@ -19,6 +19,8 @@ mod session_settings;
 mod sessions_view;
 pub mod settings_view;
 mod swarms_view;
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) use swarms_view::wasm_tests::fixture_swarm;
 mod teams_view;
 mod tool_card;
 pub mod ui;

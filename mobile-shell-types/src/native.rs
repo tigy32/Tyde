@@ -57,10 +57,11 @@ fn swift_type(ty: &str) -> String {
     }
 }
 
-pub const NATIVE_BRIDGE_VERSION: u32 = 5;
+pub const NATIVE_BRIDGE_VERSION: u32 = 6;
 pub const NATIVE_CLIENT_RELEASE: &str = env!("TYDE_NATIVE_CLIENT_RELEASE");
 
 native_enum!(NativeTab { Home = "home", Agents = "agents", Sessions = "sessions", Settings = "settings" });
+native_enum!(NativeLayout { Compact = "compact", RegularPortrait = "regular_portrait", RegularLandscape = "regular_landscape" });
 native_enum!(NativeRoute { Root = "root", Chat = "chat", Hosts = "hosts" });
 native_enum!(NativeTheme { Dark = "dark", Light = "light" });
 native_enum!(NativeIntent {
@@ -68,6 +69,7 @@ native_enum!(NativeIntent {
     Back = "back", Hosts = "hosts", NewChat = "new_chat", RenameAgent = "rename_agent",
     SessionSettings = "session_settings", CloseAgent = "close_agent",
     RegularWidth = "regular_width", CompactWidth = "compact_width",
+    RegularLandscape = "regular_landscape", ToggleSidebar = "toggle_sidebar",
     Foreground = "foreground", Background = "background"
 });
 native_enum!(NativeEndpoint {
@@ -79,7 +81,8 @@ native_enum!(NativeHttpMethod { Get = "get", Post = "post" });
 
 native_struct!(NativePresentation {
     version: [u32], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
-    title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme]
+    title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme],
+    sidebar_available: [bool], sidebar_open: [bool]
 });
 native_struct!(NativeHttpRequest {
     id: [u32],
@@ -112,6 +115,7 @@ pub fn swift_source() -> String {
     for definition in [
         NativeTab::swift(),
         NativeRoute::swift(),
+        NativeLayout::swift(),
         NativeTheme::swift(),
         NativeIntent::swift(),
         NativeEndpoint::swift(),

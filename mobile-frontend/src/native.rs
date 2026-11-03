@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use mobile_shell_types::native::{
-    NATIVE_BRIDGE_VERSION, NativeEndpoint, NativeIntent, NativePresentation, NativeRoute,
-    NativeTab, NativeTheme,
+    NATIVE_BRIDGE_VERSION, NativeEndpoint, NativeIntent, NativeLayout, NativePresentation,
+    NativeRoute, NativeTab, NativeTheme,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
@@ -142,6 +142,7 @@ fn handle_intent(state: &AppState, intent: NativeIntent) {
                 | NativeIntent::RenameAgent
                 | NativeIntent::SessionSettings
                 | NativeIntent::CloseAgent
+                | NativeIntent::ToggleSidebar
         )
     {
         return;
@@ -174,8 +175,14 @@ fn handle_intent(state: &AppState, intent: NativeIntent) {
             }
         }
         NativeIntent::NewChat => crate::actions::begin_new_chat(state),
-        NativeIntent::RegularWidth => state.native_regular_width.set(true),
-        NativeIntent::CompactWidth => state.native_regular_width.set(false),
+        NativeIntent::RegularWidth => state.native_layout.set(NativeLayout::RegularPortrait),
+        NativeIntent::RegularLandscape => state.native_layout.set(NativeLayout::RegularLandscape),
+        NativeIntent::CompactWidth => state.native_layout.set(NativeLayout::Compact),
+        NativeIntent::ToggleSidebar => {
+            if sidebar_available(state) {
+                state.native_sidebar_open.update(|open| *open = !*open);
+            }
+        }
         NativeIntent::Foreground => crate::app::page_foreground(state.clone()),
         NativeIntent::Background => crate::app::page_background(),
         NativeIntent::RenameAgent | NativeIntent::SessionSettings | NativeIntent::CloseAgent => {
@@ -296,6 +303,16 @@ pub fn chat_visible(state: &AppState) -> bool {
         && state.active_tab.get() == state.chat_origin_tab.get()
 }
 
+pub fn sidebar_available(state: &AppState) -> bool {
+    chat_visible(state)
+        && state.active_tab.get() == MobileTab::Agents
+        && state.native_layout.get() == NativeLayout::RegularLandscape
+}
+
+pub fn sidebar_visible(state: &AppState) -> bool {
+    sidebar_available(state) && state.native_sidebar_open.get()
+}
+
 fn presentation(state: &AppState) -> NativePresentation {
     let tab = state.active_tab.get();
     let hosts = state.app_mode.get() == AppMode::HostPicker;
@@ -339,6 +356,8 @@ fn presentation(state: &AppState) -> NativePresentation {
         subtitle,
         chat_actions: chat && state.active_agent.get().is_some(),
         modal: modal_open(state),
+        sidebar_available: sidebar_available(state),
+        sidebar_open: sidebar_visible(state),
         theme: if state.theme.get() == "light" {
             NativeTheme::Light
         } else {

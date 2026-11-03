@@ -5732,7 +5732,11 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     background: rgb(0 0 0 / 18%);
 }
 
-[data-native-host] .native-split .agent-child-collapse { min-width: 44px; }
+[data-native-host] .agent-child-collapse { min-width: 44px; min-height: 44px; }
+[data-native-host] .agents-filter-toggle { min-height: 44px; }
+[data-native-host] .native-split .agents-view .search-bar { margin: 8px 0 0; }
+[data-native-host] .native-split .agents-view .search-bar input { min-height: 44px; }
+[data-native-host] .native-split .list-row-chevron { display: none; }
 
 [data-native-host] .chat-send-split > .send-button {
     border-start-start-radius: var(--radius-md);
@@ -5743,7 +5747,7 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     border-end-end-radius: var(--radius-md);
 }
 [data-native-host] .native-split .ui-card:has([aria-current="page"]) {
-    background: var(--accent-soft);
+    background: var(--bg-surface-2);
     border-color: transparent;
 }
 [data-native-host] .native-split .agent-child-controls { display: contents; }

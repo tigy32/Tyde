@@ -123,7 +123,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "host")
     private var applyingPresentation = false
     private var ready = false
-    private var lastRegularWidth: Bool?
+    private var lastLayout: NativeLayout?
 
     #if DEBUG
     var navigationDiagnostics: NativeNavigationDiagnostics?
@@ -431,7 +431,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         guard state.workspace else {
             showContainer(entry)
             attach(to: entry)
-            reportWidth()
+            reportLayout()
             #if DEBUG
             observeApplied()
             #endif
@@ -492,9 +492,22 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         } else {
             content.navigationItem.rightBarButtonItems = []
         }
+        content.navigationItem.hidesBackButton = state.sidebar_open
+        content.navigationItem.leftItemsSupplementBackButton = !state.sidebar_open
+        if state.sidebar_available {
+            let sidebar = UIBarButtonItem(title: state.sidebar_open ? "Hide Agents" : "Show Agents",
+                image: UIImage(systemName: "sidebar.left"),
+                primaryAction: UIAction { [weak self] _ in self?.send(.toggle_sidebar) })
+            sidebar.accessibilityLabel = state.sidebar_open ? "Hide Agents" : "Show Agents"
+            sidebar.accessibilityIdentifier = "native-toggle-agents"
+            sidebar.isEnabled = !state.modal
+            content.navigationItem.leftBarButtonItems = [sidebar]
+        } else {
+            content.navigationItem.leftBarButtonItems = []
+        }
         content.navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = !state.modal }
         attach(to: content)
-        reportWidth()
+        reportLayout()
         #if DEBUG
         observeApplied()
         #endif
@@ -537,15 +550,31 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         } catch { fail("Native intent could not be encoded") }
     }
 
-    private func reportWidth() {
+    private func reportLayout() {
         guard ready else { return }
-        let regular = traitCollection.horizontalSizeClass == .regular
-        if lastRegularWidth != regular { lastRegularWidth = regular; send(regular ? .regular_width : .compact_width) }
+        let size = view.bounds.size
+        let layout: NativeLayout = traitCollection.horizontalSizeClass != .regular ? .compact
+            : size.width > size.height ? .regular_landscape : .regular_portrait
+        guard lastLayout != layout else { return }
+        lastLayout = layout
+        logger.notice("Native layout=\(layout.rawValue, privacy: .public) width=\(size.width) height=\(size.height)")
+        switch layout {
+        case .compact: send(.compact_width)
+        case .regular_portrait: send(.regular_width)
+        case .regular_landscape: send(.regular_landscape)
+        }
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        registerForTraitChanges([UITraitHorizontalSizeClass.self]) { (self: TydeHostController, _: UITraitCollection) in
+            self.reportLayout()
+        }
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        reportWidth()
+        reportLayout()
         #if DEBUG
         navigationDiagnostics?.record(.layout, window: view.window, state: presentation, ready: ready)
         #endif

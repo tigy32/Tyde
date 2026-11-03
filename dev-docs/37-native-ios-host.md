@@ -55,6 +55,31 @@ owner must complete Apple's export-compliance assessment and any required
 documentation. Privacy/account declarations and Apple's processed build status
 remain distribution checks, not inferred source/test success.
 
+## Adaptive Agents hierarchy
+
+The approved Duo v4 composition keeps the Agents/project hierarchy on the left
+only in regular-width landscape, with global tabs still owned by UIKit. Regular
+portrait and compact layouts show one destination at a time. UIKit alone places
+its bars, Back and system reservations; there are no web side-tabs, pose/edge
+preferences, fake status indicators or Swift agent/status records.
+
+`TydeHostController.reportLayout` projects the root view's current bounds and
+horizontal size class on layout and trait changes. The typed native layout is
+presentation input, independent of keyboard contraction, screen identity and
+connection foreground recovery. The native sidebar action changes the one
+Wasm-owned visibility choice; it hides redundant Back while the hierarchy is
+visible, respects existing modal exclusion, and retains its choice across size
+changes. Existing retained panes and the shared shell keep owning mounted
+content, scrolling and keyboard geometry. Native ABI 6 adds these projections.
+
+The existing mounted-DOM flow covers sidebar open/close, portrait/compact
+transitions, modal exclusion, filter/segment behavior and retained conversation,
+draft selection and scroll. Its native boundary is deliberately a fixture; it
+is not proof of actual UIKit resizing or Duo displays. Actual app screenshots,
+Duo integrated-display routing/fold transitions and keyboard/safe-area geometry
+remain acceptance work in an owned DeviceHub MCP session. DeviceHub connection
+or capture failures establish apparatus limits, not product layout failures.
+
 ## Ownership
 
 One retained WKWebView/document runs the mobile Rust/Wasm AppState, dispatcher,
