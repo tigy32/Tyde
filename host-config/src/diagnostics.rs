@@ -1,7 +1,7 @@
 //! Content-free, local desktop diagnostics; never sent to a host or provider.
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiOperation {
     HostReceive,
@@ -22,12 +22,32 @@ pub enum UiOperation {
     ChatVirtualWindow,
     ChatTabBinding,
     AgentsSidebarProjection,
+    HistoryProjectName,
     TaskPoll,
     TaskDrop,
     ProjectSwitch,
     TabOpen,
     TabClose,
     TabReveal,
+}
+
+pub const MAX_UI_SYNC_OPERATIONS: usize = 32;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSyncWork {
+    pub calls: u32,
+    pub items: u32,
+    pub max_items: u32,
+    pub work_ms: u32,
+    pub longest_ms: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSyncOperationWork {
+    pub operation: UiOperation,
+    pub work: UiSyncWork,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -168,6 +188,7 @@ pub enum FrontendDiagnostic {
         pending_bridge_calls: u32,
         task_work: UiTaskWork,
         task_producers: Vec<UiTaskProducerWork>,
+        sync_work: Vec<UiSyncOperationWork>,
         activity: UiActivityContext,
     },
 }

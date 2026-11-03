@@ -654,6 +654,8 @@ fn session_card(
         })
     });
     let project_name = Memo::new(move |_| {
+        let _diagnostic =
+            crate::perf::UiSpan::new(crate::perf::UiOperation::HistoryProjectName, 0, 1);
         #[cfg(all(test, target_arch = "wasm32"))]
         wasm_tests::observe_project_name_read();
         name.get()
@@ -1277,10 +1279,18 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn project_changes_only_wake_history_for_changed_names() {
+        use crate::perf::diagnostic_tests::{Capture, LocalLogCapture, LocalMonitorClock};
         use crate::state::{ProjectInfo, sort_project_infos};
         use protocol::{Project, ProjectId, ProjectNotifyPayload, ProjectRootPath, ProjectSource};
 
         install_send_stub();
+        let capture = Capture::new();
+        capture.start();
+        capture.stop();
+        let capture_off = capture.export();
+        let log = LocalLogCapture::install();
+        let clock = LocalMonitorClock::install();
+        clock.reading_step(0.25);
         let state = AppState::new();
         state.active_project.set(None);
         let project = |id: &str, name: &str, order| Project {
@@ -1332,6 +1342,19 @@ mod wasm_tests {
             .unwrap()
             .unwrap();
         assert_eq!(badge.text_content().as_deref(), Some("Alpha"));
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let initial = log.records();
+        let work = initial.as_array().unwrap().last().unwrap()["diagnostic"]["sync_work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == "history_project_name")
+            .expect("ordinary diagnostics must identify mounted History name work");
+        assert_eq!(work["work"]["calls"], 3);
+        assert_eq!(work["work"]["items"], 3);
+        assert_eq!(work["work"]["max_items"], 1);
         container.style().set_property("display", "none").unwrap();
         let mut seq = 0;
         let mut notify = |host: &str, payload: ProjectNotifyPayload| {
@@ -1410,6 +1433,26 @@ mod wasm_tests {
             badge.is_same_node(Some(&badge_after)),
             "unchanged badge retains its actual DOM"
         );
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let unchanged = log.records();
+        let diagnostic = &unchanged.as_array().unwrap().last().unwrap()["diagnostic"];
+        assert!(
+            diagnostic["sync_work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["operation"] != "history_project_name")
+        );
+        let dispatch = diagnostic["sync_work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == "host_dispatch")
+            .unwrap();
+        assert_eq!(dispatch["work"]["calls"], 6);
+        assert!(diagnostic["longest_work"].is_null());
 
         alpha.name = "Renamed Alpha".to_owned();
         notify(
@@ -1504,6 +1547,38 @@ mod wasm_tests {
                 .text_content()
                 .as_deref(),
             Some("Reconnected Remote")
+        );
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let changed = log.records();
+        let diagnostic = &changed.as_array().unwrap().last().unwrap()["diagnostic"];
+        let work = diagnostic["sync_work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == "history_project_name")
+            .unwrap();
+        assert_eq!(work["work"]["calls"], 4);
+        assert_eq!(work["work"]["items"], 4);
+        assert_eq!(work["work"]["max_items"], 1);
+        assert_eq!(work["work"]["work_ms"], 1);
+        assert_eq!(work["work"]["longest_ms"], 0);
+        assert!(diagnostic["longest_work"].is_null());
+        assert_eq!(capture.export(), capture_off);
+        for private in ["conversation", "host-a", "shared", "/owned", "Alpha"] {
+            assert!(!changed.to_string().contains(private));
+        }
+        clock.visibility(false);
+        clock.visibility(true);
+        clock.reading_step(0.0);
+        clock.advance(2000.0);
+        clock.tick();
+        settle().await;
+        let reset = log.records();
+        assert_eq!(
+            reset.as_array().unwrap().last().unwrap()["diagnostic"]["sync_work"],
+            serde_json::json!([])
         );
         drop(handle);
         container.remove();

@@ -185,6 +185,7 @@ impl DiagnosticSink {
             longest_work,
             activity,
             task_producers,
+            sync_work,
             ..
         } = &record.diagnostic
         {
@@ -202,6 +203,21 @@ impl DiagnosticSink {
                     .any(|other| other.producer == work.producer)
                 {
                     return Err("Local diagnostic repeats a task producer");
+                }
+            }
+            if sync_work.len() > host_config::diagnostics::MAX_UI_SYNC_OPERATIONS {
+                return Err("Local diagnostic synchronous operations exceed their bound");
+            }
+            for (index, work) in sync_work.iter().enumerate() {
+                use host_config::diagnostics::UiOperation;
+                if matches!(
+                    work.operation,
+                    UiOperation::TaskPoll | UiOperation::TaskDrop | UiOperation::Bridge
+                ) || sync_work[..index]
+                    .iter()
+                    .any(|other| other.operation == work.operation)
+                {
+                    return Err("Local diagnostic has an invalid synchronous operation");
                 }
             }
             for frame in longest_work

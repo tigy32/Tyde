@@ -50,6 +50,7 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   | `chat_context_scan`, `chat_context_reported_scan` | 0 | rows actually visited |
   | `chat_ink_layout`, `chat_virtual_window` | 0 | loaded rows supplied to calculation |
   | `agents_sidebar_projection` | 0 | projected agent rows |
+  | `history_project_name` | 0 | 1 card-name memo evaluation |
 
   No IDs, labels, paths, payloads or command arguments are recorded. The desktop shell drops a record
   whose `frame` is not a protocol frame kind. Example:
@@ -99,6 +100,36 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   a quiet tick emits nothing. A zero/absent bucket means no completed observation
   in that window, not proof that the producer could not be involved. Older
   records lacking `task_producers` have unknown coverage, not zero activity.
+
+  `sync_work` retains completed named synchronous spans even below the 100ms
+  longest-work threshold. Each entry has a code-defined `operation` and five
+  saturating u32 metrics: `calls`, summed `items`, `max_items` per call,
+  accumulated `work_ms`, and `longest_ms`. Fractional durations accumulate
+  before the total is truncated. Task poll/drop and bridge waits are excluded;
+  their existing counters remain separate. There are at most 32 unique named
+  operations; native ingress rejects duplicates, non-synchronous operations or
+  oversized lists. No per-call log, new timer, payload or identity is added.
+
+  This separates many short measured projections from executor polls outside
+  those scopes, without guessing which future or notification caused them.
+  For example, six project dispatches and zero `history_project_name` calls
+  distinguish lifecycle/catalog traffic from actual History name projection.
+  A genuine rename can record name work while every span is below 100ms and
+  `longest_work` remains null. `history_project_name` wraps one card memo's
+  project-name evaluation (`items:1`), not all saved sessions or catalog scans.
+  Other item units are in the table above: summed visits and maximum input
+  size must not be confused with mounted DOM rows or resident bytes.
+
+  Named spans can nest and overlap task polls. These totals are inclusive
+  wall observations, NOT an exclusive partition, CPU profile, callback count
+  for uninstrumented effects or a subtractable residual of `task_work`.
+  No task registration/wake origin is inferred from a named span. Existing
+  `file_tree_build` covers the returned entry-vector scope, not its preceding
+  page memo or subsequent keyed DOM construction. Every tick consumes these
+  aggregates, including quiet ticks; visibility resets them. An absent entry
+  in a present array means no completed named span in that window; an older
+  record without the array has unknown coverage. Delivery still uses the
+  existing bounded, nonblocking, file-only diagnostic sink and loss budgets.
 
   `activity` supplies content-free context even when `longest_work` is null:
   the last four typed command attempts (`commands`), the latest host-dispatch
@@ -463,3 +494,18 @@ The reviewed standalone export script is unchanged; a future allowlist revision
 may retain only `task_producers[].producer` from the five values above and
 `work.{polls,poll_ms,longest_poll_ms,drops,drop_ms,longest_drop_ms}` as u32 numbers,
 with a maximum of five unique entries. Older/missing fields must remain unknown.
+
+## Export compatibility for synchronous-work totals
+
+The separately reviewed V2 exporter is retained at
+`/home/tyggs/tyde-evidence/stall-export-task-producers-20261102/export-existing-mac-stalls-with-producers.py`
+(SHA-256 `68063dc3bea79399a208840c017ba52ae4cd9afc5c15fc3947112bd314538828`).
+It already preserves all five producer buckets and six u32 task metrics; the
+older exporter was intentionally unchanged. Neither existing exporter retains
+`sync_work`. A future reviewed export schema must explicitly admit the bounded
+new operation list and its five metrics before requesting those totals through
+that route. Do not substitute a raw-log dump. No customer reproduction/export
+request is warranted until a released client actually includes these metrics.
+The beta.19 report predates origin and synchronous-work fields; neither can
+retroactively identify its 19.679s work producer. This is attribution coverage,
+not a behavioral fix or an introduction date for the original incident.

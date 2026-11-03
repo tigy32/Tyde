@@ -12,7 +12,8 @@
 //! ```
 use host_config::diagnostics::{
     FrameName, FrontendDiagnostic, FrontendDiagnosticRecord, MAX_UI_ACTIVITY, SlowUiWork,
-    UiActivityContext, UiFrameActivity, UiTaskProducerWork, UiTaskWork, UiTransitionActivity,
+    UiActivityContext, UiFrameActivity, UiSyncOperationWork, UiSyncWork, UiTaskProducerWork,
+    UiTaskWork, UiTransitionActivity,
 };
 pub(crate) use host_config::diagnostics::{
     FrontendStartupPhase, UiOperation, UiTaskProducer, UiTransition,
@@ -75,6 +76,7 @@ fn operation_label(operation: UiOperation) -> &'static str {
         UiOperation::ChatVirtualWindow => "chat_virtual_window",
         UiOperation::ChatTabBinding => "chat_tab_binding",
         UiOperation::AgentsSidebarProjection => "agents_sidebar_projection",
+        UiOperation::HistoryProjectName => "history_project_name",
         UiOperation::TaskPoll => "task_poll",
         UiOperation::TaskDrop => "task_drop",
         UiOperation::ProjectSwitch => "project_switch",
@@ -190,6 +192,7 @@ struct LocalMonitor {
     longest: Option<SlowUiWork>,
     task_work: TaskWork,
     task_producers: BTreeMap<UiTaskProducer, TaskWork>,
+    sync_work: BTreeMap<UiOperation, SyncWork>,
     activity: ActivityContext,
     pending: u32,
     queue: VecDeque<FrontendDiagnostic>,
@@ -269,6 +272,21 @@ struct TaskWork {
     drop_ms: f64,
 }
 
+#[derive(Default)]
+struct SyncWork {
+    summary: UiSyncWork,
+    work_ms: f64,
+}
+
+impl SyncWork {
+    fn finish(self) -> UiSyncWork {
+        UiSyncWork {
+            work_ms: millis(self.work_ms),
+            ..self.summary
+        }
+    }
+}
+
 impl TaskWork {
     fn finish(self) -> UiTaskWork {
         UiTaskWork {
@@ -303,6 +321,7 @@ fn install_local_monitor(env: &JsValue) {
             let longest_work = m.longest.take();
             let task_work = std::mem::take(&mut m.task_work).finish();
             let producers = std::mem::take(&mut m.task_producers);
+            let sync_work = std::mem::take(&mut m.sync_work);
             (visible && interval >= 1250).then(|| FrontendDiagnostic::EventLoopGap {
                 interval_ms: interval,
                 expected_ms: 1000,
@@ -314,6 +333,13 @@ fn install_local_monitor(env: &JsValue) {
                     .into_iter()
                     .map(|(producer, work)| UiTaskProducerWork {
                         producer,
+                        work: work.finish(),
+                    })
+                    .collect(),
+                sync_work: sync_work
+                    .into_iter()
+                    .map(|(operation, work)| UiSyncOperationWork {
+                        operation,
                         work: work.finish(),
                     })
                     .collect(),
@@ -331,6 +357,7 @@ fn install_local_monitor(env: &JsValue) {
                 m.longest = None;
                 m.task_work = TaskWork::default();
                 m.task_producers.clear();
+                m.sync_work.clear();
                 m.activity.clear();
             }
         });
@@ -347,6 +374,7 @@ fn install_local_monitor(env: &JsValue) {
             longest: None,
             task_work: TaskWork::default(),
             task_producers: BTreeMap::new(),
+            sync_work: BTreeMap::new(),
             activity: ActivityContext::default(),
             pending: 0,
             queue: VecDeque::new(),
@@ -673,6 +701,13 @@ impl Drop for UiSpan {
                 }
                 return;
             }
+            let work = m.sync_work.entry(span.operation).or_default();
+            work.summary.calls = work.summary.calls.saturating_add(1);
+            let items = count(span.items);
+            work.summary.items = work.summary.items.saturating_add(items);
+            work.summary.max_items = work.summary.max_items.max(items);
+            work.work_ms += duration;
+            work.summary.longest_ms = work.summary.longest_ms.max(duration_ms);
             if duration_ms >= 100
                 && m.longest
                     .as_ref()

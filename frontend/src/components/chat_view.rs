@@ -5379,6 +5379,14 @@ mod wasm_tests {
         assert_eq!(work["bytes"], 0);
         assert!(work["frame"].is_null());
         assert!(work["duration_ms"].as_u64().unwrap() >= 100);
+        let projections = local["diagnostic"]["sync_work"].as_array().unwrap();
+        let window = projections
+            .iter()
+            .find(|row| row["operation"] == "chat_virtual_window")
+            .unwrap();
+        assert!(window["work"]["calls"].as_u64().unwrap() > 0);
+        assert_eq!(window["work"]["max_items"], total_rows);
+        assert!(window["work"]["items"].as_u64().unwrap() >= total_rows as u64);
         assert_eq!(capture.export(), disabled);
         for private in ["private", "generated payload"] {
             assert!(
