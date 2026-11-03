@@ -988,7 +988,7 @@ async fn setup_connection_transport(
                 RemoteHostLifecycleConfig::Manual => Ok(REMOTE_HOST_COMMAND.to_string()),
                 RemoteHostLifecycleConfig::ManagedTyde => managed_remote_bridge_command(),
             }?;
-            let mut child = server::process_env::command("ssh")?;
+            let mut child = crate::devtools::ssh_command()?;
             child
                 .arg("-T")
                 .args([

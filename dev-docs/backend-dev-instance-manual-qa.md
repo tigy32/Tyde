@@ -1636,3 +1636,37 @@ connection/disconnection, lifecycle SSH, feedback and external-link handlers
 already run asynchronously; their persistence, network/process operations and
 error ordering are unchanged. Retry is in-memory notification only. Native
 image reads already use blocking workers. Theme and layout are untouched.
+
+### Desktop failed-SSH-auth observation
+
+In an owned debug DEV instance, `configure_dev_instance_ssh` accepts one
+OpenSSH config string through real Tauri IPC. It writes a new mode-0600 file
+inside that instance's disposable store. Both managed lifecycle probes and
+stdio transport use the real SSH executable with `-F` pointing to that file;
+all other arguments, process ownership and authentication remain unchanged.
+Ordinary launches reject this control and retain their normal SSH/HOME/auth
+configuration. Reconfiguration and write failures reject explicitly; restart
+with a fresh instance rather than overwriting the observation configuration.
+Install it before starting remote operations.
+
+Use an owned loopback OpenSSH service, an explicit pinned known-host file and
+an owned unauthorized identity. Hold the real public-key authorization decision
+on an event gate, not a host-key check or TCP connection. In a user namespace,
+OpenSSH may reject `AuthorizedKeysCommand` because host-root executables appear
+owned by an unmapped UID. Do not disable checks or change namespace privileges.
+An owned syscall observer can instead stop OpenSSH immediately before opening
+its regular, empty `authorized_keys` file, then explicitly release that read.
+Confirm that the real key was offered and that release ends in public-key auth
+rejection; a pre-auth fixture error is not coverage.
+
+While authorization is held, separately record completion of synchronous
+`mark_frontend_ready` IPC (native main-thread dispatch), rendered Settings
+navigation with animation-frame acknowledgments, and the still-pending SSH
+bridge operation. After release, observe the rendered rejection and disconnect
+state. These are state/event assertions, never elapsed-speed assertions. Start
+only the owned controller/child with `tauri_shell::host_io=debug`; those markers
+and native UI diagnostics are excluded from process-output debug events, so
+copy `<storeDir>/tracing` before stopping the child. Preserve the detailed
+capture's capabilities, ranges and loss counters separately from aggregate
+producer/synchronous-work diagnostics. A usable UI during this held wait only
+shows that this scenario is insufficient to reproduce a stall.

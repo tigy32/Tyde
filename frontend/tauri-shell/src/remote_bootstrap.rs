@@ -548,13 +548,14 @@ async fn launch_server(ssh_destination: &str, version: &TydeReleaseVersion) -> R
 
 async fn ssh_capture(ssh_destination: &str, remote_command: &str) -> Result<String, String> {
     tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.connect event=ssh_capture_start");
-    let output = server::process_env::command("ssh")?
+    let output = crate::devtools::ssh_command()?
         .arg("-T")
         .arg(ssh_destination)
         .arg(remote_command)
         .output()
         .await
         .map_err(|err| format!("failed to start ssh command for {ssh_destination}: {err}"))?;
+    tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, success = output.status.success(), "host.connect event=ssh_capture_complete");
     if !output.status.success() {
         return Err(format!(
             "ssh command failed for {ssh_destination} with status {}: {}",

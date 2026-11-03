@@ -924,6 +924,11 @@ async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), Str
 }
 
 #[tauri::command]
+async fn configure_dev_instance_ssh(app: tauri::AppHandle, config: String) -> Result<(), String> {
+    devtools::configure_ssh(&app, config).await
+}
+
+#[tauri::command]
 async fn connect_host(
     app: tauri::AppHandle,
     state: tauri::State<'_, ShellState>,
@@ -1323,6 +1328,7 @@ macro_rules! other_production_invoke_handler {
             upsert_configured_host,
             remove_configured_host,
             set_selected_host,
+            configure_dev_instance_ssh,
             mark_ui_debug_ready,
             mark_frontend_ready,
             log_ui_diagnostic,
@@ -1353,6 +1359,7 @@ macro_rules! other_production_invoke_handler {
             upsert_configured_host,
             remove_configured_host,
             set_selected_host,
+            configure_dev_instance_ssh,
             mark_ui_debug_ready,
             mark_frontend_ready,
             log_ui_diagnostic,

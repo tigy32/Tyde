@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use devtools_protocol::{
     UiDebugRequest, UiDebugRequestEvent, UiDebugResponse, UiDebugResponseSubmission,
@@ -14,6 +15,66 @@ use uuid::Uuid;
 
 const UI_DEBUG_BIND_ENV: &str = "TYDE_DEV_UI_DEBUG_BIND_ADDR";
 const UI_DEBUG_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+static DEV_SSH_CONFIG: OnceLock<PathBuf> = OnceLock::new();
+
+pub async fn configure_ssh(app: &AppHandle, config: String) -> Result<(), String> {
+    if !cfg!(debug_assertions)
+        || std::env::var("TYDE_DEV_INSTANCE").as_deref() != Ok("1")
+        || devtools_protocol::DevInstanceStartupOwner::from_env()?.is_none()
+    {
+        return Err(
+            "SSH observation configuration requires an owned debug DEV instance".to_owned(),
+        );
+    }
+    let instance_id = devtools_protocol::DevInstanceId(
+        std::env::var(devtools_protocol::DEV_INSTANCE_ID_ENV)
+            .map_err(|error| format!("Missing DEV identity: {error}"))?,
+    );
+    if app.config().identifier
+        != devtools_protocol::dev_instance_application_identifier(&instance_id)
+    {
+        return Err("SSH observation configuration has a foreign application identity".to_owned());
+    }
+    if config.trim().is_empty() {
+        return Err("SSH observation configuration must not be empty".to_owned());
+    }
+    let store = PathBuf::from(
+        std::env::var(devtools_protocol::CONFIGURED_HOST_STORE_PATH_ENV)
+            .map_err(|error| format!("Missing DEV host store: {error}"))?,
+    );
+    let path = store
+        .parent()
+        .ok_or_else(|| "DEV host store has no parent".to_owned())?
+        .join("ssh-observation.conf");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .await
+        .map_err(|error| format!("Cannot create DEV SSH configuration: {error}"))?;
+    file.write_all(config.as_bytes())
+        .await
+        .map_err(|error| format!("Cannot write DEV SSH configuration: {error}"))?;
+    file.flush()
+        .await
+        .map_err(|error| format!("Cannot flush DEV SSH configuration: {error}"))?;
+    DEV_SSH_CONFIG
+        .set(path)
+        .map_err(|_| "DEV SSH configuration is already installed".to_owned())?;
+    tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.connect event=observation_configured");
+    Ok(())
+}
+
+pub fn ssh_command() -> Result<server::process_env::launch::GroupCommand, String> {
+    let mut command = server::process_env::command("ssh")?;
+    if let Some(path) = DEV_SSH_CONFIG.get() {
+        command.arg("-F").arg(path);
+    }
+    Ok(command)
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub struct VerifiedNativeIdentity {
