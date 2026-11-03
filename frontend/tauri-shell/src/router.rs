@@ -7,7 +7,7 @@ use std::time::Duration;
 use server::process_env::launch::{AsyncCommandGroup, AsyncGroupChild as Child, ProcessStdio};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::bridge::{
@@ -20,7 +20,6 @@ use host_config::TydeReleaseVersion;
 
 const REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 const SSH_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
-const SSH_EXIT_WAIT: Duration = Duration::from_secs(2);
 pub const HOST_VOICE_FRAME_EVENT: &str = "tyde://host-voice-frame";
 
 #[derive(Clone, serde::Serialize)]
@@ -56,7 +55,7 @@ impl Drop for AudioPermit {
 ///     unbounded outbound channel.
 ///
 /// The registry below only carries control-plane state (the outbound sender
-/// and the child handle used for teardown). It never sits in the inbound data
+/// and generation-specific cancellation/completion channels). It never sits in the inbound data
 /// path, so a stalled/backpressured writer can never stop the reader from
 /// draining the transport — which is what previously deadlocked the SSH proxy.
 #[derive(Clone)]
@@ -67,7 +66,7 @@ pub struct ProxyRouterHandle {
 struct RouterState {
     hosts: HashMap<String, Connection>,
     next_connection_id: u64,
-    pending: HashMap<String, Arc<AtomicBool>>,
+    pending: HashMap<String, ConnectionControl>,
 }
 
 struct Connection {
@@ -76,9 +75,7 @@ struct Connection {
     /// Dropping every sender (i.e. removing this entry) makes the writer task
     /// finish on its own.
     outbound_tx: mpsc::UnboundedSender<Outbound>,
-    /// SSH child process, owned here so teardown can reap it. `None` for the
-    /// in-process embedded transport.
-    child: Option<SshChild>,
+    control: ConnectionControl,
     /// Liveness flag shared with this connection's reader/stderr tasks. Cleared
     /// (non-blocking, no lock) the instant the entry is removed or superseded,
     /// so a stale reader/stderr task that is still draining stops emitting
@@ -88,6 +85,63 @@ struct Connection {
     audio_pending: Arc<AtomicUsize>,
     available: Arc<AtomicBool>,
     retry: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct ConnectionControl {
+    live: Arc<AtomicBool>,
+    cancel: watch::Sender<bool>,
+    finished: watch::Receiver<Option<Result<(), String>>>,
+}
+
+struct ConnectionOwner {
+    cancel: watch::Receiver<bool>,
+    finished: watch::Sender<Option<Result<(), String>>>,
+}
+
+impl ConnectionControl {
+    fn new() -> (Self, ConnectionOwner) {
+        let (cancel, cancellation) = watch::channel(false);
+        let (finished, completion) = watch::channel(None);
+        (
+            Self {
+                live: Arc::new(AtomicBool::new(true)),
+                cancel,
+                finished: completion,
+            },
+            ConnectionOwner {
+                cancel: cancellation,
+                finished,
+            },
+        )
+    }
+
+    fn cancel(&self) {
+        self.live.store(false, Ordering::Release);
+        self.cancel.send_replace(true);
+    }
+
+    async fn settled(mut self) -> Result<(), String> {
+        loop {
+            if let Some(result) = self.finished.borrow_and_update().clone() {
+                return result;
+            }
+            self.finished
+                .changed()
+                .await
+                .map_err(|_| "connection owner ended without completing SSH cleanup".to_owned())?;
+        }
+    }
+}
+
+impl ConnectionOwner {
+    async fn cancelled(&mut self) {
+        let _ = self.cancel.wait_for(|cancelled| *cancelled).await;
+    }
+
+    fn finish(self, result: Result<(), String>) {
+        self.finished.send_replace(Some(result));
+    }
 }
 
 struct PendingConnection {
@@ -102,7 +156,7 @@ impl Drop for PendingConnection {
         if state
             .pending
             .get(&self.host_id)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &self.live))
+            .is_some_and(|entry| Arc::ptr_eq(&entry.live, &self.live))
         {
             state.pending.remove(&self.host_id);
             self.live.store(false, Ordering::Release);
@@ -142,12 +196,6 @@ impl StderrCapture {
     }
 }
 
-#[derive(Clone, Copy)]
-enum CloseCause {
-    NaturalEof,
-    Abort,
-}
-
 impl ProxyRouterHandle {
     pub fn new() -> Self {
         Self {
@@ -173,31 +221,51 @@ impl ProxyRouterHandle {
         // sender (stopping the old writer); reaping the child closes the old
         // reader via EOF. The old reader's teardown will no-op because the new
         // connection carries a different connection id.
-        let live = Arc::new(AtomicBool::new(true));
-        let existing = {
+        let (control, owner) = ConnectionControl::new();
+        let live = control.live.clone();
+        let (previous, existing) = {
             let mut guard = self.state.lock().expect("router state poisoned");
-            if let Some(old) = guard.pending.insert(host_id.clone(), live.clone()) {
-                old.store(false, Ordering::Release);
+            let previous = guard.pending.insert(host_id.clone(), control.clone());
+            if let Some(old) = &previous {
+                old.cancel();
             }
-            guard.hosts.remove(&host_id)
+            let existing = guard.hosts.remove(&host_id);
+            if let Some(old) = &existing {
+                old.control.cancel();
+            }
+            (previous, existing)
         };
         let pending = PendingConnection {
             state: self.state.clone(),
             host_id: host_id.clone(),
             live: live.clone(),
         };
-        if let Some(existing) = existing {
-            tracing::info!(host_id, "replacing existing host connection");
-            existing.live.store(false, Ordering::Relaxed);
-            #[cfg(not(target_os = "windows"))]
-            if let Err(error) = app
-                .state::<crate::ShellState>()
-                .voice_media
-                .stop_for_host(&host_id)
-            {
-                let _ = emit_error(&app, &host_id, error);
+        let cleanup = async {
+            if let Some(previous) = previous {
+                previous.settled().await?;
             }
-            abort_child(existing.child).await;
+            if let Some(existing) = existing {
+                tracing::info!(host_id, "replacing existing host connection");
+                #[cfg(not(target_os = "windows"))]
+                if let Err(error) = app
+                    .state::<crate::ShellState>()
+                    .voice_media
+                    .stop_for_host(&host_id)
+                {
+                    let _ = emit_error(&app, &host_id, error);
+                }
+                existing.control.settled().await?;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = cleanup {
+            owner.finish(Err(error.clone()));
+            return Err(error);
+        }
+        if !live.load(Ordering::Acquire) {
+            owner.finish(Ok(()));
+            return Err("connection attempt cancelled".into());
         }
 
         let connection_id = {
@@ -217,7 +285,14 @@ impl ProxyRouterHandle {
             host.clone(),
             live.clone(),
         )
-        .await?;
+        .await;
+        let setup = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                owner.finish(Err(error.clone()));
+                return Err(error);
+            }
+        };
         let setup = if resumable {
             setup_recovery(
                 RecoveryContext {
@@ -230,9 +305,11 @@ impl ProxyRouterHandle {
                     retry: retry.clone(),
                 },
                 setup,
+                owner,
             )
             .await?
         } else {
+            owner.finish(Ok(()));
             setup
         };
 
@@ -241,32 +318,37 @@ impl ProxyRouterHandle {
 
         // Register before spawning so that an immediate reader EOF can find the
         // entry (and thus reap the child / emit disconnect) instead of racing.
-        if !live.load(Ordering::Acquire) {
-            abort_child(setup.child).await;
-            return Err("connection attempt cancelled".into());
-        }
-        {
+        let registered = {
             let mut guard = self.state.lock().expect("router state poisoned");
-            if !guard
+            if guard
                 .pending
                 .get(&host_id)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &live))
+                .is_some_and(|entry| Arc::ptr_eq(&entry.live, &live))
+                && live.load(Ordering::Acquire)
             {
-                return Err("connection attempt superseded".into());
+                guard.pending.remove(&host_id);
+                guard.hosts.insert(
+                    host_id.clone(),
+                    Connection {
+                        connection_id,
+                        outbound_tx,
+                        control: control.clone(),
+                        live: live.clone(),
+                        audio_pending,
+                        available,
+                        retry,
+                    },
+                );
+                true
+            } else {
+                false
             }
-            guard.pending.remove(&host_id);
-            guard.hosts.insert(
-                host_id.clone(),
-                Connection {
-                    connection_id,
-                    outbound_tx,
-                    child: setup.child,
-                    live: live.clone(),
-                    audio_pending,
-                    available,
-                    retry,
-                },
-            );
+        };
+        if !registered {
+            control.cancel();
+            abort_child(setup.child).await?;
+            control.settled().await?;
+            return Err("connection attempt cancelled".into());
         }
 
         drop(pending);
@@ -293,25 +375,36 @@ impl ProxyRouterHandle {
     }
 
     pub async fn disconnect(&self, host_id: String) -> Result<(), String> {
-        let connection = {
+        let (pending, connection) = {
             let mut guard = self.state.lock().expect("router state poisoned");
-            if let Some(pending) = guard.pending.remove(&host_id) {
-                pending.store(false, Ordering::Release);
+            // Keep the pending generation visible until its owner completes,
+            // so simultaneous disconnects and retries join the same cleanup.
+            let pending = guard.pending.get(&host_id).cloned();
+            if let Some(pending) = &pending {
+                pending.cancel();
             }
-            guard.hosts.remove(&host_id)
+            let connection = guard.hosts.remove(&host_id);
+            if let Some(connection) = &connection {
+                connection.control.cancel();
+                guard
+                    .pending
+                    .insert(host_id.clone(), connection.control.clone());
+            }
+            (pending, connection)
         };
-        let Some(connection) = connection else {
-            return Ok(());
-        };
-
-        // Quiet teardown: clearing `live` stops the reader/stderr tasks from
-        // emitting any late frames, dropping `connection` drops the outbound
-        // sender (the writer task ends), and reaping the child closes the
-        // reader via EOF. The reader's own teardown no-ops because the entry is
-        // already gone, so no `HOST_DISCONNECTED_EVENT` is emitted for an
-        // explicit disconnect.
-        connection.live.store(false, Ordering::Relaxed);
-        abort_child(connection.child).await;
+        if let Some(pending) = pending {
+            pending.settled().await?;
+        }
+        if let Some(connection) = connection {
+            let retiring = PendingConnection {
+                state: self.state.clone(),
+                host_id,
+                live: connection.live.clone(),
+            };
+            let result = connection.control.settled().await;
+            drop(retiring);
+            result?;
+        }
         Ok(())
     }
 
@@ -406,11 +499,9 @@ async fn reader_task(
     live: Arc<AtomicBool>,
 ) {
     let mut reader = protocol::FrameReader::new(reader);
-    let mut close_cause = CloseCause::Abort;
     loop {
         match reader.read_frame().await {
             Ok(None) => {
-                close_cause = CloseCause::NaturalEof;
                 break;
             }
             Ok(Some(frame)) => {
@@ -540,7 +631,7 @@ async fn reader_task(
         }
     }
 
-    close_connection(&state, &app, &host_id, connection_id, close_cause).await;
+    close_connection(&state, &app, &host_id, connection_id).await;
 }
 
 /// Outbound half: solely owns the transport writer and drains the unbounded
@@ -582,7 +673,7 @@ async fn writer_task(
             if live.load(Ordering::Relaxed) {
                 let _ = emit_error(&app, &host_id, error);
             }
-            close_connection(&state, &app, &host_id, connection_id, CloseCause::Abort).await;
+            close_connection(&state, &app, &host_id, connection_id).await;
             return;
         }
     }
@@ -597,13 +688,19 @@ async fn close_connection(
     app: &AppHandle,
     host_id: &str,
     connection_id: u64,
-    cause: CloseCause,
 ) {
     let connection = {
         let mut guard = state.lock().expect("router state poisoned");
         match guard.hosts.get(host_id) {
             Some(existing) if existing.connection_id == connection_id => {
-                guard.hosts.remove(host_id)
+                let connection = guard.hosts.remove(host_id);
+                if let Some(connection) = &connection {
+                    connection.control.cancel();
+                    guard
+                        .pending
+                        .insert(host_id.to_owned(), connection.control.clone());
+                }
+                connection
             }
             _ => None,
         }
@@ -612,7 +709,11 @@ async fn close_connection(
         return;
     };
 
-    connection.live.store(false, Ordering::Relaxed);
+    let retiring = PendingConnection {
+        state: state.clone(),
+        host_id: host_id.to_owned(),
+        live: connection.live.clone(),
+    };
     #[cfg(not(target_os = "windows"))]
     if let Err(error) = app
         .state::<crate::ShellState>()
@@ -621,54 +722,56 @@ async fn close_connection(
     {
         let _ = emit_error(app, host_id, error);
     }
-    if let Some(error) = finish_child(connection.child, cause).await {
+    if let Err(error) = connection.control.settled().await {
         let _ = emit_error(app, host_id, error);
     }
     tracing::info!(host_id, connection_id, "connection closed");
-    let _ = app.emit(
-        HOST_DISCONNECTED_EVENT,
-        HostDisconnectedEvent {
-            host_id: host_id.to_owned(),
-        },
-    );
+    {
+        let guard = state.lock().expect("router state poisoned");
+        if guard
+            .pending
+            .get(host_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.live, &connection.live))
+        {
+            let _ = app.emit(
+                HOST_DISCONNECTED_EVENT,
+                HostDisconnectedEvent {
+                    host_id: host_id.to_owned(),
+                },
+            );
+        }
+    }
+    drop(retiring);
 }
 
-async fn abort_child(child: Option<SshChild>) {
+async fn abort_child(child: Option<SshChild>) -> Result<(), String> {
     let Some(mut child) = child else {
-        return;
+        return Ok(());
     };
-    let _ = child.process.kill().await;
-    match child.process.wait().await {
-        Ok(status) => {
-            tracing::info!(%status, "ssh transport exited");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to wait for ssh transport exit");
-        }
-    }
-    let _ = child.stderr_task.await;
+    child
+        .process
+        .kill()
+        .await
+        .map_err(|error| format!("failed to cancel SSH transport: {error}"))?;
+    let stderr = child
+        .stderr_task
+        .await
+        .map_err(|error| format!("failed to join SSH stderr capture: {error}"))?;
+    stderr?;
+    tracing::info!("SSH transport cancellation completed");
+    Ok(())
 }
 
-async fn finish_child(child: Option<SshChild>, cause: CloseCause) -> Option<String> {
-    let mut child = child?;
-    if matches!(cause, CloseCause::Abort) {
-        abort_child(Some(child)).await;
-        return None;
-    }
-
-    let status = match tokio::time::timeout(SSH_EXIT_WAIT, child.process.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(error)) => {
-            let _ = child.stderr_task.await;
-            return Some(format!("failed to wait for ssh transport exit: {error}"));
-        }
-        Err(_) => {
-            let _ = child.process.kill().await;
-            let _ = child.process.wait().await;
-            None
-        }
+async fn finish_child(child: &mut Option<SshChild>) -> Result<Option<String>, String> {
+    let Some(child) = child.as_mut() else {
+        return Ok(None);
     };
-    let stderr_result = child.stderr_task.await;
+    let status = child
+        .process
+        .wait()
+        .await
+        .map_err(|error| format!("failed to wait for ssh transport exit: {error}"))?;
+    let stderr_result = (&mut child.stderr_task).await;
     let diagnostic = child
         .stderr_capture
         .lock()
@@ -677,14 +780,14 @@ async fn finish_child(child: Option<SshChild>, cause: CloseCause) -> Option<Stri
 
     match stderr_result {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => return Some(error),
-        Err(error) => return Some(format!("failed to join ssh stderr capture: {error}")),
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(format!("failed to join ssh stderr capture: {error}")),
     }
-    match status {
-        Some(status) if status.success() => None,
-        Some(status) => Some(ssh_exit_failure_message(status, &diagnostic)),
-        None => Some(ssh_exit_timeout_message(&diagnostic)),
-    }
+    Ok(if status.success() {
+        None
+    } else {
+        Some(ssh_exit_failure_message(status, &diagnostic))
+    })
 }
 
 fn ssh_exit_failure_message(status: ExitStatus, diagnostic: &str) -> String {
@@ -695,12 +798,14 @@ fn ssh_exit_failure_message(status: ExitStatus, diagnostic: &str) -> String {
     }
 }
 
-fn ssh_exit_timeout_message(diagnostic: &str) -> String {
-    if diagnostic.is_empty() {
-        "ssh transport closed its output without exiting".to_owned()
-    } else {
-        format!("ssh transport closed its output without exiting:\n{diagnostic}")
+async fn finish_transport(mut child: Option<SshChild>) -> Result<Option<String>, String> {
+    if let Some(child) = &mut child {
+        child
+            .process
+            .start_kill()
+            .map_err(|error| format!("failed to end SSH transport: {error}"))?;
     }
+    finish_child(&mut child).await
 }
 
 struct ConnectionSetup {
@@ -740,15 +845,31 @@ impl RecoveryContext {
 async fn setup_recovery(
     context: RecoveryContext,
     mut setup: ConnectionSetup,
+    mut owner: ConnectionOwner,
 ) -> Result<ConnectionSetup, String> {
     let (session, logical) = server::recovery::Session::new();
-    let handshake =
-        server::recovery::connect(&mut setup.reader, &mut setup.writer, None, &session).await;
-    let (id, mut transport, mut tail) = match handshake {
+    let handshake = tokio::select! {
+        biased;
+        _ = owner.cancelled() => {
+            session.close();
+            let cleanup = abort_child(setup.child).await;
+            owner.finish(cleanup.clone());
+            cleanup?;
+            return Err("connection attempt cancelled".into());
+        }
+        handshake = server::recovery::connect(&mut setup.reader, &mut setup.writer, None, &session) => handshake,
+    };
+    let (id, transport, tail) = match handshake {
         Ok(handshake) => handshake,
         Err(error) => {
             session.close();
-            let diagnostic = finish_child(setup.child, CloseCause::NaturalEof).await;
+            let diagnostic = finish_transport(setup.child).await;
+            let cancelled = *owner.cancel.borrow();
+            owner.finish(diagnostic.as_ref().map(|_| ()).map_err(Clone::clone));
+            let diagnostic = diagnostic?;
+            if cancelled {
+                return Err("connection attempt cancelled".into());
+            }
             return Err(format!(
                 "recovery handshake failed: {error}; {}",
                 diagnostic.unwrap_or_default()
@@ -756,32 +877,48 @@ async fn setup_recovery(
         }
     };
     tokio::spawn(async move {
-        let lifetime = session.clone();
-        let live = context.live.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = lifetime.closed() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if !live.load(Ordering::Acquire) {
-                            lifetime.close();
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        let mut recovering = false;
-        loop {
-            let attached_at = std::time::Instant::now();
+        let result = supervise_recovery(
+            context,
+            setup,
+            session.clone(),
+            id,
+            transport,
+            tail,
+            &mut owner,
+        )
+        .await;
+        session.close();
+        owner.finish(result);
+    });
+    let (reader, writer) = tokio::io::split(logical);
+    Ok(ConnectionSetup {
+        reader: Box::new(BufReader::new(reader)),
+        writer: Box::new(writer),
+        child: None,
+    })
+}
+
+async fn supervise_recovery(
+    context: RecoveryContext,
+    mut setup: ConnectionSetup,
+    session: Arc<server::recovery::Session>,
+    id: uuid::Uuid,
+    mut transport: server::recovery::Attachment,
+    mut tail: u64,
+    owner: &mut ConnectionOwner,
+) -> Result<(), String> {
+    let mut recovering = false;
+    loop {
+        let attached_at = std::time::Instant::now();
+        let attachment = async {
             let attachment = transport.run(setup.reader, setup.writer);
             tokio::pin!(attachment);
-            let result = if recovering {
+            if recovering {
                 context.status(false, 0, 0, "Connected — catching up…".into());
                 tokio::select! {
                     result = &mut attachment => result,
                     _ = session.caught_up(tail) => {
-                        if !session.is_closed() {
+                        if !session.is_closed() && context.live.load(Ordering::Acquire) {
                             context.available.store(true, Ordering::Release);
                             context.status(true, 0, 0, "Connected".into());
                         }
@@ -790,98 +927,112 @@ async fn setup_recovery(
                 }
             } else {
                 attachment.await
-            };
-            context.available.store(false, Ordering::Release);
-            #[cfg(not(target_os = "windows"))]
-            if let Err(error) = context
-                .app
-                .state::<crate::ShellState>()
-                .voice_media
-                .stop_for_host(&context.host_id)
-            {
-                tracing::warn!(%error, "failed to stop voice after transport loss");
             }
-            context.status(false, 1, 0, "SSH transport disconnected".into());
-            let diagnostic = finish_child(setup.child, CloseCause::NaturalEof).await;
-            let mut reason = format!(
-                "{}{}",
-                result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "SSH transport closed".into()),
-                diagnostic.map(|d| format!("; {d}")).unwrap_or_default()
-            );
-            tracing::warn!(host_id = %context.host_id, connection_age_seconds = attached_at.elapsed().as_secs(),
+        };
+        let result = tokio::select! {
+            biased;
+            _ = owner.cancelled() => {
+                session.close();
+                return abort_child(setup.child).await;
+            }
+            _ = session.closed() => return abort_child(setup.child).await,
+            result = attachment => result,
+        };
+        context.available.store(false, Ordering::Release);
+        #[cfg(not(target_os = "windows"))]
+        if let Err(error) = context
+            .app
+            .state::<crate::ShellState>()
+            .voice_media
+            .stop_for_host(&context.host_id)
+        {
+            tracing::warn!(%error, "failed to stop voice after transport loss");
+        }
+        context.status(false, 1, 0, "SSH transport disconnected".into());
+        let diagnostic = finish_transport(setup.child).await?;
+        let mut reason = format!(
+            "{}{}",
+            result
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "SSH transport closed".into()),
+            diagnostic.map(|d| format!("; {d}")).unwrap_or_default()
+        );
+        tracing::warn!(host_id = %context.host_id, connection_age_seconds = attached_at.elapsed().as_secs(),
                 received = session.received(), sent = session.tail(), %reason, "SSH session detached");
-            if session.is_closed() {
-                return;
+        if session.is_closed() {
+            return Ok(());
+        }
+        recovering = true;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            context.status(false, attempt, 1, reason.clone());
+            tokio::select! {
+                biased;
+                _ = owner.cancelled() => { session.close(); return Ok(()); },
+                _ = session.closed() => return Ok(()),
+                _ = context.retry.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
             }
-            recovering = true;
-            let mut attempt: u32 = 0;
-            loop {
-                attempt = attempt.saturating_add(1);
-                context.status(false, attempt, 1, reason.clone());
-                tokio::select! {
-                    _ = session.closed() => return,
-                    _ = context.retry.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            context.status(false, attempt, 0, reason.clone());
+            let next = setup_connection_transport(
+                &context.host_id,
+                context.app.clone(),
+                context.transport.clone(),
+                context.host.clone(),
+                context.live.clone(),
+            )
+            .await;
+            let mut next = match next {
+                Ok(next) => next,
+                Err(error) => {
+                    reason = error;
+                    continue;
                 }
-                context.status(false, attempt, 0, reason.clone());
-                let next = tokio::select! {
-                    _ = session.closed() => return,
-                    result = setup_connection_transport(&context.host_id, context.app.clone(), context.transport.clone(), context.host.clone(), context.live.clone()) => result,
-                };
-                let mut next = match next {
-                    Ok(next) => next,
-                    Err(error) => {
-                        reason = error;
-                        continue;
-                    }
-                };
-                let handshake = server::recovery::connect(
+            };
+            let handshake = tokio::select! {
+                biased;
+                _ = owner.cancelled() => {
+                    session.close();
+                    return abort_child(next.child).await;
+                }
+                _ = session.closed() => return abort_child(next.child).await,
+                handshake = server::recovery::connect(
                     &mut next.reader,
                     &mut next.writer,
                     Some(id),
                     &session,
-                )
-                .await;
-                match handshake {
-                    Ok((_, next_transport, next_tail)) => {
-                        setup = next;
-                        transport = next_transport;
-                        tail = next_tail;
-                        break;
+                ) => handshake,
+            };
+            match handshake {
+                Ok((_, next_transport, next_tail)) => {
+                    setup = next;
+                    transport = next_transport;
+                    tail = next_tail;
+                    break;
+                }
+                Err(error) => {
+                    let expired = error.kind() == std::io::ErrorKind::NotFound;
+                    reason = error.to_string();
+                    if let Some(diagnostic) = finish_transport(next.child).await? {
+                        reason.push_str(&format!("; {diagnostic}"));
                     }
-                    Err(error) => {
-                        let expired = error.kind() == std::io::ErrorKind::NotFound;
-                        reason = error.to_string();
-                        if let Some(diagnostic) =
-                            finish_child(next.child, CloseCause::NaturalEof).await
-                        {
-                            reason.push_str(&format!("; {diagnostic}"));
-                        }
-                        tracing::warn!(host_id = %context.host_id, attempt, %reason, "SSH reconnect attempt failed");
-                        if expired {
-                            context.status(
-                                false,
-                                attempt,
-                                0,
-                                "Session expired — refreshing workspace…".into(),
-                            );
-                            session.close();
-                            return;
-                        }
+                    tracing::warn!(host_id = %context.host_id, attempt, %reason, "SSH reconnect attempt failed");
+                    if expired {
+                        context.status(
+                            false,
+                            attempt,
+                            0,
+                            "Session expired — refreshing workspace…".into(),
+                        );
+                        session.close();
+                        return Ok(());
                     }
                 }
             }
         }
-    });
-    let (reader, writer) = tokio::io::split(logical);
-    Ok(ConnectionSetup {
-        reader: Box::new(BufReader::new(reader)),
-        writer: Box::new(writer),
-        child: None,
-    })
+    }
 }
 
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> Result<(), String> {
@@ -1011,16 +1162,17 @@ async fn setup_connection_transport(
                 format!("failed to start ssh transport for host {host_id}: {err}")
             })?;
 
-            let stdout = child
-                .take_stdout()
-                .ok_or_else(|| format!("ssh transport for host {host_id} has no stdout"))?;
-            let stdin = child
-                .take_stdin()
-                .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
+            let (Some(stdout), Some(stdin), Some(stderr)) =
+                (child.take_stdout(), child.take_stdin(), child.take_stderr())
+            else {
+                child.kill().await.map_err(|error| {
+                    format!("failed to cancel SSH after missing pipes: {error}")
+                })?;
+                return Err(format!(
+                    "ssh transport for host {host_id} is missing owned pipes"
+                ));
+            };
 
-            let stderr = child
-                .take_stderr()
-                .ok_or_else(|| format!("ssh transport for host {host_id} has no stderr"))?;
             let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
             let stderr_capture_for_task = stderr_capture.clone();
             let app_for_stderr = app.clone();
@@ -1126,7 +1278,9 @@ mod tests {
             "printf '%s\\n' '** WARNING: connection is not using a post-quantum key exchange algorithm.' '**' >&2; exit 0",
         )
         .await;
-        let success_error = finish_child(Some(successful), CloseCause::NaturalEof).await;
+        let success_error = finish_child(&mut Some(successful))
+            .await
+            .expect("join successful process");
         assert_eq!(
             success_error, None,
             "stderr from a successful SSH process is diagnostic, not fatal"
@@ -1147,8 +1301,9 @@ mod tests {
             "printf '%s\\n' 'Permission denied (publickey).' 'Connection closed by remote host.' >&2; exit 23",
         )
         .await;
-        let failure = finish_child(Some(failed), CloseCause::NaturalEof)
+        let failure = finish_child(&mut Some(failed))
             .await
+            .expect("join failed process")
             .expect("a nonzero SSH exit must be fatal");
         assert!(
             failure.contains("exit status: 23")

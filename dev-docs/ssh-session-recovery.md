@@ -59,3 +59,41 @@ breakable transports. They cover command and notification replay, retained strea
 sequences, expiration, and buffer exhaustion. Browser tests exercise the rendered
 workspace/status through disconnect and fresh-session preparation. Mobile MQTT
 and HTTP transports are unchanged by this SSH-specific implementation.
+
+## Native cancellation ownership
+
+A connection generation owns SSH from process launch through initial recovery
+negotiation, attachment, and reconnect negotiation. Disconnect and replacement
+signal that generation and await its process exit and stderr-task completion.
+Pending and retiring generations remain joinable until cleanup completes;
+registration and removal compare generation identity so an older attempt cannot
+remove a newer retry. Cleanup failures are returned explicitly. Local embedded
+connections use the same registry without an SSH child. Native cancellation does
+not synthesize frontend connected/disconnected or agent working/idle state.
+
+The real-native regression driver uses the canonical dev-instance launcher, an
+owned Xvfb, real loopback OpenSSH, pinned host trust, private one-shot SSH config,
+and an authorization-file syscall gate. It covers pending-auth disconnect,
+supersession, simultaneous disconnects, an unrelated embedded connection, and
+cancellation during reconnect after real recovery and Hello/Welcome handshakes.
+It also covers failed-negotiation cleanup and visible public-key rejection.
+The owned sshd disables per-source penalties for these deliberate failed-auth
+cases; key authorization and strict pinned host trust remain real. It observes the
+exact owned SSH processes with pidfds before releasing authentication. The
+original native connect Promise must reject specifically from cancellation;
+handshake expiry or an authentication rejection cannot pass the regression.
+Run in a fresh evidence directory on Linux x86_64, using the controller built by
+`./dev.sh check`:
+
+```sh
+python3 tools/repro_pending_ssh_cancellation.py \
+  "$HOME/tyde-evidence/ssh-cancel-case" target/debug/tyde-server
+```
+
+This is opt-in real dev-instance QA, not a provider conformance test or a
+replacement for `./dev.sh check`. The fixture requires OpenSSH server/client,
+Xvfb, and permission to trace its own descendants; missing prerequisites fail.
+It preserves HOME and shared SSH configuration, joins its owned children, and
+removes private keys and disposable native stores. Retained JSON/tracing receipts
+are local evidence. No UI changes are involved, and this cancellation finding is
+not a diagnosis or claimed cure for the separate severe desktop UI stalls.
