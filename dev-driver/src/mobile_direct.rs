@@ -1,6 +1,8 @@
 //! Bounded direct-host apparatus. Wire payloads remain production protocol types.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -20,6 +22,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
+#[cfg(target_os = "linux")]
+use tokio::net::UnixStream;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -39,6 +43,191 @@ struct RunConfig {
     expected: Expected,
     bundle_dir: PathBuf,
     inventory: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneTarget {
+    pub socket_path: PathBuf,
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub store_environment: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StandaloneAttestation {
+    LinuxUds {
+        pid: u32,
+        uid: u32,
+        start_ticks: u64,
+        socket_device: u64,
+        socket_inode: u64,
+        executable_sha256: String,
+        store_environment_sha256: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandaloneRunConfig {
+    target: StandaloneTarget,
+    expected: Expected,
+    bundle_dir: PathBuf,
+    inventory: BTreeMap<String, String>,
+}
+
+trait AdapterIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AdapterIo for T {}
+enum Endpoint {
+    Tcp(SocketAddr),
+    Standalone(StandaloneTarget),
+}
+impl Endpoint {
+    async fn open(&self) -> Result<(Box<dyn AdapterIo>, Option<StandaloneAttestation>)> {
+        match self {
+            Self::Tcp(endpoint) => Ok((
+                Box::new(
+                    TcpStream::connect(endpoint)
+                        .await
+                        .map_err(|_| "production TCP connect failed")?,
+                ),
+                None,
+            )),
+            Self::Standalone(target) => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = target;
+                    Err("standalone UDS source attestation requires Linux".into())
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    private_parent(&target.socket_path)?;
+                    let meta = fs::symlink_metadata(&target.socket_path)
+                        .map_err(|_| "cannot stat owned host socket")?;
+                    require(
+                        meta.file_type().is_socket()
+                            && meta.uid() == unsafe { libc::geteuid() }
+                            && meta.mode() & 0o077 == 0,
+                        "host socket must be owned and private",
+                    )?;
+                    let process = PathBuf::from(format!("/proc/{}", target.pid));
+                    require(
+                        fs::canonicalize(process.join("exe"))
+                            .map_err(|_| "cannot resolve live host executable")?
+                            == target.executable,
+                        "live host executable path mismatch",
+                    )?;
+                    // Hash before connecting: the real host bounds its initial Hello
+                    // wait, and debug images can take arbitrarily long to read.
+                    eprintln!("mobile-direct: attesting host image before connecting");
+                    let mut image = File::open(process.join("exe"))
+                        .map_err(|_| "cannot open live host executable")?;
+                    let image_meta = image.metadata().map_err(|_| "cannot stat live image")?;
+                    let mut hasher = Sha256::new();
+                    let mut buffer = [0; 64 * 1024];
+                    loop {
+                        let count = image
+                            .read(&mut buffer)
+                            .map_err(|_| "cannot hash live image")?;
+                        if count == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..count]);
+                    }
+                    let executable_sha256 = format!("{:x}", hasher.finalize());
+                    require(
+                        executable_sha256 == target.executable_sha256,
+                        "live host executable hash mismatch",
+                    )?;
+                    let stat = fs::read_to_string(process.join("stat"))
+                        .map_err(|_| "cannot attest host lifetime")?;
+                    let start_ticks = stat
+                        .rsplit_once(") ")
+                        .ok_or("invalid host lifetime record")?
+                        .1
+                        .split_whitespace()
+                        .nth(19)
+                        .ok_or("missing host start clock")?
+                        .parse::<u64>()
+                        .map_err(|_| "invalid host start clock")?;
+                    require(
+                        start_ticks == target.start_ticks,
+                        "owned host process lifetime changed",
+                    )?;
+                    let environment = fs::read(process.join("environ"))
+                        .map_err(|_| "cannot attest host store environment")?;
+                    let mut store_environment = BTreeMap::new();
+                    for entry in environment.split(|b| *b == 0) {
+                        let Some(separator) = entry.iter().position(|b| *b == b'=') else {
+                            continue;
+                        };
+                        let name = std::str::from_utf8(&entry[..separator])
+                            .map_err(|_| "invalid host environment name")?;
+                        if name == "HOME"
+                            || name == "TYDE_SKILLS_DIR_PATH"
+                            || (name.starts_with("TYDE_")
+                                && (name.ends_with("_STORE_PATH") || name.ends_with("_STORE_DIR")))
+                        {
+                            let value = std::str::from_utf8(&entry[separator + 1..])
+                                .map_err(|_| "invalid host store path")?;
+                            store_environment.insert(name.to_owned(), PathBuf::from(value));
+                        }
+                    }
+                    require(
+                        store_environment.contains_key("HOME")
+                            && store_environment.values().all(|p| p.is_absolute())
+                            && store_environment == target.store_environment,
+                        "owned host store environment mismatch",
+                    )?;
+                    let store_environment_sha256 = digest(
+                        &serde_json::to_vec(&store_environment)
+                            .map_err(|_| "cannot encode store custody")?,
+                    );
+                    eprintln!("mobile-direct: image and store custody verified; connecting UDS");
+                    let socket = UnixStream::connect(&target.socket_path)
+                        .await
+                        .map_err(|_| "owned UDS host is unavailable")?;
+                    let peer = socket.peer_cred().map_err(|_| "cannot attest UDS peer")?;
+                    let current_image = fs::metadata(process.join("exe"))
+                        .map_err(|_| "cannot recheck live image")?;
+                    let current_socket = fs::symlink_metadata(&target.socket_path)
+                        .map_err(|_| "cannot recheck owned host socket")?;
+                    let current_stat = fs::read_to_string(process.join("stat"))
+                        .map_err(|_| "cannot recheck host lifetime")?;
+                    require(
+                        peer.uid() == unsafe { libc::geteuid() }
+                            && peer.pid().and_then(|p| u32::try_from(p).ok()) == Some(target.pid)
+                            && current_stat
+                                .rsplit_once(") ")
+                                .and_then(|(_, s)| s.split_whitespace().nth(19))
+                                .and_then(|s| s.parse::<u64>().ok())
+                                == Some(start_ticks)
+                            && (current_image.dev(), current_image.ino())
+                                == (image_meta.dev(), image_meta.ino())
+                            && (current_socket.dev(), current_socket.ino())
+                                == (meta.dev(), meta.ino()),
+                        "UDS peer, image, socket or lifetime changed during attestation",
+                    )?;
+                    Ok((
+                        Box::new(socket),
+                        Some(StandaloneAttestation::LinuxUds {
+                            pid: target.pid,
+                            uid: peer.uid(),
+                            start_ticks,
+                            socket_device: meta.dev(),
+                            socket_inode: meta.ino(),
+                            executable_sha256,
+                            store_environment_sha256,
+                        }),
+                    ))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -83,7 +272,8 @@ enum Phase {
 #[serde(deny_unknown_fields)]
 struct Receipt {
     run_sha256: String,
-    ready_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready_sha256: Option<String>,
     phase: Phase,
     welcome: WelcomePayload,
     settings: HostSettingsPayload,
@@ -91,6 +281,8 @@ struct Receipt {
     offer: Option<MobilePairingOfferPayload>,
     #[serde(default)]
     superseded_receipt_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standalone_attestation: Option<StandaloneAttestation>,
 }
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -280,19 +472,26 @@ pub struct Adapter {
     pub welcome: WelcomePayload,
     pub settings: HostSettingsPayload,
     pub mobile_access: MobileAccessStatePayload,
+    standalone_attestation: Option<StandaloneAttestation>,
+    projects: Vec<protocol::Project>,
 }
 
 impl Adapter {
     pub async fn connect(endpoint: SocketAddr, expected: &Expected) -> Result<Self> {
+        Self::connect_endpoint(&Endpoint::Tcp(endpoint), expected, false).await
+    }
+    async fn connect_endpoint(
+        endpoint: &Endpoint,
+        expected: &Expected,
+        allow_empty_project: bool,
+    ) -> Result<Self> {
         require(
             expected.protocol_version == protocol::PROTOCOL_VERSION
                 && expected.tyde_version == protocol::TYDE_VERSION,
             "adapter source identity mismatch",
         )?;
-        let socket = TcpStream::connect(endpoint)
-            .await
-            .map_err(|_| "Welcome probe connect failed")?;
-        let (read, mut write) = socket.into_split();
+        let (socket, first_attestation) = endpoint.open().await?;
+        let (read, mut write) = tokio::io::split(socket);
         let stream = StreamPath(format!("/host/{}", uuid::Uuid::new_v4()));
         let config = ClientConfig::current();
         let hello = Envelope::from_payload(
@@ -328,9 +527,11 @@ impl Adapter {
             "exact Welcome version mismatch",
         )?;
         drop(write);
-        let socket = TcpStream::connect(endpoint)
-            .await
-            .map_err(|_| "client connect failed")?;
+        let (socket, standalone_attestation) = endpoint.open().await?;
+        require(
+            first_attestation == standalone_attestation,
+            "host authority changed between Welcome and bootstrap",
+        )?;
         let mut connection = client::connect(&config, socket)
             .await
             .map_err(|_| "production client handshake failed")?;
@@ -356,11 +557,14 @@ impl Adapter {
             "host must have no sessions or agents",
         )?;
         require(
-            bootstrap.projects.len() == 1
+            (bootstrap.projects.len() == 1
                 && bootstrap.projects[0]
                     .root_paths()
                     .iter()
-                    .any(|p| Path::new(&p.0) == expected.project_dir),
+                    .any(|p| Path::new(&p.0) == expected.project_dir))
+                || (allow_empty_project
+                    && standalone_attestation.is_some()
+                    && bootstrap.projects.is_empty()),
             "HostBootstrap project mismatch",
         )?;
         require(
@@ -377,6 +581,8 @@ impl Adapter {
                 configured_secrets: bootstrap.configured_secrets,
             },
             mobile_access: bootstrap.mobile_access,
+            standalone_attestation,
+            projects: bootstrap.projects,
         })
     }
 
@@ -409,6 +615,18 @@ impl Adapter {
             )?;
         };
         match envelope.kind {
+            FrameKind::ProjectNotify => match envelope
+                .parse_payload::<protocol::ProjectNotifyPayload>()
+                .map_err(|_| "invalid project publication")?
+            {
+                protocol::ProjectNotifyPayload::Upsert { project } => {
+                    self.projects.retain(|p| p.id != project.id);
+                    self.projects.push(project);
+                }
+                protocol::ProjectNotifyPayload::Delete { project } => {
+                    self.projects.retain(|p| p.id != project.id)
+                }
+            },
             FrameKind::HostSettings => {
                 self.settings = envelope
                     .parse_payload()
@@ -533,7 +751,60 @@ impl Adapter {
         }
     }
 
-    pub async fn configure(&mut self, bundle: &Path, count: u32) -> Result<()> {
+    async fn prepare_project(&mut self, expected: &Expected) -> Result<()> {
+        if self.projects.is_empty() {
+            require(
+                self.standalone_attestation.is_some(),
+                "project preparation requires attested standalone UDS",
+            )?;
+            require(
+                expected.project_dir.is_absolute()
+                    && expected.project_dir.is_dir()
+                    && fs::canonicalize(&expected.project_dir)
+                        .map_err(|_| "owned QA project is unavailable")?
+                        == expected.project_dir,
+                "QA project directory must be canonical",
+            )?;
+            self.connection
+                .project_create(protocol::ProjectCreatePayload {
+                    name: "Native QA".into(),
+                    roots: vec![protocol::ProjectRootPath(
+                        expected.project_dir.to_string_lossy().into_owned(),
+                    )],
+                })
+                .await
+                .map_err(|_| "cannot create owned QA project")?;
+            loop {
+                let event = self.next().await?;
+                if event.kind == FrameKind::ProjectOperation {
+                    let operation: protocol::ProjectOperationPayload = event
+                        .parse_payload()
+                        .map_err(|_| "invalid project operation")?;
+                    require(
+                        !matches!(
+                            operation.state,
+                            protocol::ProjectOperationState::Failed { .. }
+                        ),
+                        "server rejected owned project creation",
+                    )?;
+                }
+                if event.kind == FrameKind::ProjectNotify {
+                    break;
+                }
+            }
+        }
+        require(
+            self.projects.len() == 1
+                && self.projects[0].root_paths().len() == 1
+                && self.projects[0]
+                    .root_paths()
+                    .iter()
+                    .any(|p| Path::new(&p.0) == expected.project_dir),
+            "server must attest exactly the owned project root",
+        )
+    }
+
+    fn require_configurable(&self) -> Result<()> {
         require(
             matches!(
                 self.mobile_access.direct_hosting,
@@ -544,7 +815,11 @@ impl Adapter {
                     MobilePairingState::Active { .. }
                 ),
             "configure requires disabled disposable host",
-        )?;
+        )
+    }
+
+    pub async fn configure(&mut self, bundle: &Path, count: u32) -> Result<()> {
+        self.require_configurable()?;
         self.replace(
             vec![
                 ("/enable_mobile_connections", json!(true)),
@@ -707,22 +982,57 @@ impl Adapter {
 }
 
 pub async fn run(args: &[String]) -> Result<()> {
+    run_mode(args, false).await
+}
+pub async fn run_uds(args: &[String]) -> Result<()> {
+    run_mode(args, true).await
+}
+async fn run_mode(args: &[String], standalone: bool) -> Result<()> {
     let [request_path, output_path] = args else {
-        return Err(
-            "usage: tyde-dev-driver mobile-direct PRIVATE_REQUEST PRIVATE_NEW_RECEIPT".into(),
-        );
+        return Err(format!(
+            "usage: tyde-dev-driver {} PRIVATE_REQUEST PRIVATE_NEW_RECEIPT",
+            if standalone {
+                "mobile-direct-uds"
+            } else {
+                "mobile-direct"
+            }
+        ));
     };
     let request: Request = decode(&read_private(Path::new(request_path))?)?;
     let run_bytes = read_private(&request.run)?;
-    let config: RunConfig = decode(&run_bytes)?;
+    let (expected, bundle_dir, bundle_inventory, endpoint, dev_ready) = if standalone {
+        let config: StandaloneRunConfig = decode(&run_bytes)?;
+        (
+            config.expected,
+            config.bundle_dir,
+            config.inventory,
+            Endpoint::Standalone(config.target),
+            None,
+        )
+    } else {
+        let config: RunConfig = decode(&run_bytes)?;
+        let bytes = read_private(&config.ready_path)?;
+        let endpoint = ready_endpoint(&bytes, &config.expected)?;
+        (
+            config.expected,
+            config.bundle_dir,
+            config.inventory,
+            Endpoint::Tcp(endpoint),
+            Some(bytes),
+        )
+    };
     require(
-        inventory(&config.bundle_dir)? == config.inventory,
+        inventory(&bundle_dir)? == bundle_inventory,
         "immutable bundle inventory mismatch",
     )?;
-    let count = u32::try_from(config.inventory.len()).map_err(|_| "bundle asset count overflow")?;
-    let ready_bytes = read_private(&config.ready_path)?;
-    let endpoint = ready_endpoint(&ready_bytes, &config.expected)?;
-    let mut adapter = Adapter::connect(endpoint, &config.expected).await?;
+    let count = u32::try_from(bundle_inventory.len()).map_err(|_| "bundle asset count overflow")?;
+    let mut adapter = Adapter::connect_endpoint(
+        &endpoint,
+        &expected,
+        standalone && matches!(request.operation, Operation::Configure),
+    )
+    .await?;
+    let ready_sha256 = dev_ready.as_ref().map(|bytes| digest(bytes));
     let mut output = reserve(Path::new(output_path))?;
     let mut previous_sha256 = None;
     let previous = match &request.operation {
@@ -736,8 +1046,9 @@ pub async fn run(args: &[String]) -> Result<()> {
             let receipt: Receipt = decode(&bytes)?;
             require(
                 receipt.run_sha256 == digest(&run_bytes)
-                    && receipt.ready_sha256 == digest(&ready_bytes)
-                    && receipt.welcome == adapter.welcome,
+                    && receipt.ready_sha256 == ready_sha256
+                    && receipt.welcome == adapter.welcome
+                    && receipt.standalone_attestation == adapter.standalone_attestation,
                 "previous receipt custody mismatch",
             )?;
             require(
@@ -758,7 +1069,11 @@ pub async fn run(args: &[String]) -> Result<()> {
         .and_then(|p| p.superseded_receipt_sha256.clone());
     let phase = match request.operation {
         Operation::Configure => {
-            adapter.configure(&config.bundle_dir, count).await?;
+            adapter.require_configurable()?;
+            if standalone {
+                adapter.prepare_project(&expected).await?;
+            }
+            adapter.configure(&bundle_dir, count).await?;
             Phase::Configured
         }
         Operation::SetOrigin { origin_path, .. } => {
@@ -835,20 +1150,21 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
     };
     require(
-        inventory(&config.bundle_dir)? == config.inventory,
+        inventory(&bundle_dir)? == bundle_inventory,
         "bundle changed during operation",
     )?;
     save(
         &mut output,
         &Receipt {
             run_sha256: digest(&run_bytes),
-            ready_sha256: digest(&ready_bytes),
+            ready_sha256,
             phase,
             welcome: adapter.welcome,
             settings: adapter.settings,
             mobile_access: adapter.mobile_access,
             offer,
             superseded_receipt_sha256,
+            standalone_attestation: adapter.standalone_attestation,
         },
     )?;
     println!("mobile-direct: completed");

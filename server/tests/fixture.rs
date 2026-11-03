@@ -1041,6 +1041,32 @@ impl Fixture {
         (address, stop, task)
     }
 
+    // Each integration binary compiles this shared fixture independently.
+    #[allow(dead_code)]
+    #[cfg(unix)]
+    pub async fn listen_uds(
+        &self,
+        path: &Path,
+    ) -> (
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let listener = server::bind_uds(path)
+            .await
+            .expect("bind production UDS fixture");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private fixture socket");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(server::serve_uds(
+            listener,
+            server::ServerConfig::current(),
+            self.host.clone(),
+            stop.clone(),
+        ));
+        (stop, task)
+    }
+
     #[allow(dead_code)]
     pub fn host_for_test(&self) -> server::HostHandle {
         self.host.clone()

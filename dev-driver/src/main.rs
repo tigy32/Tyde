@@ -24,6 +24,8 @@ async fn run() {
         }
         #[cfg(unix)]
         Some("mobile-direct") => tyde_dev_driver::mobile_direct::run(&args[1..]).await,
+        #[cfg(unix)]
+        Some("mobile-direct-uds") => tyde_dev_driver::mobile_direct::run_uds(&args[1..]).await,
         Some("debug") => {
             args.remove(0);
             let config = tyde_dev_driver::debug::DebugServerConfig::from_args_env(&args);
@@ -32,7 +34,10 @@ async fn run() {
                 Err(err) => Err(err),
             }
         }
-        _ => Err("usage: tyde-dev-driver <agent-control|debug|mobile-direct> ...".to_string()),
+        _ => Err(
+            "usage: tyde-dev-driver <agent-control|debug|mobile-direct|mobile-direct-uds> ..."
+                .to_string(),
+        ),
     };
 
     if let Err(err) = result {

@@ -272,3 +272,57 @@ are claimed. It rejects a wrong Welcome release, missing-origin offer creation
 (with no offer payload), and an active-offer disable,
 then proves configure/origin/offer/consumption/revoke/Disabled. Run only through
 `./dev.sh check`.
+
+### Explicit standalone Linux UDS setup
+
+`tyde-dev-driver mobile-direct-uds PRIVATE_REQUEST PRIVATE_NEW_RECEIPT` uses
+a separate run configuration with `target` (socket_path, executable,
+executable_sha256, pid, start_ticks, store_environment), expected, bundle_dir
+and inventory.
+It does not accept or fabricate canonical DEV Ready. It validates the owned
+private socket, kernel peer UID/PID/lifetime and running executable hash on
+both live connections, then exact Welcome/protocol/HostBootstrap. Configure
+may create the one explicitly named existing project root in an empty host
+and waits for its authoritative ProjectNotify. Other operations require that
+exact project already exists. Existing no-agent/session, asset-inventory, CAS,
+receipt-chain and JIT-offer guards remain. Receipts identify their actual
+standalone attestation, never a desktop frontend/native DEV attestation.
+The original `mobile-direct` DEV Ready path and its guards are unchanged.
+
+`store_environment` explicitly pins the actual process's `HOME` plus every
+`TYDE_*_STORE_PATH`, `TYDE_*_STORE_DIR` and `TYDE_SKILLS_DIR_PATH` override
+present in `/proc/PID/environ`. Values must be absolute paths. For a host
+started with only an isolated HOME and no store overrides, it is simply
+`{"HOME": "/absolute/owned-home"}`. This is launch/store custody, not desktop
+Ready or a new authentication mode. The owner must pin the known host binary
+and its launch arguments (`host --uds`); all normal protocol/auth remains.
+
+For example, the private standalone `run.json` replaces `ready_path` with:
+
+```json
+"target": {
+  "socket_path": "/absolute/private-host/host.sock",
+  "executable": "/absolute/export/tyde-server",
+  "executable_sha256": "sha256-of-the-actual-running-image",
+  "pid": 1234,
+  "start_ticks": 5678,
+  "store_environment": {"HOME": "/absolute/owned-home"}
+}
+```
+
+Read those facts from the owned process, not a guessed PID or another host's
+receipt. Expected versions must match this driver and that host's exact
+Welcome; the existing `expected`, inventory and operation JSON above still
+apply. Run configure, set_origin and offer with `mobile-direct-uds` and fresh
+private receipt paths. A wrong mode, image or store fails before any connection
+or mutation. The image is hashed before connecting so large debug binaries do
+not consume the real host's bounded Hello window; peer credentials, pinned
+image inode, socket inode and process lifetime are rechecked after connecting.
+No host timeout is changed. Tests assert this ordering by checking the real
+listener's pending-connection state after failed custody, not elapsed time.
+
+The standalone route does not bind a tunnel, wait for a publisher descriptor,
+or qualify a native application. Keep the reserved HTTPS origin on the same
+actual host/listener and perform the owner's publisher-readiness checks before
+issuing the one JIT offer. Never pass standalone inputs to `mobile-direct` or
+construct DEV Ready to make a different mode accept them.
