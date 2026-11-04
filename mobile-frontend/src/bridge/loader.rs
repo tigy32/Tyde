@@ -14,6 +14,9 @@ pub enum UnavailableReason {
     HostChanged,
     Bootstrap,
     BootstrapTransport,
+    HostUnavailable,
+    PairingSecretMissing,
+    CredentialStorageUnavailable,
     AuthenticationRequired,
     PassRequired,
     PairingRevoked,
@@ -41,9 +44,18 @@ impl UnavailableReason {
             Self::PassRequired => "a Tyggs Pass is required to connect",
             Self::PairingRevoked => "this pairing is unavailable; re-pair from the host",
             Self::BootstrapBaseline => "update Tyde host to support native client bootstrap",
+            Self::HostUnavailable => {
+                "the host's mobile access registration has expired. Open Tyde on the host and check Settings → Mobile, then retry. If you removed this pairing, pair again"
+            }
+            Self::PairingSecretMissing => {
+                "the pairing credential is missing on this device. Re-pair from the host's Settings → Mobile"
+            }
             Self::BootstrapTransport => "the host discovery connection is temporarily unavailable",
             Self::Bootstrap => "the current host client could not be resolved",
             Self::Bridge => "this page has no compatible release loader",
+            Self::CredentialStorageUnavailable => {
+                "the app could not access credential storage. Unlock the device and retry"
+            }
             Self::Storage => "the browser could not persist the handoff",
             Self::Manifest => "the fresh release manifest could not be fetched",
             Self::Unpublished => "the host release has not been published",

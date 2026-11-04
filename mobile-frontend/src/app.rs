@@ -1395,6 +1395,320 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn credential_loss_and_unanswered_connections_surface_truthful_recovery() {
+        use crate::bridge::web::tests_support::{
+            IndexedDbHostStore, IndexedDbPskStore, PskStore, delete_device_secret,
+            isolated_test_auth, store_reconnect_host,
+        };
+        use tokio::sync::mpsc;
+        // The preceding native sign-in scenario leaves a completed callback.
+        // This flow represents a fresh document, not a retry of that callback.
+        let _auth = isolated_test_auth();
+        let endpoint = option_env!("TYDE_RTC_TEST_URL").expect("canonical real RTC fixture");
+        install_loader_boundary();
+        let window = web_sys::window().unwrap();
+        let had_config = js_sys::Reflect::has(&window, &"__TYDE_MOBILE_SERVICE__".into()).unwrap();
+        let previous_config =
+            js_sys::Reflect::get(&window, &"__TYDE_MOBILE_SERVICE__".into()).unwrap();
+        let configure = |base: &str| {
+            let config = js_sys::Object::new();
+            js_sys::Reflect::set(&config, &"baseUrl".into(), &base.into()).unwrap();
+            js_sys::Reflect::set(&window, &"__TYDE_MOBILE_SERVICE__".into(), &config).unwrap();
+        };
+        // Advance the existing attempt deadline only after the real HTTP poll
+        // arrived. No wall-time requirement or replacement product timeout.
+        let clock = BrowserOverride(js_sys::Function::new_no_args(r#"
+            const originalSet = window.setTimeout, originalClear = window.clearTimeout;
+            const deadlines = new Map(); let id = 0;
+            window.setTimeout = (callback, ms, ...args) => ms === 60000
+                ? (deadlines.set(--id, () => callback(...args)), id)
+                : originalSet(callback, ms, ...args);
+            window.clearTimeout = handle => handle < 0 ? deadlines.delete(handle) : originalClear(handle);
+            const restore = () => { window.setTimeout = originalSet; window.clearTimeout = originalClear; };
+            restore.expire = () => {
+                const next = deadlines.entries().next().value;
+                if (!next) throw new Error('No connection deadline is armed');
+                deadlines.delete(next[0]); next[1]();
+            };
+            return restore;
+        "#).call0(&wasm_bindgen::JsValue::NULL).unwrap());
+        let state = AppState::new();
+        state.app_mode.set(AppMode::Workspace);
+        let container = make_container();
+        let rendered = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(rendered);
+            view! { <components::ConnectionBanner /> }
+        });
+        let (tx, mut statuses) = mpsc::unbounded_channel();
+        let observed = state.clone();
+        let unlisten = bridge::listen_paired_host_connection_status(move |event| {
+            apply_connection_status(
+                &observed,
+                event.local_host_id.clone(),
+                event.status.clone(),
+                event.connection_instance_id,
+            );
+            tx.send(event).unwrap();
+        })
+        .await
+        .unwrap();
+        let observed = state.clone();
+        let unlisten_lines =
+            bridge::listen_host_line(move |event| handle_host_line_event(&observed, event))
+                .await
+                .unwrap();
+        let http = js_sys::Function::new_with_args(
+            "url,method,body",
+            r#"
+            return fetch(url, {method, body: body || undefined}).then(response => {
+                if (!response.ok) throw new Error('Owned fixture control failed');
+            });
+        "#,
+        );
+        let mut owned = Vec::new();
+        macro_rules! ensure {
+            ($condition:expr, $message:expr $(,)?) => {
+                if !$condition {
+                    return Err($message.to_string());
+                }
+            };
+        }
+        let result: Result<(), String> = async {
+            for secret in ["key", "credential"] {
+                let host = store_reconnect_host().await;
+                owned.push(host.clone());
+                let record = IndexedDbHostStore.get(&host).await.unwrap().unwrap();
+                if secret == "key" {
+                    IndexedDbPskStore
+                        .delete(record.psk_keychain_key_id.as_ref().unwrap())
+                        .await
+                        .unwrap();
+                } else {
+                    delete_device_secret(&record.managed.as_ref().unwrap().device_secret_key_id)
+                        .await
+                        .unwrap();
+                }
+                configure(&format!("{endpoint}/unanswered"));
+                state.active_local_host_id.set(Some(host.clone()));
+                let result = bridge::connect_paired_host(&host).await;
+                ensure!(
+                    (result.is_err()) == (secret == "key"),
+                    "only pre-actor failure rejects startup"
+                );
+                loop {
+                    let event = statuses.recv().await.unwrap();
+                    if event.local_host_id == host
+                        && let PairedHostConnectionStatus::Failed { code, message } = event.status
+                    {
+                        ensure!(
+                            (code) == (MobileAccessErrorCode::RepairRequired),
+                            "Connection boundary result changed"
+                        );
+                        ensure!(
+                            message.contains(&format!("pairing {secret} is missing")),
+                            "missing local material must be named without claiming revocation"
+                        );
+                        ensure!(
+                            !message.contains("revoked"),
+                            "Connection DOM boundary assertion failed"
+                        );
+                        break;
+                    }
+                }
+                next_tick().await;
+                ensure!(
+                    container
+                        .query_selector("[data-mobile-test='connection-banner-repair']")
+                        .unwrap()
+                        .is_some(),
+                    "Connection DOM boundary assertion failed"
+                );
+                ensure!(
+                    container
+                        .query_selector("[data-mobile-test='connection-banner-spinner']")
+                        .unwrap()
+                        .is_none(),
+                    "Connection DOM boundary assertion failed"
+                );
+                ensure!(
+                    (IndexedDbHostStore.get(&host).await.unwrap()) == (Some(record)),
+                    "failed access must retain the pairing identity"
+                );
+            }
+            let host = store_reconnect_host().await;
+            owned.push(host.clone());
+            let before = IndexedDbHostStore.get(&host).await.unwrap().unwrap();
+            state.active_local_host_id.set(Some(host.clone()));
+            let scenario = uuid::Uuid::new_v4().to_string();
+            let base = format!("{endpoint}/reconnect/{scenario}");
+            configure(&base);
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{base}/control").into(),
+                    &"POST".into(),
+                    &"unavailable".into(),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            bridge::connect_paired_host(&host).await.unwrap();
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id == host
+                    && let PairedHostConnectionStatus::Failed { code, message } = event.status
+                {
+                    ensure!(
+                        (code) == (MobileAccessErrorCode::ServiceUnavailable),
+                        "Connection boundary result changed"
+                    );
+                    ensure!(
+                        message == "Relay service temporarily unavailable",
+                        "Connection DOM boundary assertion failed"
+                    );
+                    break;
+                }
+            }
+            next_tick().await;
+            ensure!(
+                container
+                    .text_content()
+                    .unwrap()
+                    .contains("Relay service temporarily unavailable"),
+                "the first observed failure must replace Connecting, not wait for repeated failures"
+            );
+            ensure!(
+                container
+                    .query_selector("[data-mobile-test='connection-banner-spinner']")
+                    .unwrap()
+                    .is_none(),
+                "Connection DOM boundary assertion failed"
+            );
+            ensure!(
+                container
+                    .query_selector("[data-mobile-test='connection-banner-repair']")
+                    .unwrap()
+                    .is_none(),
+                "Connection DOM boundary assertion failed"
+            );
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{base}/control").into(),
+                    &"POST".into(),
+                    &"ready".into(),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            // No manual reconnect: the same actor recovers on its existing backoff.
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id == host
+                    && event.status == PairedHostConnectionStatus::Connected
+                {
+                    break;
+                }
+            }
+            let after = IndexedDbHostStore.get(&host).await.unwrap().unwrap();
+            ensure!(
+                (before.managed) == (after.managed),
+                "Connection boundary result changed"
+            );
+            ensure!(
+                (before.psk_keychain_key_id) == (after.psk_keychain_key_id),
+                "Connection boundary result changed"
+            );
+            configure(&format!("{endpoint}/unanswered"));
+            bridge::reconnect_paired_host(&host).await.unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &"GET".into(),
+                    &"".into(),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            let expire = js_sys::Reflect::get(&clock.0, &"expire".into())
+                .unwrap()
+                .dyn_into::<js_sys::Function>()
+                .unwrap();
+            expire.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id == host
+                    && let PairedHostConnectionStatus::Failed { code, message } = event.status
+                {
+                    ensure!(
+                        (code) == (MobileAccessErrorCode::TransportFailed),
+                        "Connection boundary result changed"
+                    );
+                    ensure!(
+                        message == "The host did not answer.",
+                        "The visible failure should be the concise cause, not a retry paragraph"
+                    );
+                    ensure!(
+                        !message.contains("revoked"),
+                        "Connection DOM boundary assertion failed"
+                    );
+                    break;
+                }
+            }
+            next_tick().await;
+            ensure!(
+                container
+                    .query_selector("[data-mobile-test='connection-banner-spinner']")
+                    .unwrap()
+                    .is_none(),
+                "Connection DOM boundary assertion failed"
+            );
+            ensure!(
+                container
+                    .query_selector("[data-mobile-test='connection-banner-repair']")
+                    .unwrap()
+                    .is_none(),
+                "silence is not rejected authorization"
+            );
+            ensure!(
+                (IndexedDbHostStore
+                    .list()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|record| owned.contains(&record.local_host_id))
+                    .count())
+                    == (3),
+                "Connection boundary result changed"
+            );
+            bridge::disconnect_paired_host(&host).await.unwrap();
+            Ok(())
+        }
+        .await;
+        unlisten.remove();
+        unlisten_lines.remove();
+        drop(handle);
+        container.remove();
+        for host in owned {
+            bridge::forget_paired_host(&host).await.unwrap();
+        }
+        if had_config {
+            js_sys::Reflect::set(&window, &"__TYDE_MOBILE_SERVICE__".into(), &previous_config)
+                .unwrap();
+        } else {
+            js_sys::Reflect::delete_property(&window, &"__TYDE_MOBILE_SERVICE__".into()).unwrap();
+        }
+        drop(clock);
+        restore_loader_boundary();
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+
+    #[wasm_bindgen_test]
     async fn native_tabs_retain_mounted_draft_selection_and_search_without_web_navigation() {
         use mobile_shell_types::native::{NATIVE_BRIDGE_VERSION, NativeIntent};
         crate::components::test_styles::ensure_styles_loaded();
@@ -3222,24 +3536,12 @@ mod wasm_tests {
                     denied_reads.clear();
                     install_event_listeners(state.clone()).await;
                     next_tick().await;
-                    let error = container.query_selector("[data-mobile-test='mobile-shell-error-banner']").unwrap();
-                    let message = container.query_selector(".mobile-shell-error-message").unwrap();
-                    let diagnostics = format!("Startup failure: banner={}, code={:?}, message_present={}, denied_read_count={:?}, expected_prefix={:?}, saved_auto_connect={}",
-                        error.is_some(), error.as_ref().and_then(|banner| banner.get_attribute("data-error-code")),
-                        message.is_some(), message.as_ref().and_then(|message| message.text_content()).map(|text| text.matches("Native secret_read failed: Platform denied the secret read").count()),
-                        message.as_ref().and_then(|message| message.text_content()).map(|text| text.starts_with("Failed to refresh host connection after app attach: ")),
-                        saved.auto_connect);
-                    web_sys::console::log_1(&diagnostics.into());
-                    // The real run reports one denied read: native attach now owns only
-                    // the selected host. Retained inactive pairings must not be started.
-                    if error.as_ref().and_then(|banner| banner.get_attribute("data-error-code")).as_deref() != Some("Internal")
-                        || !message.as_ref().and_then(|message| message.text_content()).is_some_and(|text|
-                            text.starts_with("Failed to refresh host connection after app attach: ")
-                            && text.matches("Native secret_read failed: Platform denied the secret read").count() == 1)
+                    if state.mobile_shell_error.get_untracked().is_some()
+                        || !matches!(state.connection_statuses.get_untracked().get(&managed.local_host_id), Some(ConnectionStatus::Error(message)) if message == "Native secret_read failed: Platform denied the secret read")
                         || state.active_local_host_id.get_untracked().as_ref() != Some(&managed.local_host_id)
                         || denied_reads.size() != 1
                         || denied_reads.get(&managed.psk_keychain_key_id.as_ref().unwrap().0.clone().into()).as_f64() != Some(1.0) {
-                        ownership_failures.push("Only the selected managed host's denied startup read must surface; inactive pairing secrets must remain unread");
+                        ownership_failures.push("Only the selected managed host's typed startup failure must surface; inactive pairing secrets must remain unread");
                     }
                     state.mobile_shell_error.set(None);
                     state.active_local_host_id.set(Some(saved.local_host_id.clone()));
@@ -3247,23 +3549,26 @@ mod wasm_tests {
                     next_tick().await;
                     let reconnect = container.query_selector("[data-mobile-test='connection-banner-reconnect']").unwrap()
                         .ok_or("The saved disconnected host must offer the normal Reconnect action")?;
-                    let completed = js_sys::Function::new_with_args("button", r#"
+                    // Failed replaces the old Disconnected component. Observe the
+                    // current error/action, not the disposed button's attributes.
+                    let completed = js_sys::Function::new_with_args("root,button", r#"
                         return new Promise(resolve => {
-                            const observer = new MutationObserver(records => {
-                                if (!button.disabled && records.some(record => record.oldValue !== null)) {
-                                    observer.disconnect(); resolve();
-                                }
-                            });
-                            observer.observe(button, {attributes:true, attributeFilter:['disabled'], attributeOldValue:true});
-                            button.click();
+                            const settled = () => {
+                                const error = root.querySelector('.connection-banner-inner.error .status-text');
+                                const action = root.querySelector('[data-mobile-test="connection-banner-reconnect"]');
+                                if (error && error.textContent === 'Native secret_read failed: Platform denied the secret read'
+                                    && action && !action.disabled) { observer.disconnect(); resolve(); }
+                            };
+                            const observer = new MutationObserver(settled);
+                            observer.observe(root, {childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['disabled']});
+                            button.click(); settled();
                         });
-                    "#).call1(&wasm_bindgen::JsValue::NULL, &reconnect).unwrap();
+                    "#).call2(&wasm_bindgen::JsValue::NULL, &container, &reconnect).unwrap();
                     wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(completed)).await.unwrap();
                     next_tick().await;
-                    let failure = container.query_selector(".mobile-shell-error-message").unwrap();
-                    if failure.as_ref().and_then(|message| message.text_content()).as_deref()
-                        != Some("Could not reconnect: Native secret_read failed: Platform denied the secret read") {
-                        ownership_failures.push("The real Reconnect action must show its pre-actor native credential failure after command completion");
+                    if state.mobile_shell_error.get_untracked().is_some()
+                        || !matches!(state.connection_statuses.get_untracked().get(&saved.local_host_id), Some(ConnectionStatus::Error(message)) if message == "Native secret_read failed: Platform denied the secret read") {
+                        ownership_failures.push("Reconnect must retain the connection owner's typed storage failure without a duplicate generic shell error");
                     }
                 }
                 if !ownership_failures.is_empty() { return Err(ownership_failures.join("; ")); }

@@ -1059,12 +1059,7 @@ async fn finish_native_auth_reconnect(
     if matches!(auth, protocol::MobileServiceAuthState::Authenticated { .. }) {
         state.native_auth_recovery.set(None);
         if let Err(message) = crate::bridge::connect_paired_host(&host).await {
-            state
-                .mobile_shell_error
-                .set(Some(crate::state::MobileShellError {
-                    code: protocol::MobileAccessErrorCode::Internal,
-                    message,
-                }));
+            log::error!("native sign-in connection startup failed: {message}");
         }
     } else {
         state

@@ -397,7 +397,6 @@ pub async fn frontend_attached(
     let manager = connection::manager();
     manager.frontend_attached();
     let records = IndexedDbHostStore.list().await?;
-    let mut failures = Vec::new();
     for record in records.into_iter().filter(|record| record.auto_connect) {
         if crate::native::is_native()
             && (!super::loader::native_owns_host(&record.local_host_id)?
@@ -410,14 +409,11 @@ pub async fn frontend_attached(
         }
         if let Err(error) = manager.connect(record.local_host_id.clone()).await {
             log::error!("auto-connect for {} failed: {error}", record.local_host_id);
-            failures.push(error);
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("\n"))
-    }
+    // Connection startup errors have already emitted the host's typed Failed
+    // state; a second shell-level error would hide its recovery action.
+    Ok(())
 }
 
 pub async fn wasm_log(level: &str, message: &str) {
@@ -547,7 +543,11 @@ fn normalize_host_label(host_label: String) -> Result<String, String> {
 /// [`service`]). Kept here so both test suites build identical managed URIs.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod tests_support {
-    pub(crate) use super::store::{DirectPairingRecord, IndexedDbHostStore, WebPairedHostRecord};
+    pub(crate) use super::service::isolated_test_auth;
+    pub(crate) use super::store::{
+        DirectPairingRecord, IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord,
+        delete_device_secret,
+    };
     use mobile_pairing::{
         ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, PreSharedKey,
     };

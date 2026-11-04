@@ -4,13 +4,16 @@ use protocol::types::{
 };
 use std::time::Duration;
 
-use crate::{Error, Peer, RtcStream, authenticate_description, failure, verify_description};
+use crate::{
+    ConnectStage, Error, Peer, RtcStream, authenticate_description, failure, verify_description,
+};
 
 use tyde_time::{sleep, timeout};
 
 pub async fn connect(
     credentials: MobileRtcCredentials,
     pairing_key: &[u8; 32],
+    mut progress: impl FnMut(ConnectStage),
 ) -> Result<RtcStream, Error> {
     if credentials.protocol_version != MOBILE_RTC_PROTOCOL_VERSION {
         return Err(failure(
@@ -66,12 +69,19 @@ pub async fn connect(
         Ok(Duration::from_millis(remaining))
     };
     let deadline = remaining()?;
+    let mut stage = ConnectStage::RelayAllocation;
+    let mut advance = |next| {
+        stage = next;
+        progress(next);
+    };
+    advance(ConnectStage::RelayAllocation);
     let mut peer = Peer::new(&signal.credentials.ice_servers).await?;
     let negotiation = async {
         match signal.credentials.role {
             MobilePeerRole::Mobile => {
                 let session_id = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
                 let offer = peer.offer().await?;
+                advance(ConnectStage::PublishOffer);
                 signal
                     .publish(authenticate_description(
                         session_id.clone(),
@@ -80,6 +90,7 @@ pub async fn connect(
                         pairing_key,
                     )?)
                     .await?;
+                advance(ConnectStage::AwaitHostAnswer);
                 let description = signal.wait(Some(session_id.clone())).await?;
                 verify_description(
                     &description,
@@ -90,10 +101,13 @@ pub async fn connect(
                 peer.set_answer(description.sdp).await?;
             }
             MobilePeerRole::Host => {
+                advance(ConnectStage::AwaitMobileOffer);
                 let description = signal.wait(None).await?;
                 let session_id = description.session_id.clone();
                 verify_description(&description, &session_id, MobileSdpKind::Offer, pairing_key)?;
+                advance(ConnectStage::CreateAnswer);
                 let answer = peer.answer(description.sdp).await?;
+                advance(ConnectStage::PublishAnswer);
                 signal
                     .publish(authenticate_description(
                         session_id,
@@ -104,6 +118,7 @@ pub async fn connect(
                     .await?;
             }
         }
+        advance(ConnectStage::OpenChannel);
         peer.into_stream_for(remaining()?).await
     };
     let duration = match signal.credentials.role {
@@ -112,7 +127,7 @@ pub async fn connect(
     };
     timeout(duration, negotiation)
         .await
-        .map_err(|_| failure("negotiation", "timed out"))?
+        .map_err(|_| Error::NegotiationTimeout { stage })?
 }
 
 struct Signaling {

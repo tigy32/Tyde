@@ -7,6 +7,14 @@ const starts = new WeakMap();
 const leases = new WeakMap();
 export const nativeDescriptorIsLive = descriptor => leases.has(descriptor) && performance.now() < leases.get(descriptor);
 const post = async (endpoint, body) => bridge().post(endpoint, JSON.stringify(body));
+
+async function pairingSecret(key) {
+  let secret;
+  try { secret = await post('secret_read', {key}); }
+  catch { throw new NativeBootstrapError('credential_storage_unavailable', 'The app could not access credential storage. Unlock the device and retry.'); }
+  if (typeof secret !== 'string' || !secret) throw new NativeBootstrapError('pairing_secret_missing', 'The pairing credential is missing on this device. Re-pair from the host’s Settings → Mobile.');
+  return secret;
+}
 const base64url = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 
 export class NativeBootstrapError extends Error {
@@ -28,14 +36,14 @@ async function request(path, body, headers = {}, direct = false) {
     const messages = {
       native_abi_incompatible: 'Update the app: this host client requires a different native bridge.',
       bootstrap_unknown: 'Update Tyde host to support native client bootstrap.',
-      bootstrap_stale: 'The host client registration has expired.',
+      bootstrap_stale: 'The host’s mobile access registration has expired. Open Tyde on the host and check Settings → Mobile, then retry. If you removed this pairing, pair again.',
       pairing_revoked: 'This pairing has been revoked.',
       revoked_device: 'This pairing has been revoked.',
       pairing_rejected: 'This pairing offer has expired or its host client changed.',
       offer_expired: 'This pairing offer has expired.',
     };
     const code = direct ? error?.code : error?.error?.code;
-    const reasons = {native_abi_incompatible:'native_version',bootstrap_unknown:'bootstrap_baseline',bootstrap_stale:'transport',
+    const reasons = {native_abi_incompatible:'native_version',bootstrap_unknown:'bootstrap_baseline',bootstrap_stale:'host_unavailable',
       pairing_revoked:'pairing_revoked',revoked_device:'pairing_revoked',unknown_device:'pairing_revoked',not_found:'pairing_revoked',forbidden:'pairing_revoked',pass_required:'pass_required'};
     throw new NativeBootstrapError(reasons[code] || 'bootstrap', messages[code] || 'The current host client is unavailable.');
   }
@@ -72,7 +80,7 @@ function resolved(value, kind, id) {
 
 export async function resolveNativeHost(record) {
   if (record.direct) {
-    const token = await post('secret_read', { key: record.direct.deviceTokenKeyId });
+    const token = await pairingSecret(record.direct.deviceTokenKeyId);
     const origin = new URL(record.direct.nativeOrigin);
     if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
       throw new NativeBootstrapError('bootstrap', 'The paired host origin is invalid.');
@@ -84,8 +92,7 @@ export async function resolveNativeHost(record) {
   if (!managed || !/^[A-Za-z0-9_-]+$/.test(managed.pairingId)) throw new NativeBootstrapError('bootstrap', 'The managed pairing is unavailable.');
   const body = { native_bridge_abi: bridge().version };
   const path = `${prefix}/pairings/${managed.pairingId}/bootstrap/resolve`;
-  const secret = await post('secret_read', { key: managed.deviceSecretKeyId });
-  if (typeof secret !== 'string' || !secret) throw new NativeBootstrapError('bootstrap', 'The pairing secret is unavailable.');
+  const secret = await pairingSecret(managed.deviceSecretKeyId);
   const nonce = crypto.randomUUID(), timestamp = Date.now();
   const bodyHash = base64url(await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify(body))));
   const canonical = ['TYCODE-PAIRING-HMAC-V1','POST',path,bodyHash,nonce,String(timestamp),managed.pairingId,'mobile'].join('\n');

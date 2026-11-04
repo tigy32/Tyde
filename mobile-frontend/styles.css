@@ -355,6 +355,30 @@ input, textarea, select {
     color: var(--accent-error);
 }
 
+/* A failure needs its own space, not a toast over the selected host. */
+.connection-banner:has(.connection-failure) {
+    position: relative;
+    inset: auto;
+    z-index: 1;
+    flex: none;
+    align-items: stretch;
+    padding: var(--space-2) var(--space-3);
+}
+
+.connection-banner-inner.connection-failure {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    width: 100%;
+    max-width: none;
+    padding: var(--space-2) var(--space-3);
+}
+
+.connection-failure .connection-banner-dismiss {
+    min-width: 44px;
+    min-height: 44px;
+}
+
 .connection-banner-inner .status-text {
     overflow: hidden;
     text-overflow: ellipsis;

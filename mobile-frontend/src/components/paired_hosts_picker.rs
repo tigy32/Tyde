@@ -273,24 +273,14 @@ fn ConnectDisconnectButton(
     // an in-flight `connect_paired_host` invoke is tracked here only.
     let pending_invoke: RwSignal<Option<LocalHostId>> = RwSignal::new(None);
 
-    let state_connect = state.clone();
     let on_connect = Callback::new(move |_: ()| {
         let id_typed = local_host_id_for_connect.clone();
-        let state = state_connect.clone();
         pending_invoke.set(Some(id_typed.clone()));
         spawn_local(async move {
             let result = bridge::connect_paired_host(&id_typed).await;
             pending_invoke.set(None);
             if let Err(error) = result {
                 log::error!("connect_paired_host({id_typed}) failed: {error}");
-                // Surface via the global shell-error signal so the user sees
-                // it; do not mutate `connection_statuses`.
-                state
-                    .mobile_shell_error
-                    .set(Some(crate::state::MobileShellError {
-                        code: protocol::MobileAccessErrorCode::Internal,
-                        message: format!("connect failed: {error}"),
-                    }));
             }
         });
     });

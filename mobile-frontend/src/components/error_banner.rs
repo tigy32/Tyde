@@ -248,25 +248,38 @@ mod wasm_tests {
                 view! { <MobileShellErrorBanner /><crate::components::PairedHostsPicker /> }
             });
             next_tick().await;
+            // Production App subscribes before Connect; this partial mount must
+            // project that same manager event instead of expecting a shell error.
+            let observed = state.clone();
+            let status_listener = crate::bridge::listen_paired_host_connection_status(move |event| {
+                crate::app::apply_connection_status(&observed, event.local_host_id, event.status, event.connection_instance_id);
+            }).await.unwrap();
             let connect = chooser.query_selector_all(".paired-host-card").unwrap().item(1).unwrap()
                 .dyn_into::<web_sys::Element>().unwrap().query_selector("button").unwrap().unwrap();
             let finished = js_sys::Function::new_with_args("root,button", r#"
                 return new Promise(resolve => {
-                    const observer = new MutationObserver(() => {
-                        if (root.querySelector('[data-mobile-test="mobile-shell-error-banner"]')) {
+                    // The captured DOM already contained B's exact failure;
+                    // Leptos updated the text node without replacing children.
+                    const settled = () => {
+                        if (root.textContent.includes('This saved host is unavailable.')) {
                             observer.disconnect(); resolve();
                         }
-                    });
-                    observer.observe(root, {childList:true, subtree:true});
-                    button.click();
+                    };
+                    const observer = new MutationObserver(settled);
+                    observer.observe(root, {childList:true, subtree:true, characterData:true});
+                    button.click(); settled();
                 });
             "#).call2(&wasm_bindgen::JsValue::NULL, &chooser, &connect).unwrap();
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(finished)).await.unwrap();
             next_tick().await;
-            let failed_for_other = state.mobile_shell_error.get_untracked().is_some_and(|error| error.message.starts_with("connect failed: "));
+            let failed_for_other = state.mobile_shell_error.get_untracked().is_none()
+                && matches!(state.connection_statuses.get_untracked().get(&unrelated), Some(crate::state::ConnectionStatus::Error(message)) if message.starts_with("This saved host is unavailable."));
             let selection_unchanged = state.active_local_host_id.get_untracked().as_ref() == Some(&host);
             let no_wrong_recovery = chooser.query_selector(".mobile-shell-error-banner [data-mobile-test='connection-banner-reconnect'],.mobile-shell-error-banner [data-mobile-test='connection-banner-repair']").unwrap().is_none();
-            let can_retry_own_row = !connect.has_attribute("disabled");
+            let can_retry_own_row = chooser.query_selector_all(".paired-host-card").unwrap().item(1).unwrap()
+                .dyn_into::<web_sys::Element>().unwrap().query_selector("button").unwrap()
+                .is_some_and(|button| !button.has_attribute("disabled"));
+            status_listener.remove();
             drop(chooser_handle);
             chooser.remove();
             check(failed_for_other && selection_unchanged && no_wrong_recovery && can_retry_own_row,

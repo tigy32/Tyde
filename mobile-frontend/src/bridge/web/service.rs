@@ -924,6 +924,28 @@ async fn finish_redeem(
     Ok(local_host_id)
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) struct TestAuthScope(AuthCallbackExchange);
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn isolated_test_auth() -> TestAuthScope {
+    TestAuthScope(
+        AUTH_CALLBACK_EXCHANGE.with(|state| state.replace(AuthCallbackExchange::Unchecked)),
+    )
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+impl Drop for TestAuthScope {
+    fn drop(&mut self) {
+        AUTH_CALLBACK_EXCHANGE.with(|state| {
+            state.replace(std::mem::replace(
+                &mut self.0,
+                AuthCallbackExchange::Unchecked,
+            ));
+        });
+    }
+}
+
 // ── Live HTTP: mint TURN credentials (reconnect) ────────────────────────────
 
 pub(super) async fn obtain_rtc_credentials(
@@ -957,7 +979,7 @@ pub(super) async fn obtain_rtc_credentials(
     }
     let device_secret = super::store::load_device_secret(&managed.device_secret_key_id)
         .await
-        .map_err(|message| error(MobileAccessErrorCode::RepairRequired, message, false))?;
+        .map_err(|cause| error(cause.code(), cause.to_string(), false))?;
     let request = MobileRtcCredentialsRequest {
         role: MobilePeerRole::Mobile,
         protocol_version: MOBILE_RTC_PROTOCOL_VERSION,

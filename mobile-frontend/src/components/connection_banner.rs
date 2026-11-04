@@ -27,16 +27,9 @@ fn HostReconnectButton() -> impl IntoView {
         };
         log::info!("mobile_connection_control host={host} control=Reconnect button=clicked");
         reconnecting.set(true);
-        let state = state.clone();
         spawn_local(async move {
             if let Err(error) = bridge::reconnect_paired_host(&host).await {
                 log::error!("reconnect: reconnect_paired_host({host}) failed: {error}");
-                state
-                    .mobile_shell_error
-                    .set(Some(crate::state::MobileShellError {
-                        code: protocol::MobileAccessErrorCode::TransportFailed,
-                        message: format!("Could not reconnect: {error}"),
-                    }));
             }
             let _ = reconnecting.try_set(false);
         });
@@ -198,7 +191,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                         let msg = msg.clone();
                         let dismiss_state = status_state.clone();
                         view! {
-                            <div class="connection-banner-inner error" role="alert">
+                            <div class="connection-banner-inner error connection-failure" role="alert">
                                 <StatusDot
                                     label="Error".to_string()
                                     tone=StatusTone::Error
@@ -496,15 +489,30 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn connection_error_can_be_dismissed() {
+        crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-error".to_owned());
         let host_for_mount = host.clone();
         let container = make_container();
+        container.set_class_name("mobile-app");
+        container
+            .style()
+            .set_css_text("width:390px;height:800px;position:relative");
         let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let state_handle_for_mount = state_handle.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state
+                .paired_hosts
+                .set(vec![crate::state::PairedHostSummary {
+                    local_host_id: host_for_mount.clone(),
+                    host_label: "Owned host".into(),
+                    direct_origin: None,
+                    credential_fingerprint: "public-layout-fixture".into(),
+                    auto_connect: false,
+                    last_connected_at_ms: None,
+                }]);
             state.connection_statuses.update(|statuses| {
                 statuses.insert(
                     host_for_mount.clone(),
@@ -513,7 +521,7 @@ mod wasm_tests {
             });
             *state_handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <ConnectionBanner /> }
+            view! { <ConnectionBanner /><div class="mobile-content"><crate::components::HomeView /></div> }
         });
         next_tick().await;
 
@@ -524,6 +532,65 @@ mod wasm_tests {
                 .contains("host unreachable"),
             "connection error should render before dismissal"
         );
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        for width in [320, 390, 466] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            for cause in ["Mobile service unavailable", "The host did not answer."] {
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(host.clone(), ConnectionStatus::Error(cause.into()));
+                });
+                next_tick().await;
+                let alert = container.query_selector("[role='alert']").unwrap().unwrap();
+                let heading = container.query_selector("h1").unwrap().unwrap();
+                let message = alert.query_selector(".status-text").unwrap().unwrap();
+                let reconnect = alert
+                    .query_selector("[data-mobile-test='connection-banner-reconnect']")
+                    .unwrap()
+                    .unwrap();
+                let dismiss = alert
+                    .query_selector("[data-mobile-test='connection-error-dismiss']")
+                    .unwrap()
+                    .unwrap();
+                let alert_box = alert.get_bounding_client_rect();
+                let text_box = message.get_bounding_client_rect();
+                let reconnect_box = reconnect.get_bounding_client_rect();
+                let dismiss_box = dismiss.get_bounding_client_rect();
+                assert_eq!(message.text_content().as_deref(), Some(cause));
+                assert!(
+                    alert_box.bottom() <= heading.get_bounding_client_rect().top(),
+                    "A failure must reserve space above the host heading"
+                );
+                assert!(
+                    text_box.right() <= reconnect_box.left()
+                        && reconnect_box.right() <= dismiss_box.left(),
+                    "Cause and recovery controls must not overlap"
+                );
+                assert_eq!(
+                    reconnect_box.top(),
+                    dismiss_box.top(),
+                    "Dismiss must stay beside Reconnect, not on a separate row"
+                );
+                assert!(
+                    reconnect_box.height() >= 44.0 && dismiss_box.height() >= 44.0,
+                    "Phone recovery controls remain tappable"
+                );
+                assert!(
+                    message.scroll_width() <= message.client_width()
+                        && message.scroll_height() <= message.client_height(),
+                    "The complete cause must remain readable"
+                );
+            }
+        }
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                host.clone(),
+                ConnectionStatus::Error("host unreachable".into()),
+            );
+        });
+        next_tick().await;
         let dismiss: HtmlElement = container
             .query_selector("[data-mobile-test='connection-error-dismiss']")
             .unwrap()

@@ -7510,10 +7510,14 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
 
     let root = repo.path().to_path_buf();
     let remove_root = root.clone();
+    let retirement = tempfile::tempdir_in(root.parent().unwrap()).unwrap();
+    let retired_root = retirement.path().join("removed-root");
     let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
     let root_hook =
         fixture.on_project_scan(root.clone(), server::ScanPoint::ReadDirectory, move || {
-            fs::remove_dir_all(&remove_root).expect("remove project root during scan");
+            // Recursive deletion exposed a live root with missing Git metadata,
+            // not the unavailable-root transition this assertion exercises.
+            fs::rename(&remove_root, &retired_root).expect("detach project root during scan");
             removed_tx
                 .send(())
                 .expect("root scan observer still waiting");

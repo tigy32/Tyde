@@ -64,8 +64,9 @@ browser fetch. The complete managed credential-and-negotiation attempt is bounde
 by the existing 60-second connection deadline. Returning after a background pause
 can interrupt an attempt that is still obtaining credentials or negotiating.
 
-After three consecutive failures of the same kind, the banner shows the error
-and explains that retries continue automatically. Reconnect remains available
+The first completed connection failure shows its cause alongside Reconnect.
+Automatic retries are unchanged; the failure remains visible while the actor
+retries. Only a successful connection clears it. Reconnect remains available
 while connecting and after an error; it cancels the old attempt and starts fresh.
 Request-stage and elapsed-time diagnostics contain no cookies or relay secrets.
 
@@ -198,3 +199,89 @@ checks EOF after revocation with a failed store write. The terminal protocol
 flow cancels a desktop connection through the same supervisor, waits on a Linux
 process-exit descriptor, and proves another connection's terminal remains usable.
 These are actual completion events, with no sleeps or performance thresholds.
+
+
+## Already-orphaned pairings and missing phone credentials
+
+The forward revocation fix cannot revoke an old Service-active pairing after
+its host secret has already been deleted. Nor can a missing answer establish
+that authorization was revoked: an offline host or broken network can look the
+same. No credentials are reconstructed, and no pairing or account is reset.
+
+The connection owner now retains typed runtime negotiation progress through
+its unchanged 60-second attempt deadline. If an authenticated offer receives
+no host answer, the actual failure says that the host did not answer and offers
+Reconnect. Missing credentials still use the distinct Re-pair state; silence
+never establishes revocation. Relay allocation,
+publication and channel-open failures name their own stage. This is an explicit
+transport error with automatic retry, not a rejected-access claim or a shorter
+timeout. A genuine failure replaces Connecting on the first occurrence; an
+in-flight retry does not erase the last observed error.
+
+Phone-local missing/invalid PSKs and device credentials are different. Their
+store emits a typed credential error; the connection manager publishes its
+failed status even when startup fails before creating the actor. Attach and
+Connect callers do not replace that host-scoped failure with a generic Internal
+shell error; pairing redemption still receives its failed-start result. The existing
+Re-pair action is projected from that state without deleting the saved host.
+A platform read denial remains a keystore failure, not proof of missing or
+revoked credentials. The pre-Wasm native discovery boundary likewise preserves
+missing credential, inaccessible credential storage and Service-emitted stale
+host registration as distinct outcomes. An expired registration asks the user
+to open the host and check Mobile access; transient discovery transport still
+retries. Existing authoritative revoked-pairing rejection remains unchanged.
+
+### Continuation evidence and regression scope
+
+A retained source-built client from `c0c1a2a4` reproduced the remaining failures
+in Chrome over real IndexedDB, loopback HTTP and loopback TURN: a missing phone
+PSK produced only an Internal attach error; an HTTP 503 remained Connecting;
+and an admitted, authenticated offer with no answer reached the original
+60-second deadline and still remained Connecting. This transport fixture does
+not claim to reproduce Service authorization or the original native episode.
+Combined with the earlier real local Service HTTP-200-after-removal receipt,
+it establishes the remaining admitted-orphan failure path without asserting
+why a particular customer connection stopped answering.
+
+The DOM regression drives local PSK and device-secret deletion, first-failure
+visibility, automatic recovery through a real TURN/server connection, retained
+pairing identities, and a real signed offer/HTTP poll with no answering host.
+It advances the already-armed deadline only after that poll arrives, rather
+than sleeping or imposing a host-speed assertion. The native loader regression
+runs the real loader DOM, native bridge contract surface and HTTP discovery;
+it distinguishes missing/denied local secrets, stale registration, transient
+service failure and authoritative revocation. It does not execute Swift or
+Keychain. No paid provider, Account, production Service or physical phone is
+involved. QR-owned managed-probe/offer flows remain untouched.
+
+Source ancestry places the pre-actor PSK read in the original browser backend
+(`01b5c569`, first containing tag `v0.8.19-beta.3`) and the three-failure
+visibility threshold in `8f51ac33` (first
+containing tag `v0.8.19-beta.25`). The native discovery collapse arrived with
+`5eb3af98` (first tagged `v0.9.6-beta.25`). These are source ancestry findings;
+only the retained current-source browser artifact was executed, not those
+historical release binaries.
+
+
+The first continuation gate exposed retained test-auth state: the preceding
+native sign-in flow had completed an AuthFailed callback, and the new transport
+flow reused it instead of a fresh document's unchecked callback state. The
+fixture now scopes and restores that document-owned auth state, as the existing
+service tests already do. Its behavioral assertions still require missing local
+material, real failure projection and recovery; failure cleanup releases its
+listeners and connections before reporting the assertion. The existing startup
+and nonselected-host DOM assertions now require the connection owner's error on
+the exact host, rather than the generic duplicate shell notice observed in the
+before/after runtime captures. Selection and inactive-pairing isolation remain
+required.
+
+
+Root's review of the original `644f99eb` captures found the retryable error toast
+overlaid the host heading and crowded Reconnect/dismiss. Retryable failure
+presentation now reserves its own normal-flow space using the existing native
+banner pattern, with cause and recovery controls in one grid row. The connection
+owner emits the concise cause without an appended retry paragraph; automatic
+retry and the unknown-versus-revoked distinction are unchanged. Original captures
+remain preserved outside the workbench. The existing DOM dismissal flow also
+requires heading clearance, readable cause text and aligned recovery controls
+at phone widths; it does not depend on elapsed-time thresholds.

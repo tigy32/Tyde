@@ -303,3 +303,78 @@ test("installed storage migrates once, then follows exact targets without losing
     }
   }
 });
+
+// The native loader runs before Wasm can own connection state. Missing local
+// material, a stale host registration and an actual rejection must stay distinct.
+test("native discovery surfaces credential loss and host absence without inventing revocation", async () => {
+  assert.ok(process.env.CHROME, "dev.sh must provision Chrome");
+  const root = new URL("../", import.meta.url);
+  let mode = "missing", requests = 0;
+  const server = createServer(async (req, res) => {
+    const path = new URL(req.url, "http://owned.invalid").pathname;
+    if (path === "/setup") { res.setHeader("content-type", "text/html"); res.end("<!doctype html><title>Owned discovery fixture</title>"); return; }
+    if (path.endsWith("/bootstrap/resolve")) {
+      requests++;
+      req.resume();
+      res.setHeader("content-type", "application/json");
+      const code = mode === "stale" ? "bootstrap_stale" : mode === "revoked" ? "pairing_revoked" : "service_unavailable";
+      res.writeHead(mode === "unavailable" ? 503 : 403).end(JSON.stringify({error:{code,message:"owned HTTP boundary",retryable:mode !== "revoked"}}));
+      return;
+    }
+    try {
+      if (!path.startsWith("/tyde/") || path.includes("..")) throw Error("asset path");
+      const relative = path === "/tyde/" ? "index.html" : path.slice(6);
+      const bytes = await readFile(new URL(relative, root));
+      const type = relative.endsWith(".html") ? "text/html" : relative.endsWith(".css") ? "text/css" : relative.endsWith(".js") ? "text/javascript" : "image/svg+xml";
+      res.setHeader("content-type",type); res.end(bytes);
+    } catch { res.writeHead(404).end(); }
+  });
+  server.listen(0, "127.0.0.1"); await once(server,"listening");
+  let browser;
+  try {
+    browser = await chromium.launch({executablePath:process.env.CHROME,args:["--no-sandbox"]});
+    for (mode of ["missing","locked","stale","unavailable","revoked"]) {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      const before = requests;
+      await context.addInitScript(mode => {
+        window.__tydeNativeHost = {version:6,bootstrapVersion:1,shellRelease:"0.9.6-beta.25",post(endpoint) {
+          if (endpoint === "presentation") return Promise.resolve(null);
+          if (endpoint === "secret_read") {
+            if (mode === "locked") return Promise.reject(new Error("Owned platform storage denial"));
+            return Promise.resolve(mode === "missing" ? null : "owned-fixture-only-secret");
+          }
+          return Promise.reject(new Error("Unexpected owned native request"));
+        }};
+      }, mode);
+      const origin = `http://127.0.0.1:${server.address().port}`;
+      await page.goto(origin+"/setup");
+      await page.evaluate(async () => {
+        await new Promise((resolve,reject) => {
+          const open = indexedDB.open("tyde-mobile",1);
+          open.onupgradeneeded=()=>{open.result.createObjectStore("paired_hosts");open.result.createObjectStore("psk");};
+          open.onerror=()=>reject(Error("Owned storage setup failed"));
+          open.onsuccess=()=>{
+            const db=open.result,tx=db.transaction("paired_hosts","readwrite");
+            tx.objectStore("paired_hosts").put(JSON.stringify([{localHostId:"owned-host",hostLabel:"Owned host",credentialFingerprint:"public-owned-fingerprint",autoConnect:true,lastConnectedAtMs:null,managed:{pairingId:"owned-pair",deviceId:"owned-device",deviceSecretKeyId:"tyde-web-owned-secret"}}]),"all");
+            tx.oncomplete=()=>{db.close();localStorage.setItem("tyde.selected-host.v1","owned-host");resolve();};
+          };
+        });
+      });
+      await page.goto(origin+"/tyde/");
+      await page.locator("#view-error").waitFor({state:"visible"});
+      const text=await page.locator("#view-error").innerText();
+      const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"host’s mobile access registration has expired",unavailable:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
+      assert.ok(text.includes(expected[mode]),`the real loader must surface the specific ${mode} failure`);
+      if(mode!=="revoked")assert.ok(!text.toLowerCase().includes("revoked"),"neither silence nor local storage failure establishes revocation");
+      assert.equal(requests-before,mode==="missing"||mode==="locked"?0:1,"local credential failure must stop before authenticated HTTP");
+      const outcome=await page.evaluate(()=>window.__tydeLoader.nativeAdmitHost("owned-host"));
+      assert.deepEqual(outcome,{status:"unavailable",reason:{missing:"pairing_secret_missing",locked:"credential_storage_unavailable",stale:"host_unavailable",unavailable:"bootstrap_transport",revoked:"pairing_revoked"}[mode]});
+      assert.equal(await page.evaluate(()=>localStorage.getItem("tyde.selected-host.v1")),"owned-host");
+      await context.close();
+    }
+  } finally {
+    if(browser)await browser.close();
+    server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));
+  }
+});

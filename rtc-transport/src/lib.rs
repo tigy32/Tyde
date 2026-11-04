@@ -31,8 +31,48 @@ const WINDOW_CHUNKS: usize = 4;
 const CHUNK_BYTES: usize = 16 * 1024;
 const BUFFER_BYTES: usize = 256 * 1024;
 
+/// Runtime negotiation progress, not a claim about pairing authorization.
+#[derive(Debug, Clone, Copy)]
+pub enum ConnectStage {
+    RelayAllocation,
+    PublishOffer,
+    AwaitHostAnswer,
+    AwaitMobileOffer,
+    CreateAnswer,
+    PublishAnswer,
+    OpenChannel,
+}
+
+impl ConnectStage {
+    pub fn timeout_message(self) -> &'static str {
+        match self {
+            Self::RelayAllocation => {
+                "A relay connection could not be established. Check your network and retry."
+            }
+            Self::PublishOffer => {
+                "The mobile service did not accept the connection offer. Check your network and retry."
+            }
+            Self::AwaitHostAnswer => "The host did not answer.",
+            Self::AwaitMobileOffer => {
+                "No mobile connection offer arrived before the relay credentials expired."
+            }
+            Self::CreateAnswer => {
+                "The host could not prepare its relay connection. Check the host's network and retry."
+            }
+            Self::PublishAnswer => {
+                "The mobile service did not accept the host's connection answer. Check the host's network and retry."
+            }
+            Self::OpenChannel => {
+                "The host answered, but the secure data channel did not open. Check both devices' networks and retry."
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{}", stage.timeout_message())]
+    NegotiationTimeout { stage: ConnectStage },
     #[error("WebRTC {stage}: {message}")]
     Connection {
         stage: &'static str,

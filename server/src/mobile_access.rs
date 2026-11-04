@@ -4076,7 +4076,7 @@ async fn connect_mobile_device_stream(
         .mint_host_rtc_credentials(record)
         .await
         .map_err(MobileTaskError::managed_service)?;
-    rtc_transport::connect(credentials, record.psk.as_bytes())
+    rtc_transport::connect(credentials, record.psk.as_bytes(), |_| {})
         .await
         .map(|stream| Box::new(stream) as BoxedMobileTransport)
         .map_err(|error| {

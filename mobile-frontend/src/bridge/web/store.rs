@@ -252,10 +252,44 @@ pub async fn store_device_secret(secret: &str) -> Result<KeychainSecretId, Strin
     Ok(key_id)
 }
 
-pub async fn load_device_secret(key_id: &KeychainSecretId) -> Result<String, String> {
+#[derive(Debug)]
+pub enum SecretLoadError {
+    Missing(&'static str),
+    Unavailable(String),
+    Invalid(&'static str),
+}
+
+impl std::fmt::Display for SecretLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(name) => write!(
+                f,
+                "{name} is missing on this device. Re-pair from the host's Settings → Mobile."
+            ),
+            Self::Invalid(name) => write!(
+                f,
+                "{name} is invalid on this device. Re-pair from the host's Settings → Mobile."
+            ),
+            Self::Unavailable(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl SecretLoadError {
+    pub fn code(&self) -> protocol::MobileAccessErrorCode {
+        match self {
+            Self::Missing(_) | Self::Invalid(_) => protocol::MobileAccessErrorCode::RepairRequired,
+            Self::Unavailable(_) => protocol::MobileAccessErrorCode::KeystoreFailed,
+        }
+    }
+}
+
+pub async fn load_device_secret(key_id: &KeychainSecretId) -> Result<String, SecretLoadError> {
     idb::get(idb::STORE_PSK, &key_id.0)
-        .await?
-        .ok_or_else(|| format!("no device pairing secret stored for {key_id}"))
+        .await
+        .map_err(SecretLoadError::Unavailable)?
+        .filter(|secret| !secret.is_empty())
+        .ok_or(SecretLoadError::Missing("The pairing credential"))
 }
 
 pub async fn delete_device_secret(key_id: &KeychainSecretId) -> Result<(), String> {
@@ -270,10 +304,12 @@ pub async fn store_device_token(token: &str) -> Result<KeychainSecretId, String>
     Ok(key_id)
 }
 
-pub async fn load_device_token(key_id: &KeychainSecretId) -> Result<String, String> {
+pub async fn load_device_token(key_id: &KeychainSecretId) -> Result<String, SecretLoadError> {
     idb::get(idb::STORE_PSK, &key_id.0)
-        .await?
-        .ok_or_else(|| format!("no device token stored for {key_id}"))
+        .await
+        .map_err(SecretLoadError::Unavailable)?
+        .filter(|secret| !secret.is_empty())
+        .ok_or(SecretLoadError::Missing("The pairing credential"))
 }
 
 // ── PSK store (seam for later WebCrypto hardening) ───────────────────────
@@ -283,7 +319,7 @@ pub async fn load_device_token(key_id: &KeychainSecretId) -> Result<String, Stri
 #[allow(async_fn_in_trait)] // Single wasm impl, only ever used statically (never as `dyn`).
 pub trait PskStore {
     async fn store(&self, psk: &PreSharedKey) -> Result<KeychainSecretId, String>;
-    async fn load(&self, key_id: &KeychainSecretId) -> Result<PreSharedKey, String>;
+    async fn load(&self, key_id: &KeychainSecretId) -> Result<PreSharedKey, SecretLoadError>;
     async fn delete(&self, key_id: &KeychainSecretId) -> Result<(), String>;
 }
 
@@ -302,15 +338,15 @@ impl PskStore for IndexedDbPskStore {
         Ok(key_id)
     }
 
-    async fn load(&self, key_id: &KeychainSecretId) -> Result<PreSharedKey, String> {
+    async fn load(&self, key_id: &KeychainSecretId) -> Result<PreSharedKey, SecretLoadError> {
         let encoded = idb::get(idb::STORE_PSK, &key_id.0)
-            .await?
-            .ok_or_else(|| format!("no PSK stored for key {key_id}"))?;
+            .await
+            .map_err(SecretLoadError::Unavailable)?
+            .ok_or(SecretLoadError::Missing("The pairing key"))?;
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded.trim().as_bytes())
-            .map_err(|error| format!("stored PSK for {key_id} is not valid base64: {error}"))?;
-        PreSharedKey::from_slice(&bytes)
-            .map_err(|error| format!("stored PSK for {key_id} is invalid: {error}"))
+            .map_err(|_| SecretLoadError::Invalid("The pairing key"))?;
+        PreSharedKey::from_slice(&bytes).map_err(|_| SecretLoadError::Invalid("The pairing key"))
     }
 
     async fn delete(&self, key_id: &KeychainSecretId) -> Result<(), String> {

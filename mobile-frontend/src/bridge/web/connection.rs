@@ -54,12 +54,6 @@ use tyde_time::{sleep, timeout};
 const CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITER_LIVENESS_DEADLINE: Duration = Duration::from_secs(45);
-/// After this many consecutive retryable failures with the same typed error
-/// code the actor keeps retrying with backoff but pins a persistent `Failed`
-/// status, so the UI shows an actionable card instead of an ambiguous eternal
-/// `Connecting` spinner.
-const PERSISTENT_FAILURE_THRESHOLD: u32 = 3;
-
 #[cfg(all(test, target_arch = "wasm32"))]
 #[derive(Default)]
 enum TestSendBehavior {
@@ -238,40 +232,6 @@ fn test_send_action(line: &str) -> Option<TestSendAction> {
             Some(TestSendAction::Deferred(response))
         }
     })
-}
-
-/// Tracks consecutive retryable failures sharing the same typed
-/// [`MobileAccessErrorCode`]. Keyed on the code — NOT the rendered message —
-/// because message details vary between attempts (broker disconnect reasons,
-/// service error text) and must not keep resetting the count; the latest
-/// error's message is still what the persistent card displays. A different
-/// code restarts the count (a new situation gets the transient treatment
-/// again); a successful connect resets it.
-#[derive(Default)]
-struct RepeatedFailures {
-    code: Option<MobileAccessErrorCode>,
-    count: u32,
-}
-
-impl RepeatedFailures {
-    fn record(&mut self, code: MobileAccessErrorCode) -> u32 {
-        if self.code == Some(code) {
-            self.count += 1;
-        } else {
-            self.code = Some(code);
-            self.count = 1;
-        }
-        self.count
-    }
-
-    fn reset(&mut self) {
-        self.code = None;
-        self.count = 0;
-    }
-
-    fn is_persistent(&self) -> bool {
-        self.count >= PERSISTENT_FAILURE_THRESHOLD
-    }
 }
 
 type TransportOutcomeCallback = Rc<dyn Fn(SubmissionTransportOutcomeEvent)>;
@@ -613,12 +573,33 @@ impl ConnectionManager {
 
     async fn spawn_connection(&self, local_host_id: LocalHostId) -> Result<(), String> {
         let host_store = IndexedDbHostStore;
-        let record = host_store
-            .get(&local_host_id)
-            .await?
-            .ok_or_else(|| format!("paired host {local_host_id} was not found"))?;
+        let record = match host_store.get(&local_host_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(self.startup_failed(
+                local_host_id,
+                MobileAccessErrorCode::UnknownDevice,
+                "This saved host is unavailable. Pair it again from the host's Settings → Mobile."
+                    .into(),
+            )),
+            Err(message) => {
+                return Err(self.startup_failed(
+                    local_host_id,
+                    MobileAccessErrorCode::StoreLoadFailed,
+                    message,
+                ));
+            }
+        };
         let psk = match record.psk_keychain_key_id.as_ref() {
-            Some(key_id) => Some(IndexedDbPskStore.load(key_id).await?),
+            Some(key_id) => match IndexedDbPskStore.load(key_id).await {
+                Ok(psk) => Some(psk),
+                Err(error) => {
+                    return Err(self.startup_failed(
+                        local_host_id,
+                        error.code(),
+                        error.to_string(),
+                    ));
+                }
+            },
             None => None,
         };
 
@@ -661,6 +642,23 @@ impl ConnectionManager {
             manager.actor_ended(local_host_id, actor_instance_id);
         });
         Ok(())
+    }
+
+    fn startup_failed(
+        &self,
+        local_host_id: LocalHostId,
+        code: MobileAccessErrorCode,
+        message: String,
+    ) -> String {
+        self.set_status_and_emit(
+            local_host_id,
+            PairedHostConnectionStatus::Failed {
+                code,
+                message: message.clone(),
+            },
+            None,
+        );
+        message
     }
 
     fn allocate_connection_instance_id(&self) -> u64 {
@@ -873,20 +871,16 @@ impl ConnectionManager {
         local_host_id: &LocalHostId,
         actor_instance_id: u64,
         error: &ConnectErr,
-        attempts: u32,
     ) {
         if !self.is_current_actor(local_host_id, actor_instance_id) {
             return;
         }
-        log::warn!(
-            "mobile host {local_host_id} has failed {attempts} consecutive reconnect attempts; \
-             still retrying: {error}"
-        );
+        log::warn!("mobile host {local_host_id} connection failed; still retrying: {error}");
         self.set_status_and_emit(
             local_host_id.clone(),
             PairedHostConnectionStatus::Failed {
                 code: error.error_code(),
-                message: format!("{error}. Retrying automatically."),
+                message: error.to_string(),
             },
             None,
         );
@@ -895,10 +889,31 @@ impl ConnectionManager {
 
 // ── Connection actor ──────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+enum ConnectionStage {
+    Credentials,
+    Direct,
+    Rtc(rtc_transport::ConnectStage),
+}
+
+impl ConnectionStage {
+    fn timeout_message(self) -> &'static str {
+        match self {
+            Self::Credentials => {
+                "The mobile service did not finish issuing connection credentials. Check your network and retry."
+            }
+            Self::Direct => {
+                "The host did not open its authenticated connection. Check that Tyde is running and retry."
+            }
+            Self::Rtc(stage) => stage.timeout_message(),
+        }
+    }
+}
+
 enum ConnectErr {
     Rtc(rtc_transport::Error),
     Io(std::io::Error),
-    Timeout,
+    Timeout(ConnectionStage),
     WriterDeadline {
         local_submission_id: LocalSubmissionId,
     },
@@ -914,11 +929,7 @@ impl std::fmt::Display for ConnectErr {
         match self {
             Self::Rtc(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "I/O error on Tyde byte stream: {error}"),
-            Self::Timeout => write!(
-                f,
-                "Connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}. \
-                 Check your network and that the host is running Tyde"
-            ),
+            Self::Timeout(stage) => write!(f, "{}", stage.timeout_message()),
             Self::WriterDeadline {
                 local_submission_id,
             } => write!(
@@ -937,9 +948,13 @@ impl std::fmt::Display for ConnectErr {
 impl ConnectErr {
     fn is_retryable(&self) -> bool {
         match self {
-            Self::Rtc(error) => matches!(error, rtc_transport::Error::Connection { .. }),
+            Self::Rtc(error) => matches!(
+                error,
+                rtc_transport::Error::Connection { .. }
+                    | rtc_transport::Error::NegotiationTimeout { .. }
+            ),
             Self::Io(error) => io_error_is_retryable(error),
-            Self::Timeout | Self::WriterDeadline { .. } | Self::Invalidated(_) => true,
+            Self::Timeout(_) | Self::WriterDeadline { .. } | Self::Invalidated(_) => true,
             Self::NeedsRepair(_) => false,
             Self::ManagedCredentials(error) => error.retryable,
         }
@@ -949,7 +964,7 @@ impl ConnectErr {
         match self {
             Self::Rtc(_) => MobileAccessErrorCode::TransportFailed,
             Self::Io(_) => MobileAccessErrorCode::TransportFailed,
-            Self::Timeout => MobileAccessErrorCode::TransportFailed,
+            Self::Timeout(_) => MobileAccessErrorCode::TransportFailed,
             Self::WriterDeadline { .. } => MobileAccessErrorCode::TransportFailed,
             Self::Invalidated(ConnectionInvalidation::HeartbeatTimeout { .. }) => {
                 MobileAccessErrorCode::TransportFailed
@@ -986,9 +1001,9 @@ async fn run_connection_actor(
 ) {
     let local_host_id = record.local_host_id.clone();
     let mut backoff = ReconnectBackoff::default();
-    let mut failures = RepeatedFailures::default();
+    let mut has_failed = false;
     loop {
-        if !failures.is_persistent() {
+        if !has_failed {
             manager.emit_connecting(&local_host_id, actor_instance_id);
         }
 
@@ -1005,7 +1020,7 @@ async fn run_connection_actor(
                     &manager,
                     &local_host_id,
                     actor_instance_id,
-                    &mut failures,
+                    &mut has_failed,
                     &error,
                 ) {
                     return;
@@ -1044,7 +1059,7 @@ async fn run_connection_actor(
                     &manager,
                     &local_host_id,
                     actor_instance_id,
-                    &mut failures,
+                    &mut has_failed,
                     &error,
                 ) {
                     return;
@@ -1072,7 +1087,7 @@ async fn run_connection_actor(
         };
 
         backoff.reset();
-        failures.reset();
+        has_failed = false;
         let Some(connection_instance_id) = manager
             .on_connected(&local_host_id, actor_instance_id)
             .await
@@ -1112,7 +1127,7 @@ async fn run_connection_actor(
                     &manager,
                     &local_host_id,
                     actor_instance_id,
-                    &mut failures,
+                    &mut has_failed,
                     &error,
                 ) {
                     return;
@@ -1143,20 +1158,15 @@ fn handle_retryable_connect_failure(
     manager: &ConnectionManager,
     local_host_id: &LocalHostId,
     actor_instance_id: u64,
-    failures: &mut RepeatedFailures,
+    has_failed: &mut bool,
     error: &ConnectErr,
 ) -> bool {
     if !error.is_retryable() {
         manager.emit_final_failure(local_host_id, actor_instance_id, error);
         return false;
     }
-    let attempts = failures.record(error.error_code());
-    if failures.is_persistent() {
-        manager.emit_persistent_failure(local_host_id, actor_instance_id, error, attempts);
-    } else {
-        log::warn!("Mobile connection to {local_host_id} failed; retrying: {error}");
-        manager.emit_connecting(local_host_id, actor_instance_id);
-    }
+    *has_failed = true;
+    manager.emit_persistent_failure(local_host_id, actor_instance_id, error);
     true
 }
 
@@ -1172,7 +1182,8 @@ async fn connect_once(
             crate::bridge::loader::BrowserOutcome::Unavailable { reason } => {
                 return Err(ConnectErr::ManagedCredentials(ManagedCredentialError {
                     code: match reason {
-                        crate::bridge::loader::UnavailableReason::BootstrapTransport => {
+                        crate::bridge::loader::UnavailableReason::BootstrapTransport
+                        | crate::bridge::loader::UnavailableReason::HostUnavailable => {
                             MobileAccessErrorCode::ServiceUnavailable
                         }
                         crate::bridge::loader::UnavailableReason::AuthenticationRequired => {
@@ -1181,14 +1192,21 @@ async fn connect_once(
                         crate::bridge::loader::UnavailableReason::PassRequired => {
                             MobileAccessErrorCode::PassRequired
                         }
-                        crate::bridge::loader::UnavailableReason::PairingRevoked => {
+                        crate::bridge::loader::UnavailableReason::PairingRevoked
+                        | crate::bridge::loader::UnavailableReason::PairingSecretMissing => {
                             MobileAccessErrorCode::RepairRequired
+                        }
+                        crate::bridge::loader::UnavailableReason::CredentialStorageUnavailable => {
+                            MobileAccessErrorCode::KeystoreFailed
                         }
                         _ => MobileAccessErrorCode::VersionMismatch,
                     },
                     message: reason.message().into(),
-                    retryable: reason
-                        == crate::bridge::loader::UnavailableReason::BootstrapTransport,
+                    retryable: matches!(
+                        reason,
+                        crate::bridge::loader::UnavailableReason::BootstrapTransport
+                            | crate::bridge::loader::UnavailableReason::HostUnavailable
+                    ),
                 }));
             }
             _ => {
@@ -1209,7 +1227,11 @@ async fn connect_once(
         (Some(_), Some(psk)) => connect_managed_once(record, psk)
             .await
             .map(|stream| Box::new(stream) as BoxedTransport),
-        _ => Err(ConnectErr::NeedsRepair(format!(
+        (Some(_), None) => Err(ConnectErr::NeedsRepair(
+            "The pairing key is missing on this device. Re-pair from the host's Settings → Mobile."
+                .into(),
+        )),
+        (None, _) => Err(ConnectErr::NeedsRepair(format!(
             "\"{}\" was paired before managed mobile access and can't connect anymore. Re-pair from the host's current QR code in the Mobile tab under Settings (Settings → Mobile) to move it to managed access, or forget it.",
             record.host_label
         ))),
@@ -1238,7 +1260,13 @@ async fn connect_direct_once(
     };
     let token = super::store::load_device_token(&direct.device_token_key_id)
         .await
-        .map_err(ConnectErr::NeedsRepair)?;
+        .map_err(|cause| {
+            ConnectErr::ManagedCredentials(ManagedCredentialError {
+                code: cause.code(),
+                message: cause.to_string(),
+                retryable: false,
+            })
+        })?;
     match timeout(
         CONNECT_ATTEMPT_TIMEOUT,
         super::direct::DirectWebSocketStream::connect(&origin, &token),
@@ -1261,7 +1289,7 @@ async fn connect_direct_once(
                 )))
             }
         }
-        Err(_) => Err(ConnectErr::Timeout),
+        Err(_) => Err(ConnectErr::Timeout(ConnectionStage::Direct)),
     }
 }
 
@@ -1269,6 +1297,7 @@ async fn connect_managed_once(
     record: &WebPairedHostRecord,
     psk: &PreSharedKey,
 ) -> Result<rtc_transport::RtcStream, ConnectErr> {
+    let stage = Cell::new(ConnectionStage::Credentials);
     let attempt = async {
         log::info!(
             "mobile_connect_attempt host={} stage=credentials",
@@ -1279,13 +1308,15 @@ async fn connect_managed_once(
             "mobile_connect_attempt host={} stage=signaling",
             record.local_host_id
         );
-        rtc_transport::connect(credentials, psk.as_bytes())
-            .await
-            .map_err(ConnectErr::Rtc)
+        rtc_transport::connect(credentials, psk.as_bytes(), |progress| {
+            stage.set(ConnectionStage::Rtc(progress))
+        })
+        .await
+        .map_err(ConnectErr::Rtc)
     };
     match timeout(CONNECT_ATTEMPT_TIMEOUT, attempt).await {
         Ok(result) => result,
-        Err(_) => Err(ConnectErr::Timeout),
+        Err(_) => Err(ConnectErr::Timeout(stage.get())),
     }
 }
 

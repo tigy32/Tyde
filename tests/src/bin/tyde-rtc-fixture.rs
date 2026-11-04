@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -74,7 +74,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay = Arc::new(tests::rtc::relay().await);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let unanswered_url = format!("http://{address}/unanswered/signal");
+    let unanswered_ice = relay.browser_ice.clone();
+    let poll_started = Arc::new(tokio::sync::Notify::new());
+    let observed_poll = poll_started.clone();
     let app = Router::new()
+        .route(
+            "/unanswered/pairings/{pairing}/webrtc",
+            post(
+                move |Path(pairing): Path<String>,
+                      Json(request): Json<protocol::MobileRtcCredentialsRequest>| {
+                    let url = unanswered_url.clone();
+                    let ice = unanswered_ice.clone();
+                    async move {
+                        assert_eq!(request.role, protocol::MobilePeerRole::Mobile);
+                        assert_eq!(
+                            request.protocol_version,
+                            protocol::MOBILE_RTC_PROTOCOL_VERSION
+                        );
+                        Json(protocol::MobileRtcCredentials {
+                            protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
+                            pairing_id: protocol::MobilePairingId(pairing),
+                            role: protocol::MobilePeerRole::Mobile,
+                            signaling_url: protocol::MobileSignalingUrl(url),
+                            signaling_token: "owned-unanswered-fixture".into(),
+                            ice_servers: vec![ice],
+                            expires_at_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64
+                                + 3_600_000,
+                        })
+                    }
+                },
+            )
+            .options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
+            "/unanswered/signal",
+            post(move |Json(command): Json<protocol::MobileSignalCommand>| {
+                let started = poll_started.clone();
+                async move {
+                    match command {
+                        protocol::MobileSignalCommand::Publish { description } => {
+                            verify_description(
+                                &description,
+                                &description.session_id,
+                                MobileSdpKind::Offer,
+                                &[53; 32],
+                            )
+                            .unwrap();
+                        }
+                        protocol::MobileSignalCommand::Poll { session_id } => {
+                            assert!(session_id.is_some());
+                            started.notify_one();
+                        }
+                    }
+                    Json(protocol::MobileSignalEvent::Waiting)
+                }
+            })
+            .options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
+            "/unanswered/poll-started",
+            get(move || {
+                let started = observed_poll.clone();
+                async move {
+                    started.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        )
         .route(
             "/interrupt-traffic",
             post(|State(relay): State<Arc<RelayFixture>>| async move {

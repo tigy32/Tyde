@@ -28,7 +28,7 @@ export async function startNativeBootstrap(hooks) {
   const fail = () => ({ status: 'unavailable', reason: 'bootstrap' });
   const failure = error => {
     const reason = error?.code === 'transport' ? 'bootstrap_transport' : error?.code;
-    return {status:'unavailable',reason:['authentication_required','pass_required','pairing_revoked','native_version','bootstrap_baseline','bootstrap_transport'].includes(reason) ? reason : 'bootstrap'};
+    return {status:'unavailable',reason:['authentication_required','pass_required','pairing_revoked','native_version','bootstrap_baseline','bootstrap_transport','host_unavailable','pairing_secret_missing','credential_storage_unavailable'].includes(reason) ? reason : 'bootstrap'};
   };
   const handoffPairing = uri => {
     sessionStorage.setItem(pairKey, uri);
