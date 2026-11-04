@@ -9,9 +9,49 @@ import {createServer as httpServer, request as httpRequest} from 'node:http';
 import {connect} from 'node:net';
 import {once} from 'node:events';
 import {createInterface} from 'node:readline';
+import {runInNewContext} from 'node:vm';
 import {chromium} from '@playwright/test';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+const desktopStyles = await readFile('frontend/styles.css','utf8');
+const decoderSource = await readFile('web/loader/vendor/jsqr.js','utf8');
+const decoderEntry = 'return __webpack_require__(__webpack_require__.s = 3);';
+if(decoderSource.split(decoderEntry).length!==2)throw Error('QR diagnostic source identity changed');
+const decoderScope={module:{exports:{}}};
+runInNewContext(decoderSource.replace(decoderEntry,'globalThis.__thinQrModules=__webpack_require__;'+decoderEntry)
+  .replace('function readVersion(matrix) {','exports.__thinReadVersion=readVersion; function readVersion(matrix) {'),decoderScope);
+const qrModules=decoderScope.__thinQrModules;
+const diagnoseQrPipeline=({data,width,height,bits,dimension,svg_x,svg_y,svg_width,svg_height},uri)=>{
+  const grid=dimension-4;
+  const expected=qrModules(0).BitMatrix.createEmpty(grid,grid);
+  for(let y=0;y<grid;y++)for(let x=0;x<grid;x++)expected.set(x,y,bits[(y+2)*dimension+x+2]);
+  const reference=qrModules(5).decode(expected);
+  const {binarized}=qrModules(4).binarize(Uint8ClampedArray.from(data),width,height,false);
+  let binaryMismatch=0;
+  for(let y=0;y<dimension;y++)for(let x=0;x<dimension;x++){
+    if(binarized.get(Math.floor(svg_x+(x+.5)*svg_width/dimension),Math.floor(svg_y+(y+.5)*svg_height/dimension))!==!!bits[y*dimension+x])binaryMismatch++;
+  }
+  const locations=qrModules(12).locate(binarized)||[];
+  return {reference_matrix_decoded:!!reference,reference_matrix_exact:reference?.text===uri,binarized_module_mismatch:binaryMismatch,
+    locations:locations.map(location=>{
+      const {matrix}=qrModules(11).extract(binarized,location);
+      let mismatch=0;
+      if(matrix.width===grid)for(let y=0;y<grid;y++)for(let x=0;x<grid;x++)if(matrix.get(x,y)!==!!bits[(y+2)*dimension+x+2])mismatch++;
+      const version=qrModules(5).__thinReadVersion(matrix);
+      let refinement=null;
+      if(version){
+        const refinedDimension=version.versionNumber*4+17;
+        const refined=qrModules(11).extract(binarized,{...location,dimension:refinedDimension}).matrix;
+        let difference=0;
+        if(refined.width===grid)for(let y=0;y<grid;y++)for(let x=0;x<grid;x++)if(refined.get(x,y)!==!!bits[(y+2)*dimension+x+2])difference++;
+        const result=qrModules(5).decode(refined);
+        refinement={encoded_version:version.versionNumber,dimension:refinedDimension,module_mismatch:refined.width===grid?difference:null,decoded:!!result,exact:result?.text===uri};
+      }
+      const decoded=qrModules(5).decode(matrix);
+      return {dimension:location.dimension,extracted_dimension:matrix.width,same_dimension:matrix.width===grid,
+        module_mismatch:matrix.width===grid?mismatch:null,decoded:!!decoded,exact:decoded?.text===uri,refinement};
+    })};
+};
 const temporary = await mkdtemp(resolvePath(tmpdir(), 'tyde-native-client-'));
 const sockets = new Set();
 const transports = new Set();
@@ -67,7 +107,7 @@ try {
   const targets = new Map();
   let pairRequests=0, documents=0, scope=null, presentation=null, publisherFault=null;
   let releasePublisher=null, initialPublicationHeld=false;
-  let holdPairingManifest=false, pairingManifestArrived=null, releasePairingManifest=null, pairingOutcome=null;
+  let holdPairingManifest=false, pairingManifestArrived=null, releasePairingManifest=null, pairingOutcome=null, pairingCancellationObserved=null;
   let failNextHostPublication=false, holdNextHostPublication=false, releaseHostPublication=null;
   const secrets = new Map();
   const pendingHttp = new Map();
@@ -90,10 +130,10 @@ try {
       }
       const path=new URL(req.url,'https://tycode.dev').pathname;
       if(path==='/tyde/manifest.json'){
-        if(holdPairingManifest&&req.headers['x-tyde-native-publication-sim']!=='1'){
+        if(holdPairingManifest&&req.headers['x-tyde-native-publication-sim']!=='1'&&req.headers['x-tyde-native-pairing-test']==='1'){
           holdPairingManifest=false;
           const released=new Promise(resolve=>releasePairingManifest=resolve);
-          pairingManifestArrived();await released;
+          pairingManifestArrived({pairing:req.headers['x-tyde-native-pairing-test']==='1'});await released;
         }
         if(req.headers['x-tyde-native-publication-sim']==='1'){
           if(!initialPublicationHeld){
@@ -169,6 +209,148 @@ try {
     stage=phase;console.error(`NATIVE_BOUNDARY ${phase}`);
     await writeFile(resolvePath(evidence,'current-boundary.json'),JSON.stringify({stage})+'\n');
   };
+  const renderedDesktopQr=async svg=>{
+    const desktop=await browser.newPage({viewport:{width:1200,height:900}});
+    desktop.setDefaultTimeout(0);desktop.setDefaultNavigationTimeout(0);
+    try{
+      await desktop.setContent('<html data-theme="dark"><body><div class="settings-overlay"><div class="settings-root"><div class="settings-layout"><div class="settings-content"><div class="settings-mobile-pairing-active"><div class="settings-mobile-pairing-qr"></div></div></div></div></div></div></body></html>');
+      await desktop.addStyleTag({content:desktopStyles});
+      const qr=desktop.locator('.settings-mobile-pairing-qr');
+      await qr.evaluate((node,svg)=>{node.innerHTML=svg;},svg);
+      await desktop.evaluate(()=>Promise.all(document.getAnimations().map(animation=>animation.finished)));
+      const box=await qr.boundingBox();
+      if(!box||box.width<=0||box.height<=0)throw Error('Desktop pairing QR is not rendered');
+      const layout=await qr.evaluate(node=>{
+        const svg=node.querySelector('svg').getBoundingClientRect(),box=node.getBoundingClientRect();
+        let visible={left:Math.max(0,box.left),top:Math.max(0,box.top),right:Math.min(innerWidth,box.right),bottom:Math.min(innerHeight,box.bottom)};
+        for(let parent=node.parentElement;parent;parent=parent.parentElement){
+          const style=getComputedStyle(parent),rect=parent.getBoundingClientRect();
+          if(['hidden','auto','scroll','clip'].includes(style.overflowX)){visible.left=Math.max(visible.left,rect.left);visible.right=Math.min(visible.right,rect.right);}
+          if(['hidden','auto','scroll','clip'].includes(style.overflowY)){visible.top=Math.max(visible.top,rect.top);visible.bottom=Math.min(visible.bottom,rect.bottom);}
+        }
+        return {svg_width:svg.width,svg_height:svg.height,svg_x:svg.left-box.left,svg_y:svg.top-box.top,
+          fully_visible:visible.left<=box.left&&visible.top<=box.top&&visible.right>=box.right&&visible.bottom>=box.bottom,
+          opacity:getComputedStyle(node.closest('.settings-overlay')).opacity};
+      });
+      const pixels=await qr.screenshot();
+      return {png:pixels.toString('base64'),width:box.width,height:box.height,...layout};
+    }finally{await desktop.close();}
+  };
+  const scanRenderedDesktopQr=async (target,host)=>{
+    const rendered=await renderedDesktopQr(host.qr_svg);
+    const receipt=resolvePath(evidence,`desktop-qr-${host.phase||'direct'}-decode-boundary.json`);
+    let completeVideo;
+    const videoFrame=new Promise(resolve=>{completeVideo=resolve;});
+    const videoObservation={events:[]};let videoWrites=Promise.resolve();
+    await target.exposeBinding('__thinQrVideoDiagnostic',async ({frame},snapshot)=>{
+      if(frame!==target.mainFrame())throw Error('Untrusted QR diagnostic frame');
+      const {pixels,...state}=snapshot;
+      videoObservation.events.push(state);
+      if(pixels)videoObservation.decoder_pipeline=diagnoseQrPipeline(pixels,host.qr_uri);
+      const json=JSON.stringify(videoObservation,null,2)+'\n';
+      videoWrites=videoWrites.then(()=>writeFile(resolvePath(evidence,`desktop-qr-${host.phase||'direct'}-video-boundary.json`),json));
+      await videoWrites;
+      if(pixels||state.scanner_failure)completeVideo(state);
+    });
+    let decoded;
+    try{
+    decoded=await target.evaluate(async ({png,uri,svg,layout})=>{
+      const observation=window.__thinQrDecodeObservation={stage:'import'};
+      const {decodeQrImageData,isPairingScanValue}=await import('/tyde/loader.js');
+      observation.stage='image';
+      const image=new Image();image.src='data:image/png;base64,'+png;await image.decode();
+      const canvas=document.createElement('canvas');canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;
+      const context=canvas.getContext('2d');context.drawImage(image,0,0);
+      const frame=context.getImageData(0,0,canvas.width,canvas.height);
+      let minimum=255,maximum=0;
+      for(let i=0;i<frame.data.length;i+=4){minimum=Math.min(minimum,frame.data[i]);maximum=Math.max(maximum,frame.data[i]);}
+      Object.assign(observation,{stage:'decode',width:canvas.width,height:canvas.height,minimum,maximum});
+      const value=decodeQrImageData(frame);
+      const exact=value===uri,recognized=isPairingScanValue(value);
+      Object.assign(observation,{decoded:typeof value==='string',exact,recognized});
+      const vector=new DOMParser().parseFromString(svg,'image/svg+xml').documentElement;
+      const dimension=vector.viewBox.baseVal.width;
+      const dark=new Set([...vector.querySelectorAll('rect[fill="#000000"]')].map(node=>node.getAttribute('x')+':'+node.getAttribute('y')));
+      let darkMismatch=0,lightMismatch=0;
+      for(let y=0;y<dimension;y++)for(let x=0;x<dimension;x++){
+        const px=Math.floor(layout.svg_x+(x+.5)*layout.svg_width/dimension);
+        const py=Math.floor(layout.svg_y+(y+.5)*layout.svg_height/dimension);
+        const expected=dark.has(x+':'+y),actual=frame.data[(py*frame.width+px)*4]<128;
+        if(expected!==actual){if(expected)darkMismatch++;else lightMismatch++;}
+      }
+      observation.modules={dimension,compared:dimension*dimension,dark_mismatch:darkMismatch,light_mismatch:lightMismatch};
+      window.__thinQrDebugFrame={data:Array.from(frame.data),width:frame.width,height:frame.height,dimension,...layout,
+        bits:Array.from({length:dimension*dimension},(_,i)=>dark.has(i%dimension+':'+Math.floor(i/dimension))?1:0)};
+      const diagnose=(label,source,sx,sy,sw,sh,width,height,vector=false)=>{
+        const sample=document.createElement('canvas');sample.width=width;sample.height=height;
+        const pixels=sample.getContext('2d');
+        if(vector)pixels.drawImage(source,0,0,width,height);else pixels.drawImage(source,sx,sy,sw,sh,0,0,width,height);
+        const text=decodeQrImageData(pixels.getImageData(0,0,width,height));
+        return {path:label,width,height,decoded:typeof text==='string',exact:text===uri,recognized:isPairingScanValue(text)};
+      };
+      // These comparisons diagnose the same private offer; none substitutes for
+      // the original screenshot's acceptance or its production Scan input.
+      const comparisons=[diagnose('screenshot_svg_crop',image,layout.svg_x,layout.svg_y,layout.svg_width,layout.svg_height,layout.svg_width,layout.svg_height)];
+      const vectorUrl=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'}));
+      try{
+        const vectorImage=new Image();vectorImage.src=vectorUrl;await vectorImage.decode();
+        for(const size of [layout.svg_width,600])comparisons.push(diagnose('same_offer_svg',vectorImage,0,0,vectorImage.naturalWidth,vectorImage.naturalHeight,size,size,true));
+      }finally{URL.revokeObjectURL(vectorUrl);}
+      observation.comparisons=comparisons;
+      if(!exact||!recognized)throw Error('Rendered desktop QR did not pass the actual native loader recognizer');
+      // Actual media frames exercise the scanner consumer, not camera permission/capture.
+      const stream=canvas.captureStream(0),request=navigator.mediaDevices.getUserMedia;
+      const track=stream.getVideoTracks()[0];
+      if(typeof track.requestFrame!=='function')throw Error('Explicit canvas video frame capture is unavailable');
+      const decoder=window.jsQR,template=window.__thinQrDebugFrame,video=document.getElementById('scan-video');
+      const report=(event,extra={})=>window.__thinQrVideoDiagnostic({event,ready_state:video.readyState,paused:video.paused,
+        width:video.videoWidth,height:video.videoHeight,live_tracks:stream.getTracks().filter(track=>track.readyState==='live').length,...extra});
+      const listeners=['play','loadedmetadata','loadeddata','playing','error'].map(event=>{
+        const listener=()=>{
+          // The detached canvas must paint after capture starts; otherwise the
+          // stream stays live with zero dimensions and play never settles.
+          if(event==='play'){context.drawImage(image,0,0);track.requestFrame();}
+          void report(event);
+        };video.addEventListener(event,listener);return [event,listener];
+      });
+      const status=new MutationObserver(()=>{if(document.getElementById('scan-status').getAttribute('role')==='alert')void report('scanner-error',{scanner_failure:true});});
+      status.observe(document.getElementById('scan-status'),{childList:true,attributes:true});
+      navigator.mediaDevices.getUserMedia=async constraints=>{await report('camera-request',{environment_requested:constraints?.video?.facingMode==='environment'});return stream;};
+      let observed=false;
+      window.jsQR=(data,width,height,options)=>{
+        const result=decoder(data,width,height,options);
+        if(!observed){observed=true;void report('decoder-frame',{decoded:typeof result?.data==='string',exact:result?.data===uri,
+          recognized:isPairingScanValue(result?.data),pixels:{...template,data:Array.from(data),width,height}});}
+        return result;
+      };
+      window.__thinQrSource={canvas,stream,restore(){navigator.mediaDevices.getUserMedia=request;window.jsQR=decoder;
+        status.disconnect();for(const [event,listener]of listeners)video.removeEventListener(event,listener);}};
+      return {exact,recognized};
+    },{png:rendered.png,uri:host.qr_uri,svg:host.qr_svg,layout:{svg_x:rendered.svg_x,svg_y:rendered.svg_y,svg_width:rendered.svg_width,svg_height:rendered.svg_height}});
+    }finally{
+      const observation=await target.evaluate(()=>window.__thinQrDecodeObservation);
+      const frame=await target.evaluate(()=>window.__thinQrDebugFrame);
+      if(frame)observation.decoder_pipeline=diagnoseQrPipeline(frame,host.qr_uri);
+      await target.evaluate(()=>{delete window.__thinQrDebugFrame;});
+      await writeFile(receipt,JSON.stringify({rendered_width:rendered.width,rendered_height:rendered.height,
+        svg_width:rendered.svg_width,svg_height:rendered.svg_height,svg_x:rendered.svg_x,svg_y:rendered.svg_y,fully_visible:rendered.fully_visible,opacity:rendered.opacity,...observation},null,2)+'\n');
+    }
+    await target.locator('#scan-button').click();
+    const video=await videoFrame;
+    if(video.scanner_failure)throw Error('The actual scanner surfaced a camera or decoder failure');
+    if(!video.exact||!video.recognized)throw Error('The actual scanner did not decode its supplied QR video frame');
+    return {desktop_producer:true,desktop_css_dom_pixels:true,rendered_width:rendered.width,rendered_height:rendered.height,
+      real_server_offer:true,decoded_exact:decoded.exact,recognizer_accepted:decoded.recognized,
+      limit:'Production desktop QR renderer and CSS in an isolated real DOM fixture, not the mounted Settings component; rendered screenshot pixels feed a canvas stream and actual native-loader continuation, not a physical camera or UIKit.'};
+  };
+  const finishQrCapture=async target=>{
+    const stopped=await target.evaluate(()=>{
+      const source=window.__thinQrSource;
+      const stopped=source.stream.getTracks().every(track=>track.readyState==='ended');
+      source.restore();delete window.__thinQrSource;return stopped;
+    });
+    if(!stopped)throw Error('The native loader did not stop its consumed QR stream');
+  };
   const requireVisible=async selector=>Promise.race([
     page.locator(selector).waitFor({state:'visible'}),
     page.locator('#view-error').waitFor({state:'visible'}).then(()=>{throw Error('Explicit bootstrap failure');}),
@@ -224,6 +406,9 @@ try {
   const intent=detail=>{if(!accepts(detail,contract.intents))throw Error('The installed native shell cannot emit this intent');return page.evaluate(detail=>window.dispatchEvent(new CustomEvent('tyde-native-intent',{detail})),detail);};
   await page.exposeBinding('__thinPairingSettled',(_,outcome)=>{
     if(pairingOutcome){pairingOutcome(outcome);pairingOutcome=null;}
+  });
+  await page.exposeBinding('__thinPairingCancellationObserved',()=>{
+    if(pairingCancellationObserved){pairingCancellationObserved();pairingCancellationObserved=null;}
   });
   const identity=()=>page.evaluate(()=>new Promise((resolve,reject)=>{
     const open=indexedDB.open('tyde-mobile',1);open.onerror=()=>reject(Error());open.onsuccess=()=>{
@@ -315,11 +500,19 @@ try {
     }));
     try {
     await probe.goto('https://tycode.dev/tyde/?native=1',{waitUntil:'domcontentloaded'});
-    await probe.locator('#paste-input').fill(host.qr_uri);await probe.locator('#connect-button').click();
+    let qrProof;
+    if(host.phase==='before')qrProof=await scanRenderedDesktopQr(probe,host);
+    else{await probe.locator('#paste-input').fill(host.qr_uri);await probe.locator('#connect-button').click();}
     // Managed ServiceAuthScreen performs its existing authenticated redemption;
     // only direct pairing has a separate Pair confirmation button.
     await Promise.race([probe.waitForFunction(()=>window.__thinPresentation?.workspace===true),probe.locator('[data-mobile-test="pairing-failed-message"]').waitFor({state:'visible'}).then(()=>{throw Error();})]);
     const saved=await rows();if(saved.length!==1||!saved[0].managed||keys.size!==2||attempts!==1||responses!==1||publicRequest.http_status!==200||publicRequest.release!==host.release||publicRequest.protocol!==published.versions[host.release].protocolVersion||publicRequest.transport!==published.versions[host.release].transportProtocolVersion)throw Error();
+    if(qrProof){
+      await finishQrCapture(probe);
+      await writeFile(resolvePath(evidence,'managed-desktop-qr-native-continuation.json'),JSON.stringify({
+        ...qrProof,canonical_managed_redemption:true,stream_stopped:true,redeem_starts:attempts,redeem_responses:responses,
+      },null,2)+'\n');
+    }
     emit({event:'managed-saved',pairing_id:saved[0].managed.pairingId,device_id:saved[0].managed.deviceId});
     const registration=await receive();
     if(host.phase==='failed_registration'){
@@ -420,7 +613,7 @@ try {
         pairingFailed:!!document.querySelector('[data-mobile-test="pairing-failed-message"]'),shellError:!!document.querySelector('[data-mobile-test="mobile-shell-error-banner"]'),
         loaderFailed:!document.getElementById('view-error')?.hidden}));
       await writeFile(resolvePath(evidence,`managed-${host.phase}-failure.json`),JSON.stringify({stage,...state,redeem_starts:attempts,redeem_responses:responses,secrets:keys.size,record_count:(await rows()).length},null,2)+'\n');
-      await probe.evaluate(()=>document.querySelectorAll('textarea').forEach(node=>node.value=''));
+      await probe.evaluate(()=>{document.querySelectorAll('textarea,input').forEach(node=>node.value='');const video=document.querySelector('#scan-video');if(video)video.hidden=true;});
       await probe.screenshot({path:resolvePath(evidence,`managed-${host.phase}-failure-redacted.png`)});throw Error();
     }
   };
@@ -434,15 +627,14 @@ try {
   await requireVisible('#paste-input');
   await boundary('bootstrap chooser screenshot');
   await page.screenshot({path:resolvePath(evidence,'bootstrap-chooser.png')});
-  await boundary('bootstrap pairing URI entry');
-  await writeFile(resolvePath(evidence,'bootstrap-input-contract.json'),JSON.stringify({
-    pairing_uri_is_string:typeof first.qr_uri==='string',pairing_uri_present:typeof first.qr_uri==='string'&&first.qr_uri.length>0
-  })+'\n');
-  await page.locator('#paste-input').fill(first.qr_uri);
-  await boundary('fresh offer resolution and exact client execution');
-  await page.locator('#connect-button').click();
+  await boundary('desktop QR producer and real decoder to native scanner continuation');
+  const qrProof=await scanRenderedDesktopQr(page,first);
   console.error('NATIVE_BOUNDARY awaiting first Pair');
   await Promise.race([page.getByRole('button',{name:'Pair',exact:true}).waitFor({state:'visible'}),page.locator('#view-error').waitFor({state:'visible'}).then(()=>{throw Error();})]);
+  await finishQrCapture(page);
+  await writeFile(resolvePath(evidence,'desktop-qr-native-continuation.json'),JSON.stringify({
+    ...qrProof,canonical_pair_confirmation:true,stream_stopped:true,
+  },null,2)+'\n');
   const discoveryBeforeConfirmation=mainDiscovery.device_requests;
   await page.evaluate(()=>window.__thinAdvanceClock(121000));
   await page.getByRole('button',{name:'Pair',exact:true}).click();
@@ -560,6 +752,26 @@ try {
       window.__tydeLoader.nativePreparePairing=async(...args)=>{
         const outcome=await prepare(...args);await window.__thinPairingSettled(outcome);return outcome;
       };
+      const fetch=window.fetch,reload=window.__tydeLoader.nativeReloadAllowed;
+      window.fetch=(input,options)=>{
+        const url=new URL(input instanceof Request?input.url:String(input),location.href);
+        if(url.origin!==location.origin||url.pathname!=='/tyde/manifest.json')return fetch.call(window,input,options);
+        const stack=new Error().stack;
+        if(typeof stack!=='string')throw Error('Manifest caller evidence unavailable');
+        const pairing=stack.split('\n').some(line=>line.includes('preparePairing')&&line.includes('/native-bootstrap.js:'));
+        const headers=new Headers(options?.headers??(input instanceof Request?input.headers:undefined));
+        headers.set('x-tyde-native-pairing-test',pairing?'1':'0');
+        return fetch.call(window,input,{...options,headers});
+      };
+      window.__tydeLoader.nativeReloadAllowed=(...args)=>{
+        const result=reload(...args);
+        if(window.__thinCancelArmed&&args[1]===false){window.__thinCancelArmed=false;void window.__thinPairingCancellationObserved();}
+        return result;
+      };
+      window.__thinRestorePairingProbe=()=>{
+        window.fetch=fetch;window.__tydeLoader.nativeReloadAllowed=reload;
+        delete window.__thinCancelArmed;delete window.__thinRestorePairingProbe;
+      };
     });
     await intent('hosts');await page.getByRole('button',{name:'Pair another host',exact:true}).click();
     await page.getByRole('button',{name:'Paste link',exact:true}).click();
@@ -567,19 +779,45 @@ try {
     const publisherHeld=new Promise(resolve=>pairingManifestArrived=resolve);
     const cancelledOperation=new Promise(resolve=>pairingOutcome=resolve);
     holdPairingManifest=true;
+    const unrelatedRead=page.evaluate(async()=>{
+      const response=await fetch('/tyde/manifest.json',{cache:'no-store'});return response.ok;
+    });
+    const firstPublication=await Promise.race([
+      unrelatedRead.then(ok=>({read:true,ok})),publisherHeld.then(held=>({read:false,...held})),
+    ]);
+    if(!firstPublication.read){
+      releasePairingManifest();await unrelatedRead;
+      await writeFile(resolvePath(evidence,'cancelled-publisher-identity.json'),JSON.stringify({unrelated_read_consumed_hold:true,
+        held_pairing:firstPublication.pairing,real_http_response_released:true},null,2)+'\n');
+      throw Error('Unrelated publication read consumed pairing hold');
+    }
+    if(!firstPublication.ok)throw Error('Unrelated publication read failed');
     await page.getByRole('button',{name:'Continue',exact:true}).click();
-    await publisherHeld;
+    const held=await Promise.race([publisherHeld,cancelledOperation.then(()=>{throw Error('Pairing finished before its publication hold');})]);
+    if(!held.pairing)throw Error('Publication hold did not belong to pairing');
+    const cancelObserved=new Promise(resolve=>pairingCancellationObserved=resolve);
+    await page.evaluate(()=>{window.__thinCancelArmed=true;});
     await page.getByRole('button',{name:'Cancel',exact:true}).click();
+    await cancelObserved;
+    await writeFile(resolvePath(evidence,'cancelled-publisher-identity.json'),JSON.stringify({unrelated_read_consumed_hold:false,
+      unrelated_read_completed:true,held_pairing:true,cancellation_owner_acknowledged:true},null,2)+'\n');
     await intent('agents');await page.waitForFunction(()=>window.__thinPresentation?.route==='chat');
     await page.locator('[data-mobile-test="chat-input"]').fill('Draft after cancelled pairing');
     releasePairingManifest();
     const cancellation=await cancelledOperation;
-    if(cancellation.status!=='unavailable'||cancellation.reason!=='cancelled'||documents!==documentsBeforeCancel||pairRequests!==1||
-        await page.locator('[data-mobile-test="chat-input"]').inputValue()!=='Draft after cancelled pairing'||
-        await page.evaluate(()=>sessionStorage.getItem('tyde.native.pending-pair.v1'))!==null)throw Error('Late publisher completion resumed a cancelled pairing');
+    const cancelledObservation={
+      outcome_cancelled:cancellation.status==='unavailable'&&cancellation.reason==='cancelled',
+      same_document:documents===documentsBeforeCancel,
+      no_extra_pair_request:pairRequests===1,
+      draft_retained:await page.locator('[data-mobile-test="chat-input"]').inputValue()==='Draft after cancelled pairing',
+      pending_pair_absent:await page.evaluate(()=>sessionStorage.getItem('tyde.native.pending-pair.v1'))===null,
+    };
+    await writeFile(resolvePath(evidence,'cancelled-pairing-observation.json'),JSON.stringify(cancelledObservation,null,2)+'\n');
+    for(const [invariant,passed] of Object.entries(cancelledObservation))if(!passed)throw Error(`Cancelled pairing invariant failed: ${invariant}`);
     await writeFile(resolvePath(evidence,'cancelled-pairing-publication-proof.json'),JSON.stringify({real_manifest_response_held:true,
       explicit_cancel_before_release:true,settled_outcome:'cancelled',same_document:true,draft_retained:true,pair_requests:pairRequests,
       synchronization:'actual HTTP arrival/release and operation-completion event; no sleeps/time thresholds'},null,2)+'\n');
+    await page.evaluate(()=>window.__thinRestorePairingProbe());
     await page.locator('[data-mobile-test="chat-input"]').fill('');
     await boundary('different-wire host switch');
     await intent('hosts');await page.getByRole('button',{name:'Pair another host',exact:true}).click();
@@ -667,7 +905,7 @@ try {
   if(evidence)await writeFile(resolvePath(evidence,'safe-driver-error.json'),JSON.stringify(failure,null,2)+'\n');
   console.error(`Native client upgrade failed at ${stage}`);
   if(page&&evidence&&!page.isClosed()){
-    await page.locator('textarea,input').evaluateAll(nodes=>nodes.forEach(node=>node.style.visibility='hidden'));
+    await page.locator('textarea,input,#scan-video').evaluateAll(nodes=>nodes.forEach(node=>node.style.visibility='hidden'));
     await page.screenshot({path:resolvePath(evidence,'boundary-failure-redacted.png')});
     const state=await page.evaluate(()=>({loaderError:document.getElementById('error-message')?.textContent,
       secure:window.isSecureContext,worker:!!navigator.serviceWorker?.controller,client:window.__tydeLoader?.bootVersion()}));

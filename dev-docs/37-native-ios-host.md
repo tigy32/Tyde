@@ -923,6 +923,218 @@ another typing action.
 
 ## Native shared images and pairing diagnostics
 
+### Build 4 thin-scanner observation packet
+
+The independent decoder-error defect dates to `d9bbf6a5` (2026-06-22), first
+contained in tag `v0.8.19-beta.5`. Its `catch { return null; }` makes a failed
+decoder indistinguishable from a successfully read frame containing no QR;
+the scan loop also used to swallow frame/detector exceptions indefinitely.
+Build4 first reaches that thin scanner through `5eb3af98` in beta25. This
+provenance does not identify the cause of the reported physical-camera failure
+or native pinch drift. Neither original native episode has been reproduced by this change.
+
+The fresh-offer rendered-pixel RED is a separate decoder-geometry defect.
+At the actual 256px desktop QR box (238px SVG), all 6,561 module centres match
+the producer and remain correct after binarization; the box is unclipped and
+fully opaque. The existing mounted Settings DOM flow independently checks the
+same 256px box and 238px SVG geometry with production CSS; its fixture offer is
+not the live server offer. The bundled locator nevertheless estimates 79 modules for the
+77-module version-15 code. The same private offer decodes exactly as a source
+matrix and at 600px, while the original screenshot fails. The 600px comparison
+is diagnostic only, never accepted input. Reading the existing BCH-protected
+version metadata from the first extraction yields version 15; extracting at its
+authoritative 77-module dimension recovers every module and the exact payload
+from the unchanged 256px pixels. The decoder now performs that metadata-driven
+refinement before payload decoding, not after a failed decode or by guessing,
+rescaling or trying alternate dimensions. Both vendored copies remain identical.
+The renderer, camera constraints and native geometry are unchanged.
+
+This geometry defect entered the loader with vendored jsQR in `d9bbf6a5`, first
+contained in `v0.8.19-beta.5`; the full-client copy arrived in `0946f663`, first
+contained in `v0.8.19-beta.8`. The desktop SVG renderer dates to `998bd5aa` (first
+containing tag `v0.8.15`) and is unchanged. These are source ancestry findings,
+not historical binary/camera reproduction. The original physical-camera cause
+and native pinch drift remain open; this product decoder reproduction does not
+establish the original camera's captured pixels.
+
+The retained RED run read an expired direct-link fixture from actual canvas
+pixels: exact decode=true and blank-frame=true, but exception propagation=false.
+The new flow instead uses a fresh real-server offer and the unchanged
+desktop SVG producer (now shared through `mobile-pairing`), browser SVG raster
+and actual bundled decoder, the native loader recognizer, and its real Scan
+button/offer continuation through Pair confirmation and authenticated connection.
+A canvas-backed MediaStream supplies input above the camera boundary; there is
+no claim of mounted desktop UI, physical capture, permissions or UIKit. A separate
+harness stall was observed as a live track and `play` event with zero dimensions,
+no metadata/data event and no decoder call: the detached canvas had only painted
+before capture started. The source now paints and explicitly requests its frame
+on the real video `play` event, with manual capture rather than a periodic timer.
+This changes only the owned test video producer, not scanner lifecycle. QR SVG,
+pixels and text stay in the private driver pipe/browser; receipts contain only
+booleans. Failure screenshots also hide the scanner video.
+The error correction preserves genuine no-QR frames, waits for current video
+data, stops capture on frame/decode failure, and renders a content-free alert.
+It leaves canonical offer continuation, camera constraints and permission
+requests, Paste, native host code and zoom/geometry unchanged. No native binary
+change is required for this origin-loader correction; no publication is made.
+The smaller DOM flow replaces the old in-process decoder-only assertions.
+
+The rendered-pixel qualification uses an isolated real desktop DOM fixture with
+the production stylesheet and QR producer, then decodes the element's screenshot
+pixels at its actual rendered size after the finite overlay animation completes.
+Content-free receipts retain decode stage, dimensions, contrast and recognition
+booleans on failure as well as success. PNG bytes remain in memory/private browser
+arguments, never an artifact or log. This is not the mounted Settings component
+or a camera image. Direct continuation uses the existing real-server flow;
+the managed offer is exercised separately through the same pixel/Scan boundary,
+then the actual Service redemption and unchanged auth/revocation handoff. The
+private handoff retains `qr_uri`/`release`/`phase`, adds producer `qr_svg` for the
+initial managed offer, and preserves `managed-saved` pairing/device bindings,
+`{reload, verifyRevoked, context}` and the final managed-revocation handshake.
+Other managed phases retain Paste coverage. These are qualified only when the
+canonical run is supplied its owned local Service fixture, never inferred from
+the direct offer.
+
+The Chromium pinch qualifier did not qualify: six completed CDP input commands
+left `visualViewport.scale` at 1 in every sample. Those commands are not counted
+as actual gestures, and their capability assertion is removed from the product
+gate rather than treated as a scanner regression or made green by setting scale.
+The real DOM measurement remains: viewport/loader 844px, empty app root 844px,
+document 1688px. That extra extent is an observation, not established native
+drift causality; no geometry or accessibility-zoom change is made. The failed
+qualifier is retained in external content-free evidence.
+
+The existing WebKit composer/onboarding fixture is the minimal available
+loopback route, but no camera-capability assertions are added to that automated
+frontend suite: checking fixture globals would not guard user-visible scanner
+behavior. No WebKit camera observation, Safari, UIKit or physical capture is
+claimed. The native document packet remains paused at the clipboard boundary.
+
+The collateral watcher gate failed in the root-disappearance flow with a Git
+`ls-files` error. The stream actor already reports availability changes without
+CommandError; its error branch means the root was still classified watchable.
+Recursive deletion can remove `.git` before that root disappears, so the harness
+was injecting repository corruption while asserting only root absence. The
+corrected harness atomically renames the root at the same scan hook. It retains
+the exact unavailable-root assertions and still rejects every CommandError.
+Watcher diagnostics record only root-directory and root `.git` entry presence
+on inventory failure;
+no error is swallowed and no actor/connection ownership is changed.
+A subsequent recovery test saw version `0 -> 1` after a recorded catch-up rescan.
+The returned integrated QR candidate hit the ten-minute watchdog in
+`project_watcher_prunes_ignored_build_trees`, after its last successful source
+write and before the queued-create race produced another listing. The retained
+trace does not distinguish the following listing-hold and child-event-hold waits.
+The child hold nevertheless assumes that native events retain paths through
+coalescing; `Command::Rescan` does not. The same test deliberately creates native
+queue loss. Its listing race now uses a fresh existing server fixture, isolated
+from that overflow storm, and holds the watcher after acknowledging a protocol
+file observation. Observation does not schedule a listing refresh. A reviewed
+intermediate source-write barrier was rejected because releasing that unrelated
+write after deletion could mask broken child-removal handling.
+The independent listing trigger is now an actual directory creation, observed
+processed before the non-refreshing hold. Barrier reads use a separate existing
+protocol client so they cannot consume the original client's removal listing.
+
+The real listing must include the unclassified child and settle before deletion.
+The test then waits for the actual native removal to enter the worker queue,
+releases the non-refreshing barrier, and completes another protocol observation
+behind that removal. After the actor's file refresh settles, a second real
+connection must receive a cached bootstrap without the child, and the original
+connection must receive the removal listing. Cached replay does not rescan the
+filesystem; it makes broken removal handling fail on stale visible state instead
+of waiting for the watchdog. Content-free logs identify each hold/wait. The
+unavailable-root contract, production event classification and watchdog remain
+unchanged. The original timeout alone does not prove which wait stalled or that
+QR changes caused a production watcher defect.
+
+The controlled regression run removed only the existing uninventoried-removal
+branch. The isolated race reached every hold, listed the child, settled, queued
+its actual native removal, and then failed on stale cached bootstrap state in
+28.517s:595 other native tests passed, with no timeout. Native create, modify and
+remove classification each reported zero relevant paths for that missing child.
+Canonical removal handling is restored in the final candidate; neither the
+original disappearance assertions nor the watchdog was weakened.
+
+A subsequent run passed the watcher but failed the driver's compound
+late-publisher cancellation assertion. Its old artifact cannot identify which
+predicate failed; a visibility-only run recorded all five predicates true and
+is not treated as a causal repair. Independently, the publisher hold introduced
+with `5eb3af98`/`v0.9.6-beta.25` matched every non-publication manifest read, not
+the pairing operation. A controlled real HTTP read consumed that hold, with
+`held_pairing=false`, and deterministically failed before cancellation while
+595 other native tests passed. This is a confirmed fixture defect, not exclusive
+attribution of the earlier compound failure.
+
+The existing driver now marks the actual unminified `preparePairing` caller at
+its manifest fetch; only that test-marked request can consume this scoped hold.
+The caller stack is inspected in memory and never retained. An unrelated real
+publisher read must finish without consuming the hold. Cancel must then be
+acknowledged by the existing reload/admission owner before the held response is
+released; the original cancelled outcome, document, draft, redemption and pending
+URI assertions all remain. Markers, wrappers and content-free receipts exist
+only in this fixture, are removed after the phase, and add no shipped telemetry
+or native host change. The actual600s watcher wait and6c's underlying agent hang
+remain unconfirmed; neither is explained by this separate HTTP fixture defect.
+
+Versions identify invalidation generations, not content hashes: the watcher
+explicitly invalidates every observed file after lost events. Its unchanged-read
+assertion now compares two reads after the corrupt-index watcher stops, retaining
+exact content and version equality without pinning the earlier watch generation.
+
+Root routes this packet only to AirGUI operator6c's **unpaired spare**, never
+the preserved paired A66. Use the existing owned native/inspector route; no
+XCTest, host GUI automation, alternate evaluator, reset or release is authorized.
+If that route cannot evaluate the existing document, report that limitation;
+do not substitute Safari/PWA or an injected camera.
+
+Baseline source is `563a7bbebf3360a1af7cfa7e71b93710ceb5510f`, in workbench
+`227488e9-7fa2-4dbb-9280-dc12d9332e5b`, branch
+`fix/native-qr-scanner-interaction-20261104`. The ready-to-paste single console
+expression is `tools/observe-native-scanner.js`, probe
+`thin-scanner-observation-v2`, SHA-256
+`a044d876703d00ba282f3dbdf10e2d7b52dca11e652d612d834a54a0dd7c5f4a`.
+It admits only the production native entry or E266's exact existing
+`qa-thin-nativebf-fc10ed.tycode.dev` native entry, labels that distinction in
+every result, and checks the fetched loader/CSS/decoder hashes against its
+embedded baseline before becoming ready.
+Those network hashes identify fetched source, not proof of previously executed
+cached bytes. Preserve the existing route's load/source receipt alongside them.
+
+1. Record the installed build and the spare's actual window/orientation in the
+   existing episode receipt. E266 is QA-origin simulator evidence, not TF4
+   production/physical-camera acceptance. Its original Allow → moving test
+   pattern baseline has zero QR/pair attempts and zero pinch gestures; the
+   retained helper lacks two-contact input and the exact-device SDK capture
+   failed before input, then closed. Do not count six samples without six
+   actual gestures as pinch evidence. Open its normal initial Scan QR camera; keep
+   one Root-authorized current host QR in view. Preserve the original screenshot
+   for Root, without copying/exporting the QR, clipboard, page text or storage.
+2. Evaluate the entire file once in that actual native document. The sole
+   success result starts `thin-scanner-observation-v2 ready (e266_qa)` or
+   `thin-scanner-observation-v2 ready (production)`. Any error is STOP,
+   not permission to change page state or retry using a different route.
+3. Evaluate `window.tydeScannerObservation.sample(0)` before gestures. After
+   each of six real pinch-and-release gestures, preserve the original screenshot
+   and evaluate `.sample(1)` through `.sample(6)` respectively. Each evaluation
+   returns one JSON string. There are no timers, input injection, zoom resets,
+   lifecycle nudges, native overrides, camera replacement or retained pixels.
+4. If normal recognition advances the page, stop sampling and preserve that
+   original transition/error screenshot instead. Continue only through the
+   normal canonical pairing route under Root's episode authorization. Root
+   personally inspects original UI screenshots; JSON is not UI signoff.
+
+The probe reads one current real video frame per sample, calls the bundled
+decoder without altering the production scan, and discards pixels/payload. Its
+only output is bounded numeric geometry/readiness, booleans and fixed failure
+stages. It rejects nonnumeric, out-of-order, extra or eighth arguments/samples.
+**Never pass a raw QR/link as an argument, return its text, export camera pixels
+or include any credential in the handoff.** Return only the seven JSON strings,
+original screenshot custody references and Root's UI verdict. A simulator/no
+camera result cannot establish physical recognition. JS viewport/document
+geometry is not UIKit contentOffset/zoomScale; obtain those only if the existing
+route already exposes them, and otherwise state the gap explicitly.
+
 Native Swarm shared images use the existing in-document typed image viewer,
 including Close/focus restoration and modal navigation exclusion. Browser/PWA
 image anchors remain unchanged. No data-URL document-navigation exception is

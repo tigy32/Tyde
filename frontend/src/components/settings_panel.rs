@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use mobile_pairing::render_pairing_qr_svg;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
@@ -42,49 +43,6 @@ use protocol::{clear_invalid_dependent_select_values, options_including_current}
 const STORAGE_DEFAULT_SEND_ACTION: &str = "tyde-default-send-action";
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
-
-/// Mirror of the server's `is_loopback_url` host check: `localhost` (case
-/// insensitive) or any IP literal whose address is a loopback address (covers
-/// `127.0.0.0/8` and `::1`).
-/// Render the pairing `qr_uri` as an inline SVG QR code. Returns an
-/// SVG string that callers splat into the DOM via `inner_html`.
-/// Uses `qrcodegen` (pure Rust, no transitive deps) with Medium ECC —
-/// the QR fits comfortably on the user's monitor and the pairing
-/// session has a short TTL so degraded scan ergonomics matter less
-/// than keeping the QR small. Returns `None` if the input exceeds
-/// QR-version-40 capacity (~2953 bytes), which would indicate a
-/// malformed `qr_uri` from the server rather than a legitimate
-/// pairing payload.
-fn render_pairing_qr_svg(qr_uri: &str) -> Option<String> {
-    let qr = qrcodegen::QrCode::encode_text(qr_uri, qrcodegen::QrCodeEcc::Medium).ok()?;
-    // `qrcodegen` ships the module bitmap but no SVG writer (their
-    // demo crate provides one). Implement a tiny SVG emitter inline.
-    // border=2 keeps the quiet zone the spec requires. Fill/stroke
-    // are CSS-overridable via `.settings-mobile-pairing-qr rect`.
-    let border: i32 = 2;
-    let size = qr.size();
-    let dim = size + border * 2;
-    use std::fmt::Write;
-    let mut out = String::with_capacity((size * size) as usize * 32);
-    let _ = write!(
-        out,
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {dim} {dim}" stroke="none" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#ffffff"/>"##,
-    );
-    for y in 0..size {
-        for x in 0..size {
-            if qr.get_module(x, y) {
-                let _ = write!(
-                    out,
-                    r##"<rect x="{}" y="{}" width="1" height="1" fill="#000000"/>"##,
-                    x + border,
-                    y + border,
-                );
-            }
-        }
-    }
-    out.push_str("</svg>");
-    Some(out)
-}
 
 /// Compute how many seconds remain until `expires_at_ms` (millis since
 /// epoch). Returns `None` if the host clock can't be read. Saturating
@@ -14369,6 +14327,10 @@ mod wasm_tests {
     async fn mobile_tab_active_offer_renders_qr_fallback_and_cancel() {
         let calls = install_settings_send_stub();
         let container = make_container();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        container.append_child(&style).unwrap();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             install_mobile_host_settings(&state, true);
@@ -14395,6 +14357,14 @@ mod wasm_tests {
             .query_selector("svg")
             .unwrap()
             .expect("QR container must contain an inline <svg> element");
+        // Match the screenshot boundary's desktop geometry in the real Settings
+        // component; the live-server flow separately supplies the actual QR data.
+        let box_rect = qr_container.get_bounding_client_rect();
+        let svg_rect = qr_svg.get_bounding_client_rect();
+        assert_eq!(box_rect.width(), 256.0);
+        assert_eq!(box_rect.height(), 256.0);
+        assert_eq!(svg_rect.width(), 238.0);
+        assert_eq!(svg_rect.height(), 238.0);
         // The SVG must contain real QR module rects — otherwise we
         // could ship an empty <svg/> and still satisfy the "is the
         // element present" check. Each dark module renders as a

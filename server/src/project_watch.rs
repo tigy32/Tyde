@@ -50,6 +50,12 @@ impl EventSink {
                         path,
                         crate::project_stream::scan_test_support::ScanPoint::WatcherQueued,
                     );
+                    if matches!(event.kind, EventKind::Remove(_)) {
+                        crate::project_stream::scan_test_support::run(
+                            path,
+                            crate::project_stream::scan_test_support::ScanPoint::WatcherRemovalQueued,
+                        );
+                    }
                 }
             }
             false
@@ -510,6 +516,11 @@ impl ProjectWatcher {
                                 .map_err(notify::Error::io)
                                 .and_then(|root| state.observe(root.join(path.relative_path)));
                             let _ = reply.send(result);
+                            #[cfg(feature = "test-support")]
+                            crate::project_stream::scan_test_support::run(
+                                Path::new(&path.root.0),
+                                crate::project_stream::scan_test_support::ScanPoint::WatcherObservationComplete,
+                            );
                             continue;
                         }
                         Command::ViewDirectories(paths, queries, cancel, reply) => {
@@ -769,7 +780,14 @@ impl WatchState {
                     &["ls-files", "-z", "--cached"],
                     GitAccessMode::ReadOnly,
                 )
-                .map_err(watch_error)?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        root_directory_present = root.is_dir(),
+                        root_git_entry_present = root.join(".git").exists(),
+                        "project tracked-file inventory failed after repository detection"
+                    );
+                    watch_error(error)
+                })?;
                 for relative in tracked.split('\0').filter(|path| !path.is_empty()) {
                     let path = root.join(relative);
                     let parents: Vec<_> = path

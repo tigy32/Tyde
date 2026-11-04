@@ -1123,20 +1123,20 @@ export function isPairingScanValue(value) {
 }
 
 // Runs the bundled jsQR decoder over an ImageData and returns the decoded QR
-// string, or null when no QR is found. Pure (no DOM/camera) so the fallback
-// decode path is unit-testable with a fixture ImageData. `jsqr` is normally the
-// global the vendor <script> installs; it is injectable for tests.
+// string, or null when no QR is found. Decoder failures are not empty frames.
+// `jsqr` normally comes from the bundled vendor script.
 export function decodeQrImageData(imageData, jsqr) {
   const decoder =
     jsqr || (typeof globalThis !== "undefined" ? globalThis.jsQR : undefined);
-  if (typeof decoder !== "function" || !imageData) return null;
+  if (typeof decoder !== "function") throw new Error("QR decoder is unavailable");
+  if (!imageData) throw new Error("QR frame is unavailable");
   let result;
   try {
     result = decoder(imageData.data, imageData.width, imageData.height, {
       inversionAttempts: "attemptBoth",
     });
   } catch {
-    return null;
+    throw new Error("QR decoding failed");
   }
   return result && typeof result.data === "string" ? result.data : null;
 }
@@ -1163,12 +1163,22 @@ function grabVideoFrame() {
   scanCanvas.width = video.videoWidth;
   scanCanvas.height = video.videoHeight;
   const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) return null;
+  if (!ctx) throw new Error("QR canvas is unavailable");
   ctx.drawImage(video, 0, 0, scanCanvas.width, scanCanvas.height);
   return ctx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
 }
 
 async function startScan(manifest, nativeOffer = null) {
+  const fail = message => {
+    if (ui.scanStatus) {
+      ui.scanStatus.setAttribute("role", "alert");
+      ui.scanStatus.textContent = message;
+    }
+  };
+  if (ui.scanStatus) {
+    ui.scanStatus.removeAttribute("role");
+    ui.scanStatus.textContent = "";
+  }
   const hasCamera =
     navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function";
   if (!hasCamera) {
@@ -1181,6 +1191,19 @@ async function startScan(manifest, nativeOffer = null) {
 
   // Decode strategy: native BarcodeDetector if present, else the jsQR fallback.
   const hasDetector = "BarcodeDetector" in window;
+  let detector = null;
+  if (hasDetector && !nativeOffer) {
+    try {
+      // eslint-disable-next-line no-undef
+      detector = new BarcodeDetector({ formats: ["qr_code"] });
+    } catch {
+      detector = null;
+    }
+  }
+  if (!detector && typeof globalThis.jsQR !== "function") {
+    fail("The QR decoder is unavailable. Try again, or paste the pairing link.");
+    return;
+  }
 
   try {
     scanStream = await navigator.mediaDevices.getUserMedia({
@@ -1190,16 +1213,6 @@ async function startScan(manifest, nativeOffer = null) {
     ui.video.hidden = false;
     await ui.video.play();
 
-    let detector = null;
-    if (hasDetector && !nativeOffer) {
-      try {
-        // eslint-disable-next-line no-undef
-        detector = new BarcodeDetector({ formats: ["qr_code"] });
-      } catch {
-        detector = null; // unsupported format set, etc. → use jsQR.
-      }
-    }
-
     const onDecoded = async (value) => {
       stopScan();
       if (nativeOffer) await nativeOffer(value);
@@ -1208,24 +1221,28 @@ async function startScan(manifest, nativeOffer = null) {
 
     const tick = async () => {
       if (!scanStream) return;
+      let value = null;
       try {
+        if (ui.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          scanRaf = requestAnimationFrame(tick);
+          return;
+        }
         if (detector) {
           const codes = await detector.detect(ui.video);
           const hit = codes.find((c) => isPairingScanValue(c.rawValue));
-          if (hit) {
-            await onDecoded(hit.rawValue);
-            return;
-          }
+          value = hit ? hit.rawValue : null;
         } else {
           const frame = grabVideoFrame();
-          const value = frame ? decodeQrImageData(frame) : null;
-          if (isPairingScanValue(value)) {
-            await onDecoded(value);
-            return;
-          }
+          value = frame ? decodeQrImageData(frame) : null;
         }
       } catch {
-        // Transient detect/draw failures are ignored; keep scanning.
+        stopScan();
+        fail("QR scanning failed. Try again, or paste the pairing link.");
+        return;
+      }
+      if (isPairingScanValue(value)) {
+        await onDecoded(value);
+        return;
       }
       scanRaf = requestAnimationFrame(tick);
     };

@@ -1750,15 +1750,19 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
             == protocol::MobileAccessErrorCode::NativeAbiIncompatible,
         "refusal must distinguish app ABI from host baseline"
     );
+    let qr_svg =
+        mobile_pairing::render_pairing_qr_svg(&qr_uri.0).expect("desktop pairing QR producer");
     send(
         &mut input,
-        serde_json::json!({"qr_uri":qr_uri,"release":baseline.release,"address":baseline.address}),
+        serde_json::json!({"qr_uri":qr_uri,"qr_svg":qr_svg,"release":baseline.release,"address":baseline.address}),
     )
     .await;
     event(&mut output, "paired").await;
     let managed_pairing = if let Some(service) = &mut service {
         let qr_uri = baseline.managed_offer().await;
-        send(&mut input,serde_json::json!({"event":"managed-offer","qr_uri":qr_uri,"release":baseline.release,"phase":"before"})).await;
+        let qr_svg = mobile_pairing::render_pairing_qr_svg(&qr_uri.0)
+            .expect("desktop managed pairing QR producer");
+        send(&mut input,serde_json::json!({"event":"managed-offer","qr_uri":qr_uri,"qr_svg":qr_svg,"release":baseline.release,"phase":"before"})).await;
         let saved = event(&mut output, "managed-saved").await;
         let pairing = saved["pairing_id"]
             .as_str()

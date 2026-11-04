@@ -6,8 +6,8 @@
  * Licensed under the Apache License, Version 2.0.
  *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Vendored verbatim into the Tyde web loader so the in-app QR scanner works on
- * browsers without a native BarcodeDetector (notably iOS Safari). It is plain,
+ * Vendored into Tyde with version-metadata extraction refinement for browsers
+ * without a native BarcodeDetector (notably iOS Safari). It is plain,
  * same-origin JS (no eval, no runtime network) so it runs under the loader's
  * strict CSP (script-src 'self'). UMD: as a classic <script> it assigns the
  * global `jsQR`.
@@ -350,6 +350,16 @@ function scan(matrix) {
     for (var _i = 0, locations_1 = locations; _i < locations_1.length; _i++) {
         var location_1 = locations_1[_i];
         var extracted = extractor_1.extract(matrix, location_1);
+        // Pixel-quantized finder widths can estimate 79 modules for a 77-module
+        // code. Use its BCH-protected version before decoding any payload.
+        var version = decoder_1.readVersion(extracted.matrix);
+        if (version && version.versionNumber >= 7) {
+            var dimension = 17 + 4 * version.versionNumber;
+            if (dimension !== location_1.dimension) {
+                location_1.dimension = dimension;
+                extracted = extractor_1.extract(matrix, location_1);
+            }
+        }
         var decoded = decoder_1.decode(extracted.matrix);
         if (decoded) {
             return {
@@ -685,6 +695,7 @@ function readVersion(matrix) {
         return bestVersion;
     }
 }
+exports.readVersion = readVersion;
 function readFormatInformation(matrix) {
     var topLeftFormatInfoBits = 0;
     for (var x = 0; x <= 8; x++) {

@@ -37,11 +37,12 @@ test("installed storage migrates once, then follows exact targets without losing
   const generated = JSON.parse(await readFile(manifestPath,"utf8"));
   assert.equal(generated.versions[old].followsSelectedHost,undefined,"historical artifact gains no capability during backfill");
   assert.equal(generated.versions[capable].followsSelectedHost,1);
-  let published = false, legacy = true, offline = false, tamper = false, blocked = false;
+  let published = false, legacy = true, offline = false, tamper = false, blocked = false, scannerOnly = false;
   let servedClient = null, directPolicy = {}, directEntry = {};
   let manifestRequests = 0;
   const manifest = () => {
     const value = structuredClone(generated);
+    if (scannerOnly) { value.versions = {}; return value; }
     value.blocked = blocked ? [old] : [];
     if (!published) delete value.versions[capable].followsSelectedHost;
     if (servedClient !== null) {
@@ -294,6 +295,78 @@ test("installed storage migrates once, then follows exact targets without losing
       await assert.rejects(promisify(execFile)("python3",args),error => error.stderr.includes("servedClientRelease"),"a direct startup declaration cannot be deployed to the shared origin");
       await writeFile(manifestPath,JSON.stringify({...manifest(),servedClientRelease:capable}));
       await assert.rejects(promisify(execFile)("python3",[...args,"--direct-hosted"]),error => error.stderr.includes("servedClientRelease"),"the release guard must reject an incorrect startup declaration");
+    });
+    await t.test("thin scanner preserves blank video frames and renders decode failures without a camera", async () => {
+      scannerOnly = true;
+      const scanner = await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
+      try {
+        scanner.setDefaultTimeout(0);
+        await scanner.goto(origin + '/tyde/');
+        await scanner.locator('#view-pair').waitFor({state:'visible'});
+        const geometry = await scanner.evaluate(() => ({
+          viewportHeight: innerHeight, documentHeight: document.documentElement.scrollHeight,
+          loaderHeight: document.getElementById('loader-shell').getBoundingClientRect().height,
+          emptyAppHeight: document.getElementById('app-root').getBoundingClientRect().height,
+        }));
+        assert.ok(process.env.TYDE_NATIVE_CURRENT_CLIENT,'the canonical check must own scanner evidence');
+        const evidence = join(process.env.TYDE_NATIVE_CURRENT_CLIENT,'..','scanner-evidence');
+        await mkdir(evidence,{recursive:true});
+        const failure = await scanner.evaluate(() => new Promise(resolve => {
+          // A real DOM MediaStream exercises the consumer, not camera capture or permission.
+          const canvas = document.createElement('canvas');
+          canvas.width = canvas.height = 80;
+          document.body.append(canvas);
+          canvas.getContext('2d').fillRect(0,0,80,80);
+          const stream = canvas.captureStream(0);
+          const track = stream.getVideoTracks()[0];
+          if (typeof track.requestFrame !== 'function') throw Error('Explicit canvas frame capture is unavailable');
+          document.getElementById('scan-video').addEventListener('play', () => {
+            canvas.getContext('2d').fillRect(0,0,80,80);
+            track.requestFrame();
+          }, {once:true});
+          const originalRequest = navigator.mediaDevices.getUserMedia;
+          const originalDecoder = window.jsQR;
+          delete window.BarcodeDetector;
+          navigator.mediaDevices.getUserMedia = async () => stream;
+          let blank;
+          window.jsQR = (...args) => {
+            if (blank === undefined) {
+              const result = originalDecoder(...args);
+              blank = result === null;
+              return result;
+            }
+            queueMicrotask(() => {
+              const status = document.getElementById('scan-status');
+              const video = document.getElementById('scan-video');
+              const result = {blank,message:status.textContent,role:status.getAttribute('role'),
+                stopped:stream.getTracks().every(track=>track.readyState==='ended'),
+                detached:video.srcObject===null,hidden:video.hidden};
+              stream.getTracks().forEach(track=>track.stop());
+              navigator.mediaDevices.getUserMedia = originalRequest;
+              window.jsQR = originalDecoder;
+              canvas.remove();resolve(result);
+            });
+            throw Error('private decoder detail');
+          };
+          document.getElementById('scan-button').click();
+        }));
+        assert.deepEqual(failure,{blank:true,message:'QR scanning failed. Try again, or paste the pairing link.',
+          role:'alert',stopped:true,detached:true,hidden:true},
+          'a running scanner must surface decode failure and release its real MediaStream');
+        await scanner.evaluate(() => { delete window.jsQR; });
+        await scanner.locator('#scan-button').click();
+        // Await the real button handler's settled state, not a camera permission prompt.
+        await scanner.waitForFunction(() => document.getElementById('scan-status').textContent.length > 0);
+        assert.equal(await scanner.locator('#scan-status').textContent(),
+          'The QR decoder is unavailable. Try again, or paste the pairing link.');
+        assert.equal(await scanner.locator('#scan-status').getAttribute('role'),'alert');
+        assert.equal(await scanner.locator('#scan-video').isVisible(),false);
+        assert.equal(await scanner.locator('#paste-input').isVisible(),true);
+        assert.equal(await scanner.locator('#connect-button').isEnabled(),true);
+        await writeFile(join(evidence,'isolated-dom-geometry.json'),JSON.stringify(geometry,null,2));
+        await scanner.screenshot({path:join(evidence,'decoder-unavailable.png')});
+        console.info('Scanner real-DOM evidence: '+evidence);
+      } finally { await scanner.close(); }
     });
   } finally {
     try {

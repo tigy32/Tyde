@@ -4291,6 +4291,8 @@ pub mod scan_test_support {
         WatcherReady,
         WatcherAdopted,
         WatcherQueued,
+        WatcherRemovalQueued,
+        WatcherObservationComplete,
         WatcherProcess,
         WatcherReconcile,
         WatcherProcessed,
