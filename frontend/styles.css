@@ -8823,6 +8823,20 @@ math merror {
     tab-size: 4;
 }
 
+.file-view-window-body {
+    display: flow-root;
+}
+
+.file-view-windowed {
+    position: sticky;
+    top: 0;
+    height: 0;
+}
+
+.file-view-windowed > .file-view-window-body {
+    position: relative;
+}
+
 .file-view-content code {
     font-family: var(--font-mono);
     color: var(--text-primary);

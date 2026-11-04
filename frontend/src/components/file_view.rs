@@ -68,10 +68,8 @@ fn code_intel_error_label(error: &CodeIntelErrorPayload) -> String {
 }
 
 /// Below this line count we render every line up-front — no spacers, no
-/// scroll math. This keeps the small-file path identical in DOM shape to
-/// the pre-virtualization implementation, so existing layout assertions
-/// (`renders_lines_single_spaced`) survive unchanged. Above this threshold
-/// we switch on viewport windowing.
+/// scroll math. Small files retain normal document scrolling; larger files
+/// publish a bounded viewport window.
 const VIRTUALIZE_THRESHOLD: usize = 200;
 
 /// Number of buffer lines to render outside the visible viewport on each
@@ -463,6 +461,8 @@ fn FileViewLoaded(
     });
 
     let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
+    let window_body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let windowed = total >= VIRTUALIZE_THRESHOLD;
 
     // ── Open-at-line (from project search) ─────────────────────────────
     // Resolve a pending goto for THIS file *synchronously*, before the virtual
@@ -508,6 +508,7 @@ fn FileViewLoaded(
     let scroll_top = RwSignal::new(initial_scroll_top);
     let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
     let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+    let decoration_height = RwSignal::new(0.0);
     // Set true once the real line height has been measured (drives the
     // one-shot consumption of a goto request — see below).
     let geometry_measured = RwSignal::new(false);
@@ -551,6 +552,9 @@ fn FileViewLoaded(
             return;
         }
         let Some(el) = pre_ref.get() else { return };
+        let Some(body) = window_body_ref.get() else {
+            return;
+        };
         el.set_scroll_top(scroll_top.get_untracked() as i32);
         geometry_observer.update_value(|slot| {
             if let Some((observer, _callback)) = slot.take() {
@@ -558,6 +562,7 @@ fn FileViewLoaded(
             }
         });
         let element: web_sys::Element = el.clone().unchecked_into();
+        let body_element: web_sys::Element = body.clone().unchecked_into();
         let measure_logged = measure_logged.clone();
         let perf_key_for_measure = perf_key_for_measure.clone();
         let measure = move || {
@@ -565,7 +570,7 @@ fn FileViewLoaded(
                 return;
             }
             let vh = el.client_height() as f64;
-            if vh > 0.0 {
+            if vh > 0.0 && viewport_height.get_untracked() != vh {
                 viewport_height.set(vh);
             }
             if let Ok(Some(line_el)) = el.query_selector(".file-line")
@@ -588,14 +593,32 @@ fn FileViewLoaded(
                     );
                 }
             }
+            if windowed {
+                match body.query_selector_all(":scope > .file-line") {
+                    Ok(rows) => {
+                        let extra = body.offset_height() as f64
+                            - rows.length() as f64 * line_height.get_untracked();
+                        if decoration_height.get_untracked() != extra {
+                            decoration_height.set(extra);
+                        }
+                    }
+                    Err(error) => crate::components::header::report_user_error(format!(
+                        "Could not measure file review decorations: {error:?}"
+                    )),
+                }
+            }
             // A resize can also clamp native scrollTop near the end of a file.
-            scroll_top.set(el.scroll_top() as f64);
+            let st = el.scroll_top() as f64;
+            if scroll_top.get_untracked() != st {
+                scroll_top.set(st);
+            }
         };
         measure();
         let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |_| measure());
         match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
             Ok(observer) => {
                 observer.observe(&element);
+                observer.observe(&body_element);
                 geometry_observer.set_value(Some((observer, callback)));
             }
             Err(error) => crate::components::header::report_user_error(format!(
@@ -849,9 +872,8 @@ fn FileViewLoaded(
     };
 
     // Visible window in line-index space. Small files
-    // render everything (start=0, end=total) so spacers
-    // stay at 0px and the pre-virtualization DOM shape
-    // is preserved. Larger files use the seeded
+    // render everything (start=0, end=total) in normal document flow.
+    // Larger files use the seeded
     // (then measured) line_height to bound the window
     // from the very first render.
     let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
@@ -1143,126 +1165,124 @@ fn FileViewLoaded(
                                 on:mousemove=on_content_mousemove
                                 on:mouseleave=on_content_mouseleave
                             >
-                                // Spacers are siblings of `<For>`, not inside the
-                                // same reactive closure — otherwise the outer
-                                // closure rerunning would tear down and recreate
-                                // the `<For>` itself, defeating keyed DOM
-                                // preservation.
-                                {move || {
-                                    let (start, _) = visible_window.get();
-                                    let h = start as f64 * line_height.get();
-                                    (h > 0.0).then(|| view! {
-                                        <div
-                                            class="file-view-spacer"
-                                            style=format!("height: {h}px;")
-                                        ></div>
-                                    })
-                                }}
-                                <For
-                                    each=move || {
-                                        let (s, e) = visible_window.get();
-                                        (s..e).collect::<Vec<usize>>()
-                                    }
-                                    key=|i| *i
-                                    let:i
-                                >
-                                    {
-                                        let text = lines_for_render.line(i).to_owned();
-                                        let highlighted_for_row = highlighted_for_render.clone();
-                                        let find_for_class = find_for_render.clone();
-                                        let row_root = review_root.clone();
-                                        let row_path = review_path.clone();
-                                        let pointer_root = row_root.clone();
-                                        let pointer_path = row_path.clone();
-                                        let pointer_target = review_target.clone();
-                                        let thread_target = review_target.clone();
-                                        view! {
-                                            <div
-                                                class=move || format!("{} diff-line", file_line_class_with_diagnostics(
-                                                    i, &find_for_class, decorations, flash_line,
-                                                ))
-                                                data-find-idx=i
-                                                data-anchor-new-line={(i + 1).to_string()}
-                                                data-anchor-old-line=""
-                                            >
-                                                <span
-                                                    class="file-line-num"
-                                                    data-line-num={(i + 1).to_string()}
-                                                    on:pointerdown={
-                                                        let row_root = pointer_root.clone();
-                                                        let row_path = pointer_path.clone();
-                                                        move |event: web_sys::PointerEvent| {
-                                                            event.prevent_default();
-                                                            let Some((host, review_id)) = draft.get_untracked() else {
-                                                                return;
-                                                            };
-                                                            let review = build_review_decorations(
-                                                                composer,
-                                                                drag_selection,
-                                                                review_id,
-                                                                host,
-                                                                is_draft,
-                                                                pointer_target.clone(),
-                                                            );
-                                                            (review.gutter_pointer_down)(
-                                                                row_root.clone(),
-                                                                row_path.clone(),
-                                                                protocol::ReviewDiffSide::New,
-                                                                i as u32 + 1,
-                                                            );
-                                                        }
-                                                    }
-                                                ></span>
-                                                {move || {
-                                                    // Reactive read: when a
-                                                    // chunk lands and updates
-                                                    // the signal, this closure
-                                                    // re-runs and the row
-                                                    // swaps from plain text to
-                                                    // colored spans. Diagnostic
-                                                    // squiggles overlay via the
-                                                    // same reactive read of the
-                                                    // decorations memo.
-                                                    let tokens = highlighted_for_row
-                                                        .with(|v| v.get(i).and_then(|t| t.clone()));
-                                                    let decos = decorations
-                                                        .with(|m| m.get(&i).cloned());
-                                                    render_file_line_content(
-                                                        text.clone(), tokens, decos,
-                                                    )
-                                                }}
-                                            </div>
-                                            {move || {
-                                                let (host, review_id) = draft.get()?;
-                                                let review = build_review_decorations(
-                                                    composer,
-                                                    drag_selection,
-                                                    review_id,
-                                                    host,
-                                                    is_draft,
-                                                    thread_target.clone(),
-                                                );
-                                                (review.decoration_below_line)(
-                                                    row_root.clone(),
-                                                    row_path.clone(),
-                                                    protocol::ReviewDiffSide::New,
-                                                    i as u32 + 1,
-                                                )
-                                            }}
+                                // Native scrolling may outrun the DOM publication. Keep the
+                                // last complete window pinned until its rows and offset commit.
+                                <div class="file-view-window" class:file-view-windowed=windowed>
+                                    <div
+                                        class="file-view-window-body"
+                                        node_ref=window_body_ref
+                                        style:top=move || {
+                                            if windowed {
+                                                let (start, _) = visible_window.get();
+                                                format!("{}px", start as f64 * line_height.get() - scroll_top.get())
+                                            } else {
+                                                "auto".to_owned()
+                                            }
                                         }
-                                    }
-                                </For>
-                                {move || {
-                                    let (_, end) = visible_window.get();
-                                    let h = total.saturating_sub(end) as f64
-                                        * line_height.get();
-                                    (h > 0.0).then(|| view! {
-                                        <div
-                                            class="file-view-spacer"
-                                            style=format!("height: {h}px;")
-                                        ></div>
-                                    })
-                                }}
+                                    >
+                                        <For
+                                            each=move || {
+                                                let (s, e) = visible_window.get();
+                                                (s..e).collect::<Vec<usize>>()
+                                            }
+                                            key=|i| *i
+                                            let:i
+                                        >
+                                            {
+                                                let text = lines_for_render.line(i).to_owned();
+                                                let highlighted_for_row = highlighted_for_render.clone();
+                                                let find_for_class = find_for_render.clone();
+                                                let row_root = review_root.clone();
+                                                let row_path = review_path.clone();
+                                                let pointer_root = row_root.clone();
+                                                let pointer_path = row_path.clone();
+                                                let pointer_target = review_target.clone();
+                                                let thread_target = review_target.clone();
+                                                view! {
+                                                    <div
+                                                        class=move || format!("{} diff-line", file_line_class_with_diagnostics(
+                                                            i, &find_for_class, decorations, flash_line,
+                                                        ))
+                                                        data-find-idx=i
+                                                        data-anchor-new-line={(i + 1).to_string()}
+                                                        data-anchor-old-line=""
+                                                    >
+                                                        <span
+                                                            class="file-line-num"
+                                                            data-line-num={(i + 1).to_string()}
+                                                            on:pointerdown={
+                                                                let row_root = pointer_root.clone();
+                                                                let row_path = pointer_path.clone();
+                                                                move |event: web_sys::PointerEvent| {
+                                                                    event.prevent_default();
+                                                                    let Some((host, review_id)) = draft.get_untracked() else {
+                                                                        return;
+                                                                    };
+                                                                    let review = build_review_decorations(
+                                                                        composer,
+                                                                        drag_selection,
+                                                                        review_id,
+                                                                        host,
+                                                                        is_draft,
+                                                                        pointer_target.clone(),
+                                                                    );
+                                                                    (review.gutter_pointer_down)(
+                                                                        row_root.clone(),
+                                                                        row_path.clone(),
+                                                                        protocol::ReviewDiffSide::New,
+                                                                        i as u32 + 1,
+                                                                    );
+                                                                }
+                                                            }
+                                                        ></span>
+                                                        {move || {
+                                                            // Reactive read: when a
+                                                            // chunk lands and updates
+                                                            // the signal, this closure
+                                                            // re-runs and the row
+                                                            // swaps from plain text to
+                                                            // colored spans. Diagnostic
+                                                            // squiggles overlay via the
+                                                            // same reactive read of the
+                                                            // decorations memo.
+                                                            let tokens = highlighted_for_row
+                                                                .with(|v| v.get(i).and_then(|t| t.clone()));
+                                                            let decos = decorations
+                                                                .with(|m| m.get(&i).cloned());
+                                                            render_file_line_content(
+                                                                text.clone(), tokens, decos,
+                                                            )
+                                                        }}
+                                                    </div>
+                                                    {move || {
+                                                        let (host, review_id) = draft.get()?;
+                                                        let review = build_review_decorations(
+                                                            composer,
+                                                            drag_selection,
+                                                            review_id,
+                                                            host,
+                                                            is_draft,
+                                                            thread_target.clone(),
+                                                        );
+                                                        (review.decoration_below_line)(
+                                                            row_root.clone(),
+                                                            row_path.clone(),
+                                                            protocol::ReviewDiffSide::New,
+                                                            i as u32 + 1,
+                                                        )
+                                                    }}
+                                                }
+                                            }
+                                        </For>
+                                    </div>
+                                </div>
+                                {windowed.then(|| view! {
+                                    <div
+                                        class="file-view-extent"
+                                        aria-hidden="true"
+                                        style:height=move || format!("{}px", total as f64 * line_height.get() + decoration_height.get())
+                                    ></div>
+                                })}
                             </pre> }.into_any())
                             }}
                             {move || {
@@ -2469,24 +2489,18 @@ mod wasm_tests {
     }
 
     fn line_rows(container: &HtmlElement) -> Vec<Element> {
-        // Query for rendered rows by structural pattern: the direct children of
-        // the file-content `<pre>`. Using a structural query (rather than a
-        // specific class on each row) keeps the test resilient to row-level
-        // class renames as long as one row per source line is rendered.
         let nodes = container
-            .query_selector_all(".file-view-content > *")
+            .query_selector_all(".file-view-content [data-find-idx]")
             .unwrap();
         (0..nodes.length())
             .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
             .collect()
     }
 
-    /// Count rendered line rows, ignoring virtualization spacers. Spacers
-    /// have the `file-view-spacer` class and are only present for files
-    /// large enough to engage windowing.
+    /// Count source rows without counting their publication container or extent.
     fn rendered_line_count(container: &HtmlElement) -> usize {
         container
-            .query_selector_all(".file-view-content > .file-line")
+            .query_selector_all(".file-view-content [data-find-idx]")
             .unwrap()
             .length() as usize
     }
@@ -3009,6 +3023,9 @@ mod wasm_tests {
         };
         let container = make_container();
         let mount_path = path.clone();
+        let captured = Rc::new(RefCell::new(None));
+        let captured_for_mount = captured.clone();
+        let total_lines = 500;
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let key = file_key(mount_path.clone());
@@ -3018,7 +3035,12 @@ mod wasm_tests {
                     OpenFile {
                         path: mount_path.clone(),
                         version: ProjectFileVersion(1),
-                        contents: Some("first\nsecond\nthird".to_owned()),
+                        contents: Some(
+                            (0..total_lines)
+                                .map(|line| format!("line {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
                         is_binary: false,
                         missing: false,
                     },
@@ -3059,11 +3081,9 @@ mod wasm_tests {
                             root: mount_path.root.clone(),
                             relative_path: mount_path.relative_path.clone(),
                             revision: "server-revision".to_owned(),
-                            lines: vec![
-                                "first".to_owned(),
-                                "second".to_owned(),
-                                "third".to_owned(),
-                            ],
+                            lines: (0..total_lines)
+                                .map(|line| format!("line {line}"))
+                                .collect(),
                         }],
                         comments: vec![protocol::ReviewComment {
                             id: protocol::ReviewCommentId("comment-file".to_owned()),
@@ -3098,6 +3118,7 @@ mod wasm_tests {
                     },
                 );
             });
+            *captured_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! { <FileView tab_id=TabId(20_099) key=key /> }
         });
@@ -3118,6 +3139,89 @@ mod wasm_tests {
                 .contains("comment on ordinary file"),
             "ordinary-file line range thread must render at its anchored line"
         );
+        animation_frame().await;
+        next_tick().await;
+        let pre = container
+            .query_selector(".file-view-content")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let thread = pre
+            .query_selector(".review-thread-region")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let first_height = thread.offset_height();
+        assert!(first_height > 0);
+        assert_eq!(pre.scroll_height(), total_lines * 20 + 24 + first_height);
+        let row_before = pre.query_selector("[data-find-idx='1']").unwrap().unwrap();
+        let row_after = pre.query_selector("[data-find-idx='2']").unwrap().unwrap();
+        assert_eq!(
+            thread.get_bounding_client_rect().top(),
+            row_before.get_bounding_client_rect().bottom()
+        );
+        assert_eq!(
+            row_after.get_bounding_client_rect().top(),
+            thread.get_bounding_client_rect().bottom()
+        );
+        assert_eq!(
+            row_after
+                .query_selector("code")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap(),
+            "line 2"
+        );
+
+        let state = captured.borrow().clone().unwrap();
+        state.reviews.update(|reviews| {
+            reviews
+                .get_mut(&protocol::ReviewId("review-file".to_owned()))
+                .unwrap()
+                .comments[0]
+                .body =
+                "comment on ordinary file\n\nA second paragraph.\n\nA third paragraph.".to_owned();
+        });
+        next_tick().await;
+        animation_frame().await;
+        next_tick().await;
+        let thread = pre
+            .query_selector(".review-thread-region")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert!(thread.offset_height() > first_height);
+        assert_eq!(
+            pre.scroll_height(),
+            total_lines * 20 + 24 + thread.offset_height()
+        );
+        let expanded_height = thread.offset_height();
+
+        pre.set_scroll_top(8000);
+        pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        animation_frame().await;
+        next_tick().await;
+        assert!(
+            pre.query_selector(".review-thread-region")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(pre.scroll_height(), total_lines * 20 + 24);
+        assert_populated_file_view(&pre, total_lines as usize);
+        pre.set_scroll_top(0);
+        pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        animation_frame().await;
+        next_tick().await;
+        assert_eq!(pre.scroll_height(), total_lines * 20 + 24 + expanded_height);
+        assert!(pre.text_content().unwrap().contains("A third paragraph."));
     }
 
     #[wasm_bindgen_test]
@@ -3875,6 +3979,26 @@ mod wasm_tests {
         wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
     }
 
+    fn file_publication(pre: &HtmlElement) -> Vec<(String, String, f64, f64)> {
+        let nodes = pre.query_selector_all("[data-find-idx]").unwrap();
+        (0..nodes.length())
+            .map(|index| {
+                let row = nodes.item(index).unwrap().dyn_into::<Element>().unwrap();
+                let rect = row.get_bounding_client_rect();
+                (
+                    row.get_attribute("data-find-idx").unwrap(),
+                    row.query_selector("code")
+                        .unwrap()
+                        .unwrap()
+                        .text_content()
+                        .unwrap(),
+                    rect.top(),
+                    rect.bottom(),
+                )
+            })
+            .collect()
+    }
+
     fn assert_populated_file_view(pre: &HtmlElement, total_lines: usize) {
         let rect = pre.get_bounding_client_rect();
         let nodes = pre.query_selector_all("[data-find-idx]").unwrap();
@@ -3975,7 +4099,7 @@ mod wasm_tests {
              out of {total_lines} total lines"
         );
 
-        // The two spacer divs preserve scrollbar geometry: the `<pre>`'s
+        // The native extent preserves scrollbar geometry: the `<pre>`'s
         // total scrollable height should be roughly total_lines * line_height.
         let pre = container
             .query_selector(".file-view-content")
@@ -3984,7 +4108,7 @@ mod wasm_tests {
             .dyn_into::<HtmlElement>()
             .unwrap();
         let row = container
-            .query_selector(".file-view-content > .file-line")
+            .query_selector(".file-view-content [data-find-idx]")
             .unwrap()
             .expect("at least one rendered line")
             .dyn_into::<HtmlElement>()
@@ -4003,7 +4127,14 @@ mod wasm_tests {
         );
         // Disjoint jumps must replace the rows, not leave a blank viewport.
         for target in [60_000, 4_000, 98_000, 24_000, 0, 50_000] {
+            let published = file_publication(&pre);
             pre.set_scroll_top(target);
+            // The compositor can move before the next scroll notification.
+            assert_eq!(
+                file_publication(&pre),
+                published,
+                "native scrolling discarded the last complete text publication"
+            );
             pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
                 .unwrap();
             next_tick().await;
@@ -4015,7 +4146,9 @@ mod wasm_tests {
         next_tick().await;
         assert_populated_file_view(&pre, total_lines);
         for target in [90_000, 0, 45_000] {
+            let published = file_publication(&pre);
             pre.set_scroll_top(target);
+            assert_eq!(file_publication(&pre), published);
             pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
                 .unwrap();
             next_tick().await;
@@ -4025,6 +4158,67 @@ mod wasm_tests {
         animation_frame().await;
         next_tick().await;
         assert_populated_file_view(&pre, total_lines);
+
+        // The retained integration failure selected plain Text while async
+        // highlighting was still replacing it with spans, even without scroll.
+        // Observe the final line's actual highlight instead of counting ticks.
+        pre.set_scroll_top(pre.scroll_height());
+        pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        let highlighted = js_sys::Function::new_with_args(
+            "pre",
+            r#"return new Promise(resolve => {
+                const ready = () => pre.querySelector("[data-find-idx='4999'] code span[style]");
+                const observer = new MutationObserver(() => {
+                    if (ready()) { observer.disconnect(); resolve(); }
+                });
+                observer.observe(pre, {childList: true, subtree: true});
+                if (ready()) { observer.disconnect(); resolve(); }
+            });"#,
+        )
+        .call1(&wasm_bindgen::JsValue::NULL, pre.as_ref())
+        .unwrap()
+        .dyn_into::<js_sys::Promise>()
+        .unwrap();
+        wasm_bindgen_futures::JsFuture::from(highlighted)
+            .await
+            .unwrap();
+        assert_populated_file_view(&pre, total_lines);
+        pre.set_scroll_top(45_000);
+        pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_populated_file_view(&pre, total_lines);
+
+        let code = pre
+            .query_selector("[data-find-idx='2251'] code")
+            .unwrap()
+            .unwrap();
+        // Syntax spans are valid output; Range offsets must address their Text node.
+        let mut text = code.first_child().unwrap();
+        while text.node_type() != web_sys::Node::TEXT_NODE {
+            text = text.first_child().unwrap();
+        }
+        assert!(text.text_content().unwrap().starts_with("line"));
+        let window = web_sys::window().unwrap();
+        let selection = window.get_selection().unwrap().unwrap();
+        let range = window.document().unwrap().create_range().unwrap();
+        range.set_start(&text, 0).unwrap();
+        range.set_end(&text, 4).unwrap();
+        selection.remove_all_ranges().unwrap();
+        selection.add_range(&range).unwrap();
+        assert_eq!(String::from(selection.to_string()), "line");
+        pre.set_scroll_top(pre.scroll_top() + 20);
+        pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(String::from(selection.to_string()), "line");
+        assert!(selection.anchor_node().unwrap().is_same_node(Some(&text)));
+        assert_eq!(selection.anchor_offset(), 0);
+        assert_eq!(selection.focus_offset(), 4);
+        assert_populated_file_view(&pre, total_lines);
+        selection.remove_all_ranges().unwrap();
     }
 
     /// The open-at-line path (from project search): a `pending_goto_line`
@@ -4170,7 +4364,7 @@ mod wasm_tests {
         // The diagnostic row's visible text is byte-for-byte the source line —
         // the overlay added spans but changed no characters.
         let rows = container
-            .query_selector_all(".file-view-content > .file-line")
+            .query_selector_all(".file-view-content [data-find-idx]")
             .unwrap();
         assert_eq!(rows.length(), 3, "expected one row per source line");
         let row1 = rows.item(1).unwrap();
@@ -4227,7 +4421,7 @@ mod wasm_tests {
         );
         assert_eq!(
             container
-                .query_selector_all(".file-view-content > .file-line")
+                .query_selector_all(".file-view-content [data-find-idx]")
                 .unwrap()
                 .item(1)
                 .unwrap()
@@ -4315,7 +4509,7 @@ mod wasm_tests {
 
         // The rendered window must contain the target line on first paint.
         let rows = container
-            .query_selector_all(".file-view-content > .file-line")
+            .query_selector_all(".file-view-content [data-find-idx]")
             .unwrap();
         let mut texts = Vec::new();
         for i in 0..rows.length() {
@@ -4343,7 +4537,7 @@ mod wasm_tests {
         // After geometry is measured the target line stays in view.
         next_tick().await;
         let rows_after = container
-            .query_selector_all(".file-view-content > .file-line")
+            .query_selector_all(".file-view-content [data-find-idx]")
             .unwrap();
         let mut still_present = false;
         for i in 0..rows_after.length() {
