@@ -58,6 +58,34 @@ owner must complete Apple's export-compliance assessment and any required
 documentation. Privacy/account declarations and Apple's processed build status
 remain distribution checks, not inferred source/test success.
 
+## Approved thin-shell preview build 4
+
+The user approved an updated private TestFlight preview and the
+`v0.9.6-beta.25` host/bootstrap rollout. This supersedes the bundled-client
+preview above, not its historical QA limitations. Release build 4 is tracked in
+`ios/Tyde.xcodeproj/project.pbxproj`; Debug remains build 1. The existing ASC app
+is Tyde Agent Studio (`6829602646`), bundle `dev.tycode.tyde`, team `743QY8VN34`.
+A read-only ASC API check on 2026-11-04 at 02:56:55 UTC returned only builds 2
+and 3, both VALID; build 4 was unallocated. Recheck before upload and stop if
+another upload has allocated it.
+
+The source baseline is beta25 commit `9e3a6cc0`, including the integrated
+thin-shell/ABI6 source landed in `5eb3af98`. The Lander must land this bookkeeping
+commit and pass the clean-main gate before distribution. Generate fresh
+production resources from that landed source with `./dev.sh ios-bundle`, without
+`--qa-origin`. The entry remains `https://tycode.dev/tyde/?native=1`; do not ship
+legacy bundled-client assets, a frozen QA bundle or a QA-origin app. The installed
+shell and authenticated host-selected full client retain independent release
+identities; build 4 does not pin future hosts to beta25.
+
+Archive the Tyde scheme's Release configuration with canonical marketing version
+0.9.6 and build 4, without archive/export/IPA version or build-number overrides.
+Export must preserve the reviewed identity. Source validation is not an accepted
+or signed archive: production bootstrap/client publication, signing/profile,
+archive resources and identity, export compliance, upload processing and actual
+TestFlight availability remain the distribution owner's checks. The Lander owns
+publication; the source owner does not archive, upload or deploy this change.
+
 ## Adaptive Agents hierarchy
 
 The approved Duo v4 composition keeps the Agents/project hierarchy on the left
