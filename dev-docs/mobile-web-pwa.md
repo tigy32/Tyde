@@ -766,3 +766,35 @@ Content-free hit/ancestor geometry diagnostics remain in the settings flow.
 No gesture CSS, production behavior, or physical-device evidence changed.
 Native text selection and image-specific zoom remain unverified by the physical
 fixture; selectable computed styles and page pinch are not substitutes for them.
+
+## Viewport reflow and transcript following (2026-11-04)
+
+The current AppSurface reproduced a scroll defect in Linux WebKit 26.5:
+starting at the end of the existing long-history fixture, actual browser
+viewport changes from 951x585 to 382x580, then through 669x867, 385x571,
+1194x834 and back to 382x580 left the thread 428, 387 and finally 677 CSS
+pixels above its end. Chromium 149 kept the end in the same flow. No page
+reload, visibility change, viewport API override or repaint was involved.
+
+Tyde disables the shared shell's optional follow-end behavior because Tyde
+owns history anchoring. Its content effect did not observe changes to the
+scroller's own box. A scoped ResizeObserver now preserves that owner's
+follow-end state across reflow, without taking over viewport sizing. History
+readers, new-chat setup and hidden native panes keep their existing guards;
+unmount disconnects the observer. The existing mounted AppSurface flow also
+resizes a pinned thread with Chrome's automatic overflow anchoring disabled,
+so a browser feature cannot conceal a missing application scroll owner.
+
+The content-only scroll effect predates the shared-shell migration; commit
+`01099962` introduced the explicit `followEnd: false` integration. This is
+path history, not proof of the first affected release. The original customer
+web loader version and nearly-blank Safari/PWA cause remain unestablished.
+Linux viewport dimensions are not native Duo poses, software-keyboard or
+Home Screen PWA evidence. The fixture's explicit missing-compatible-loader
+warning remains visible; the fixture does not certify backend or pairing.
+
+A separate Chromium compositor-scale diagnostic also retained the old shell
+size during a width change at scale 2. This follows the vendored runtime's
+documented pinch-zoom freeze contract, introduced in `01099962`; it was not
+changed or assigned as the customer's cause. Native Safari/PWA transitions
+and Root's visual acceptance remain separate requirements.

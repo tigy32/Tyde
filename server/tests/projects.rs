@@ -1934,10 +1934,13 @@ async fn unavailable_project_root_keeps_other_roots_live() {
 
     let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    // Catch-up rescans have no event path, but visit each root's process hook.
+    eprintln!("PROJECT WATCH RETIREMENT phase=hold_requested");
     let blocked = fixture.on_project_scan(
-        repo_b.path().join("app/retirement-trigger"),
-        server::ScanPoint::WatcherReconcile,
+        repo_b.path().to_path_buf(),
+        server::ScanPoint::WatcherProcess,
         move || {
+            eprintln!("PROJECT WATCH RETIREMENT phase=worker_held");
             let _ = blocked_tx.send(());
             release_rx.recv().expect("release retired watcher");
         },

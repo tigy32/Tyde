@@ -3850,8 +3850,28 @@ mod wasm_tests {
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
         render_shell(&frame).await;
         assert_bottom_gap(&dock, 8.0);
+        // Linux WebKit loses the transcript end during resize. Disable Chrome's
+        // automatic anchoring so this flow requires Tyde's scroll owner too.
+        scroller
+            .style()
+            .set_property("overflow-anchor", "none")
+            .unwrap();
         scroller.set_scroll_top(scroller.scroll_height());
         render_shell(&frame).await;
+        for (width, height) in [(951, 585), (382, 580), (669, 867), (385, 571), (393, 852)] {
+            frame
+                .set_attribute(
+                    "style",
+                    &format!("width:{width}px;height:{height}px;border:0"),
+                )
+                .unwrap();
+            render_shell(&frame).await;
+            assert!(
+                (scroller.scroll_height() - scroller.client_height() - scroller.scroll_top()).abs()
+                    <= 1,
+                "resizing a thread at its end must retain the latest message"
+            );
+        }
         let clearance =
             dock.get_bounding_client_rect().top() - transcript.get_bounding_client_rect().bottom();
         wasm_bindgen_test::console_log!("Transcript end clearance={clearance}");

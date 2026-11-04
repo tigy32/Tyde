@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use leptos::prelude::*;
+use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
@@ -692,6 +693,51 @@ pub fn ChatView() -> impl IntoView {
                     }));
             }
         }
+    });
+
+    // Reflowing the same thread does not invalidate its content signals.
+    let layout_state = state.clone();
+    Effect::new(move |_| {
+        let Some(scroller) = scroll_ref.get() else {
+            return;
+        };
+        let target = scroller.clone();
+        let state = layout_state.clone();
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            if user_scrolled_up.get_untracked()
+                || state.active_agent.get_untracked().is_none()
+                || (crate::native::is_native() && !crate::native::chat_visible(&state))
+            {
+                return;
+            }
+            log::debug!(
+                "chat viewport resized: scrollTop={} clientHeight={} scrollHeight={}",
+                target.scroll_top(),
+                target.client_height(),
+                target.scroll_height()
+            );
+            scroll_chat_to_bottom(&target);
+        });
+        let observer = match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => observer,
+            Err(error) => {
+                log::error!("Could not observe transcript viewport: {error:?}");
+                layout_state
+                    .mobile_shell_error
+                    .set(Some(crate::state::MobileShellError {
+                        code: protocol::MobileAccessErrorCode::Internal,
+                        message: "Could not observe transcript viewport".into(),
+                    }));
+                return;
+            }
+        };
+        observer.observe(&scroller);
+        let held = send_wrapper::SendWrapper::new((observer, callback));
+        on_cleanup(move || {
+            let (observer, callback) = held.take();
+            observer.disconnect();
+            drop(callback);
+        });
     });
 
     let scroll_ref_for_scroll = scroll_ref;
