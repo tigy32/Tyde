@@ -221,6 +221,55 @@ fn resize_probe_command() -> &'static str {
     "stty size\n"
 }
 
+#[cfg(target_os = "linux")]
+async fn connection_terminal_process(
+    client: &mut client::Connection,
+    cwd: &std::path::Path,
+) -> tokio::io::unix::AsyncFd<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let (created, _) = create_terminal(
+        client,
+        TerminalCreatePayload {
+            target: TerminalLaunchTarget::Path {
+                cwd: cwd.display().to_string(),
+            },
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await;
+    client
+        .terminal_send(
+            &created.terminal_id,
+            TerminalSendPayload {
+                data: concat!(
+                    r#"exec /bin/sh -c 'printf "\nrevocation-shell=%s\n" "$$"; exec /bin/cat'"#,
+                    "\r"
+                )
+                .into(),
+            },
+        )
+        .await
+        .unwrap();
+    let marker = regex::Regex::new(r"(?m)^revocation-shell=([0-9]+)\r?$").unwrap();
+    let mut output = String::new();
+    let pid = loop {
+        let event = expect_next_event(client, "connection-owned terminal ready").await;
+        assert_eq!(event.kind, FrameKind::TerminalOutput);
+        output.push_str(&event.parse_payload::<TerminalOutputPayload>().unwrap().data);
+        if let Some(captures) = marker.captures(&output) {
+            break captures[1].parse::<libc::pid_t>().unwrap();
+        }
+    };
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(
+        fd >= 0,
+        "owned terminal must have a process-completion descriptor"
+    );
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+    tokio::io::unix::AsyncFd::new(fd).unwrap()
+}
+
 #[tokio::test]
 async fn terminal_create_path_emits_start_and_streams_output() {
     let mut fixture = Fixture::new().await;
@@ -269,6 +318,52 @@ async fn terminal_create_path_emits_start_and_streams_output() {
     )
     .await;
     assert!(output.contains(&token));
+    // Mobile rejects terminal controls; shared connection cancellation is exercised
+    // through a desktop client that actually owns a terminal.
+    #[cfg(target_os = "linux")]
+    {
+        let (mut cancelled, task) = fixture.connect_cancellable().await;
+        let process = connection_terminal_process(&mut cancelled, cwd.path()).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        loop {
+            match cancelled.next_event().await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(protocol::FrameError::Io(_)) => break,
+                Err(_) => panic!("cancelled terminal connection ended with invalid protocol data"),
+            }
+        }
+        process.readable().await.unwrap().retain_ready();
+        let retained = format!("retained-terminal-{}", Uuid::new_v4());
+        fixture
+            .client
+            .terminal_send(
+                &new_terminal.terminal_id,
+                TerminalSendPayload {
+                    data: echo_command(&retained),
+                },
+            )
+            .await
+            .unwrap();
+        wait_for_output_containing(
+            &mut fixture.client,
+            &new_terminal.terminal_id,
+            &retained,
+            "unrelated terminal survives connection cancellation",
+        )
+        .await;
+    }
+    fixture
+        .client
+        .terminal_close(&new_terminal.terminal_id)
+        .await
+        .unwrap();
+    wait_for_terminal_exit(
+        &mut fixture.client,
+        &new_terminal.terminal_id,
+        "retained terminal explicitly closed",
+    )
+    .await;
 }
 
 #[tokio::test]

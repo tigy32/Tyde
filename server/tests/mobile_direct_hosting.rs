@@ -726,6 +726,69 @@ async fn direct_pairing_grants_a_working_protocol_connection() {
         grant.device_id
     );
 
+    phone
+        .heartbeat(protocol::HeartbeatPayload {
+            client_sent_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    fixture::next_frame_matching_on(
+        &mut phone,
+        "live phone immediately before revocation",
+        |event| {
+            event.kind == FrameKind::HeartbeatAck
+                && event
+                    .parse_payload::<protocol::HeartbeatPayload>()
+                    .is_ok_and(|heartbeat| heartbeat.client_sent_at_ms == 1)
+        },
+    )
+    .await;
+
+    std::fs::rename(&pairings_path, &preserved_path).unwrap();
+    std::fs::create_dir(&pairings_path).unwrap();
+    send_host_payload(
+        desktop,
+        FrameKind::MobileDeviceRevoke,
+        &protocol::MobileDeviceRevokePayload {
+            device_id: grant.device_id.clone(),
+        },
+    )
+    .await;
+    fixture::next_frame_matching_on(desktop, "revocation storage failure", |event| {
+        event.kind == FrameKind::CommandError
+    })
+    .await;
+    loop {
+        match phone.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(protocol::FrameError::Io(_)) => break,
+            Err(_) => panic!("revoked transport ended with invalid protocol data"),
+        }
+    }
+    assert!(
+        open_mobile_websocket(&base, &grant.device_token.0)
+            .await
+            .is_err(),
+        "failed persistence must not leave runtime access authorized"
+    );
+    std::fs::remove_dir(&pairings_path).unwrap();
+    std::fs::rename(&preserved_path, &pairings_path).unwrap();
+    send_host_payload(
+        desktop,
+        FrameKind::MobileDeviceRevoke,
+        &protocol::MobileDeviceRevokePayload {
+            device_id: grant.device_id.clone(),
+        },
+    )
+    .await;
+    fixture::next_frame_matching_on(desktop, "durable revocation retry", |event| {
+        event.kind == FrameKind::MobileAccessState
+            && event
+                .parse_payload::<MobileAccessStatePayload>()
+                .is_ok_and(|state| state.paired_devices.is_empty())
+    })
+    .await;
+
     let failed_disable = start_direct_pairing(desktop).await;
     let failed_disable_payload =
         DirectMobilePairingQrPayload::from_uri(pairing_uri_fragment(&failed_disable.qr_uri.0))
@@ -1708,7 +1771,15 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
         )
         .await;
         event(&mut output, "managed-verified").await;
-        Some(pairing)
+        Some((
+            pairing,
+            protocol::MobileDeviceId(
+                saved["device_id"]
+                    .as_str()
+                    .expect("private managed device binding")
+                    .to_owned(),
+            ),
+        ))
     } else {
         None
     };
@@ -1792,7 +1863,7 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
         },
     )
     .await;
-    if let (Some(service), Some(pairing)) = (&mut service, &managed_pairing) {
+    if let (Some(service), Some((pairing, _))) = (&mut service, &managed_pairing) {
         service.registered(pairing).await;
     }
     let (_, state) = fixture.connect_with_bootstrap().await;
@@ -2010,6 +2081,34 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
     .await;
     send(&mut input, serde_json::json!({"event":"revoked"})).await;
     event(&mut output, "revocation-verified").await;
+    if let Some((_, device_id)) = &managed_pairing {
+        fixture::send_host_payload(
+            &mut fixture.client,
+            FrameKind::MobileDeviceRevoke,
+            &protocol::MobileDeviceRevokePayload {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
+        fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "managed owner revocation committed",
+            |event| {
+                event.kind == FrameKind::MobileAccessState
+                    && event
+                        .parse_payload::<MobileAccessStatePayload>()
+                        .is_ok_and(|state| {
+                            state
+                                .paired_devices
+                                .iter()
+                                .all(|device| &device.device_id != device_id)
+                        })
+            },
+        )
+        .await;
+        send(&mut input, serde_json::json!({"event":"managed-revoked"})).await;
+        event(&mut output, "managed-revocation-verified").await;
+    }
     send(&mut input, serde_json::json!({"event":"finish"})).await;
     event(&mut output, "done").await;
     drop(input);
@@ -2039,4 +2138,170 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
         "Native shell/client process boundaries passed; proof directory={}",
         evidence.display()
     );
+}
+
+#[tokio::test]
+async fn managed_revocation_retains_credentials_until_authority_confirms() {
+    use axum::{Router, body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
+    use server::store::mobile_pairings::{
+        ManagedMobilePairingCredential, MobilePairingRecord, MobilePairings, MobilePairingsStore,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    type Receipt = oneshot::Sender<axum::response::Response>;
+    async fn revoke(
+        State(requests): State<mpsc::UnboundedSender<Receipt>>,
+        body: Bytes,
+    ) -> axum::response::Response {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["reason"],
+            "host_owner_removed_device"
+        );
+        let (reply, result) = oneshot::channel();
+        requests.send(reply).unwrap();
+        result.await.unwrap()
+    }
+    let (requests, mut incoming) = mpsc::unbounded_channel();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route(
+                    "/pairings/owned-pairing/revoke",
+                    axum::routing::post(revoke),
+                )
+                .with_state(requests),
+        )
+        .await
+        .unwrap();
+    });
+    let store = tempfile::tempdir().unwrap();
+    let records = ["owned", "retained"].map(|id| {
+        let psk = mobile_pairing::PreSharedKey::random();
+        let fingerprint = server::store::mobile_pairings::key_fingerprint(&psk);
+        MobilePairingRecord {
+            device_id: protocol::MobileDeviceId(id.into()),
+            psk,
+            label: id.into(),
+            created_at_ms: 1,
+            last_seen_at_ms: None,
+            state: protocol::MobileDeviceState::Paired,
+            key_fingerprint: fingerprint,
+            push: None,
+            managed: Some(ManagedMobilePairingCredential {
+                pairing_id: format!("{id}-pairing"),
+                host_pairing_secret: uuid::Uuid::new_v4().to_string(),
+            }),
+        }
+    });
+    let mut pairings = MobilePairings::empty();
+    pairings.devices = records.to_vec();
+    MobilePairingsStore::load(store.path().join("mobile_pairings.json"))
+        .unwrap()
+        .save(&pairings)
+        .unwrap();
+    let mut fixture = Fixture::new_at_existing_store_with_runtime_config(
+        store.path().to_owned(),
+        server::HostRuntimeConfig {
+            mobile_managed_service_base_url: Some(endpoint),
+            ..Default::default()
+        },
+    )
+    .await;
+    let payload = protocol::MobileDeviceRevokePayload {
+        device_id: records[0].device_id.clone(),
+    };
+    fixture::send_host_payload(&mut fixture.client, FrameKind::MobileDeviceRevoke, &payload).await;
+    // An old host deletes credentials without ever consulting the authority.
+    let request = tokio::select! {
+        request = incoming.recv() => request.expect("revocation request"),
+        _ = fixture::next_frame_matching_on(&mut fixture.client, "revocation before authority", |event| {
+            event.kind == FrameKind::CommandError || (event.kind == FrameKind::MobileAccessState &&
+                event.parse_payload::<MobileAccessStatePayload>().is_ok_and(|state| state.paired_devices.len() < 2))
+        }) => panic!("host completed revocation before consulting its authority"),
+    };
+    request.send((StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({"error":{
+        "code":"service_unavailable", "message":"Owned revocation transport unavailable", "retryable":true
+    }}))).into_response()).unwrap_or_else(|_| panic!("revocation HTTP caller dropped"));
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "explicit revocation failure",
+        |event| event.kind == FrameKind::CommandError,
+    )
+    .await;
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        state.mobile_access.paired_devices.len(),
+        2,
+        "failed revocation must retain retry authority"
+    );
+
+    fixture::send_host_payload(&mut fixture.client, FrameKind::MobileDeviceRevoke, &payload).await;
+    let request = incoming.recv().await.unwrap();
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        state.mobile_access.paired_devices.len(),
+        2,
+        "mobile actor must serve independent clients while authority is held"
+    );
+    let path = store.path().join("mobile_pairings.json");
+    let preserved = store.path().join("preserved-pairings.json");
+    std::fs::rename(&path, &preserved).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    request
+        .send(
+            axum::Json(serde_json::json!({"pairing_id":"owned-pairing","status":"revoked"}))
+                .into_response(),
+        )
+        .unwrap_or_else(|_| panic!("revocation HTTP caller dropped"));
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "confirmed revocation persistence error",
+        |event| event.kind == FrameKind::CommandError,
+    )
+    .await;
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert!(
+        state
+            .mobile_access
+            .paired_devices
+            .iter()
+            .any(|device| device.device_id == records[0].device_id
+                && device.state == protocol::MobileDeviceState::Revoked),
+        "confirmed authority must remain revoked while retaining its durable retry credential"
+    );
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&preserved, &path).unwrap();
+    fixture::send_host_payload(&mut fixture.client, FrameKind::MobileDeviceRevoke, &payload).await;
+    incoming
+        .recv()
+        .await
+        .unwrap()
+        .send(
+            axum::Json(serde_json::json!({
+                "pairing_id":"owned-pairing", "status":"revoked"
+            }))
+            .into_response(),
+        )
+        .unwrap_or_else(|_| panic!("durable retry HTTP caller dropped"));
+    fixture::next_frame_matching_on(&mut fixture.client, "confirmed managed removal", |event| {
+        event.kind == FrameKind::MobileAccessState
+            && event
+                .parse_payload::<MobileAccessStatePayload>()
+                .is_ok_and(|state| {
+                    state.paired_devices.len() == 1
+                        && state.paired_devices[0].device_id == records[1].device_id
+                })
+    })
+    .await;
+    let (_, state) = fixture.connect_with_bootstrap().await;
+    assert_eq!(state.mobile_access.paired_devices.len(), 1);
+    assert_eq!(
+        state.mobile_access.paired_devices[0].device_id,
+        records[1].device_id
+    );
+    http.abort();
+    let _ = http.await;
 }

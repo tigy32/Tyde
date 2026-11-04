@@ -137,3 +137,64 @@ The service suite exercises real HTTP boundaries for signaling isolation,
 role/session binding, expiration, disabled pairings and credential issuance.
 Cloudflare issuance in that suite uses a local HTTP fixture. Production DSQL,
 Cloudflare and a physical phone still need a smoke test after an approved rollout.
+
+## Owner revocation
+
+Removing a managed device must revoke its Service pairing with the host's signed
+`POST /pairings/{id}/revoke` before discarding the host credential. Local deletion
+alone stops the listener but leaves discovery, relay credentials and signaling
+active at the authority. A phone can then negotiate with an absent listener until
+its connection deadline instead of receiving `pairing_revoked`.
+
+The mobile actor keeps serving independent clients while the revocation HTTP
+operation runs. A failed revocation emits the existing command error and retains
+the credential needed to retry. A confirmed receipt must name the exact pairing
+and the revoked state. The actor revokes runtime access and closes its tasks
+before durable removal; a storage failure cannot preserve live access or let a
+late connection restore it. Its retained revoked record permits a durable retry.
+Direct pairings still use their host-owned token authority; they do not contact
+the managed Service. Other devices and ordinary network retry handling are
+unchanged. Native reconnect projects the Service's rejection through the existing
+repair-required state and Re-pair action; no new timeout or UI status is needed.
+
+### Historical scope
+
+Source ancestry places the missing managed revocation call in `97868ca7`
+(2026-07-07, managed Service integration), first included in tagged
+`v0.8.19-beta.19`. The WebRTC negotiation and 60-second attempt deadline arrived
+in `22cec0c8` (2026-09-12), first included in `v0.9.3-beta.10`. The host-matched
+native shell path arrived in `5eb3af98`, first tagged `v0.9.6-beta.25`.
+These are source/first-containing-tag findings, **not historical runtime proof**:
+no old released binary or original phone session has been reproduced by this
+investigation. The exact transport and build of the original report still need
+correlation with Root's native evidence.
+
+The managed branch of `native_shell_loads_exact_clients_with_retained_pairing`
+uses `TYDE_THIN_NATIVE_SERVICE` to exercise a separately owned local Service,
+real host commands, authenticated discovery and the source-built Wasm client
+under the frozen native bridge contract. It asserts the actual rejection and
+rendered repair action without a speed threshold; it does not establish Swift,
+Keychain, real OAuth, production Service or physical-phone behavior. The ordinary
+server flow also holds the revocation HTTP response to check independent-client
+responsiveness, explicit failure, retry-credential retention and scoped removal.
+
+The pre-fix run at Tyde source `563a7bbe` with local Service source
+`c9d701823b2fb6bfefb1adc0e3fb4f8dee7c2fdd` failed the real client regression:
+local owner removal completed, but the actual Service continued returning
+HTTP 200 for the removed pairing's bootstrap discovery. The fixture used an isolated in-memory Service and development-HMAC
+session, not Account or production credentials. Its RTC issuance was disabled,
+so this proves the missing revocation across the auth boundary, **not a measured
+60-second TURN negotiation or the original phone episode**.
+
+The active WebSocket storage-failure regression also exposed a connection-scope
+ownership leak: aborting the mobile bridge dropped plain `JoinHandle`s while
+its reader, writer and application tasks kept running. The caller now signals
+cancellation to a supervised connection scope rather than aborting its teardown.
+That scope stops and joins its owned tasks, closes output, and runs canonical
+host-stream unregistration, including project/review subscription removal and
+terminal closure. Mobile deliberately rejects terminal controls with
+`mobile_terminal_command`; the mobile regression retains that boundary and
+checks EOF after revocation with a failed store write. The terminal protocol
+flow cancels a desktop connection through the same supervisor, waits on a Linux
+process-exit descriptor, and proves another connection's terminal remains usable.
+These are actual completion events, with no sleeps or performance thresholds.

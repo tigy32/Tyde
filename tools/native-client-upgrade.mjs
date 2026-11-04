@@ -257,7 +257,7 @@ try {
     const probeContext=await browser.newContext({viewport:{width:466,height:678}});
     const probe=await probeContext.newPage();probe.setDefaultTimeout(0);probe.setDefaultNavigationTimeout(0);
     const keys=new Map();let secretScope=null, attempts=0, responses=0, publicRequest=null, includeSession=true;
-    const resolutions=[],httpReceipts=[];
+    const resolutions=[],httpReceipts=[];let nextDiscovery=null,discoveryStarted=0;
     await probeContext.exposeBinding('__nativePlatform',async({frame},endpoint,encoded)=>{
       if(frame!==probe.mainFrame())throw Error();const body=JSON.parse(encoded);
       if(endpoint==='begin_bootstrap'){secretScope=null;return null;}
@@ -272,6 +272,7 @@ try {
       if(closing)throw Error('Owned native document closed');
       const url=new URL(body.url);if(url.origin!=='https://tycode.dev'||!url.pathname.startsWith('/api/tyde/mobile/v1/'))throw Error();
       const redeem=url.pathname.endsWith('/pairings/redeem');if(redeem)attempts++;
+      const discoveryOrdinal=url.pathname.endsWith('/bootstrap/resolve')?++discoveryStarted:0;
       const target=new URL(initial.service.endpoint).origin+url.pathname;
       return new Promise((resolve,reject)=>{
         const request=httpRequest(target,{method:body.method.toUpperCase(),headers:{...body.headers,...(includeSession?{cookie:initial.service.cookie}:{})}},response=>{
@@ -280,6 +281,7 @@ try {
             let responseBody=null;try{responseBody=JSON.parse(data);}catch{}
             const code=responseBody?.error?.code;
             httpReceipts.push({kind,http_status:response.statusCode,...(typeof code==='string'&&/^[a-z_]{1,64}$/.test(code)?{error_code:code}:{})});
+            if(kind==='bootstrap_resolve'&&nextDiscovery&&discoveryOrdinal>nextDiscovery.after){const completed=nextDiscovery.complete;nextDiscovery=null;completed(httpReceipts.at(-1));}
             if(redeem){
               responses++;const request=JSON.parse(body.body);
               publicRequest={release:request.release_version,protocol:request.protocol_version,transport:request.transport_protocol_version,http_status:response.statusCode};
@@ -318,7 +320,7 @@ try {
     // only direct pairing has a separate Pair confirmation button.
     await Promise.race([probe.waitForFunction(()=>window.__thinPresentation?.workspace===true),probe.locator('[data-mobile-test="pairing-failed-message"]').waitFor({state:'visible'}).then(()=>{throw Error();})]);
     const saved=await rows();if(saved.length!==1||!saved[0].managed||keys.size!==2||attempts!==1||responses!==1||publicRequest.http_status!==200||publicRequest.release!==host.release||publicRequest.protocol!==published.versions[host.release].protocolVersion||publicRequest.transport!==published.versions[host.release].transportProtocolVersion)throw Error();
-    emit({event:'managed-saved',pairing_id:saved[0].managed.pairingId});
+    emit({event:'managed-saved',pairing_id:saved[0].managed.pairingId,device_id:saved[0].managed.deviceId});
     const registration=await receive();
     if(host.phase==='failed_registration'){
       if(registration.event!=='managed-registration-failed')throw Error();
@@ -387,7 +389,32 @@ try {
       await writeFile(resolvePath(evidence,'managed-auth-recovery-proof.json'),JSON.stringify({actual_service_unauthenticated_401:true,full_client_sign_in_action:true,no_repair_action:true,retained_identity:true,redeem_starts:attempts,limit:'Fixture session restored for explicit reload; no OAuth provider or RTC claim.'},null,2)+'\n');
     }
     emit({event:'managed-verified'});
-    const result={reload,context:probeContext};managedContexts.push(result);return result;
+    const verifyRevoked=async()=>{
+      await boundary('managed owner revocation on actual reconnect');
+      const discovery=new Promise(resolve=>nextDiscovery={after:discoveryStarted,complete:resolve});
+      const repair=probe.locator('[data-mobile-test="connection-banner-repair"]');
+      await Promise.race([
+        repair.waitFor({state:'visible'}),
+        (async()=>{
+          await probe.locator('[data-mobile-test="connection-banner-reconnect"]').click();
+          const receipt=await discovery;
+          if(receipt.error_code!=='pairing_revoked')throw Error('Owner removal left managed authority active');
+          await repair.waitFor({state:'visible'});
+        })()
+      ]);
+      if(!httpReceipts.some(r=>r.kind==='bootstrap_resolve'&&r.error_code==='pairing_revoked')||
+          await probe.locator('[data-mobile-test="connection-banner-spinner"]').isVisible()||
+          await probe.locator('[data-mobile-test="connection-banner-sign-in"]').isVisible()||
+          JSON.stringify(await rows())!==JSON.stringify(saved)||keys.size!==2||attempts!==1)throw Error('Managed revocation did not preserve identity and render authoritative repair');
+      await probe.screenshot({path:resolvePath(evidence,'managed-revoked-access.png')});
+      await writeFile(resolvePath(evidence,'managed-revoked-access-proof.json'),JSON.stringify({
+        real_owner_revocation:true,actual_service_pairing_revoked:true,existing_repair_action:true,
+        spinner_absent:true,sign_in_absent:true,record_and_secrets_retained:true,extra_pairing:false,
+        synchronization:'actual HTTP rejection and rendered repair action; no timeout threshold',
+        limit:'Real local Service, host protocol and source-built Wasm with frozen native ABI. Not Swift, real OAuth or physical phone proof.'
+      },null,2)+'\n');
+    };
+    const result={reload,verifyRevoked,context:probeContext};managedContexts.push(result);return result;
     } catch {
       const state=await probe.evaluate(()=>({workspace:window.__thinPresentation?.workspace===true,client:window.__tydeLoader?.bootVersion(),
         pairingFailed:!!document.querySelector('[data-mobile-test="pairing-failed-message"]'),shellError:!!document.querySelector('[data-mobile-test="mobile-shell-error-banner"]'),
@@ -620,7 +647,12 @@ try {
     if(await page.locator('[data-mobile-test="connection-banner-update-required"]').isVisible()||pairRequests!==3)throw Error('Revocation became compatibility failure');
     await page.screenshot({path:resolvePath(evidence,'revoked-pairing-repair.png')});
     await writeFile(resolvePath(evidence,'revoked-pairing-proof.json'),JSON.stringify({real_owner_revocation:true,existing_repair_action:true,version_error:false,extra_pairing:false},null,2)+'\n');
-    emit({event:'revocation-verified'});await receive();emit({event:'done'});
+    emit({event:'revocation-verified'});
+    if(managed){
+      if((await receive()).event!=='managed-revoked')throw Error();
+      await managed.verifyRevoked();emit({event:'managed-revocation-verified'});
+    }
+    await receive();emit({event:'done'});
   }
   await writeFile(resolvePath(initial.evidence,'shell-runtime-proof.json'),JSON.stringify({shell_archive_sha256:custody.archive_sha256,native_contract_sha256:custody.native_contract_sha256,unchanged_native_consumer_enforced:true,shell_release:metadata.release,
     current_client_release:entryFor(initial.current_bundle),clients:manifests.map(m=>({release:m.servedClientRelease,protocol:m.versions[m.servedClientRelease].protocolVersion,entry:m.versions[m.servedClientRelease].entry})),

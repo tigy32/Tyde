@@ -193,6 +193,19 @@ pub async fn run_connection_with_synthetic_voice(
     .await
 }
 
+struct ConnectionLifetime {
+    output: OutputQueue,
+    cancel: CancellationToken,
+}
+
+impl Drop for ConnectionLifetime {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.output.close();
+        tracing::debug!("connection transport scope closed");
+    }
+}
+
 async fn run_connection_with_origin(
     connection: Connection,
     host: HostHandle,
@@ -201,6 +214,39 @@ async fn run_connection_with_origin(
     #[cfg(feature = "test-support")] observer: Option<
         oneshot::Sender<crate::stream::ReplayAdmissionProbe>,
     >,
+) -> Result<(), FrameError> {
+    let cancel = CancellationToken::new();
+    let cancellation = cancel.clone().drop_guard();
+    let task = tokio::spawn(supervise_connection_scope(
+        connection,
+        host,
+        origin,
+        voice_providers,
+        #[cfg(feature = "test-support")]
+        observer,
+        cancel,
+    ));
+    let result = task.await.map_err(|error| {
+        tracing::error!(
+            cancelled = error.is_cancelled(),
+            panicked = error.is_panic(),
+            "connection supervisor failed"
+        );
+        FrameError::Io(std::io::Error::other("connection supervisor failed"))
+    })?;
+    drop(cancellation);
+    result
+}
+
+async fn supervise_connection_scope(
+    connection: Connection,
+    host: HostHandle,
+    origin: ConnectionOrigin,
+    voice_providers: crate::voice::VoiceProviders,
+    #[cfg(feature = "test-support")] observer: Option<
+        oneshot::Sender<crate::stream::ReplayAdmissionProbe>,
+    >,
+    cancel: CancellationToken,
 ) -> Result<(), FrameError> {
     let mobile_connection = origin.is_mobile();
     let started = std::time::Instant::now();
@@ -219,6 +265,10 @@ async fn run_connection_with_origin(
     } = connection;
 
     let output_queue = OutputQueue::default();
+    let lifetime = ConnectionLifetime {
+        output: output_queue.clone(),
+        cancel: cancel.clone(),
+    };
     #[cfg(feature = "test-support")]
     if let Some(observer) = observer {
         let _ = observer.send(output_queue.replay_probe());
@@ -239,14 +289,17 @@ async fn run_connection_with_origin(
         ConnectionOrigin::Desktop => ProjectFileDelivery::Full,
         ConnectionOrigin::Mobile { .. } => ProjectFileDelivery::Off,
     };
-    let deferred_attachments = host
-        .register_connection_host_stream(
-            host_output_stream.clone(),
-            agent_replay,
-            origin.is_desktop(),
-            project_files,
-        )
-        .await;
+    let deferred_attachments = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            drop(lifetime);
+            host.unregister_host_stream(&host_stream).await;
+            return Ok(());
+        },
+        attachments = host.register_connection_host_stream(
+            host_output_stream.clone(), agent_replay, origin.is_desktop(), project_files,
+        ) => attachments,
+    };
     // Replay may be held independently on each actor. Awaiting one attach
     // before starting the next strands unrelated agents behind that replay.
     let mut bootstrap_attachments = tokio::task::JoinSet::new();
@@ -257,26 +310,26 @@ async fn run_connection_with_origin(
         });
     }
 
-    let cancel = CancellationToken::new();
-
     let reader_task = {
         let cancel = cancel.clone();
-        tokio::spawn(reader_loop(reader, inbound_tx, cancel))
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(reader_loop(
+            reader, inbound_tx, cancel,
+        )))
     };
     let (bootstrap_written_tx, bootstrap_written_rx) = oneshot::channel();
     let writer_task = {
         let cancel = cancel.clone();
-        tokio::spawn(writer_loop(
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(writer_loop(
             writer,
             output_queue.clone(),
             outgoing_seq,
             cancel,
             Some(bootstrap_written_tx),
-        ))
+        )))
     };
     let catalog_refresh_host = host.clone();
     let catalog_refresh_cancel = cancel.clone();
-    let catalog_refresh_task = tokio::spawn(async move {
+    let catalog_refresh_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         if agent_replay != AgentReplayMode::Lazy {
             return;
         }
@@ -297,7 +350,7 @@ async fn run_connection_with_origin(
         catalog_refresh_host
             .refresh_lazy_connection_catalogs()
             .await;
-    });
+    }));
     let first_request = Arc::new(Notify::new());
     let app_task = {
         let cancel = cancel.clone();
@@ -305,7 +358,7 @@ async fn run_connection_with_origin(
         let host_stream = host_stream.clone();
         let host_output_stream = host_output_stream.clone();
         let app_first_request = Arc::clone(&first_request);
-        tokio::spawn(async move {
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             app_loop(AppLoopResources {
                 host,
                 host_stream,
@@ -318,13 +371,13 @@ async fn run_connection_with_origin(
                 voice_providers,
             })
             .await
-        })
+        }))
     };
 
     let capacity_replay_host = host.clone();
     let capacity_replay_stream = host_stream.clone();
     let capacity_replay_cancel = cancel.clone();
-    let capacity_replay_task = tokio::spawn(async move {
+    let capacity_replay_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         tokio::select! {
             _ = capacity_replay_cancel.cancelled() => return,
             _ = first_request.notified() => {}
@@ -333,7 +386,7 @@ async fn run_connection_with_origin(
         capacity_replay_host
             .replay_backend_capacity_for_host_stream(&capacity_replay_stream)
             .await;
-    });
+    }));
 
     // Wait for the first task to finish, then tear the scope down.
     // Drain only the two losers — re-polling a JoinHandle that tokio::select!
@@ -343,11 +396,19 @@ async fn run_connection_with_origin(
         Reader,
         Writer,
         App,
+        Cancelled,
     }
     let mut reader_task = reader_task;
     let mut writer_task = writer_task;
     let mut app_task = app_task;
     let (result, winner) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            reader_task.abort();
+            writer_task.abort();
+            app_task.abort();
+            (Ok(()), SelectWinner::Cancelled)
+        },
         res = &mut reader_task => {
             cancel.cancel();
             writer_task.abort();
@@ -380,6 +441,11 @@ async fn run_connection_with_origin(
 
     // Drain the two aborted tasks so their Drop runs (socket halves close, fd released).
     match winner {
+        SelectWinner::Cancelled => {
+            let _ = reader_task.await;
+            let _ = writer_task.await;
+            let _ = app_task.await;
+        }
         SelectWinner::Reader => {
             let _ = writer_task.await;
             let _ = app_task.await;
@@ -398,7 +464,7 @@ async fn run_connection_with_origin(
     catalog_refresh_task.abort();
     let _ = catalog_refresh_task.await;
 
-    output_queue.close();
+    drop(lifetime);
     bootstrap_attachments.abort_all();
     let mut result = result;
     while let Some(attachment) = bootstrap_attachments.join_next().await {

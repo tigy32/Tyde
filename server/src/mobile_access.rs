@@ -334,6 +334,12 @@ pub(crate) enum MobileAccessCommand {
         device_id: MobileDeviceId,
         reply: oneshot::Sender<Result<(), MobileAccessCommandFailure>>,
     },
+    ManagedDeviceRevoked {
+        revocation_id: Uuid,
+        device_id: MobileDeviceId,
+        result: Result<(), MobileAccessCommandFailure>,
+        reply: oneshot::Sender<Result<(), MobileAccessCommandFailure>>,
+    },
     RenameDevice {
         device_id: MobileDeviceId,
         label: String,
@@ -481,6 +487,7 @@ pub(crate) struct MobileAccessActor {
     active_requester: Option<StreamPath>,
     accept_tasks: HashMap<AcceptTaskKey, JoinHandle<()>>,
     connected_tasks: HashMap<MobileDeviceId, ConnectedMobileTask>,
+    revocation_tasks: HashMap<Uuid, JoinHandle<()>>,
     pairing_ttl_task: Option<JoinHandle<()>>,
     offer_poll_task: Option<JoinHandle<()>>,
     handoff_ack_retry_task: Option<JoinHandle<()>>,
@@ -739,6 +746,51 @@ impl ManagedMobileServiceClient {
             ));
         }
         Ok(receipt.generation)
+    }
+
+    async fn revoke_pairing(
+        &self,
+        pairing: &ManagedMobilePairingCredential,
+    ) -> Result<(), ManagedServiceError> {
+        #[derive(Deserialize)]
+        struct Receipt {
+            pairing_id: String,
+            status: RevokedStatus,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum RevokedStatus {
+            Revoked,
+        }
+        let endpoint = format!("/pairings/{}/revoke", pairing.pairing_id);
+        let body = br#"{"reason":"host_owner_removed_device"}"#;
+        let authorization = pairing_auth_header(
+            &pairing.host_pairing_secret,
+            "POST",
+            &self.base.path_for(&endpoint),
+            body,
+            PairingRole::Host,
+            &pairing.pairing_id,
+        )?;
+        let response = self
+            .http
+            .post(self.base.url_for(&endpoint))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-tycode-pairing-auth", authorization)
+            .body(body.as_slice())
+            .send()
+            .await
+            .map_err(ManagedServiceError::transport)?;
+        let receipt: Receipt = parse_managed_response(response).await?;
+        if receipt.pairing_id != pairing.pairing_id {
+            return Err(ManagedServiceError::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "Managed revocation receipt belongs to another pairing",
+            ));
+        }
+        match receipt.status {
+            RevokedStatus::Revoked => Ok(()),
+        }
     }
 
     async fn mint_host_rtc_credentials(
@@ -1340,6 +1392,7 @@ impl MobileAccessActor {
             active_requester: None,
             accept_tasks: HashMap::new(),
             connected_tasks: HashMap::new(),
+            revocation_tasks: HashMap::new(),
             pairing_ttl_task: None,
             offer_poll_task: None,
             handoff_ack_retry_task: None,
@@ -1528,7 +1581,44 @@ impl MobileAccessActor {
                     self.cancel_pairing(&offer_id).await;
                 }
                 MobileAccessCommand::RevokeDevice { device_id, reply } => {
-                    let result = self.revoke_device(&device_id).await;
+                    if let Some(pairing) = self
+                        .pairings
+                        .devices
+                        .iter()
+                        .find(|record| record.device_id == device_id)
+                        .and_then(|record| record.managed.clone())
+                    {
+                        let service = self.managed_service.clone();
+                        let tx = self.tx.clone();
+                        let revocation_id = Uuid::new_v4();
+                        let task = tokio::spawn(async move {
+                            let result = service.revoke_pairing(&pairing).await.map_err(|error| {
+                                MobileAccessCommandFailure::new(error.code, error.message)
+                            });
+                            let _ = tx.send(MobileAccessCommand::ManagedDeviceRevoked {
+                                revocation_id,
+                                device_id,
+                                result,
+                                reply,
+                            });
+                        });
+                        self.revocation_tasks.insert(revocation_id, task);
+                    } else {
+                        let result = self.revoke_device(&device_id).await;
+                        let _ = reply.send(result);
+                    }
+                }
+                MobileAccessCommand::ManagedDeviceRevoked {
+                    revocation_id,
+                    device_id,
+                    result,
+                    reply,
+                } => {
+                    self.revocation_tasks.remove(&revocation_id);
+                    let result = match result {
+                        Ok(()) => self.revoke_device(&device_id).await,
+                        Err(error) => Err(error),
+                    };
                     let _ = reply.send(result);
                 }
                 MobileAccessCommand::RegisterPush {
@@ -1655,6 +1745,9 @@ impl MobileAccessActor {
     }
 
     async fn shutdown_runtime_state(&mut self) {
+        for (_, task) in self.revocation_tasks.drain() {
+            task.abort();
+        }
         self.direct_hosting = DirectHostingState::Disabled;
         self.abort_all_tasks();
         self.mobile_pairings_lease = None;
@@ -2552,12 +2645,13 @@ impl MobileAccessActor {
         &mut self,
         device_id: &MobileDeviceId,
     ) -> Result<(), MobileAccessCommandFailure> {
-        if !self.pairings.remove_device(device_id) {
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::UnknownDevice,
                 format!("unknown mobile device {device_id}"),
             ));
-        }
+        };
+        *device.state = MobileDeviceState::Revoked;
         if let Some(task) = self
             .accept_tasks
             .remove(&AcceptTaskKey::Device(device_id.clone()))
@@ -2570,11 +2664,17 @@ impl MobileAccessActor {
         if let Some(task) = self.connected_tasks.remove(device_id) {
             task.task.abort();
         }
-        self.pairings_store
-            .save(&self.pairings)
-            .map_err(|message| {
-                MobileAccessCommandFailure::new(MobileAccessErrorCode::StoreLoadFailed, message)
-            })?;
+        let mut updated = self.pairings.clone();
+        updated.remove_device(device_id);
+        if let Err(message) = self.pairings_store.save(&updated) {
+            self.fan_out_state().await;
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            ));
+        }
+        self.pairings = updated;
+        tracing::info!("mobile device access revoked and credentials removed");
         self.fan_out_state().await;
         Ok(())
     }
@@ -3177,6 +3277,9 @@ impl MobileAccessActor {
         let Some(device) = self.pairings.device_mut(device_id) else {
             return false;
         };
+        if *device.state == MobileDeviceState::Revoked {
+            return false;
+        }
         *device.state = MobileDeviceState::Connected;
         if let Some(now) = now {
             *device.last_seen_at_ms = Some(now);
@@ -3244,12 +3347,9 @@ impl MobileAccessActor {
             );
             return;
         }
-        if self
-            .pairings
-            .devices
-            .iter()
-            .any(|record| &record.device_id == device_id)
-        {
+        if self.pairings.devices.iter().any(|record| {
+            &record.device_id == device_id && record.state != MobileDeviceState::Revoked
+        }) {
             if matches!(
                 code,
                 MobileAccessErrorCode::RepairRequired | MobileAccessErrorCode::RevokedDevice

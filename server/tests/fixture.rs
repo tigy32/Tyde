@@ -732,6 +732,13 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn connect_cancellable(&self) -> (client::Connection, tokio::task::JoinHandle<()>) {
+        let (mut client, task) = connect_owned_raw_client(self.host.clone()).await;
+        read_initial_host_bootstrap(&mut client).await;
+        (client, task)
+    }
+
+    #[allow(dead_code)]
     pub async fn connect_agent_control(&self) -> AgentControlHandle {
         let client = connect_raw_client(self.host.clone()).await;
         AgentControlHandle::from_connection(client)
@@ -2198,11 +2205,17 @@ pub async fn send_load_agent_on(client: &mut client::Connection, agent_stream: &
 }
 
 async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
+    connect_owned_raw_client(host).await.0
+}
+
+async fn connect_owned_raw_client(
+    host: server::HostHandle,
+) -> (client::Connection, tokio::task::JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();
     let client_config = client::ClientConfig::current();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let conn = server::accept(&server_config, server_stream)
             .await
             .expect("server handshake failed");
@@ -2211,9 +2224,10 @@ async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
         }
     });
 
-    client::connect(&client_config, client_stream)
+    let client = client::connect(&client_config, client_stream)
         .await
-        .expect("client handshake failed")
+        .expect("client handshake failed");
+    (client, task)
 }
 
 // nextest isolates each test in its own process, including this OS resource limit.
