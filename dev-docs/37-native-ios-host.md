@@ -98,6 +98,22 @@ platform fixture; it does not certify iOS URLSession, production auth or the
 user's installed TestFlight connection. Updated bridge bytes require a new
 native build, not replacement of an already published host client.
 
+The current authorized private preview tracks Release build 6 in the Xcode
+project; Debug remains build 1. The read-only ASC query on 2026-11-04 at
+21:11 UTC found builds 2–5 VALID, old build 1 awaiting upload, and no build 6
+record or reservation. Build 5's archive-time override was a one-off, not the
+route for build 6. Recheck allocation before upload; use the tracked identity
+without archive-time overrides.
+
+Build 6 carries native-response source `90f5754099f28f51b54dfc9c6f7ac5cdf2a9a3ef`
+and bridge SHA256
+`e2a99530db7daa8a56a081c6fde69dbe308f94a7c7a890fbe180d044adb77fa6`.
+Distribution follows source landing, clean-main validation and push, using fresh
+production resources from the final landed source. Existing beta26 and its
+matched client suffice; no host restart, Service change or client republication
+is required. The boundary proof above does not establish physical TestFlight
+acceptance, the user's live error stack or ordinary native UI Send/response.
+
 ## Adaptive Agents hierarchy
 
 The approved Duo v4 composition keeps the Agents/project hierarchy on the left
