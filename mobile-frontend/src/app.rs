@@ -1576,6 +1576,93 @@ mod wasm_tests {
             state.app_mode.set(AppMode::Workspace);
             state.active_local_host_id.set(Some(host_id.clone()));
             state.paired_hosts.set(vec![host]);
+            state.projects.set(vec![crate::state::ProjectInfo {
+                local_host_id: host_id.clone(),
+                project: protocol::Project {
+                    id: protocol::ProjectId("entry-project".into()),
+                    name: "Entry project".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone { roots: vec![] },
+                },
+            }]);
+            state.agents.set([("entry-loose", "Loose agent", None),
+                ("entry-project-agent", "Project agent", Some(protocol::ProjectId("entry-project".into())))]
+                .into_iter().map(|(id, name, project_id)| crate::state::AgentInfo {
+                    local_host_id: host_id.clone(),
+                    agent_id: protocol::AgentId(id.into()),
+                    name: name.into(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Claude,
+                    workspace_roots: vec![], project_id, parent_agent_id: None,
+                    session_id: None, custom_agent_id: None, created_at_ms: 0,
+                    instance_stream: protocol::StreamPath(format!("/agent/{id}")),
+                    started: true, fatal_error: None, review_recipient: false,
+                }).collect());
+            next_tick().await;
+            for (layout, open) in [
+                (NativeIntent::RegularLandscape, true),
+                (NativeIntent::RegularLandscape, false),
+                (NativeIntent::RegularWidth, false),
+                (NativeIntent::CompactWidth, false),
+            ] {
+                navigate(layout)?;
+                next_tick().await;
+                for name in ["Loose agent", "Project agent"] {
+                    navigate(NativeIntent::Home)?;
+                    next_tick().await;
+                    find(&format!("[data-mobile-test='home-recent-agent-row'][aria-label='Open chat with {name}']"))?
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    let home_entry = projected()?;
+                    check(home_entry.tab == mobile_shell_types::native::NativeTab::Agents
+                        && home_entry.route == mobile_shell_types::native::NativeRoute::Chat
+                        && home_entry.title == name,
+                        "Home agent cards must select the same native Agents conversation destination")?;
+                    let hierarchy = find("[data-mobile-test='agents-view']")?;
+                    let chat = find("[data-mobile-test='chat-messages']")?;
+                    let wide = layout == NativeIntent::RegularLandscape;
+                    check(home_entry.sidebar_available == wide && home_entry.sidebar_open == open
+                        && (hierarchy.get_bounding_client_rect().height() > 0.0) == open
+                        && chat.get_bounding_client_rect().height() > 0.0,
+                        "Home entry preserves the layout and deliberate hierarchy visibility choice")?;
+                    if open {
+                        check(hierarchy.text_content().unwrap().contains("Entry project")
+                            && hierarchy.get_bounding_client_rect().right() <= chat.get_bounding_client_rect().left(),
+                            "Home entry shows the project/agent hierarchy to the left of the conversation")?;
+                    }
+                    if !open {
+                        navigate(NativeIntent::Back)?;
+                        next_tick().await;
+                        check(projected()?.tab == mobile_shell_types::native::NativeTab::Agents
+                            && hierarchy.get_bounding_client_rect().height() > 0.0,
+                            "Back from Home-selected chat returns to Agents without changing compact navigation")?;
+                    }
+                    find(&format!("[data-mobile-test='agents-view'] [aria-label='Open chat with {name}']"))?
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    check(projected()? == home_entry,
+                        "Home and Agents entry must emit identical native presentation")?;
+                    if !open && wide {
+                        navigate(NativeIntent::ToggleSidebar)?;
+                        next_tick().await;
+                        check(projected()?.sidebar_open && hierarchy.get_bounding_client_rect().height() > 0.0,
+                            "A hidden Home-entry sidebar remains available to Show Agents")?;
+                        navigate(NativeIntent::ToggleSidebar)?;
+                        next_tick().await;
+                    }
+                }
+                if open {
+                    navigate(NativeIntent::ToggleSidebar)?;
+                    next_tick().await;
+                }
+            }
+            state.agents.set(vec![]);
+            state.projects.set(vec![]);
+            state.active_agent.set(None);
+            navigate(NativeIntent::RegularLandscape)?;
+            navigate(NativeIntent::ToggleSidebar)?;
+            navigate(NativeIntent::CompactWidth)?;
+            navigate(NativeIntent::Back)?;
             next_tick().await;
             navigate(NativeIntent::Agents)?;
             next_tick().await;

@@ -289,6 +289,9 @@ pub fn HomeView() -> impl IntoView {
                                             local_host_id: host_id.clone(),
                                             agent_id: agent_id.clone(),
                                         }));
+                                        if crate::native::is_native() {
+                                            s_row.active_tab.set(MobileTab::Agents);
+                                        }
                                         s_row.show_chat();
                                     });
                                     view! {

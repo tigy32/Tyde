@@ -103,6 +103,13 @@ visible, respects existing modal exclusion, and retains its choice across size
 changes. Existing retained panes and the shared shell keep owning mounted
 content, scrolling and keyboard geometry. Native ABI 6 adds these projections.
 
+Opening an existing agent from Home selects the native Agents destination,
+just like selecting its Agents row. Both entries use the same landscape
+hierarchy availability and preserve the user's sidebar visibility choice.
+Portrait and compact remain single-destination navigation; browser/PWA Home
+and new-chat entry are unchanged. This is a hosted-client navigation change,
+not a Swift binary or native ABI change.
+
 The existing mounted-DOM flow covers sidebar open/close, portrait/compact
 transitions, modal exclusion, filter/segment behavior and retained conversation,
 draft selection and scroll. Its native boundary is deliberately a fixture; it
