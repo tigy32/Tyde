@@ -1103,9 +1103,8 @@ async fn dying_launch_prompt_is_absent_from_resumed_history() {
                     .is_ok_and(|closed| closed.agent_id == agent.new_agent.agent_id)
         })
         .await;
-    let (_, snapshot) = fixture.connect_with_bootstrap().await;
-    let usage = snapshot
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == resumed.new_agent.agent_id)
         .expect("resumed accounting after failed card closes");

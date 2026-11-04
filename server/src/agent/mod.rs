@@ -453,20 +453,37 @@ fn reject_held_agent_controls(held: &mut VecDeque<HeldControlDelivery>, reason: 
 struct UsageSnapshotReply {
     sender: oneshot::Sender<AgentUsageSnapshot>,
     #[cfg(feature = "test-support")]
-    gate: Option<Arc<crate::host::SpawnOperationTestGateInner>>,
+    pending: PendingUsageReadForTest,
 }
 
 impl UsageSnapshotReply {
     fn send(self, snapshot: AgentUsageSnapshot) {
+        let Self {
+            sender,
+            #[cfg(feature = "test-support")]
+            pending,
+        } = self;
+        let _ = sender.send(snapshot);
         #[cfg(feature = "test-support")]
-        if let Some(gate) = self.gate {
-            tokio::spawn(async move {
-                crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
-                let _ = self.sender.send(snapshot);
-            });
-            return;
-        }
-        let _ = self.sender.send(snapshot);
+        drop(pending);
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct PendingUsageReadForTest(watch::Sender<usize>);
+
+#[cfg(feature = "test-support")]
+impl PendingUsageReadForTest {
+    fn new(pending: watch::Sender<usize>) -> Self {
+        pending.send_modify(|count| *count += 1);
+        Self(pending)
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for PendingUsageReadForTest {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
     }
 }
 
@@ -993,6 +1010,8 @@ pub(crate) struct AgentHandle {
     accepting_input: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
     final_usage: watch::Receiver<Option<AgentUsageSnapshot>>,
+    #[cfg(feature = "test-support")]
+    pending_usage_reads: watch::Sender<usize>,
     close_preparing: Arc<AtomicBool>,
     moving_project: Arc<AtomicBool>,
     native_registration: NativeRegistrationState,
@@ -2752,12 +2771,7 @@ impl AgentHandle {
             .map_err(|_| "Accounting ownership acknowledgement was lost".to_owned())?
     }
 
-    pub(crate) async fn read_usage_snapshot(
-        &self,
-        #[cfg(feature = "test-support")] gate: Option<
-            Arc<crate::host::SpawnOperationTestGateInner>,
-        >,
-    ) -> Option<AgentUsageSnapshot> {
+    pub(crate) async fn read_usage_snapshot(&self) -> Option<AgentUsageSnapshot> {
         if self.actor_finished() {
             return self.final_usage.borrow().clone();
         }
@@ -2793,7 +2807,7 @@ impl AgentHandle {
                 reply: UsageSnapshotReply {
                     sender: reply_tx,
                     #[cfg(feature = "test-support")]
-                    gate,
+                    pending: PendingUsageReadForTest::new(self.pending_usage_reads.clone()),
                 },
             })
             .is_err()
@@ -2801,6 +2815,11 @@ impl AgentHandle {
             return None;
         }
         reply_rx.await.ok()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pending_usage_reads_for_test(&self) -> watch::Receiver<usize> {
+        self.pending_usage_reads.subscribe()
     }
 
     pub async fn interrupt(&self) -> InterruptOutcome {
@@ -11979,6 +11998,8 @@ pub(crate) fn spawn_agent_actor(
             accepting_input,
             closing,
             final_usage,
+            #[cfg(feature = "test-support")]
+            pending_usage_reads: watch::channel(0).0,
             close_preparing: Arc::new(AtomicBool::new(false)),
             moving_project: Arc::new(AtomicBool::new(false)),
             native_registration,
@@ -12872,6 +12893,8 @@ pub(crate) fn spawn_relay_agent_actor(
         accepting_input,
         closing,
         final_usage,
+        #[cfg(feature = "test-support")]
+        pending_usage_reads: watch::channel(0).0,
         close_preparing: Arc::new(AtomicBool::new(false)),
         moving_project: Arc::new(AtomicBool::new(false)),
         native_registration,

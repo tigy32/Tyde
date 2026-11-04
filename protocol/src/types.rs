@@ -1942,6 +1942,8 @@ pub struct HostBootstrapPayload<S = Value> {
     #[serde(default)]
     pub agent_restoration_failures: Vec<AgentRestorationFailure>,
     pub agents: Vec<NewAgentPayload>,
+    /// Optional observations; fresh accounting arrives through TaskTokenUsage
+    /// without delaying the initial agent inventory.
     #[serde(default)]
     pub task_token_usages: Vec<TaskTokenUsagePayload>,
     #[serde(default)]

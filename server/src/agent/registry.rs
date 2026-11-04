@@ -1199,7 +1199,7 @@ impl AgentRegistry {
         ordered
     }
 
-    pub fn notify_session_binding_changed(&self) {
+    pub fn notify_usage_changed(&self) {
         let next = self.status_change_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.status_change_tx.send(next);
     }

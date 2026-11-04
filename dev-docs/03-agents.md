@@ -805,9 +805,13 @@ zero when a backend did not report usage. `AgentActivityStats.token_usage` is
 the same `agent_total` snapshot so reconnecting clients can render the current
 total without waiting for another turn.
 
-Task-level token totals are also server-owned. The host emits
-`TaskTokenUsagePayload` on the host stream and includes current rollups in
-`HostBootstrapPayload.task_token_usages`. A rollup is keyed by the active root
+Task-level token totals are server-owned, best-effort observations. The host
+emits `TaskTokenUsagePayload` updates through its existing accounting worker.
+Fresh accounting never gates initial agent inventory or lifecycle cleanup;
+connecting eager subscribers wake that same worker after `HostBootstrap`.
+The optional `HostBootstrapPayload.task_token_usages` field remains compatible
+on the wire; absent observations are not measured zeroes.
+A rollup is keyed by the active root
 agent/session and sums that root plus descendants from explicit
 `parent_agent_id` relationships. Each agent contributes its strict-self total
 once; parent totals do not absorb sub-agent totals. Missing child usage is

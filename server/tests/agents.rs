@@ -2074,13 +2074,13 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
         .clone();
     eprintln!("Usage accounting diagnostic: next generation reconciled");
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
     let late_agent = bootstrapped_agent(&bootstrap, &agent.agent_id);
     eprintln!(
         "Usage reconnect diagnostic: subscriber_stream_changed={}",
         late_agent.instance_stream != agent.instance_stream
     );
-    let task = bootstrap
-        .task_token_usages
+    let task = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == agent.agent_id)
         .expect("task usage");
@@ -2148,11 +2148,10 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     )
     .await;
     eprintln!("Usage accounting diagnostic: actor closed");
-    let (_, closed) = fixture.connect_with_bootstrap().await;
+    let closed_task_usages = fixture.task_usage_snapshot().await;
     // Only live roots are advertised; retained usage becomes observable on resume.
     assert!(
-        closed
-            .task_token_usages
+        closed_task_usages
             .iter()
             .all(|usage| usage.root_session_id.as_ref() != Some(&session)),
         "closed task roots must not stay advertised"
@@ -2180,10 +2179,9 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     )
     .await;
     eprintln!("Usage accounting diagnostic: saved session reopened");
-    let (_, reopened_usage) = fixture.connect_with_bootstrap().await;
+    let reopened_usage_task_usages = fixture.task_usage_snapshot().await;
     assert_eq!(
-        reopened_usage
-            .task_token_usages
+        reopened_usage_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == reopened.agent_id)
             .expect("retained usage on reopen")
@@ -2196,10 +2194,9 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
         .await;
     let mut active = restored[&session].clone();
     eprintln!("Usage resume diagnostic: phase=restored_bootstrap_begin");
-    let (_, ready) = fixture.connect_with_bootstrap().await;
+    let ready_task_usages = fixture.task_usage_snapshot().await;
     eprintln!("Usage resume diagnostic: phase=restored_bootstrap_received");
-    let restored = ready
-        .task_token_usages
+    let restored = ready_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&session].agent_id)
         .expect("restored usage");
@@ -2386,10 +2383,9 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
             expected_total,
         );
         eprintln!("Usage resume diagnostic: case={index} phase=resumed_usage_verified");
-        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        let bootstrap_task_usages = fixture.task_usage_snapshot().await;
         eprintln!("Usage resume diagnostic: case={index} phase=resumed_bootstrap_received");
-        let task = bootstrap
-            .task_token_usages
+        let task = bootstrap_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == resumed.agent_id)
             .expect("interrupted generation retained");
@@ -2456,9 +2452,8 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
             "durable usage ready",
         )
         .await;
-        let (_, durable) = fixture.connect_with_bootstrap().await;
-        let task = durable
-            .task_token_usages
+        let durable_task_usages = fixture.task_usage_snapshot().await;
+        let task = durable_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == reopened.agent_id)
             .expect("durable resumed usage");
@@ -2514,9 +2509,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         "/tmp/reset-grandchild",
     )
     .await;
-    let (_, before) = fixture.connect_with_bootstrap().await;
-    let before = before
-        .task_token_usages
+    let before_task_usages = fixture.task_usage_snapshot().await;
+    let before = before_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .expect("initial tree usage");
@@ -2614,9 +2608,9 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
     assert!(reset.member_agent_ids.contains(&child.agent_id));
     assert!(reset.member_agent_ids.contains(&grandchild.agent_id));
     assert!(reset.member_agent_ids.contains(&starting.agent_id));
-    let (mut observer, other) = fixture.connect_with_bootstrap().await;
-    let other = other
-        .task_token_usages
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    let other_task_usages = fixture.task_usage_snapshot().await;
+    let other = other_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .unwrap();
@@ -2663,9 +2657,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
     )
     .await;
-    let (_, replayed) = fixture.connect_with_bootstrap().await;
-    let replayed = replayed
-        .task_token_usages
+    let replayed_task_usages = fixture.task_usage_snapshot().await;
+    let replayed = replayed_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .unwrap();
@@ -2723,9 +2716,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         "close second reset replacement",
     )
     .await;
-    let (_, rebound) = fixture.connect_with_bootstrap().await;
-    let rebound = rebound
-        .task_token_usages
+    let rebound_task_usages = fixture.task_usage_snapshot().await;
+    let rebound = rebound_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .unwrap();
@@ -2757,9 +2749,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         .await;
     let resumed = restored[&session].clone();
     let resumed_child = restored[&child_session].clone();
-    let (_, durable) = fixture.connect_with_bootstrap().await;
-    let durable = durable
-        .task_token_usages
+    let durable_task_usages = fixture.task_usage_snapshot().await;
+    let durable = durable_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == resumed.agent_id)
         .unwrap();
@@ -2776,9 +2767,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         "mock backend response to: after restart",
     )
     .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let after = after
-        .task_token_usages
+    let after_task_usages = fixture.task_usage_snapshot().await;
+    let after = after_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == resumed.agent_id)
         .unwrap();
@@ -2903,10 +2893,9 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
         )
         .await;
         usage_reset_diagnostic("test:peer-reset-published");
-        let (_, newer) = fixture.connect_with_bootstrap().await;
+        let newer_task_usages = fixture.task_usage_snapshot().await;
         assert_eq!(
-            newer
-                .task_token_usages
+            newer_task_usages
                 .iter()
                 .find(|usage| usage.root_agent_id == resumed.agent_id)
                 .unwrap()
@@ -2939,9 +2928,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
             },
         )
         .await;
-        let (_, ordered) = fixture.connect_with_bootstrap().await;
-        let ordered = ordered
-            .task_token_usages
+        let ordered_task_usages = fixture.task_usage_snapshot().await;
+        let ordered = ordered_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == resumed.agent_id)
             .unwrap();
@@ -2954,9 +2942,8 @@ async fn reset_usage_excludes_in_flight_descendants_and_replay_across_restart() 
     let restored = fixture
         .restored_agents(&restart, std::slice::from_ref(&session))
         .await;
-    let (_, durable) = fixture.connect_with_bootstrap().await;
-    let durable = durable
-        .task_token_usages
+    let durable_task_usages = fixture.task_usage_snapshot().await;
+    let durable = durable_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&session].agent_id)
         .unwrap();
@@ -3060,9 +3047,8 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
         MOCK_TURN_TOKEN_TOTAL * 4,
     );
     checkpoint.wait_until_entered().await;
-    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-    let task = bootstrap
-        .task_token_usages
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let task = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == new_agent.agent_id)
         .expect("covered unavailable response");
@@ -3091,9 +3077,8 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     })
     .await;
     checkpoint.wait_until_entered().await;
-    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-    let task = bootstrap
-        .task_token_usages
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let task = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == new_agent.agent_id)
         .expect("generation optional coverage upgraded");
@@ -3129,9 +3114,8 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
         MOCK_TURN_TOKEN_TOTAL
     );
     checkpoint.wait_until_entered().await;
-    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-    let task = bootstrap
-        .task_token_usages
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let task = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == new_agent.agent_id)
         .expect("uncovered responses retained");
@@ -3320,9 +3304,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     )
     .await;
     assert_known_task_status(&task_usage.total.status);
-    let (_, settled) = fixture.connect_with_bootstrap().await;
-    let timing = &settled
-        .task_token_usages
+    let settled_task_usages = fixture.task_usage_snapshot().await;
+    let timing = &settled_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == parent_new.agent_id)
         .expect("native timing rollup")
@@ -3345,9 +3328,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     let restored = fixture
         .restored_agents(&restart, std::slice::from_ref(&parent_session))
         .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let after_task_usages = fixture.task_usage_snapshot().await;
+    let usage = after_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&parent_session].agent_id)
         .expect("native child accounting after restart");
@@ -3403,9 +3385,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     )
     .await;
     fixture::next_logical_frame_matching_on(&mut fixture.client, "native open span durable before hard restart", |env| env.stream == running_child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "native-running-timing"))).await;
-    let (_, before_kill) = fixture.connect_with_bootstrap().await;
-    let before = before_kill
-        .task_token_usages
+    let before_kill_task_usages = fixture.task_usage_snapshot().await;
+    let before = before_kill_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored_parent.agent_id)
         .expect("before native hard restart")
@@ -3416,9 +3397,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     let restored = fixture
         .restored_agents(&restart, std::slice::from_ref(&parent_session))
         .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let after_task_usages = fixture.task_usage_snapshot().await;
+    let usage = after_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&parent_session].agent_id)
         .expect("native hard restart observations");
@@ -3433,9 +3413,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
                 && entry.span.tool_call_id == "native-running-timing"
                 && entry.span.state == protocol::TaskTimingState::Interrupted)
     );
-    let (_, reconnect) = fixture.connect_with_bootstrap().await;
-    let repeated = reconnect
-        .task_token_usages
+    let reconnect_task_usages = fixture.task_usage_snapshot().await;
+    let repeated = reconnect_task_usages
         .iter()
         .find(|item| item.root_agent_id == usage.root_agent_id)
         .expect("native reconnect observations");
@@ -3581,9 +3560,8 @@ async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_par
         .await
         .expect("send final missing-usage turn");
     expect_strict_mock_turn(&mut fixture.client, &agent.stream, "final unreported turn").await;
-    let (_, final_live) = fixture.connect_with_bootstrap().await;
-    let live = final_live
-        .task_token_usages
+    let final_live_task_usages = fixture.task_usage_snapshot().await;
+    let live = final_live_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
         .expect("final live partial own usage");
@@ -3632,9 +3610,8 @@ async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_par
     let restored = fixture
         .restored_agents(&restart, std::slice::from_ref(&session))
         .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let after_task_usages = fixture.task_usage_snapshot().await;
+    let usage = after_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&session].agent_id)
         .expect("retained final missing usage");
@@ -3786,24 +3763,26 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     assert_eq!(payload.breakdown[2].tree_index, 2);
     assert_known_task_scope(&payload.breakdown[2].usage, MOCK_TURN_TOKEN_TOTAL);
 
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
     let host = fixture.host_for_test();
-    let snapshot_gate = host.install_next_bootstrap_snapshot_reply_test_gate().await;
-    let late_connection = tokio::spawn(fixture::connect_host(host));
-    snapshot_gate.wait_until_entered().await;
+    let publication = host.install_next_bootstrap_publication_test_gate().await;
+    let late_connection =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(fixture::connect_host(host)));
+    publication.wait_until_entered().await;
     fixture
         .client
         .list_sessions(ListSessionsPayload::default())
         .await
-        .expect("list sessions while an agent snapshot reply is held");
+        .expect("list sessions while another inventory awaits publication");
     let sessions = expect_kind(
         &mut fixture.client,
         FrameKind::SessionList,
-        "host remains responsive during an admitted agent snapshot read",
+        "existing connection remains responsive while another inventory is held",
     )
     .await;
     let _: SessionListPayload = sessions
         .parse_payload()
-        .expect("session list during blocked usage read");
+        .expect("session list during held inventory publication");
     let pending = spawn_token_usage_agent(
         &mut fixture.client,
         "usage-during-bootstrap",
@@ -3819,12 +3798,12 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     expect_task_token_usage_matching(
         &mut usage_client,
         &pending.agent_id,
-        "pending agent settles while bootstrap is held",
+        "new agent settles before held inventory publication",
         |usage| usage.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL,
     )
     .await;
-    snapshot_gate.release_one();
-    let (mut late_client, bootstrap) = late_connection.await.expect("late bootstrap task");
+    publication.release_one();
+    let (mut late_client, bootstrap) = late_connection.await.expect("late inventory publication");
     assert!(
         !bootstrap
             .agents
@@ -3851,8 +3830,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "queued canonical usage must become navigable after ordered NewAgent delivery"
     );
     wall_clock_account(&pending_usage, &pending.agent_id);
-    let bootstrapped = bootstrap
-        .task_token_usages
+    let bootstrapped = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .expect("HostBootstrap should include root task token usage");
@@ -4110,9 +4088,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
             .agent_id,
         reopened.agent_id
     );
-    let (_, reclosed) = fixture.connect_with_bootstrap().await;
-    let reclosed = reclosed
-        .task_token_usages
+    let reclosed_task_usages = fixture.task_usage_snapshot().await;
+    let reclosed = reclosed_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == root.agent_id)
         .expect("reclosed child rollup");
@@ -4138,8 +4115,9 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         })
         .await
         .expect("delete closed chat context");
-    let (mut deletion_observer, deleted_bootstrap) = fixture.connect_with_bootstrap().await;
-    let retained = if let Some(usage) = deleted_bootstrap.task_token_usages.iter().find(|usage| {
+    let (mut deletion_observer, _) = fixture.connect_with_bootstrap().await;
+    let deleted_bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let retained = if let Some(usage) = deleted_bootstrap_task_usages.iter().find(|usage| {
         usage.root_agent_id == root.agent_id
             && usage.breakdown.iter().any(|entry| {
                 entry.session_id.as_ref() == Some(&grandchild_session)
@@ -4223,9 +4201,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "fork must still display inherited context"
     );
     drop(fork_reservation);
-    let (_, fork_ready) = fixture.connect_with_bootstrap().await;
-    let fork_usage = fork_ready
-        .task_token_usages
+    let fork_ready_task_usages = fixture.task_usage_snapshot().await;
+    let fork_usage = fork_ready_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == fork.agent_id)
         .expect("fork usage");
@@ -4246,9 +4223,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         )
         .await;
     let restored_agent = &restored_agents[&root_session];
-    let (_, ready) = fixture.connect_with_bootstrap().await;
-    let restored = ready
-        .task_token_usages
+    let ready_task_usages = fixture.task_usage_snapshot().await;
+    let restored = ready_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == restored_agent.agent_id)
         .expect("restored task usage");
@@ -4259,8 +4235,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         restored.total.status
     );
     assert_eq!(restored.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL * 5);
-    let restored_fork = ready
-        .task_token_usages
+    let restored_fork = ready_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == restored_agents[&fork_session].agent_id)
         .expect("restored fork own usage");
@@ -4283,10 +4258,9 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "mock backend response to: after accounting restore",
     )
     .await;
-    let (_, updated) = fixture.connect_with_bootstrap().await;
+    let updated_task_usages = fixture.task_usage_snapshot().await;
     assert_eq!(
-        updated
-            .task_token_usages
+        updated_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == restored_agent.agent_id)
             .expect("updated restored task")
@@ -4312,8 +4286,7 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         1
     );
 
-    let before_mix = updated
-        .task_token_usages
+    let before_mix = updated_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == restored_agent.agent_id)
         .expect("pre-mix authoritative usage")
@@ -4379,9 +4352,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         },
     )
     .await;
-    let (_, settled) = fixture.connect_with_bootstrap().await;
-    let mixed = settled
-        .task_token_usages
+    let settled_task_usages = fixture.task_usage_snapshot().await;
+    let mixed = settled_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == mixed.root_agent_id)
         .expect("settled component accounting");
@@ -4525,8 +4497,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         "another provider's closed usage remains untouched"
     );
     let (mut replay_client, replay) = fixture.connect_with_bootstrap().await;
-    let replayed = replay
-        .task_token_usages
+    let replay_task_usages = fixture.task_usage_snapshot().await;
+    let replayed = replay_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored_agent.agent_id)
         .expect("mixed usage reconnect");
@@ -4555,10 +4527,9 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
             entry.agent_id
         );
     }
-    let (_, closed) = fixture.connect_with_bootstrap().await;
+    let closed_task_usages = fixture.task_usage_snapshot().await;
     assert_eq!(
-        closed
-            .task_token_usages
+        closed_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == restored_agent.agent_id)
             .expect("closed mixed rollup")
@@ -4570,9 +4541,8 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
     let restored = fixture
         .restored_agents(&restarted, std::slice::from_ref(&session))
         .await;
-    let (_, replay) = fixture.connect_with_bootstrap().await;
-    let replayed = replay
-        .task_token_usages
+    let replay_task_usages = fixture.task_usage_snapshot().await;
+    let replayed = replay_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&session].agent_id)
         .expect("mixed usage restart");
@@ -4630,9 +4600,9 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
     )
     .await;
     gate.wait_until_entered().await;
-    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
-    let pending = bootstrap
-        .task_token_usages
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let pending = bootstrap_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == agent.agent_id)
         .expect("native pending rollup");
@@ -4662,9 +4632,8 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
     let agents = fixture
         .restored_agents(&bootstrap, std::slice::from_ref(&session))
         .await;
-    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-    let restored = bootstrap
-        .task_token_usages
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let restored = bootstrap_task_usages
         .iter()
         .find(|payload| payload.root_agent_id == agents[&session].agent_id)
         .expect("restored native rollup");
@@ -4724,9 +4693,8 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
     let agents = fixture
         .restored_agents(&bootstrap, std::slice::from_ref(&session))
         .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let after_task_usages = fixture.task_usage_snapshot().await;
+    let usage = after_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == agents[&session].agent_id)
         .expect("native failed-checkpoint coverage");
@@ -4831,9 +4799,8 @@ async fn task_native_accounting_updates_after_idle_and_restores_known_zero() {
     let restored = fixture
         .restored_agents(&restart, std::slice::from_ref(&session))
         .await;
-    let (_, durable) = fixture.connect_with_bootstrap().await;
-    let durable = durable
-        .task_token_usages
+    let durable_task_usages = fixture.task_usage_snapshot().await;
+    let durable = durable_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == restored[&session].agent_id)
         .unwrap();
@@ -4954,9 +4921,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .expect("send timing turn");
         foreground.wait_until_entered().await;
         fixture.next_chat_event_matching(&root, "wait request observed", |event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "timing-await")).await;
-        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-        let initial = bootstrap
-            .task_token_usages
+        let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+        let initial = bootstrap_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
             .expect("task bootstrap");
@@ -4987,9 +4953,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                 matches!(event, ChatEvent::TypingStatusChanged(false))
             })
             .await;
-        let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-        let running = bootstrap
-            .task_token_usages
+        let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+        let running = bootstrap_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
             .expect("running task bootstrap");
@@ -5025,9 +4990,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
         tokio::time::advance(Duration::from_secs(3)).await;
         background.release_one();
         fixture.next_chat_event_matching(&root, "background completion", |event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "timing-check")).await;
-        let (_, completed_bootstrap) = fixture.connect_with_bootstrap().await;
-        let completed = completed_bootstrap
-            .task_token_usages
+        let completed_bootstrap_task_usages = fixture.task_usage_snapshot().await;
+        let completed = completed_bootstrap_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == root.new_agent.agent_id)
             .expect("completed task bootstrap");
@@ -5122,9 +5086,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             "timing reopened ready",
         )
         .await;
-        let (_, reopened_bootstrap) = fixture.connect_with_bootstrap().await;
-        let reopened_usage = reopened_bootstrap
-            .task_token_usages
+        let reopened_bootstrap_task_usages = fixture.task_usage_snapshot().await;
+        let reopened_usage = reopened_bootstrap_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == reopened.agent_id)
             .expect("reopened timing usage");
@@ -5230,9 +5193,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                 _ => {}
             }
         }
-        let (_, replay) = fixture.connect_with_bootstrap().await;
-        let restored = replay
-            .task_token_usages
+        let replay_task_usages = fixture.task_usage_snapshot().await;
+        let restored = replay_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == restored_agent.agent_id)
             .expect("restored task timing");
@@ -5421,9 +5383,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .restored_agents(&killed, std::slice::from_ref(&session))
             .await;
         let restored_agent = &killed_agents[&session];
-        let (_, crashed) = fixture.connect_with_bootstrap().await;
-        let crashed = crashed
-            .task_token_usages
+        let crashed_task_usages = fixture.task_usage_snapshot().await;
+        let crashed = crashed_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == restored_agent.agent_id)
             .expect("crash-restored timing");
@@ -5509,9 +5470,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
         .await;
         after.wait_until_entered().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        let (_, next_turn) = fixture.connect_with_bootstrap().await;
-        let next_turn = next_turn
-            .task_token_usages
+        let next_turn_task_usages = fixture.task_usage_snapshot().await;
+        let next_turn = next_turn_task_usages
             .iter()
             .find(|payload| payload.root_agent_id == restored_agent.agent_id)
             .expect("next-turn timing");
@@ -5587,9 +5547,9 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .await;
             drop(reservation);
             fixture::next_logical_frame_matching_on(&mut fixture.client, "child bounded trace complete", |env| env.stream == child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "retention-tool-64"))).await;
-            let (_, own) = fixture.connect_with_bootstrap().await;
+            let own_task_usages = fixture.task_usage_snapshot().await;
             assert_eq!(
-                own.task_token_usages
+                own_task_usages
                     .iter()
                     .find(|usage| usage.root_agent_id == restored_agent.agent_id)
                     .expect("bounded descendant traces")
@@ -5598,9 +5558,8 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
                 64 * (index + 2)
             );
         }
-        let (_, bounded) = fixture.connect_with_bootstrap().await;
-        let timing = &bounded
-            .task_token_usages
+        let bounded_task_usages = fixture.task_usage_snapshot().await;
+        let timing = &bounded_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == restored_agent.agent_id)
             .expect("bounded task trace")
@@ -5858,9 +5817,9 @@ async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() 
         other => panic!("expected partial descendant usage after close, got {other:?}"),
     }
 
-    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    let bootstrapped = bootstrap
-        .task_token_usages
+    let (_late_client, _) = fixture.connect_with_bootstrap().await;
+    let bootstrap_task_usages = fixture.task_usage_snapshot().await;
+    let bootstrapped = bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == root.agent_id)
         .expect("HostBootstrap should include partial root task token usage");
@@ -11812,6 +11771,7 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     );
 
     let (mut late_client, eager_bootstrap) = fixture.connect_with_bootstrap().await;
+    let eager_bootstrap_task_usages = fixture.task_usage_snapshot().await;
     let replayed_child_new = bootstrapped_agent(&eager_bootstrap, &child_new.agent_id);
     assert_eq!(replayed_child_new.origin, AgentOrigin::BackendNative);
     assert_eq!(
@@ -11851,8 +11811,7 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     );
     assert_eq!(root.origin, AgentOrigin::User);
     // Lazy mobile bootstraps omit rollups; use the eager subscriber's usage snapshot.
-    let usage = eager_bootstrap
-        .task_token_usages
+    let usage = eager_bootstrap_task_usages
         .iter()
         .find(|usage| usage.root_agent_id == parent_new.agent_id)
         .expect("native tree task usage in host bootstrap");
@@ -14049,15 +14008,16 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
             .expect("request unclaimed creation");
         handoff.wait_until_entered().await;
         let (mut pending, bootstrap) = fixture.connect_with_bootstrap().await;
+        let bootstrap_task_usages = fixture.task_usage_snapshot().await;
         assert!(
             bootstrap.agents.is_empty(),
             "creation has not published NewAgent"
         );
         assert!(
-            !bootstrap.task_token_usages.is_empty(),
+            !bootstrap_task_usages.is_empty(),
             "pending actor retains usage ownership"
         );
-        for usage in &bootstrap.task_token_usages {
+        for usage in &bootstrap_task_usages {
             for entry in &usage.breakdown {
                 assert_eq!(
                     entry.navigation,
@@ -14135,12 +14095,13 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
                     break;
                 }
             }
-            let (mut late, bootstrap) = fixture.connect_with_bootstrap().await;
+            let (mut late, _) = fixture.connect_with_bootstrap().await;
+            let bootstrap_task_usages = fixture.task_usage_snapshot().await;
             assert!(
-                !bootstrap.task_token_usages.is_empty(),
+                !bootstrap_task_usages.is_empty(),
                 "failed cleanup must retain canonical ownership"
             );
-            for usage in &bootstrap.task_token_usages {
+            for usage in &bootstrap_task_usages {
                 for entry in &usage.breakdown {
                     assert_eq!(
                         entry.navigation,
@@ -14179,9 +14140,10 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
                 "recovered unclaimed cleanup",
             )
             .await;
-            let (mut recovered, bootstrap) = fixture.connect_with_bootstrap().await;
+            let (mut recovered, _) = fixture.connect_with_bootstrap().await;
+            let bootstrap_task_usages = fixture.task_usage_snapshot().await;
             assert!(
-                bootstrap.task_token_usages.is_empty(),
+                bootstrap_task_usages.is_empty(),
                 "successful close removes retained ownership"
             );
             recovered
@@ -14209,12 +14171,13 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
             continue;
         }
         let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+        let bootstrap_task_usages = fixture.task_usage_snapshot().await;
         assert!(
             bootstrap.agents.is_empty(),
             "cancelled creation must not leave a live agent"
         );
         assert!(
-            bootstrap.task_token_usages.is_empty(),
+            bootstrap_task_usages.is_empty(),
             "cancelled creation must not leave a live usage root"
         );
     }
@@ -16519,9 +16482,8 @@ async fn stopping_an_untracked_background_command_closes_its_card() {
             completion.outcome
         );
 
-        let (_, cancelled) = fixture.connect_with_bootstrap().await;
-        let timing = &cancelled
-            .task_token_usages
+        let cancelled_task_usages = fixture.task_usage_snapshot().await;
+        let timing = &cancelled_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
             .expect("cancelled tool timing")
@@ -16563,9 +16525,8 @@ async fn stopping_an_untracked_background_command_closes_its_card() {
             matches!(next, ChatEvent::StreamEnd(_)),
             "a repeated stop closed the card twice: {next:?}"
         );
-        let (_, settled) = fixture.connect_with_bootstrap().await;
-        let timing = &settled
-            .task_token_usages
+        let settled_task_usages = fixture.task_usage_snapshot().await;
+        let timing = &settled_task_usages
             .iter()
             .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
             .expect("settled cancellation timing")
@@ -17635,8 +17596,9 @@ async fn human_home_help_hands_off_to_independent_project_owner() {
     let resumed_start: AgentStartPayload = env.parse_payload().unwrap();
     assert_eq!(resumed_start.tyde_permissions, AgentTydePermissions::Root);
     let (mut reader, snapshot) = fixture.connect_with_bootstrap().await;
+    let snapshot_task_usages = fixture.task_usage_snapshot().await;
     assert!(
-        matches!(&snapshot.task_token_usages.iter().find(|usage| usage.root_agent_id == resumed.agent_id).expect("unreadable Help accounting").total.status, TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        matches!(&snapshot_task_usages.iter().find(|usage| usage.root_agent_id == resumed.agent_id).expect("unreadable Help accounting").total.status, TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
         "a usable resumed Help chat must not certify its unreadable accounting complete"
     );
     let replay_stream = bootstrapped_agent(&snapshot, &resumed.agent_id).instance_stream;

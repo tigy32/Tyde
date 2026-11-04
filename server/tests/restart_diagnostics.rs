@@ -133,9 +133,8 @@ async fn restart_diagnostics_attribute_missing_checkpoints_without_replacing_acc
         .await
         .unwrap();
     cancelled.expect_queued_messages(&agent, 1).await;
-    let (_, live_before) = cancelled.connect_with_bootstrap().await;
-    let known_before = live_before
-        .task_token_usages
+    let task_usage_snapshot = cancelled.task_usage_snapshot().await;
+    let known_before = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == original_id)
         .expect("typed live accounting before fault")
@@ -275,9 +274,8 @@ async fn restart_diagnostics_attribute_missing_checkpoints_without_replacing_acc
         }
     }
     drop(reservation);
-    let (_, recovered) = cancelled.connect_with_bootstrap().await;
-    let known_after = &recovered
-        .task_token_usages
+    let task_usage_snapshot = cancelled.task_usage_snapshot().await;
+    let known_after = &task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == original_id)
         .expect("typed accounting after recovery")

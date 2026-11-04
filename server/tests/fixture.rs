@@ -731,6 +731,55 @@ impl Fixture {
         connect_client_with_bootstrap(self.host.clone()).await
     }
 
+    // Accounting assertions consume the background worker's real protocol
+    // updates; ordinary connection/inventory helpers must never wait for them.
+    #[allow(dead_code)]
+    pub async fn task_usage_snapshot(&self) -> Vec<protocol::TaskTokenUsagePayload> {
+        let (mut client, bootstrap) = self.connect_with_bootstrap().await;
+        let mut usages = bootstrap
+            .task_token_usages
+            .into_iter()
+            .map(|usage| (usage.root_agent_id.clone(), usage))
+            .collect::<HashMap<_, _>>();
+        self.host.synchronize_task_usage_refresh_for_test().await;
+        // HeartbeatAck is Control and can overtake TaskTokenUsage. A distinct
+        // SessionList view is ordered on the same Chat lane as accounting.
+        client
+            .list_sessions(protocol::ListSessionsPayload {
+                scope: Some(protocol::SessionListScope::RootSessions),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("send accounting publication fence");
+        loop {
+            let next = client.next_event();
+            tokio::pin!(next);
+            let frame = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut next => break result.expect("read accounting publication")
+                        .expect("accounting connection stays open"),
+                    _ = tokio::task::yield_now() => {},
+                }
+            };
+            if frame.kind == FrameKind::TaskTokenUsage {
+                let usage: protocol::TaskTokenUsagePayload =
+                    frame.parse_payload().expect("typed task accounting update");
+                usages.insert(usage.root_agent_id.clone(), usage);
+            } else if frame.kind == FrameKind::SessionList {
+                let fence: protocol::SessionListPayload =
+                    frame.parse_payload().expect("accounting fence");
+                if fence.page.scope == protocol::SessionListScope::RootSessions
+                    && fence.page.limit == Some(1)
+                {
+                    break;
+                }
+            }
+        }
+        usages.into_values().collect()
+    }
+
     #[allow(dead_code)]
     pub async fn connect_cancellable(&self) -> (client::Connection, tokio::task::JoinHandle<()>) {
         let (mut client, task) = connect_owned_raw_client(self.host.clone()).await;

@@ -1023,7 +1023,7 @@ pub(crate) struct HostState {
     #[cfg(feature = "test-support")]
     agent_publication_start_test_gate: Option<state_owner::StartTestGate>,
     #[cfg(feature = "test-support")]
-    bootstrap_snapshot_reply_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    bootstrap_publication_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     usage_reset_publication_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
@@ -2836,13 +2836,13 @@ impl HostHandle {
     }
 
     #[cfg(feature = "test-support")]
-    pub async fn install_next_bootstrap_snapshot_reply_test_gate(
+    pub async fn install_next_bootstrap_publication_test_gate(
         &self,
     ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         let shared = gate.shared();
         self.state
-            .with(move |state| state.bootstrap_snapshot_reply_test_gate = Some(shared))
+            .with(move |state| state.bootstrap_publication_test_gate = Some(shared))
             .await;
         gate
     }
@@ -3897,10 +3897,6 @@ impl HostHandle {
                 });
             }
         }
-        let usage_sources = match agent_replay {
-            AgentReplayMode::Lazy => None,
-            AgentReplayMode::Eager => Some(task_token_usage_sources_for_state(state)),
-        };
         let mut agents_with_background_work = Vec::new();
         for agent in &agents {
             if state.registry.has_background_work(&agent.agent_id) {
@@ -3912,7 +3908,6 @@ impl HostHandle {
         let tychat_snapshot = state.tychat.snapshot();
         let dots_snapshot = state.dots.state.borrow().clone();
 
-            let task_token_usages = Vec::new();
         let (settings_doc, configured_secrets, settings_etag) = {
             let store = Arc::clone(&settings_store_for_projection);
             settings_wire_projection(&store, &settings)
@@ -3958,7 +3953,7 @@ impl HostHandle {
             teams_store_load_error: team_snapshot.load_error,
             agent_restoration_failures,
             agents,
-            task_token_usages,
+            task_token_usages: Vec::new(),
             workflow_summaries,
             workflow_diagnostics,
             workflow_runs,
@@ -3966,13 +3961,12 @@ impl HostHandle {
             agents_view_preferences,
         };
 
-            Some((bootstrap, usage_sources, deferred_attachments, settings_doc,
+            Some((bootstrap, deferred_attachments, settings_doc,
                 refresh_dynamic_session_schemas, project_ids, swarm_load_error))
         })).await
         };
         let Some((
-            mut bootstrap,
-            usage_sources,
+            bootstrap,
             deferred_attachments,
             settings_doc,
             refresh_dynamic_session_schemas,
@@ -3983,25 +3977,13 @@ impl HostHandle {
             return Vec::new();
         };
         #[cfg(feature = "test-support")]
-        let snapshot_gate = self
+        if let Some(gate) = self
             .state
-            .with(|state| state.bootstrap_snapshot_reply_test_gate.take())
-            .await;
-        let (usage_snapshots, usage_live, usage_sessions) = match usage_sources {
-            Some((handles, closed, live, sessions)) => (
-                task_token_usage_snapshots_from_handles(
-                    handles,
-                    closed,
-                    #[cfg(feature = "test-support")]
-                    snapshot_gate,
-                )
-                .await,
-                live,
-                sessions,
-            ),
-            None => (Vec::new(), HashSet::new(), HashMap::new()),
-        };
-        let learning_usage = self.config.usage().await;
+            .with(|state| state.bootstrap_publication_test_gate.take())
+            .await
+        {
+            wait_for_spawn_operation_test_gate_inner(&gate).await;
+        }
         let bootstrap_agent_ids = bootstrap
             .agents
             .iter()
@@ -4012,10 +3994,6 @@ impl HostHandle {
             .state
             .with(move |state| {
                 let mut deferred_attachments = deferred_attachments;
-                bootstrap.task_token_usages = task_token_usage_rollups_from_snapshots(usage_snapshots, &state.task_usage_resets, &usage_live, &usage_sessions, &learning_usage);
-
-                let advertised = bootstrap_agent_ids.iter().filter(|id| task_usage_agent_is_live(state, id)).cloned().collect();
-                project_task_usage_navigation(&advertised, &mut bootstrap.task_token_usages);
                 let mut payload = serde_json::to_value(&bootstrap)
                     .expect("failed to serialize HostBootstrap payload for host stream registration");
                 payload["settings"] = settings_doc;
@@ -4073,11 +4051,6 @@ impl HostHandle {
                     subscriber.last_backend_native_settings_snapshots = Some(Vec::new());
                     subscriber.last_launch_profile_catalog =
                         Some(bootstrap.launch_profile_catalog.clone());
-                    subscriber.last_task_token_usages = bootstrap
-                        .task_token_usages
-                        .iter()
-                        .map(|payload| (payload.root_agent_id.clone(), payload.clone()))
-                        .collect();
                     (
                         std::mem::take(&mut subscriber.pending_bootstrap_new_agents),
                         std::mem::take(&mut subscriber.pending_bootstrap_frames),
@@ -4197,6 +4170,10 @@ impl HostHandle {
                     }
                 }
 
+                if agent_replay == AgentReplayMode::Eager {
+                    // Optional accounting must not delay the agent inventory.
+                    state.registry.notify_usage_changed();
+                }
                 deferred_attachments
             })
             .await;
@@ -10672,10 +10649,10 @@ std::ops::ControlFlow::Continue((
                         snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
                     }
                     fan_out_current_agents_view_preferences(state);
+                    state.registry.notify_usage_changed();
                 })
                 .await
         }
-        self.fan_out_task_token_usages().await;
         self.fan_out_session_lists().await.map_err(|error| AppError::internal(OPERATION,
             anyhow!("Saved session deletion committed; session-list publication failed. Do not repeat the deletion: {error}")))?;
         drop(deletion_guard);
@@ -10774,6 +10751,17 @@ std::ops::ControlFlow::Continue((
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn pending_agent_usage_reads_for_test(
+        &self,
+        agent_id: &AgentId,
+    ) -> tokio::sync::watch::Receiver<usize> {
+        self.agent_handle(agent_id)
+            .await
+            .expect("usage observation requires a registered agent")
+            .pending_usage_reads_for_test()
+    }
+
     /// Settles pending status or elapsed refresh work, then acknowledges the
     /// armed deadline. A future timer is not fired or rearmed by this barrier.
     #[cfg(feature = "test-support")]
@@ -10792,13 +10780,7 @@ std::ops::ControlFlow::Continue((
             .state
             .with(|state| task_token_usage_sources_for_state(state))
             .await;
-        let snapshots = task_token_usage_snapshots_from_handles(
-            handles,
-            closed_snapshots,
-            #[cfg(feature = "test-support")]
-            None,
-        )
-        .await;
+        let snapshots = task_token_usage_snapshots_from_handles(handles, closed_snapshots).await;
         let learning_usage = self.config.usage().await;
         self.state
             .with(move |state| {
@@ -10832,13 +10814,7 @@ std::ops::ControlFlow::Continue((
             .state
             .with(|state| task_token_usage_sources_for_state(state))
             .await;
-        let snapshots = task_token_usage_snapshots_from_handles(
-            handles,
-            closed,
-            #[cfg(feature = "test-support")]
-            None,
-        )
-        .await;
+        let snapshots = task_token_usage_snapshots_from_handles(handles, closed).await;
         #[cfg(feature = "test-support")]
         usage_reset_diagnostic("server:snapshots-read");
         let rollups = task_token_usage_rollups_from_snapshots(
@@ -13787,7 +13763,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                     .await
             }
         }
-        self.fan_out_task_token_usages().await;
         Ok(true)
     }
 
@@ -16211,7 +16186,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                             }
                         }
                     }
-                    state.registry.notify_session_binding_changed();
+                    state.registry.notify_usage_changed();
                     tracing::debug!(
                         trigger = "session_binding",
                         "publishing current annotation snapshot"
@@ -16704,7 +16679,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         self.state
             .with(move |state| {
                 visibility.finish_new_agent_fanout(state);
-                state.registry.notify_session_binding_changed();
+                state.registry.notify_usage_changed();
             })
             .await;
         visibility_guard.disarm();
@@ -20459,7 +20434,7 @@ fn spawn_host_inner(
         #[cfg(feature = "test-support")]
         agent_publication_start_test_gate: None,
         #[cfg(feature = "test-support")]
-        bootstrap_snapshot_reply_test_gate: None,
+        bootstrap_publication_test_gate: None,
         #[cfg(feature = "test-support")]
         usage_reset_publication_test_gate: None,
         #[cfg(feature = "test-support")]
@@ -24599,33 +24574,19 @@ fn task_token_usage_sources_for_state(
 async fn task_token_usage_snapshots_from_handles(
     handles: Vec<AgentHandle>,
     closed_snapshots: Vec<AgentUsageSnapshot>,
-    #[cfg(feature = "test-support")] mut snapshot_gate: Option<Arc<SpawnOperationTestGateInner>>,
 ) -> Vec<AgentUsageSnapshot> {
     let mut snapshots = Vec::new();
     for handle in handles {
-        snapshots.push(
-            read_agent_usage_snapshot_or_unavailable(
-                &handle,
-                #[cfg(feature = "test-support")]
-                snapshot_gate.take(),
-            )
-            .await,
-        );
+        snapshots.push(read_agent_usage_snapshot_or_unavailable(&handle).await);
     }
     snapshots.extend(closed_snapshots);
     snapshots
 }
 
-async fn read_agent_usage_snapshot_or_unavailable(
-    handle: &AgentHandle,
-    #[cfg(feature = "test-support")] gate: Option<Arc<SpawnOperationTestGateInner>>,
-) -> AgentUsageSnapshot {
+async fn read_agent_usage_snapshot_or_unavailable(handle: &AgentHandle) -> AgentUsageSnapshot {
     let start = handle.snapshot();
     handle
-        .read_usage_snapshot(
-            #[cfg(feature = "test-support")]
-            gate,
-        )
+        .read_usage_snapshot()
         .await
         .unwrap_or_else(|| unavailable_agent_usage_snapshot(start))
 }

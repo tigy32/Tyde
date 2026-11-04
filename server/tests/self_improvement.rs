@@ -287,9 +287,8 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         "Each accepted identity is analyzed once"
     );
     let reconnect = fixture.connect_with_bootstrap().await;
-    let task = reconnect
-        .1
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let task = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == agent.new_agent.agent_id)
         .expect("author task rollup");
@@ -982,12 +981,12 @@ async fn journal_failure_and_replay_preserve_author_once_and_accounting_failure_
     assert_eq!(recovered.changes.len(), 1, "Reprojection must not reapply");
     fixture.host_for_test().stop_learning_for_test().await;
     eprintln!("LEARNING JOURNAL phase=accounting_actor_stopped");
-    let incomplete = fixture.connect_with_bootstrap().await.1;
     eprintln!("LEARNING JOURNAL phase=incomplete_accounting_bootstrapped");
-    assert!(!incomplete.task_token_usages.is_empty());
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    assert!(!task_usage_snapshot.is_empty());
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
     assert!(
-        incomplete
-            .task_token_usages
+        task_usage_snapshot
             .iter()
             .all(|usage| match &usage.total.status {
                 TaskTokenUsageStatus::Partial { reasons, .. }

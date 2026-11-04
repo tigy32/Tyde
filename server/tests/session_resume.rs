@@ -751,9 +751,8 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         )
         .await;
     fixture.finish_turn(&parent).await;
-    let (_, before) = fixture.connect_with_bootstrap().await;
-    let parent_usage = before
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let parent_usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
         .expect("parent usage")
@@ -822,9 +821,8 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         "resuming an open session must produce a distinct card"
     );
 
-    let (_, shared) = fixture.connect_with_bootstrap().await;
-    let usage = shared
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
         .expect("shared-session task accounting");
@@ -868,9 +866,8 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     })
     .await;
 
-    let (_, remaining) = fixture.connect_with_bootstrap().await;
-    let usage = remaining
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
         .expect("remaining shared accounting");
@@ -878,8 +875,8 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         usage.total.usage.total_tokens, parent_usage,
         "closing one card cannot certify shared historical attribution"
     );
-    let parent_session = before
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let parent_session = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == parent.new_agent.agent_id)
         .and_then(|usage| usage.root_session_id.clone())
@@ -894,10 +891,9 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     restored_by_session.get(&session).expect(
         "the card still open must be restored; closing its sibling must not withdraw the session",
     );
-    let (_, after_restart) = fixture.connect_with_bootstrap().await;
     let restored_parent = &restored_by_session[&parent_session];
-    let usage = after_restart
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == restored_parent.agent_id)
         .expect("restored shared accounting");
@@ -940,9 +936,8 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         "mock backend response to: shared after reset",
     )
     .await;
-    let (_, scoped) = fixture.connect_with_bootstrap().await;
-    let scoped = scoped
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let scoped = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == restored_parent.agent_id)
         .unwrap();
@@ -4633,9 +4628,8 @@ async fn a_transcript_that_cannot_be_written_reports_a_non_fatal_error() {
         |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
     )
     .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == reopened.agent_id)
         .expect("append-loss accounting after resume");
@@ -4748,9 +4742,8 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
     )
     .await;
 
-    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
-    let usage = bootstrap
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == resumed.agent_id)
         .expect("damaged accounting rollup");
@@ -4809,18 +4802,18 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         "mock backend response to: after missing journal",
     )
     .await;
-    let (_, after_missing) = fixture.connect_with_bootstrap().await;
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
     assert!(
-        matches!(&after_missing.task_token_usages.iter().find(|usage| usage.root_agent_id == missing.agent_id).expect("missing-journal usage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        matches!(&task_usage_snapshot.iter().find(|usage| usage.root_agent_id == missing.agent_id).expect("missing-journal usage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
         "a new journal cannot certify lost history complete"
     );
     let bootstrap = fixture.restart_host().await;
     let restored = fixture
         .restored_agents(&bootstrap, std::slice::from_ref(&session_id))
         .await;
-    let (_, restarted) = fixture.connect_with_bootstrap().await;
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
     assert!(
-        matches!(&restarted.task_token_usages.iter().find(|usage| usage.root_agent_id == restored[&session_id].agent_id).expect("persistent missing-history coverage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
+        matches!(&task_usage_snapshot.iter().find(|usage| usage.root_agent_id == restored[&session_id].agent_id).expect("persistent missing-history coverage").total.status, protocol::TaskTokenUsageStatus::Partial { reasons, .. } if reasons.contains(&protocol::TaskTokenUsageUnavailableReason::AccountingHistoryIncomplete)),
         "recreating a journal must not clear historical incompleteness after restart"
     );
     // A complete, independent session must not select provider accounting merely
@@ -4835,9 +4828,8 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         )
         .await;
     fixture.finish_turn(&complete).await;
-    let (_, before) = fixture.connect_with_bootstrap().await;
-    let usage = before
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == complete.new_agent.agent_id)
         .expect("complete usage before marker loss");
@@ -4892,9 +4884,8 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         "mock backend response to: new own turn",
     )
     .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == resumed.agent_id)
         .expect("marker-loss accounting");
@@ -4952,9 +4943,8 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         "mock backend response to: after directory loss",
     )
     .await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == missing.agent_id)
         .expect("missing-directory accounting");
@@ -5054,9 +5044,8 @@ async fn restart_does_not_resurrect_backend_native_children() {
     assert!(child_settings.schema.is_none());
 
     fixture::next_logical_frame_matching_on(&mut fixture.client, "running native tool observation", |env| env.stream == child.instance_stream && env.kind == FrameKind::ChatEvent && env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "native-running-timing"))).await;
-    let (_, before) = fixture.connect_with_bootstrap().await;
-    let own_before = before
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let own_before = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == parent.agent_id)
         .expect("running native task usage")
@@ -5099,9 +5088,9 @@ async fn restart_does_not_resurrect_backend_native_children() {
             .any(|agent| agent.agent_id == child.agent_id),
         "a failed restart cannot replace the instance before accounting commits"
     );
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
     assert_eq!(
-        still_owned
-            .task_token_usages
+        task_usage_snapshot
             .iter()
             .find(|usage| usage.root_agent_id == parent.agent_id)
             .expect("failed-restart source accounting")
@@ -5129,9 +5118,8 @@ async fn restart_does_not_resurrect_backend_native_children() {
     );
 
     restoration_finished.wait_until_entered().await;
-    let (_, after) = fixture.connect_with_bootstrap().await;
-    let usage = after
-        .task_token_usages
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
+    let usage = task_usage_snapshot
         .iter()
         .find(|usage| usage.root_agent_id == restored_parent.agent_id)
         .expect("running native accounting retained after restart");
@@ -7705,9 +7693,9 @@ async fn non_cancellable_restored_child_startup_holds_its_parent() {
             },
         )
         .await;
+    let task_usage_snapshot = fixture.task_usage_snapshot().await;
     assert!(
-        bootstrap
-            .task_token_usages
+        task_usage_snapshot
             .iter()
             .any(|usage| match &usage.total.status {
                 protocol::TaskTokenUsageStatus::Unavailable { reasons, .. }
@@ -7716,7 +7704,7 @@ async fn non_cancellable_restored_child_startup_holds_its_parent() {
                 }
                 protocol::TaskTokenUsageStatus::Known => false,
             }),
-        "bootstrap reports unsettled accounting without awaiting held native startup"
+        "background accounting reports unsettled startup without delaying inventory"
     );
     let mut restored = RestoredReplay::seed(&bootstrap);
     let descriptors = restored

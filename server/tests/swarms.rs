@@ -6405,9 +6405,8 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             "actual retirement native teardown held before registry removal",
         )
         .await;
-    // Fresh UI bootstrap asks every actor for usage; the closing actor cannot
-    // service ReadUsageSnapshot while awaiting native shutdown. This existing
-    // authenticated survivor reads canonical state over HTTP without that wait.
+    // The authenticated survivor observes the canonical retiring state while
+    // actual native shutdown still owns the member's binding.
     let teardown_describe: SwarmDescribe =
         tool_value(&(call_tool(&retained_caller, "tyde_swarm_describe", json!({}))).await);
     assert!(teardown_describe.member_id == retained.spec.id);

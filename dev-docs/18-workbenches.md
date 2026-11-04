@@ -567,6 +567,12 @@ Successful flow:
    warnings. Later watcher/scanning failures remain project-owned errors and
    state, not a catalog rollback or failed mutation.
 
+Closing an agent and deleting a saved session notify the existing task-usage
+worker; lifecycle completion does not await usage replies from unrelated agents.
+Required teardown, durable accounting checkpoints and reference deletion still
+complete before their lifecycle result. Accounting navigation changes remain
+server-owned and publish through the same usage worker after its sources reply.
+
 `ProjectNotify::Delete` is only emitted after both git removal and store
 deletion succeed. If git removal succeeds but store delete fails, surface
 `Internal` and leave the record in place. Do not emit `Delete`. The record
