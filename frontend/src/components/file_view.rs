@@ -534,9 +534,16 @@ fn FileViewLoaded(
         state_for_restore.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
     });
 
-    // Measure the geometry once after first paint. The
-    // Effect re-runs if the underlying signals fire
-    // (rare here — only the initial mount).
+    type GeometryObserver = Option<(web_sys::ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>;
+    let geometry_observer: StoredValue<GeometryObserver, LocalStorage> =
+        StoredValue::new_local(None);
+    on_cleanup(move || {
+        geometry_observer.update_value(|slot| {
+            if let Some((observer, _callback)) = slot.take() {
+                observer.disconnect();
+            }
+        });
+    });
     let perf_key_for_measure = format!("file:{}", f.path.relative_path);
     let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
@@ -545,29 +552,55 @@ fn FileViewLoaded(
         }
         let Some(el) = pre_ref.get() else { return };
         el.set_scroll_top(scroll_top.get_untracked() as i32);
-        let vh = el.client_height() as f64;
-        if vh > 0.0 {
-            viewport_height.set(vh);
-        }
-        if let Ok(Some(line_el)) = el.query_selector(".file-line")
-            && let Some(html_el) = line_el.dyn_ref::<web_sys::HtmlElement>()
-        {
-            let lh = html_el.offset_height() as f64;
-            if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
-                line_height.set(lh);
+        geometry_observer.update_value(|slot| {
+            if let Some((observer, _callback)) = slot.take() {
+                observer.disconnect();
             }
-            if !measure_logged.get() {
-                measure_logged.set(true);
-                // Signal the goto re-snap Effect that the real line height is
-                // now known so it can correct + consume the request.
-                geometry_measured.set(true);
-                crate::perf::log_phase(
-                    "file_open",
-                    "first_paint_measured",
-                    &perf_key_for_measure,
-                    &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
-                );
+        });
+        let element: web_sys::Element = el.clone().unchecked_into();
+        let measure_logged = measure_logged.clone();
+        let perf_key_for_measure = perf_key_for_measure.clone();
+        let measure = move || {
+            if show_rendered.get_untracked() {
+                return;
             }
+            let vh = el.client_height() as f64;
+            if vh > 0.0 {
+                viewport_height.set(vh);
+            }
+            if let Ok(Some(line_el)) = el.query_selector(".file-line")
+                && let Some(html_el) = line_el.dyn_ref::<web_sys::HtmlElement>()
+            {
+                let lh = html_el.offset_height() as f64;
+                if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
+                    line_height.set(lh);
+                }
+                if !measure_logged.get() {
+                    measure_logged.set(true);
+                    // Signal the goto re-snap Effect that the real line height is
+                    // now known so it can correct + consume the request.
+                    geometry_measured.set(true);
+                    crate::perf::log_phase(
+                        "file_open",
+                        "first_paint_measured",
+                        &perf_key_for_measure,
+                        &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
+                    );
+                }
+            }
+            // A resize can also clamp native scrollTop near the end of a file.
+            scroll_top.set(el.scroll_top() as f64);
+        };
+        measure();
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |_| measure());
+        match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => {
+                observer.observe(&element);
+                geometry_observer.set_value(Some((observer, callback)));
+            }
+            Err(error) => crate::components::header::report_user_error(format!(
+                "Could not observe file viewport size: {error:?}"
+            )),
         }
     });
 
@@ -3832,6 +3865,54 @@ mod wasm_tests {
         }
     }
 
+    async fn animation_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    }
+
+    fn assert_populated_file_view(pre: &HtmlElement, total_lines: usize) {
+        let rect = pre.get_bounding_client_rect();
+        let nodes = pre.query_selector_all("[data-find-idx]").unwrap();
+        let mut previous_bottom = None;
+        let mut first_top = None;
+        let mut last_bottom = 0.0;
+        for index in 0..nodes.length() {
+            let row = nodes.item(index).unwrap().dyn_into::<Element>().unwrap();
+            let line: usize = row.get_attribute("data-find-idx").unwrap().parse().unwrap();
+            let code = row.query_selector("code").unwrap().unwrap();
+            assert_eq!(code.text_content().unwrap(), format!("line {line}"));
+            let row_rect = row.get_bounding_client_rect();
+            assert_eq!(row_rect.height(), 20.0, "source row height changed");
+            assert_eq!(
+                row_rect.top(),
+                rect.top() + 12.0 + line as f64 * 20.0 - pre.scroll_top() as f64,
+                "source line is positioned at the wrong file offset"
+            );
+            if let Some(bottom) = previous_bottom {
+                assert_eq!(row_rect.top(), bottom, "gap between source rows");
+            }
+            first_top.get_or_insert(row_rect.top());
+            previous_bottom = Some(row_rect.bottom());
+            last_bottom = row_rect.bottom();
+        }
+        let content_top = rect.top() + 12.0;
+        let content_bottom = (rect.bottom() - 12.0)
+            .min(content_top + total_lines as f64 * 20.0 - pre.scroll_top() as f64);
+        assert!(
+            first_top.unwrap() <= content_top,
+            "blank top of file viewport"
+        );
+        assert!(
+            last_bottom >= content_bottom,
+            "blank bottom of file viewport: rows end at {last_bottom}, viewport ends at {content_bottom}"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn large_file_only_renders_visible_window() {
         ensure_styles_loaded();
@@ -3920,6 +4001,30 @@ mod wasm_tests {
              expected≈{expected_total:.0}px (row_height={row_height:.1}px × \
              {total_lines} lines), ratio={ratio:.3}"
         );
+        // Disjoint jumps must replace the rows, not leave a blank viewport.
+        for target in [60_000, 4_000, 98_000, 24_000, 0, 50_000] {
+            pre.set_scroll_top(target);
+            pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_populated_file_view(&pre, total_lines);
+        }
+        // The viewer can grow without another scroll event (window/pane resize).
+        container.style().set_property("height", "2400px").unwrap();
+        animation_frame().await;
+        next_tick().await;
+        assert_populated_file_view(&pre, total_lines);
+        for target in [90_000, 0, 45_000] {
+            pre.set_scroll_top(target);
+            pre.dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_populated_file_view(&pre, total_lines);
+        }
+        container.style().set_property("height", "400px").unwrap();
+        animation_frame().await;
+        next_tick().await;
+        assert_populated_file_view(&pre, total_lines);
     }
 
     /// The open-at-line path (from project search): a `pending_goto_line`

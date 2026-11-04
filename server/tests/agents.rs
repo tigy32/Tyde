@@ -16837,14 +16837,15 @@ async fn help_controls_top_level_agents_across_projects() {
         "Help-deleted project must leave the project list"
     );
 
+    let initial_idle_gate = MockGateHandle::new();
     let redirect_gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "Help-created top level",
-            MockScript::one(MockTurn::exit_plan_request(
-                "help-pending-plan",
-                "# Pending plan",
-            ))
+            MockScript::one(
+                MockTurn::exit_plan_request("help-pending-plan", "# Pending plan")
+                    .with_gate_before_idle(&initial_idle_gate),
+            )
             .then(MockTurn::held_text("default redirect reply"))
             .then(MockTurn::gated_text("redirect reply", &redirect_gate))
             .then(MockTurn::text("queued reply"))
@@ -16882,6 +16883,10 @@ async fn help_controls_top_level_agents_across_projects() {
     assert_eq!(start.custom_agent_id, project_manager);
     assert!(start.parent_agent_id.is_none());
     assert_eq!(start.workspace_roots, project_roots(&project));
+    // Bootstrap omits historical typing events; attach before the initial idle.
+    initial_idle_gate.wait_until_entered().await;
+    eprintln!("HELP CONFIG initial plan observer attached before idle");
+    initial_idle_gate.release_one();
     fixture::expect_paused_tool_request_on(
         &mut fixture.client,
         &new.instance_stream,
@@ -16889,6 +16894,7 @@ async fn help_controls_top_level_agents_across_projects() {
     )
     .await;
 
+    eprintln!("HELP CONFIG initial plan pause observed");
     let listed = config_agent_tool(&url, "tyde_config_list_agents", json!({})).await;
     let listed = mcp_success_json(&listed);
     let agents = listed.as_array().unwrap();
