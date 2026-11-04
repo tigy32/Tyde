@@ -1978,6 +1978,32 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
 
     let (is_error, body) = call_agent_control(
         &fixture,
+        &spawned.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "spawned worker self-query failed");
+    let worker_scope: Value = serde_json::from_str(&body).expect("worker scope JSON");
+    assert!(
+        worker_scope["caller_project_id"] == workbench.id.0,
+        "caller identity must match the spawned worker, not its canonical parent"
+    );
+    let worker_projects = worker_scope["projects"]
+        .as_array()
+        .expect("worker projects");
+    assert_eq!(worker_projects.len(), 2);
+    for expected in [&parent.id, &workbench.id] {
+        assert!(
+            worker_projects
+                .iter()
+                .any(|project| project["project_id"] == expected.0),
+            "reporting the actual caller must preserve canonical parent/workbench visibility"
+        );
+    }
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
         &orchestrator.agent_id,
         "tyde_spawn_agent",
         json!({
@@ -5506,6 +5532,23 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         mapped.parent_agent_id.as_ref() == Some(&caller.agent_id),
         "MCP child must preserve its authenticated caller as parent"
     );
+    for agent_id in [&caller.agent_id, &mapped.agent_id] {
+        let (failed, body) =
+            call_agent_control(&fixture, agent_id, "tyde_list_workbenches", json!({})).await;
+        assert!(!failed, "Bubblewrap worker self-query failed");
+        let scope: Value = serde_json::from_str(&body).expect("Bubblewrap scope JSON");
+        assert!(
+            scope["caller_project_id"] == project.id.0,
+            "Bubblewrap caller identity must not be replaced by its Native parent"
+        );
+        let own = scope["projects"]
+            .as_array()
+            .expect("scoped projects")
+            .iter()
+            .find(|entry| entry["project_id"] == project.id.0)
+            .expect("caller workbench remains visible");
+        assert_eq!(own["environment"]["kind"], "bubblewrap");
+    }
     let (_, replay) = fixture.connect_with_bootstrap().await;
     assert!(
         replay.projects.iter().any(|entry| entry == &project),

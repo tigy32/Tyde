@@ -1687,7 +1687,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List the authenticated caller's canonical project and its git workbenches, or a writable swarm's current host/project scope. Includes newly created workbenches. Ordinary agents can use returned project IDs for spawning."
+        description = "Return caller_project_id as the authenticated caller's current project, and list its canonical parent and workbenches or a writable swarm's host/project scope. Includes newly created workbenches. An agent spawned in a workbench is already assigned there; no create or move is needed."
     )]
     async fn tyde_list_workbenches(
         &self,
@@ -3122,8 +3122,8 @@ async fn do_list_workbenches(
             host.list_projects().await?,
         )
     } else {
-        let (caller_project_id, projects) = caller_project_scope(host, caller).await?;
-        (Some(caller_project_id), projects)
+        let (_, projects) = caller_project_scope(host, caller).await?;
+        (host.project_id_for_agent(caller).await, projects)
     };
     let interrupted_creations = host
         .project_catalog

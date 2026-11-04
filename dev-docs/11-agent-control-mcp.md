@@ -787,6 +787,9 @@ mode is advisory and does not change tool availability.
 These tools are deliberately least-privilege scoped. The caller must be
 assigned to a project. The server resolves that assignment to its canonical
 standalone parent, and listing returns only that parent and its workbenches.
+`caller_project_id` remains the caller's actual assigned project, not that
+canonical parent. A worker spawned with a workbench's `project_id` is already
+in that workbench; it must not create or enter another one to start work.
 Creation requires that exact parent id; an unrelated project id is rejected.
 The explicit id is retained as a confirmation guard rather than inferred from
 ambient paths.
