@@ -338,6 +338,130 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
+    async fn native_http_bridge_preserves_signaling_and_turn_delivery() {
+        let endpoint =
+            option_env!("TYDE_RTC_TEST_URL").expect("dev.sh must start the real TURN fixture");
+        let client = reqwest::Client::new();
+        let ice: Vec<MobileIceServer> = client
+            .get(format!("{endpoint}/ice"))
+            .send()
+            .await
+            .expect("actual relay configuration")
+            .json()
+            .await
+            .expect("relay configuration response");
+        // Only the platform transport is emulated: the shipped bridge, HTTP
+        // answer, reqwest Wasm conversion and TURN peers are real. No TLS claim.
+        let install = js_sys::Function::new_with_args(
+            "endpoint,source",
+            r#"
+            const original = window.fetch;
+            const transport = original.bind(window);
+            const target = endpoint.replace('http:', 'https:') + '/api/tyde/mobile/v1/fixture/offer';
+            let responses = 0;
+            const platform = {location:window.location,fetch:transport,webkit:{messageHandlers:{
+                http:{postMessage:async encoded=>{
+                    const request = JSON.parse(encoded);
+                    if (request.url !== target || request.method !== 'post') throw Error('Unexpected native fixture request');
+                    const response = await transport(endpoint+'/offer', {
+                        method:'POST',headers:request.headers,body:request.body,redirect:'error'
+                    });
+                    responses++;
+                    return {status:response.status,body:await response.text()};
+                }},
+                http_cancel:{postMessage:async()=>null}
+            }}};
+            platform.top = platform;
+            new Function('window','tydeNativeBootstrapOrigin','tydeNativeBridgeVersion',
+                'tydeNativeBootstrapVersion','tydeNativeShellRelease','tydeNativeSecretScopeEndpoint',
+                'tydeNativeHttpEndpoint','tydeNativeHttpCancelEndpoint',source)(
+                    platform,location.origin,6,1,'0.9.6-beta.25','secret_scope','http','http_cancel');
+            window.fetch = async (input,options) => {
+                const requestURL = new URL(input instanceof Request ? input.url : input, location.href).href;
+                const response = await platform.fetch(input,options);
+                if (requestURL === target && (response.url !== target || response.clone().url !== target)) {
+                    throw Error('Native HTTP discarded the successful signaling response URL');
+                }
+                return response;
+            };
+            return {target,restore(){window.fetch=original;return responses;}};
+            "#,
+        );
+        let guard = install
+            .call2(
+                &JsValue::UNDEFINED,
+                &endpoint.into(),
+                &include_str!("../../ios/Tyde/native-host.js").into(),
+            )
+            .expect("install the shipped native HTTP bridge");
+        let outcome: Result<(), String> = async {
+            let target = js_sys::Reflect::get(&guard, &"target".into())
+                .map_err(|_| "native fixture target missing")?
+                .as_string()
+                .ok_or("native fixture target invalid")?;
+            let mut peer = Peer::new(&ice).await.map_err(|error| error.to_string())?;
+            let session = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
+            let offer = peer.offer().await.map_err(|error| error.to_string())?;
+            let signed = crate::authenticate_description(
+                session.clone(),
+                MobileSdpKind::Offer,
+                offer,
+                &[53; 32],
+            )
+            .map_err(|error| error.to_string())?;
+            let answer: MobileRtcDescription = client
+                .post(target)
+                .json(&signed)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .json()
+                .await
+                .map_err(|error| error.to_string())?;
+            crate::verify_description(&answer, &session, MobileSdpKind::Answer, &[53; 32])
+                .map_err(|error| error.to_string())?;
+            peer.set_answer(answer.sdp)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut stream = peer
+                .into_stream()
+                .await
+                .map_err(|error| error.to_string())?;
+            let message = b"native signaling response reached the real TURN peer";
+            stream
+                .write_all(message)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream.flush().await.map_err(|error| error.to_string())?;
+            let mut received = vec![0; message.len()];
+            stream
+                .read_exact(&mut received)
+                .await
+                .map_err(|error| error.to_string())?;
+            if received != message {
+                return Err("native TURN delivery changed bytes".into());
+            }
+            Ok(())
+        }
+        .await;
+        let responses = js_sys::Reflect::get(&guard, &"restore".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap()
+            .call0(&guard)
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "native HTTP/reqwest/TURN boundary failed: {outcome:?}"
+        );
+        assert_eq!(
+            responses.as_f64(),
+            Some(1.0),
+            "one actual HTTP answer must settle"
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn browser_native_turn_interop_preserves_bulk_and_reconnect() {
         let endpoint =
             option_env!("TYDE_RTC_TEST_URL").expect("dev.sh must start the real TURN fixture");

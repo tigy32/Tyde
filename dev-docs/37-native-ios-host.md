@@ -86,6 +86,18 @@ archive resources and identity, export compliance, upload processing and actual
 TestFlight availability remain the distribution owner's checks. The Lander owns
 publication; the source owner does not archive, upload or deploy this change.
 
+## Native HTTP signaling responses
+
+The native fetch bridge preserves the actual request URL on its returned
+`Response` and its clones. Native URLSession refuses redirects, so that URL
+is authoritative. Wasm reqwest consumes this metadata during WebRTC signaling;
+an empty synthetic response URL throws before normal connection error handling,
+even when the HTTP request succeeded. PWA fetch is unchanged. The real TURN
+browser flow exercises the shipped bridge and reqwest through an owned HTTP
+platform fixture; it does not certify iOS URLSession, production auth or the
+user's installed TestFlight connection. Updated bridge bytes require a new
+native build, not replacement of an already published host client.
+
 ## Adaptive Agents hierarchy
 
 The approved Duo v4 composition keeps the Agents/project hierarchy on the left

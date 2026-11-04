@@ -37,7 +37,12 @@
         try {
             const response = await pending;
             request.signal.throwIfAborted();
-            return new Response(response.body, { status: response.status, headers: { "content-type": "application/json" } });
+            // Native networking refuses redirects, so this is the actual response URL.
+            const identify = value => Object.defineProperties(value, {
+                url: { value: request.url },
+                clone: { value: () => identify(Response.prototype.clone.call(value)) }
+            });
+            return identify(new Response(response.body, { status: response.status, headers: { "content-type": "application/json" } }));
         } catch (error) {
             request.signal.throwIfAborted();
             throw error;
