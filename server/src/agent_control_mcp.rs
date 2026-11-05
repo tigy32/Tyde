@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use http_body::Body as _;
 use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
@@ -49,7 +50,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::host::{BaseRevision, CreatedWorkbench, HostHandle};
+use crate::host::{BaseRevision, CreatedWorkbench, HostHandle, HostStateLeaf};
+use crate::store::settings::AgentControlSettings;
 use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
@@ -355,10 +357,317 @@ enum AgentControlMcpSurface {
     Await,
 }
 
+impl AgentControlMcpSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Await => "await",
+        }
+    }
+}
+
+/// Opt-in, content-free discovery diagnostics: correlation numbers, hashed
+/// caller references, outcome classes, counts and durations only.
+const DISCOVERY_TRACE_TARGET: &str = "tyde_mcp_discovery";
+
+/// The agent-control discovery context of one registered agent. The registry
+/// publishes it before the agent's actor starts and retracts it on removal.
+/// `start` is the agent's own start-payload watch, so acknowledged role
+/// changes are visible to the next discovery request.
+#[derive(Clone)]
+pub(crate) struct AgentControlDiscoveryEntry {
+    pub(crate) start: tokio::sync::watch::Receiver<protocol::AgentStartPayload>,
+    pub(crate) parent_agent_id: Option<AgentId>,
+    pub(crate) scope: AgentControlDiscoveryScope,
+}
+
+/// A swarm's workspace policy cannot change for existing sessions, so it is
+/// bound once at spawn.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AgentControlDiscoveryScope {
+    Ordinary,
+    Swarm(protocol::SwarmWorkspacePolicy),
+}
+
+pub(crate) type AgentControlDiscoveryCatalog = HashMap<AgentId, AgentControlDiscoveryEntry>;
+
+/// The authoritative published state `tools/list` reads. Discovery never
+/// waits on the host state owner, another actor or disk; invocation still
+/// re-checks live authority.
+#[derive(Clone)]
+pub(crate) struct AgentControlDiscovery {
+    agents: tokio::sync::watch::Receiver<AgentControlDiscoveryCatalog>,
+    settings: tokio::sync::watch::Receiver<settings_model::HostSettings>,
+}
+
+struct DiscoveredCaller {
+    scope: AgentControlDiscoveryScope,
+    capabilities: protocol::types::AgentControlMcpCapabilities,
+    subagent: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DiscoveryFailure {
+    AgentsClosed,
+    SettingsClosed,
+    NotRegistered,
+    DepthUnknown,
+}
+
+impl DiscoveryFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentsClosed => "agents_closed",
+            Self::SettingsClosed => "settings_closed",
+            Self::NotRegistered => "not_registered",
+            Self::DepthUnknown => "depth_unknown",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::AgentsClosed => {
+                "Tyde agent-control discovery is unavailable: the agent registry publication closed"
+            }
+            Self::SettingsClosed => {
+                "Tyde agent-control discovery is unavailable: the host settings publication closed"
+            }
+            Self::NotRegistered => "The calling agent is not registered with this Tyde host",
+            Self::DepthUnknown => "Cannot determine the caller's Tyde agent depth",
+        }
+    }
+}
+
+impl AgentControlDiscovery {
+    pub(crate) fn new(
+        agents: tokio::sync::watch::Receiver<AgentControlDiscoveryCatalog>,
+        settings: tokio::sync::watch::Receiver<settings_model::HostSettings>,
+    ) -> Self {
+        Self { agents, settings }
+    }
+
+    fn tiers_enabled(&self) -> Result<bool, DiscoveryFailure> {
+        if self.settings.has_changed().is_err() {
+            return Err(DiscoveryFailure::SettingsClosed);
+        }
+        Ok(self.settings.borrow().complexity_tiers_enabled)
+    }
+
+    fn caller(&self, caller: &AgentId) -> Result<DiscoveredCaller, DiscoveryFailure> {
+        if self.agents.has_changed().is_err() {
+            return Err(DiscoveryFailure::AgentsClosed);
+        }
+        if self.settings.has_changed().is_err() {
+            return Err(DiscoveryFailure::SettingsClosed);
+        }
+        let (entry, depth) = {
+            let catalog = self.agents.borrow();
+            let entry = catalog
+                .get(caller)
+                .cloned()
+                .ok_or(DiscoveryFailure::NotRegistered)?;
+            let depth = catalog_depth(&catalog, caller).ok_or(DiscoveryFailure::DepthUnknown)?;
+            (entry, depth)
+        };
+        let (origin, subagent) = {
+            let start = entry.start.borrow();
+            (
+                start.origin,
+                start.parent_agent_id.is_some()
+                    && start.tyde_permissions == protocol::AgentTydePermissions::Agent,
+            )
+        };
+        let settings = AgentControlSettings::of(&self.settings.borrow());
+        let capabilities = crate::host::agent_control_mcp_capabilities_for(
+            settings.enabled || origin == AgentOrigin::Tychat,
+            settings.max_depth,
+            depth,
+        );
+        Ok(DiscoveredCaller {
+            scope: entry.scope,
+            capabilities,
+            subagent,
+        })
+    }
+}
+
+/// Root-inclusive depth over published parent links; `None` for a missing
+/// ancestor or a cycle, exactly like the registry's own depth walk.
+fn catalog_depth(catalog: &AgentControlDiscoveryCatalog, agent_id: &AgentId) -> Option<u8> {
+    let mut current = agent_id;
+    let mut depth = 1_u8;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let entry = catalog.get(current)?;
+        let Some(parent_agent_id) = entry.parent_agent_id.as_ref() else {
+            return Some(depth);
+        };
+        depth = depth.checked_add(1)?;
+        current = parent_agent_id;
+    }
+}
+
+fn discovery_caller_ref(caller: &AgentId) -> String {
+    use sha2::Digest;
+    let digest = Sha256::digest(caller.0.as_bytes());
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Correlates an MCP HTTP exchange with the handler that served it.
+#[derive(Clone, Copy, Debug)]
+struct McpHttpExchange(u64);
+
+static NEXT_MCP_HTTP_EXCHANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+async fn trace_mcp_http_exchange(
+    axum::extract::State(surface): axum::extract::State<AgentControlMcpSurface>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let exchange = NEXT_MCP_HTTP_EXCHANGE.fetch_add(1, Ordering::Relaxed);
+    request.extensions_mut().insert(McpHttpExchange(exchange));
+    let method = match *request.method() {
+        axum::http::Method::GET => "get",
+        axum::http::Method::POST => "post",
+        axum::http::Method::DELETE => "delete",
+        _ => "other",
+    };
+    let mut exchange_trace = McpHttpExchangeTrace {
+        exchange,
+        surface: surface.as_str(),
+        started: Instant::now(),
+        stage: "head",
+    };
+    tracing::debug!(
+        target: DISCOVERY_TRACE_TARGET,
+        event = "http_received",
+        exchange,
+        surface = surface.as_str(),
+        method,
+    );
+    let response = next.run(request).await;
+    tracing::debug!(
+        target: DISCOVERY_TRACE_TARGET,
+        event = "http_head",
+        exchange,
+        surface = surface.as_str(),
+        status = response.status().as_u16(),
+        elapsed_us = exchange_trace.started.elapsed().as_micros() as u64,
+    );
+    exchange_trace.stage = "body";
+    response.map(|inner| {
+        axum::body::Body::new(TracedMcpBody {
+            inner,
+            exchange_trace,
+        })
+    })
+}
+
+/// Reports whether a response finished, failed, or was dropped by the
+/// transport before completion.
+struct McpHttpExchangeTrace {
+    exchange: u64,
+    surface: &'static str,
+    started: Instant,
+    stage: &'static str,
+}
+
+impl McpHttpExchangeTrace {
+    fn finish(&mut self, outcome: &'static str) {
+        if self.stage == "finished" {
+            return;
+        }
+        tracing::debug!(
+            target: DISCOVERY_TRACE_TARGET,
+            event = "http_finished",
+            exchange = self.exchange,
+            surface = self.surface,
+            stage = self.stage,
+            outcome,
+            elapsed_us = self.started.elapsed().as_micros() as u64,
+        );
+        self.stage = "finished";
+    }
+}
+
+impl Drop for McpHttpExchangeTrace {
+    fn drop(&mut self) {
+        self.finish("dropped");
+    }
+}
+
+struct TracedMcpBody {
+    inner: axum::body::Body,
+    exchange_trace: McpHttpExchangeTrace,
+}
+
+impl http_body::Body for TracedMcpBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            std::task::Poll::Ready(None) => this.exchange_trace.finish("completed"),
+            std::task::Poll::Ready(Some(Err(_))) => this.exchange_trace.finish("errored"),
+            _ if this.inner.is_end_stream() => this.exchange_trace.finish("completed"),
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for TracedMcpBody {
+    fn drop(&mut self) {
+        if self.inner.is_end_stream() {
+            self.exchange_trace.finish("completed");
+        }
+    }
+}
+
+fn trace_list_tools_result(
+    exchange: Option<u64>,
+    surface: AgentControlMcpSurface,
+    received: Instant,
+    outcome: &'static str,
+    caller_ref: Option<&str>,
+    tool_count: Option<usize>,
+) {
+    tracing::debug!(
+        target: DISCOVERY_TRACE_TARGET,
+        event = "list_tools_result",
+        exchange,
+        surface = surface.as_str(),
+        outcome,
+        caller_ref,
+        tool_count,
+        elapsed_us = received.elapsed().as_micros() as u64,
+    );
+}
+
 #[derive(Clone)]
 struct TydeAgentControlMcpServer {
     host: HostHandle,
     credentials: AgentControlCredentialAuthority,
+    discovery: AgentControlDiscovery,
     surface: AgentControlMcpSurface,
     active_await_requests: Arc<AtomicUsize>,
     await_request_cancellations: Arc<Mutex<HashMap<AgentId, HashMap<Uuid, CancellationToken>>>>,
@@ -2451,35 +2760,80 @@ impl ServerHandler for TydeAgentControlMcpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let (swarm_caller, subagent_caller) =
-            match context.extensions.get::<axum::http::request::Parts>() {
-                Some(parts) => match authenticated_caller_from_parts(&self.credentials, parts) {
-                    Ok(Some(caller)) => (
-                        self.host
-                            .is_swarm_agent(&caller)
-                            .await
-                            .map_err(|error| McpError::internal_error(error.message, None))?,
-                        caller_is_subagent(&self.host, &caller)
-                            .await
-                            .map_err(|error| McpError::internal_error(error, None))?,
-                    ),
-                    Ok(None) => (false, false),
-                    Err(error) => return Err(McpError::invalid_params(error, None)),
-                },
-                None => (false, false),
-            };
+        let received = Instant::now();
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let exchange = parts
+            .and_then(|parts| parts.extensions.get::<McpHttpExchange>())
+            .map(|exchange| exchange.0);
+        let activity = self.host.state_activity();
+        tracing::debug!(
+            target: DISCOVERY_TRACE_TARGET,
+            event = "list_tools_received",
+            exchange,
+            surface = self.surface.as_str(),
+            host_state_executing = activity.executing_operation,
+            host_state_queued = activity.queued_operations,
+            host_state_awaiting_leaf = activity.awaiting_leaf.map(HostStateLeaf::as_str),
+        );
+        let caller = match parts {
+            Some(parts) => match authenticated_caller_from_parts(&self.credentials, parts) {
+                Ok(caller) => caller,
+                Err(error) => {
+                    trace_list_tools_result(
+                        exchange,
+                        self.surface,
+                        received,
+                        "rejected",
+                        None,
+                        None,
+                    );
+                    return Err(McpError::invalid_params(error, None));
+                }
+            },
+            None => None,
+        };
+        let caller_ref = caller.as_ref().map(discovery_caller_ref);
+        let discovered = match &caller {
+            Some(caller) => match self.discovery.caller(caller) {
+                Ok(discovered) => Some(discovered),
+                Err(failure) => {
+                    trace_list_tools_result(
+                        exchange,
+                        self.surface,
+                        received,
+                        failure.as_str(),
+                        caller_ref.as_deref(),
+                        None,
+                    );
+                    return Err(McpError::internal_error(failure.message(), None));
+                }
+            },
+            None => None,
+        };
+        let tiers_enabled = match self.discovery.tiers_enabled() {
+            Ok(enabled) => enabled,
+            Err(failure) => {
+                trace_list_tools_result(
+                    exchange,
+                    self.surface,
+                    received,
+                    failure.as_str(),
+                    caller_ref.as_deref(),
+                    None,
+                );
+                return Err(McpError::internal_error(failure.message(), None));
+            }
+        };
         let mut tools = self.tool_router.list_all();
-        if !swarm_caller
-            && let Some(parts) = context.extensions.get::<axum::http::request::Parts>()
-            && let Some(caller) = authenticated_caller_from_parts(&self.credentials, parts)
-                .map_err(|error| McpError::invalid_params(error, None))?
-        {
-            let capabilities = self
-                .host
-                .agent_control_mcp_capabilities(&caller)
-                .await
-                .map_err(|error| McpError::internal_error(error, None))?;
-            tools.retain(|tool| agent_control_tool_allowed(&capabilities, tool.name.as_ref()));
+        if let Some(discovered) = &discovered {
+            match discovered.scope {
+                AgentControlDiscoveryScope::Ordinary => tools.retain(|tool| {
+                    agent_control_tool_allowed(&discovered.capabilities, tool.name.as_ref())
+                }),
+                AgentControlDiscoveryScope::Swarm(policy) => {
+                    tools.retain(|tool| swarm_tool_allowed_for_policy(policy, tool.name.as_ref()))
+                }
+            }
         }
         tools.retain(|tool| match self.surface {
             AgentControlMcpSurface::Control => {
@@ -2489,30 +2843,6 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
             }
         });
-        if swarm_caller {
-            let parts = context
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .ok_or_else(|| McpError::invalid_params("Missing caller authentication", None))?;
-            let caller = authenticated_caller_from_parts(&self.credentials, parts)
-                .map_err(|error| McpError::invalid_params(error, None))?
-                .ok_or_else(|| McpError::invalid_params("Missing caller authentication", None))?;
-            let policy = self
-                .host
-                .describe_swarm_for_agent(caller)
-                .await
-                .map_err(|error| McpError::internal_error(error.message, None))?
-                .swarm
-                .constraints
-                .workspace_policy;
-            tools.retain(|tool| swarm_tool_allowed_for_policy(policy, tool.name.as_ref()));
-        }
-        let tiers_enabled = self
-            .host
-            .read_settings()
-            .await
-            .map(|settings| settings.complexity_tiers_enabled)
-            .unwrap_or(false);
         if !tiers_enabled {
             for tool in &mut tools {
                 if tool.name == "tyde_spawn_agent" {
@@ -2526,7 +2856,10 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 }
             }
         }
-        if subagent_caller {
+        if discovered
+            .as_ref()
+            .is_some_and(|discovered| discovered.subagent)
+        {
             for tool in &mut tools {
                 let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
                 if let Some(properties) = schema
@@ -2537,6 +2870,21 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 }
             }
         }
+        let outcome = match &discovered {
+            Some(discovered) => match discovered.scope {
+                AgentControlDiscoveryScope::Ordinary => "agent",
+                AgentControlDiscoveryScope::Swarm(_) => "swarm_agent",
+            },
+            None => "anonymous",
+        };
+        trace_list_tools_result(
+            exchange,
+            self.surface,
+            received,
+            outcome,
+            caller_ref.as_deref(),
+            Some(tools.len()),
+        );
         Ok(ListToolsResult {
             tools,
             next_cursor: None,
@@ -2668,9 +3016,10 @@ impl ServerHandler for TydeAgentControlMcpServer {
     }
 }
 
-pub fn start_server(
+pub(crate) fn start_server(
     bind_addr: Option<SocketAddr>,
     host_handle: HostHandle,
+    discovery: AgentControlDiscovery,
 ) -> Result<AgentControlMcpHandle, String> {
     let bind_addr = bind_addr.unwrap_or_else(|| {
         DEFAULT_BIND_ADDR
@@ -2719,6 +3068,7 @@ pub fn start_server(
                     .expect("failed to create tokio agent-control MCP listener");
                 let control_host = host_handle.clone();
                 let control_credentials = server_credentials.clone();
+                let control_discovery = discovery.clone();
                 let control_active_await_requests = Arc::clone(&server_active_await_requests);
                 let control_await_request_cancellations =
                     Arc::clone(&server_await_request_cancellations);
@@ -2734,6 +3084,7 @@ pub fn start_server(
                         Ok(TydeAgentControlMcpServer {
                             host: control_host.clone(),
                             credentials: control_credentials.clone(),
+                            discovery: control_discovery.clone(),
                             surface: AgentControlMcpSurface::Control,
                             active_await_requests: Arc::clone(&control_active_await_requests),
                             await_request_cancellations: Arc::clone(
@@ -2754,6 +3105,7 @@ pub fn start_server(
                 );
                 let await_host = host_handle.clone();
                 let await_credentials = server_credentials.clone();
+                let await_discovery = discovery;
                 let await_active_requests = Arc::clone(&server_active_await_requests);
                 let await_request_cancellations = Arc::clone(&server_await_request_cancellations);
                 let await_active_send_requests = Arc::clone(&server_active_send_requests);
@@ -2768,6 +3120,7 @@ pub fn start_server(
                         Ok(TydeAgentControlMcpServer {
                             host: await_host.clone(),
                             credentials: await_credentials.clone(),
+                            discovery: await_discovery.clone(),
                             surface: AgentControlMcpSurface::Await,
                             active_await_requests: Arc::clone(&await_active_requests),
                             await_request_cancellations: Arc::clone(&await_request_cancellations),
@@ -2786,10 +3139,22 @@ pub fn start_server(
                 );
                 let tychat_service =
                     crate::tychat_mcp::service(host_handle.clone(), server_credentials.clone());
+                let control_router = Router::new().nest_service("/mcp", control_service).layer(
+                    axum::middleware::from_fn_with_state(
+                        AgentControlMcpSurface::Control,
+                        trace_mcp_http_exchange,
+                    ),
+                );
+                let await_router = Router::new().nest_service("/await", await_service).layer(
+                    axum::middleware::from_fn_with_state(
+                        AgentControlMcpSurface::Await,
+                        trace_mcp_http_exchange,
+                    ),
+                );
                 let router = Router::new()
                     .route("/healthz", get(healthz_handler))
-                    .nest_service("/mcp", control_service)
-                    .nest_service("/await", await_service)
+                    .merge(control_router)
+                    .merge(await_router)
                     .nest_service("/tychat", tychat_service);
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::warn!("agent-control MCP HTTP server stopped: {err}");

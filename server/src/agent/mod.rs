@@ -4112,10 +4112,11 @@ async fn fork_through_trait<B: Backend>(
 
 pub(crate) fn spawn_agent_actor(
     agent_id: AgentId,
-    start: AgentStartPayload,
+    start_tx: watch::Sender<AgentStartPayload>,
     request: ResolvedSpawnRequest,
     runtime: AgentActorRuntimeContext,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
+    let start = start_tx.borrow().clone();
     let AgentActorRuntimeContext {
         tychat,
         #[cfg(feature = "test-support")]
@@ -4157,7 +4158,7 @@ pub(crate) fn spawn_agent_actor(
         start.parent_agent_id.as_ref(),
         request.resolved_spawn_config.access_mode,
     );
-    let (start_tx, start_rx) = watch::channel(start.clone());
+    let start_rx = start_tx.subscribe();
     let native_registration = NativeRegistrationState {
         pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         owner_start: start_rx.clone(),
@@ -12052,13 +12053,14 @@ pub(crate) struct RelayAgentRuntimeResources {
 
 pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
-    start: AgentStartPayload,
+    start_tx: watch::Sender<AgentStartPayload>,
     input_origin: MessageOrigin,
     receivers: RelayEventReceivers,
     runtime: RelayAgentRuntimeResources,
     session_id: SessionId,
     status_handle: registry::AgentStatusHandle,
 ) -> AgentHandle {
+    let start = start_tx.borrow().clone();
     let RelayEventReceivers {
         mut events,
         mut model_usage,
@@ -12080,7 +12082,7 @@ pub(crate) fn spawn_relay_agent_actor(
         start.parent_agent_id.as_ref(),
         protocol::BackendAccessMode::Unrestricted,
     );
-    let (start_tx, start_rx) = watch::channel(start.clone());
+    let start_rx = start_tx.subscribe();
     let (final_usage_tx, final_usage) = watch::channel(None);
     let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
     let accounting_actor = diagnostics.slot;

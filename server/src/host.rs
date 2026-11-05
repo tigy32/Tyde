@@ -2,6 +2,7 @@ use crate::agent::{AccountingDiagnosticPhase, accounting_diagnostic_run};
 #[path = "host_state.rs"]
 mod state_owner;
 use state_owner::StateOwner;
+pub(crate) use state_owner::{HostStateActivity, HostStateLeaf, awaited_leaf};
 #[path = "project_lifecycle.rs"]
 pub(crate) mod lifecycle;
 #[path = "project_catalog.rs"]
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::store::settings::AgentControlSettings;
 use anyhow::{Context, anyhow};
 use futures_util::FutureExt;
 use protocol::types::{
@@ -2165,6 +2167,10 @@ impl Drop for InstalledWorkbenchRemoveHook {
 }
 
 impl HostHandle {
+    pub(crate) fn state_activity(&self) -> HostStateActivity {
+        self.state.activity()
+    }
+
     pub(crate) async fn dots_command(
         &self,
         command: protocol::DotsCommandPayload,
@@ -5985,6 +5991,12 @@ impl HostHandle {
         let agent_depth = parent_agent_depth
             .and_then(|depth| depth.checked_add(1))
             .unwrap_or(1);
+        let agent_control_settings = settings_store.agent_control_settings();
+        let agent_control = agent_control_mcp_capabilities_for(
+            agent_control_settings.enabled,
+            agent_control_settings.max_depth,
+            agent_depth,
+        );
 
         let swarm_workspace = if let Some((swarm_id, member_id, policy)) = &swarm_binding {
             let registry = {
@@ -6073,13 +6085,13 @@ impl HostHandle {
                     None => (None, None),
                 };
                 let startup_mcp_servers = startup_mcp_servers_for_settings(
-                    &host_settings,
+                    host_settings.tyde_debug_mcp_enabled,
+                    &agent_control,
                     &workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
                     &config_mcp,
                     payload.custom_agent_id.as_ref(),
-                    agent_depth,
                 );
                 let requested_custom_agent_id = payload.custom_agent_id.clone();
                 let (
@@ -6387,13 +6399,13 @@ impl HostHandle {
                     None => (None, None),
                 };
                 let startup_mcp_servers = startup_mcp_servers_for_settings(
-                    &host_settings,
+                    host_settings.tyde_debug_mcp_enabled,
+                    &agent_control,
                     &record.workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
                     &config_mcp,
                     record.custom_agent_id.as_ref(),
-                    agent_depth,
                 );
                 let (
                     effective_custom_agent_id,
@@ -6719,13 +6731,13 @@ let custom_agents = &state.custom_agent_store;
                 let workspace_roots = record.workspace_roots.clone();
                 let backend_kind = record.backend_kind;
                 let startup_mcp_servers = startup_mcp_servers_for_settings(
-                    &host_settings,
+                    host_settings.tyde_debug_mcp_enabled,
+                    &agent_control,
                     &workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
                     &config_mcp,
                     record.custom_agent_id.as_ref(),
-                    agent_depth,
                 );
                 let (
                     effective_custom_agent_id,
@@ -7029,8 +7041,7 @@ let custom_agents = &state.custom_agent_store;
             request.tyde_permissions = protocol::AgentTydePermissions::Root;
         }
         if origin != AgentOrigin::Tychat
-            && agent_control_mcp_capabilities_for_settings(&host_settings, agent_depth).scope
-                == protocol::types::AgentControlMcpScope::ReviewOnly
+            && agent_control.scope == protocol::types::AgentControlMcpScope::ReviewOnly
             && request
                 .resolved_spawn_config
                 .mcp_servers
@@ -7045,7 +7056,7 @@ let custom_agents = &state.custom_agent_store;
                  Canonical configured review remains available: use tyde_preview_review and \
                  tyde_review, then the review finding tools. Do not substitute inline or proxy \
                  review for the configured mode or change host settings to bypass the depth limit.",
-                host_settings.tyde_agent_control_max_depth,
+                agent_control.max_depth,
             );
             request
                 .resolved_spawn_config
@@ -7088,19 +7099,14 @@ let custom_agents = &state.custom_agent_store;
                 .resolved_spawn_config
                 .builtin_steering
                 .push_str(crate::tychat::INSTRUCTIONS);
-            let forced = settings_model::HostSettings {
-                tyde_agent_control_mcp_enabled: true,
-                tyde_agent_control_max_depth: u8::MAX,
-                ..Default::default()
-            };
             let mut servers = startup_mcp_servers_for_settings(
-                &forced,
+                false,
+                &agent_control_mcp_capabilities_for(true, u8::MAX, 1),
                 &request.workspace_roots,
                 &debug_mcp,
                 &agent_control_mcp,
                 &config_mcp,
                 None,
-                1,
             );
             if servers.is_empty() {
                 return Err(AppError::invalid(
@@ -7145,12 +7151,13 @@ let custom_agents = &state.custom_agent_store;
             request.resolved_spawn_config.builtin_steering.push_str(&format!(
                 "\n\nYour server-authorized workspace policy is {policy:?}. Current projects and roots in scope: {scope}. Use tyde_swarm_describe to obtain the current workspace_projects before accessing another project or workbench; the server resolves this list dynamically. Project scope includes newly created workbenches of the selected parent project. Host scope includes all current and newly added projects on this host. Workbench scope covers only the selected workbench. Writable host/project members can use tyde_list_workbenches, tyde_create_workbench, and tyde_remove_workbench within their scope. Do not edit outside the authorized scope. Repository-specific workbench, validation, and landing instructions still apply."
             ));
-            request
-                .resolved_spawn_config
-                .bind_swarm_membership(protocol::SwarmMembership {
+            request.resolved_spawn_config.bind_swarm_membership(
+                protocol::SwarmMembership {
                     swarm_id: swarm_id.clone(),
                     member_id: member_id.clone(),
-                });
+                },
+                *policy,
+            );
             swarms::apply_swarm_spawn_policy(&mut request, *policy)
                 .map_err(|error| AppError::invalid("swarm_activate", error.message))?;
         }
@@ -7848,22 +7855,18 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     .await
             }
         };
-        let settings = match settings_store.get() {
-            Ok(settings) => settings,
-            Err(error) => {
-                tracing::warn!(%error, "failed to read host settings; ignoring spawn cost hint");
-                request.cost_hint = None;
-                return request;
-            }
-        };
-        if !settings.complexity_tiers_enabled {
+        let backend_kind = request.backend_kind;
+        let (tiers_enabled, tier_config) = settings_store.read_committed(|settings| {
+            (
+                settings.complexity_tiers_enabled,
+                settings.backend_tier_configs.get(&backend_kind).cloned(),
+            )
+        });
+        if !tiers_enabled {
             request.cost_hint = None;
             return request;
         }
-        let tier_values = match (
-            hint,
-            settings.backend_tier_configs.get(&request.backend_kind),
-        ) {
+        let tier_values = match (hint, tier_config) {
             (protocol::SpawnCostHint::Medium, _) => {
                 request.cost_hint = None;
                 return request;
@@ -7906,8 +7909,8 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     }
                 }
             }
-            (protocol::SpawnCostHint::Low, Some(config)) => config.low.clone(),
-            (protocol::SpawnCostHint::High, Some(config)) => config.high.clone(),
+            (protocol::SpawnCostHint::Low, Some(config)) => config.low,
+            (protocol::SpawnCostHint::High, Some(config)) => config.high,
         };
         if backend_has_dynamic_session_schema(request.backend_kind)
             && request.session_settings_schema.is_none()
@@ -14230,6 +14233,12 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         Some(handle.snapshot())
     }
 
+    pub(crate) async fn agent_control_settings(&self) -> AgentControlSettings {
+        self.state
+            .with(move |state| state.settings_store.agent_control_settings())
+            .await
+    }
+
     pub(crate) async fn read_settings(&self) -> Result<settings_model::HostSettings, String> {
         {
             self.state
@@ -14699,12 +14708,11 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                 Ok::<_, String>((depth, start, state.settings_store.clone()))
             })
             .await?;
-        let mut settings = settings_store.get().map_err(|error| error.to_string())?;
-        if start.origin == AgentOrigin::Tychat {
-            settings.tyde_agent_control_mcp_enabled = true;
-        }
-        Ok(agent_control_mcp_capabilities_for_settings(
-            &settings, depth,
+        let settings = settings_store.agent_control_settings();
+        Ok(agent_control_mcp_capabilities_for(
+            settings.enabled || start.origin == AgentOrigin::Tychat,
+            settings.max_depth,
+            depth,
         ))
     }
 
@@ -14728,10 +14736,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                     .await?
             }
         };
-        let max_depth = settings_store
-            .get()
-            .map_err(|error| format!("failed to load host settings: {error}"))?
-            .tyde_agent_control_max_depth;
+        let max_depth = settings_store.agent_control_settings().max_depth;
         if parent_depth >= max_depth {
             return Err(format!(
                 "Tyde sub-agent depth limit of {max_depth} reached; agent {parent_agent_id} cannot spawn another level"
@@ -15437,14 +15442,19 @@ let project_id = &project_id;
                 let workspace_roots = workspace_roots.clone();
                 self.state
                     .with(move |state| {
+                        let agent_control = state.settings_store.agent_control_settings();
                         startup_mcp_servers_for_settings(
-                            &settings,
+                            settings.tyde_debug_mcp_enabled,
+                            &agent_control_mcp_capabilities_for(
+                                agent_control.enabled,
+                                agent_control.max_depth,
+                                1,
+                            ),
                             &workspace_roots,
                             &state.debug_mcp,
                             &state.agent_control_mcp,
                             &state.config_mcp,
                             None,
-                            1,
                         )
                     })
                     .await
@@ -18381,14 +18391,15 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         let host_settings = settings_store
             .get()
             .map_err(|error| format!("failed to load host settings for review target: {error}"))?;
+        let agent_control = settings_store.agent_control_settings();
         let startup_mcp_servers = startup_mcp_servers_for_settings(
-            &host_settings,
+            host_settings.tyde_debug_mcp_enabled,
+            &agent_control_mcp_capabilities_for(agent_control.enabled, agent_control.max_depth, 1),
             &project_roots,
             &debug_mcp,
             &agent_control_mcp,
             &config_mcp,
             None,
-            1,
         );
         let mut resolved_spawn_config = {
             {
@@ -20294,6 +20305,10 @@ fn spawn_host_inner(
     )?;
     let (settings_apply_tx, settings_apply_rx) = mpsc::unbounded_channel();
     let registry = AgentRegistry::new();
+    let agent_control_discovery = crate::agent_control_mcp::AgentControlDiscovery::new(
+        registry.subscribe_agent_control_discovery(),
+        settings_store.subscribe_committed(),
+    );
     let agent_status_transitions = registry.subscribe_status_transitions();
     let agent_turn_state_transitions = registry.subscribe_status_transitions();
     let (state, state_actor) = StateOwner::new(HostState {
@@ -20558,6 +20573,7 @@ fn spawn_host_inner(
     let agent_control_mcp = match crate::agent_control_mcp::start_server(
         runtime_config.agent_control_mcp_bind_addr,
         host.clone(),
+        agent_control_discovery,
     ) {
         Ok(handle) => handle,
         Err(err) if runtime_config.agent_control_mcp_bind_addr.is_none() => {
@@ -22722,13 +22738,13 @@ fn spawn_host_workflow_catalog_task(
         .expect("failed to spawn workflow catalog worker thread");
 }
 
-fn agent_control_mcp_capabilities_for_settings(
-    settings: &settings_model::HostSettings,
+pub(crate) fn agent_control_mcp_capabilities_for(
+    enabled: bool,
+    max_depth: u8,
     depth: u8,
 ) -> protocol::types::AgentControlMcpCapabilities {
     use protocol::types::{AgentControlMcpCapabilities, AgentControlMcpScope};
-    let max_depth = settings.tyde_agent_control_max_depth;
-    let scope = if !settings.tyde_agent_control_mcp_enabled {
+    let scope = if !enabled {
         AgentControlMcpScope::Disabled
     } else if depth >= max_depth {
         AgentControlMcpScope::ReviewOnly
@@ -22743,17 +22759,17 @@ fn agent_control_mcp_capabilities_for_settings(
 }
 
 pub(crate) fn startup_mcp_servers_for_settings(
-    settings: &settings_model::HostSettings,
+    debug_mcp_enabled: bool,
+    agent_control: &protocol::types::AgentControlMcpCapabilities,
     workspace_roots: &[String],
     debug_mcp: &DebugMcpHandle,
     agent_control_mcp: &AgentControlMcpHandle,
     config_mcp: &ConfigMcpHandle,
     custom_agent_id: Option<&protocol::CustomAgentId>,
-    agent_depth: u8,
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
 
-    if settings.tyde_debug_mcp_enabled {
+    if debug_mcp_enabled {
         let repo_root = workspace_roots
             .first()
             .map(|value| value.trim())
@@ -22770,7 +22786,9 @@ pub(crate) fn startup_mcp_servers_for_settings(
         });
     }
 
-    if settings.tyde_agent_control_mcp_enabled && !agent_control_mcp.url.is_empty() {
+    if agent_control.scope != protocol::types::AgentControlMcpScope::Disabled
+        && !agent_control_mcp.url.is_empty()
+    {
         servers.push(StartupMcpServer {
             name: crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME.to_string(),
             supports_parallel_tool_calls: true,
@@ -22791,8 +22809,7 @@ pub(crate) fn startup_mcp_servers_for_settings(
         });
     }
 
-    if ((settings.tyde_agent_control_mcp_enabled
-        && agent_depth < settings.tyde_agent_control_max_depth)
+    if (agent_control.scope == protocol::types::AgentControlMcpScope::Delegation
         || custom_agent_id
             .is_some_and(|id| id.0 == crate::store::custom_agents::OPERATOR_CUSTOM_AGENT_ID))
         && !config_mcp.url.is_empty()

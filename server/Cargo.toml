@@ -25,6 +25,8 @@ settings-model = { path = "../settings-model" }
 mobile-pairing = { path = "../mobile-pairing" }
 rtc-transport = { path = "../rtc-transport" }
 axum = { version = "0.8", features = ["ws"] }
+http-body = "1"
+pin-project-lite = "0.2"
 base64 = "0.22"
 command-group = { version = "5", features = ["with-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

@@ -32,7 +32,15 @@ pub struct ResolvedSpawnConfig {
     pub tool_policy: ToolPolicy,
     pub excluded_tool_categories: Vec<protocol::ToolCategory>,
     pub access_mode: BackendAccessMode,
-    pub swarm_membership: Option<protocol::SwarmMembership>,
+    pub swarm_binding: Option<SwarmSpawnBinding>,
+}
+
+/// A swarm member's identity and its swarm's workspace policy, bound once at
+/// spawn. A swarm's workspace policy cannot change for existing sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwarmSpawnBinding {
+    pub membership: protocol::SwarmMembership,
+    pub workspace_policy: protocol::SwarmWorkspacePolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +57,7 @@ impl ResolvedSpawnConfig {
     fn empty(policy: SpawnConfigPolicy) -> Self {
         Self {
             policy,
-            swarm_membership: None,
+            swarm_binding: None,
             instructions: None,
             steering_body: String::new(),
             builtin_steering: String::new(),
@@ -84,9 +92,16 @@ impl ResolvedSpawnConfig {
         Self::empty(SpawnConfigPolicy::FailedStartup)
     }
 
-    pub(crate) fn bind_swarm_membership(&mut self, membership: protocol::SwarmMembership) {
+    pub(crate) fn bind_swarm_membership(
+        &mut self,
+        membership: protocol::SwarmMembership,
+        workspace_policy: protocol::SwarmWorkspacePolicy,
+    ) {
         self.policy = SpawnConfigPolicy::Swarm;
-        self.swarm_membership = Some(membership);
+        self.swarm_binding = Some(SwarmSpawnBinding {
+            membership,
+            workspace_policy,
+        });
     }
 
     /// Whether a plain `Resume` rebuilds this configuration faithfully.

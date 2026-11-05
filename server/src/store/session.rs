@@ -1467,7 +1467,8 @@ impl SessionStoreHandle {
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        self.run(Arc::clone(&self.writers), operation).await
+        self.run(Arc::clone(&self.writers), "write", operation)
+            .await
     }
 
     pub(crate) async fn read<T, F>(&self, operation: F) -> Result<T, String>
@@ -1475,30 +1476,34 @@ impl SessionStoreHandle {
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        self.run(Arc::clone(&self.readers), operation).await
+        self.run(Arc::clone(&self.readers), "read", operation).await
     }
 
     async fn run<T, F>(
         &self,
         admission: Arc<tokio::sync::Semaphore>,
+        kind: &'static str,
         operation: F,
     ) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        let permit = admission
-            .acquire_owned()
+        crate::host::awaited_leaf(crate::host::HostStateLeaf::SessionStore, kind, async {
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(|_| "session storage closed")?;
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                let result = operation(&store);
+                drop(permit);
+                result
+            })
             .await
-            .map_err(|_| "session storage closed")?;
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || {
-            let result = operation(&store);
-            drop(permit);
-            result
+            .map_err(|error| format!("session storage task failed: {error}"))?
         })
         .await
-        .map_err(|error| format!("session storage task failed: {error}"))?
     }
 
     pub async fn update<F>(&self, session_id: &SessionId, update: F) -> Result<(), String>

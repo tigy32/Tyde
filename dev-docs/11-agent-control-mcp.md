@@ -682,6 +682,43 @@ A sent message can be thousands of characters, and it must never swallow the vie
 - MCP tool dispatch routes to `HostHandle` / agent actor operations
 - tool responses use protocol types directly where protocol events are returned
 
+### Discovery Reads Published State
+
+`tools/list` is on every provider's startup and restore path, so it must not
+queue behind unrelated work. It reads only authoritative published state and
+never awaits the host state owner, another actor, or disk:
+
+- The agent registry publishes each agent's discovery entry (its own
+  start-payload watch, parent link, and spawn-bound swarm workspace policy)
+  before the agent's actor starts, and retracts it on removal. Role changes are
+  sent on that start watch before they are acknowledged.
+- The settings store publishes every committed document before acknowledging
+  the write. That publication is the single authority for agent-control
+  enablement and depth limits (the MCP servers and depth guidance an agent is
+  launched with, swarm launch, discovery, and invocation) and for complexity
+  tiers. A hand edit of `settings.json` takes effect when the store next
+  commits a write or the host restarts.
+- Depth, delegation capability, swarm policy, role, and tier filtering use
+  exactly the same rules as invocation.
+- An unregistered caller, an undeterminable depth, or a closed publication is
+  an explicit error. There is no fallback catalog.
+
+`tools/call` keeps its live checks: a swarm member's current membership and
+policy, committed settings, and live caller authority are re-checked on every
+invocation. Discovery reflects the swarm policy bound at spawn, which cannot
+change for an existing session.
+
+Content-free diagnostics are opt-in. `RUST_LOG=tyde_mcp_discovery=debug`
+traces each MCP HTTP exchange (received, response head, and whether the body
+completed, errored, or was dropped) and each discovery result. Those events
+carry a hashed caller reference, outcome, tool count, and duration, plus the
+host state owner's executing operation and awaited leaf at receipt.
+`RUST_LOG=tyde_host_state=debug` traces each owner operation's enqueue, start,
+and end, with call site, queue wait, run time, and outcome. It also traces each
+swarm-registry or session-store request made while an operation executes.
+Neither target records credentials, raw IDs, request or response bodies,
+schemas, or chat content.
+
 ### Startup MCP Injection
 
 In `startup_mcp_servers_for_settings()`, add the agent-control MCP URL when

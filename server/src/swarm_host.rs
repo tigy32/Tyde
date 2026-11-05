@@ -956,11 +956,8 @@ Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(PrivateAdmission::Admitted
             }
         }
         self.swarm_workspace_projects(constraints).await?;
-        let settings = self
-            .read_settings()
-            .await
-            .map_err(|error| fail(SwarmErrorCode::Storage, error))?;
-        if !settings.tyde_agent_control_mcp_enabled || settings.tyde_agent_control_max_depth == 0 {
+        let agent_control = self.agent_control_settings().await;
+        if !agent_control.enabled || agent_control.max_depth == 0 {
             return Err(fail(
                 SwarmErrorCode::Unsupported,
                 "Enable agent-control MCP before launching a swarm",

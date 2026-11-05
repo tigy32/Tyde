@@ -87,6 +87,33 @@ enum Command {
     ),
 }
 
+impl Command {
+    fn kind(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "test-support")]
+            Self::FailNextDirectorySync(_) => "fail_next_directory_sync",
+            #[cfg(feature = "test-support")]
+            Self::FailNextCompletion(_) => "fail_next_completion",
+            Self::PrivateAdmission(..) => "private_admission",
+            Self::Snapshot(_) => "snapshot",
+            Self::ReadImage(..) => "read_image",
+            Self::ContainsAgent(..) => "contains_agent",
+            Self::Apply(..) => "apply",
+            Self::Publish(..) => "publish",
+            Self::Authorize(..) => "authorize",
+            Self::Reserve(..) => "reserve",
+            Self::Defer(..) => "defer",
+            Self::Complete(..) => "complete",
+            Self::Status(..) => "status",
+            Self::Migration(..) => "migration",
+            Self::Helper(..) => "helper",
+            Self::Binding(..) => "binding",
+            Self::Error(..) => "error",
+            Self::Replace(..) => "replace",
+        }
+    }
+}
+
 impl SwarmRegistryHandle {
     pub(crate) fn spawn(
         path: PathBuf,
@@ -377,14 +404,19 @@ impl SwarmRegistryHandle {
         command: impl FnOnce(oneshot::Sender<Result<T, SwarmFailure>>) -> Command,
     ) -> Result<T, SwarmFailure> {
         let (tx, rx) = oneshot::channel();
-        tokio::select! {
-            biased;
-            () = self.stopped.cancelled() => Err(failure(SwarmErrorCode::Lifecycle, "Swarm host is stopped")),
-            result = async {
-                self.tx.send(command(tx)).await.map_err(|_| failure(SwarmErrorCode::Lifecycle, "Swarm actor closed"))?;
-                rx.await.map_err(|_| failure(SwarmErrorCode::Lifecycle, "Swarm actor reply closed"))?
-            } => result,
-        }
+        let command = command(tx);
+        let kind = command.kind();
+        crate::host::awaited_leaf(crate::host::HostStateLeaf::SwarmRegistry, kind, async {
+            tokio::select! {
+                biased;
+                () = self.stopped.cancelled() => Err(failure(SwarmErrorCode::Lifecycle, "Swarm host is stopped")),
+                result = async {
+                    self.tx.send(command).await.map_err(|_| failure(SwarmErrorCode::Lifecycle, "Swarm actor closed"))?;
+                    rx.await.map_err(|_| failure(SwarmErrorCode::Lifecycle, "Swarm actor reply closed"))?
+                } => result,
+            }
+        })
+        .await
     }
     #[cfg(feature = "test-support")]
     pub(crate) async fn fail_next_directory_sync(&self) -> Result<(), SwarmFailure> {

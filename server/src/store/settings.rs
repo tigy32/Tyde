@@ -67,10 +67,41 @@ impl std::fmt::Debug for SecretTokenKey {
     }
 }
 
+/// Agent-control capability settings. Launch, discovery and invocation all
+/// take them from the committed publication, so the MCP servers an agent is
+/// given, the tools it discovers and the calls it may make never disagree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AgentControlSettings {
+    pub(crate) enabled: bool,
+    pub(crate) max_depth: u8,
+}
+
+impl AgentControlSettings {
+    pub(crate) fn of(settings: &HostSettings) -> Self {
+        Self {
+            enabled: settings.tyde_agent_control_mcp_enabled,
+            max_depth: settings.tyde_agent_control_max_depth,
+        }
+    }
+}
+
+/// Every settings document this store has committed, published so readers
+/// that must not wait on disk or the host state owner observe each committed
+/// write before the write is acknowledged. Never printed: settings may carry
+/// secret values.
+struct CommittedSettings(tokio::sync::watch::Sender<HostSettings>);
+
+impl std::fmt::Debug for CommittedSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommittedSettings(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct HostSettingsStore {
     path: PathBuf,
     secret_key: std::sync::OnceLock<SecretTokenKey>,
+    committed: CommittedSettings,
 }
 
 impl HostSettingsStore {
@@ -88,10 +119,11 @@ impl HostSettingsStore {
         Self::migrate_legacy_kiro_settings(&path)?;
         Self::migrate_legacy_gemini_settings(&path)?;
         Self::migrate_launch_profiles_to_map(&path)?;
-        let _ = Self::read_from_disk(&path)?;
+        let committed = Self::read_from_disk(&path)?;
         Ok(Self {
             path,
             secret_key: std::sync::OnceLock::new(),
+            committed: CommittedSettings(tokio::sync::watch::channel(committed).0),
         })
     }
 
@@ -163,6 +195,20 @@ impl HostSettingsStore {
         Self::read_from_disk(&self.path)
     }
 
+    pub(crate) fn subscribe_committed(&self) -> tokio::sync::watch::Receiver<HostSettings> {
+        self.committed.0.subscribe()
+    }
+
+    /// Reads the committed publication, the one authority agent-control
+    /// discovery and invocation both use for capabilities and tiers.
+    pub(crate) fn read_committed<R>(&self, read: impl FnOnce(&HostSettings) -> R) -> R {
+        read(&self.committed.0.borrow())
+    }
+
+    pub(crate) fn agent_control_settings(&self) -> AgentControlSettings {
+        self.read_committed(AgentControlSettings::of)
+    }
+
     /// First-run convenience: when no settings file exists yet, enable every
     /// backend that is already installed on this host and pick a sensible
     /// default, so a brand-new user can start chatting immediately instead of
@@ -190,6 +236,9 @@ impl HostSettingsStore {
         settings.enabled_backends = enabled;
         settings.default_backend = default_backend;
         Self::save(&self.path, &settings)?;
+        self.committed
+            .0
+            .send_replace(Self::read_from_disk(&self.path)?);
         Ok(true)
     }
 
@@ -199,6 +248,7 @@ impl HostSettingsStore {
     pub fn replace(&self, settings: HostSettings) -> Result<HostSettings, String> {
         let settings = validate_settings(settings)?;
         Self::save(&self.path, &settings)?;
+        self.committed.0.send_replace(settings.clone());
         Ok(settings)
     }
 

@@ -8661,6 +8661,28 @@ async fn agent_control_depth_limit_removes_tools_and_rejects_recursion() {
             .expect("disabled inventory")
             .is_empty()
     );
+
+    let settings_path = fixture.settings_store_path();
+    let mut hand_edited: Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).expect("read committed settings"))
+            .expect("parse committed settings");
+    hand_edited["settings"]["tyde_agent_control_mcp_enabled"] = json!(true);
+    std::fs::write(
+        &settings_path,
+        serde_json::to_vec(&hand_edited).expect("encode hand edit"),
+    )
+    .expect("hand edit settings");
+    let denied = mcp_tool_call_as(&parent_caller, false, "tyde_list_agents", json!({})).await;
+    assert!(
+        mcp_result_is_error(&denied)
+            && mcp_result_text(&denied).contains("disabled in host settings"),
+        "invocation follows committed settings, not an uncommitted hand edit"
+    );
+    assert_eq!(
+        mcp_list_tool_catalog(&parent_caller, false).await,
+        Ok(Vec::new()),
+        "discovery follows the same committed settings"
+    );
 }
 
 #[tokio::test]
@@ -9298,6 +9320,17 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         mcp_result_is_error(&denied),
         "Demotion restores the child scope contract"
     );
+    for await_surface in [false, true] {
+        let catalog = mcp_list_tool_catalog(&child_caller, await_surface)
+            .await
+            .expect("demoted child catalog");
+        assert!(
+            !catalog
+                .iter()
+                .any(|tool| tool["inputSchema"]["properties"].get("global").is_some()),
+            "acknowledged demotion withdraws advertised global controls"
+        );
+    }
 
     let child_listed = mcp_list_agents(&child_caller).await;
     assert_eq!(
@@ -9469,6 +9502,17 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         mcp_result_is_error(&revoked),
         "Closed agents must lose their caller authority"
     );
+    for await_surface in [false, true] {
+        let error = mcp_list_tool_catalog(&child_caller, await_surface)
+            .await
+            .expect_err("closed agents must not discover tools");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not registered")),
+            "closed callers get an explicit discovery error: {error}"
+        );
+    }
     let (_late_client, after_close) = fixture.connect_with_bootstrap().await;
     assert!(
         !after_close
@@ -9489,6 +9533,105 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             .any(|a| a.agent_id == parent_b.agent_id)
     );
     assert!(after_close.agents.iter().any(|a| a.agent_id == child_b));
+}
+
+async fn mcp_list_tool_catalog(
+    caller: &server::AgentControlMcpCaller,
+    await_surface: bool,
+) -> Result<Vec<Value>, Value> {
+    let url = if await_surface {
+        &caller.await_url
+    } else {
+        &caller.url
+    };
+    let response = post_json_with_headers(
+        url,
+        &[("Authorization", &caller.authorization)],
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    // rmcp lists tools in its per-instance HashMap order, which was never a
+    // catalog contract; compare catalogs by name.
+    match response["result"]["tools"].as_array() {
+        Some(tools) => {
+            let mut tools = tools.clone();
+            tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+            Ok(tools)
+        }
+        None => Err(response["error"].clone()),
+    }
+}
+
+/// Discovery must be served from published registry and settings state, so a
+/// provider's startup `tools/list` never queues behind unrelated host work.
+#[tokio::test]
+async fn agent_control_discovery_answers_while_host_state_is_held() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "discovery-held-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let control = mcp_list_tool_catalog(&caller, false)
+        .await
+        .expect("baseline control catalog");
+    let awaitable = mcp_list_tool_catalog(&caller, true)
+        .await
+        .expect("baseline await catalog");
+    let mut await_names = awaitable
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<Vec<_>>();
+    await_names.sort_unstable();
+    assert_eq!(await_names, ["tyde_await_agents", "tyde_review"]);
+    assert!(
+        control.iter().any(|tool| tool["name"] == "tyde_spawn_agent"
+            && tool["inputSchema"]["properties"].get("global").is_some()),
+        "a top-level delegating caller is offered spawn with global scope"
+    );
+
+    let host = fixture.host_for_test();
+    let (publication, _cancelled) = host.install_next_agent_publication_start_test_gate().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("discovery-held-root".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/discovery-held-root".to_owned()],
+                prompt: "hold host state during discovery".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit host-state holding spawn");
+    publication.wait_until_entered().await;
+    assert_eq!(
+        mcp_list_tool_catalog(&caller, false).await,
+        Ok(control.clone()),
+        "control discovery must not wait on the held host state owner"
+    );
+    assert_eq!(
+        mcp_list_tool_catalog(&caller, true).await,
+        Ok(awaitable.clone()),
+        "await discovery must not wait on the held host state owner"
+    );
+    publication.release_one();
+    let published = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "held spawn publishes after release",
+    )
+    .await
+    .parse_payload::<NewAgentPayload>()
+    .expect("held spawn NewAgent");
+    assert_eq!(published.name, "discovery-held-root");
+    assert_eq!(mcp_list_tool_catalog(&caller, false).await, Ok(control));
 }
 
 #[tokio::test]

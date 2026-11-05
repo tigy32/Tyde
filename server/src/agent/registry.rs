@@ -18,7 +18,9 @@ use crate::agent::{
     now_ms, spawn_agent_actor, spawn_relay_agent_actor,
 };
 use crate::agent_control_mcp::{
-    AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
+    AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME,
+    AgentControlDiscoveryCatalog, AgentControlDiscoveryEntry, AgentControlDiscoveryScope,
+    AgentControlMcpHandle,
 };
 use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -32,6 +34,9 @@ const AGENT_STATUS_TRANSITION_CAPACITY: usize = 256;
 
 pub(crate) struct AgentRegistry {
     agents: HashMap<AgentId, AgentEntry>,
+    /// Published with every registration and removal, before an agent's
+    /// actor can start, so agent-control discovery never waits on HostState.
+    discovery_tx: watch::Sender<AgentControlDiscoveryCatalog>,
     status_change_tx: watch::Sender<u64>,
     status_change_counter: Arc<AtomicU64>,
     transition_tx: broadcast::Sender<AgentStatusTransition>,
@@ -945,6 +950,7 @@ impl AgentRegistry {
         let (transition_tx, _transition_rx) = broadcast::channel(AGENT_STATUS_TRANSITION_CAPACITY);
         Self {
             agents: HashMap::new(),
+            discovery_tx: watch::channel(AgentControlDiscoveryCatalog::new()).0,
             status_change_tx,
             status_change_counter: Arc::new(AtomicU64::new(0)),
             transition_tx,
@@ -997,7 +1003,11 @@ impl AgentRegistry {
         }
         let start = AgentStartPayload {
             tyde_permissions: request.tyde_permissions,
-            swarm_membership: request.resolved_spawn_config.swarm_membership.clone(),
+            swarm_membership: request
+                .resolved_spawn_config
+                .swarm_binding
+                .as_ref()
+                .map(|binding| binding.membership.clone()),
             agent_id: agent_id.clone(),
             name: request.name.clone(),
             origin: request.origin,
@@ -1015,10 +1025,15 @@ impl AgentRegistry {
         };
 
         let access_mode = request.resolved_spawn_config.access_mode;
+        let scope = match &request.resolved_spawn_config.swarm_binding {
+            Some(binding) => AgentControlDiscoveryScope::Swarm(binding.workspace_policy),
+            None => AgentControlDiscoveryScope::Ordinary,
+        };
+        let start_tx = self.publish_discovery(&start, scope);
         let status_handle = self.next_status_handle(agent_id.clone());
         let (handle, session_binding_rx) = spawn_agent_actor(
             agent_id.clone(),
-            start.clone(),
+            start_tx,
             request,
             runtime.with_status(status_handle.clone()),
         );
@@ -1071,10 +1086,11 @@ impl AgentRegistry {
             created_at_ms: request.created_at_ms,
         };
 
+        let start_tx = self.publish_discovery(&start, AgentControlDiscoveryScope::Ordinary);
         let status_handle = self.next_status_handle(agent_id.clone());
         let handle = spawn_relay_agent_actor(
             agent_id.clone(),
-            start.clone(),
+            start_tx,
             request.input_origin,
             receivers,
             runtime,
@@ -1100,7 +1116,39 @@ impl AgentRegistry {
         SpawnedRelayAgent { start, handle }
     }
 
+    fn publish_discovery(
+        &self,
+        start: &AgentStartPayload,
+        scope: AgentControlDiscoveryScope,
+    ) -> watch::Sender<AgentStartPayload> {
+        let (start_tx, start_rx) = watch::channel(start.clone());
+        self.discovery_tx.send_modify(|catalog| {
+            let previous = catalog.insert(
+                start.agent_id.clone(),
+                AgentControlDiscoveryEntry {
+                    start: start_rx,
+                    parent_agent_id: start.parent_agent_id.clone(),
+                    scope,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "agent-control discovery attempted to publish duplicate agent_id {}",
+                start.agent_id
+            );
+        });
+        start_tx
+    }
+
+    pub(crate) fn subscribe_agent_control_discovery(
+        &self,
+    ) -> watch::Receiver<AgentControlDiscoveryCatalog> {
+        self.discovery_tx.subscribe()
+    }
+
     pub fn remove_agent(&mut self, agent_id: &AgentId) -> Option<AgentHandle> {
+        self.discovery_tx
+            .send_if_modified(|catalog| catalog.remove(agent_id).is_some());
         let removed = self.agents.remove(agent_id).map(|entry| entry.handle);
         if removed.is_some() {
             let next = self.status_change_counter.fetch_add(1, Ordering::SeqCst) + 1;
