@@ -63,11 +63,10 @@ fn AgentHandoffView(owner_agent_ref: AgentRef, handoff: protocol::AgentHandoff) 
                 project_id,
             }
         }));
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+        state.open_agent_chat(crate::state::ActiveAgentRef {
             local_host_id: agent.local_host_id,
             agent_id: agent.agent_id,
-        }));
-        state.show_chat();
+        });
     });
     view! {
         <div class="chat-card chat-card-system">
@@ -273,10 +272,14 @@ pub fn ChatView() -> impl IntoView {
     });
 
     let s_back = state.clone();
-    let on_back = move |_| {
+    let on_back = Callback::new(move |()| {
         more_open.set(false);
-        s_back.viewing_chat.set(false);
-    };
+        if crate::native::is_native() {
+            crate::native::handle_intent(&s_back, mobile_shell_types::native::NativeIntent::Back);
+        } else {
+            s_back.back_from_chat();
+        }
+    });
 
     // Edge-swipe-to-go-back. We record the touch start position, optionally
     // abandon it mid-gesture if it turns into a vertical scroll, and only make
@@ -325,7 +328,7 @@ pub fn ChatView() -> impl IntoView {
         let dy = t.client_y() as f64 - sy;
         if back_swipe_triggered(sx, dx, dy) {
             more_open.set(false);
-            s_swipe.viewing_chat.set(false);
+            s_swipe.back_from_chat();
         }
     };
 
@@ -512,36 +515,29 @@ pub fn ChatView() -> impl IntoView {
         })
     };
 
-    let s_subtitle = state.clone();
-    let header_subtitle = move || {
-        let mut parts = Vec::new();
-        if let Some(backend) = active_backend() {
-            parts.push(backend);
-        }
-        if let Some(label) = compaction_label() {
-            parts.push(label);
-        }
-        let active = s_subtitle.active_agent.get()?;
-        // A dead agent is not responding, whatever a stale turn flag says.
-        let turn_active = !agent_is_terminated_tracked(s_subtitle.agents, &active)
-            && s_subtitle
-                .agent_turn_active
-                .with(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false));
-        if turn_active {
-            parts.push("Responding".to_string());
-        } else if !agent_is_terminated_tracked(s_subtitle.agents, &active)
-            && s_subtitle
-                .agents_with_background_work
-                .with(|agents| agents.contains(&active.as_agent_ref()))
-        {
-            parts.push("⧗ Background work".to_string());
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" • "))
-        }
+    let header_subtitle = active_backend;
+    let thinking_state = state.clone();
+    let thinking = move || {
+        let active = thinking_state.active_agent.get()?;
+        let working = thinking_state
+            .agent_turn_active
+            .with(|turns| turns.get(&active.as_agent_ref()).copied().unwrap_or(false));
+        (!agent_is_terminated_tracked(thinking_state.agents, &active) && working)
+            .then_some("••• Thinking")
     };
+    let menu_state = state.clone();
+    let on_send_actions = Callback::new(move |()| {
+        more_open.set(false);
+        menu_state.chat_send_menu_open.set(true);
+    });
+    let sidebar_state = state.clone();
+    let sidebar_visibility_state = state.clone();
+    let toggle_sidebar = Callback::new(move |()| {
+        crate::native::handle_intent(
+            &sidebar_state,
+            mobile_shell_types::native::NativeIntent::ToggleSidebar,
+        );
+    });
 
     if crate::native::is_native() {
         let native_state = state.clone();
@@ -765,6 +761,17 @@ pub fn ChatView() -> impl IntoView {
             on:touchend=on_touch_end
         >
             <div class="chat-header tws-header">
+                <button type="button" class="chat-back-button"
+                    aria-label={let state = state.clone(); move || state.chat_back_label()}
+                    data-mobile-test="chat-back" on:click=move |_| on_back.run(())>
+                    <span class="chat-back-chevron" aria-hidden="true">"\u{2039}"</span>
+                </button>
+                {crate::native::is_native().then(|| view! {
+                    <Show when=move || crate::native::sidebar_available(&sidebar_visibility_state)>
+                        <button type="button" class="chat-sidebar-toggle" aria-label="Toggle agents"
+                            data-mobile-test="chat-sidebar-toggle" on:click=move |_| toggle_sidebar.run(())>"☰"</button>
+                    </Show>
+                })}
                 {move || {
                     if rename_editing.get() {
                         view! {
@@ -812,32 +819,19 @@ pub fn ChatView() -> impl IntoView {
                         }.into_any()
                     } else {
                         view! {
-                            <button
-                                type="button"
-                                class="chat-back-button"
-                                aria-label="Back to Agents"
-                                data-mobile-test="chat-back"
-                                on:click=on_back
-                            >
-                                <span class="chat-back-chevron" aria-hidden="true">"\u{2039}"</span>
-                                <span class="chat-back-label">"Agents"</span>
-                            </button>
                             <div class="chat-header-center">
                                 <div class="chat-header-title" data-mobile-test="chat-title">
-                                    {agent_name()}
+                                    {agent_name}
                                 </div>
                                 {move || header_subtitle().map(|subtitle| view! {
                                     <div class="chat-header-subtitle" data-mobile-test="chat-subtitle">
                                         {subtitle}
                                     </div>
                                 })}
+                                <crate::components::ChatConnectionStatus />
                             </div>
                             <div class="chat-header-actions">
                                 {move || {
-                                    if !has_active_agent() {
-                                        return view! { <div class="chat-header-action-spacer"></div> }
-                                            .into_any();
-                                    }
                                     let rename_cb = on_rename_open;
                                     let close_cb = on_close_agent;
                                     let settings_cb = on_open_session_settings;
@@ -873,6 +867,11 @@ pub fn ChatView() -> impl IntoView {
                                                             }
                                                         }
                                                     >
+                                                        <button type="button" class="chat-action-menu-item" role="menuitem"
+                                                            data-mobile-test="chat-menu-send-actions" on:click=move |_| on_send_actions.run(())>
+                                                            "Send actions"
+                                                        </button>
+                                                        <Show when=has_active_agent>
                                                         <button
                                                             type="button"
                                                             class="chat-action-menu-item"
@@ -882,6 +881,7 @@ pub fn ChatView() -> impl IntoView {
                                                         >
                                                             "Rename"
                                                         </button>
+                                                        </Show>
                                                         <button
                                                             type="button"
                                                             class="chat-action-menu-item"
@@ -891,6 +891,7 @@ pub fn ChatView() -> impl IntoView {
                                                         >
                                                             "Session Settings"
                                                         </button>
+                                                        <Show when=has_active_agent>
                                                         <button
                                                             type="button"
                                                             class="chat-action-menu-item destructive"
@@ -900,6 +901,7 @@ pub fn ChatView() -> impl IntoView {
                                                         >
                                                             "Close Agent"
                                                         </button>
+                                                        </Show>
                                                     </div>
                                                 </Show>
                                             </div>
@@ -1273,10 +1275,10 @@ pub fn ChatView() -> impl IntoView {
                                                     {
                                                         let r = r_render.clone();
                                                         view! {
-                                                            <div class="reasoning-block">
-                                                                <div class="reasoning-label">"Thinking..."</div>
+                                                            <details class="reasoning-block">
+                                                                <summary class="reasoning-label">"Thinking"</summary>
                                                                 <div class="reasoning-text">{move || r.get()}</div>
-                                                            </div>
+                                                            </details>
                                                         }
                                                     }
                                                 </Show>
@@ -1302,9 +1304,6 @@ pub fn ChatView() -> impl IntoView {
                                                 </div>
                                             }.into_any()
                                         }}
-                                        <div class="streaming-indicator" role="status" aria-live="polite">
-                                            <Spinner aria_label="Assistant is responding".to_string() />
-                                        </div>
                                     </div>
                                 }
                             })}
@@ -1332,6 +1331,12 @@ pub fn ChatView() -> impl IntoView {
                         </div>
                     }.into_any()
                 }}
+                <Show when=move || thinking().is_some()>
+                    <div class="chat-working-status" role="status" data-mobile-test="chat-thinking">
+                        {thinking}
+                    </div>
+                </Show>
+                {move || compaction_label().map(|label| view! { <div class="chat-working-status" role="status">{label}</div> })}
                 </div>
             </div>
             // Submissions addressed to *this* agent that the transport could not
@@ -2628,13 +2633,19 @@ mod wasm_tests {
             .as_agent_ref();
         state.chat_input.set("Apply my correction".to_owned());
         next_tick().await;
-        container
-            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+        let primary = container
+            .query_selector("[data-mobile-test='chat-send']")
             .unwrap()
-            .expect("send menu")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+            .unwrap();
+        let options = web_sys::KeyboardEventInit::new();
+        options.set_key("ArrowDown");
+        options.set_bubbles(true);
+        primary
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &options)
+                    .unwrap(),
+            )
+            .unwrap();
         next_tick().await;
         assert!(
             container
@@ -2845,12 +2856,17 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-subtitle']")
             .unwrap()
             .expect("chat subtitle");
+        assert_eq!(
+            subtitle.text_content().unwrap_or_default(),
+            "Claude",
+            "the compact title contains only the backend, not lifecycle labels"
+        );
         assert!(
-            subtitle
-                .text_content()
-                .unwrap_or_default()
-                .contains("⧗ Background work"),
-            "an idle chat waiting on background tasks must show the hourglass"
+            container
+                .query_selector("[data-mobile-test='chat-thinking']")
+                .unwrap()
+                .is_none(),
+            "background work alone must not claim an active typing turn"
         );
         assert!(
             container
@@ -4141,15 +4157,19 @@ mod wasm_tests {
                 .is_none(),
             "stop must not render while idle"
         );
-        let back_text = container
+        let back = container
             .query_selector("[data-mobile-test='chat-back']")
             .unwrap()
-            .expect("back button")
-            .text_content()
-            .unwrap_or_default();
+            .expect("back button");
+        // The compact icon's destination is its accessible name, not duplicated visible text.
+        assert_eq!(
+            back.get_attribute("aria-label").as_deref(),
+            Some("Back to Agents")
+        );
         assert!(
-            back_text.contains("Agents"),
-            "back affordance should label the destination: {back_text}"
+            back.get_bounding_client_rect().width() >= 44.0
+                && back.get_bounding_client_rect().height() >= 44.0,
+            "The named Back affordance remains visible and touch-sized"
         );
         let title = container
             .query_selector("[data-mobile-test='chat-title']")
@@ -4212,9 +4232,14 @@ mod wasm_tests {
                     "only Back and More belong in the header, including while responding"
                 );
                 assert!(!header.text_content().unwrap().contains("Stop"));
+                assert_eq!(subtitle.text_content().unwrap(), "Claude");
                 assert_eq!(
-                    subtitle.text_content().unwrap().contains("Responding"),
-                    running
+                    container
+                        .query_selector("[data-mobile-test='chat-thinking']")
+                        .unwrap()
+                        .is_some(),
+                    running,
+                    "only typed turn state controls the quiet thinking indicator"
                 );
                 let bounds = header.get_bounding_client_rect();
                 let back_bounds = back.get_bounding_client_rect();
@@ -4329,6 +4354,32 @@ mod wasm_tests {
                 .is_some(),
             "close should move into the More menu"
         );
+        let send_actions: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='chat-menu-send-actions']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        send_actions.click();
+        next_tick().await;
+        let menu = container
+            .query_selector("[data-mobile-test='chat-send-menu']")
+            .unwrap()
+            .unwrap();
+        assert!(menu.text_content().unwrap().contains("Cancel"));
+        assert_eq!(
+            crate::bridge::test_sent_lines().len(),
+            1,
+            "opening send actions must not send or cancel"
+        );
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+            .unwrap()
+            .unwrap()
+            .unchecked_ref::<web_sys::HtmlElement>()
+            .click();
+        more_btn.click();
+        next_tick().await;
         let settings_item: web_sys::HtmlElement = container
             .query_selector("[data-mobile-test='chat-menu-session-settings']")
             .unwrap()
@@ -4480,7 +4531,13 @@ mod wasm_tests {
             .expect("subtitle")
             .text_content()
             .unwrap_or_default();
-        assert!(subtitle.contains("Compaction queued"), "{subtitle}");
+        assert_eq!(subtitle, "Claude");
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Compaction queued")
+        );
 
         state.context_compaction_operations.update(|operations| {
             operations.insert(
@@ -4497,7 +4554,13 @@ mod wasm_tests {
             .expect("subtitle")
             .text_content()
             .unwrap_or_default();
-        assert!(subtitle.contains("Compacting context"), "{subtitle}");
+        assert_eq!(subtitle, "Claude");
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Compacting context")
+        );
     }
 
     #[wasm_bindgen_test]
@@ -5122,35 +5185,18 @@ mod wasm_tests {
         let bar =
             context_bar(&container).expect("an assistant row with a breakdown puts the bar up");
         assert_eq!(context_bar_value(&container).as_deref(), Some("60"));
-        // The header is a rounded capsule and the ring traces its whole
-        // silhouette, so the fill reads as a share of the header's perimeter
-        // rather than of a widget inside it.
-        let ring = bar.get_bounding_client_rect();
-        let header = bar
-            .parent_element()
-            .expect("header")
-            .get_bounding_client_rect();
-        for (edge, ring_edge, header_edge) in [
-            ("left", ring.left(), header.left()),
-            ("right", ring.right(), header.right()),
-            ("top", ring.top(), header.top()),
-            ("bottom", ring.bottom(), header.bottom()),
-        ] {
-            assert!(
-                (ring_edge - header_edge).abs() < 1.0,
-                "the ring hugs the header's {edge} edge ({ring_edge} vs {header_edge})"
-            );
-        }
+        // The approved header replaces the perimeter ring with one thin line.
+        let line = bar.get_bounding_client_rect();
+        let header = bar.parent_element().unwrap().get_bounding_client_rect();
+        assert!((line.left() - header.left()).abs() < 1.0);
+        assert!((line.right() - header.right()).abs() < 1.0);
+        assert!((line.bottom() - header.bottom()).abs() <= 1.0);
+        assert!(line.height() <= 2.0, "context usage must be a hairline");
         let stroke_width = px(&context_bar_fill_style(&container, "stroke-width"));
+        assert!((0.5..=2.0).contains(&stroke_width));
         assert!(
-            (0.5..=2.0).contains(&stroke_width),
-            "a hairline, like the composer's thinking ring, not a widget: {stroke_width}px"
-        );
-        let corner = px(&context_bar_fill_style(&container, "rx"));
-        assert!(
-            (corner - (header.height() / 2.0 - 1.0)).abs() < 1.0,
-            "the ring follows the capsule's rounded ends ({corner} vs {})",
-            header.height()
+            bar.text_content().unwrap().is_empty(),
+            "no visible usage text"
         );
         let clip = context_bar_fill_style(&container, "clip-path");
         assert!(

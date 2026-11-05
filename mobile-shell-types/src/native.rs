@@ -86,6 +86,14 @@ impl NativeWire for u32 {
         serde_json::json!({"type":"integer","minimum":0,"maximum":u32::MAX})
     }
 }
+impl NativeWire for u64 {
+    fn swift_type() -> String {
+        "UInt64".into()
+    }
+    fn contract() -> serde_json::Value {
+        serde_json::json!({"type":"integer","minimum":0,"maximum":u64::MAX})
+    }
+}
 impl NativeWire for u16 {
     fn swift_type() -> String {
         "UInt16".into()
@@ -129,11 +137,13 @@ pub const NATIVE_CLIENT_RELEASE: &str = env!("TYDE_NATIVE_CLIENT_RELEASE");
 native_enum!(NativeTab { Home = "home", Agents = "agents", Sessions = "sessions", Settings = "settings" });
 native_enum!(NativeLayout { Compact = "compact", RegularPortrait = "regular_portrait", RegularLandscape = "regular_landscape" });
 native_enum!(NativeRoute { Root = "root", Chat = "chat", Hosts = "hosts" });
+native_enum!(NativeChatHeaderOwner { Shell = "shell", Client = "client" });
+native_enum!(NativeRootStatusOwner { Shell = "shell" });
 native_enum!(NativeTheme { Dark = "dark", Light = "light" });
 native_enum!(NativeIntent {
     Home = "home", Agents = "agents", Sessions = "sessions", Settings = "settings",
     Back = "back", Hosts = "hosts", NewChat = "new_chat", RenameAgent = "rename_agent",
-    SessionSettings = "session_settings", CloseAgent = "close_agent",
+    SendActions = "send_actions", SessionSettings = "session_settings", CloseAgent = "close_agent",
     RegularWidth = "regular_width", CompactWidth = "compact_width",
     RegularLandscape = "regular_landscape", ToggleSidebar = "toggle_sidebar",
     Foreground = "foreground", Background = "background"
@@ -145,10 +155,12 @@ native_enum!(NativeEndpoint {
 native_enum!(NativeAuthProvider { Apple = "apple", Google = "google" });
 native_enum!(NativeHttpMethod { Get = "get", Post = "post" });
 
+native_struct!(NativeConnectedStatus { round_trip_ms: [Option<u64>] });
 native_struct!(NativePresentation {
     version: [u32], client_ready: [bool], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
     title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme],
-    sidebar_available: [bool], sidebar_open: [bool]
+    sidebar_available: [bool], sidebar_open: [bool], chat_header_owner: [Option<NativeChatHeaderOwner>],
+    root_status_owner: [Option<NativeRootStatusOwner>], root_connected_status: [Option<NativeConnectedStatus>]
 });
 native_struct!(NativeHttpRequest {
     id: [u32],
@@ -183,6 +195,9 @@ pub fn swift_source() -> String {
         NativeRoute::swift(),
         NativeLayout::swift(),
         NativeTheme::swift(),
+        NativeChatHeaderOwner::swift(),
+        NativeRootStatusOwner::swift(),
+        NativeConnectedStatus::swift(),
         NativeIntent::swift(),
         NativeEndpoint::swift(),
         NativeHttpMethod::swift(),

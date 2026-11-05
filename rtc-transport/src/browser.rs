@@ -374,8 +374,8 @@ mod wasm_tests {
             platform.top = platform;
             new Function('window','tydeNativeBootstrapOrigin','tydeNativeBridgeVersion',
                 'tydeNativeBootstrapVersion','tydeNativeShellRelease','tydeNativeSecretScopeEndpoint',
-                'tydeNativeHttpEndpoint','tydeNativeHttpCancelEndpoint',source)(
-                    platform,location.origin,6,1,'0.9.6-beta.25','secret_scope','http','http_cancel');
+                'tydeNativeHttpEndpoint','tydeNativeHttpCancelEndpoint','tydeNativeChatHeaderOwner','tydeNativeRootStatusOwner',source)(
+                    platform,location.origin,6,1,'0.9.6-beta.25','secret_scope','http','http_cancel','client','shell');
             window.fetch = async (input,options) => {
                 const requestURL = new URL(input instanceof Request ? input.url : input, location.href).href;
                 const response = await platform.fetch(input,options);

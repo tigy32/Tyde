@@ -1163,13 +1163,15 @@ mod wasm_tests {
             .unwrap()
             .expect("the composer retains its primary action");
         assert_eq!(primary.text_content().as_deref(), Some("Send"));
-        container
-            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
-            .unwrap()
-            .expect("more send actions")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        let options = web_sys::KeyboardEventInit::new();
+        options.set_key("ArrowDown");
+        options.set_bubbles(true);
+        primary
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &options)
+                    .unwrap(),
+            )
+            .unwrap();
         next_tick().await;
         let cancel = container
             .query_selector("[data-mobile-test='chat-send-menu-cancel']")

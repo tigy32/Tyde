@@ -841,11 +841,10 @@ fn SendAgentMessageCard(
         let owner = owner_agent_ref.clone();
         let agent_id = agent_id.clone();
         move |_: ()| {
-            state.active_agent.set(Some(ActiveAgentRef {
+            state.open_agent_chat(ActiveAgentRef {
                 local_host_id: owner.local_host_id.clone(),
                 agent_id: agent_id.clone(),
-            }));
-            state.show_chat();
+            });
         }
     });
 
@@ -5007,6 +5006,12 @@ mod wasm_tests {
     /// user is currently looking at host-B.
     fn two_hosts_active_on_b(state: &AppState) {
         state.agents.update(|agents| {
+            // The host catalog includes the parents owning these real tool streams.
+            for host in ["host-a", "host-b"] {
+                let mut parent = child_agent_on(host, "agent-1", "Parent", false);
+                parent.parent_agent_id = None;
+                agents.push(parent);
+            }
             agents.push(child_agent_on("host-a", "agent-sub", "Host A worker", true));
             agents.push(child_agent_on(
                 "host-b",

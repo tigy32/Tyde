@@ -99,6 +99,7 @@ private final class NativeInputDiagnostics: NSObject, WKScriptMessageHandler {
 @MainActor
 final class ContentController: UIViewController {
     var onVisible: ((ContentController) -> Void)?
+    weak var connectedStatusView: UIView?
     override func viewDidLoad() { super.viewDidLoad(); view.backgroundColor = .systemBackground }
     override func viewWillAppear(_ animated: Bool) { super.viewWillAppear(animated); onVisible?(self) }
 }
@@ -119,7 +120,15 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     private var presentation: NativePresentation?
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "host")
     private var applyingPresentation = false
-    private var ready = false
+    private var ready = false {
+        didSet {
+            if !ready {
+                for content in Array(roots.values) + Array(detailControllers.values) {
+                    content.connectedStatusView?.isHidden = true
+                }
+            }
+        }
+    }
     private var lastLayout: NativeLayout?
 
     #if DEBUG
@@ -234,7 +243,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                 let (url, bridge) = try await Task.detached { try ClientBootstrap.load() }.value
                 guard let self else { return }
                 if !plainWebKitControl {
-                    let bootstrap = "const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
+                    let bootstrap = "const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
                     configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
                 }
                 for script in startupScripts { configuration.userContentController.addUserScript(script) }
@@ -435,7 +444,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         tabs.setTabBarHidden(state.modal, animated: false)
         for navigation in navigations.values {
             navigation.tabBarItem.isEnabled = !state.modal
-            navigation.setNavigationBarHidden(false, animated: false)
+            navigation.setNavigationBarHidden(state.route == .chat && state.chat_header_owner == .client, animated: false)
             navigation.navigationBar.isUserInteractionEnabled = !state.modal
             navigation.navigationBar.accessibilityElementsHidden = state.modal
             navigation.interactivePopGestureRecognizer?.isEnabled = !state.modal
@@ -456,25 +465,69 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             if navigation.topViewController !== root { navigation.setViewControllers([root], animated: false) }
         }
         content.navigationItem.title = state.title
-        if let subtitle = state.subtitle {
+        content.connectedStatusView = nil
+        if ready, state.route != .chat, state.root_status_owner == .shell, let status = state.root_connected_status {
             let heading = UIStackView()
-            heading.axis = .vertical
+            heading.axis = .horizontal
+            heading.spacing = 8
             heading.alignment = .center
             let title = UILabel()
             title.text = state.title
             title.font = .preferredFont(forTextStyle: .headline)
             title.adjustsFontForContentSizeCategory = true
+            title.lineBreakMode = .byTruncatingTail
+            title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let health = UIStackView()
+            health.axis = .horizontal
+            health.spacing = 5
+            health.alignment = .center
+            let dot = UIView()
+            dot.backgroundColor = .systemGreen
+            dot.layer.cornerRadius = 3
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([dot.widthAnchor.constraint(equalToConstant: 6), dot.heightAnchor.constraint(equalToConstant: 6)])
+            let latency = UILabel()
+            latency.font = .preferredFont(forTextStyle: .subheadline)
+            latency.adjustsFontForContentSizeCategory = true
+            latency.textColor = .secondaryLabel
+            if let milliseconds = status.round_trip_ms {
+                latency.text = "\(milliseconds) ms"
+                latency.accessibilityLabel = "Connected, round trip \(milliseconds) milliseconds"
+            } else {
+                latency.text = "Checking…"
+                latency.accessibilityLabel = "Connected, checking round-trip time"
+            }
+            latency.accessibilityIdentifier = "native-root-connection-status"
+            health.addArrangedSubview(dot)
+            health.addArrangedSubview(latency)
+            health.setContentCompressionResistancePriority(.required, for: .horizontal)
+            heading.addArrangedSubview(title)
+            heading.addArrangedSubview(health)
+            content.connectedStatusView = health
+            content.navigationItem.titleView = heading
+        } else if let subtitle = state.subtitle {
+            let heading = UIStackView()
+            heading.axis = state.route == .chat ? .horizontal : .vertical
+            heading.spacing = state.route == .chat ? 8 : 0
+            heading.alignment = .center
+            let title = UILabel()
+            title.text = state.title
+            title.font = .preferredFont(forTextStyle: .headline)
+            title.adjustsFontForContentSizeCategory = true
+            if state.route == .chat {
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            }
             let detail = UILabel()
             detail.text = subtitle
-            detail.font = .preferredFont(forTextStyle: .caption1)
+            detail.font = .preferredFont(forTextStyle: state.route == .chat ? .subheadline : .caption1)
             detail.adjustsFontForContentSizeCategory = true
             detail.textColor = .secondaryLabel
             heading.addArrangedSubview(title)
             heading.addArrangedSubview(detail)
             content.navigationItem.titleView = heading
         } else { content.navigationItem.titleView = nil }
-        if state.chat_actions {
-            content.navigationItem.rightBarButtonItems = [moreButton()]
+        if state.route == .chat {
+            content.navigationItem.rightBarButtonItems = [moreButton(agentActions: state.chat_actions, composerActions: state.chat_header_owner == .client)]
         } else if state.route == .root && state.tab == .agents {
             content.navigationItem.rightBarButtonItems = [newChatButton()]
         } else if state.route == .root && state.tab == .home {
@@ -513,12 +566,16 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         return button
     }
 
-    private func moreButton() -> UIBarButtonItem {
-        let actions = [
-            UIAction(title: "Rename agent", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.send(.rename_agent) },
-            UIAction(title: "Session settings", image: UIImage(systemName: "slider.horizontal.3")) { [weak self] _ in self?.send(.session_settings) },
-            UIAction(title: "Close agent", image: UIImage(systemName: "xmark.circle"), attributes: .destructive) { [weak self] _ in self?.send(.close_agent) }
-        ]
+    private func moreButton(agentActions: Bool, composerActions: Bool) -> UIBarButtonItem {
+        var actions: [UIAction] = []
+        if composerActions {
+            actions.append(UIAction(title: "Send actions", image: UIImage(systemName: "paperplane")) { [weak self] _ in self?.send(.send_actions) })
+        }
+        actions.append(UIAction(title: "Session settings", image: UIImage(systemName: "slider.horizontal.3")) { [weak self] _ in self?.send(.session_settings) })
+        if agentActions {
+            actions.append(UIAction(title: "Rename agent", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.send(.rename_agent) })
+            actions.append(UIAction(title: "Close agent", image: UIImage(systemName: "xmark.circle"), attributes: .destructive) { [weak self] _ in self?.send(.close_agent) })
+        }
         let button = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: UIMenu(children: actions))
         button.accessibilityLabel = "More agent actions"
         return button

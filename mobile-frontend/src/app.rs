@@ -90,6 +90,8 @@ pub(crate) fn AppSurface() -> impl IntoView {
             node_ref=root
             data-theme=move || state.theme.get()
             data-native-host=crate::native::is_native().then_some("")
+            data-native-chat-header=move || state.native_chat_header_owner.get().map(|owner| owner.to_string())
+            data-native-root-status=move || state.native_root_status_owner.get().map(|owner| owner.to_string())
             data-mobile-fixture={
                 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
                 { crate::fixtures::fixture_name() }
@@ -1722,6 +1724,8 @@ mod wasm_tests {
         );
         js_sys::Reflect::set(&native, &"post".into(), &post).unwrap();
         js_sys::Reflect::set(&native, &"presentations".into(), &js_sys::Array::new()).unwrap();
+        js_sys::Reflect::set(&native, &"chatHeaderOwner".into(), &"client".into()).unwrap();
+        js_sys::Reflect::set(&native, &"rootStatusOwner".into(), &"shell".into()).unwrap();
         install_loader_boundary();
         js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
         let state = AppState::new();
@@ -1890,6 +1894,31 @@ mod wasm_tests {
             state.app_mode.set(AppMode::Workspace);
             state.active_local_host_id.set(Some(host_id.clone()));
             state.paired_hosts.set(vec![host]);
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+            state.heartbeat_round_trip_ms_by_host.update(|values| { values.insert(host_id.clone(), 47); });
+            for destination in [NativeIntent::Home, NativeIntent::Agents] {
+                navigate(destination)?;
+                next_tick().await;
+                let root = projected()?;
+                check(root.root_status_owner == Some(mobile_shell_types::native::NativeRootStatusOwner::Shell)
+                    && root.root_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
+                    && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
+                    "Home and Agents roots project healthy latency into native chrome without a second status band")?;
+                if destination == NativeIntent::Home {
+                    check(root.title == "Native host" && find(".home-hero")?.get_bounding_client_rect().height() == 0.0
+                        && find(".home-grid")?.get_bounding_client_rect().height() > 0.0,
+                        "Home transfers its existing host heading/status to the compact toolbar without changing dashboard content")?;
+                }
+            }
+            navigate(NativeIntent::Home)?;
+            state.native_root_status_owner.set(None);
+            next_tick().await;
+            check(projected()?.root_connected_status.is_none()
+                && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() > 0.0
+                && find(".home-hero")?.get_bounding_client_rect().height() > 0.0,
+                "An installed shell without root-status ownership retains its existing native/body presentation")?;
+            state.native_root_status_owner.set(Some(mobile_shell_types::native::NativeRootStatusOwner::Shell));
+            next_tick().await;
             state.projects.set(vec![crate::state::ProjectInfo {
                 local_host_id: host_id.clone(),
                 project: protocol::Project {
@@ -1940,17 +1969,40 @@ mod wasm_tests {
                         && chat.get_bounding_client_rect().height() > 0.0,
                         "Home entry preserves the layout and deliberate hierarchy visibility choice")?;
                     if open {
+                        // This entry fixture has live rows; the later retained-draft phase clears them.
+                        let list = find("[data-mobile-test='agents-list']")?.get_bounding_client_rect();
+                        let row = find("[data-mobile-test='agent-row-idle']")?.get_bounding_client_rect();
+                        check(row.width() >= list.width() - 1.0,
+                            "Pinned hierarchy rows fill the available list width rather than shrink into cards")?;
+                        let title = find("[data-mobile-test='chat-title']")?.get_bounding_client_rect();
+                        let backend = find("[data-mobile-test='chat-subtitle']")?.get_bounding_client_rect();
+                        check((title.bottom() - backend.bottom()).abs() < 8.0,
+                            "An active agent's title and backend share the compact header line")?;
                         check(hierarchy.text_content().unwrap().contains("Entry project")
                             && hierarchy.get_bounding_client_rect().right() <= chat.get_bounding_client_rect().left(),
                             "Home entry shows the project/agent hierarchy to the left of the conversation")?;
                     }
-                    if !open {
-                        navigate(NativeIntent::Back)?;
-                        next_tick().await;
-                        check(projected()?.tab == mobile_shell_types::native::NativeTab::Agents
-                            && hierarchy.get_bounding_client_rect().height() > 0.0,
-                            "Back from Home-selected chat returns to Agents without changing compact navigation")?;
-                    }
+                    let back = find("[data-mobile-test='chat-back']")?;
+                    let back_bounds = back.get_bounding_client_rect();
+                    let header = find(".chat-header")?.get_bounding_client_rect();
+                    let backend = find("[data-mobile-test='chat-subtitle']")?.get_bounding_client_rect();
+                    let latency = find(".chat-header [data-mobile-test='connection-banner-rtt']")?.get_bounding_client_rect();
+                    check(back_bounds.width() >= 44.0 && back_bounds.height() >= 44.0
+                        && back_bounds.top() >= header.top() && back_bounds.bottom() <= header.bottom(),
+                        "Every agent chat has a visible touch-sized Back, including top-level expanded chats")?;
+                    check(header.height() == 45.0 && header.top() == find(".mobile-content")?.get_bounding_client_rect().top()
+                        && (latency.top() - backend.top()).abs() < 8.0
+                        && latency.left() >= backend.right() && latency.left() - backend.right() <= 28.0
+                        && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
+                        "Title, backend and healthy latency occupy one compact row with no separate status/header band")?;
+                    back.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    check(projected()?.tab == mobile_shell_types::native::NativeTab::Agents
+                        && projected()?.route == mobile_shell_types::native::NativeRoute::Root
+                        && hierarchy.get_bounding_client_rect().height() > 0.0
+                        && !state.viewing_chat.get_untracked()
+                        && hierarchy.query_selector("[aria-current='page']").unwrap().is_none(),
+                        "Top-level Back returns to the unselected Agents list, never Home or a retained open chat")?;
                     find(&format!("[data-mobile-test='agents-view'] [aria-label='Open chat with {name}']"))?
                         .dyn_into::<HtmlElement>().unwrap().click();
                     next_tick().await;
@@ -1970,6 +2022,58 @@ mod wasm_tests {
                     next_tick().await;
                 }
             }
+            // Actual server-emitted relationships drive a nested route, not tool text.
+            let stream = protocol::StreamPath("/host/native-hierarchy".into());
+            for (seq, id, parent) in [(0, "Navigation child", "entry-loose"), (1, "Navigation grandchild", "Navigation child")] {
+                let mut child = fixture_user_agent(id, id);
+                child.parent_agent_id = Some(protocol::AgentId(parent.into()));
+                child.activity = protocol::AgentActivity::Thinking;
+                child.origin = protocol::AgentOrigin::AgentControl;
+                dispatch_envelope(&state, &host_id,
+                    protocol::Envelope::from_payload(stream.clone(), FrameKind::NewAgent, seq, &child).unwrap());
+            }
+            let other_host = LocalHostId("different-navigation-host".into());
+            let mut collision = fixture_user_agent("entry-loose", "other-session");
+            collision.name = "Wrong host parent".into();
+            dispatch_envelope(&state, &other_host,
+                protocol::Envelope::from_payload(stream, FrameKind::NewAgent, 0, &collision).unwrap());
+            for layout in [NativeIntent::RegularLandscape, NativeIntent::CompactWidth] {
+                navigate(layout)?;
+                navigate(NativeIntent::Back)?;
+                next_tick().await;
+                find("[data-mobile-test='agents-view'] [aria-label='Open chat with Loose agent']")?
+                    .dyn_into::<HtmlElement>().unwrap().click();
+                next_tick().await;
+                for name in ["Navigation child", "Navigation grandchild"] {
+                    find("[data-mobile-test='activity-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    find(&format!("[data-mobile-test='activity-agent'] [aria-label='Open chat with {name}']"))?
+                        .dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    check(find("[data-mobile-test='chat-title']")?.text_content().as_deref() == Some(name),
+                        "Opening a child enters its actual chat")?;
+                }
+                for parent in ["Navigation child", "Loose agent"] {
+                    let back = find("[data-mobile-test='chat-back']")?;
+                    check(back.get_attribute("aria-label").as_deref() == Some(format!("Back to {parent}").as_str())
+                        && back.get_bounding_client_rect().width() >= 44.0,
+                        "Nested Back names the same-host parent and remains visible")?;
+                    back.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    check(projected()?.route == mobile_shell_types::native::NativeRoute::Chat
+                        && find("[data-mobile-test='chat-title']")?.text_content().as_deref() == Some(parent),
+                        "Nested Back pops exactly one parent chat, never the list or a colliding host")?;
+                }
+                find("[data-mobile-test='chat-back']")?.dyn_into::<HtmlElement>().unwrap().click();
+                next_tick().await;
+                check(projected()?.route == mobile_shell_types::native::NativeRoute::Root
+                    && projected()?.tab == mobile_shell_types::native::NativeTab::Agents,
+                    "Back after the final parent lands at Agents")?;
+            }
+            // Restore the open-chat entry condition before the retained-draft journey.
+            find("[data-mobile-test='agents-view'] [aria-label='Open chat with Loose agent']")?
+                .dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
             state.agents.set(vec![]);
             state.projects.set(vec![]);
             state.active_agent.set(None);
@@ -2083,18 +2187,43 @@ mod wasm_tests {
                     for intent in [NativeIntent::Home, NativeIntent::Agents, NativeIntent::Sessions, NativeIntent::Settings] {
                         navigate(intent)?;
                         next_tick().await;
-                        let hud = find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect();
                         let content = find(".mobile-content")?;
-                        check(hud.height() > 0.0 && content.get_bounding_client_rect().top() >= hud.bottom(),
-                            "Native connection feedback must reserve layout space above every screen")?;
+                        // Root healthy status is rendered by UIKit, not an invented DOM rectangle.
+                        // Its typed projection and absent band are guarded here; native geometry needs the custodian.
+                        let toolbar_status = crate::native::chat_visible(&state)
+                            && matches!(state.active_host_connection_status(), ConnectionStatus::Connected);
+                        let native_root_status = crate::native::root_status_owned(&state)
+                            && matches!(state.active_host_connection_status(), ConnectionStatus::Connected);
+                        let hud = if native_root_status {
+                            check(projected()?.root_connected_status.is_some()
+                                && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
+                                "Healthy native root chrome reserves no redundant DOM status band")?;
+                            None
+                        } else if toolbar_status {
+                            let header = find(".chat-header")?.get_bounding_client_rect();
+                            let status = find(".chat-header [data-mobile-test='connection-banner-rtt']")?.get_bounding_client_rect();
+                            check(status.height() > 0.0 && status.top() >= header.top() && status.bottom() <= header.bottom()
+                                && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
+                                "Healthy feedback stays inside the visible client chat toolbar at every width")?;
+                            Some(status)
+                        } else {
+                            let banner = find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect();
+                            check(banner.height() > 0.0 && content.get_bounding_client_rect().top() >= banner.bottom(),
+                                "Recovery feedback reserves layout space above content")?;
+                            Some(banner)
+                        };
                         let controls = content.query_selector_all("button,input,textarea,select,a,[role='button'],[role='option']").unwrap();
                         for index in 0..controls.length() {
                             let control = controls.item(index).unwrap().dyn_into::<web_sys::Element>().unwrap();
                             let bounds = control.get_bounding_client_rect();
-                            if bounds.width() > 0.0 && bounds.height() > 0.0 {
+                            if let Some(hud) = &hud
+                                && bounds.width() > 0.0 && bounds.height() > 0.0 {
                                 check(bounds.right() <= hud.left() || bounds.left() >= hud.right()
                                     || bounds.bottom() <= hud.top() || bounds.top() >= hud.bottom(),
-                                    "Native connection feedback must not cover an interactive control")?;
+                                    &format!("Native connection feedback overlaps tag={} test={:?} control=({}, {}, {}, {}) hud=({}, {}, {}, {})",
+                                        control.tag_name(), control.get_attribute("data-mobile-test"),
+                                        bounds.left(), bounds.top(), bounds.right(), bounds.bottom(),
+                                        hud.left(), hud.top(), hud.right(), hud.bottom()))?;
                             }
                         }
                     }
@@ -2132,6 +2261,68 @@ mod wasm_tests {
                 pane.has_attribute("hidden"), window.get_computed_style(&workspace).unwrap().unwrap()
                     .get_property_value("grid-template-columns").unwrap()
             ))?;
+            state.native_chat_header_owner.set(None);
+            next_tick().await;
+            check(projected()?.chat_header_owner.is_none(),
+                "Without a transfer the client must not acknowledge ownership to the shell")?;
+            check(find("[data-mobile-test='chat-title']")?.get_bounding_client_rect().height() == 0.0,
+                "The immutable v6 shell retains header ownership without an explicit transfer")?;
+            state.native_chat_header_owner.set(Some(mobile_shell_types::native::NativeChatHeaderOwner::Client));
+            next_tick().await;
+            check(projected()?.chat_header_owner == Some(mobile_shell_types::native::NativeChatHeaderOwner::Client),
+                "The loaded client acknowledges the ownership it actually renders")?;
+            // Updated acceptance retains Back even beside the pinned Agents list.
+            check(find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().height() >= 44.0
+                && find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().width() >= 44.0,
+                "Pinned agents retain an independent visible, touch-sized Back control")?;
+            let agents_header = find("[data-mobile-test='agents-view'] .view-header")?;
+            check(agents_header.get_bounding_client_rect().height() == 0.0,
+                "The pinned hierarchy is untitled; search is its top control")?;
+            check(find("[data-mobile-test='chat-title']")?.get_bounding_client_rect().height() > 0.0
+                && find(".chat-header")?.get_bounding_client_rect().height() == 45.0,
+                "A draft chat retains its compact heading without inventing a backend")?;
+            find("[data-mobile-test='chat-more']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let settings = find("[data-mobile-test='chat-menu-session-settings']")?;
+            check(settings.get_attribute("role").as_deref() == Some("menuitem")
+                && settings.get_bounding_client_rect().width() >= 44.0
+                && settings.get_bounding_client_rect().height() >= 44.0,
+                "The actual header More menu exposes touch-sized Session settings separately from Send actions")?;
+            settings.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(find("[data-mobile-test='session-settings-sheet']")?.get_bounding_client_rect().height() > 0.0
+                && state.session_settings_open.get_untracked() && projected()?.modal,
+                "Header Session settings opens the existing modal sheet")?;
+            find("[data-mobile-test='session-settings-done']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(!state.session_settings_open.get_untracked() && !projected()?.modal
+                && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
+                && composer.value() == "Retained draft",
+                "Closing Session settings restores the exact retained composer")?;
+            let saved_connection_statuses = state.connection_statuses.get_untracked();
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+            state.heartbeat_round_trip_ms_by_host.update(|round_trips| { round_trips.insert(host_id.clone(), 47); });
+            next_tick().await;
+            let toolbar = find(".chat-header")?.get_bounding_client_rect();
+            let healthy = find(".chat-header [data-mobile-test='connection-banner-rtt']")?;
+            let healthy_bounds = healthy.get_bounding_client_rect();
+            check(healthy.text_content().as_deref() == Some("47 ms")
+                && healthy_bounds.top() >= toolbar.top() && healthy_bounds.bottom() <= toolbar.bottom()
+                && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
+                "Healthy typed RTT belongs inside the chat toolbar, not above the pinned hierarchy")?;
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Disconnected); });
+            next_tick().await;
+            check(find("[data-mobile-test='connection-banner-reconnect']")?.get_bounding_client_rect().height() >= 44.0
+                && container.query_selector(".chat-header [data-mobile-test='connection-banner-rtt']").unwrap().is_none(),
+                "A disconnected host keeps global recovery and removes healthy toolbar feedback")?;
+            state.connection_statuses.set(saved_connection_statuses);
+            next_tick().await;
+            navigate(NativeIntent::SendActions)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-send-menu']")?.get_bounding_client_rect().height() > 0.0,
+                "The native More menu reaches the same composer actions without a hold")?;
+            find("[data-mobile-test='chat-send-menu-backdrop']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
             let retained_agent = state.active_agent.get_untracked();
             let filter = find("[data-mobile-test='agents-search']")?
                 .dyn_into::<web_sys::HtmlInputElement>().map_err(|_| "Agent filter is not editable")?;
@@ -2149,8 +2340,17 @@ mod wasm_tests {
                 (NativeIntent::CompactWidth, false, false),
                 (NativeIntent::RegularLandscape, true, true),
             ] {
-                navigate(intent)?;
+                if intent == NativeIntent::ToggleSidebar {
+                    let toggle = find("[data-mobile-test='chat-sidebar-toggle']")?;
+                    check(toggle.get_bounding_client_rect().height() >= 44.0,
+                        "The visible toolbar offers a touch-usable sidebar toggle even when the hierarchy is closed")?;
+                    toggle.dyn_into::<HtmlElement>().unwrap().click();
+                } else {
+                    navigate(intent)?;
+                }
                 next_tick().await;
+                check(container.query_selector("[data-mobile-test='chat-sidebar-toggle']").unwrap().is_some() == expected_available,
+                    "Only layouts with an available hierarchy render its toggle")?;
                 let presentation = projected()?;
                 let visible = agents.get_bounding_client_rect().height() > 0.0;
                 check(visible == expected_open && presentation.sidebar_open == expected_open,
@@ -2272,9 +2472,20 @@ mod wasm_tests {
                 protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 1, &current).unwrap());
             next_tick().await;
             check(state.active_agent.get_untracked().is_none(), "Discovery alone is not a new-chat completion")?;
+            let back = find("[data-mobile-test='chat-back']")?;
+            check(back.get_bounding_client_rect().height() >= 44.0, "Compact client-owned chat exposes its actual Back control")?;
+            back.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(!state.viewing_chat.get_untracked() && state.native_chat_destination.get_untracked().is_none(),
+                "The visible Back cancels pending navigation to a creation without cancelling the creation itself")?;
             let published: protocol::AgentStartPayload = serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
             dispatch_envelope(&state, &host_id,
                 protocol::Envelope::from_payload(creation.stream, FrameKind::AgentStart, 0, &published).unwrap());
+            next_tick().await;
+            check(!state.viewing_chat.get_untracked() && projected()?.route == mobile_shell_types::native::NativeRoute::Root,
+                "Delayed creation publication cannot reopen a chat after visible Back")?;
+            find("[data-mobile-test='agents-view'] [aria-label='Open chat with current-chat']")?
+                .dyn_into::<HtmlElement>().unwrap().click();
             next_tick().await;
             let current_composer = find("[data-mobile-test='chat-input']")?
                 .dyn_into::<web_sys::HtmlTextAreaElement>().map_err(|_| "Current composer is not editable")?;
@@ -2341,7 +2552,7 @@ mod wasm_tests {
             shell.style().set_css_text(&saved_layout);
             navigate(NativeIntent::CompactWidth)?;
             next_tick().await;
-            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            navigate(NativeIntent::SendActions)?;
             next_tick().await;
             find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
             next_tick().await;
@@ -2381,7 +2592,7 @@ mod wasm_tests {
                 && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
                 "The same non-superseded Fork completion must not discard later source text, selection or photos")?;
             // A separate explicit creation is then superseded by Resume.
-            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            navigate(NativeIntent::SendActions)?;
             next_tick().await;
             find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
             next_tick().await;
@@ -2400,7 +2611,7 @@ mod wasm_tests {
                 && container.query_selector("[data-mobile-test='chat-photo-tray']").unwrap().is_none()
                 && state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id),
                 "A photo-only source edit must also retire automatic Fork navigation without changing its text or conversation")?;
-            find("[data-mobile-test='chat-send-menu-toggle']")?.dyn_into::<HtmlElement>().unwrap().click();
+            navigate(NativeIntent::SendActions)?;
             next_tick().await;
             find("[data-mobile-test='chat-send-menu-ask-aside']")?.dyn_into::<HtmlElement>().unwrap().click();
             next_tick().await;
@@ -4244,15 +4455,21 @@ mod wasm_tests {
             let header_bounds = header.get_bounding_client_rect();
             let dock_bounds = dock.get_bounding_client_rect();
             assert!(
-                header_bounds.width() <= 840.0 && dock_bounds.width() <= 840.0,
-                "wide chat chrome must stay on a readable rail"
+                dock_bounds.width() <= 840.0,
+                "the composer retains its readable rail"
             );
+            let shell_bounds = container
+                .query_selector(".mobile-app")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            // The approved flat header spans chat; only the composer remains inset.
             assert!(
-                (header_bounds.left() - dock_bounds.left()).abs() <= 1.0
-                    && (header_bounds.right() - dock_bounds.right()).abs() <= 1.0,
-                "header and composer must share the same rails"
+                (header_bounds.left() - shell_bounds.left()).abs() <= 1.0
+                    && (header_bounds.right() - shell_bounds.right()).abs() <= 1.0,
+                "the flat header must span the chat's full width"
             );
-            for selector in [".chat-back-button", ".send-menu-toggle"] {
+            for selector in [".chat-back-button", ".send-button"] {
                 let control = container.query_selector(selector).unwrap().unwrap();
                 let bounds = control.get_bounding_client_rect();
                 assert!(
@@ -4408,6 +4625,24 @@ mod wasm_tests {
                 )
                 .unwrap();
         };
+        let hold_clock = BrowserOverride(
+            js_sys::Function::new_no_args(
+                r#"
+            const set = window.setTimeout, clear = window.clearTimeout;
+            const pending = new Map(); let id = 1000000000;
+            window.setTimeout = function(callback, delay, ...args) {
+                if (delay !== 450) return set.call(this, callback, delay, ...args);
+                pending.set(++id, () => callback(...args)); return id;
+            };
+            window.clearTimeout = function(id) {
+                if (!pending.delete(id)) clear.call(this, id);
+            };
+            return () => { window.setTimeout = set; window.clearTimeout = clear; };
+        "#,
+            )
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap(),
+        );
         let contact_guard = crate::bridge::test_defer_sends();
         for resize_during_contact in [false, true] {
             for (shape, draft) in [
@@ -4592,22 +4827,19 @@ mod wasm_tests {
             assert_eq!(send.text_content().unwrap().trim(), "Send");
             assert!(!send.has_attribute("disabled"));
             assert!(reachable() && send.contains(Some(&hit_at(point))));
-            let ring = container
-                .query_selector("[data-mobile-test='chat-thinking-ring']")
+            let thinking = container
+                .query_selector("[data-mobile-test='chat-thinking']")
                 .unwrap();
             assert_eq!(
-                ring.is_some(),
+                thinking.is_some(),
                 activity == protocol::AgentActivity::Thinking
             );
-            if let Some(ring) = ring {
-                let style = frame
-                    .content_window()
-                    .unwrap()
-                    .get_computed_style(&ring)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+            if let Some(thinking) = thinking {
+                assert!(thinking.text_content().unwrap().contains("Thinking"));
+                assert_eq!(thinking.get_attribute("role").as_deref(), Some("status"));
             }
+            // The indicator is now in the transcript; the hit test above still
+            // proves that every lifecycle edge leaves Send unobstructed.
             down_or_up("pointerup", point);
             send.unchecked_ref::<HtmlElement>().click();
             next_tick().await;
@@ -4644,12 +4876,14 @@ mod wasm_tests {
         let attempts_before_overlays = crate::bridge::test_send_attempts();
         // A menu intentionally catches the first outside tap. Closing it must remove interception.
         let toggle = container
-            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+            .query_selector("[data-mobile-test='chat-send']")
             .unwrap()
             .unwrap();
         for iteration in 0..2 {
             let point = center();
-            toggle.unchecked_ref::<HtmlElement>().click();
+            toggle
+                .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
+                .unwrap();
             next_tick().await;
             for (edge, activity) in [
                 protocol::AgentActivity::Thinking,
@@ -4763,6 +4997,7 @@ mod wasm_tests {
             "overlay disclosure and dismissal do not submit"
         );
         drop(contact_guard);
+        drop(hold_clock);
         input.blur().unwrap();
         state.active_agent.set(None);
         render_shell(&frame).await;
@@ -5213,7 +5448,6 @@ mod wasm_tests {
                 "[data-mobile-test='chat-input-container']",
                 "[data-mobile-test='chat-input']",
                 "[data-mobile-test='chat-send']",
-                "[data-mobile-test='chat-send-menu-toggle']",
             ],
         );
         let live_scroller = frame_document

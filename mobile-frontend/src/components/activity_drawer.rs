@@ -280,8 +280,7 @@ pub fn ActivityDrawer() -> impl IntoView {
     });
     let open_agent = Callback::new(move |target: ActiveAgentRef| {
         expanded.set(false);
-        state.active_agent.set(Some(target));
-        state.show_chat();
+        state.open_agent_chat(target);
     });
 
     view! {
@@ -363,15 +362,16 @@ pub fn ActivityDrawer() -> impl IntoView {
                                     format!("{n} agent{}", if n == 1 { "" } else { "s" })
                                 })}</span>
                             </Show>
-                            <svg viewBox="0 0 16 16" aria-hidden="true" class="activity-chevron">
-                                <path d="M3 10L8 5L13 10" />
-                            </svg>
+                            <Show when=move || has_work()><span aria-hidden="true">"·"</span></Show>
                             <Show when=move || has_work()>
                                 <span>{move || snapshot.with(|snapshot| {
                                     let n = snapshot.commands.len();
                                     format!("{n} command{}", if n == 1 { "" } else { "s" })
                                 })}</span>
                             </Show>
+                            <svg viewBox="0 0 16 16" aria-hidden="true" class="activity-chevron">
+                                <path d="M3 10L8 5L13 10" />
+                            </svg>
                         </button>
                     </Show>
                     <div

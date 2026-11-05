@@ -72,6 +72,35 @@ pub fn install(state: AppState) {
     if !is_native() {
         return;
     }
+    // The immutable installed v6 shell owns chrome unless it explicitly transfers it.
+    let owner = (|| {
+        let window = web_sys::window().ok_or("Native host window is unavailable")?;
+        let api = js_sys::Reflect::get(&window, &"__tydeNativeHost".into())
+            .map_err(|_| "Native host bridge is unavailable".to_owned())?;
+        let value = js_sys::Reflect::get(&api, &"chatHeaderOwner".into())
+            .map_err(|_| "Native chat header ownership is unavailable".to_owned())?;
+        let chat = serde_wasm_bindgen::from_value::<
+            Option<mobile_shell_types::native::NativeChatHeaderOwner>,
+        >(value)
+        .map_err(|error| format!("Invalid native chat header ownership: {error}"))?;
+        let root = js_sys::Reflect::get(&api, &"rootStatusOwner".into())
+            .map_err(|_| "Native root status ownership is unavailable".to_owned())?;
+        let root = serde_wasm_bindgen::from_value::<
+            Option<mobile_shell_types::native::NativeRootStatusOwner>,
+        >(root)
+        .map_err(|error| format!("Invalid native root status ownership: {error}"))?;
+        Ok((chat, root))
+    })();
+    match owner {
+        Ok((chat, root)) => {
+            state.native_chat_header_owner.set(chat);
+            state.native_root_status_owner.set(root);
+        }
+        Err(error) => {
+            report(&state, error);
+            return;
+        }
+    }
     let listener_state = state.clone();
     let callback =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
@@ -152,7 +181,7 @@ fn modal_open(state: &AppState) -> bool {
         .with(|sources| sources.iter().any(|open| open.get()))
 }
 
-fn handle_intent(state: &AppState, intent: NativeIntent) {
+pub(crate) fn handle_intent(state: &AppState, intent: NativeIntent) {
     if modal_open(state)
         && matches!(
             intent,
@@ -164,6 +193,7 @@ fn handle_intent(state: &AppState, intent: NativeIntent) {
                 | NativeIntent::Hosts
                 | NativeIntent::NewChat
                 | NativeIntent::RenameAgent
+                | NativeIntent::SendActions
                 | NativeIntent::SessionSettings
                 | NativeIntent::CloseAgent
                 | NativeIntent::ToggleSidebar
@@ -194,8 +224,7 @@ fn handle_intent(state: &AppState, intent: NativeIntent) {
             if state.app_mode.get_untracked() == AppMode::HostPicker {
                 state.app_mode.set(AppMode::Workspace);
             } else {
-                state.native_chat_destination.set(None);
-                state.viewing_chat.set(false);
+                state.back_from_chat();
             }
         }
         NativeIntent::NewChat => crate::actions::begin_new_chat(state),
@@ -209,6 +238,7 @@ fn handle_intent(state: &AppState, intent: NativeIntent) {
         }
         NativeIntent::Foreground => crate::app::page_foreground(state.clone()),
         NativeIntent::Background => crate::app::page_background(),
+        NativeIntent::SendActions => state.chat_send_menu_open.set(true),
         NativeIntent::RenameAgent | NativeIntent::SessionSettings | NativeIntent::CloseAgent => {
             state.native_chat_action.set(Some(intent));
         }
@@ -271,6 +301,7 @@ pub fn open_created_chat(state: &AppState) {
             local_host_id: target.local_host_id,
             agent_id,
         }));
+        state.chat_back_stack.set(Vec::new());
         state.chat_origin_tab.set(target.tab);
         state.viewing_chat.set(true);
     });
@@ -324,6 +355,7 @@ pub fn open_host(state: &AppState, local_host_id: LocalHostId) {
                 .draft_session_settings
                 .set(protocol::SessionSettingsValues::default());
             state.viewing_chat.set(false);
+            state.chat_back_stack.set(Vec::new());
             state.native_chat_action.set(None);
             state.active_local_host_id.set(Some(local_host_id));
         }
@@ -338,6 +370,18 @@ pub fn chat_visible(state: &AppState) -> bool {
         && state.active_tab.get() == state.chat_origin_tab.get()
 }
 
+pub fn root_status_owned(state: &AppState) -> bool {
+    is_native()
+        && state.native_root_status_owner.get()
+            == Some(mobile_shell_types::native::NativeRootStatusOwner::Shell)
+        && matches!(
+            state.app_mode.get(),
+            AppMode::Workspace | AppMode::HostPicker
+        )
+        && state.active_local_host_id.get().is_some()
+        && !chat_visible(state)
+}
+
 pub fn sidebar_available(state: &AppState) -> bool {
     chat_visible(state)
         && state.active_tab.get() == MobileTab::Agents
@@ -346,6 +390,13 @@ pub fn sidebar_available(state: &AppState) -> bool {
 
 pub fn sidebar_visible(state: &AppState) -> bool {
     sidebar_available(state) && state.native_sidebar_open.get()
+}
+
+fn home_title(state: &AppState) -> String {
+    match state.active_host_label() {
+        Some(label) => label,
+        None => "Home".into(),
+    }
 }
 
 fn presentation(state: &AppState) -> NativePresentation {
@@ -359,12 +410,12 @@ fn presentation(state: &AppState) -> NativePresentation {
     } else {
         (
             match tab {
-                MobileTab::Home => "Home",
-                MobileTab::Agents => "Agents",
-                MobileTab::Sessions => "Sessions",
-                MobileTab::Settings => "Settings",
-            }
-            .into(),
+                MobileTab::Home if root_status_owned(state) => home_title(state),
+                MobileTab::Home => "Home".to_owned(),
+                MobileTab::Agents => "Agents".to_owned(),
+                MobileTab::Sessions => "Sessions".to_owned(),
+                MobileTab::Settings => "Settings".to_owned(),
+            },
             None,
         )
     };
@@ -394,6 +445,23 @@ fn presentation(state: &AppState) -> NativePresentation {
         modal: modal_open(state),
         sidebar_available: sidebar_available(state),
         sidebar_open: sidebar_visible(state),
+        chat_header_owner: state.native_chat_header_owner.get(),
+        root_status_owner: state.native_root_status_owner.get(),
+        root_connected_status: if root_status_owned(state)
+            && matches!(
+                state.active_host_connection_status(),
+                crate::state::ConnectionStatus::Connected
+            ) {
+            Some(mobile_shell_types::native::NativeConnectedStatus {
+                round_trip_ms: state.active_local_host_id.get().and_then(|host| {
+                    state
+                        .heartbeat_round_trip_ms_by_host
+                        .with(|values| values.get(&host).copied())
+                }),
+            })
+        } else {
+            None
+        },
         theme: if state.theme.get() == "light" {
             NativeTheme::Light
         } else {

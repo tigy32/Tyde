@@ -119,6 +119,7 @@ pub fn HomeView() -> impl IntoView {
     let on_view_sessions = Callback::new(move |_: ()| {
         s_nav_sessions.active_tab.set(MobileTab::Sessions);
     });
+    let native_heading_state = state.clone();
     let s_recent = state.clone();
     let recent_agents = move || -> Vec<AgentInfo> {
         let Some(active) = s_recent.active_local_host_id.get() else {
@@ -148,7 +149,8 @@ pub fn HomeView() -> impl IntoView {
     view! {
         <div class="view home-view" data-mobile-test="home-view">
             <div class="shell-flow">
-                <header class="home-hero">
+                <header class="home-hero" hidden=move || crate::native::root_status_owned(&native_heading_state)
+                    && native_heading_state.active_host_label().is_some()>
                     <Show when=|| !crate::native::is_native()><p class="home-hero-greeting">"Welcome back"</p></Show>
                     <h1 class="home-hero-host">
                         {move || {
@@ -285,14 +287,13 @@ pub fn HomeView() -> impl IntoView {
                                     let backend = format!("{:?}", agent.backend_kind);
                                     let s_row = s.clone();
                                     let on_click = Callback::new(move |_: ()| {
-                                        s_row.active_agent.set(Some(ActiveAgentRef {
-                                            local_host_id: host_id.clone(),
-                                            agent_id: agent_id.clone(),
-                                        }));
                                         if crate::native::is_native() {
                                             s_row.active_tab.set(MobileTab::Agents);
                                         }
-                                        s_row.show_chat();
+                                        s_row.open_agent_chat(ActiveAgentRef {
+                                            local_host_id: host_id.clone(),
+                                            agent_id: agent_id.clone(),
+                                        });
                                     });
                                     view! {
                                         <Card

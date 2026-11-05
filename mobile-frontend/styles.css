@@ -1241,54 +1241,37 @@ input, textarea, select {
     gap: var(--space-2);
 }
 
-/* Context occupancy as a ring around the header capsule. The complete outline
-   is revealed from left to right, so the top and bottom advance together around
-   the title and a full window closes the capsule. */
+/* Context occupancy is a hairline; its token counts remain accessible. */
 .chat-context-bar {
     position: absolute;
-    inset: 0;
+    bottom: 0;
+    left: 0;
     width: 100%;
-    height: 100%;
-    overflow: visible;
+    height: 2px;
     pointer-events: none;
     --ring-colour: var(--accent-primary);
 }
-
 .chat-context-bar rect {
-    x: 1px;
-    y: 1px;
-    width: calc(100% - 2px);
-    height: calc(100% - 2px);
-    rx: calc(var(--header-height) / 2 - 1px);
+    x: 0;
+    y: 0.5px;
+    width: 100%;
+    height: 1px;
     fill: none;
-    stroke-width: 1.5px;
-    stroke-linecap: round;
+    stroke-width: 1px;
 }
-
-.chat-context-bar-track {
-    stroke: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
-}
-
+.chat-context-bar-track { stroke: var(--border-default); }
 .chat-context-bar-fill {
-    /* A stroke COLOUR, not a gradient: the tone is the signal (calm, amber,
-       red), so the level stays readable to anything that inspects the
-       computed colour. */
     stroke: var(--ring-colour);
     clip-path: inset(0 var(--context-remaining) 0 0);
-    filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ring-colour) 70%, transparent));
     transition: clip-path var(--motion-slow) var(--ease-standard);
 }
-
-.chat-context-bar[data-context-level="warning"] {
-    --ring-colour: var(--accent-warning);
-}
-
-.chat-context-bar[data-context-level="danger"] {
-    --ring-colour: var(--accent-error);
-}
+.chat-context-bar[data-context-level="warning"] { --ring-colour: var(--accent-warning); }
+.chat-context-bar[data-context-level="danger"] { --ring-colour: var(--accent-error); }
 
 .chat-back-button {
-    min-width: 72px;
+    min-width: 44px;
+    flex-shrink: 0;
+    justify-content: center;
     min-height: 44px;
     display: inline-flex;
     align-items: center;
@@ -1319,10 +1302,11 @@ input, textarea, select {
     flex: 1;
     min-width: 0;
     display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: var(--space-2);
+    text-align: start;
 }
 
 .chat-header-title {
@@ -1335,18 +1319,19 @@ input, textarea, select {
 }
 
 .chat-header-subtitle {
-    margin-top: 2px;
+    flex-shrink: 0;
+    margin-top: 0;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--text-tertiary);
-    font-size: 11px;
-    font-weight: 500;
+    font-size: 14px;
+    font-weight: 400;
 }
 
 .chat-header-actions {
-    min-width: 72px;
+    min-width: 0;
     display: flex;
     justify-content: flex-end;
     align-items: center;
@@ -2358,36 +2343,6 @@ input, textarea, select {
     background: transparent;
 }
 
-.chat-thinking-ring {
-    position: absolute;
-    inset: 0;
-    z-index: 3;
-    pointer-events: none;
-    border-radius: inherit;
-    padding: 1px;
-    /* Tychat apps/web/src/styles.css: .sidequest-drawer[data-waiting]::after. */
-    background: linear-gradient(90deg, transparent 0%, var(--accent-primary) 40%, var(--accent-primary) 60%, transparent 100%);
-    background-size: 200% 100%;
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor;
-    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    mask-composite: exclude;
-    animation: thinking-shimmer 1600ms ease-in-out infinite;
-}
-
-@keyframes thinking-shimmer {
-    from { background-position: 100% 0; }
-    to { background-position: -100% 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .chat-thinking-ring {
-        animation: none;
-        background: var(--accent-primary);
-        opacity: 0.45;
-    }
-}
-
 .activity-anchor {
     position: relative;
     height: 36px;
@@ -2404,18 +2359,18 @@ input, textarea, select {
     position: relative;
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 12px;
-    width: max-content;
-    min-width: 68%;
+    justify-content: flex-start;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
     max-width: 100%;
     min-height: 36px;
-    margin: 0 auto;
-    padding: 8px 18px;
-    border: 1px solid var(--border-strong);
-    border-bottom: 0;
-    border-radius: 28px 28px 0 0;
-    background: var(--surface-float);
+    margin: 0;
+    padding: 8px 10px;
+    border: 0;
+    border-top: 1px solid var(--border-default);
+    border-radius: 0;
+    background: var(--bg-base);
     color: var(--text-secondary);
     font-size: 12px;
     white-space: nowrap;
@@ -2775,38 +2730,12 @@ input, textarea, select {
     transform: scale(0.92);
 }
 
-/* Split send button: primary label (Send/Queue/Cancel) plus a caret toggle
-   that opens a dropdown of secondary actions (Steer, Fork + send, Cancel).
-   The wrapper is the positioning context for the popup menu. */
+/* One Send/Cancel control anchors the shared action menu. */
 .chat-send-split {
     position: relative;
     display: flex;
     align-items: center;
     flex-shrink: 0;
-}
-
-/* The caret is an affordance on the send action, not a second button of equal
-   weight: a bare glyph beside the filled pill, so the composer's right end
-   reads as one control rather than two competing slabs. */
-.send-menu-toggle {
-    min-width: 44px;
-    width: 44px;
-    height: var(--composer-control-height);
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 15px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-}
-
-.send-menu-toggle:active {
-    transform: scale(0.96);
 }
 
 .chat-send-menu-backdrop {
@@ -2920,11 +2849,6 @@ input, textarea, select {
 
 .chat-send-menu-item:active {
     background: var(--bg-hover);
-}
-
-.send-menu-toggle:disabled {
-    opacity: var(--button-disabled-opacity);
-    cursor: not-allowed;
 }
 
 .chat-input-queued-list {
@@ -5684,9 +5608,9 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .chat-header:not(:has(.chat-rename-bar)) > :not(.chat-context-bar) { display: none; }
 [data-native-host] .chat-header:not(:has(.chat-rename-bar)):not(:has(.chat-context-bar)) { display: none; }
 [data-native-host] .chat-header:not(:has(.chat-rename-bar)):has(.chat-context-bar) {
-    height: 6px;
-    min-height: 6px;
-    margin: 6px 12px 0;
+    height: 2px;
+    min-height: 2px;
+    margin: 0;
     padding: 0;
     border-radius: 3px;
     box-shadow: none;
@@ -5721,7 +5645,52 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .native-split .agents-view .shell-flow { padding: 0 12px 12px; }
 [data-native-host] .native-split .agents-view .shell-flow::before,
 [data-native-host] .native-split .agents-view .shell-flow::after { height: 0; }
-[data-native-host] .native-split .agent-list { display: flex; flex-direction: column; }
+[data-native-host] .native-split .agent-list {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-4);
+}
+[data-native-host] .native-split .agent-project-section,
+[data-native-host] .native-split .agent-row-group { gap: 2px; }
+[data-native-host] .native-split .agent-list .ui-card {
+    width: 100%;
+    padding: 8px 12px;
+    border: 0;
+    border-radius: var(--radius-md);
+    box-shadow: none;
+    background: transparent;
+}
+[data-native-host] .native-split .agent-list .ui-card:hover { background: var(--bg-hover); }
+[data-native-host] .native-split .agent-list .ui-card:has([aria-current="page"]) {
+    background: color-mix(in srgb, var(--accent-primary) 20%, var(--bg-base));
+}
+[data-native-host] .native-split .list-row-subtitle > span { margin-left: 0 !important; }
+[data-native-host] .native-split [data-mobile-test="agent-row-status-label"],
+[data-native-host] .native-split .list-row-subtitle > span:has(.ui-pill),
+[data-native-host] .native-split .agents-filter-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+.agents-filter-icon { display: none; }
+[data-native-host] .native-split .agents-filter-icon { display: inline; font-size: 22px; }
+[data-native-host] .native-split .agents-filter-toggle {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+    background: transparent;
+    border-color: transparent;
+    color: var(--text-secondary);
+}
+[data-native-host] .native-split .agents-filter-toggle:hover { background: var(--bg-hover); }
+[data-native-host] .native-split .agents-list-controls { margin-bottom: 8px; }
+[data-native-host] .native-split .agent-child-collapse,
+[data-native-host] .native-split .agent-child-count-badge { background: transparent; border: 0; }
 [data-native-host] .native-split .agent-child-collapse,
 [data-native-host] .native-split .ui-button,
 [data-native-host] .native-split .agent-list-item { min-height: 44px; }
@@ -5751,10 +5720,6 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     border-radius: 0;
     color: white;
 }
-[data-native-host] .chat-send-split > .send-menu-toggle {
-    border-inline-start: 1px solid rgb(255 255 255 / 28%);
-    background: rgb(0 0 0 / 18%);
-}
 
 [data-native-host] .agent-child-collapse { min-width: 44px; min-height: 44px; }
 [data-native-host] .agents-filter-toggle { min-height: 44px; }
@@ -5762,16 +5727,8 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .native-split .agents-view .search-bar input { min-height: 44px; }
 [data-native-host] .native-split .list-row-chevron { display: none; }
 
-[data-native-host] .chat-send-split > .send-button {
-    border-start-start-radius: var(--radius-md);
-    border-end-start-radius: var(--radius-md);
-}
-[data-native-host] .chat-send-split > .send-menu-toggle {
-    border-start-end-radius: var(--radius-md);
-    border-end-end-radius: var(--radius-md);
-}
 [data-native-host] .native-split .ui-card:has([aria-current="page"]) {
-    background: var(--bg-surface-2);
+    background: color-mix(in srgb, var(--accent-primary) 20%, var(--bg-base));
     border-color: transparent;
 }
 [data-native-host] .native-split .agent-child-controls { display: contents; }
@@ -5835,3 +5792,73 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .mobile-shell-error-banner { flex-wrap: wrap; }
 [data-native-host] .mobile-shell-error-message { flex: 1 1 16rem; }
 [data-native-host] .connection-banner-action { min-width: 44px; min-height: 44px; }
+
+
+/* Chat is a flat reading surface, separate from the other native views. */
+.chat-header.tws-header {
+    position: relative;
+    height: 45px;
+    min-height: 45px;
+    margin: var(--tws-safe-top) 0 0;
+    padding: 0 var(--space-3);
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--bg-base);
+    border-bottom: 1px solid var(--border-default);
+}
+.chat-sidebar-toggle { min-width: 44px; min-height: 44px; }
+.chat-working-status {
+    padding: var(--space-2) var(--space-3);
+    color: var(--text-tertiary);
+    font-size: 13px;
+}
+.chat-view .chat-message.assistant,
+.chat-view .chat-message.streaming {
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+}
+.chat-view .reasoning-block {
+    background: none;
+    padding: 0;
+    border: 0;
+}
+.chat-send-split > .send-button {
+    border-radius: var(--radius-md);
+    touch-action: manipulation;
+    -webkit-touch-callout: none;
+    user-select: none;
+}
+.send-button[aria-disabled="true"] { opacity: 0.5; }
+[data-native-host][data-native-chat-header="client"] .chat-header:not(:has(.chat-rename-bar)) {
+    display: flex;
+    height: 45px;
+    min-height: 45px;
+    margin: 0;
+    padding: 0 var(--space-3);
+    border-radius: 0;
+}
+[data-native-host][data-native-chat-header="client"] .chat-header:not(:has(.chat-rename-bar)) > :not(.chat-context-bar) { display: flex; }
+[data-native-host] .native-split .agents-view .view-header { display: none; }
+[data-native-host] .native-split .agents-view .search-bar { margin: 0; }
+[data-native-host] .chat-send-split { background: transparent; }
+[data-native-host] .chat-send-split > .send-button { border-radius: var(--radius-md); }
+
+.chat-connection-status { display: inline-flex; align-items: center; flex-shrink: 0; }
+.chat-connection-status .connection-banner-inner.connected {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    white-space: nowrap;
+}
+
+/* Moving Home's existing identity/status into native chrome removes only its header row. */
+[data-native-host] .home-hero[hidden] { display: none; }
+@container tws (min-width: 640px) {
+    [data-native-host] .home-view:has(.home-hero[hidden]) .home-quick-actions { grid-row: 2 / 4; }
+    [data-native-host] .home-view:has(.home-hero[hidden]) .section-heading { grid-row: 2; }
+    [data-native-host] .home-view:has(.home-hero[hidden]) .agent-list { grid-row: 3; }
+}

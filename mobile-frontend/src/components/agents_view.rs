@@ -532,7 +532,8 @@ fn render_agents_body(
                                             data-mobile-test="agents-hide-subagents"
                                             on:click=toggle_hide
                                         >
-                                            {move || if hide_sub_agents.get() { "Show sub-agents" } else { "Hide sub-agents" }}
+                                            <span class="agents-filter-icon" aria-hidden="true">"☷"</span>
+                                            <span class="agents-filter-label">{move || if hide_sub_agents.get() { "Show sub-agents" } else { "Hide sub-agents" }}</span>
                                         </button>
                                     </div>
                                 }.into_any()
@@ -768,17 +769,17 @@ fn agent_row(
     let host_id_click = host_id.clone();
     let agent_id_click = agent_id.clone();
     let on_click = Callback::new(move |_: ()| {
-        state_for_click.active_agent.set(Some(ActiveAgentRef {
+        state_for_click.open_agent_chat(ActiveAgentRef {
             local_host_id: host_id_click.clone(),
             agent_id: agent_id_click.clone(),
-        }));
-        state_for_click.show_chat();
+        });
     });
 
     let selected_state = state.clone();
     let selected_agent = agent_ref.clone();
     let selected = move || {
         (crate::native::is_native()
+            && crate::native::chat_visible(&selected_state)
             && selected_state
                 .active_agent
                 .get()

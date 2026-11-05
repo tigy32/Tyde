@@ -28,6 +28,7 @@ pub mod ui;
 pub use agents_view::AgentsView;
 pub use bottom_nav::BottomNav;
 pub use chat_view::ChatView;
+pub(crate) use connection_banner::ChatConnectionStatus;
 pub use connection_banner::ConnectionBanner;
 pub use error_banner::MobileShellErrorBanner;
 pub use home_view::HomeView;

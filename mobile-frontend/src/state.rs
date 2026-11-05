@@ -1027,6 +1027,7 @@ pub struct AppState {
     pub active_tab: RwSignal<MobileTab>,
     pub viewing_chat: RwSignal<bool>,
     pub chat_origin_tab: RwSignal<MobileTab>,
+    pub chat_back_stack: RwSignal<Vec<ActiveAgentRef>>,
     pub chat_draft_id: RwSignal<uuid::Uuid>,
     pub native_layout: RwSignal<mobile_shell_types::native::NativeLayout>,
     pub native_sidebar_open: RwSignal<bool>,
@@ -1034,6 +1035,11 @@ pub struct AppState {
     pub native_unsaved_sources: RwSignal<Vec<Signal<bool>>>,
     pub native_chat_destination: RwSignal<Option<NativeChatDestination>>,
     pub native_auth_recovery: RwSignal<Option<NativeAuthRecovery>>,
+    pub chat_send_menu_open: RwSignal<bool>,
+    pub native_chat_header_owner:
+        RwSignal<Option<mobile_shell_types::native::NativeChatHeaderOwner>>,
+    pub native_root_status_owner:
+        RwSignal<Option<mobile_shell_types::native::NativeRootStatusOwner>>,
     pub native_chat_action: RwSignal<Option<mobile_shell_types::native::NativeIntent>>,
     pub native_chat_heading: RwSignal<(String, Option<String>)>,
 
@@ -1241,9 +1247,87 @@ impl Default for AppState {
 
 impl AppState {
     pub fn show_chat(&self) {
+        self.enter_chat(Vec::new());
+    }
+
+    pub fn open_agent_chat(&self, target: ActiveAgentRef) {
+        let path = self.agents.with_untracked(|agents| {
+            let mut current = target.clone();
+            let mut visited = HashSet::new();
+            let mut parents = Vec::new();
+            loop {
+                if !visited.insert(current.as_agent_ref()) {
+                    return Err("The agent hierarchy contains a cycle.");
+                }
+                let info = agents
+                    .iter()
+                    .find(|info| info.agent_ref() == current.as_agent_ref())
+                    .ok_or("The selected agent's hierarchy is unavailable.")?;
+                let Some(parent_id) = &info.parent_agent_id else {
+                    break;
+                };
+                current = ActiveAgentRef {
+                    local_host_id: current.local_host_id,
+                    agent_id: parent_id.clone(),
+                };
+                parents.push(current.clone());
+            }
+            parents.reverse();
+            Ok(parents)
+        });
+        match path {
+            Ok(parents) => batch(|| {
+                self.active_agent.set(Some(target));
+                self.enter_chat(parents);
+            }),
+            Err(message) => self.mobile_shell_error.set(Some(MobileShellError {
+                code: MobileAccessErrorCode::Internal,
+                message: message.into(),
+            })),
+        }
+    }
+
+    fn enter_chat(&self, parents: Vec<ActiveAgentRef>) {
         self.native_chat_destination.set(None);
+        self.chat_back_stack.set(parents);
         self.chat_origin_tab.set(self.active_tab.get_untracked());
         self.viewing_chat.set(true);
+    }
+
+    pub fn back_from_chat(&self) {
+        self.native_chat_destination.set(None);
+        // This is navigation history, not a live catalog lookup: connection recovery
+        // may retire agent records while the user still needs to leave the chat.
+        let parent = self
+            .chat_back_stack
+            .try_update(|parents| parents.pop())
+            .flatten();
+        if let Some(parent) = parent {
+            self.active_agent.set(Some(parent));
+        } else {
+            batch(|| {
+                self.active_tab.set(MobileTab::Agents);
+                self.chat_origin_tab.set(MobileTab::Agents);
+                self.viewing_chat.set(false);
+            });
+        }
+    }
+
+    pub fn chat_back_label(&self) -> String {
+        self.chat_back_stack.with(|parents| {
+            parents
+                .last()
+                .map(|parent| {
+                    self.agents.with(|agents| {
+                        agents
+                            .iter()
+                            .find(|info| info.agent_ref() == parent.as_agent_ref())
+                            .map(|info| format!("Back to {}", info.name))
+                            .unwrap_or_else(|| "Back to parent chat".into())
+                    })
+                })
+                .unwrap_or_else(|| "Back to Agents".into())
+        })
     }
 
     pub fn new() -> Self {
@@ -1282,6 +1366,7 @@ impl AppState {
             active_tab: RwSignal::new(MobileTab::Home),
             viewing_chat: RwSignal::new(false),
             chat_origin_tab: RwSignal::new(MobileTab::Home),
+            chat_back_stack: RwSignal::new(Vec::new()),
             chat_draft_id: RwSignal::new(uuid::Uuid::new_v4()),
             native_layout: RwSignal::new(mobile_shell_types::native::NativeLayout::Compact),
             native_sidebar_open: RwSignal::new(true),
@@ -1289,6 +1374,9 @@ impl AppState {
             native_unsaved_sources: RwSignal::new(Vec::new()),
             native_chat_destination: RwSignal::new(None),
             native_auth_recovery: RwSignal::new(None),
+            chat_send_menu_open: RwSignal::new(false),
+            native_chat_header_owner: RwSignal::new(None),
+            native_root_status_owner: RwSignal::new(None),
             native_chat_action: RwSignal::new(None),
             native_chat_heading: RwSignal::new(("New Chat".into(), None)),
 
@@ -1991,6 +2079,16 @@ impl AppState {
             .cloned()
     }
 
+    pub fn active_host_label(&self) -> Option<String> {
+        let host = self.active_local_host_id.get()?;
+        self.paired_hosts.with(|hosts| {
+            hosts
+                .iter()
+                .find(|entry| entry.local_host_id == host)
+                .map(|entry| entry.host_label.clone())
+        })
+    }
+
     pub fn active_host_connection_status(&self) -> ConnectionStatus {
         let Some(host) = self.active_local_host_id.get() else {
             return ConnectionStatus::Disconnected;
@@ -2355,6 +2453,7 @@ impl AppState {
             .is_some_and(|active| active.local_host_id == *host)
         {
             self.active_agent.set(None);
+            self.chat_back_stack.set(Vec::new());
             self.viewing_chat.set(false);
         }
         if self

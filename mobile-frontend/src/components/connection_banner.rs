@@ -87,37 +87,25 @@ pub(crate) fn NativeCommandErrorRecovery() -> impl IntoView {
     } } }
 }
 
-/// Floating connection indicator. Healthy connections show a compact
-/// end-to-end round-trip measurement; states needing attention expand to a
-/// larger action pill.
-#[component]
-pub fn ConnectionBanner() -> impl IntoView {
-    let state = use_context::<AppState>().unwrap();
-    let status_state = state.clone();
-    let command_error_state = state.clone();
-    let bundle_state = state.clone();
+fn chat_owns_connection_status(state: &AppState) -> bool {
+    if crate::native::is_native() {
+        crate::native::chat_visible(state)
+            && state.native_chat_header_owner.get()
+                == Some(mobile_shell_types::native::NativeChatHeaderOwner::Client)
+    } else {
+        state.viewing_chat.get()
+    }
+}
 
-    view! {
-        <div class="connection-banner" data-mobile-test="connection-banner"
-            hidden=move || crate::native::is_native() && state.mobile_shell_error.get().is_some()>
-            {move || native_bundle_message(&bundle_state).map(|message| view! {
-                <div class="connection-banner-inner error" role="status" data-mobile-test="bundle-sync">
-                    <span class="status-text">{message}</span>
-                </div>
-            })}
-            {move || {
-                if crate::native::is_native()
-                    && (native_bundle_message(&status_state).is_some() || status_state.active_host_command_error().is_some()) {
-                    return ().into_any();
-                }
-                let status = status_state.active_host_connection_status();
-                match status {
-                    ConnectionStatus::Connected => {
-                        let round_trip_ms = status_state
+#[component]
+fn ConnectedHostStatus() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! { {move || {
+                        let round_trip_ms = state
                             .active_local_host_id
                             .get()
                             .and_then(|host| {
-                                status_state
+                                state
                                     .heartbeat_round_trip_ms_by_host
                                     .get()
                                     .get(&host)
@@ -146,6 +134,56 @@ pub fn ConnectionBanner() -> impl IntoView {
                                 </span>
                             </div>
                         }.into_any()
+    }} }
+}
+
+#[component]
+pub(crate) fn ChatConnectionStatus() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! { <Show when=move || chat_owns_connection_status(&state)
+        && matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
+        && native_bundle_message(&state).is_none()
+        && state.active_host_command_error().is_none()
+        && state.mobile_shell_error.get().is_none()>
+        <span class="chat-connection-status"><ConnectedHostStatus /></span>
+    </Show> }
+}
+
+/// Floating connection indicator. Healthy connections show a compact
+/// end-to-end round-trip measurement; states needing attention expand to a
+/// larger action pill.
+#[component]
+pub fn ConnectionBanner() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let status_state = state.clone();
+    let command_error_state = state.clone();
+    let bundle_state = state.clone();
+
+    view! {
+        <div class="connection-banner" data-mobile-test="connection-banner"
+            hidden=move || (crate::native::is_native() && state.mobile_shell_error.get().is_some())
+                || ((chat_owns_connection_status(&state) || crate::native::root_status_owned(&state))
+                    && matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
+                    && native_bundle_message(&state).is_none()
+                    && state.active_host_command_error().is_none())>
+            {move || native_bundle_message(&bundle_state).map(|message| view! {
+                <div class="connection-banner-inner error" role="status" data-mobile-test="bundle-sync">
+                    <span class="status-text">{message}</span>
+                </div>
+            })}
+            {move || {
+                if crate::native::is_native()
+                    && (native_bundle_message(&status_state).is_some() || status_state.active_host_command_error().is_some()) {
+                    return ().into_any();
+                }
+                let status = status_state.active_host_connection_status();
+                match status {
+                    ConnectionStatus::Connected => {
+                        if chat_owns_connection_status(&status_state) {
+                            ().into_any()
+                        } else {
+                            view! { <ConnectedHostStatus /> }.into_any()
+                        }
                     }
                     ConnectionStatus::Connecting => {
                         view! {

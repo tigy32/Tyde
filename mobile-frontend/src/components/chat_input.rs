@@ -1185,7 +1185,8 @@ pub(super) fn NewChatOptions() -> impl IntoView {
 ///
 /// The primary sends the draft, cancelling the current turn when busy, or
 /// cancels without sending when the running composer's draft is empty.
-/// The only persistent actions are that primary button and its caret. Photos, speech, and state-specific secondary actions live in the
+/// One primary button sends or cancels; its hold menu contains photos, speech,
+/// and state-specific secondary actions. They live in the
 /// shared menu so the textarea keeps the width of the capsule.
 #[component]
 pub fn ChatInput() -> impl IntoView {
@@ -1585,6 +1586,12 @@ pub fn ChatInput() -> impl IntoView {
             .with(|text| !text.trim().is_empty())
             || composer.images.with(|images| !images.is_empty())
     });
+    // Keep the one control focusable for its menu even when Send is unavailable.
+    let send_unavailable = Memo::new(move |_| {
+        is_terminated.get()
+            || (!(can_cancel.get() && !has_input.get())
+                && (!has_input.get() || submitting.get() || loading_photos.get()))
+    });
     let btw_state = state.clone();
     let can_btw =
         Memo::new(move |_| has_input.get() && active_agent_has_session_id_tracked(&btw_state));
@@ -1623,11 +1630,62 @@ pub fn ChatInput() -> impl IntoView {
             let _ = textarea.focus();
         }
     });
-    let menu_open = RwSignal::new(false);
+    let menu_open = state.chat_send_menu_open;
+    let send_button_ref = NodeRef::<leptos::html::Button>::new();
+    let send_menu_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        if menu_open.get()
+            && let Some(menu) = send_menu_ref.get()
+        {
+            let _ = menu.focus();
+        }
+    });
+    let long_pressed = RwSignal::new(false);
+    Effect::new(move |_| {
+        if !menu_open.get() {
+            long_pressed.set(false);
+        }
+    });
+    let press_timer = RwSignal::new(None::<TimeoutHandle>);
+    let cancel_press = move || {
+        if let Some(timer) = press_timer.get_untracked() {
+            timer.clear();
+            press_timer.set(None);
+        }
+    };
+    on_cleanup(cancel_press);
+    let menu_owner = state.active_agent;
+    let menu_tab = state.active_tab;
+    let menu_chat = state.viewing_chat;
+    Effect::new(move |_| {
+        menu_owner.track();
+        menu_tab.track();
+        menu_chat.track();
+        cancel_press();
+        long_pressed.set(false);
+        menu_open.set(false);
+    });
+    let close_menu = Callback::new(move |()| {
+        menu_open.set(false);
+        if let Some(button) = send_button_ref.get_untracked() {
+            let _ = button.focus();
+        }
+    });
+    let press_error_state = state.clone();
+    let on_press_error = Callback::new(move |error: String| {
+        long_pressed.set(true);
+        report_send_error(&press_error_state, error);
+    });
     let on_split_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() == "Escape" && menu_open.get() {
+        if ev.key() == "Enter" || ev.key() == " " {
+            long_pressed.set(false);
+        }
+        if ev.key() == "ArrowDown" || (ev.shift_key() && ev.key() == "F10") {
             ev.prevent_default();
-            menu_open.set(false);
+            menu_open.set(true);
+        } else if ev.key() == "Escape" && menu_open.get() {
+            ev.prevent_default();
+            close_menu.run(());
         }
     };
 
@@ -2013,13 +2071,6 @@ pub fn ChatInput() -> impl IntoView {
             </Show>
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
-                <Show when=move || is_running.get()>
-                    <div
-                        class="chat-thinking-ring"
-                        data-mobile-test="chat-thinking-ring"
-                        aria-hidden="true"
-                    ></div>
-                </Show>
                 <textarea
                     class="chat-input-field"
                     // Visible, not just a tooltip. On a touch UI `title` never
@@ -2055,6 +2106,31 @@ pub fn ChatInput() -> impl IntoView {
                     <button
                         type="button"
                         class="send-button"
+                        node_ref=send_button_ref
+                        aria-haspopup="menu"
+                        aria-expanded=move || menu_open.get().to_string()
+                        on:pointerdown=move |event: web_sys::PointerEvent| {
+                            if event.button() != 0 { return; }
+                            cancel_press();
+                            long_pressed.set(false);
+                            match set_timeout_with_handle(move || {
+                                long_pressed.set(true);
+                                menu_open.set(true);
+                                press_timer.set(None);
+                            }, std::time::Duration::from_millis(450)) {
+                                Ok(timer) => press_timer.set(Some(timer)),
+                                Err(error) => on_press_error.run(format!("Cannot open send actions: {error:?}")),
+                            }
+                        }
+                        on:pointerup=move |_| cancel_press()
+                        on:pointercancel=move |_| cancel_press()
+                        on:pointerleave=move |_| cancel_press()
+                        on:contextmenu=move |event: web_sys::MouseEvent| {
+                            event.prevent_default();
+                            cancel_press();
+                            long_pressed.set(true);
+                            menu_open.set(true);
+                        }
                         aria-label={move || {
                             if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
                             else if can_cancel.get() && !has_input.get() { "Cancel current turn" }
@@ -2068,6 +2144,11 @@ pub fn ChatInput() -> impl IntoView {
                             let do_interrupt = interrupt_for_menu.clone();
                             let do_send = send_for_menu.clone();
                             move |_| {
+                                cancel_press();
+                                if long_pressed.get_untracked() {
+                                    long_pressed.set(false);
+                                    return;
+                                }
                                 if is_terminated.get_untracked() {
                                     return;
                                 }
@@ -2078,38 +2159,13 @@ pub fn ChatInput() -> impl IntoView {
                                 }
                             }
                         }
-                        disabled=move || {
-                            // A dead actor has no send, no steer, and no turn to
-                            // cancel. This outranks the Cancel branch below,
-                            // which is otherwise unconditionally enabled.
-                            if is_terminated.get() { true }
-                            // Cancel (thinking+empty): always enabled — stopping a
-                            // turn must never be blocked by an unsettled send.
-                            else if can_cancel.get() && !has_input.get() { false }
-                            // The composer keeps its draft across the in-flight
-                            // window, so having input no longer implies this is
-                            // a fresh send. Say so explicitly.
-                            else { !has_input.get() || submitting.get() || loading_photos.get() }
-                        }
+                        aria-disabled=move || send_unavailable.get().to_string()
                     >
                         {move || {
                             if is_terminated.get() { "Terminated" }
                             else if can_cancel.get() && !has_input.get() { "Cancel" }
                             else { "Send" }
                         }}
-                    </button>
-                    <button
-                        type="button"
-                        class="send-menu-toggle"
-                        data-mobile-test="chat-send-menu-toggle"
-                        aria-haspopup="menu"
-                        aria-expanded=move || {
-                            if menu_open.get() { "true" } else { "false" }
-                        }
-                        aria-label="More send actions"
-                        on:click=move |_| menu_open.update(|open| *open = !*open)
-                    >
-                        <span aria-hidden="true">"\u{2304}"</span>
                     </button>
                     {move || {
                         if !menu_open.get() {
@@ -2122,15 +2178,17 @@ pub fn ChatInput() -> impl IntoView {
                         let show_steer = is_steer.get();
                         let show_btw = can_btw.get();
                         let show_cancel =
-                            is_steer.get() || (is_awaiting_user.get() && has_input.get());
+                            can_cancel.get();
                         view! {
                             <div
                                 class="chat-send-menu-backdrop"
                                 data-mobile-test="chat-send-menu-backdrop"
-                                on:click=move |_| menu_open.set(false)
+                                on:click=move |_| close_menu.run(())
                             ></div>
                             <div
                                 class="chat-send-menu"
+                                node_ref=send_menu_ref
+                                tabindex="-1"
                                 role="menu"
                                 aria-label="Send actions"
                                 data-mobile-test="chat-send-menu"
@@ -2764,15 +2822,9 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    /// Click the split-button caret to reveal the action menu.
+    /// The single send control exposes its menu without submitting the draft.
     async fn open_menu(container: &HtmlElement) {
-        let toggle: HtmlElement = container
-            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
-            .unwrap()
-            .expect("dropdown toggle must be present")
-            .dyn_into()
-            .unwrap();
-        toggle.click();
+        dispatch_keydown(&primary(container), "ArrowDown", false, false);
         next_tick().await;
     }
 
@@ -2783,11 +2835,8 @@ mod wasm_tests {
             .expect("primary button must be present")
     }
 
-    fn caret(container: &HtmlElement) -> web_sys::Element {
-        container
-            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
-            .unwrap()
-            .expect("caret button must always be present")
+    fn menu_trigger(container: &HtmlElement) -> web_sys::Element {
+        primary(container)
     }
 
     fn menu_item_texts(container: &HtmlElement) -> Vec<String> {
@@ -2986,7 +3035,7 @@ mod wasm_tests {
     }
 
     /// **The idle composer shows only the field and one send split.** Photos and
-    /// speech live behind its caret; a live voice session still sits above the
+    /// speech live in its hold menu; a live voice session still sits above the
     /// capsule without overlapping it.
     #[wasm_bindgen_test]
     async fn voice_controls_live_inside_the_composer() {
@@ -3013,8 +3062,8 @@ mod wasm_tests {
             .expect("the composer capsule renders");
         assert_eq!(
             capsule.query_selector_all("button").unwrap().length(),
-            2,
-            "the closed composer shows only the primary send action and its caret"
+            1,
+            "the approved composer has one Send/Cancel button and no caret"
         );
         let split = container
             .query_selector("[data-mobile-test='chat-send-split']")
@@ -3022,7 +3071,7 @@ mod wasm_tests {
             .expect("send split");
         assert!(
             rect(&split).width() <= 110.0,
-            "the compact send split must preserve textarea width, got {}px",
+            "the single send control must preserve textarea width, got {}px",
             rect(&split).width()
         );
         let field = container
@@ -3062,7 +3111,45 @@ mod wasm_tests {
             "speech actions must not clutter the closed composer"
         );
 
-        open_menu(&container).await;
+        // Advance the product's hold timer explicitly; never wait on wall time.
+        struct HoldClock;
+        impl Drop for HoldClock {
+            fn drop(&mut self) {
+                js_sys::eval("window.setTimeout = window.__holdClock.set; window.clearTimeout = window.__holdClock.clear; delete window.__holdClock;").unwrap();
+            }
+        }
+        js_sys::eval(r#"
+            window.__holdClock = { set: window.setTimeout, clear: window.clearTimeout, fire: null };
+            window.setTimeout = function(callback, delay, ...args) {
+                if (delay !== 450) return window.__holdClock.set.call(this, callback, delay, ...args);
+                window.__holdClock.fire = () => { window.__holdClock.fire = null; callback(...args); };
+                return 2147483646;
+            };
+            window.clearTimeout = function(id) {
+                if (id === 2147483646) window.__holdClock.fire = null;
+                else window.__holdClock.clear.call(this, id);
+            };
+        "#).unwrap();
+        let clock = HoldClock;
+        let pointer = |name| web_sys::PointerEvent::new(name).unwrap();
+        send.dispatch_event(&pointer("pointerdown")).unwrap();
+        send.dispatch_event(&pointer("pointercancel")).unwrap();
+        assert!(
+            js_sys::eval("window.__holdClock.fire === null")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            "a canceled press must discard the pending menu"
+        );
+        send.dispatch_event(&pointer("pointerdown")).unwrap();
+        js_sys::eval("window.__holdClock.fire()").unwrap();
+        next_tick().await;
+        send.dispatch_event(&pointer("pointerup")).unwrap();
+        send.unchecked_ref::<HtmlElement>().click();
+        next_tick().await;
+        assert!(state.chat_input.get_untracked().is_empty());
+        drop(clock);
+
         let _menu = container
             .query_selector("[data-mobile-test='chat-send-menu']")
             .unwrap()
@@ -3084,7 +3171,7 @@ mod wasm_tests {
                     .closest("[data-mobile-test='chat-send-menu']")
                     .unwrap()
                     .is_some(),
-            "photo and microphone actions must share the send caret menu"
+            "photo and microphone actions share the long-press menu"
         );
         assert!(
             container
@@ -3250,6 +3337,46 @@ mod wasm_tests {
         std::mem::forget(h);
         next_tick().await;
 
+        container
+            .query_selector("[data-mobile-test='chat-more']")
+            .unwrap()
+            .unwrap()
+            .unchecked_ref::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-menu-rename']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-menu-close']")
+                .unwrap()
+                .is_none()
+        );
+        container
+            .query_selector("[data-mobile-test='chat-menu-send-actions']")
+            .unwrap()
+            .unwrap()
+            .unchecked_ref::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-add-photo']")
+                .unwrap()
+                .is_some(),
+            "empty draft chats expose composer utilities through More without holding a disabled action"
+        );
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+            .unwrap()
+            .unwrap()
+            .unchecked_ref::<HtmlElement>()
+            .click();
+        next_tick().await;
         let backend: web_sys::HtmlSelectElement = container
             .query_selector("[data-mobile-test='new-chat-backend']")
             .unwrap()
@@ -3318,6 +3445,12 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-input-capsule']")
             .unwrap()
             .unwrap();
+        // More-menu dismissal restores Send focus; measure the genuinely unfocused baseline.
+        menu_trigger(&container)
+            .unchecked_ref::<HtmlElement>()
+            .blur()
+            .unwrap();
+        next_tick().await;
         let unfocused_capsule = style(&capsule, "box-shadow");
         let browser_font = style(&backend, "font-size");
         let browser_family = style(&backend, "font-family");
@@ -3409,13 +3542,13 @@ mod wasm_tests {
             visual_failures
                 .push("Native editing must retain a visible capsule focus treatment".into());
         }
-        caret(&container)
+        menu_trigger(&container)
             .unchecked_ref::<HtmlElement>()
             .focus()
             .unwrap();
         next_tick().await;
-        if style(&caret(&container), "outline-style") == "none"
-            || style(&caret(&container), "outline-width") == "0px"
+        if style(&menu_trigger(&container), "outline-style") == "none"
+            || style(&menu_trigger(&container), "outline-width") == "0px"
             || style(&capsule, "box-shadow") != unfocused_capsule
         {
             visual_failures.push(
@@ -3873,7 +4006,10 @@ mod wasm_tests {
         next_tick().await;
 
         let send: HtmlElement = primary(&container).dyn_into().unwrap();
-        assert!(!send.has_attribute("disabled"), "Send must start enabled");
+        assert!(
+            send.get_attribute("aria-disabled").as_deref() == Some("false"),
+            "Send must start enabled"
+        );
 
         // First tap. The send is deferred, so it is genuinely unsettled: the
         // future is parked on the oneshot and the composer still holds the text.
@@ -3892,7 +4028,7 @@ mod wasm_tests {
              that is the whole point, and it is what removed the accidental guard"
         );
         assert!(
-            send.has_attribute("disabled"),
+            send.get_attribute("aria-disabled").as_deref() == Some("true"),
             "Send must be disabled while a submission is unsettled"
         );
 
@@ -3984,7 +4120,7 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(crate::bridge::test_send_attempts(), 1);
         assert!(
-            send.has_attribute("disabled"),
+            send.get_attribute("aria-disabled").as_deref() == Some("true"),
             "Send must be disabled while the message is unsettled"
         );
 
@@ -4165,7 +4301,7 @@ mod wasm_tests {
             };
             assert!(send.is_connected());
             assert!(send.is_same_node(Some(&primary(&container))));
-            assert!(!send.has_attribute("disabled"));
+            assert!(send.get_attribute("aria-disabled").as_deref() == Some("false"));
             send.dispatch_event(&web_sys::Event::new("pointerup").unwrap())
                 .unwrap();
             send.click();
@@ -4176,7 +4312,7 @@ mod wasm_tests {
                 "draft retained until local admission"
             );
             if !reject {
-                assert!(send.has_attribute("disabled"));
+                assert!(send.get_attribute("aria-disabled").as_deref() == Some("true"));
                 send.click();
                 next_tick().await;
                 assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
@@ -4236,9 +4372,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 1: Idle + empty ─────────────────────────────────────
-    // Primary "Send" disabled; caret still exposes composer utilities.
+    // Primary "Send" disabled; the menu still exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn idle_empty_send_disabled_caret_opens_utilities() {
+    async fn idle_empty_send_disabled_menu_opens_utilities() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -4250,14 +4386,14 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
         assert!(
-            p.has_attribute("disabled"),
+            p.get_attribute("aria-disabled").as_deref() == Some("true"),
             "Send must be disabled when empty"
         );
 
-        let c = caret(&container);
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
-            "the caret must remain available for attachments and speech"
+            "the menu must remain available for attachments and speech"
         );
 
         let picker: web_sys::HtmlInputElement = container
@@ -4946,9 +5082,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 4: Thinking + empty ─────────────────────────────────
-    // Primary "Cancel" enabled; caret still exposes composer utilities.
+    // Primary "Cancel" enabled; the menu still exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn thinking_empty_primary_cancel_caret_opens_utilities() {
+    async fn thinking_empty_primary_cancel_menu_opens_utilities() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -4977,21 +5113,24 @@ mod wasm_tests {
             "primary must be Cancel when thinking with empty composer"
         );
         assert!(
-            !p.has_attribute("disabled"),
+            p.get_attribute("aria-disabled").as_deref() == Some("false"),
             "Cancel must be enabled while thinking"
         );
 
-        let c = caret(&container);
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
             "composer utilities remain available while a turn is running"
         );
         open_menu(&container).await;
-        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Add photos".to_owned(), "Cancel".to_owned()]
+        );
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Steer", "Cancel".
+    // Primary "Send" enabled; menu available; dropdown has "Steer", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_no_session_send_primary_queue_steer_cancel_menu() {
         let host = LocalHostId("host-1".to_owned());
@@ -5024,7 +5163,10 @@ mod wasm_tests {
             "Send",
             "primary must remain Send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Send must be enabled");
+        assert!(
+            p.get_attribute("aria-disabled").as_deref() == Some("false"),
+            "Send must be enabled"
+        );
 
         assert!(
             container
@@ -5229,7 +5371,7 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(p.text_content().unwrap_or_default().trim(), "Cancel");
         assert!(
-            !p.has_attribute("disabled"),
+            p.get_attribute("aria-disabled").as_deref() == Some("false"),
             "Cancel must be enabled while the agent awaits the user"
         );
         p.unchecked_ref::<web_sys::HtmlElement>().click();
@@ -5245,7 +5387,7 @@ mod wasm_tests {
     }
 
     // ── State matrix row 3: Idle + input + session ───────────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Fork + send" only.
+    // Primary "Send" enabled; menu available; dropdown has "Fork + send" only.
     #[wasm_bindgen_test]
     async fn idle_input_with_session_menu_fork_send_only() {
         let host = LocalHostId("host-1".to_owned());
@@ -5280,20 +5422,20 @@ mod wasm_tests {
         next_tick().await;
 
         // No draft still leaves composer utilities reachable.
-        let c = caret(&container);
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
-            "caret must expose composer utilities before there is a draft"
+            "menu must expose composer utilities before there is a draft"
         );
 
         type_text(&container, "why is this slow?");
         next_tick().await;
 
-        // Now has draft → caret enabled, menu has "Fork + send" only.
-        let c = caret(&container);
+        // Now has draft → menu available, menu has "Fork + send" only.
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
-            "caret must be enabled once draft + session"
+            "menu must remain available once draft + session"
         );
 
         open_menu(&container).await;
@@ -5320,9 +5462,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 2: Idle + input, no session ─────────────────────────
-    // Primary "Send" enabled; caret exposes composer utilities.
+    // Primary "Send" enabled; the menu exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn idle_input_no_session_send_enabled_caret_opens_utilities() {
+    async fn idle_input_no_session_send_enabled_menu_opens_utilities() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -5360,15 +5502,15 @@ mod wasm_tests {
         let p = primary(&container);
         assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
         assert!(
-            !p.has_attribute("disabled"),
+            p.get_attribute("aria-disabled").as_deref() == Some("false"),
             "Send must be enabled with draft"
         );
 
         // No session → Fork + send absent, but utilities remain.
-        let c = caret(&container);
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
-            "caret must retain composer utilities without a session"
+            "menu must retain composer utilities without a session"
         );
         open_menu(&container).await;
         assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
@@ -5382,7 +5524,7 @@ mod wasm_tests {
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
+    // Primary "Send" enabled; menu available; dropdown has "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_with_session_send_primary_full_menu() {
         let host = LocalHostId("host-1".to_owned());
@@ -5432,10 +5574,13 @@ mod wasm_tests {
             "Send",
             "primary must remain Send when thinking with draft"
         );
-        assert!(!p.has_attribute("disabled"), "Send must be enabled");
+        assert!(
+            p.get_attribute("aria-disabled").as_deref() == Some("false"),
+            "Send must be enabled"
+        );
 
-        let c = caret(&container);
-        assert!(!c.has_attribute("disabled"), "caret must be enabled");
+        let c = menu_trigger(&container);
+        assert!(!c.has_attribute("disabled"), "menu must remain available");
 
         open_menu(&container).await;
         assert_eq!(
@@ -5574,7 +5719,7 @@ mod wasm_tests {
             "a stale active turn must not render Cancel on a dead agent"
         );
         assert!(
-            p.has_attribute("disabled"),
+            p.get_attribute("aria-disabled").as_deref() == Some("true"),
             "Terminated is a state, not an action — the control must be disabled"
         );
         // The recovery routes must be *visible*, not only in a tooltip: `title`
@@ -5612,7 +5757,7 @@ mod wasm_tests {
             "Terminated",
             "a draft must not turn a dead agent's primary back into Send"
         );
-        assert!(p.has_attribute("disabled"));
+        assert!(p.get_attribute("aria-disabled").as_deref() == Some("true"));
 
         // Clicking a disabled button is not a real test — the browser never
         // dispatches it. The keyboard path is not gated by `disabled` at all,
@@ -5637,7 +5782,7 @@ mod wasm_tests {
         // agent from the retained session on the *host* stream, never on the
         // dead instance stream. Invoke it for real rather than only reading the
         // menu label — a Fork that was itself broken would pass a label check.
-        let c = caret(&container);
+        let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
             "Fork + send must remain available on a dead agent with a session"
@@ -5885,121 +6030,12 @@ mod wasm_tests {
 
         let p = primary(&container);
         assert_eq!(p.text_content().unwrap_or_default().trim(), "Terminated");
-        assert!(p.has_attribute("disabled"));
+        assert!(p.get_attribute("aria-disabled").as_deref() == Some("true"));
         assert!(
-            !caret(&container).has_attribute("disabled"),
+            !menu_trigger(&container).has_attribute("disabled"),
             "attachments remain available even though Fork + send is absent"
         );
         open_menu(&container).await;
         assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
-    }
-
-    #[wasm_bindgen_test]
-    async fn a_running_turn_lights_the_composer_rim_and_idle_puts_it_out() {
-        crate::components::test_styles::ensure_styles_loaded();
-        let host = LocalHostId("host-1".to_owned());
-        let agent_ref = AgentRef {
-            local_host_id: host.clone(),
-            agent_id: AgentId("agent-1".to_owned()),
-        };
-        let state = AppState::new();
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host.clone(),
-            agent_id: AgentId("agent-1".to_owned()),
-        }));
-        state.agent_turn_active.update(|m| {
-            m.insert(agent_ref.clone(), true);
-        });
-        let container = make_container();
-        container.style().set_property("width", "390px").unwrap();
-        let mount_state = state.clone();
-        let _h = mount_to(container.clone(), move || {
-            provide_context(mount_state);
-            view! { <ChatInput /> }
-        });
-        next_tick().await;
-
-        let ring = |container: &HtmlElement| {
-            container
-                .query_selector("[data-mobile-test='chat-thinking-ring']")
-                .unwrap()
-        };
-        let capsule = container
-            .query_selector("[data-mobile-test='chat-input-capsule']")
-            .unwrap()
-            .expect("composer capsule");
-        let ring_el = ring(&container).expect("a running turn draws the ring");
-
-        // The ring traces the whole capsule, not one of its edges.
-        let capsule_box = capsule.get_bounding_client_rect();
-        let ring_box = ring_el.get_bounding_client_rect();
-        for (edge, ring_edge, capsule_edge) in [
-            ("left", ring_box.left(), capsule_box.left()),
-            ("right", ring_box.right(), capsule_box.right()),
-            ("top", ring_box.top(), capsule_box.top()),
-            ("bottom", ring_box.bottom(), capsule_box.bottom()),
-        ] {
-            assert!(
-                (ring_edge - capsule_edge).abs() < 1.0,
-                "the ring hugs the capsule's {edge} edge ({ring_edge} vs {capsule_edge})"
-            );
-        }
-
-        let window = web_sys::window().unwrap();
-        let capsule_radius = window
-            .get_computed_style(&capsule)
-            .unwrap()
-            .expect("capsule style")
-            .get_property_value("border-top-left-radius")
-            .unwrap();
-        let capsule_radius: f64 = capsule_radius
-            .trim_end_matches("px")
-            .parse()
-            .expect("capsule radius in px");
-        let style = window.get_computed_style(&ring_el).unwrap().unwrap();
-        let prop = |name: &str| style.get_property_value(name).unwrap();
-        assert_eq!(prop("pointer-events"), "none");
-        assert_eq!(prop("filter"), "none", "no glowing orbit");
-        assert_eq!(prop("padding-top"), "1px", "a one-pixel edge");
-        assert_eq!(
-            prop("mask-composite"),
-            "exclude, exclude",
-            "the center is cut out"
-        );
-        assert_eq!(prop("background-size"), "200% 100%");
-        assert_eq!(prop("animation-duration"), "1.6s");
-        assert_eq!(prop("animation-timing-function"), "ease-in-out");
-        assert_eq!(prop("animation-iteration-count"), "infinite");
-        let radius: f64 = prop("border-top-left-radius")
-            .trim_end_matches("px")
-            .parse()
-            .expect("radius in px");
-        assert!((radius - capsule_radius).abs() < 0.01);
-        let seek = js_sys::Function::new_with_args(
-            "element, time",
-            "const animation = element.getAnimations()[0]; animation.pause(); animation.currentTime = time;",
-        );
-        for (time, position) in [(0, "100% 0px"), (800, "0% 0px"), (1600, "100% 0px")] {
-            seek.call2(&wasm_bindgen::JsValue::NULL, &ring_el, &time.into())
-                .unwrap();
-            assert_eq!(prop("background-position"), position, "horizontal sweep");
-        }
-        for (theme, accent) in [("light", "rgb(37, 99, 235)"), ("dark", "rgb(0, 122, 204)")] {
-            container.set_attribute("data-theme", theme).unwrap();
-            let gradient = prop("background-image");
-            assert_eq!(
-                gradient,
-                format!(
-                    "linear-gradient(90deg, rgba(0, 0, 0, 0) 0%, {accent} 40%, {accent} 60%, rgba(0, 0, 0, 0) 100%)"
-                ),
-                "one selected-theme accent fades through transparent edges"
-            );
-        }
-
-        state.agent_turn_active.update(|m| {
-            m.remove(&agent_ref);
-        });
-        next_tick().await;
-        assert!(ring(&container).is_none(), "an idle agent shows no ring");
     }
 }
