@@ -2574,3 +2574,32 @@ until explicit fixture release, then requires normal completion and idle. This
 replaces the old 75-second child sleep, one-second admission guess and ten-second
 settlement threshold with event/state synchronization. Only Codex exposes the
 code-mode ownership trace this provider-specific scenario exercises.
+
+## Codex rejected code batches and post-terminal control
+
+`real_codex_sequential_code_batches` uses the production Backend and actual MCP
+transport. A genuine native code cell synchronously rejects before evaluating
+two textual MCP calls in `Promise.all`. Two subsequent successful cells each
+await two actual MCP calls. The prompt supplies exact configured tool names.
+Content-free receipts from the independent stdout reader require the actual
+failed cell and native `turn/completed`, and the fixture journal must contain
+exactly the four successful invocations before steering and interrupting.
+The case requires cancellation settlement, all four results, exact A/B and C/D
+response ownership, the final answer, typed idle, a subsequent answer and clean
+shutdown. Only Codex exposes the native code-mode boundary under test.
+
+The old forwarder inferred a batch size from source text, including code that
+never dispatched a tool, and keyed that inferred batch by turn. A later cell
+could panic the task while a rejected declaration's phantom batch remained.
+Two fully successful literal batches alone do not necessarily reproduce this:
+a controlled baseline passed that narrower scenario. Production's first cell
+actually reported `Script failed`; the second used `Promise.allSettled`, also
+matched by the old `Promise.all` substring search. Its notification task panic
+and later post-terminal cancellation wait are retained in incident evidence.
+
+The independent RPC reader could still answer controls while notification-owned
+active-turn state could no longer retire. An already-terminal interrupt reply
+therefore led to a state wait that could never complete. Genuine notifications
+now flow in order to the existing raw-response/tool/rollout ownership handlers,
+without guessed membership or withheld completions. Server lifecycle remains
+exclusively driven by `TypingStatusChanged`; accounting isolation is unchanged.

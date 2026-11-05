@@ -16646,6 +16646,154 @@ fn real_codex_legacy_dynamic_await() {
 
 #[test]
 #[ignore = "real backend conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_codex_sequential_code_batches() {
+    run_codex_scenario(
+        "real_codex_sequential_code_batches",
+        Profile::codex(),
+        |host| {
+            Box::pin(async move {
+                let script = host.workspace().join("batch-probe.py");
+                let journal = host.workspace().join("batch-calls.jsonl");
+                std::fs::write(&script, mcp_probe_script()).expect("write actual MCP server");
+                install_mcp_server(
+                    host,
+                    MCP_SERVER_NAME,
+                    "python3",
+                    vec![
+                        script.to_string_lossy().into_owned(),
+                        journal.to_string_lossy().into_owned(),
+                    ],
+                )
+                .await;
+                let agent = spawn_agent(host, &launch_prompt()).await;
+                let launched = collect_turn(host, &agent, &launch_prompt()).await;
+                assert_ready_handshake(&launched);
+                let prompt = concat!(
+                    "Use functions.exec for THREE separate sequential code cells in this turn. ",
+                    "First execute exactly this intentionally rejected cell: await Promise.all([",
+                    "(() => { throw new Error('EXPECTED_BATCH_REJECTION'); })(),",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'unreached-a'}),",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'unreached-b'})]); ",
+                    "The synchronous first argument must fail before either MCP call is evaluated. ",
+                    "Do not retry that cell. Continue with these two successful cells. ",
+                    "Execute the first cell exactly: text(await Promise.all([",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'batch-a'}),",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'batch-b'})])); ",
+                    "After it completes, execute the second cell exactly: text(await Promise.all([",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'batch-c'}),",
+                    "tools.mcp__tyde_conformance_probe__record_probe({value:'batch-d'})])); ",
+                    "Do not change the tool names or use other tools. Only after all four actual ",
+                    "MCP_OK results are returned, reply BATCH_DONE."
+                );
+                let (receipts, mut native) = tokio::sync::mpsc::unbounded_channel();
+                NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = Some(receipts));
+                send_prompt(host, &agent, prompt).await;
+                let mut rejected_cells = 0;
+                loop {
+                    match native
+                        .recv()
+                        .await
+                        .expect("native terminal receipt channel")
+                    {
+                        NativeReceipt::NativeCodeCellFailed => rejected_cells += 1,
+                        NativeReceipt::NativeTurnCompleted => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    rejected_cells, 1,
+                    "the native provider must execute exactly one rejected code cell before completing the successful batches"
+                );
+                NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = None);
+                let served = mcp_journal(&journal);
+                let mut values = served
+                    .iter()
+                    .map(|call| {
+                        call.get("value")
+                            .and_then(Value::as_str)
+                            .expect("actual MCP call must contain its string value")
+                    })
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                assert_eq!(
+                    values,
+                    vec!["batch-a", "batch-b", "batch-c", "batch-d"],
+                    "native turn completed without the four required actual MCP calls"
+                );
+                eprintln!(
+                    "BATCH PROOF: four actual MCP calls and native turn/completed received before control"
+                );
+                assert!(
+                    matches!(
+                        host.backend_ref().steer(user_message("Reply UNUSED")).await,
+                        SteerOutcome::NoActiveTurn(_) | SteerOutcome::Unsupported(_)
+                    ),
+                    "a provider-completed turn must not accept steering"
+                );
+                assert!(
+                    host.backend_ref().interrupt().await,
+                    "cancellation must settle after sequential code batches"
+                );
+                let interrupted = collect_turn(host, &agent, prompt).await;
+                assert_mcp_calls_reached_the_server(
+                    &interrupted,
+                    &journal,
+                    0,
+                    &["batch-a", "batch-b", "batch-c", "batch-d"],
+                );
+                assert_mcp_results_came_back(
+                    &interrupted,
+                    &["batch-a", "batch-b", "batch-c", "batch-d"],
+                );
+                assert_response_groups_its_tool_calls(&interrupted);
+                // The real run also emitted a tool-discovery response. Check the
+                // two MCP batches, not unrelated discovery declarations.
+                let batches = interrupted
+                    .assistant_messages()
+                    .map(|message| {
+                        let mut values = message
+                            .tool_calls
+                            .iter()
+                            .filter(|call| is_probe_tool(&call.name))
+                            .map(|call| {
+                                call.arguments
+                                    .get("value")
+                                    .and_then(Value::as_str)
+                                    .expect("probe declaration must retain its string value")
+                            })
+                            .collect::<Vec<_>>();
+                        values.sort_unstable();
+                        values
+                    })
+                    .filter(|values| !values.is_empty())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    batches,
+                    vec![vec!["batch-a", "batch-b"], vec!["batch-c", "batch-d"]],
+                    "each actual MCP batch must retain exactly its own two declarations"
+                );
+                assert_final_text_contains(&interrupted, "BATCH_DONE");
+                let prompt = "Reply exactly BATCH_RECOVERED without tools.";
+                send_prompt(host, &agent, prompt).await;
+                let mut followup = host.turn(prompt);
+                // An idle interrupt can emit its own acknowledgement and idle.
+                collect_control_events_until(host, &mut followup, |event| {
+                    matches!(event, ChatEvent::StreamEnd(end) if end.message.content.contains("BATCH_RECOVERED"))
+                }).await;
+                collect_control_events_until(host, &mut followup, |event| {
+                    matches!(event, ChatEvent::TypingStatusChanged(false))
+                })
+                .await;
+                assert_final_text_contains(&followup, "BATCH_RECOVERED");
+                assert_universal_contract(&[launched, interrupted, followup]);
+                assert_clean_close(host, &agent).await;
+            })
+        },
+    );
+}
+
+#[test]
+#[ignore = "real backend conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_codex_abandoned_agent_await() {
     run_codex_scenario(
         "real_codex_abandoned_agent_await",

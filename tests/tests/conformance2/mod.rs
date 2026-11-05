@@ -533,6 +533,8 @@ pub(super) enum NativeReceipt {
     Narrative,
     ToolCompletion,
     ControlStartPending,
+    NativeTurnCompleted,
+    NativeCodeCellFailed,
 }
 
 thread_local! {
@@ -551,6 +553,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NarrativeReceiptCa
                     self.0 = Some(NativeReceipt::ControlStartPending);
                 } else if value {
                     self.0 = match field.name() {
+                        "codex_native_code_cell_failed_received" => {
+                            Some(NativeReceipt::NativeCodeCellFailed)
+                        }
+                        "codex_native_turn_completed_received" => {
+                            Some(NativeReceipt::NativeTurnCompleted)
+                        }
                         "codex_narrative_delta_processed" => Some(NativeReceipt::Narrative),
                         "codex_tool_completion_processed" => Some(NativeReceipt::ToolCompletion),
                         "codex_control_start_pending" => Some(NativeReceipt::ControlStartPending),

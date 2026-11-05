@@ -2437,68 +2437,11 @@ impl CodexSession {
         let forward_inner = Arc::downgrade(&inner);
         crate::backend::subprocess::spawn(async move {
             let mut rx = inbound_rx;
-            let mut nested_batches = HashMap::<String, CodexNestedGenericBatch>::new();
             while let Some(inbound) = rx.recv().await {
                 let Some(forward_inner) = forward_inner.upgrade() else {
                     return;
                 };
-                if let Some((turn_id, call_count)) = codex_raw_nested_batch_declaration(&inbound) {
-                    tracing::debug!(call_count, "Codex declared a nested generic tool batch");
-                    assert!(
-                        nested_batches
-                            .insert(turn_id, CodexNestedGenericBatch::new(call_count))
-                            .is_none(),
-                        "Codex declared overlapping nested generic batches for one turn"
-                    );
-                    forward_inner.handle_inbound(inbound).await;
-                    continue;
-                }
-                let Some((method, params, _, item_id)) =
-                    codex_nested_generic_tool_notification(&inbound)
-                else {
-                    forward_inner.handle_inbound(inbound).await;
-                    continue;
-                };
-                let Some(turn_id) = extract_turn_id(params) else {
-                    forward_inner.handle_inbound(inbound).await;
-                    continue;
-                };
-                let Some(batch) = nested_batches.get_mut(&turn_id) else {
-                    forward_inner.handle_inbound(inbound).await;
-                    continue;
-                };
-                match method {
-                    "item/started" => {
-                        tracing::debug!("Codex admitted a nested generic tool request");
-                        batch.observe_start(item_id);
-                        forward_inner.handle_inbound(inbound).await;
-                        if batch.starts_remaining == 0 {
-                            for completion in batch.pending_completions.drain(..) {
-                                forward_inner.handle_inbound(completion).await;
-                            }
-                        }
-                    }
-                    "item/completed" => {
-                        batch.observe_completion(item_id);
-                        if batch.starts_remaining == 0 {
-                            forward_inner.handle_inbound(inbound).await;
-                        } else {
-                            tracing::debug!(
-                                starts_remaining = batch.starts_remaining,
-                                "Holding a nested generic completion until every request is admitted"
-                            );
-                            batch.pending_completions.push(inbound);
-                        }
-                    }
-                    _ => forward_inner.handle_inbound(inbound).await,
-                }
-                if batch.completions_remaining == 0 {
-                    assert!(
-                        batch.pending_completions.is_empty(),
-                        "Codex nested batch ended before every request was admitted"
-                    );
-                    nested_batches.remove(&turn_id);
-                }
+                forward_inner.handle_inbound(inbound).await;
             }
         });
 
@@ -9345,6 +9288,7 @@ impl CodexInner {
                     }
                     Err(error) => return Err(error.to_string()),
                 }
+                tracing::debug!(target: "tyde_codex_dispatch_receipt", "Codex interrupt RPC settled; awaiting correlated terminal state");
                 self.state
                     .when(
                         move |state| {
@@ -21482,85 +21426,6 @@ async fn read_codex_rollout_trace(
     Ok(())
 }
 
-fn codex_nested_generic_tool_notification(
-    inbound: &CodexInbound,
-) -> Option<(&str, &Value, &str, &str)> {
-    let CodexInbound::Notification { method, params } = inbound else {
-        return None;
-    };
-    let item = params.get("item")?;
-    let item_type = item.get("type")?.as_str()?;
-    if !matches!(item_type, "mcpToolCall" | "dynamicToolCall") {
-        return None;
-    }
-    let item_id = item.get("id")?.as_str()?;
-    Some((method, params, item_type, item_id))
-}
-
-struct CodexNestedGenericBatch {
-    starts_remaining: usize,
-    completions_remaining: usize,
-    started_ids: HashSet<String>,
-    completed_ids: HashSet<String>,
-    pending_completions: Vec<CodexInbound>,
-}
-
-impl CodexNestedGenericBatch {
-    fn new(call_count: usize) -> Self {
-        Self {
-            starts_remaining: call_count,
-            completions_remaining: call_count,
-            started_ids: HashSet::new(),
-            completed_ids: HashSet::new(),
-            pending_completions: Vec::new(),
-        }
-    }
-
-    fn observe_start(&mut self, item_id: &str) {
-        assert!(
-            self.started_ids.insert(item_id.to_owned()),
-            "Codex duplicated nested batch request admission {item_id}"
-        );
-        self.starts_remaining = self
-            .starts_remaining
-            .checked_sub(1)
-            .expect("Codex admitted more nested requests than the raw batch declared");
-    }
-
-    fn observe_completion(&mut self, item_id: &str) {
-        assert!(
-            self.completed_ids.insert(item_id.to_owned()),
-            "Codex duplicated nested batch completion {item_id}"
-        );
-        self.completions_remaining = self
-            .completions_remaining
-            .checked_sub(1)
-            .expect("Codex completed more nested requests than the raw batch declared");
-    }
-}
-
-fn codex_raw_nested_batch_declaration(inbound: &CodexInbound) -> Option<(String, usize)> {
-    let CodexInbound::Notification { method, params } = inbound else {
-        return None;
-    };
-    if method != "rawResponseItem/completed" {
-        return None;
-    }
-    let item = params.get("item")?;
-    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
-        return None;
-    }
-    let input = item.get("input").and_then(Value::as_str)?;
-    if !input.contains("Promise.all") {
-        return None;
-    }
-    let call_count = input.match_indices("tools.mcp__").count();
-    if call_count < 2 {
-        return None;
-    }
-    Some((extract_turn_id(params)?, call_count))
-}
-
 fn toml_quoted(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
@@ -22402,6 +22267,19 @@ impl CodexRpc {
                             params,
                         });
                     } else {
+                        if method == "turn/completed" {
+                            tracing::debug!(target: "tyde_codex_dispatch_receipt", codex_native_turn_completed_received = true, "Codex stdout reader received native terminal notification");
+                        }
+                        if method == "rawResponseItem/completed"
+                            && params.get("item").is_some_and(|item| {
+                                item.get("type").and_then(Value::as_str)
+                                    == Some("custom_tool_call_output")
+                                    && raw_custom_tool_output_text(item)
+                                        .starts_with("Script failed")
+                            })
+                        {
+                            tracing::debug!(target: "tyde_codex_dispatch_receipt", codex_native_code_cell_failed_received = true, "Codex stdout reader received a failed native code cell");
+                        }
                         if method == "thread/closed"
                             && let Some(thread_id) = params.get("threadId").and_then(Value::as_str)
                             && stdout_pending
