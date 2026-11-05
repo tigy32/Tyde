@@ -98,8 +98,8 @@ platform fixture; it does not certify iOS URLSession, production auth or the
 user's installed TestFlight connection. Updated bridge bytes require a new
 native build, not replacement of an already published host client.
 
-The current authorized private preview tracks Release build 6 in the Xcode
-project; Debug remains build 1. The read-only ASC query on 2026-11-04 at
+The preceding private preview tracked Release build 6 in the Xcode
+project; Debug remained build 1. The read-only ASC query on 2026-11-04 at
 21:11 UTC found builds 2–5 VALID, old build 1 awaiting upload, and no build 6
 record or reservation. Build 5's archive-time override was a one-off, not the
 route for build 6. Recheck allocation before upload; use the tracked identity
@@ -113,6 +113,31 @@ production resources from the final landed source. Existing beta26 and its
 matched client suffice; no host restart, Service change or client republication
 is required. The boundary proof above does not establish physical TestFlight
 acceptance, the user's live error stack or ordinary native UI Send/response.
+
+## Current private preview build 7 preparation
+
+Release now tracks build 7; Debug remains build 1. The GET-only ASC preflight
+on 2026-11-05 at 08:56:31 UTC found builds 2–6 VALID with uploads COMPLETE,
+build 1 AWAITING_UPLOAD, and no build 7 record or reservation. This prepares
+the next unused tracked identity; it does not reserve or upload it. Recheck
+allocation before distribution and preserve the tracked identity without
+archive/export overrides. Build 5's one-off override must not be reused.
+
+Finished UI source `0e162fa1fb2b0901d0e7749e067aaf47f5823f24` is integrated
+in checked/pushed main `bfc9e4b5c9ba987eca0dcb47a9e4d166b87cd1d4`.
+This bookkeeping adds no product changes or unfinished WebContent recovery/crash
+work. Changed Swift and `native-host.js` require a fresh native build from final
+landed source with production resources. Hosted mobile assets containing the UI
+must be published separately; a native archive alone does not update the
+host-selected full client. No manual beta28 approval is held, and this source
+preparation authorizes no cut, tag, deployment, host/device update or restart.
+
+Protocol 97, native ABI 6, bootstrap 1, production origin, same-team identity,
+entitlements and existing pairings remain unchanged. Source validation/review
+do not establish physical crash recovery, keyboard or hold-interaction
+acceptance, nor close the earlier native QA limits. The Lander owns clean-main
+validation/push; the distribution owner owns signing, archive, compliance,
+upload and private TestFlight availability after the required approvals.
 
 ## Adaptive Agents hierarchy
 
