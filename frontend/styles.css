@@ -1,6 +1,7 @@
 /* ===== CSS Custom Properties ===== */
 :root {
     --base-font-size: 13px;
+    --code-line-height: 20px;
 
     /* Spacing */
     --space-1: 4px;
@@ -9103,6 +9104,28 @@ math merror {
     position: relative;
 }
 
+.diff-window {
+    flex-shrink: 0;
+}
+
+.diff-windowed {
+    position: sticky;
+    top: 0;
+    height: 0;
+    flex-shrink: 0;
+}
+
+.diff-window-body {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+.diff-extent {
+    flex-shrink: 0;
+    pointer-events: none;
+}
+
 /* Cmd/Ctrl-hover go-to-definition affordance over a diff row.
  *
  * Drawn as an overlay rather than by splitting the row's spans the way the file
@@ -9280,8 +9303,8 @@ math merror {
     display: flex;
     font-family: var(--font-mono);
     font-size: 0.923rem;
-    line-height: 20px;
-    min-height: 20px;
+    line-height: var(--code-line-height);
+    min-height: var(--code-line-height);
 }
 
 .diff-line-context {
@@ -9436,7 +9459,7 @@ math merror {
 }
 
 .diff-line-empty {
-    min-height: 20px;
+    min-height: var(--code-line-height);
 }
 
 /* ===== Find Bar ===== */

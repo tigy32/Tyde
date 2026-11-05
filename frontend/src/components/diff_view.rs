@@ -210,6 +210,27 @@ const OVERSCAN_LINES: f64 = 80.0;
 /// preserves layout assertions for tiny test diffs.
 const VIRTUALIZE_THRESHOLD: usize = 200;
 
+fn measured_code_line_height(element: &web_sys::Element) -> Result<f64, String> {
+    let window = web_sys::window().ok_or("Diff viewport has no window")?;
+    let style = window
+        .get_computed_style(element)
+        .map_err(|error| format!("Could not read diff styles: {error:?}"))?
+        .ok_or("Diff viewport has no computed style")?;
+    let value = style
+        .get_property_value("--code-line-height")
+        .map_err(|error| format!("Could not read code line height: {error:?}"))?;
+    let height: f64 = value
+        .trim()
+        .strip_suffix("px")
+        .ok_or("Code line height must use pixels")?
+        .parse()
+        .map_err(|error| format!("Could not parse code line height: {error}"))?;
+    if !height.is_finite() || height <= 0.0 {
+        return Err("Code line height must be finite and positive".to_owned());
+    }
+    Ok(height)
+}
+
 fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
     TabScrollState {
         scroll_top: el.scroll_top(),
@@ -225,6 +246,9 @@ fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
 /// are refined by a measurement effect on first paint.
 #[derive(Clone, Copy)]
 struct DiffScroll {
+    scroll_ref: NodeRef<leptos::html::Div>,
+    body_ref: NodeRef<leptos::html::Div>,
+    content_height: RwSignal<f64>,
     scroll_top: RwSignal<f64>,
     viewport_height: RwSignal<f64>,
     line_height: RwSignal<f64>,
@@ -1334,6 +1358,26 @@ fn DiffContent(
     // expanded files, so revealing context stays consistent across all of it
     // instead of only changing what is painted.
     let scroll_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let window_body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let content_height = RwSignal::new(0.0);
+    // Scroll geometry. Pre-seed line/viewport height estimates so the
+    // visible window is bounded from the very first paint, before the
+    // measurement effect runs. Mirrors `file_view` exactly.
+    let scroll_top =
+        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
+    let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
+    let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+    let geometry_measured = RwSignal::new(false);
+    let scroll_ctx = DiffScroll {
+        scroll_ref,
+        body_ref: window_body_ref,
+        content_height,
+        scroll_top,
+        viewport_height,
+        line_height,
+    };
+    provide_context(scroll_ctx);
+
     let base_files = Arc::new(diff.files.clone());
     let expansions: RwSignal<std::collections::HashMap<String, ExpandRegions>> =
         RwSignal::new(std::collections::HashMap::new());
@@ -1372,6 +1416,31 @@ fn DiffContent(
                 .collect(),
         )
     });
+    let view_mode_for_window = state.diff_view_mode;
+    let windowed = Memo::new(move |_| {
+        let mode = view_mode_for_window.get();
+        expanded_files.get().iter().any(|entry| {
+            let file = &entry.file;
+            if file.is_binary || file.unmerged || file.hunks.is_empty() {
+                return false;
+            }
+            let items = file
+                .hunks
+                .iter()
+                .map(|hunk| {
+                    let lines = match mode {
+                        DiffViewMode::Unified => hunk.lines.len(),
+                        DiffViewMode::SideBySide => {
+                            pair_lines_side_by_side(hunk.lines.clone()).len()
+                        }
+                    };
+                    lines + usize::from(context_mode == DiffContextMode::Hunks)
+                })
+                .sum::<usize>()
+                + usize::from(entry.ui.shows_trailing_boundary(context_mode));
+            items >= VIRTUALIZE_THRESHOLD
+        })
+    });
     let per_file_expand: Memo<Arc<std::collections::HashMap<String, FileExpandUi>>> =
         Memo::new(move |_| {
             Arc::new(
@@ -1396,7 +1465,7 @@ fn DiffContent(
                 expansions.update(|regions| {
                     regions.remove(path);
                 });
-                restore_expansion_anchor(scroll_ref, expanded_files, context_mode, anchor);
+                restore_expansion_anchor(scroll_ctx, expanded_files, context_mode, anchor);
                 return;
             }
             match source {
@@ -1407,7 +1476,7 @@ fn DiffContent(
                     // instead.
                     let anchor = capture_expansion_anchor(scroll_ref, expanded_files, context_mode);
                     apply_expand_action(&act_base, &source, expansions, &target);
-                    restore_expansion_anchor(scroll_ref, expanded_files, context_mode, anchor);
+                    restore_expansion_anchor(scroll_ctx, expanded_files, context_mode, anchor);
                 }
                 // Nothing to reveal from yet: remember what the user asked for
                 // and replay it the moment the full-context read lands, so the
@@ -1449,7 +1518,7 @@ fn DiffContent(
             for target in &targets {
                 apply_expand_action(&replay_base, &source, expansions, target);
             }
-            restore_expansion_anchor(scroll_ref, expanded_files, context_mode, anchor);
+            restore_expansion_anchor(scroll_ctx, expanded_files, context_mode, anchor);
         });
     }
 
@@ -1487,20 +1556,6 @@ fn DiffContent(
         &format!(" lines={total_lines} took={prep_dt:.1}ms"),
     );
 
-    // Scroll geometry. Pre-seed line/viewport height estimates so the
-    // visible window is bounded from the very first paint, before the
-    // measurement effect runs. Mirrors `file_view` exactly.
-    let scroll_top =
-        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
-    let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
-    let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
-    let scroll_ctx = DiffScroll {
-        scroll_top,
-        viewport_height,
-        line_height,
-    };
-    provide_context(scroll_ctx);
-
     let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
     let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
     let scroll_ref_for_restore = scroll_ref;
@@ -1512,42 +1567,106 @@ fn DiffContent(
         let (Some(tab_id), Some(saved)) = (tab_id, initial_scroll_state) else {
             return;
         };
-        let Some(el) = scroll_ref_for_restore.get() else {
+        let height = content_height.get();
+        if !geometry_measured.get() || height == 0.0 {
             return;
-        };
-        restored_initial_scroll_for_effect.set(true);
-        el.set_scroll_top(saved.scroll_top);
-        scroll_top.set(el.scroll_top() as f64);
-        let element: web_sys::Element = el.clone().unchecked_into();
-        state_for_restore.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+        }
+        let restored = restored_initial_scroll_for_effect.clone();
+        let state = state_for_restore.clone();
+        spawn_local(async move {
+            leptos::task::tick().await;
+            let Some(el) = scroll_ref_for_restore.try_get_untracked().flatten() else {
+                return;
+            };
+            let Some(body) = window_body_ref.try_get_untracked().flatten() else {
+                return;
+            };
+            // The first measurement can still contain estimated-height spacers.
+            // Restore only after the measured body and native extent are published.
+            if !geometry_measured.get_untracked()
+                || restored.get()
+                || body.offset_height() as f64 != height
+            {
+                return;
+            }
+            restored.set(true);
+            el.set_scroll_top(saved.scroll_top);
+            scroll_top.set(el.scroll_top() as f64);
+            let element: web_sys::Element = el.unchecked_into();
+            state.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+        });
     });
 
-    // Measure the geometry once after first paint. Re-runs are cheap; we
-    // only update the signal if the measured value differs meaningfully.
+    type GeometryObserver = Option<(web_sys::ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>;
+    let geometry_observer: StoredValue<GeometryObserver, LocalStorage> =
+        StoredValue::new_local(None);
+    on_cleanup(move || {
+        geometry_observer.update_value(|slot| {
+            if let Some((observer, _callback)) = slot.take() {
+                observer.disconnect();
+            }
+        });
+    });
     let perf_key_for_measure = perf_key.clone();
     let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
         let Some(el) = scroll_ref.get() else { return };
-        let vh = el.client_height() as f64;
-        if vh > 0.0 && (viewport_height.get_untracked() - vh).abs() > 0.5 {
-            viewport_height.set(vh);
-        }
-        if let Ok(Some(line_el)) = el.query_selector(".diff-line")
-            && let Some(html_el) = line_el.dyn_ref::<web_sys::HtmlElement>()
-        {
-            let lh = html_el.offset_height() as f64;
-            if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
+        let Some(body) = window_body_ref.get() else {
+            return;
+        };
+        let element: web_sys::Element = el.clone().unchecked_into();
+        let body_element: web_sys::Element = body.clone().unchecked_into();
+        let measurement_element = element.clone();
+        let measure_logged = measure_logged.clone();
+        let perf_key = perf_key_for_measure.clone();
+        let restored_initial_scroll = restored_initial_scroll.clone();
+        let measure = move || {
+            let vh = el.client_height() as f64;
+            if viewport_height.get_untracked() != vh {
+                viewport_height.set(vh);
+            }
+            let lh = match measured_code_line_height(&measurement_element) {
+                Ok(height) => height,
+                Err(error) => {
+                    geometry_measured.set(false);
+                    crate::components::header::report_user_error(error);
+                    return;
+                }
+            };
+            if line_height.get_untracked() != lh {
                 line_height.set(lh);
             }
-            if !measure_logged.get() {
-                measure_logged.set(true);
+            geometry_measured.set(true);
+            if !measure_logged.replace(true) {
                 crate::perf::log_phase(
                     "diff_open",
                     "first_paint_measured",
-                    &perf_key_for_measure,
+                    &perf_key,
                     &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
                 );
             }
+            let height = body.offset_height() as f64;
+            if content_height.get_untracked() != height {
+                content_height.set(height);
+            }
+            let st = el.scroll_top() as f64;
+            if (initial_scroll_state.is_none() || restored_initial_scroll.get())
+                && scroll_top.get_untracked() != st
+            {
+                scroll_top.set(st);
+            }
+        };
+        measure();
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |_| measure());
+        match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            Ok(observer) => {
+                observer.observe(&element);
+                observer.observe(&body_element);
+                geometry_observer.set_value(Some((observer, callback)));
+            }
+            Err(error) => crate::components::header::report_user_error(format!(
+                "Could not observe diff viewport size: {error:?}"
+            )),
         }
     });
 
@@ -1570,13 +1689,6 @@ fn DiffContent(
     // decorations) still see the outer `.diff-content` value.
     install_scrollport_width_observer(scroll_ref);
 
-    // Throttle scroll updates to one per animation frame. Native scroll
-    // events fire faster than 60Hz (often hundreds/sec on a trackpad);
-    // batching means the visible_window memo only invalidates once per
-    // paint, so the `<For>` diffs once per frame and the main thread
-    // doesn't fight itself trying to keep up. Smooths out the
-    // "lines flash blank during fast scroll" pattern users report.
-    //
     // ── Code intelligence (hover + go-to-definition) over the new side ──────
     // Only a live diff tab with a project identity qualifies: review snapshots
     // are frozen against a diff we cannot prove still matches the worktree.
@@ -1832,6 +1944,13 @@ fn DiffContent(
                     })
                 })
             }}
+            {move || {
+                if state.find_bar_open.get() {
+                    Some(view! { <FindBar /> })
+                } else {
+                    None
+                }
+            }}
             <div
                 // Reactive *class*, not style: `install_scrollport_width_observer`
                 // owns an inline custom property on this element, and a reactive
@@ -1848,13 +1967,6 @@ fn DiffContent(
                 on:click=on_click
                 on:contextmenu=on_contextmenu
             >
-                {move || {
-                    if state.find_bar_open.get() {
-                        Some(view! { <FindBar /> })
-                    } else {
-                        None
-                    }
-                }}
                 {move || cmd_link.get().map(|link| view! {
                     <div
                         class="diff-cmd-link"
@@ -1865,6 +1977,13 @@ fn DiffContent(
                         )
                     ></div>
                 })}
+                // Publish rows and their offset together; native scrolling must not
+                // translate the last complete window into an unpainted spacer.
+                <div class="diff-window" class:diff-windowed=move || windowed.get()>
+                    <div class="diff-window-body" node_ref=window_body_ref
+                        style:top=move || if windowed.get() { format!("{}px", -scroll_top.get()) } else { "auto".to_owned() }
+                        style:min-height=move || format!("{}px", viewport_height.get())
+                    >
                 {move || {
                     // Search indices and virtual-scroll row offsets are
                     // recomputed from the *expanded* files, so revealing
@@ -1908,6 +2027,9 @@ fn DiffContent(
                         })
                         .collect::<Vec<_>>()
                 }}
+                    </div>
+                </div>
+                <div class="diff-extent" style:height=move || format!("{}px", if windowed.get() { content_height.get() } else { 0.0 })></div>
             </div>
             {move || {
                 // A miss still opens the menu — disabled, carrying its reason —
@@ -3789,37 +3911,25 @@ fn capture_diff_scroll_anchor(
     None
 }
 
-/// The height of a rendered row, measured rather than assumed: the virtual
-/// spacers are sized from the same value, so a row-index correction has to use
-/// what the rows actually measure.
-fn measured_diff_line_height(scrollport: &web_sys::Element) -> f64 {
-    scrollport
-        .query_selector(".diff-line")
-        .ok()
-        .flatten()
-        .and_then(|row| row.dyn_into::<web_sys::HtmlElement>().ok())
-        .map(|row| row.offset_height() as f64)
-        .filter(|height| *height > 0.0)
-        .unwrap_or(INITIAL_LINE_HEIGHT_ESTIMATE)
-}
-
 /// Put the anchored row back where it was. Returns false when it could only
 /// be approximated from the row model because the row is not in the document
 /// — a virtualized file renders a window around the current scroll position,
 /// and a large expansion moves the row out of it.
 fn restore_diff_scroll_anchor(
     scrollport: &web_sys::Element,
+    scroll_top: RwSignal<f64>,
     anchor: &DiffScrollAnchor,
     files: &[ExpandedDiffFile],
     context_mode: DiffContextMode,
-) -> bool {
+) -> Result<bool, String> {
     if let Ok(Some(row)) = scrollport.query_selector(&anchor.selector()) {
         let viewport_top = scrollport.get_bounding_client_rect().top();
         let drift = (row.get_bounding_client_rect().top() - viewport_top) - anchor.offset;
         if drift.abs() >= 0.5 {
             scrollport.set_scroll_top(scrollport.scroll_top() + drift.round() as i32);
+            scroll_top.set(scrollport.scroll_top() as f64);
         }
-        return true;
+        return Ok(true);
     }
     // Nothing to measure, but the row model knows which row the anchor became,
     // and every row inserted between the two positions is a revealed context
@@ -3827,13 +3937,14 @@ fn restore_diff_scroll_anchor(
     // window, where the next pass can measure it exactly.
     let (Some(before), Some(after)) = (anchor.row, anchor_row_index(files, context_mode, anchor))
     else {
-        return true;
+        return Ok(true);
     };
-    let shift = (after as f64 - before as f64) * measured_diff_line_height(scrollport);
+    let shift = (after as f64 - before as f64) * measured_code_line_height(scrollport)?;
     if shift != 0.0 {
         scrollport.set_scroll_top(scrollport.scroll_top() + shift.round() as i32);
+        scroll_top.set(scrollport.scroll_top() as f64);
     }
-    false
+    Ok(false)
 }
 
 /// The scrollport element, or `None` once this diff is gone.
@@ -3857,57 +3968,54 @@ fn capture_expansion_anchor(
 
 /// Put it back there now that the expansion has been applied.
 fn restore_expansion_anchor(
-    scroll_ref: NodeRef<leptos::html::Div>,
+    scroll: DiffScroll,
     expanded_files: Memo<Arc<Vec<ExpandedDiffFile>>>,
     context_mode: DiffContextMode,
     anchor: Option<DiffScrollAnchor>,
 ) {
-    let (Some(anchor), Some(element)) = (anchor, diff_scrollport_element(scroll_ref)) else {
-        return;
-    };
-    schedule_anchor_restore(element, expanded_files, context_mode, anchor);
-}
-
-/// Hold the viewport still across an expansion that has just been applied.
-/// Scheduled on the next frame so the correction measures the re-rendered
-/// rows rather than the ones being replaced.
-fn schedule_anchor_restore(
-    scrollport: web_sys::Element,
-    expanded_files: Memo<Arc<Vec<ExpandedDiffFile>>>,
-    context_mode: DiffContextMode,
-    anchor: DiffScrollAnchor,
-) {
-    schedule_anchor_restore_pass(scrollport, expanded_files, context_mode, anchor, 1);
+    let Some(anchor) = anchor else { return };
+    schedule_anchor_restore_pass(scroll, expanded_files, context_mode, anchor, 1);
 }
 
 fn schedule_anchor_restore_pass(
-    scrollport: web_sys::Element,
+    scroll: DiffScroll,
     expanded_files: Memo<Arc<Vec<ExpandedDiffFile>>>,
     context_mode: DiffContextMode,
     anchor: DiffScrollAnchor,
     retries: u8,
 ) {
     request_animation_frame(move || {
-        // The frame can land after the diff that scheduled it is gone: the tab
-        // closed, or a refreshed diff replaced this component. Reading a
-        // disposed signal panics, so treat an unreadable row model as "nothing
-        // left to hold still" rather than assuming this diff still exists.
-        let Some(files) = expanded_files.try_get_untracked() else {
+        let Some(body) = scroll.body_ref.try_get_untracked().flatten() else {
             return;
         };
-        if restore_diff_scroll_anchor(&scrollport, &anchor, &files, context_mode) || retries == 0 {
-            return;
-        }
-        // The approximate correction scrolled the anchored row back into the
-        // window. Its scroll event rebuilds that window before the next
-        // frame's callbacks, so one more pass measures the real row.
-        schedule_anchor_restore_pass(
-            scrollport,
-            expanded_files,
-            context_mode,
-            anchor,
-            retries - 1,
-        );
+        // Expansion can grow a pinned body before ResizeObserver publishes its
+        // native extent. Commit that extent before setting a target offset.
+        scroll.content_height.set(body.offset_height() as f64);
+        spawn_local(async move {
+            leptos::task::tick().await;
+            let (Some(files), Some(scrollport)) = (
+                expanded_files.try_get_untracked(),
+                diff_scrollport_element(scroll.scroll_ref),
+            ) else {
+                return;
+            };
+            match restore_diff_scroll_anchor(
+                &scrollport,
+                scroll.scroll_top,
+                &anchor,
+                &files,
+                context_mode,
+            ) {
+                Ok(true) => return,
+                Ok(false) if retries == 0 => return,
+                Ok(false) => {}
+                Err(error) => {
+                    crate::components::header::report_user_error(error);
+                    return;
+                }
+            }
+            schedule_anchor_restore_pass(scroll, expanded_files, context_mode, anchor, retries - 1);
+        });
     });
 }
 
@@ -6749,63 +6857,77 @@ mod wasm_tests {
     async fn expanding_past_the_virtualization_threshold_holds_scroll_position() {
         ensure_styles_loaded();
         const LONG_FILE_LINES: u32 = 1200;
-        const LONG_FILE_CHANGES: [u32; 2] = [10, 600];
-        let container = make_container();
-        container
-            .set_attribute(
-                "style",
-                "position: absolute; top: 0; left: 0; width: 800px; height: 120px; \
+        for second_change in [600, 1190] {
+            let changes = [10, second_change];
+            let full = expand_full_file_for(LONG_FILE_LINES, &changes);
+            let mut base = expand_base_file_for(LONG_FILE_LINES, &changes);
+            if second_change == 1190 {
+                // Keep this eager viewport deep enough that a clamped correction
+                // cannot accidentally leave the EOF anchor inside the overscan.
+                base.hunks[0].old_start = 1;
+                base.hunks[0].new_start = 1;
+                base.hunks[0].old_count = 150;
+                base.hunks[0].new_count = 150;
+                base.hunks[0].lines = full.hunks[0]
+                    .lines
+                    .iter()
+                    .filter(|line| line.new_line_number.or(line.old_line_number).unwrap() <= 150)
+                    .cloned()
+                    .collect();
+            }
+            let container = make_container();
+            container
+                .set_attribute(
+                    "style",
+                    "position: absolute; top: 0; left: 0; width: 800px; height: 120px; \
                  display: flex; flex-direction: column;",
-            )
-            .unwrap();
-        let handle = mount_expandable_diff_with(
-            container.clone(),
-            DiffViewMode::Unified,
-            AppState::new(),
-            expand_base_file_for(LONG_FILE_LINES, &LONG_FILE_CHANGES),
-            Some(vec![expand_full_file_for(
-                LONG_FILE_LINES,
-                &LONG_FILE_CHANGES,
-            )]),
-        );
-        next_tick().await;
-        next_tick().await;
+                )
+                .unwrap();
+            let handle = mount_expandable_diff_with(
+                container.clone(),
+                DiffViewMode::Unified,
+                AppState::new(),
+                base,
+                Some(vec![full]),
+            );
+            next_tick().await;
+            next_tick().await;
 
-        let scrollport = diff_scrollport(&container);
-        scrollport.set_scroll_top(scrollport.scroll_height());
-        next_tick().await;
-        let (reading, before) = first_visible_new_line(&container, &scrollport);
-        assert!(
-            reading >= 597,
-            "the viewport must start inside the second hunk for this test to \
+            let scrollport = diff_scrollport(&container);
+            scrollport.set_scroll_top(scrollport.scroll_height());
+            next_tick().await;
+            let (reading, before) = first_visible_new_line(&container, &scrollport);
+            assert!(
+                reading >= second_change - 3,
+                "the viewport must start inside the second hunk for this test to \
              mean anything (line {reading})",
-        );
+            );
 
-        // Reveal the whole file: ~590 lines land above the viewport, and the
-        // file crosses into virtualized rendering.
-        click_in(&container, "[data-test=\"diff-expand-all\"]");
-        next_tick().await;
-        next_frame().await;
-        next_frame().await;
-        next_frame().await;
+            // Reveal context above the viewport across the virtualization boundary.
+            click_in(&container, "[data-test=\"diff-expand-all\"]");
+            next_tick().await;
+            next_frame().await;
+            next_frame().await;
+            next_frame().await;
 
-        let row = new_side_row(&container, reading).unwrap_or_else(|| {
-            panic!("the row the user was reading (line {reading}) must still be on screen")
-        });
-        let after =
-            row.get_bounding_client_rect().top() - scrollport.get_bounding_client_rect().top();
-        assert!(
-            (after - before).abs() < 2.0,
-            "the row the user was reading must stay put (was {before}, now {after})",
-        );
-        assert!(
-            new_side_row(&container, 1).is_none(),
-            "and the start of the file, hundreds of lines above, must not be \
+            let row = new_side_row(&container, reading).unwrap_or_else(|| {
+                panic!("the row the user was reading (line {reading}) must still be on screen")
+            });
+            let after =
+                row.get_bounding_client_rect().top() - scrollport.get_bounding_client_rect().top();
+            assert!(
+                (after - before).abs() < 2.0,
+                "the row the user was reading must stay put (was {before}, now {after})",
+            );
+            assert!(
+                new_side_row(&container, 1).is_none(),
+                "and the start of the file, hundreds of lines above, must not be \
              rendered into the window",
-        );
+            );
 
-        drop(handle);
-        container.remove();
+            drop(handle);
+            container.remove();
+        }
     }
 
     // ── Code intelligence over the diff ────────────────────────────────────
@@ -7688,86 +7810,282 @@ mod wasm_tests {
         );
     }
 
-    /// A diff with 1000 Added lines must NOT put all 1000 rows in the DOM.
-    /// Virtualization (commits c55a2c4 / 93e0343) clips rendering to the
-    /// visible window plus an overscan buffer; spacers above and below
-    /// preserve the scroll geometry so the scrollbar is the right size.
-    ///
-    /// If this regresses, the diff viewer's gutter paint flash on scroll
-    /// returns and the FullFile mode becomes unusable on big files.
-    /// Asserts on user-visible behaviour: row counts and scroll height,
-    /// not on internal class names beyond the ones needed to find rows.
+    fn diff_publication(container: &HtmlElement) -> Vec<(String, f64, f64)> {
+        query_all(container, ".diff-line")
+            .into_iter()
+            .filter(|row| row.get_bounding_client_rect().width() > 0.0)
+            .map(|row| {
+                let rect = row.get_bounding_client_rect();
+                (row.text_content().unwrap(), rect.top(), rect.bottom())
+            })
+            .collect()
+    }
+
+    fn assert_populated_diff(container: &HtmlElement, total: usize) {
+        let scrollport = diff_scrollport(container);
+        let viewport = scrollport.get_bounding_client_rect();
+        let mut panes = query_all(container, ".diff-pane");
+        if panes.is_empty() {
+            panes = query_all(container, ".diff-hunks");
+        }
+        let mut paired_tops = std::collections::BTreeMap::new();
+        for pane in panes {
+            if pane.get_bounding_client_rect().width() == 0.0 {
+                continue;
+            }
+            let nodes = pane.query_selector_all(".diff-line").unwrap();
+            let mut previous: Option<(usize, f64)> = None;
+            let mut first = None;
+            let mut last = None;
+            // The retained Chrome failure has 20.390625px hunk chrome and 20px
+            // code rows. An origin inferred from an EOF spacer is not the
+            // document's origin. Check perceived row spacing and pane alignment.
+            for i in 0..nodes.length() {
+                let row = nodes
+                    .item(i)
+                    .unwrap()
+                    .dyn_into::<web_sys::Element>()
+                    .unwrap();
+                let rect = row.get_bounding_client_rect();
+                let number: usize = row
+                    .get_attribute("data-anchor-new-line")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    row.query_selector(".diff-text")
+                        .unwrap()
+                        .unwrap()
+                        .text_content()
+                        .unwrap(),
+                    format!("line {}", number - 1)
+                );
+                assert_eq!(rect.height(), 20.0, "diff row height changed");
+                if let Some((before, bottom)) = previous {
+                    assert_eq!(number, before + 1, "a code line was skipped");
+                    assert_eq!(rect.top(), bottom, "gap between code rows");
+                }
+                if let Some(top) = paired_tops.insert(number, rect.top()) {
+                    assert_eq!(rect.top(), top, "side-by-side lines lost alignment");
+                }
+                first.get_or_insert((number, rect.top()));
+                last = Some((number, rect.bottom()));
+                previous = Some((number, rect.bottom()));
+            }
+            let (first_number, first_top) = first.unwrap();
+            let chrome = if first_number == 1 {
+                container
+                    .query_selector(".diff-file-header")
+                    .unwrap()
+                    .unwrap()
+                    .get_bounding_client_rect()
+                    .height()
+                    + pane
+                        .query_selector(".diff-hunk-header")
+                        .unwrap()
+                        .map_or(0.0, |header| header.get_bounding_client_rect().height())
+            } else {
+                0.0
+            };
+            assert!(
+                first_top <= viewport.top() + chrome,
+                "blank top of diff viewport"
+            );
+            let (last_number, last_bottom) = last.unwrap();
+            if last_number < total {
+                assert!(
+                    last_bottom >= viewport.bottom(),
+                    "blank bottom of diff viewport"
+                );
+            } else {
+                let footer = pane
+                    .query_selector(".diff-hunk-footer")
+                    .unwrap()
+                    .map_or(0.0, |footer| footer.get_bounding_client_rect().height());
+                assert_eq!(
+                    last_bottom + footer,
+                    pane.get_bounding_client_rect().bottom(),
+                    "code EOF is separated from the end of the content"
+                );
+                if scrollport.scroll_top()
+                    == scrollport.scroll_height() - scrollport.client_height()
+                {
+                    // scrollHeight/scrollTop are integer pixels; DOMRects retain fractions.
+                    assert!(
+                        (last_bottom + footer - viewport.bottom()).abs() < 1.0,
+                        "the native EOF extent lost the last visible code row"
+                    );
+                }
+            }
+        }
+    }
+
     #[wasm_bindgen_test]
     async fn large_diff_only_renders_visible_window() {
         ensure_styles_loaded();
-        let root = ProjectRootPath("test-root".to_owned());
-        let scope = ProjectDiffScope::Unstaged;
-        let total_lines = 1000usize;
-        let diff = synth_added_diff(total_lines, root.clone());
+        for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+            for context_mode in [DiffContextMode::Hunks, DiffContextMode::FullFile] {
+                for total_lines in [20usize, 2000] {
+                    let root = ProjectRootPath("test-root".to_owned());
+                    let scope = ProjectDiffScope::Unstaged;
+                    let mut diff = synth_added_diff(total_lines, root.clone());
+                    diff.context_mode = context_mode;
+                    diff.files[0].relative_path = "big.txt".to_owned();
+                    for line in &mut diff.files[0].hunks[0].lines {
+                        line.kind = ProjectGitDiffLineKind::Context;
+                        line.old_line_number = line.new_line_number;
+                    }
+                    let container = make_container();
+                    let find_open = StoredValue::new(None);
+                    let handle = mount_to(container.clone(), move || {
+                        let state = AppState::new();
+                        state.find_bar_open.set(total_lines == 20);
+                        find_open.set_value(Some(state.find_bar_open));
+                        state.save_tab_scroll_state(
+                            TabId(90_001),
+                            TabScrollState {
+                                scroll_top: if total_lines == 20 { 0 } else { 39_800 },
+                                scroll_height: 40_000,
+                                client_height: 600,
+                                user_scrolled_up: true,
+                            },
+                        );
+                        state.diff_view_mode.set(mode);
+                        state.diff_context_mode.set(context_mode);
+                        state.diff_contents.update(|d| {
+                            d.insert(
+                                crate::state::DiffKey::new(
+                                    "h",
+                                    ProjectId("p".to_owned()),
+                                    root.clone(),
+                                    scope,
+                                    "big.txt".to_owned(),
+                                ),
+                                diff.clone(),
+                            );
+                        });
+                        provide_context(state);
+                        view! {
+                            <DiffView tab_id=TabId(90_001) host_id="h".to_owned() project_id=ProjectId("p".to_owned())
+                                root=root.clone() scope=scope path="big.txt".to_owned() />
+                        }
+                    });
+                    next_tick().await;
+                    next_frame().await;
+                    next_tick().await;
+                    let scrollport = diff_scrollport(&container);
+                    if total_lines == 20 {
+                        assert!(container.query_selector(".find-bar").unwrap().is_some());
+                        assert_eq!(
+                            scrollport.scroll_height(),
+                            scrollport.client_height(),
+                            "Find introduced scrolling into a short diff"
+                        );
+                        let published = diff_publication(&container);
+                        scrollport.set_scroll_top(20);
+                        assert_eq!(scrollport.scroll_top(), 0);
+                        assert_eq!(diff_publication(&container), published);
+                        drop(handle);
+                        container.remove();
+                        continue;
+                    }
+                    assert_eq!(
+                        scrollport.scroll_top(),
+                        39_800.min(scrollport.scroll_height() - scrollport.client_height()),
+                        "saved EOF scroll was not restored"
+                    );
+                    let extent = scrollport.scroll_height();
+                    assert!(extent > 40_000, "offscreen rows lost their extent");
+                    assert!(query_all(&container, ".diff-line").len() < total_lines / 2);
+                    assert_populated_diff(&container, total_lines);
+                    for target in [12_000, 4_000, 36_000, 0, 20_000] {
+                        let published = diff_publication(&container);
+                        scrollport.set_scroll_top(target);
+                        assert_eq!(
+                            diff_publication(&container),
+                            published,
+                            "native scrolling discarded the complete diff publication",
+                        );
+                        scrollport
+                            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                            .unwrap();
+                        next_tick().await;
+                        assert_populated_diff(&container, total_lines);
+                        assert_eq!(scrollport.scroll_height(), extent);
+                    }
+                    find_open.get_value().unwrap().set(true);
+                    next_tick().await;
+                    next_frame().await;
+                    next_tick().await;
+                    assert_populated_diff(&container, total_lines);
+                    let find_top = container
+                        .query_selector(".find-bar")
+                        .unwrap()
+                        .unwrap()
+                        .get_bounding_client_rect()
+                        .top();
+                    let published = diff_publication(&container);
+                    scrollport.set_scroll_top(20_020);
+                    assert_eq!(diff_publication(&container), published);
+                    scrollport
+                        .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                        .unwrap();
+                    next_tick().await;
+                    assert_populated_diff(&container, total_lines);
+                    assert_eq!(
+                        container
+                            .query_selector(".find-bar")
+                            .unwrap()
+                            .unwrap()
+                            .get_bounding_client_rect()
+                            .top(),
+                        find_top
+                    );
+                    scrollport.set_scroll_top(20_000);
+                    scrollport
+                        .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                        .unwrap();
+                    next_tick().await;
 
-        let container = make_container();
-        let mount_root = root.clone();
-        let mount_path = "big.rs".to_owned();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.diff_contents.update(|d| {
-                d.insert(
-                    crate::state::DiffKey::new(
-                        "h",
-                        protocol::ProjectId("p".to_owned()),
-                        mount_root.clone(),
-                        scope,
-                        mount_path.clone(),
-                    ),
-                    diff.clone(),
-                );
-            });
-            provide_context(state);
-            view! {
-                <DiffView
-                    host_id="h".to_owned()
-                    project_id=protocol::ProjectId("p".to_owned())
-                    root=mount_root.clone()
-                    scope=scope
-                    path=mount_path.clone()
-                />
+                    container.style().set_property("height", "2600px").unwrap();
+                    next_frame().await;
+                    next_tick().await;
+                    assert_populated_diff(&container, total_lines);
+                    assert!(query_all(&container, ".diff-line").len() < total_lines / 2);
+
+                    let row = new_side_row(&container, 1001).unwrap();
+                    let selected_top = row.get_bounding_client_rect().top();
+                    let text = row.query_selector(".diff-text").unwrap().unwrap();
+                    let range = web_sys::window()
+                        .unwrap()
+                        .document()
+                        .unwrap()
+                        .create_range()
+                        .unwrap();
+                    range.select_node_contents(&text).unwrap();
+                    let selection = web_sys::window().unwrap().get_selection().unwrap().unwrap();
+                    selection.remove_all_ranges().unwrap();
+                    selection.add_range(&range).unwrap();
+                    scrollport.set_scroll_top(scrollport.scroll_top() + 20);
+                    scrollport
+                        .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+                        .unwrap();
+                    next_tick().await;
+                    assert_eq!(selection.to_string().as_string().unwrap(), "line 1000");
+                    assert_eq!(
+                        new_side_row(&container, 1001)
+                            .unwrap()
+                            .get_bounding_client_rect()
+                            .top(),
+                        selected_top - 20.0,
+                        "retained selection moved by the wrong scroll distance"
+                    );
+                    selection.remove_all_ranges().unwrap();
+                    drop(handle);
+                    container.remove();
+                }
             }
-        });
-        // First tick mounts; a second lets the measurement Effect refine
-        // viewport_height/line_height from real DOM measurements.
-        next_tick().await;
-        next_tick().await;
-
-        let rendered = container.query_selector_all(".diff-line").unwrap().length() as usize;
-        assert!(
-            rendered > 0,
-            "expected some diff lines rendered, got {rendered}"
-        );
-        assert!(
-            rendered < total_lines / 2,
-            "virtualization not engaging: rendered {rendered} of {total_lines} lines \
-             (expected fewer than {})",
-            total_lines / 2
-        );
-
-        // Scroll height should reflect the full file (visible rows + spacers
-        // standing in for off-screen rows). If virtualization regressed to
-        // rendering everything, scroll_height would still match — but we'd
-        // also see all 1000 rows in DOM. The row-count guard above catches
-        // that case; this guard catches the inverse regression where
-        // someone "fixes" the row count by silently dropping spacers.
-        let scroll_el = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content scroll container present")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let scroll_height = scroll_el.scroll_height();
-        assert!(
-            scroll_height > 5000,
-            "expected scroll_height > 5000px for 1000-line file, got {scroll_height}; \
-             spacers may have been dropped"
-        );
+        }
     }
 
     /// CRITICAL: Virtualization must stay engaged when the host passes
