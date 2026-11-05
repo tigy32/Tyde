@@ -114,9 +114,10 @@ matched client suffice; no host restart, Service change or client republication
 is required. The boundary proof above does not establish physical TestFlight
 acceptance, the user's live error stack or ordinary native UI Send/response.
 
-## Current private preview build 7 preparation
+## Historical private preview build 7 preparation
 
-Release now tracks build 7; Debug remains build 1. The GET-only ASC preflight
+At preparation, Release tracked build 7; Debug remained build 1. The GET-only
+ASC preflight
 on 2026-11-05 at 08:56:31 UTC found builds 2–6 VALID with uploads COMPLETE,
 build 1 AWAITING_UPLOAD, and no build 7 record or reservation. This prepares
 the next unused tracked identity; it does not reserve or upload it. Recheck
@@ -138,6 +139,65 @@ do not establish physical crash recovery, keyboard or hold-interaction
 acceptance, nor close the earlier native QA limits. The Lander owns clean-main
 validation/push; the distribution owner owns signing, archive, compliance,
 upload and private TestFlight availability after the required approvals.
+
+## Current private preview build 8 preparation
+
+Release tracks build 8; Debug stays build 1. The attested GET-only ASC preflight
+at `2026-11-05T19:35:16.043962Z` found builds 2–7 VALID/COMPLETE, old build 1
+AWAITING_UPLOAD and no build 8 record or reservation. Identity remains app
+`6829602646`, bundle `dev.tycode.tyde`, team `743QY8VN34`, private group
+`0da66ed5-d509-48c1-9ffe-517772097422`. Build 7 from source `693aed6e` is
+already AVAILABLE to existing A and VALID/COMPLETE
+(delivery `23154306-e145-49ba-886d-a6f982a9a93b`);
+preserve it without duplicate upload or reservation. Recheck allocation before
+upload and stop if build 8 is taken. Use normal tracked metadata, never native
+archive/export/build-number overrides.
+
+Finished source base `120cddb11b96faea68a911758b62ff573acd2748` includes
+SSH POSIX-shell launch guards (`120cddb1`) atop `c4efd78c`, with finished UI/
+scroll (`bfc9e4b5`/`0e162fa1`), lifecycle recovery (`79581004`/`6e8097c8` source),
+decoder/publication cache correction (`0152be11`/`2155a706` source), native
+discovery error contract (`f03f72f2`) and registration wording (`c4efd78c`).
+The discovery contract and wording change only shared loader and
+mobile-frontend sources. Screenshot source `348733b0` is mapped unchanged to
+`ca756889` atop this base: only three unasserted discovery captures and their
+evidence plumbing are removed, with separate visual QA documented. All
+remaining scenario and assertion bytes are preserved. Build 7
+contains none of the Swift recovery. Changed Swift lifecycle and native bridge
+recovery require a new native binary even though protocol 97, native ABI 6 and
+bootstrap 1 remain unchanged; there is no release-version lock reason for 8.
+This commit changes only Release build metadata and provenance, not product,
+runtime, protocol, ABI or release versions.
+
+After source landing, clean-main validation and push, generate fresh production
+resources with `./dev.sh ios-bundle` from that exact landed source. Keep
+`https://tycode.dev/tyde/?native=1`, without `--qa-origin`, old/frozen bundles or
+resource substitution. Preserve exact source/archive identity, existing paired
+records and Keychain data. A native archive does not publish the host-selected
+full client. Signing, resource/identity inspection, compliance and processed
+upload remain separate distribution checks, not source-validation claims.
+
+Native empty-input loss/recovery passed only stable captures 08–10; transient
+07 blank is an accepted known limitation, not a proved recovering affordance.
+Nonempty text, photos, unresolved Send, no-replay and direct-handshake order
+remain unproved natively; DOM/protocol proof is separate. No keyboard-crash or
+tabs cause/fix, physical Send or full-app acceptance is claimed. The discovery
+error contract and registration wording have HTTP/browser and mounted-banner
+proof only; no native Retry proof or native foreground-incident cure is claimed.
+
+The earlier metadata candidate `a9f74735` remains a historical gate FAIL;
+`8f636f1c` passed only its earlier `0152be11` source. Neither is validation
+of this composed source. Native reconnect, keyboard, tabs and incomplete
+four-pose QA remain unresolved; no new native acceptance is claimed, and
+four-pose completion is not an upload gate.
+
+Standing authorization covers the normal private preview upload by its owner.
+Immutable `v0.9.6-beta.28` at `9a181e3d` excludes SSH `120cddb1`, this
+screenshot change and new metadata. No retag, new release, group change or A
+activation is authorized here; existing A availability for 7 is preserved.
+No account, Service, IAM, deployment, host/device update or restart is authorized.
+The Lander alone owns landing/check/push and publisher steps; this bookkeeping
+executor performs no Apple API, archive, upload or native QA operations.
 
 ## Adaptive Agents hierarchy
 
