@@ -22,6 +22,7 @@ use protocol::{
 struct ManagedHome {
     dir: tempfile::TempDir,
     version: TydeReleaseVersion,
+    shell: &'static str,
     untracked: std::cell::RefCell<Vec<Child>>,
 }
 
@@ -34,6 +35,7 @@ impl ManagedHome {
         let home = Self {
             dir,
             version,
+            shell: "/bin/sh",
             untracked: Default::default(),
         };
         let bin_dir = home.path().join(".tyde/bin").join(home.version.as_str());
@@ -67,7 +69,7 @@ impl ManagedHome {
     }
 
     fn sh(&self, script: &str) -> Output {
-        self.command("/bin/sh")
+        self.command(self.shell)
             .arg("-c")
             .arg(script)
             .output()
@@ -285,7 +287,7 @@ impl LaunchCaller {
         let mut path = vec![shim];
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         let mut child = home
-            .command("/bin/sh")
+            .command(home.shell)
             .args(["-c", &managed_host::launch_script(&home.version)])
             .env("PATH", std::env::join_paths(path).unwrap())
             .stdout(Stdio::null())
@@ -379,7 +381,15 @@ impl Drop for LaunchLease {
 
 #[test]
 fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
-    let home = ManagedHome::install();
+    for shell in ["zsh", "bash", "/bin/sh"] {
+        exercise_managed_lifecycle(shell);
+    }
+}
+
+fn exercise_managed_lifecycle(shell: &'static str) {
+    let mut home = ManagedHome::install();
+    home.shell = shell;
+    eprintln!("Managed lifecycle: login_shell={shell}");
     let fresh = home.probe();
     assert!(fresh.installed_target);
     assert_eq!(fresh.running, RemoteTydeRunningState::NotRunning);
@@ -424,6 +434,16 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     assert!(home.managed_server_pids().is_empty());
     home.release_legacy_launch_guard(replacement);
 
+    let initial = home.launch();
+    let initial_owner = home.sole_managed_server();
+    home.assert_managed_by(initial_owner, "after initial launch");
+    assert!(
+        initial.status.success(),
+        "launch must report success after the real host is ready: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    home.stop();
+
     // Two clients (or a superseded and a fresh reconnect attempt) launch at
     // once. Exactly one server can own the socket, and the pid file must name
     // that one, or every later reconnect relaunches into a bound socket.
@@ -458,7 +478,7 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     let invalid_parent = home.path().join("not-a-directory");
     std::fs::write(&invalid_parent, b"owned error boundary").unwrap();
     let failed = home
-        .command("/bin/sh")
+        .command(home.shell)
         .args(["-c", &managed_host::launch_script(&home.version)])
         .env("TYDE_SOCKET_PATH", invalid_parent.join("host.sock"))
         .output()

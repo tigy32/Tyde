@@ -210,11 +210,17 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+// SSH uses the login shell; zsh scopes a function-installed EXIT trap to
+// that function. Keep the lifecycle and its lease in one POSIX shell instead.
+fn posix_shell_command(script: &str) -> String {
+    format!("exec /bin/sh -c {}", shell_quote(script))
+}
+
 pub fn probe_script(target_version: &TydeReleaseVersion) -> String {
-    format!(
+    posix_shell_command(&format!(
         "set -eu\ntarget_version={}\n{SHELL_LIB}{PROBE_BODY}",
         shell_quote(target_version.as_str())
-    )
+    ))
 }
 
 pub fn parse_probe_output(
@@ -251,14 +257,14 @@ pub fn parse_probe_output(
 }
 
 pub fn stop_script() -> String {
-    format!("set -eu\n{SHELL_LIB}{STOP_BODY}")
+    posix_shell_command(&format!("set -eu\n{SHELL_LIB}{STOP_BODY}"))
 }
 
 pub fn launch_script(version: &TydeReleaseVersion) -> String {
-    format!(
+    posix_shell_command(&format!(
         "set -eu\nversion={}\n{SHELL_LIB}{LAUNCH_BODY}",
         shell_quote(version.as_str())
-    )
+    ))
 }
 
 fn parse_key_value_lines(output: &str) -> Result<HashMap<String, String>, String> {

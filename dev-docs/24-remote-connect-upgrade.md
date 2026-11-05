@@ -27,6 +27,18 @@ pid file always names the socket owner. The launch script succeeds only when
 the pid file names the process it started; the mere existence of a socket
 proves nothing, because another server may own it.
 
+Managed lifecycle commands explicitly exec `/bin/sh` from the SSH login shell.
+The scripts require POSIX shell semantics, including process-wide EXIT traps.
+Installing an EXIT trap inside a function in zsh runs it when that function
+returns: acquisition removed its own guard and closed the launch lease before
+checking or launching the host. A single launch could leave a healthy host but
+fail with a missing guard and "owner changed before release"; concurrent callers
+could also race to bind the socket. This regression entered in `ec12e5c9`
+("Wait for managed launch owner completion"), first included in
+`v0.9.6-beta.17`. The real lifecycle flow now executes through zsh, bash and sh,
+verifying initial readiness before checking launch success, then contention,
+reconnect, adoption and genuine error boundaries. No guard error is suppressed.
+
 Launches and orphan adoption share a kernel file lease on
 `~/.tyde/run/tyde-host-launch.lock`. The shell opens descriptor 9 and the exact
 installed server's internal `host --lock-launch` command locks its shared open
@@ -35,8 +47,8 @@ not a retry count or elapsed deadline. The pathname is never unlinked: removing
 it could let different callers lock different inodes. Closing the last inherited
 lease descriptor releases it, including on launcher failure. The process-launch
 exec helper closes unowned descriptors before the independent host executes, so
-the long-lived server cannot retain the launch lease. No external locking utility,
-extra interpreter, host-load admission or execution-mode change is required.
+the long-lived server cannot retain the launch lease. No third-party locking
+utility or interpreter, host-load admission or execution-mode change is required.
 
 While holding that lease, callers also publish the historical O_EXCL PID guard
 so an older client's script cannot enter the same critical section. An already
