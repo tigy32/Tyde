@@ -227,6 +227,91 @@ class TransportProtocolVersionTests(unittest.TestCase):
         ):
             transport_version_check.check_transport_version(self.root)
 
+    def test_runtime_progress_preserves_real_git_wire_guard(self) -> None:
+        paths = transport_version_check.WIRE_CONTRACT_PATHS
+        current = {path: (REPO_ROOT / path).read_text() for path in paths}
+        library, signaling = paths[:2]
+        old = dict(current)
+        start = old[library].index("/// Runtime negotiation progress")
+        end = old[library].index("#[derive(Debug, thiserror::Error)]", start)
+        old[library] = old[library][:start] + old[library][end:]
+        old[library] = old[library].replace(
+            '    #[error("{}", stage.timeout_message())]\n'
+            '    NegotiationTimeout { stage: ConnectStage },\n', "",
+        )
+        old[signaling] = old[signaling].replace(
+            "use crate::{\n"
+            "    ConnectStage, Error, Peer, RtcStream, authenticate_description, failure, verify_description,\n"
+            "};",
+            "use crate::{Error, Peer, RtcStream, authenticate_description, failure, verify_description};",
+        ).replace("    mut progress: impl FnMut(ConnectStage),\n", "").replace(
+            "    let mut stage = ConnectStage::RelayAllocation;\n"
+            "    let mut advance = |next| {\n"
+            "        stage = next;\n"
+            "        progress(next);\n"
+            "    };\n", "",
+        ).replace(
+            ".map_err(|_| Error::NegotiationTimeout { stage })",
+            '.map_err(|_| failure("negotiation", "timed out"))',
+        )
+        old[signaling] = "".join(
+            line for line in old[signaling].splitlines(keepends=True)
+            if not line.strip().startswith("advance(ConnectStage::")
+        )
+        for path, source in old.items():
+            (self.root / path).write_text(source)
+        checker = self.root / "tools/check_transport_protocol_version.py"
+        checker.parent.mkdir()
+        shutil.copy2(TOOLS_DIR / checker.name, checker)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "pre-progress transport"],
+                       cwd=self.root, check=True)
+        for path, source in current.items():
+            (self.root / path).write_text(source)
+
+        def guard(accepted: bool) -> None:
+            result = subprocess.run(
+                [sys.executable, str(checker), "HEAD"], cwd=self.root,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0 if accepted else 1,
+                             result.stdout + result.stderr)
+            if not accepted:
+                self.assertIn("without increasing MOBILE_RTC_PROTOCOL_VERSION",
+                              result.stderr)
+
+        guard(True)
+        mutations = (
+            (library, "const CHUNK_BYTES: usize = 16 * 1024;",
+             "const CHUNK_BYTES: usize = 8 * 1024;"),
+            (library, '"tyde-rtc-description-v1"', '"tyde-rtc-description-v2"'),
+            (library, "if &description.session_id != session_id",
+             "if &description.session_id == session_id"),
+            (paths[2], "BytesMut::from(&[1][..])", "BytesMut::from(&[2][..])"),
+            (signaling, "MobileSdpKind::Answer,", "MobileSdpKind::Offer,"),
+            (signaling, "Duration::from_secs(60)", "Duration::from_secs(61)"),
+            (signaling, "Duration::from_secs(15)", "Duration::from_secs(16)"),
+            (signaling, "now.saturating_add(60_000)", "now.saturating_add(30_000)"),
+            (signaling, "        progress(next);", "        publish(next);"),
+            (library, 'Self::AwaitHostAnswer => "The host did not answer.",',
+             'Self::AwaitHostAnswer => { publish(); "The host did not answer." },'),
+            (transport_version_check.TRANSPORT_VERSION_PATH,
+             "pub authentication: String,", "pub authentication: Vec<u8>,"),
+            (transport_version_check.TRANSPORT_VERSION_PATH,
+             'MOBILE_RTC_CHANNEL_LABEL: &str = "tyde.v1"',
+             'MOBILE_RTC_CHANNEL_LABEL: &str = "tyde.v2"'),
+        )
+        for path, before, after in mutations:
+            with self.subTest(path=path, mutation=before):
+                self.assertIn(before, current[path])
+                (self.root / path).write_text(current[path].replace(before, after))
+                guard(False)
+                (self.root / path).write_text(current[path])
+        (self.root / library).write_text(current[library].replace(
+            "The host did not answer.", "The host has not answered.",
+        ))
+        guard(True)
+
 class RunStatusTests(unittest.TestCase):
     def test_selects_exact_workflow_tag_and_sha(self) -> None:
         runs = [

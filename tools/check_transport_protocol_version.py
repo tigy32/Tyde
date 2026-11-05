@@ -84,9 +84,13 @@ RUST_TOKEN = re.compile(
 )
 
 
+def rust_tokens(source: str) -> tuple[str, ...]:
+    return tuple(match.group() for match in RUST_TOKEN.finditer(source)
+                 if not match.group().startswith(("//", "/*")))
+
+
 def wire_tokens(source: str) -> tuple[str, ...]:
-    tokens = [match.group() for match in RUST_TOKEN.finditer(source)
-              if not match.group().startswith(("//", "/*"))]
+    tokens = list(rust_tokens(source))
     result = []
     cursor = 0
     test_module = ["#", "[", "cfg", "(", "test", ")", "]", "mod", "wasm_tests", "{"]
@@ -113,6 +117,83 @@ def wire_tokens(source: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def local_progress_tokens(
+    path: pathlib.Path, tokens: tuple[str, ...]
+) -> tuple[str, ...]:
+    # Recognize only pure local observations. Unknown declarations, callback
+    # bodies and timeout arguments remain in the conservative wire comparison.
+    replacements: list[tuple[str, str]] = []
+    if path == pathlib.Path("rtc-transport/src/lib.rs"):
+        replacements = [(
+            '''#[derive(Debug, Clone, Copy)]
+            pub enum ConnectStage {
+                RelayAllocation, PublishOffer, AwaitHostAnswer, AwaitMobileOffer,
+                CreateAnswer, PublishAnswer, OpenChannel,
+            }
+            impl ConnectStage {
+                pub fn timeout_message(self) -> &'static str {
+                    match self {
+                        Self::RelayAllocation => { "message" }
+                        Self::PublishOffer => { "message" }
+                        Self::AwaitHostAnswer => "message",
+                        Self::AwaitMobileOffer => { "message" }
+                        Self::CreateAnswer => { "message" }
+                        Self::PublishAnswer => { "message" }
+                        Self::OpenChannel => { "message" }
+                    }
+                }
+            }''',
+            "",
+        ), (
+            '''#[error("{}", stage.timeout_message())]
+            NegotiationTimeout { stage: ConnectStage },''',
+            "",
+        )]
+    elif path == pathlib.Path("rtc-transport/src/signaling.rs"):
+        replacements = [(
+            '''use crate::{ConnectStage, Error, Peer, RtcStream,
+                authenticate_description, failure, verify_description,};''',
+            '''use crate::{Error, Peer, RtcStream,
+                authenticate_description, failure, verify_description};''',
+        ), (
+            "mut progress: impl FnMut(ConnectStage),",
+            "",
+        ), (
+            '''let mut stage = ConnectStage::RelayAllocation;
+            let mut advance = |next| { stage = next; progress(next); };''',
+            "",
+        ), (
+            ".map_err(|_| Error::NegotiationTimeout { stage })",
+            '.map_err(|_| failure("negotiation", "timed out"))',
+        )]
+        replacements.extend(
+            (f"advance(ConnectStage::{stage});", "")
+            for stage in (
+                "RelayAllocation", "PublishOffer", "AwaitHostAnswer",
+                "AwaitMobileOffer", "CreateAnswer", "PublishAnswer", "OpenChannel",
+            )
+        )
+    patterns = [(rust_tokens(before), rust_tokens(after))
+                for before, after in replacements]
+    result = []
+    cursor = 0
+    while cursor < len(tokens):
+        for before, after in patterns:
+            candidate = tokens[cursor:cursor + len(before)]
+            if len(candidate) == len(before) and all(
+                actual == expected
+                or expected == '"message"' and actual.startswith('"')
+                for actual, expected in zip(candidate, before)
+            ):
+                result.extend(after)
+                cursor += len(before)
+                break
+        else:
+            result.append(tokens[cursor])
+            cursor += 1
+    return tuple(result)
+
+
 def wire_source(path: pathlib.Path, source: str) -> tuple[str, ...]:
     if path == TRANSPORT_VERSION_PATH:
         # Application frames have their own version; only exported RTC types
@@ -133,7 +214,7 @@ def wire_source(path: pathlib.Path, source: str) -> tuple[str, ...]:
         'use tyde_time::{sleep, timeout};',
         'use tyde_time::{sleep, timeout};',
     )
-    return wire_tokens(source)
+    return local_progress_tokens(path, wire_tokens(source))
 
 
 def check_transport_version(

@@ -7,6 +7,12 @@ Tyde framed byte protocol into the existing connection handlers: handshake,
 sequence validation, replay, chat, files, terminals, and voice stay server-owned.
 There is no automatic MQTT or direct-network fallback.
 
+The release guard compares RTC wire source independently of application/UI
+versions. Local `ConnectStage` observations and literal timeout explanations
+do not change that wire contract. Its narrow normalization still rejects
+changed credentials, SDP authentication, framing, deadlines, or non-observational
+callback bodies without a transport version increase.
+
 ## Connection establishment
 
 1. Pairing keeps its durable host/device secrets and the QR-shared pairing key.
