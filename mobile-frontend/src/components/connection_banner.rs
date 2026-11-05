@@ -576,7 +576,11 @@ mod wasm_tests {
                 .style()
                 .set_property("width", &format!("{width}px"))
                 .unwrap();
-            for cause in ["Mobile service unavailable", "The host did not answer."] {
+            for cause in [
+                "Mobile service unavailable",
+                "The host did not answer.",
+                crate::bridge::loader::UnavailableReason::HostUnavailable.message(),
+            ] {
                 state.connection_statuses.update(|statuses| {
                     statuses.insert(host.clone(), ConnectionStatus::Error(cause.into()));
                 });
@@ -597,6 +601,19 @@ mod wasm_tests {
                 let reconnect_box = reconnect.get_bounding_client_rect();
                 let dismiss_box = dismiss.get_bounding_client_rect();
                 assert_eq!(message.text_content().as_deref(), Some(cause));
+                if cause == crate::bridge::loader::UnavailableReason::HostUnavailable.message() {
+                    assert_eq!(
+                        message.text_content().as_deref(),
+                        Some("the host's mobile access registration is unavailable")
+                    );
+                    assert!(
+                        alert
+                            .query_selector("[data-mobile-test='connection-banner-repair']")
+                            .unwrap()
+                            .is_none(),
+                        "Unavailable registration must not ask to re-pair"
+                    );
+                }
                 assert!(
                     alert_box.bottom() <= heading.get_bounding_client_rect().top(),
                     "A failure must reserve space above the host heading"

@@ -189,7 +189,7 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}worker.addEventListener('statechange',()=>{if(worker.state==='activated'){done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
-    assert.ok(cacheNames.includes("tyde-loader-v14"),"updated worker precaches the new root shell");
+    assert.ok(cacheNames.includes("tyde-loader-v15"),"updated worker precaches the new root shell");
     assert.ok(!cacheNames.includes("tyde-loader-v12"),"updated worker retires only the old shell cache");
     await t.test("vendor decoder is shell state, never verified bundle state", async () => {
       const decoderUrl = "/tyde/vendor/jsqr.js";
@@ -437,7 +437,7 @@ test("native discovery surfaces credential loss and host absence without inventi
       }
       res.setHeader("content-type", "application/json");
       const code = mode === "stale" ? "bootstrap_stale" : mode === "revoked" ? "pairing_revoked" : "service_unavailable";
-      res.writeHead(mode === "unavailable" ? 503 : 403).end(JSON.stringify({error:{code,message:"owned HTTP boundary",retryable:mode !== "revoked"}}));
+      res.writeHead(mode === "unavailable" ? 503 : mode === "stale" ? 410 : 403).end(JSON.stringify({error:{code,message:"owned HTTP boundary",retryable:mode === "unavailable"}}));
       return;
     }
     try {
@@ -482,15 +482,30 @@ test("native discovery surfaces credential loss and host absence without inventi
               };
             });
           });
+          const readPairing = () => new Promise((resolve, reject) => {
+            const open = indexedDB.open("tyde-mobile", 1);
+            open.onerror = () => reject(Error("Owned pairing read failed"));
+            open.onsuccess = () => {
+              const db = open.result, tx = db.transaction("paired_hosts", "readonly");
+              const read = tx.objectStore("paired_hosts").get("all");
+              tx.oncomplete = () => { db.close(); resolve(read.result); };
+              tx.onerror = () => reject(Error("Owned pairing transaction failed"));
+            };
+          });
+          const retainedPairing = await page.evaluate(readPairing);
           await page.goto(origin+"/tyde/");
           await page.locator("#view-error").waitFor({state:"visible"});
           const text=await page.locator("#view-error").innerText();
-          if (mode === "gateway" || mode === "revoked") {
+          if (mode === "gateway" || mode === "stale" || mode === "revoked") {
             await page.screenshot({path:join(evidence, `${mode}-discovery-error.png`)});
           }
-          const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"host’s mobile access registration has expired",unavailable:"Host discovery is temporarily unavailable",gateway:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
+          const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"The host’s mobile access registration is unavailable.",unavailable:"Host discovery is temporarily unavailable",gateway:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
           assert.ok(text.includes(expected[mode]),`the real loader must surface the specific ${mode} failure`);
           if(mode!=="revoked")assert.ok(!text.toLowerCase().includes("revoked"),"neither silence nor local storage failure establishes revocation");
+          if (mode === "stale") {
+            assert.doesNotMatch(text, /expired|re-?pair|pair again/i,
+              "Unavailable registration does not establish expired or removed pairing authority");
+          }
           assert.equal(requests-before,mode==="missing"||mode==="locked"?0:1,"local credential failure must stop before authenticated HTTP");
           const reason = {missing:"pairing_secret_missing",locked:"credential_storage_unavailable",stale:"host_unavailable",unavailable:"bootstrap_transport",gateway:"bootstrap_transport",revoked:"pairing_revoked"}[mode];
           const outcome=await page.evaluate(()=>window.__tydeLoader.nativeAdmitHost("owned-host"));
@@ -501,6 +516,8 @@ test("native discovery surfaces credential loss and host absence without inventi
           assert.equal(requests-before,mode==="missing"||mode==="locked"?0:3,
             "Each admission uses the real HTTP boundary; missing local credentials never reach it");
           assert.equal(await page.evaluate(()=>localStorage.getItem("tyde.selected-host.v1")),"owned-host");
+          assert.ok(await page.evaluate(readPairing) === retainedPairing,
+            "Discovery failures must retain the exact durable pairing bytes");
         } finally { await context.close(); }
       });
     }

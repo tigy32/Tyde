@@ -44,9 +44,7 @@ impl UnavailableReason {
             Self::PassRequired => "a Tyggs Pass is required to connect",
             Self::PairingRevoked => "this pairing is unavailable; re-pair from the host",
             Self::BootstrapBaseline => "update Tyde host to support native client bootstrap",
-            Self::HostUnavailable => {
-                "the host's mobile access registration has expired. Open Tyde on the host and check Settings → Mobile, then retry. If you removed this pairing, pair again"
-            }
+            Self::HostUnavailable => "the host's mobile access registration is unavailable",
             Self::PairingSecretMissing => {
                 "the pairing credential is missing on this device. Re-pair from the host's Settings → Mobile"
             }

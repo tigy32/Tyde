@@ -41,7 +41,7 @@ async function request(path, body, headers = {}, direct = false) {
     const messages = {
       native_abi_incompatible: 'Update the app: this host client requires a different native bridge.',
       bootstrap_unknown: 'Update Tyde host to support native client bootstrap.',
-      bootstrap_stale: 'The host’s mobile access registration has expired. Open Tyde on the host and check Settings → Mobile, then retry. If you removed this pairing, pair again.',
+      bootstrap_stale: 'The host’s mobile access registration is unavailable.',
       pairing_revoked: 'This pairing has been revoked.',
       revoked_device: 'This pairing has been revoked.',
       pairing_rejected: 'This pairing offer has expired or its host client changed.',
