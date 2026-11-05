@@ -423,7 +423,6 @@ test("installed storage migrates once, then follows exact targets without losing
 test("native discovery surfaces credential loss and host absence without inventing revocation", async t => {
   assert.ok(process.env.CHROME, "dev.sh must provision Chrome");
   const root = new URL("../", import.meta.url);
-  const evidence = await mkdtemp(join(tmpdir(), "tyde-native-discovery-"));
   let mode = "missing", requests = 0;
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, "http://owned.invalid").pathname;
@@ -496,9 +495,6 @@ test("native discovery surfaces credential loss and host absence without inventi
           await page.goto(origin+"/tyde/");
           await page.locator("#view-error").waitFor({state:"visible"});
           const text=await page.locator("#view-error").innerText();
-          if (mode === "gateway" || mode === "stale" || mode === "revoked") {
-            await page.screenshot({path:join(evidence, `${mode}-discovery-error.png`)});
-          }
           const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"The host’s mobile access registration is unavailable.",unavailable:"Host discovery is temporarily unavailable",gateway:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
           assert.ok(text.includes(expected[mode]),`the real loader must surface the specific ${mode} failure`);
           if(mode!=="revoked")assert.ok(!text.toLowerCase().includes("revoked"),"neither silence nor local storage failure establishes revocation");
@@ -521,7 +517,6 @@ test("native discovery surfaces credential loss and host absence without inventi
         } finally { await context.close(); }
       });
     }
-    console.info("Native discovery error originals: "+evidence);
   } finally {
     if(browser)await browser.close();
     server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));

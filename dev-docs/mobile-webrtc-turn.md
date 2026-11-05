@@ -260,6 +260,21 @@ service failure and authoritative revocation. It does not execute Swift or
 Keychain. No paid provider, Account, production Service or physical phone is
 involved. QR-owned managed-probe/offer flows remain untouched.
 
+Discovery screenshots are separate visual QA, not correctness assertions. The
+retained Build 8 gate failed at an unasserted gateway `page.screenshot` with
+`Page.captureScreenshot: Unable to capture screenshot`, before its text,
+typed-outcome and storage assertions ran. The discovery flow no longer captures
+diagnostic images; all six scenarios and their behavioral assertions remain.
+The Chrome capture failure's internal cause is unknown, and this change does
+not establish gateway correctness or repair Chrome.
+
+When visual QA is explicitly requested, use the normal public browser or
+dev-instance workflow in `backend-dev-instance-manual-qa.md` to capture the
+actual changed UI separately. Retain original images and their source/browser
+identity outside the correctness gate; a failed capture is incomplete visual
+evidence, never a pass. No manual capture has been performed for this
+harness-only change.
+
 Source ancestry places the pre-actor PSK read in the original browser backend
 (`01b5c569`, first containing tag `v0.8.19-beta.3`) and the three-failure
 visibility threshold in `8f51ac33` (first
