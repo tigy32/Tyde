@@ -14,7 +14,7 @@ import {chromium} from '@playwright/test';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const desktopStyles = await readFile('frontend/styles.css','utf8');
-const decoderSource = await readFile('web/loader/vendor/jsqr.js','utf8');
+const decoderSource = await readFile('web/loader/decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js','utf8');
 const decoderEntry = 'return __webpack_require__(__webpack_require__.s = 3);';
 if(decoderSource.split(decoderEntry).length!==2)throw Error('QR diagnostic source identity changed');
 const decoderScope={module:{exports:{}}};

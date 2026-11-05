@@ -11,7 +11,7 @@
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
     <link data-trunk rel="css" href="vendor/web-shell/shell.css" />
     <link data-trunk rel="css" href="styles.css" />
-    <link data-trunk rel="copy-file" href="vendor/jsqr.js" />
+    <link data-trunk rel="copy-file" href="../web/loader/decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js" />
     <link data-trunk rel="copy-file" href="voice-media.js" />
     <link data-trunk rel="copy-file" href="voice-codec-worker.js" />
     <link data-trunk rel="copy-file" href="voice-capture-worklet.js" />
@@ -102,10 +102,9 @@
     })();
 
     </script>
-    <!-- Keep vendor/jsqr.js byte-for-byte identical to web/loader/vendor/jsqr.js.
-         The loader copy is the source of truth; this classic script installs
-         window.jsQR before the WASM scanner can request a camera. -->
-    <script src="jsqr.js"></script>
+    <!-- Copy the loader's content-addressed decoder source so both entrypoints
+         execute identical bytes, pinned before requesting a camera. -->
+    <script src="jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js" integrity="sha384-XZ1VKM4duvNSGMP1bzHWkAQHmnD8R6s0BvC20m/gc//1WvoKFyq+j4CnB7wO2llV"></script>
   <script src="voice-media.js"></script>
 </body>
 </html>

@@ -385,7 +385,10 @@ fn content_type_for(path: &Path) -> &'static str {
 fn cache_control_for(path: &str) -> &'static str {
     if path == MANIFEST_PATH {
         MANIFEST_CACHE_CONTROL
-    } else if path.starts_with('v') && path.contains('/') {
+    } else if path.split_once('/').is_some_and(|(directory, _)| {
+        protocol::TydeReleaseVersion::parse(directory)
+            .is_ok_and(|version| version.github_tag() == directory)
+    }) {
         // `v<version>/…` bundles are immutable by construction: a new build
         // publishes under a new version rather than replacing these bytes.
         IMMUTABLE_CACHE_CONTROL

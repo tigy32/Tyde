@@ -17,7 +17,7 @@
 //
 // Bump LOADER_CACHE when the precache list or shell logic changes.
 
-const LOADER_CACHE = "tyde-loader-v12";
+const LOADER_CACHE = "tyde-loader-v13";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with loader.js
 
 // Paths are relative to the SW scope (`/tyde/`).
@@ -35,7 +35,7 @@ const SHELL_ASSETS = [
   "./styles.js",
   "./manifest-policy.js",
   "./integrity.js",
-  "./vendor/jsqr.js",
+  "./decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js",
   "./manifest.webmanifest",
   "./icons/icon.svg",
 ];
@@ -64,7 +64,7 @@ self.addEventListener("activate", (event) => {
 
 function isVersionedBundle(url) {
   // e.g. /tyde/v0.8.19-beta.2/tyde-mobile.js
-  return /\/tyde\/v[^/]+\//.test(url.pathname);
+  return /^\/tyde\/v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\//.test(url.pathname);
 }
 
 function isManifest(url) {
@@ -94,11 +94,9 @@ self.addEventListener("fetch", (event) => {
 });
 
 function isShellAsset(url) {
-  return (
-    /\/(index\.html|mobile-service-config\.js|loader\.(js|css)|native-bootstrap\.js|native-service\.js|cbor\.js|pairing\.js|pairing-ui\.js|styles\.js|manifest-policy\.js|integrity\.js|vendor\/jsqr\.js|manifest\.webmanifest)$/.test(
-      url.pathname,
-    ) || url.pathname.endsWith("/")
-  );
+  return SHELL_ASSETS.some(asset =>
+    new URL(asset, self.registration.scope).pathname === url.pathname,
+  ) || url.pathname.endsWith("/");
 }
 
 // Cache-first READ for immutable versioned bundles. On a miss, fetch from the

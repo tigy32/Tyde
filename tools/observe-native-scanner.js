@@ -8,9 +8,9 @@
     throw new Error('Scanner observation requires the original unpaired native entry');
   }
   const sources = {
-    'loader.js': '90542cb16d34c91979e89492d61c0e9ecc7a8a2d924e464079e6278ea9c3e926',
+    'loader.js': 'f07d93650758c9886bdbbabdc0934a886897742171a75518640c39fed9656fad',
     'loader.css': 'e458c101ba2cb1ae4cb6cc373587d394254c6432d8a0113f4493ca0ee865981e',
-    'vendor/jsqr.js': '30412062c9e6cc3a182775a6e497e4cc0d0f37765253499183adb1845b40a1d6',
+    'decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js': '5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101',
   };
   for (const [path, expected] of Object.entries(sources)) {
     const response = await fetch(path, {cache: 'no-store'});

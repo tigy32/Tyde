@@ -66,7 +66,7 @@ readonly -a LOADER_SHELL_KEYS=(
   "styles.js"
   "manifest-policy.js"
   "integrity.js"
-  "vendor/jsqr.js"
+  "decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js"
   "manifest.webmanifest"
   "icons/icon.svg"
 )

@@ -61,6 +61,15 @@ impl BundleFixture {
         std::fs::write(bundle.join("app.js"), "export default 1;\n").expect("write bundle entry");
         std::fs::write(bundle.join("app_bg.wasm"), &wasm_bytes).expect("write bundle wasm");
 
+        for directory in ["vendor", "vassets", "v9", "v9.9.9junk"] {
+            std::fs::create_dir_all(root.join(directory)).expect("create shell asset dir");
+            std::fs::write(
+                root.join(directory).join("decoder.js"),
+                "current shell bytes",
+            )
+            .expect("write shell asset");
+        }
+
         Self { dir, wasm_bytes }
     }
 
@@ -238,6 +247,20 @@ async fn direct_hosting_serves_the_mobile_web_origin() {
         bundle.wasm_bytes,
         "served wasm must be the bundle's bytes"
     );
+
+    for directory in ["vendor", "vassets", "v9", "v9.9.9junk"] {
+        let asset = get(&base, &format!("/tyde/{directory}/decoder.js")).await;
+        assert_eq!(asset.status(), 200);
+        assert_eq!(
+            header(&asset, "cache-control"),
+            "public,max-age=60",
+            "non-release directories must not become immutable bundles"
+        );
+        assert_eq!(
+            asset.text().await.expect("read shell asset"),
+            "current shell bytes"
+        );
+    }
 
     // Security headers ride on every response. `frame-ancestors` and the
     // camera policy exist only here — the loader's `<meta>` CSP cannot express

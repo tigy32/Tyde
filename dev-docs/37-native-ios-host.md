@@ -1244,3 +1244,36 @@ versioned assets and manifest/SRI identities; never overwrite a published
 release record. A dedicated QA catalog may expose these genuine unreleased
 source candidates without a production deployment. Reuse the identified QA
 app binary across host revisions. GUI interaction remains device-scoped MCP.
+
+### Mobile decoder cache identity
+
+The root-shell decoder is published at
+`decoder/jsqr-<sha256>.js`, with matching SHA-384 script integrity. Its filename
+must change with its bytes. The versioned client copies that same source;
+there is no second maintained decoder or legacy-URL alias. The shell worker's
+precache list, deployment metadata keys and scanner observation follow the
+same filename. Generated version manifests still cover every executable.
+
+The original worker classifier (`2675f222`) treated `/tyde/vendor/` as a
+versioned bundle, and direct hosting (`4cc043e2`) made every `v`-prefixed
+directory immutable. Decoder correction `ea654f4d` changed bytes at the old
+`vendor/jsqr.js` URL from SHA-256 `30412062…` to `5f0b8270…`; successful
+versioned-bundle SRI did not establish the root scanner's identity. The new
+URL names the corrected bytes without cache-busting queries, purges, permission
+changes, or alternate loading paths. Both classifiers now require a release
+path segment, leaving non-release assets in the shell regime.
+
+The direct-hosting protocol/HTTP flow guards mutable vendor and version-like
+paths alongside immutable release bytes. The real browser flow seeds stale
+vendor bytes in the verified-bundle cache, fetches the current decoder through
+the installed worker, and verifies its URL digest, script integrity and loaded
+global. Existing boot, revocation and fail-closed bundle checks remain intact.
+
+The decoder directory deliberately does not start with `v`: an installed old
+worker would reject an uncached native script even at a new hash under
+`vendor/`. The browser upgrade flow starts with the frozen pre-fix worker,
+withholds worker publication until after the first `?native=1` document,
+and requires that document to execute the corrected decoder. This reproduced
+`window.jsQR` being unavailable with the hash still under `vendor/`; moving
+the canonical asset to `decoder/` does not weaken the old worker's verified
+bundle enforcement.

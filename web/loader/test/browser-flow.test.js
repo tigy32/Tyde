@@ -38,6 +38,7 @@ test("installed storage migrates once, then follows exact targets without losing
   assert.equal(generated.versions[old].followsSelectedHost,undefined,"historical artifact gains no capability during backfill");
   assert.equal(generated.versions[capable].followsSelectedHost,1);
   let published = false, legacy = true, offline = false, tamper = false, blocked = false, scannerOnly = false;
+  let legacyWorkerActive = true;
   let servedClient = null, directPolicy = {}, directEntry = {};
   let manifestRequests = 0;
   const manifest = () => {
@@ -75,7 +76,11 @@ test("installed storage migrates once, then follows exact targets without losing
     if(!checked.ok) throw new Error('fixture integrity failure');
     await (await import(target.entry)).default();
     document.getElementById('loader-shell').hidden=true;`;
-  const assets = new Set(["index.html", "loader.js", "native-bootstrap.js", "native-service.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "vendor/jsqr.js", "icons/icon.svg"]);
+  const decoderPath = (await readFile(new URL("index.html", root), "utf8"))
+    .match(/<script src="\.\/(decoder\/jsqr[^"/]*\.js)"/)[1];
+  const decoderBytes = await readFile(new URL(decoderPath, root));
+  const legacyWorker = await readFile(new URL("test/fixtures/pre-cache-classifier-sw.js", root));
+  const assets = new Set(["index.html", "loader.js", "native-bootstrap.js", "native-service.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js", "icons/icon.svg"]);
   const server = createServer(async (req, res) => {
     try {
       const path = new URL(req.url, "http://fixture.invalid").pathname;
@@ -96,10 +101,13 @@ test("installed storage migrates once, then follows exact targets without losing
         return;
       }
       const asset = path === "/tyde/" ? "index.html" : path.slice("/tyde/".length);
+      if (asset === "vendor/jsqr.js") {
+        res.setHeader("Content-Type", "text/javascript"); res.end(decoderBytes); return;
+      }
       if (!path.startsWith("/tyde/") || !assets.has(asset)) { res.statusCode=404;res.end();return; }
       let body = await readFile(new URL(asset, root));
       if (legacy && asset === "loader.js") body = Buffer.from(legacyLoader);
-      if (legacy && asset === "sw.js") body = Buffer.from(body.toString().replace("tyde-loader-v12", "tyde-loader-v9"));
+      if (legacyWorkerActive && asset === "sw.js") body = legacyWorker;
       res.setHeader("Content-Type", asset.endsWith(".js") ? "text/javascript" : asset.endsWith(".css") ? "text/css" : asset.endsWith(".svg") ? "image/svg+xml" : asset.endsWith(".html") ? "text/html" : "application/json");
       res.end(body);
     } catch { res.statusCode=500;res.end("fixture failure"); }
@@ -146,7 +154,15 @@ test("installed storage migrates once, then follows exact targets without losing
     await navigate("/tyde/");
     assert.equal(await waitFor(`Client ${old}`),true);
     await evaluateAsync("const done=arguments[arguments.length-1]; navigator.serviceWorker.ready.then(()=>{if(navigator.serviceWorker.controller)done(true);else navigator.serviceWorker.addEventListener('controllerchange',()=>done(true),{once:true});});");
+    await t.test("current decoder loads on the first native document under the installed old worker", async () => {
+      assert.equal(await page.evaluate(() => navigator.serviceWorker.controller !== null), true);
+      legacy = false;
+      await navigate("/tyde/?native=1");
+      assert.equal(await page.evaluate(() => typeof window.jsQR), "function",
+        "an installed old worker must not reject the new decoder before worker activation");
+    });
     legacy = false;
+    legacyWorkerActive = false;
     // Uploading a new loader before the capable manifest cannot consume migration.
     await navigate("/tyde/");
     assert.equal(await waitFor(`Client ${old}`),true);
@@ -173,8 +189,33 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}worker.addEventListener('statechange',()=>{if(worker.state==='activated'){done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
-    assert.ok(cacheNames.includes("tyde-loader-v12"),"updated worker precaches the new root shell");
-    assert.ok(!cacheNames.includes("tyde-loader-v9"),"updated worker retires only the old shell cache");
+    assert.ok(cacheNames.includes("tyde-loader-v13"),"updated worker precaches the new root shell");
+    assert.ok(!cacheNames.includes("tyde-loader-v12"),"updated worker retires only the old shell cache");
+    await t.test("vendor decoder is shell state, never verified bundle state", async () => {
+      const decoderUrl = "/tyde/vendor/jsqr.js";
+      await page.evaluate(async url => {
+        const bundle = await caches.open('tyde-bundle-v1');
+        await bundle.put(url, new Response('stale decoder bytes'));
+      }, decoderUrl);
+      const bytes = await page.evaluate(async url => Array.from(new Uint8Array(
+        await (await fetch(url)).arrayBuffer())), decoderUrl);
+      assert.ok(Buffer.from(bytes).equals(decoderBytes),
+        "the worker must fetch current decoder bytes instead of a stale bundle-cache entry");
+      const identity = await page.evaluate(async path => {
+        const script = document.querySelector(`script[src="./${path}"]`);
+        const bytes = await (await fetch(script.src)).arrayBuffer();
+        const hex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
+          byte => byte.toString(16).padStart(2, '0')).join('');
+        const sri = 'sha384-' + btoa(String.fromCharCode(...new Uint8Array(
+          await crypto.subtle.digest('SHA-384', bytes))));
+        return {path: `decoder/jsqr-${hex}.js`, sri, declared: script.integrity,
+          decoderAvailable: typeof window.jsQR === 'function'};
+      }, decoderPath);
+      assert.equal(decoderPath, identity.path, "decoder publication identity must name its exact bytes");
+      assert.equal(identity.declared, identity.sri, "the executed decoder must have matching SRI");
+      assert.ok(identity.decoderAvailable, "the browser must load the pinned decoder");
+      await page.evaluate(async url => (await caches.open('tyde-bundle-v1')).delete(url), decoderUrl);
+    });
     const retained = await evaluateAsync(`const done=arguments[arguments.length-1];const r=indexedDB.open('tyde-mobile',1);r.onsuccess=()=>{const db=r.result;const tx=db.transaction(['paired_hosts','psk']);const a=tx.objectStore('paired_hosts').get('all');const b=tx.objectStore('psk').get('retained-key');tx.oncomplete=()=>{done([a.result,b.result]);db.close();};};`);
     assert.ok(retained[0]===JSON.stringify([{localHostId:"retained-host"},{localHostId:"second-host"},{localHostId:"third-host"}]) && retained[1]==="fixture-only-key","pairing and key stores remain byte-identical");
     const prepare = (version, protocol=66) => evaluateAsync(`const done=arguments[arguments.length-1];window.__tydeLoader.prepareHostSwitch(${JSON.stringify(version)},${protocol},'retained-host').then(done);`);
