@@ -23,6 +23,7 @@ import {
 import { verifyArtifacts } from "./integrity.js";
 import { resolveBundleStylesheets } from "./styles.js";
 import { detectScanCapability, pairingUiState } from "./pairing-ui.js";
+import { nativeBootstrapFailure } from "./native-service.js";
 
 const MANIFEST_URL = "./manifest.json";
 export const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired version
@@ -104,7 +105,7 @@ export async function prepareHostSwitch(version, protocolVersion, host) {
       nativeDescriptor = await nativeRuntime.switchTarget(host);
       version = nativeDescriptor.client_release_version;
       protocolVersion = nativeDescriptor.protocol_version;
-    } catch { return unavailable("bootstrap"); }
+    } catch (error) { return nativeBootstrapFailure(error); }
   }
   cancelHostSwitch();
   const operation = {

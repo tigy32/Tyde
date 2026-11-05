@@ -189,7 +189,7 @@ test("installed storage migrates once, then follows exact targets without losing
     assert.equal(await evaluate("return localStorage.getItem('tyde.loader.follow-host.v1')"),"1");
     assert.equal(await evaluateAsync("const done=arguments[arguments.length-1];navigator.serviceWorker.getRegistration().then(async registration=>{await registration.update();const worker=registration.installing||registration.waiting;if(!worker||worker.state==='activated'){done(true);return;}worker.addEventListener('statechange',()=>{if(worker.state==='activated'){done(true);}});});"),true);
     const cacheNames = await evaluateAsync("const done=arguments[arguments.length-1];caches.keys().then(done);");
-    assert.ok(cacheNames.includes("tyde-loader-v13"),"updated worker precaches the new root shell");
+    assert.ok(cacheNames.includes("tyde-loader-v14"),"updated worker precaches the new root shell");
     assert.ok(!cacheNames.includes("tyde-loader-v12"),"updated worker retires only the old shell cache");
     await t.test("vendor decoder is shell state, never verified bundle state", async () => {
       const decoderUrl = "/tyde/vendor/jsqr.js";
@@ -420,9 +420,10 @@ test("installed storage migrates once, then follows exact targets without losing
 
 // The native loader runs before Wasm can own connection state. Missing local
 // material, a stale host registration and an actual rejection must stay distinct.
-test("native discovery surfaces credential loss and host absence without inventing revocation", async () => {
+test("native discovery surfaces credential loss and host absence without inventing revocation", async t => {
   assert.ok(process.env.CHROME, "dev.sh must provision Chrome");
   const root = new URL("../", import.meta.url);
+  const evidence = await mkdtemp(join(tmpdir(), "tyde-native-discovery-"));
   let mode = "missing", requests = 0;
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, "http://owned.invalid").pathname;
@@ -430,6 +431,10 @@ test("native discovery surfaces credential loss and host absence without inventi
     if (path.endsWith("/bootstrap/resolve")) {
       requests++;
       req.resume();
+      if (mode === "gateway") {
+        res.writeHead(502, {"content-type":"text/plain"}).end("Owned proxy upstream closed");
+        return;
+      }
       res.setHeader("content-type", "application/json");
       const code = mode === "stale" ? "bootstrap_stale" : mode === "revoked" ? "pairing_revoked" : "service_unavailable";
       res.writeHead(mode === "unavailable" ? 503 : 403).end(JSON.stringify({error:{code,message:"owned HTTP boundary",retryable:mode !== "revoked"}}));
@@ -447,46 +452,59 @@ test("native discovery surfaces credential loss and host absence without inventi
   let browser;
   try {
     browser = await chromium.launch({executablePath:process.env.CHROME,args:["--no-sandbox"]});
-    for (mode of ["missing","locked","stale","unavailable","revoked"]) {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-      const before = requests;
-      await context.addInitScript(mode => {
-        window.__tydeNativeHost = {version:6,bootstrapVersion:1,shellRelease:"0.9.6-beta.25",post(endpoint) {
-          if (endpoint === "presentation") return Promise.resolve(null);
-          if (endpoint === "secret_read") {
-            if (mode === "locked") return Promise.reject(new Error("Owned platform storage denial"));
-            return Promise.resolve(mode === "missing" ? null : "owned-fixture-only-secret");
+    for (mode of ["gateway","missing","locked","stale","unavailable","revoked"]) {
+      await t.test(mode, async () => {
+        const context = await browser.newContext();
+        try {
+          const page = await context.newPage();
+          const before = requests;
+          await context.addInitScript(mode => {
+            window.__tydeNativeHost = {version:6,bootstrapVersion:1,shellRelease:"0.9.6-beta.25",post(endpoint) {
+              if (endpoint === "presentation") return Promise.resolve(null);
+              if (endpoint === "secret_read") {
+                if (mode === "locked") return Promise.reject(new Error("Owned platform storage denial"));
+                return Promise.resolve(mode === "missing" ? null : "owned-fixture-only-secret");
+              }
+              return Promise.reject(new Error("Unexpected owned native request"));
+            }};
+          }, mode);
+          const origin = `http://127.0.0.1:${server.address().port}`;
+          await page.goto(origin+"/setup");
+          await page.evaluate(async () => {
+            await new Promise((resolve,reject) => {
+              const open = indexedDB.open("tyde-mobile",1);
+              open.onupgradeneeded=()=>{open.result.createObjectStore("paired_hosts");open.result.createObjectStore("psk");};
+              open.onerror=()=>reject(Error("Owned storage setup failed"));
+              open.onsuccess=()=>{
+                const db=open.result,tx=db.transaction("paired_hosts","readwrite");
+                tx.objectStore("paired_hosts").put(JSON.stringify([{localHostId:"owned-host",hostLabel:"Owned host",credentialFingerprint:"public-owned-fingerprint",autoConnect:true,lastConnectedAtMs:null,managed:{pairingId:"owned-pair",deviceId:"owned-device",deviceSecretKeyId:"tyde-web-owned-secret"}}]),"all");
+                tx.oncomplete=()=>{db.close();localStorage.setItem("tyde.selected-host.v1","owned-host");resolve();};
+              };
+            });
+          });
+          await page.goto(origin+"/tyde/");
+          await page.locator("#view-error").waitFor({state:"visible"});
+          const text=await page.locator("#view-error").innerText();
+          if (mode === "gateway" || mode === "revoked") {
+            await page.screenshot({path:join(evidence, `${mode}-discovery-error.png`)});
           }
-          return Promise.reject(new Error("Unexpected owned native request"));
-        }};
-      }, mode);
-      const origin = `http://127.0.0.1:${server.address().port}`;
-      await page.goto(origin+"/setup");
-      await page.evaluate(async () => {
-        await new Promise((resolve,reject) => {
-          const open = indexedDB.open("tyde-mobile",1);
-          open.onupgradeneeded=()=>{open.result.createObjectStore("paired_hosts");open.result.createObjectStore("psk");};
-          open.onerror=()=>reject(Error("Owned storage setup failed"));
-          open.onsuccess=()=>{
-            const db=open.result,tx=db.transaction("paired_hosts","readwrite");
-            tx.objectStore("paired_hosts").put(JSON.stringify([{localHostId:"owned-host",hostLabel:"Owned host",credentialFingerprint:"public-owned-fingerprint",autoConnect:true,lastConnectedAtMs:null,managed:{pairingId:"owned-pair",deviceId:"owned-device",deviceSecretKeyId:"tyde-web-owned-secret"}}]),"all");
-            tx.oncomplete=()=>{db.close();localStorage.setItem("tyde.selected-host.v1","owned-host");resolve();};
-          };
-        });
+          const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"host’s mobile access registration has expired",unavailable:"Host discovery is temporarily unavailable",gateway:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
+          assert.ok(text.includes(expected[mode]),`the real loader must surface the specific ${mode} failure`);
+          if(mode!=="revoked")assert.ok(!text.toLowerCase().includes("revoked"),"neither silence nor local storage failure establishes revocation");
+          assert.equal(requests-before,mode==="missing"||mode==="locked"?0:1,"local credential failure must stop before authenticated HTTP");
+          const reason = {missing:"pairing_secret_missing",locked:"credential_storage_unavailable",stale:"host_unavailable",unavailable:"bootstrap_transport",gateway:"bootstrap_transport",revoked:"pairing_revoked"}[mode];
+          const outcome=await page.evaluate(()=>window.__tydeLoader.nativeAdmitHost("owned-host"));
+          assert.deepEqual(outcome,{status:"unavailable",reason});
+          const preparation=await page.evaluate(()=>window.__tydeLoader.prepareHostSwitch("0.9.6-beta.25",97,"owned-host"));
+          assert.deepEqual(preparation,{status:"unavailable",reason},
+            "Host switching must preserve the same typed discovery failure as reconnect admission");
+          assert.equal(requests-before,mode==="missing"||mode==="locked"?0:3,
+            "Each admission uses the real HTTP boundary; missing local credentials never reach it");
+          assert.equal(await page.evaluate(()=>localStorage.getItem("tyde.selected-host.v1")),"owned-host");
+        } finally { await context.close(); }
       });
-      await page.goto(origin+"/tyde/");
-      await page.locator("#view-error").waitFor({state:"visible"});
-      const text=await page.locator("#view-error").innerText();
-      const expected = {missing:"pairing credential is missing on this device",locked:"could not access credential storage",stale:"host’s mobile access registration has expired",unavailable:"Host discovery is temporarily unavailable",revoked:"This pairing has been revoked"};
-      assert.ok(text.includes(expected[mode]),`the real loader must surface the specific ${mode} failure`);
-      if(mode!=="revoked")assert.ok(!text.toLowerCase().includes("revoked"),"neither silence nor local storage failure establishes revocation");
-      assert.equal(requests-before,mode==="missing"||mode==="locked"?0:1,"local credential failure must stop before authenticated HTTP");
-      const outcome=await page.evaluate(()=>window.__tydeLoader.nativeAdmitHost("owned-host"));
-      assert.deepEqual(outcome,{status:"unavailable",reason:{missing:"pairing_secret_missing",locked:"credential_storage_unavailable",stale:"host_unavailable",unavailable:"bootstrap_transport",revoked:"pairing_revoked"}[mode]});
-      assert.equal(await page.evaluate(()=>localStorage.getItem("tyde.selected-host.v1")),"owned-host");
-      await context.close();
     }
+    console.info("Native discovery error originals: "+evidence);
   } finally {
     if(browser)await browser.close();
     server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));

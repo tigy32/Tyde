@@ -1,4 +1,4 @@
-import { resolveNativeHost, resolveNativeOffer, nativeSignIn, NativeBootstrapError, nativeDescriptorIsLive } from './native-service.js';
+import { resolveNativeHost, resolveNativeOffer, nativeSignIn, NativeBootstrapError, nativeDescriptorIsLive, nativeBootstrapFailure } from './native-service.js';
 import { artifactSetSha256, nativeBridgeCompatible } from './manifest-policy.js';
 
 // Discovery chooses identity; executable selection and delivery stay in loader.js.
@@ -26,10 +26,6 @@ export async function startNativeBootstrap(hooks) {
   const pairKey = 'tyde.native.pending-pair.v1';
   const forgetKey = 'tyde.native.pending-forget.v1';
   const fail = () => ({ status: 'unavailable', reason: 'bootstrap' });
-  const failure = error => {
-    const reason = error?.code === 'transport' ? 'bootstrap_transport' : error?.code;
-    return {status:'unavailable',reason:['authentication_required','pass_required','pairing_revoked','native_version','bootstrap_baseline','bootstrap_transport','host_unavailable','pairing_secret_missing','credential_storage_unavailable'].includes(reason) ? reason : 'bootstrap'};
-  };
   const handoffPairing = uri => {
     sessionStorage.setItem(pairKey, uri);
     pending = true;
@@ -153,7 +149,7 @@ export async function startNativeBootstrap(hooks) {
         if (same(descriptor)) { bootedDescriptor = descriptor; firstPairAdmission = false; return { status: 'matching' }; }
         return change();
       } catch (error) {
-        return failure(error);
+        return nativeBootstrapFailure(error);
       }
     },
     async preparePairing(uri) {
@@ -174,7 +170,7 @@ export async function startNativeBootstrap(hooks) {
         // Only an explicitly safe Continue/scan reaches here. Bootstrap owns
         // sign-in before a different host's full client can be selected.
         if (error?.code === 'authentication_required') return handoffPairing(uri);
-        return failure(error);
+        return nativeBootstrapFailure(error);
       }
     },
   };
@@ -212,7 +208,7 @@ export async function startNativeBootstrap(hooks) {
     } catch (error) {
       if (ticket !== generation) return {status:'unavailable',reason:'cancelled'};
       showFailure(error);
-      return failure(error);
+      return nativeBootstrapFailure(error);
     }
   };
   const showFailure = error => {

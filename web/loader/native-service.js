@@ -21,6 +21,11 @@ export class NativeBootstrapError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
 
+export function nativeBootstrapFailure(error) {
+  const reason = error?.code === 'transport' ? 'bootstrap_transport' : error?.code;
+  return {status:'unavailable',reason:['authentication_required','pass_required','pairing_revoked','native_version','bootstrap_baseline','bootstrap_transport','host_unavailable','pairing_secret_missing','credential_storage_unavailable'].includes(reason) ? reason : 'bootstrap'};
+}
+
 async function request(path, body, headers = {}, direct = false) {
   const started = performance.now();
   let response;
@@ -28,7 +33,7 @@ async function request(path, body, headers = {}, direct = false) {
     response = await fetch(path, { method: 'POST', credentials: 'include', cache: 'no-store', redirect: 'error',
       headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
   } catch { throw new NativeBootstrapError('transport', 'The host discovery connection is unavailable.'); }
-  if (response.status === 503 || response.status === 429) throw new NativeBootstrapError('transport', 'Host discovery is temporarily unavailable.');
+  if (response.status === 502 || response.status === 503 || response.status === 429) throw new NativeBootstrapError('transport', 'Host discovery is temporarily unavailable.');
   if (!response.ok) {
     if (response.status === 401) throw new NativeBootstrapError('authentication_required', 'Sign in to connect to your host.');
     if (direct && response.status === 404) throw new NativeBootstrapError('bootstrap_baseline', 'Update Tyde host to support native client bootstrap.');
