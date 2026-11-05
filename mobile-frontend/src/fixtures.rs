@@ -7,7 +7,7 @@ use protocol::{
     ToolPolicy,
 };
 use settings_model::HostSettings;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::bridge::{Accepted, LocalSubmissionId};
 use crate::state::{
@@ -52,7 +52,59 @@ pub fn mark_ready() {
     );
 }
 
-pub fn capture_send(line: &str) -> Accepted {
+pub async fn capture_send(
+    host: &LocalHostId,
+    line: &str,
+    custody: Option<crate::recovery::InputCustody>,
+) -> Result<Accepted, crate::bridge::SendRejected> {
+    let local_submission_id = NEXT_SUBMISSION_ID.with(|next| {
+        let id = next.get();
+        next.set(id.saturating_add(1));
+        LocalSubmissionId(id)
+    });
+    let accepted = Accepted {
+        connection_instance_id: FIXTURE_CONNECTION_INSTANCE_ID,
+        local_submission_id,
+    };
+    if let Ok(value) = js_sys::Reflect::get(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_BEFORE_ADMISSION__".into(),
+    ) && let Some(observer) = value.dyn_ref::<js_sys::Function>()
+    {
+        let result = observer
+            .call1(&JsValue::NULL, &JsValue::from_str(line))
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+            .await
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+    }
+    crate::recovery::prepare_transport(host, line, accepted, custody).await?;
+    if let Ok(value) =
+        js_sys::Reflect::get(&js_sys::global(), &"__TYDE_FIXTURE_AFTER_PREPARE__".into())
+        && let Some(observer) = value.dyn_ref::<js_sys::Function>()
+    {
+        let result = observer
+            .call1(&JsValue::NULL, &JsValue::from_str(line))
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+        let reject = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+            .await
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+        if reject.as_bool() == Some(true) {
+            crate::recovery::reject_prepared(accepted).await;
+            if let Ok(value) =
+                js_sys::Reflect::get(&js_sys::global(), &"__TYDE_FIXTURE_REJECTED__".into())
+                && let Some(observer) = value.dyn_ref::<js_sys::Function>()
+            {
+                let result = observer
+                    .call0(&JsValue::NULL)
+                    .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+                wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+                    .await
+                    .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+            }
+            return Err(crate::bridge::SendRejected::QueueFull);
+        }
+    }
     if let Some(window) = web_sys::window() {
         let key = JsValue::from_str("__TYDE_FIXTURE_SENT_LINES__");
         let lines = js_sys::Reflect::get(window.as_ref(), &key)
@@ -64,15 +116,17 @@ pub fn capture_send(line: &str) -> Accepted {
         let _ = js_sys::Reflect::set(window.as_ref(), &key, lines.as_ref());
     }
 
-    let local_submission_id = NEXT_SUBMISSION_ID.with(|next| {
-        let id = next.get();
-        next.set(id.saturating_add(1));
-        LocalSubmissionId(id)
-    });
-    Accepted {
-        connection_instance_id: FIXTURE_CONNECTION_INSTANCE_ID,
-        local_submission_id,
+    if let Ok(value) = js_sys::Reflect::get(&js_sys::global(), &"__TYDE_FIXTURE_OUTBOUND__".into())
+        && let Some(observer) = value.dyn_ref::<js_sys::Function>()
+    {
+        let result = observer
+            .call1(&JsValue::NULL, &JsValue::from_str(line))
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&result))
+            .await
+            .map_err(|_| crate::bridge::SendRejected::ConnectionClosed)?;
     }
+    Ok(accepted)
 }
 
 pub fn seed_state(state: &AppState) {
@@ -249,6 +303,15 @@ pub fn seed_state(state: &AppState) {
     state.agent_loaded.update(|loaded| {
         loaded.insert(agent_ref.clone());
     });
+    if name == "recovery" {
+        let agents = state.agents.get_untracked();
+        state
+            .agent_load_requests
+            .update(|requests| requests.extend(agents.iter().map(|agent| agent.agent_ref())));
+        state
+            .agent_loaded
+            .update(|loaded| loaded.extend(agents.iter().map(|agent| agent.agent_ref())));
+    }
     state.chat_messages.update(|messages| {
         messages.insert(
             agent_ref.clone(),
@@ -325,7 +388,7 @@ pub fn seed_state(state: &AppState) {
             state.active_agent.set(None);
             state.show_chat();
         }
-        "chat" | "chat-light" | "disconnected" | "error" | "voice" | "images" => {
+        "chat" | "chat-light" | "disconnected" | "error" | "voice" | "images" | "recovery" => {
             state.show_chat();
         }
         _ => {
@@ -430,4 +493,51 @@ fn image_messages() -> Vec<ChatMessageEntry> {
     });
     messages.push(output);
     messages
+}
+
+pub fn reserve_recovered_submission_ids(next: u64) {
+    NEXT_SUBMISSION_ID.with(|current| current.set(current.get().max(next)));
+}
+
+pub fn install_recovery(state: &AppState) {
+    crate::recovery::begin(state);
+    crate::recovery::observe(state);
+    let state = state.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let idb = crate::bridge::web::idb::STORE_HOSTS;
+            let host = serde_json::json!({"localHostId":"fixture-host", "hostLabel":"Fixture host", "credentialFingerprint":"fixture", "autoConnect":false, "lastConnectedAtMs":null, "managed":null, "direct":null});
+            crate::bridge::web::idb::put(idb, "all", &serde_json::to_string(&vec![host]).map_err(|_| "Fixture host could not be encoded")?).await?;
+            crate::recovery::restore(&state).await?;
+            crate::recovery::commit_current().await?;
+            Ok::<_, String>(())
+        }.await;
+        if let Err(error) = result {
+            crate::recovery::report_restore_failure(&state, error);
+        }
+        mark_ready();
+    });
+    let commit = wasm_bindgen::closure::Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+        wasm_bindgen_futures::future_to_promise(async {
+            crate::recovery::commit_current()
+                .await
+                .map(|_| JsValue::TRUE)
+                .map_err(|_| JsValue::from_str("Input recovery commit failed"))
+        })
+    });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_COMMIT_INPUT__".into(),
+        commit.as_ref(),
+    )
+    .expect("fixture commit boundary");
+    let commit = send_wrapper::SendWrapper::new(commit);
+    on_cleanup(move || {
+        js_sys::Reflect::delete_property(
+            &js_sys::global(),
+            &"__TYDE_FIXTURE_COMMIT_INPUT__".into(),
+        )
+        .expect("remove fixture commit boundary");
+        drop(commit.take());
+    });
 }

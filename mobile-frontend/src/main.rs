@@ -9,6 +9,7 @@ mod fixtures;
 mod markdown;
 mod native;
 mod push;
+mod recovery;
 mod send;
 mod shell;
 pub mod state;
@@ -33,7 +34,9 @@ fn main() {
     if fixtures::is_requested() {
         leptos::mount::mount_to(root, app::FixtureApp).forget();
         remove_boot_screen();
-        fixtures::mark_ready();
+        if fixtures::fixture_name() != "recovery" {
+            fixtures::mark_ready();
+        }
         return;
     }
 

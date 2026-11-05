@@ -355,14 +355,15 @@ pub async fn set_paired_host_auto_connect(
 pub async fn send_host_line(
     local_host_id: &LocalHostId,
     line: &str,
+    custody: Option<crate::recovery::InputCustody>,
 ) -> Result<Accepted, SendRejected> {
     #[cfg(all(feature = "ui-fixtures", debug_assertions))]
     if crate::fixtures::is_requested() {
-        return Ok(crate::fixtures::capture_send(line));
+        return crate::fixtures::capture_send(local_host_id, line, custody).await;
     }
 
     connection::manager()
-        .send_line(local_host_id.clone(), line.to_owned())
+        .send_line(local_host_id.clone(), line.to_owned(), custody)
         .await
 }
 
@@ -859,4 +860,16 @@ mod wasm_tests {
             "a managed protocol mismatch must request a loader reboot",
         );
     }
+}
+
+pub(crate) fn reserve_recovered_submission_ids(next: u64) {
+    connection::manager().reserve_recovered_submission_ids(next);
+    #[cfg(all(feature = "ui-fixtures", debug_assertions))]
+    if crate::fixtures::is_requested() {
+        crate::fixtures::reserve_recovered_submission_ids(next);
+    }
+}
+
+pub(crate) fn reserve_unsent_submission_id(minimum: u64) -> super::LocalSubmissionId {
+    connection::manager().reserve_unsent_submission_id(minimum)
 }

@@ -25,6 +25,7 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
     private var httpTasks: [UInt32: Task<NativeHttpResponse, Error>] = [:]
     private var clientSecretKeys: Set<String>?
     private var document = UUID()
+    private var documentActive = false
     private func retireDocument() {
         document = UUID()
         for task in httpTasks.values { task.cancel() }
@@ -32,8 +33,8 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
         if case .active(let session, _) = authentication { session.cancel() }
         authentication = .idle
     }
-    func beginBootstrap() { retireDocument(); clientSecretKeys = nil }
-    func suspendClient() { retireDocument(); clientSecretKeys = [] }
+    func beginBootstrap() { retireDocument(); clientSecretKeys = nil; documentActive = true }
+    func suspendClient() { retireDocument(); clientSecretKeys = []; documentActive = false }
 
     private let networking = NativeNetworking()
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "platform")
@@ -44,6 +45,10 @@ final class PlatformBridge: NSObject, WKScriptMessageHandlerWithReply {
               let endpoint = NativeEndpoint(rawValue: message.name),
               let json = message.body as? String, let data = json.data(using: .utf8) else {
             replyHandler(nil, "Untrusted native bridge message")
+            return
+        }
+        guard documentActive else {
+            replyHandler(nil, "Native document is unavailable")
             return
         }
         let submittedDocument = document

@@ -106,7 +106,9 @@ fn target_is_terminated(state: &AppState, record: &PendingSubmission) -> bool {
 /// a stream nobody is reading, and mint a second stranded record. Copy, Edit,
 /// and Discard stay available, so the text is never trapped.
 fn can_resend(state: &AppState, record: &PendingSubmission) -> bool {
-    if target_is_terminated(state, record) {
+    if target_is_terminated(state, record)
+        || (record.target == SubmissionTarget::NewChat && record.spawn_payload.is_none())
+    {
         return false;
     }
     let current = state
@@ -133,7 +135,22 @@ async fn copy_to_clipboard(text: &str) -> bool {
 async fn resend(state: &AppState, record: &PendingSubmission) {
     let outcome = match &record.target {
         SubmissionTarget::NewChat => {
-            crate::actions::spawn_new_chat(state, record.text.clone(), record.images.clone()).await
+            let Some(payload) = &record.spawn_payload else {
+                shell_error(state, "The original new-chat request is unavailable. Copy or edit its preserved input instead of reconstructing it.".into());
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&record.local_host_id) else {
+                return;
+            };
+            crate::actions::spawn_chat(
+                state,
+                &record.local_host_id,
+                stream,
+                payload,
+                crate::actions::SpawnChatNavigation::Background,
+                Some(crate::recovery::InputCustody::retry(record)),
+            )
+            .await
         }
         SubmissionTarget::Agent(agent_ref) => {
             // Transport guard, not just a disabled button: `can_resend` already
@@ -172,7 +189,7 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
             if record.action == protocol::HumanInputAction::InterruptAndSend {
                 state.begin_human_admission(agent_ref, &record.human_input_id);
             }
-            crate::send::send_composer_input(
+            crate::send::send_composer_owned(
                 &agent_ref.local_host_id,
                 stream,
                 &protocol::HumanInputPayload {
@@ -180,6 +197,7 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
                     action: record.action,
                     input: payload,
                 },
+                crate::recovery::InputCustody::retry(record),
             )
             .await
         }
@@ -199,7 +217,8 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
                 // it the moment the user pressed Send again.
                 origin: record.origin,
                 local_host_id: record.local_host_id.clone(),
-                connection_instance_id: accepted.connection_instance_id,
+                connection_instance_id: Some(accepted.connection_instance_id),
+                spawn_payload: None,
                 target: record.target.clone(),
                 text: record.text.clone(),
                 images: record.images.clone(),
@@ -281,6 +300,13 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
             return;
         }
         let Some(record) = with_record() else { return };
+        if edit_state.active_local_host_id.get_untracked().as_ref() != Some(&record.local_host_id) {
+            shell_error(
+                &edit_state,
+                "Select the original host before recovering this input.".into(),
+            );
+            return;
+        }
         // A card reply is a typed answer, not chat text. Handing it to the composer
         // would strip the tool response and re-send it as an ordinary message,
         // which the agent queues behind the very turn this reply exists to end.
@@ -290,7 +316,8 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
                 Some(protocol::SendMessageToolResponse::AskUserQuestion { .. }) => {
                     "a question answer"
                 }
-                _ => "a plan decision",
+                Some(protocol::SendMessageToolResponse::ExitPlanMode { .. }) => "a plan decision",
+                None => "a session request",
             };
             shell_error(
                 &edit_state,
@@ -298,33 +325,108 @@ fn PendingSubmissionCard(local_submission_id: LocalSubmissionId) -> impl IntoVie
             );
             return;
         }
-        // Explicit user action is the only thing that may write the composer,
-        // and anything already typed there wins: appending would silently
-        // reorder the user's own words. The record stays put and says so.
+        // Restore the whole local input atomically, never into another owner or
+        // over a draft the user has already started.
         if !edit_state
             .chat_input
             .with_untracked(|text| text.trim().is_empty())
+            || !edit_state.chat_images.get_untracked().is_empty()
         {
             shell_error(
                 &edit_state,
-                "Clear the message box first, then tap Edit again.".to_owned(),
+                "Clear the message box first, then tap Edit again.".into(),
             );
             return;
         }
-        edit_state.chat_input.set(record.text.clone());
-        // The composer holds text; it cannot hold attachments. Retiring a record
-        // that carries images would destroy the only copy of them, so a record
-        // with attachments keeps its row — the text is now editable in the
-        // composer, and the images stay recoverable until the user explicitly
-        // discards them. Discard remains the single path that destroys anything.
-        if record.images.is_empty() {
-            // Terminal for the *lineage*: the message is back with the user. The
-            // card that created it must say so, not revert to "queued locally".
+        match &record.target {
+            SubmissionTarget::NewChat => {
+                let Some(payload) = &record.spawn_payload else {
+                    return;
+                };
+                let protocol::SpawnAgentParams::New {
+                    backend_kind,
+                    session_settings,
+                    ..
+                } = &payload.params
+                else {
+                    return;
+                };
+                if edit_state.draft_backend_override.get_untracked().is_some()
+                    || edit_state.draft_custom_agent_id.get_untracked().is_some()
+                    || !edit_state
+                        .draft_session_settings
+                        .get_untracked()
+                        .0
+                        .is_empty()
+                {
+                    shell_error(
+                        &edit_state,
+                        "Finish the current draft settings before recovering another request."
+                            .into(),
+                    );
+                    return;
+                }
+                crate::actions::open_new_chat(&edit_state);
+                edit_state.draft_backend_override.set(Some(*backend_kind));
+                edit_state
+                    .draft_custom_agent_id
+                    .set(payload.custom_agent_id.clone());
+                edit_state
+                    .draft_session_settings
+                    .set(session_settings.clone().unwrap_or_default());
+                edit_state
+                    .active_project
+                    .set(payload.project_id.clone().map(|project_id| {
+                        crate::state::ActiveProjectRef {
+                            local_host_id: record.local_host_id.clone(),
+                            project_id,
+                        }
+                    }));
+            }
+            SubmissionTarget::Agent(owner) => {
+                if !edit_state
+                    .agents
+                    .with_untracked(|agents| agents.iter().any(|agent| agent.agent_ref() == *owner))
+                {
+                    shell_error(
+                        &edit_state,
+                        "The original conversation is unavailable; its input is still preserved."
+                            .into(),
+                    );
+                    return;
+                }
+                edit_state.open_agent_chat(crate::state::ActiveAgentRef {
+                    local_host_id: owner.local_host_id.clone(),
+                    agent_id: owner.agent_id.clone(),
+                });
+                if !edit_state
+                    .active_agent
+                    .get_untracked()
+                    .is_some_and(|active| active.as_agent_ref() == *owner)
+                {
+                    return;
+                }
+            }
+        }
+        batch(|| {
+            edit_state.set_chat_input(record.text.clone());
+            edit_state.chat_images.set(
+                record
+                    .images
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| crate::state::PendingImage {
+                        name: format!("Recovered photo {}", index + 1),
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    })
+                    .collect(),
+            );
             edit_state.withdraw_submission(
                 local_submission_id,
                 SubmissionWithdrawal::ReturnedToComposer,
             );
-        }
+        });
     };
 
     let discard_state = state.clone();
@@ -695,7 +797,24 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: Some(protocol::SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::HumanChat,
+                    name: None,
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: protocol::SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "deploy the thing".into(),
+                        images: None,
+                        backend_kind: protocol::BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                }),
                 target: SubmissionTarget::NewChat,
                 text: "deploy the thing".to_owned(),
                 images: Vec::new(),
@@ -876,7 +995,8 @@ mod wasm_tests {
                     local_submission_id: LocalSubmissionId(FIXTURE_ID + id),
                     origin: SubmissionOriginId(FIXTURE_ORIGIN + id),
                     local_host_id: host.clone(),
-                    connection_instance_id: 7,
+                    connection_instance_id: Some(7),
+                    spawn_payload: None,
                     target: SubmissionTarget::NewChat,
                     text: format!("message {id}"),
                     images: Vec::new(),
@@ -994,7 +1114,8 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 2),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: SubmissionTarget::Agent(agent_for_mount.clone()),
                 text: "look at this".to_owned(),
                 images: Vec::new(),
@@ -1175,7 +1296,7 @@ mod wasm_tests {
         });
         state
             .draft_backend_override
-            .set(Some(protocol::BackendKind::Claude));
+            .set(Some(protocol::BackendKind::Codex));
         next_tick().await;
 
         let original = state
@@ -1193,6 +1314,23 @@ mod wasm_tests {
         resend.click();
         next_tick().await;
         next_tick().await;
+        let sent = crate::bridge::test_sent_lines()
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+            .find(|frame| frame.kind == protocol::FrameKind::SpawnAgent)
+            .unwrap();
+        assert!(
+            matches!(
+                sent.parse_payload::<protocol::SpawnAgentPayload>()
+                    .unwrap()
+                    .params,
+                protocol::SpawnAgentParams::New {
+                    backend_kind: protocol::BackendKind::Claude,
+                    ..
+                }
+            ),
+            "Resend retains the original typed launch request, not the current composer backend"
+        );
 
         let replacement = state
             .pending_submissions
@@ -1311,7 +1449,8 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 2),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: SubmissionTarget::Agent(agent_for_mount.clone()),
                 text: "to this agent".to_owned(),
                 images: Vec::new(),
@@ -1346,7 +1485,7 @@ mod wasm_tests {
     /// destroy the only copy of its images — which is precisely the silent data
     /// loss the removed auto-restore was committing.
     #[wasm_bindgen_test]
-    async fn edit_never_destroys_attachments_it_cannot_hand_back() {
+    async fn edit_returns_the_complete_input_to_the_rendered_composer() {
         let container = make_container();
         let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -1362,7 +1501,27 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 3),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: Some(protocol::SpawnAgentPayload {
+                    launch_context: protocol::AgentLaunchContext::HumanChat,
+                    name: None,
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: protocol::SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "look at this".into(),
+                        images: Some(vec![protocol::ImageData {
+                            media_type: "image/png".into(),
+                            data: "AAAA".into(),
+                        }]),
+                        backend_kind: protocol::BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                }),
                 target: SubmissionTarget::NewChat,
                 text: "look at this".to_owned(),
                 images: vec![protocol::ImageData {
@@ -1374,7 +1533,7 @@ mod wasm_tests {
             });
             *handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <PendingSubmissions /> }
+            view! { <PendingSubmissions /><crate::components::chat_input::ChatInput /> }
         });
         next_tick().await;
         let state = handle.borrow().as_ref().unwrap().clone();
@@ -1391,27 +1550,24 @@ mod wasm_tests {
             "look at this",
             "Edit must hand the text back"
         );
-        let held = state
-            .pending_submissions
-            .get_untracked()
-            .get(&LocalSubmissionId(FIXTURE_ID))
-            .cloned()
-            .expect(
-                "a record carrying attachments must survive Edit — the composer cannot \
-                 hold them, so discarding it would destroy the only copy",
-            );
-        assert_eq!(held.images.len(), 1, "the images must still be recoverable");
+        // The composer now owns attachments in AppState; the old row-retention
+        // assertion protected a private buffer that could not receive them.
+        assert!(
+            state.pending_submissions.get_untracked().is_empty(),
+            "Complete input has one owner after Edit"
+        );
+        let image = container
+            .query_selector("[data-mobile-test='chat-photo-tray'] img")
+            .unwrap()
+            .unwrap();
+        assert!(
+            image
+                .get_attribute("src")
+                .is_some_and(|src| src.ends_with("AAAA")),
+            "The real composer renders the held attachment without dropping its payload"
+        );
     }
 
-    /// **An agent-targeted resend must put the held images on the wire.**
-    ///
-    /// It was hardcoding `images: None`, silently dropping every attachment the
-    /// record was holding. And `SendMessagePayload::images` is
-    /// `skip_serializing_if = "Option::is_none"`, so `None` and `Some(vec)` are
-    /// *different bytes* — the resend was not even sending the same message.
-    ///
-    /// Asserted against the captured frame, not against the record: the record was
-    /// always right; it was the serialization that lost them.
     #[wasm_bindgen_test]
     async fn an_agent_resend_serializes_the_held_images_onto_the_wire() {
         for action in [
@@ -1472,7 +1628,8 @@ mod wasm_tests {
                     local_submission_id: LocalSubmissionId(FIXTURE_ID),
                     origin: SubmissionOriginId(FIXTURE_ORIGIN + 1),
                     local_host_id: host,
-                    connection_instance_id: 7,
+                    connection_instance_id: Some(7),
+                    spawn_payload: None,
                     target: SubmissionTarget::Agent(agent_for_mount.clone()),
                     text: "look at this".to_owned(),
                     images: images_for_mount,
@@ -1766,7 +1923,8 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 1),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: SubmissionTarget::Agent(agent_for_mount.clone()),
                 text: "no pictures".to_owned(),
                 images: Vec::new(),
@@ -1817,7 +1975,8 @@ mod wasm_tests {
                 local_submission_id: LocalSubmissionId(FIXTURE_ID),
                 origin: SubmissionOriginId(FIXTURE_ORIGIN + 4),
                 local_host_id: host,
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: SubmissionTarget::NewChat,
                 // No spaces: nothing for the browser to break on unless the CSS
                 // says it may.
@@ -1890,7 +2049,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn edit_refuses_to_clobber_a_composer_the_user_is_using() {
         let (container, state) = mount_with(PendingSubmissionState::DeliveryUnknown, Some(8)).await;
-        state.chat_input.set("half a thought".to_owned());
+        state.set_chat_input("half a thought".to_owned());
         next_tick().await;
 
         let edit: HtmlElement = find(&container, "pending-submission-edit")

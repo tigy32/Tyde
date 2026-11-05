@@ -7,7 +7,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use crate::bridge::Accepted;
 use crate::send::SendFrameError;
 use crate::state::{
-    AgentRef, AppState, LocalHostId, PendingSubmission, PendingSubmissionState, SubmissionTarget,
+    AgentRef, AppState, LocalHostId, PendingImage, PendingSubmission, PendingSubmissionState,
+    SubmissionTarget,
 };
 
 const QUEUED_EDIT_MIN_HEIGHT_PX: i32 = 39;
@@ -24,13 +25,6 @@ const TERMINATED_COMPOSER_HINT: &str =
 /// where the text is read aloud rather than skimmed.
 const TERMINATED_COMPOSER_LABEL: &str =
     "Agent stopped. Use Fork + send, Resume in Sessions, or New Chat.";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingImage {
-    name: String,
-    media_type: String,
-    data: String,
-}
 
 /// Visually hidden, still announced. Inline because this is an accessibility
 /// invariant of the composer, not a theming choice.
@@ -199,11 +193,43 @@ fn copy_queued_draft(text: String, status: RwSignal<&'static str>) {
 /// the host of one message with the text of another.
 struct OutboundSubmission {
     human_input_id: protocol::HumanInputId,
+    origin: crate::state::SubmissionOriginId,
+    draft: crate::recovery::CapturedDraft,
     action: protocol::HumanInputAction,
     local_host_id: LocalHostId,
     target: SubmissionTarget,
     text: String,
     images: Vec<protocol::ImageData>,
+}
+
+impl OutboundSubmission {
+    fn new(
+        state: &AppState,
+        action: protocol::HumanInputAction,
+        local_host_id: LocalHostId,
+        target: SubmissionTarget,
+        text: String,
+        images: Vec<protocol::ImageData>,
+    ) -> Self {
+        Self {
+            human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
+            origin: state.mint_submission_origin(),
+            draft: crate::recovery::CapturedDraft::capture(state, target.clone()),
+            action,
+            local_host_id,
+            target,
+            text,
+            images,
+        }
+    }
+
+    fn custody(&self) -> crate::recovery::InputCustody {
+        crate::recovery::InputCustody {
+            id: self.human_input_id.clone(),
+            origin: Some(self.origin),
+            draft: Some(self.draft.clone()),
+        }
+    }
 }
 
 /// The composer's own handles: its text and photos, the live region that
@@ -215,6 +241,7 @@ struct OutboundSubmission {
 struct Composer {
     textarea: NodeRef<leptos::html::Textarea>,
     images: RwSignal<Vec<PendingImage>>,
+    edit_id: RwSignal<uuid::Uuid>,
     attachment_error: RwSignal<Option<String>>,
     announcement: RwSignal<String>,
     /// Set while a submission is unsettled.
@@ -232,10 +259,11 @@ struct Composer {
 }
 
 impl Composer {
-    fn new() -> Self {
+    fn new(state: &AppState) -> Self {
         Self {
             textarea: NodeRef::new(),
-            images: RwSignal::new(Vec::new()),
+            images: state.chat_images,
+            edit_id: state.chat_edit_id,
             attachment_error: RwSignal::new(None),
             announcement: RwSignal::new(String::new()),
             submitting: RwSignal::new(false),
@@ -257,7 +285,20 @@ impl Composer {
     /// Empty the composer. Called only from [`settle_submission`], and only once
     /// the complete submission has a holder.
     fn clear(&self, state: &AppState) {
-        state.chat_input.set(String::new());
+        let destination = state
+            .native_chat_destination
+            .get_untracked()
+            .filter(|target| {
+                target.source_draft.is_some()
+                    && target.draft_id == state.chat_draft_id.get_untracked()
+                    && target.source_agent == state.active_agent.get_untracked()
+            });
+        state.set_chat_input(String::new());
+        if let Some(mut destination) = destination {
+            destination.source_draft = None;
+            destination.source_edit_id = state.chat_edit_id.get_untracked();
+            state.native_chat_destination.set(Some(destination));
+        }
         self.images.set(Vec::new());
         self.attachment_error.set(None);
         if let Some(textarea) = self.textarea.get_untracked() {
@@ -967,6 +1008,7 @@ pub(super) fn NewChatOptions() -> impl IntoView {
         let value = event_target_value(&event);
         let backend = parse_backend(&value);
         log::debug!("Mobile backend selection: value={value:?}, backend={backend:?}");
+        change_backend_state.chat_edit_id.set(uuid::Uuid::new_v4());
         change_backend_state.draft_backend_override.set(backend);
         // Session settings are keyed by the backend's own schema, so a draft
         // carrying the previous backend's model name is not a preference the
@@ -1191,7 +1233,7 @@ pub(super) fn NewChatOptions() -> impl IntoView {
 #[component]
 pub fn ChatInput() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
-    let composer = Composer::new();
+    let composer = Composer::new(&state);
     let textarea_ref = composer.textarea;
     let photo_input_ref = NodeRef::<leptos::html::Input>::new();
     let attachment_error = composer.attachment_error;
@@ -1263,13 +1305,26 @@ pub fn ChatInput() -> impl IntoView {
                 return;
             }
 
-            let human_input_id = protocol::HumanInputId(uuid::Uuid::new_v4().to_string());
+            let target = active_target
+                .as_ref()
+                .map(|(active, _)| SubmissionTarget::Agent(active.as_agent_ref()))
+                .unwrap_or(SubmissionTarget::NewChat);
+            let submission = OutboundSubmission::new(
+                &state,
+                action,
+                host.clone(),
+                target,
+                text.clone(),
+                images.clone(),
+            );
+            let human_input_id = submission.human_input_id.clone();
+            let custody = submission.custody();
             composer.begin();
             spawn_local(async move {
                 // The composer still holds the text through this await. It is
                 // cleared only inside `settle_submission`, and only once the
                 // record has taken custody.
-                let (target, outcome) = match active_target {
+                let outcome = match active_target {
                     Some((active, stream)) => {
                         let payload = protocol::HumanInputPayload {
                             id: human_input_id.clone(),
@@ -1284,37 +1339,28 @@ pub fn ChatInput() -> impl IntoView {
                         if action == protocol::HumanInputAction::InterruptAndSend {
                             state.begin_human_admission(&active.as_agent_ref(), &human_input_id);
                         }
-                        let outcome = crate::send::send_composer_input(
+                        crate::send::send_composer_owned(
                             &active.local_host_id,
                             stream,
                             &payload,
+                            custody.clone(),
                         )
-                        .await;
-                        (SubmissionTarget::Agent(active.as_agent_ref()), outcome)
+                        .await
                     }
                     None => {
                         // A new chat has no agent yet, and the client must not
                         // guess which `NewAgent` is its own — so this record is
                         // host-scoped, not attached to any agent.
-                        let outcome =
-                            crate::actions::spawn_new_chat(&state, text.clone(), images.clone())
-                                .await;
-                        (SubmissionTarget::NewChat, outcome)
+                        crate::actions::spawn_new_chat(
+                            &state,
+                            text.clone(),
+                            images.clone(),
+                            custody.clone(),
+                        )
+                        .await
                     }
                 };
-                settle_submission(
-                    &state,
-                    composer,
-                    OutboundSubmission {
-                        human_input_id,
-                        action,
-                        local_host_id: host,
-                        target,
-                        text,
-                        images,
-                    },
-                    outcome,
-                );
+                settle_submission(&state, composer, submission, outcome);
             });
         }
     };
@@ -1369,7 +1415,7 @@ pub fn ChatInput() -> impl IntoView {
             {
                 Ok(_) => {
                     if state.chat_input.get_untracked() == objective {
-                        state.chat_input.set(String::new());
+                        state.set_chat_input(String::new());
                     }
                 }
                 Err(error) => report_send_error(&state, format!("Failed to set goal: {error}")),
@@ -1405,6 +1451,14 @@ pub fn ChatInput() -> impl IntoView {
             }
 
             let state = state.clone();
+            let submission = OutboundSubmission::new(
+                &state,
+                protocol::HumanInputAction::Steer,
+                host.clone(),
+                SubmissionTarget::Agent(active.as_agent_ref()),
+                text.clone(),
+                images.clone(),
+            );
             composer.begin();
             spawn_local(async move {
                 if text.is_empty() && images.is_empty() {
@@ -1430,26 +1484,18 @@ pub fn ChatInput() -> impl IntoView {
                     origin: None,
                     tool_response: None,
                 };
-                let outcome = crate::send::send_frame(
+                let outcome = crate::send::send_composer_owned(
                     &active.local_host_id,
                     stream,
-                    protocol::FrameKind::SteerMessage,
-                    &payload,
+                    &protocol::HumanInputPayload {
+                        id: submission.human_input_id.clone(),
+                        action: protocol::HumanInputAction::Steer,
+                        input: payload,
+                    },
+                    submission.custody(),
                 )
                 .await;
-                settle_submission(
-                    &state,
-                    composer,
-                    OutboundSubmission {
-                        human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
-                        action: protocol::HumanInputAction::Steer,
-                        local_host_id: host,
-                        target: SubmissionTarget::Agent(active.as_agent_ref()),
-                        text,
-                        images,
-                    },
-                    outcome,
-                );
+                settle_submission(&state, composer, submission, outcome);
             });
         }
     };
@@ -1525,23 +1571,24 @@ pub fn ChatInput() -> impl IntoView {
                 return;
             }
             let state = state.clone();
+            let submission = OutboundSubmission::new(
+                &state,
+                protocol::HumanInputAction::Send,
+                host.clone(),
+                SubmissionTarget::NewChat,
+                text.clone(),
+                images.clone(),
+            );
             composer.begin();
             spawn_local(async move {
-                let outcome =
-                    crate::actions::spawn_side_question(&state, text.clone(), images.clone()).await;
-                settle_submission(
+                let outcome = crate::actions::spawn_side_question(
                     &state,
-                    composer,
-                    OutboundSubmission {
-                        human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
-                        action: protocol::HumanInputAction::Send,
-                        local_host_id: host,
-                        target: SubmissionTarget::NewChat,
-                        text,
-                        images,
-                    },
-                    outcome,
-                );
+                    text.clone(),
+                    images.clone(),
+                    submission.custody(),
+                )
+                .await;
+                settle_submission(&state, composer, submission, outcome);
             });
         }
     };
@@ -1625,7 +1672,7 @@ pub fn ChatInput() -> impl IntoView {
     let slash_open = Memo::new(move |_| !slash_matches.get().is_empty());
     let slash_accept_state = state.clone();
     let accept_slash_command = Callback::new(move |name: String| {
-        slash_accept_state.chat_input.set(format!("/{name} "));
+        slash_accept_state.set_chat_input(format!("/{name} "));
         if let Some(textarea) = textarea_ref.get_untracked() {
             let _ = textarea.focus();
         }
@@ -1739,6 +1786,10 @@ pub fn ChatInput() -> impl IntoView {
         native_destination.set(None);
         loading_photos.set(true);
         attachment_error.set(None);
+        let photo_state = choose_photo_state.clone();
+        let draft_id = photo_state.chat_draft_id.get_untracked();
+        let host = photo_state.active_local_host_id.get_untracked();
+        let agent = photo_state.active_agent.get_untracked();
         photo_owner.with(|| {
             leptos::task::spawn_local_scoped_with_cancellation(async move {
                 let mut added = Vec::new();
@@ -1749,7 +1800,17 @@ pub fn ChatInput() -> impl IntoView {
                         Err(error) => errors.push(error),
                     }
                 }
+                let _ = loading_photos.try_update(|loading| *loading = false);
+                // The image buffer now outlives this component; a discarded draft's
+                // file completion must not write into its replacement.
+                if photo_state.chat_draft_id.get_untracked() != draft_id
+                    || photo_state.active_local_host_id.get_untracked() != host
+                    || photo_state.active_agent.get_untracked() != agent
+                {
+                    return;
+                }
                 if !added.is_empty() {
+                    composer.edit_id.set(uuid::Uuid::new_v4());
                     composer.images.update(|images| images.extend(added));
                 }
                 if !errors.is_empty() {
@@ -2009,6 +2070,7 @@ pub fn ChatInput() -> impl IntoView {
                                             class="chat-photo-remove"
                                             aria-label=format!("Remove {}", image.name)
                                             on:click=move |_| {
+                                                composer.edit_id.set(uuid::Uuid::new_v4());
                                                 composer.images.update(|images| {
                                                     if index < images.len() {
                                                         native_destination.set(None);
@@ -2091,7 +2153,7 @@ pub fn ChatInput() -> impl IntoView {
                         let textarea = event_target::<web_sys::HtmlTextAreaElement>(&ev);
                         let val = textarea.value();
                         if s_input.chat_input.get_untracked() != val {
-                            s_input.chat_input.set(val);
+                            s_input.set_chat_input(val);
                         }
                     }
                     on:keydown=on_keydown
@@ -2328,6 +2390,8 @@ fn settle_submission(
 ) {
     let OutboundSubmission {
         human_input_id,
+        origin,
+        draft,
         action,
         local_host_id,
         target,
@@ -2344,6 +2408,7 @@ fn settle_submission(
                     .is_some_and(|active| active.as_agent_ref() == *owner),
             };
             let unchanged = same_target
+                && draft.matches(state)
                 && state.chat_input.get_untracked().trim() == text
                 && composer.image_payload() == images;
             state.hold_submission(PendingSubmission {
@@ -2352,9 +2417,10 @@ fn settle_submission(
                 action,
                 local_submission_id: accepted.local_submission_id,
                 // A fresh logical submission: the user just made this one.
-                origin: state.mint_submission_origin(),
+                origin,
                 local_host_id,
-                connection_instance_id: accepted.connection_instance_id,
+                connection_instance_id: Some(accepted.connection_instance_id),
+                spawn_payload: None,
                 target,
                 text,
                 images,
@@ -2365,6 +2431,7 @@ fn settle_submission(
                 state: PendingSubmissionState::QueuedLocally,
             });
             if unchanged {
+                draft.clear_options(state);
                 composer.clear(state);
             }
             composer.announcement.set(QUEUED_ANNOUNCEMENT.to_owned());
@@ -2606,14 +2673,16 @@ mod wasm_tests {
         let state = AppState::new();
         let host = LocalHostId("host-1".to_owned());
         state.active_local_host_id.set(Some(host.clone()));
-        state.chat_input.set("ship it".to_owned());
+        state.set_chat_input("ship it".to_owned());
 
-        let composer = Composer::new();
+        let composer = Composer::new(&state);
 
         settle_submission(
             &state,
             composer,
             OutboundSubmission {
+                origin: state.mint_submission_origin(),
+                draft: crate::recovery::CapturedDraft::capture(&state, SubmissionTarget::NewChat),
                 human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
                 action: protocol::HumanInputAction::Send,
                 local_host_id: host.clone(),
@@ -2664,7 +2733,7 @@ mod wasm_tests {
     async fn admission_moves_photos_into_the_recovery_record() {
         let state = AppState::new();
         let host = LocalHostId("host-1".to_owned());
-        let composer = Composer::new();
+        let composer = Composer::new(&state);
         composer.images.set(vec![PendingImage {
             name: "photo.jpg".to_owned(),
             media_type: "image/jpeg".to_owned(),
@@ -2676,6 +2745,8 @@ mod wasm_tests {
             &state,
             composer,
             OutboundSubmission {
+                origin: state.mint_submission_origin(),
+                draft: crate::recovery::CapturedDraft::capture(&state, SubmissionTarget::NewChat),
                 human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
                 action: protocol::HumanInputAction::Send,
                 local_host_id: host,
@@ -2709,14 +2780,16 @@ mod wasm_tests {
         let state = AppState::new();
         let host = LocalHostId("host-1".to_owned());
         state.active_local_host_id.set(Some(host.clone()));
-        state.chat_input.set("ship it".to_owned());
+        state.set_chat_input("ship it".to_owned());
 
-        let composer = Composer::new();
+        let composer = Composer::new(&state);
 
         settle_submission(
             &state,
             composer,
             OutboundSubmission {
+                origin: state.mint_submission_origin(),
+                draft: crate::recovery::CapturedDraft::capture(&state, SubmissionTarget::NewChat),
                 human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()),
                 action: protocol::HumanInputAction::Send,
                 local_host_id: host,
@@ -4434,7 +4507,7 @@ mod wasm_tests {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             }));
-            state.chat_input.set("composer draft stays here".to_owned());
+            state.set_chat_input("composer draft stays here".to_owned());
             state.agent_message_queue.update(|m| {
                 m.insert(
                     agent_ref,

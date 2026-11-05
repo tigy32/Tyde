@@ -1,8 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use protocol::{Envelope, FrameKind, ProtocolFrame, StreamPath};
 use serde::Serialize;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{self, Accepted, SendRejected};
 use crate::state::LocalHostId;
@@ -30,34 +32,150 @@ impl From<SendRejected> for SendFrameError {
     }
 }
 
-// WASM is single-threaded; per-(host, stream) monotonic sequence numbers are
-// the protocol invariant.
-thread_local! {
-    static SEQ_MAP: RefCell<HashMap<(LocalHostId, StreamPath), u64>> = RefCell::new(HashMap::new());
+struct OutboundRequest {
+    kind: FrameKind,
+    payload: serde_json::Value,
+    binary: Option<Vec<u8>>,
+    custody: Option<crate::recovery::InputCustody>,
+    reply: oneshot::Sender<Result<Option<Accepted>, SendFrameError>>,
 }
 
+struct OutboundStream {
+    sender: mpsc::UnboundedSender<OutboundRequest>,
+    active: Rc<Cell<bool>>,
+    #[cfg(all(test, target_arch = "wasm32"))]
+    sequence: Rc<Cell<u64>>,
+}
+
+thread_local! {
+    static STREAMS: RefCell<HashMap<(LocalHostId, StreamPath), OutboundStream>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
 fn current_seq(host: &LocalHostId, stream: &StreamPath) -> u64 {
-    SEQ_MAP.with(|map| {
-        map.borrow()
+    STREAMS.with(|streams| {
+        streams
+            .borrow()
             .get(&(host.clone(), stream.clone()))
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |stream| stream.sequence.get())
     })
 }
 
-fn commit_seq(host: &LocalHostId, stream: &StreamPath, accepted_seq: u64) {
-    SEQ_MAP.with(|map| {
-        let mut map = map.borrow_mut();
-        let counter = map.entry((host.clone(), stream.clone())).or_insert(0);
-        debug_assert_eq!(*counter, accepted_seq);
-        *counter = accepted_seq.wrapping_add(1);
+pub fn reset_seq_for_host(host: &LocalHostId) {
+    STREAMS.with(|streams| {
+        streams.borrow_mut().retain(|(owner, _), stream| {
+            if owner != host {
+                return true;
+            }
+            stream.active.set(false);
+            false
+        })
     });
 }
 
-pub fn reset_seq_for_host(host: &LocalHostId) {
-    SEQ_MAP.with(|map| {
-        map.borrow_mut().retain(|(h, _), _| h != host);
+async fn submit<T: Serialize>(
+    host: &LocalHostId,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+    binary: Option<Vec<u8>>,
+    custody: Option<crate::recovery::InputCustody>,
+) -> Result<Option<Accepted>, SendFrameError> {
+    let payload = serde_json::to_value(payload)
+        .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
+    let sender = STREAMS.with(|streams| {
+        let mut streams = streams.borrow_mut();
+        let key = (host.clone(), stream.clone());
+        streams
+            .entry(key)
+            .or_insert_with(|| {
+                let (sender, mut receiver) = mpsc::unbounded_channel::<OutboundRequest>();
+                let active = Rc::new(Cell::new(true));
+                let sequence = Rc::new(Cell::new(0));
+                let live = active.clone();
+                let counter = sequence.clone();
+                let host = host.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    while let Some(request) = receiver.recv().await {
+                        let result: Result<Option<Accepted>, SendFrameError> = async {
+                            if !live.get() {
+                                return Err(SendRejected::ConnectionClosed.into());
+                            }
+                            let seq = counter.get();
+                            let envelope = Envelope::from_payload(
+                                stream.clone(),
+                                request.kind,
+                                seq,
+                                &request.payload,
+                            )
+                            .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
+                            let accepted = match request.binary {
+                                Some(binary) => {
+                                    bridge::web::send_voice_frame(
+                                        &host,
+                                        ProtocolFrame { envelope, binary },
+                                    )
+                                    .await?;
+                                    None
+                                }
+                                None => {
+                                    let line =
+                                        serde_json::to_string(&envelope).map_err(|error| {
+                                            SendFrameError::Encoding(error.to_string())
+                                        })?;
+                                    Some(
+                                        bridge::send_host_line(&host, &line, request.custody)
+                                            .await?,
+                                    )
+                                }
+                            };
+                            counter.set(seq.wrapping_add(1));
+                            Ok(accepted)
+                        }
+                        .await;
+                        let _ = request.reply.send(result);
+                    }
+                });
+                OutboundStream {
+                    sender,
+                    active,
+                    #[cfg(all(test, target_arch = "wasm32"))]
+                    sequence,
+                }
+            })
+            .sender
+            .clone()
     });
+    let retained_payload = payload.clone();
+    let retained_custody = custody.clone();
+    let (reply, result) = oneshot::channel();
+    let outcome = match sender.send(OutboundRequest {
+        kind,
+        payload,
+        binary,
+        custody,
+        reply,
+    }) {
+        Ok(()) => match result.await {
+            Ok(result) => result,
+            Err(_) => Err(SendRejected::ConnectionClosed.into()),
+        },
+        Err(_) => Err(SendRejected::ConnectionClosed.into()),
+    };
+    if let Err(error) = &outcome {
+        crate::recovery::retain_rejected_input(
+            host,
+            kind,
+            retained_payload,
+            retained_custody,
+            matches!(
+                error,
+                SendFrameError::Rejected(SendRejected::ConnectionClosed)
+            ),
+        )
+        .await;
+    }
+    outcome
 }
 
 pub async fn send_frame<T: Serialize>(
@@ -66,42 +184,46 @@ pub async fn send_frame<T: Serialize>(
     kind: FrameKind,
     payload: &T,
 ) -> Result<Accepted, SendFrameError> {
-    let seq = current_seq(host, &stream);
-    log::info!(
-        "mobile_frame_tx host={} stream={} seq={} kind={}",
-        host,
-        stream,
-        seq,
-        kind
-    );
-    let sequence_stream = stream.clone();
-    let envelope = Envelope::from_payload(stream, kind, seq, payload)
-        .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
-    let line = serde_json::to_string(&envelope)
-        .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
-    let accepted = bridge::send_host_line(host, &line)
-        .await
-        .map_err(SendFrameError::Rejected)?;
-    commit_seq(host, &sequence_stream, seq);
-    Ok(accepted)
+    submit(host, stream, kind, payload, None, None)
+        .await?
+        .ok_or_else(|| {
+            SendFrameError::Encoding("Text frame returned a binary-only completion".into())
+        })
 }
 
-pub async fn send_composer_input(
+pub async fn send_composer_owned(
     host: &LocalHostId,
     stream: StreamPath,
     payload: &protocol::HumanInputPayload,
+    custody: crate::recovery::InputCustody,
 ) -> Result<Accepted, SendFrameError> {
-    match payload.action {
-        protocol::HumanInputAction::Send => {
-            send_frame(host, stream, FrameKind::SendMessage, &payload.input).await
-        }
-        protocol::HumanInputAction::Steer => {
-            send_frame(host, stream, FrameKind::SteerMessage, &payload.input).await
-        }
-        protocol::HumanInputAction::InterruptAndSend => {
-            send_frame(host, stream, FrameKind::HumanInput, payload).await
-        }
-    }
+    let kind = match payload.action {
+        protocol::HumanInputAction::Send => FrameKind::SendMessage,
+        protocol::HumanInputAction::Steer => FrameKind::SteerMessage,
+        protocol::HumanInputAction::InterruptAndSend => FrameKind::HumanInput,
+    };
+    let result = if kind == FrameKind::HumanInput {
+        submit(host, stream, kind, payload, None, Some(custody)).await?
+    } else {
+        submit(host, stream, kind, &payload.input, None, Some(custody)).await?
+    };
+    result.ok_or_else(|| {
+        SendFrameError::Encoding("Human input returned a binary-only completion".into())
+    })
+}
+
+pub async fn send_frame_with_custody<T: Serialize>(
+    host: &LocalHostId,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+    custody: Option<crate::recovery::InputCustody>,
+) -> Result<Accepted, SendFrameError> {
+    submit(host, stream, kind, payload, None, custody)
+        .await?
+        .ok_or_else(|| {
+            SendFrameError::Encoding("Text frame returned a binary-only completion".into())
+        })
 }
 
 pub async fn send_binary_frame<T: Serialize>(
@@ -111,15 +233,9 @@ pub async fn send_binary_frame<T: Serialize>(
     payload: &T,
     binary: Vec<u8>,
 ) -> Result<(), SendFrameError> {
-    let seq = current_seq(host, &stream);
-    let sequence_stream = stream.clone();
-    let envelope = Envelope::from_payload(stream, kind, seq, payload)
-        .map_err(|error| SendFrameError::Encoding(error.to_string()))?;
-    crate::bridge::web::send_voice_frame(host, ProtocolFrame { envelope, binary })
+    submit(host, stream, kind, payload, Some(binary), None)
         .await
-        .map_err(SendFrameError::Rejected)?;
-    commit_seq(host, &sequence_stream, seq);
-    Ok(())
+        .map(|_| ())
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

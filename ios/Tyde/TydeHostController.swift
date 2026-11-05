@@ -120,15 +120,22 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     private var presentation: NativePresentation?
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "host")
     private var applyingPresentation = false
-    private var ready = false {
+    private enum DocumentState: String { case loading, live, terminated, recovering, failed }
+    private var documentState = DocumentState.loading {
         didSet {
-            if !ready {
+            guard documentState != oldValue else { return }
+            logger.notice("Native document state=\(self.documentState.rawValue, privacy: .public)")
+            if documentState != .live {
                 for content in Array(roots.values) + Array(detailControllers.values) {
                     content.connectedStatusView?.isHidden = true
                 }
             }
         }
     }
+    private var ready: Bool { documentState == .live }
+    private var loadGeneration: UInt64 = 0
+    private var loadDocument: (() -> Void)?
+    private var documentNavigation: WKNavigation?
     private var lastLayout: NativeLayout?
 
     #if DEBUG
@@ -238,25 +245,94 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         tabs.viewControllers = [navigations[.home]!, navigations[.agents]!, navigations[.sessions]!, navigations[.settings]!]
         showContainer(entry)
         attach(to: entry)
-        Task { @MainActor [weak self] in
-            do {
-                let (url, bridge) = try await Task.detached { try ClientBootstrap.load() }.value
-                guard let self else { return }
-                if !plainWebKitControl {
-                    let bootstrap = "const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
-                    configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        var scriptsInstalled = false
+        loadDocument = { [weak self] in
+            guard let self else { return }
+            self.loadGeneration += 1
+            let generation = self.loadGeneration
+            Task { @MainActor [weak self] in
+                do {
+                    let (url, bridge) = try await Task.detached { try ClientBootstrap.load() }.value
+                    guard let self, self.loadGeneration == generation else { return }
+                    if !scriptsInstalled {
+                        if !plainWebKitControl {
+                            let bootstrap = "const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
+                            configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+                        }
+                        for script in startupScripts { configuration.userContentController.addUserScript(script) }
+                        scriptsInstalled = true
+                    }
+                    #if DEBUG
+                    if plainWebKitControl {
+                        self.webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: Self.plainWebKitDocument(pairing: false))
+                        return
+                    }
+                    #endif
+                    guard let navigation = self.webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)) else {
+                        self.documentFailed("Native client navigation could not start")
+                        return
+                    }
+                    self.documentNavigation = navigation
+                } catch {
+                    guard let self, self.loadGeneration == generation else { return }
+                    self.documentFailed("Native bootstrap could not start")
                 }
-                for script in startupScripts { configuration.userContentController.addUserScript(script) }
-                #if DEBUG
-                if plainWebKitControl {
-                    self.webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: Self.plainWebKitDocument(pairing: false))
-                    return
-                }
-                #endif
-                self.webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
-            } catch { self?.fail("Native bootstrap could not start") }
+            }
         }
+        guard let loadDocument else { documentFailed("Native bootstrap is unavailable"); return }
+        loadDocument()
+        #if DEBUG
+        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardDidChangeFrameNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(observeKeyboardFrame(_:)), name: name, object: nil)
+        }
+        #endif
     }
+
+    func willEnterForeground() {
+        if ready { send(.foreground) }
+    }
+
+    func didBecomeActive() {
+        if documentState == .terminated { recoverDocument() }
+    }
+
+    private func recoverDocument() {
+        guard documentState == .terminated || documentState == .failed else { return }
+        clearFailure()
+        documentState = .recovering
+        platform.suspendClient()
+        lastLayout = nil
+        showContainer(entry)
+        attach(to: entry)
+        webView.isHidden = true
+        guard let loadDocument else { documentFailed("Native recovery is unavailable"); return }
+        loadDocument()
+    }
+
+    private func documentFailed(_ message: String) {
+        documentState = .failed
+        platform.suspendClient()
+        fail(message)
+    }
+
+    private func clearFailure() {
+        failureOverlay?.removeFromSuperview()
+        failureOverlay = nil
+        failureText = nil
+        failureMessages.removeAll()
+    }
+
+    #if DEBUG
+    @objc private func observeKeyboardFrame(_ notification: Notification) {
+        guard navigationDiagnostics != nil else { return }
+        let stage = notification.name == UIResponder.keyboardWillChangeFrameNotification ? "will-change" : "did-change"
+        let frame = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+        let safe = view.safeAreaInsets
+        let content = webView.superview
+        let navigationHidden = navigations[presentation?.tab ?? .home]?.isNavigationBarHidden == true
+        logger.debug("Native keyboard stage=\(stage, privacy: .public) document=\(self.documentState.rawValue, privacy: .public) hostWidth=\(self.view.bounds.width) hostHeight=\(self.view.bounds.height) safeTop=\(safe.top) safeBottom=\(safe.bottom) contentWidth=\(content?.bounds.width ?? 0) contentHeight=\(content?.bounds.height ?? 0) navHidden=\(navigationHidden) keyboardFramePresent=\(frame != nil) keyboardHeight=\(frame?.height ?? 0)")
+    }
+    #endif
 
     #if DEBUG
     private static func plainWebKitDocument(pairing: Bool) -> String {
@@ -418,8 +494,15 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         applyingPresentation = true
         defer { applyingPresentation = false }
         logger.debug("Native projection tab=\(state.tab.rawValue, privacy: .public) route=\(state.route.rawValue, privacy: .public) workspace=\(state.workspace)")
+        guard documentState == .loading || documentState == .recovering || documentState == .live else { return }
         presentation = state
-        ready = state.client_ready
+        guard state.client_ready else {
+            if documentState == .live { documentState = .loading }
+            showContainer(entry)
+            attach(to: entry)
+            return
+        }
+        documentState = .live
         #if DEBUG
         navigationDiagnostics?.record(.projection, window: view.window, state: state, ready: ready)
         let observeApplied = { [self] in
@@ -678,26 +761,52 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         }
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        documentNavigation = navigation
+        if documentState == .live { documentState = .loading }
+        platform.suspendClient()
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard navigation === documentNavigation else { return }
         guard webView.url?.host == ClientBootstrap.origin.host else { fail("Untrusted native document"); return }
-        ready = false
+        if documentState != .recovering { documentState = .loading }
         lastLayout = nil
         platform.beginBootstrap()
+        webView.isHidden = false
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard navigation === documentNavigation else { return }
         webView.evaluateJavaScript("JSON.stringify({secureContext:window.isSecureContext,webCrypto:!!window.crypto?.subtle,indexedDB:!!window.indexedDB,webRTC:typeof RTCPeerConnection==='function',mediaCapture:typeof navigator.mediaDevices?.getUserMedia==='function',audioWorklet:typeof AudioWorkletNode==='function'})") { [weak self] value, error in
+            guard let self, self.documentNavigation === navigation else { return }
             if let value = value as? String, error == nil {
-                self?.logger.notice("Native WebKit capabilities \(value, privacy: .public)")
-            } else { self?.fail("Native platform capability diagnostics failed") }
+                self.logger.notice("Native WebKit capabilities \(value, privacy: .public)")
+            } else { self.fail("Native platform capability diagnostics failed") }
         }
     }
 
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail("Native client navigation failed") }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail("Native client could not load") }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard navigation === documentNavigation else { return }
+        documentFailed("Native client navigation failed")
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard navigation === documentNavigation else { return }
+        documentFailed("Native client could not load")
+    }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        ready = false
-        fail("The web content process ended. Reopen Tyde to reconnect; unsent in-memory changes may be lost.")
+        let interruptedRecovery = documentState == .recovering
+        loadGeneration += 1
+        documentState = .terminated
+        platform.suspendClient()
+        webView.isHidden = true
+        showContainer(entry)
+        attach(to: entry)
+        if interruptedRecovery {
+            documentFailed("The web content process ended during recovery. Retry to reconnect.")
+        } else if view.window?.windowScene?.activationState == .foregroundActive {
+            recoverDocument()
+        }
     }
 
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
@@ -724,13 +833,13 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         text.textColor = .label
         text.text = failureMessages.joined(separator: "\n\n")
         text.accessibilityLabel = "Tyde error"
-        let dismiss = UIButton(configuration: .borderedTinted(), primaryAction: UIAction(title: "Dismiss") { [weak self] _ in
-            self?.failureOverlay?.removeFromSuperview()
-            self?.failureOverlay = nil
-            self?.failureText = nil
-            self?.failureMessages.removeAll()
+        let retry = documentState == .failed
+        let title = retry ? "Retry" : "Dismiss"
+        let dismiss = UIButton(configuration: .borderedTinted(), primaryAction: UIAction(title: title) { [weak self] _ in
+            guard let self else { return }
+            if retry { self.recoverDocument() } else { self.clearFailure() }
         })
-        dismiss.setTitle("Dismiss", for: .normal)
+        dismiss.setTitle(title, for: .normal)
         let panel = UIStackView(arrangedSubviews: [text, dismiss])
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.axis = .vertical

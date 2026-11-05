@@ -17,6 +17,8 @@ pub fn MobileShellErrorBanner() -> impl IntoView {
                 let code_label = format!("{:?}", err.code);
                 let message = err.message.clone();
                 let dismiss_state = state.clone();
+                let retry_state = state.clone();
+                let retry = matches!(state.recovery_status.get(), crate::recovery::RecoveryStatus::Failed | crate::recovery::RecoveryStatus::RestoreFailed);
                 view! {
                     <div
                         class="mobile-shell-error-banner"
@@ -28,6 +30,14 @@ pub fn MobileShellErrorBanner() -> impl IntoView {
                             <span class="mobile-shell-error-code">{code_label.clone()}</span>
                         })}
                         <span class="mobile-shell-error-message">{message}</span>
+                        {retry.then(move || view! {
+                            <button type="button" style="min-width:44px;min-height:44px" data-mobile-test="recovery-retry"
+                                on:click=move |_| {
+                                    let state = retry_state.clone();
+                                    wasm_bindgen_futures::spawn_local(async move { crate::recovery::retry(&state).await; });
+                                }>"Retry"</button>
+                        })}
+                        {(!retry).then(move || view! {
                         <button
                             type="button"
                             class="error-banner-dismiss"
@@ -37,6 +47,7 @@ pub fn MobileShellErrorBanner() -> impl IntoView {
                         >
                             "×"
                         </button>
+                        })}
                     </div>
                 }
             })

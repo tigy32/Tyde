@@ -1912,7 +1912,7 @@ mod wasm_tests {
             "the opened swarm is the one tapped"
         );
         let active_before = state.active_agent.get_untracked();
-        state.chat_input.set("keep this draft".to_owned());
+        state.set_chat_input("keep this draft".to_owned());
         state.swarms_by_host.update(|hosts| {
             hosts.get_mut(&host).unwrap().clear();
         });

@@ -24,7 +24,7 @@ serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-uuid = { version = "1", features = ["v4", "js"] }
+uuid = { version = "1", features = ["v4", "js", "serde"] }
 sha2 = "0.11.0"
 p256 = "0.13"
 base64 = { workspace = true }

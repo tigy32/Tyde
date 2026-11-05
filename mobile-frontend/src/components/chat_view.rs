@@ -335,6 +335,11 @@ pub fn ChatView() -> impl IntoView {
     let s_name = state.clone();
     let agent_name = move || {
         let active = s_name.active_agent.get();
+        let default_heading = if active.is_some() {
+            "Conversation"
+        } else {
+            "New Chat"
+        };
         active
             .and_then(|ar| {
                 s_name.agents.with(|agents| {
@@ -344,7 +349,7 @@ pub fn ChatView() -> impl IntoView {
                         .map(|a| a.name.clone())
                 })
             })
-            .unwrap_or_else(|| "New Chat".to_string())
+            .unwrap_or_else(|| default_heading.to_owned())
     };
 
     let s_backend = state.clone();
@@ -981,6 +986,10 @@ pub fn ChatView() -> impl IntoView {
                     };
 
                     let key = ar.as_agent_ref();
+                    if matches!(s_body.active_host_connection_status(), crate::state::ConnectionStatus::Connected)
+                        && !s_body.agents.with(|agents| agents.iter().any(|agent| agent.agent_ref() == key)) {
+                        return view! { <p role="status" data-mobile-test="recovered-conversation-unavailable">"This conversation is unavailable. Your draft is preserved."</p> }.into_any();
+                    }
                     let messages = s_body.chat_messages.with(|m| {
                         m.get(&key).cloned().unwrap_or_default()
                     });
@@ -2631,7 +2640,7 @@ mod wasm_tests {
             .get_untracked()
             .expect("active agent")
             .as_agent_ref();
-        state.chat_input.set("Apply my correction".to_owned());
+        state.set_chat_input("Apply my correction".to_owned());
         next_tick().await;
         let primary = container
             .query_selector("[data-mobile-test='chat-send']")
@@ -3199,7 +3208,7 @@ mod wasm_tests {
         let mut attached = make_message(MessageSender::User, "Reference");
         attached.message.images = Some(vec![images[1].clone()]);
         state.push_chat_message_entry(&owner, attached);
-        state.chat_input.set("preserved image draft".to_owned());
+        state.set_chat_input("preserved image draft".to_owned());
         let mount_state = state.clone();
         let handle = mount_to(container.clone(), move || {
             provide_context(mount_state);

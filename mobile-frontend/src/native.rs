@@ -163,6 +163,7 @@ pub fn track_unsaved(open: impl Into<Signal<bool>>) {
 
 pub fn can_leave_workspace(state: &AppState) -> bool {
     state.chat_input.get().is_empty()
+        && state.chat_images.get().is_empty()
         && state.pending_submissions.get().is_empty()
         && state.draft_session_settings.get().0.is_empty()
         && state.draft_backend_override.get().is_none()
@@ -237,7 +238,17 @@ pub(crate) fn handle_intent(state: &AppState, intent: NativeIntent) {
             }
         }
         NativeIntent::Foreground => crate::app::page_foreground(state.clone()),
-        NativeIntent::Background => crate::app::page_background(),
+        NativeIntent::Background => {
+            crate::app::page_background();
+            if state.recovery_status.get_untracked() == crate::recovery::RecoveryStatus::Ready {
+                let state = state.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(error) = crate::recovery::commit_current().await {
+                        crate::recovery::report_write_failure(&state, error);
+                    }
+                });
+            }
+        }
         NativeIntent::SendActions => state.chat_send_menu_open.set(true),
         NativeIntent::RenameAgent | NativeIntent::SessionSettings | NativeIntent::CloseAgent => {
             state.native_chat_action.set(Some(intent));
@@ -272,6 +283,7 @@ pub fn open_created_chat(state: &AppState) {
     };
     if state.active_local_host_id.get_untracked().as_ref() != Some(&target.local_host_id)
         || state.chat_draft_id.get_untracked() != target.draft_id
+        || state.chat_edit_id.get_untracked() != target.source_edit_id
         || state.active_agent.get_untracked() != target.source_agent
         || target
             .source_draft
@@ -294,7 +306,15 @@ pub fn open_created_chat(state: &AppState) {
     batch(|| {
         state.native_chat_destination.set(None);
         if target.source_draft.is_some() {
-            state.chat_input.set(String::new());
+            state.set_chat_input(String::new());
+            state.chat_images.set(Vec::new());
+            if target.clears_draft_options {
+                state.draft_backend_override.set(None);
+                state.draft_custom_agent_id.set(None);
+                state
+                    .draft_session_settings
+                    .set(protocol::SessionSettingsValues::default());
+            }
             state.chat_draft_id.set(uuid::Uuid::new_v4());
         }
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
@@ -348,7 +368,7 @@ pub fn open_host(state: &AppState, local_host_id: LocalHostId) {
         }
         if changed {
             state.chat_draft_id.set(uuid::Uuid::new_v4());
-            state.chat_input.set(String::new());
+            state.set_chat_input(String::new());
             state.draft_backend_override.set(None);
             state.draft_custom_agent_id.set(None);
             state
@@ -421,7 +441,10 @@ fn presentation(state: &AppState) -> NativePresentation {
     };
     NativePresentation {
         version: NATIVE_BRIDGE_VERSION,
-        client_ready: true,
+        client_ready: matches!(
+            state.recovery_status.get(),
+            crate::recovery::RecoveryStatus::Disabled | crate::recovery::RecoveryStatus::Ready
+        ),
         workspace: matches!(
             state.app_mode.get(),
             AppMode::Workspace | AppMode::HostPicker

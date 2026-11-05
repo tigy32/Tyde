@@ -142,6 +142,7 @@ pub fn SessionSettingsSheet() -> impl IntoView {
             Some(SettingsTarget::Draft) | None => {
                 // Keep displayed preset values server-owned rather than freezing them as overrides.
                 let previous = untrack(|| change_state.effective_draft_session_settings());
+                change_state.chat_edit_id.set(uuid::Uuid::new_v4());
                 change_state.draft_session_settings.update(|overrides| {
                     for key in previous.0.keys() {
                         if !new_values.0.contains_key(key) {
@@ -892,7 +893,7 @@ mod wasm_tests {
         });
         state.app_mode.set(AppMode::Workspace);
         state.viewing_chat.set(true);
-        state.chat_input.set("unsent draft".to_owned());
+        state.set_chat_input("unsent draft".to_owned());
         state.agent_turn_active.update(|turns| {
             turns.insert(active.as_agent_ref(), true);
         });

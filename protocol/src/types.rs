@@ -3662,7 +3662,7 @@ pub enum AgentLaunchContext {
     HumanChat,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpawnAgentPayload {
     #[serde(default)]
     pub launch_context: AgentLaunchContext,
@@ -3675,7 +3675,7 @@ pub struct SpawnAgentPayload {
     pub params: SpawnAgentParams,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SpawnAgentParams {
     New {

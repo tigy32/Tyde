@@ -42,7 +42,16 @@ pub fn App() -> impl IntoView {
     provide_context(state.clone());
 
     crate::bundle::restore_selection(&state);
-    spawn_local(install_event_listeners(state.clone()));
+    if crate::native::is_native() {
+        crate::recovery::begin(&state);
+        crate::recovery::observe(&state);
+        let recovery_state = state.clone();
+        spawn_local(async move {
+            restore_native_document(recovery_state).await;
+        });
+    } else {
+        spawn_local(install_event_listeners(state.clone()));
+    }
     install_page_visibility_recovery(state.clone());
     install_app_mode_effect(state.clone());
     spawn_boot_pairing_handoff(state.clone());
@@ -51,11 +60,31 @@ pub fn App() -> impl IntoView {
     view! { <AppSurface /> }
 }
 
+pub async fn restore_native_document(state: AppState) {
+    match crate::recovery::restore(&state).await {
+        Ok(()) => {
+            state.mobile_shell_error.update(|error| {
+                if error
+                    .as_ref()
+                    .is_some_and(|error| error.code == MobileAccessErrorCode::StoreLoadFailed)
+                {
+                    *error = None;
+                }
+            });
+            install_event_listeners(state).await;
+        }
+        Err(error) => crate::recovery::report_restore_failure(&state, error),
+    }
+}
+
 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
 #[component]
 pub fn FixtureApp() -> impl IntoView {
     let state = AppState::new();
     crate::fixtures::seed_state(&state);
+    if crate::fixtures::fixture_name() == "recovery" {
+        crate::fixtures::install_recovery(&state);
+    }
     provide_context(state);
 
     view! { <AppSurface /> }
@@ -2125,6 +2154,34 @@ mod wasm_tests {
             composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
             composer.set_selection_range(2, 7).unwrap();
             let photo = find("[data-mobile-test='chat-photo-tray'] img")?;
+            let saved_hosts = state.paired_hosts.get_untracked();
+            state.paired_hosts.update(|hosts| hosts.push(fixture_host("native-photo-other", "Other host")));
+            let saved_text = state.chat_input.get_untracked();
+            let saved_backend = state.draft_backend_override.get_untracked();
+            state.set_chat_input(String::new());
+            state.draft_backend_override.set(None);
+            navigate(NativeIntent::Home)?;
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            find("[data-mobile-test='paired-host-open'][aria-label^='Open Other host,']")?
+                .dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            check(state.active_local_host_id.get_untracked().as_ref() == Some(&host_id)
+                && state.chat_images.get_untracked().len() == 1
+                && find("[data-mobile-test='mobile-shell-error-banner']")?.text_content().unwrap_or_default()
+                    .contains("Finish or save your current work"),
+                "A photo-only draft blocks a real other-host Open without moving its attachment")?;
+            state.mobile_shell_error.set(None);
+            state.paired_hosts.set(saved_hosts);
+            state.set_chat_input(saved_text);
+            state.draft_backend_override.set(saved_backend);
+            navigate(NativeIntent::Back)?;
+            navigate(NativeIntent::Agents)?;
+            next_tick().await;
+            // The photo-only probe deliberately replaced the field value; set
+            // the baseline selection again before measuring navigation retention.
+            composer.set_selection_range(2, 7).unwrap();
+
             state.draft_custom_agent_id.set(Some(protocol::CustomAgentId("retained-native-custom".into())));
             state.draft_session_settings.set(protocol::SessionSettingsValues(
                 [("model".into(), protocol::SessionSettingValue::String("retained-native-model".into()))].into_iter().collect()));
@@ -2677,6 +2734,37 @@ mod wasm_tests {
                 &format!("Only the matching server NewAgent commits the Sessions chat destination: tab={:?}, route={:?}, title_matches={}, pending={}",
                     resumed_projection.tab, resumed_projection.route, resumed_projection.title == "resumed-chat",
                     state.native_chat_destination.get_untracked().is_some()))?;
+            let retry_owner = state.active_agent.get_untracked().ok_or("Missing current conversation")?;
+            let retry_draft = "A newer draft must survive the older retry";
+            current_composer.set_value(retry_draft);
+            current_composer.dispatch_event(&web_sys::Event::new("input").unwrap()).unwrap();
+            let retry_edit = state.chat_edit_id.get_untracked();
+            state.active_connection_instance_ids.update(|ids| { ids.insert(host_id.clone(), bridge::TEST_CONNECTION_INSTANCE_ID); });
+            state.hold_submission(crate::state::PendingSubmission {
+                human_input_id: protocol::HumanInputId(uuid::Uuid::new_v4().to_string()), failure_reason: None,
+                action: protocol::HumanInputAction::Send, local_submission_id: bridge::LocalSubmissionId(800_000),
+                origin: state.mint_submission_origin(), local_host_id: host_id.clone(), connection_instance_id: None,
+                spawn_payload: Some(protocol::SpawnAgentPayload { launch_context: protocol::AgentLaunchContext::HumanChat,
+                    name: None, custom_agent_id: None, parent_agent_id: None, project_id: None,
+                    params: protocol::SpawnAgentParams::Fork { from_session_id: resumed.session_id.clone().ok_or("Missing original session")?, prompt: "Older held request".into(), images: None, access_mode: None } }),
+                target: crate::state::SubmissionTarget::NewChat,
+                text: "Older held request".into(), images: Vec::new(), tool_response: None,
+                state: crate::state::PendingSubmissionState::DeliveryUnknown,
+            });
+            next_tick().await;
+            find("[data-mobile-test='pending-submission-resend']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let retry_frame = bridge::test_sent_lines().into_iter().filter_map(|line| serde_json::from_str::<protocol::Envelope>(&line).ok())
+                .filter(|frame| frame.kind == FrameKind::SpawnAgent).next_back().ok_or("Retry did not cross the protocol boundary")?;
+            check(state.native_chat_destination.get_untracked().is_none(), "An older retry does not own the newer composer or its navigation")?;
+            let retry_agent = fixture_user_agent("retry-published", "retry-published-session");
+            dispatch_envelope(&state, &host_id, protocol::Envelope::from_payload(retry_frame.stream, FrameKind::AgentStart, 0,
+                &serde_json::from_value::<protocol::AgentStartPayload>(serde_json::to_value(&retry_agent).unwrap()).unwrap()).unwrap());
+            dispatch_envelope(&state, &host_id, protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 6, &retry_agent).unwrap());
+            next_tick().await;
+            check(state.active_agent.get_untracked() == Some(retry_owner) && current_composer.value() == retry_draft
+                && state.chat_edit_id.get_untracked() == retry_edit,
+                "Publishing the older retry cannot navigate away or erase the newer draft")?;
             dispatch_envelope(&state, &host_id,
                 protocol::Envelope::from_payload(resumed.instance_stream.clone(), FrameKind::AgentActivityStats, 0,
                     &protocol::AgentActivityStatsPayload {
@@ -2691,7 +2779,7 @@ mod wasm_tests {
                 context.get_bounding_client_rect().height() > 0.0,
                 "Native content retains visible accessible server context occupancy")?;
             dispatch_envelope(&state, &host_id,
-                protocol::Envelope::from_payload(host_stream, FrameKind::Welcome, 6,
+                protocol::Envelope::from_payload(host_stream, FrameKind::Welcome, 7,
                     &protocol::WelcomePayload {
  mobile_client_bootstrap: None,
                         protocol_version: protocol::PROTOCOL_VERSION, tyde_version: protocol::TYDE_VERSION,
@@ -2825,7 +2913,7 @@ mod wasm_tests {
         state.host_streams.update(|m| {
             m.insert(host.clone(), stream.clone());
         });
-        state.chat_input.set("unsent draft".into());
+        state.set_chat_input("unsent draft".into());
         let container = make_container();
         let mounted_state = state.clone();
         let handle = mount_to(container.clone(), move || {
@@ -2917,7 +3005,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(loader_owns_target(&host.0, "0.9.4-beta.12"));
         state.viewing_chat.set(true);
-        state.chat_input.set(String::new());
+        state.set_chat_input(String::new());
         next_tick().await;
         assert_eq!(
             loader_preparations(),
@@ -2941,7 +3029,8 @@ mod wasm_tests {
             local_submission_id: bridge::LocalSubmissionId(9999),
             origin: state.mint_submission_origin(),
             local_host_id: host.clone(),
-            connection_instance_id: 17,
+            connection_instance_id: Some(17),
+            spawn_payload: None,
             target: crate::state::SubmissionTarget::NewChat,
             text: "pending fixture".into(),
             images: Vec::new(),
@@ -2995,7 +3084,7 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(loader_preparations(), 3, "deliberate A > B > A is allowed");
         // A new draft can race the promise completion before effects flush.
-        state.chat_input.set("new unsent draft".into());
+        state.set_chat_input("new unsent draft".into());
         finish_loader_prepare(2, "");
         next_tick().await;
         assert_eq!(loader_reloads(), 0);
@@ -3003,7 +3092,7 @@ mod wasm_tests {
             state.chat_input.get_untracked() == "new unsent draft",
             "new draft is retained"
         );
-        state.chat_input.set(String::new());
+        state.set_chat_input(String::new());
         next_tick().await;
         assert_eq!(loader_preparations(), 4);
         apply_disconnect(&state, &host, None);
@@ -3337,6 +3426,8 @@ mod wasm_tests {
                         source_agent: state.active_agent.get_untracked(),
                         created_agent: None,
                         source_draft: Some(state.chat_input.get_untracked()),
+                        source_edit_id: state.chat_edit_id.get_untracked(),
+                        clears_draft_options: false,
                     }));
                 state
                     .draft_backend_override
@@ -3531,8 +3622,20 @@ mod wasm_tests {
                     if state.active_local_host_id.get_untracked().as_ref() != Some(&created.local_host_id) || !previous_composer.is_connected() || state.chat_input.get_untracked().is_empty() {
                         return Err("A host switch must not erase an unsent mounted draft before loader safety is evaluated".into());
                     }
+                    // Resume now retains local request custody too. Settle its real
+                    // transport boundary before asserting that an otherwise empty host can leave.
+                    let outcomes = listen_submission_outcomes(&state).await.map_err(|_| "Could not install transport outcome listener")?;
+                    let resume = state.pending_submissions.get_untracked().into_values()
+                        .find(|record| record.local_host_id == created.local_host_id
+                            && record.spawn_payload.as_ref().is_some_and(|payload|
+                                matches!(payload.params, protocol::SpawnAgentParams::Resume { .. })))
+                        .ok_or("The accepted Resume must retain its input holder")?;
+                    bridge::test_emit_send_outcome(&created.local_host_id, resume.local_submission_id.0 as usize,
+                        bridge::SubmissionTransportOutcome::TransportAcknowledged);
+                    next_tick().await;
+                    outcomes.remove();
                     // Explicitly finish/discard this fixture's owned draft before exercising the original cross-host routing guarantee.
-                    state.chat_input.set(String::new());
+                    state.set_chat_input(String::new());
                     state.draft_session_settings.set(Default::default());
                     state.draft_backend_override.set(None);
                     state.draft_custom_agent_id.set(None);
@@ -3572,6 +3675,18 @@ mod wasm_tests {
                     if sent.len() != 1 || sent[0].parse_payload::<protocol::SpawnAgentPayload>().unwrap().project_id.is_some() {
                         return Err("Resume must send through the selected host's real protocol seam without a different host's project".into());
                     }
+                    // The capture transport needs its explicit acknowledgement;
+                    // an unresolved Resume is intentionally not idle-safe work.
+                    let outcomes = listen_submission_outcomes(&state).await.map_err(|_| "Could not install resume outcome listener")?;
+                    let resume = state.pending_submissions.get_untracked().into_values()
+                        .find(|record| record.local_host_id == old.local_host_id
+                            && record.spawn_payload.as_ref().is_some_and(|payload|
+                                matches!(payload.params, protocol::SpawnAgentParams::Resume { .. })))
+                        .ok_or("The second accepted Resume must retain its input holder")?;
+                    bridge::test_emit_send_outcome(&old.local_host_id, resume.local_submission_id.0 as usize,
+                        bridge::SubmissionTransportOutcome::TransportAcknowledged);
+                    next_tick().await;
+                    outcomes.remove();
                     intent(NativeIntent::Agents);
                     next_tick().await;
                     if state.viewing_chat.get_untracked() || container.query_selector("[data-mobile-test='chat-input']").unwrap()
@@ -4120,7 +4235,7 @@ mod wasm_tests {
         }
         state.app_mode.set(AppMode::Workspace);
         state.viewing_chat.set(true);
-        state.chat_input.set("preserved draft".to_owned());
+        state.set_chat_input("preserved draft".to_owned());
         let state_for_mount = state.clone();
         let mount = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
@@ -5774,7 +5889,8 @@ mod wasm_tests {
             local_submission_id: crate::bridge::LocalSubmissionId(99),
             origin: discarded,
             local_host_id: host.clone(),
-            connection_instance_id: 7,
+            connection_instance_id: Some(7),
+            spawn_payload: None,
             target: crate::state::SubmissionTarget::NewChat,
             text: "thrown away".to_owned(),
             images: Vec::new(),
@@ -5795,7 +5911,8 @@ mod wasm_tests {
             local_submission_id: crate::bridge::LocalSubmissionId(1),
             origin: state.mint_submission_origin(),
             local_host_id: host.clone(),
-            connection_instance_id: 7,
+            connection_instance_id: Some(7),
+            spawn_payload: None,
             target: crate::state::SubmissionTarget::NewChat,
             text: "do not lose me".to_owned(),
             images: Vec::new(),

@@ -45,7 +45,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) { host?.send(.background) }
-    func sceneWillEnterForeground(_ scene: UIScene) { host?.send(.foreground) }
+    func sceneWillEnterForeground(_ scene: UIScene) { host?.willEnterForeground() }
+    func sceneDidBecomeActive(_ scene: UIScene) { host?.didBecomeActive() }
 }
 
 #if DEBUG

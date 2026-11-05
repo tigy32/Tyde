@@ -17,13 +17,16 @@ use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
+use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransaction, IdbTransactionMode};
 
 const DB_NAME: &str = "tyde-mobile";
 const DB_VERSION: u32 = 1;
 
 pub const STORE_HOSTS: &str = "paired_hosts";
 pub const STORE_PSK: &str = "psk";
+// The immutable loader opens schema1. A separate key namespace preserves it.
+pub const STORE_RECOVERY: &str = STORE_HOSTS;
+pub const RECOVERY_KEY_PREFIX: &str = "input-recovery:";
 
 fn jserr(value: JsValue) -> String {
     value
@@ -180,18 +183,7 @@ pub async fn put(store: &str, key: &str, value: &str) -> Result<(), String> {
         )
         .await;
     }
-    let db = open_db().await?;
-    let connection = DatabaseConnection(db.clone());
-    let tx = db
-        .transaction_with_str_and_mode(store, IdbTransactionMode::Readwrite)
-        .map_err(jserr)?;
-    let object_store = tx.object_store(store).map_err(jserr)?;
-    let request = object_store
-        .put_with_key(&JsValue::from_str(value), &JsValue::from_str(key))
-        .map_err(jserr)?;
-    await_request(request).await?;
-    drop(connection);
-    Ok(())
+    write(store, key, Some(value)).await
 }
 
 pub async fn delete(store: &str, key: &str) -> Result<(), String> {
@@ -202,16 +194,91 @@ pub async fn delete(store: &str, key: &str) -> Result<(), String> {
         )
         .await;
     }
+    write(store, key, None).await
+}
+
+struct TransactionListeners {
+    transaction: IdbTransaction,
+    complete: Option<Closure<dyn FnMut()>>,
+    abort: Option<Closure<dyn FnMut()>>,
+}
+
+impl Drop for TransactionListeners {
+    fn drop(&mut self) {
+        self.transaction.set_oncomplete(None);
+        self.transaction.set_onabort(None);
+        drop(self.complete.take());
+        drop(self.abort.take());
+    }
+}
+
+async fn write(store: &str, key: &str, value: Option<&str>) -> Result<(), String> {
     let db = open_db().await?;
     let connection = DatabaseConnection(db.clone());
     let tx = db
         .transaction_with_str_and_mode(store, IdbTransactionMode::Readwrite)
         .map_err(jserr)?;
-    let object_store = tx.object_store(store).map_err(jserr)?;
-    let request = object_store
-        .delete(&JsValue::from_str(key))
-        .map_err(jserr)?;
-    await_request(request).await?;
+    let (sender, receiver) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let sender = Rc::new(RefCell::new(Some(sender)));
+    let completed = sender.clone();
+    let complete = Closure::<dyn FnMut()>::new(move || {
+        if let Some(sender) = completed.borrow_mut().take() {
+            let _ = sender.send(Ok(()));
+        }
+    });
+    let failed = sender;
+    let abort = Closure::<dyn FnMut()>::new(move || {
+        if let Some(sender) = failed.borrow_mut().take() {
+            let _ = sender.send(Err(
+                "IndexedDB transaction aborted; input was not committed".into(),
+            ));
+        }
+    });
+    tx.set_oncomplete(Some(complete.as_ref().unchecked_ref()));
+    tx.set_onabort(Some(abort.as_ref().unchecked_ref()));
+    let listeners = TransactionListeners {
+        transaction: tx.clone(),
+        complete: Some(complete),
+        abort: Some(abort),
+    };
+    let object = tx.object_store(store).map_err(jserr)?;
+    let key = JsValue::from_str(key);
+    match value {
+        Some(value) => object
+            .put_with_key(&JsValue::from_str(value), &key)
+            .map_err(jserr)?,
+        None => object.delete(&key).map_err(jserr)?,
+    };
+    receiver
+        .await
+        .map_err(|_| "IndexedDB transaction completion was lost".to_owned())??;
+    drop(listeners);
     drop(connection);
     Ok(())
+}
+
+pub async fn keys(store: &str) -> Result<Vec<String>, String> {
+    let db = open_db().await?;
+    let connection = DatabaseConnection(db.clone());
+    let tx = db
+        .transaction_with_str_and_mode(store, IdbTransactionMode::Readonly)
+        .map_err(jserr)?;
+    let request = tx
+        .object_store(store)
+        .map_err(jserr)?
+        .get_all_keys()
+        .map_err(jserr)?;
+    let result = await_request(request).await?;
+    let array = result
+        .dyn_into::<js_sys::Array>()
+        .map_err(|_| "IndexedDB keys were not an array")?;
+    let keys = array
+        .iter()
+        .map(|key| {
+            key.as_string()
+                .ok_or_else(|| "Input recovery key was not a string".to_owned())
+        })
+        .collect();
+    drop(connection);
+    keys
 }

@@ -355,10 +355,17 @@ async fn resume_session(
         },
     };
 
-    crate::actions::spawn_chat(state, host_id, host_stream, &payload, true)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    crate::actions::spawn_chat(
+        state,
+        host_id,
+        host_stream,
+        &payload,
+        crate::actions::SpawnChatNavigation::Navigate,
+        None,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 async fn delete_session(

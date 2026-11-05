@@ -7,39 +7,63 @@ use crate::state::{
     AgentRef, AppState, HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectDiffState,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpawnChatNavigation {
+    Navigate,
+    Background,
+}
+
 pub async fn spawn_chat(
     state: &AppState,
     host: &LocalHostId,
     host_stream: protocol::StreamPath,
     payload: &protocol::SpawnAgentPayload,
-    separate_composer: bool,
+    navigation: SpawnChatNavigation,
+    custody: Option<crate::recovery::InputCustody>,
 ) -> Result<Accepted, SendFrameError> {
     let stream = if crate::native::is_native() {
         let stream = host_stream
             .spawn_child(uuid::Uuid::new_v4())
             .map_err(|e| SendFrameError::Encoding(e.to_string()))?;
-        state
-            .native_chat_destination
-            .set(Some(crate::state::NativeChatDestination {
-                local_host_id: host.clone(),
-                stream: stream.clone(),
-                tab: state.active_tab.get_untracked(),
-                draft_id: state.chat_draft_id.get_untracked(),
-                source_agent: state.active_agent.get_untracked(),
-                created_agent: None,
-                source_draft: separate_composer.then(|| state.chat_input.get_untracked()),
-            }));
+        if navigation != SpawnChatNavigation::Background {
+            let draft = custody.as_ref().and_then(|input| input.draft.as_ref());
+            state
+                .native_chat_destination
+                .set(Some(crate::state::NativeChatDestination {
+                    local_host_id: host.clone(),
+                    stream: stream.clone(),
+                    tab: state.active_tab.get_untracked(),
+                    draft_id: draft.map_or_else(
+                        || state.chat_draft_id.get_untracked(),
+                        |draft| draft.draft_id,
+                    ),
+                    source_agent: draft.map_or_else(
+                        || state.active_agent.get_untracked(),
+                        |draft| draft.agent.clone(),
+                    ),
+                    created_agent: None,
+                    source_draft: draft.map(|draft| draft.text.clone()),
+                    source_edit_id: draft
+                        .map_or_else(|| state.chat_edit_id.get_untracked(), |draft| draft.edit_id),
+                    clears_draft_options: draft.is_some()
+                        && matches!(payload.params, protocol::SpawnAgentParams::New { .. }),
+                }));
+        }
         stream
     } else {
         host_stream
     };
-    let result = send_frame(
+    let result = crate::send::send_frame_with_custody(
         host,
         stream.clone(),
         protocol::FrameKind::SpawnAgent,
         payload,
+        custody,
     )
     .await;
+    if let Ok(accepted) = &result {
+        crate::recovery::hold_spawn(state, host, *accepted, payload);
+    }
     if result.is_err()
         && state
             .native_chat_destination
@@ -56,6 +80,7 @@ pub async fn spawn_new_chat(
     state: &AppState,
     message: String,
     images: Vec<protocol::ImageData>,
+    custody: crate::recovery::InputCustody,
 ) -> Result<Accepted, SendFrameError> {
     let host = state
         .active_local_host_id
@@ -156,13 +181,15 @@ pub async fn spawn_new_chat(
         },
     };
 
-    let accepted = spawn_chat(state, &host, host_stream, &payload, false).await?;
-
-    state.draft_backend_override.set(None);
-    state.draft_custom_agent_id.set(None);
-    state
-        .draft_session_settings
-        .set(protocol::SessionSettingsValues::default());
+    let accepted = spawn_chat(
+        state,
+        &host,
+        host_stream,
+        &payload,
+        SpawnChatNavigation::Navigate,
+        Some(custody),
+    )
+    .await?;
 
     Ok(accepted)
 }
@@ -178,6 +205,7 @@ pub async fn spawn_side_question(
     state: &AppState,
     prompt: String,
     images: Vec<protocol::ImageData>,
+    custody: crate::recovery::InputCustody,
 ) -> Result<Accepted, SendFrameError> {
     let prompt = prompt.trim().to_owned();
     if prompt.is_empty() && images.is_empty() {
@@ -227,7 +255,15 @@ pub async fn spawn_side_question(
         },
     };
 
-    spawn_chat(state, &host, host_stream, &payload, true).await
+    spawn_chat(
+        state,
+        &host,
+        host_stream,
+        &payload,
+        SpawnChatNavigation::Navigate,
+        Some(custody),
+    )
+    .await
 }
 
 /// Locate the agent's `instance_stream` so an outbound frame can be sent
@@ -463,7 +499,8 @@ pub fn open_new_chat(state: &AppState) {
     state.chat_draft_id.set(uuid::Uuid::new_v4());
     state.project_picker_open.set(false);
     state.active_agent.set(None);
-    state.chat_input.set(String::new());
+    state.set_chat_input(String::new());
+    state.chat_images.set(Vec::new());
     state.show_chat();
 }
 

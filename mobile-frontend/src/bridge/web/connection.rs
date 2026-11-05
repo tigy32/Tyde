@@ -357,6 +357,17 @@ pub fn manager() -> ConnectionManager {
 }
 
 impl ConnectionManager {
+    pub(crate) fn reserve_recovered_submission_ids(&self, next: u64) {
+        let mut inner = self.inner.borrow_mut();
+        inner.next_local_submission_id = inner.next_local_submission_id.max(next);
+    }
+    pub(crate) fn reserve_unsent_submission_id(&self, minimum: u64) -> LocalSubmissionId {
+        let mut inner = self.inner.borrow_mut();
+        let id = inner.next_local_submission_id.max(minimum);
+        inner.next_local_submission_id = id + 1;
+        LocalSubmissionId(id)
+    }
+
     pub async fn connect(&self, local_host_id: LocalHostId) -> Result<(), String> {
         if self.inner.borrow().active.contains_key(&local_host_id) {
             return Ok(());
@@ -437,6 +448,7 @@ impl ConnectionManager {
         &self,
         local_host_id: LocalHostId,
         line: String,
+        custody: Option<crate::recovery::InputCustody>,
     ) -> Result<Accepted, SendRejected> {
         #[cfg(all(test, target_arch = "wasm32"))]
         if let Some(action) = test_send_action(&line) {
@@ -469,6 +481,21 @@ impl ConnectionManager {
             inner.next_local_submission_id = inner.next_local_submission_id.wrapping_add(1);
             (tx, connection_instance_id, local_submission_id)
         };
+        let accepted = Accepted {
+            connection_instance_id,
+            local_submission_id,
+        };
+        crate::recovery::prepare_transport(&local_host_id, &line, accepted, custody).await?;
+        let still_current = self
+            .inner
+            .borrow()
+            .active
+            .get(&local_host_id)
+            .is_some_and(|active| active.connection_instance_id == Some(connection_instance_id));
+        if !still_current {
+            crate::recovery::reject_prepared(accepted).await;
+            return Err(SendRejected::ConnectionClosed);
+        }
         match tx.try_send(ConnectionCommand::SendLine {
             line,
             connection_instance_id,
@@ -493,6 +520,7 @@ impl ConnectionManager {
                 })
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::recovery::reject_prepared(accepted).await;
                 log::warn!(
                     "mobile_send_rejected host={local_host_id} reason={:?} queue_depth={CONNECTION_CHANNEL_CAPACITY}",
                     SendRejected::QueueFull
@@ -500,6 +528,7 @@ impl ConnectionManager {
                 Err(SendRejected::QueueFull)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                crate::recovery::reject_prepared(accepted).await;
                 log::warn!(
                     "mobile_send_rejected host={local_host_id} reason={:?} queue_depth=0",
                     SendRejected::ConnectionClosed

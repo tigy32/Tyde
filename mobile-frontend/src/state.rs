@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::bridge::{LocalSubmissionId, SubmissionTransportOutcome};
 pub use mobile_shell_types::{
@@ -178,7 +179,7 @@ pub fn connection_failed_status(code: MobileAccessErrorCode, message: String) ->
 ///
 /// This is **not** correlation with any server event. It never goes on the wire.
 /// It is a UI identity, and it says nothing about what the host did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SubmissionOriginId(pub u64);
 
 /// Why a submission's record left the pending store *without* the transport
@@ -240,7 +241,7 @@ const IMPLAUSIBLE_WITHDRAWAL_COUNT: usize = 4096;
 /// A new-chat submission has **no agent**: the agent does not exist yet, and
 /// guessing which `NewAgent` is "ours" is exactly the inference this model
 /// bans. New-chat recovery is therefore host-scoped, never agent-scoped.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SubmissionTarget {
     /// Spawns a new agent. No agent ownership is known or guessed.
     NewChat,
@@ -253,7 +254,7 @@ pub enum SubmissionTarget {
 ///
 /// Neither a socket acknowledgement nor a pending record claims actor admission.
 /// Atomic human input retains custody until its typed server outcome arrives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingSubmissionState {
     /// Admitted to this connection's bounded outbound queue. Held **silently** —
     /// no banner, no artifact, no announcement. The happy path is
@@ -284,10 +285,10 @@ impl PendingSubmissionState {
 /// the composer used to be cleared *before* the send was awaited, so a send
 /// that never settled destroyed the text with no error and no holder.
 ///
-/// In-memory and non-persistent by design: this is client-originated input, not
-/// a mirror of server state. A page reload drops it, exactly as an unsent
-/// composer draft has always been dropped.
-#[derive(Clone, Debug, PartialEq)]
+/// Local user-input custody, never server state. The recovery journal commits
+/// it before transmission; a new document surfaces unresolved custody without
+/// replaying it or treating the old connection instance as live.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubmission {
     pub human_input_id: protocol::HumanInputId,
     pub failure_reason: Option<String>,
@@ -301,7 +302,9 @@ pub struct PendingSubmission {
     /// The connection instance that admitted the frame. A transport outcome
     /// reported by a *different* instance can never mutate this record, and a
     /// uncertain resend requires a new connection; explicit actor refusal does not.
-    pub connection_instance_id: u64,
+    #[serde(skip)]
+    pub connection_instance_id: Option<u64>,
+    pub spawn_payload: Option<protocol::SpawnAgentPayload>,
     pub target: SubmissionTarget,
     pub text: String,
     pub images: Vec<protocol::ImageData>,
@@ -341,6 +344,17 @@ impl PendingSubmission {
     /// recover through **Send again** or **Discard**.
     pub fn is_editable_in_composer(&self) -> bool {
         self.tool_response.is_none()
+            && matches!(
+                (&self.target, &self.spawn_payload),
+                (SubmissionTarget::Agent(_), _)
+                    | (
+                        SubmissionTarget::NewChat,
+                        Some(protocol::SpawnAgentPayload {
+                            params: protocol::SpawnAgentParams::New { .. },
+                            ..
+                        })
+                    )
+            )
     }
 
     /// What to show the user for this record.
@@ -351,6 +365,13 @@ impl PendingSubmission {
     pub fn display_text(&self) -> String {
         if !self.text.trim().is_empty() {
             return self.text.clone();
+        }
+        if let Some(payload) = &self.spawn_payload {
+            return match payload.params {
+                protocol::SpawnAgentParams::Resume { .. } => "Resume conversation".into(),
+                protocol::SpawnAgentParams::Fork { .. } => "Fork conversation".into(),
+                protocol::SpawnAgentParams::New { .. } => "Start conversation".into(),
+            };
         }
         match &self.tool_response {
             Some(protocol::SendMessageToolResponse::AskUserQuestion { answer, .. }) => {
@@ -378,7 +399,7 @@ impl PendingSubmission {
     pub fn can_resend_on(&self, current_connection_instance_id: Option<u64>) -> bool {
         match current_connection_instance_id {
             Some(current) => {
-                current != self.connection_instance_id
+                self.connection_instance_id != Some(current)
                     || (self.state == PendingSubmissionState::NotSent
                         && self.failure_reason.is_some())
             }
@@ -529,13 +550,13 @@ pub enum AppMode {
 /// Composite key for per-agent state (chat, tasks, streaming, etc).
 /// Combines `LocalHostId` with `AgentId` so two paired hosts that happen to
 /// generate colliding agent identifiers stay isolated.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentRef {
     pub local_host_id: LocalHostId,
     pub agent_id: AgentId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActiveProjectRef {
     pub local_host_id: LocalHostId,
     pub project_id: ProjectId,
@@ -630,7 +651,7 @@ pub struct ReviewRef {
     pub review_id: ReviewId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveAgentRef {
     pub local_host_id: LocalHostId,
     pub agent_id: AgentId,
@@ -876,7 +897,7 @@ pub struct HostBrowseSession {
 
 // ── Navigation ─────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, Serialize, Deserialize)]
 pub enum MobileTab {
     Home,
     Agents,
@@ -967,6 +988,8 @@ pub struct NativeChatDestination {
     pub source_agent: Option<ActiveAgentRef>,
     pub created_agent: Option<AgentId>,
     pub source_draft: Option<String>,
+    pub source_edit_id: uuid::Uuid,
+    pub clears_draft_options: bool,
 }
 
 #[derive(Clone)]
@@ -1029,6 +1052,7 @@ pub struct AppState {
     pub chat_origin_tab: RwSignal<MobileTab>,
     pub chat_back_stack: RwSignal<Vec<ActiveAgentRef>>,
     pub chat_draft_id: RwSignal<uuid::Uuid>,
+    pub chat_edit_id: RwSignal<uuid::Uuid>,
     pub native_layout: RwSignal<mobile_shell_types::native::NativeLayout>,
     pub native_sidebar_open: RwSignal<bool>,
     pub native_modal_sources: RwSignal<Vec<Signal<bool>>>,
@@ -1102,6 +1126,8 @@ pub struct AppState {
     pub session_history: RwSignal<HashMap<AgentRef, SessionHistoryState>>,
     pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
     pub chat_input: RwSignal<String>,
+    pub chat_images: RwSignal<Vec<PendingImage>>,
+    pub recovery_status: RwSignal<crate::recovery::RecoveryStatus>,
     /// Outbound submissions the client is holding on the user's behalf, keyed by
     /// the connection layer's [`LocalSubmissionId`] — one entry per *transport
     /// attempt*. Bounded, in-memory, and non-persistent. Records are held silently
@@ -1140,7 +1166,7 @@ pub struct AppState {
     /// the truth.
     pub withdrawn_submissions: RwSignal<HashMap<SubmissionOriginId, WithdrawnSubmission>>,
     /// Monotonic source of [`SubmissionOriginId`]s. Client-local; never on the wire.
-    next_submission_origin: RwSignal<u64>,
+    pub(crate) next_submission_origin: RwSignal<u64>,
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
     pub native_goals: RwSignal<HashMap<AgentRef, protocol::NativeGoal>>,
     pub goal_capabilities: RwSignal<HashMap<AgentRef, protocol::GoalCapabilities>>,
@@ -1246,6 +1272,13 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn set_chat_input(&self, text: String) {
+        batch(|| {
+            self.chat_edit_id.set(uuid::Uuid::new_v4());
+            self.chat_input.set(text);
+        });
+    }
+
     pub fn show_chat(&self) {
         self.enter_chat(Vec::new());
     }
@@ -1368,6 +1401,7 @@ impl AppState {
             chat_origin_tab: RwSignal::new(MobileTab::Home),
             chat_back_stack: RwSignal::new(Vec::new()),
             chat_draft_id: RwSignal::new(uuid::Uuid::new_v4()),
+            chat_edit_id: RwSignal::new(uuid::Uuid::new_v4()),
             native_layout: RwSignal::new(mobile_shell_types::native::NativeLayout::Compact),
             native_sidebar_open: RwSignal::new(true),
             native_modal_sources: RwSignal::new(Vec::new()),
@@ -1405,6 +1439,8 @@ impl AppState {
             session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
+            chat_images: RwSignal::new(Vec::new()),
+            recovery_status: RwSignal::new(crate::recovery::RecoveryStatus::Disabled),
             pending_submissions: RwSignal::new(HashMap::new()),
             in_flight_human_admissions: RwSignal::new(HashMap::new()),
             withdrawn_submissions: RwSignal::new(HashMap::new()),
@@ -1705,6 +1741,9 @@ impl AppState {
     /// Records retire on transport/server admission, explicit withdrawal, or
     /// forgetting their host.
     pub fn hold_submission(&self, submission: PendingSubmission) {
+        let Some(submission) = crate::recovery::finish_admission(self, submission) else {
+            return;
+        };
         let admission = match &submission.target {
             SubmissionTarget::Agent(agent)
                 if submission.action == protocol::HumanInputAction::InterruptAndSend =>
@@ -1844,14 +1883,8 @@ impl AppState {
                 // Already discarded by the user, or retired. Not an error.
                 return;
             };
-            if record.connection_instance_id != connection_instance_id {
-                log::warn!(
-                    "submission outcome for foreign connection instance \
-                     local_submission_id={} record_instance={} \
-                     outcome_instance={connection_instance_id}",
-                    local_submission_id.0,
-                    record.connection_instance_id
-                );
+            if record.connection_instance_id != Some(connection_instance_id) {
+                log::warn!("Ignoring a submission outcome outside its current connection");
                 return;
             }
             if record.failure_reason.is_some() {
@@ -2497,4 +2530,11 @@ impl AppState {
             drafts.retain(|(owner, _), _| owner != agent_ref);
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingImage {
+    pub name: String,
+    pub media_type: String,
+    pub data: String,
 }

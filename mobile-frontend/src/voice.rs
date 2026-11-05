@@ -1427,7 +1427,7 @@ mod wasm_tests {
     async fn dictation_replaces_partials_and_appends_only_after_finish() {
         let container = container();
         let state = AppState::new();
-        state.chat_input.set("existing draft".to_owned());
+        state.set_chat_input("existing draft".to_owned());
         state.voice_ui.set(MobileVoiceState::Active {
             generation: 7,
             host: LocalHostId("dictation-host".to_owned()),
@@ -1473,7 +1473,7 @@ mod wasm_tests {
         assert_eq!(state.chat_input.get_untracked(), "existing draft");
 
         handle_control(&state, &host, &transcript("provider final", true));
-        state.chat_input.set("concurrent edit".to_owned());
+        state.set_chat_input("concurrent edit".to_owned());
         let stop_envelope = Envelope::from_payload(
             StreamPath("/voice/dictation-session".to_owned()),
             FrameKind::VoiceStop,
@@ -1498,7 +1498,7 @@ mod wasm_tests {
                 .with_untracked(|messages| messages.is_empty())
         );
 
-        state.chat_input.set("cancelled draft".to_owned());
+        state.set_chat_input("cancelled draft".to_owned());
         state.voice_ui.set(MobileVoiceState::Active {
             generation: 8,
             host,

@@ -74,6 +74,7 @@ fn safe_to_reload(state: &AppState) -> bool {
         && !state.project_picker_open.get()
         && !state.session_settings_open.get()
         && state.chat_input.get().is_empty()
+        && state.chat_images.get().is_empty()
         && state.pending_submissions.get().is_empty()
         && state.draft_session_settings.get().0.is_empty()
         && state.draft_backend_override.get().is_none()
@@ -104,6 +105,7 @@ pub fn install(state: AppState) {
                 && mode == AppMode::Onboarding
                 && handoff_complete
                 && input_state.chat_input.get().is_empty()
+                && input_state.chat_images.get().is_empty()
                 && input_state.pending_submissions.get().is_empty());
         (
             host,

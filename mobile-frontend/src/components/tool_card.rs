@@ -1647,7 +1647,8 @@ fn hold_reply(
         // reply after a deliberate resend replaces the record underneath it.
         origin,
         local_host_id: owner.local_host_id.clone(),
-        connection_instance_id: accepted.connection_instance_id,
+        connection_instance_id: Some(accepted.connection_instance_id),
+        spawn_payload: None,
         // Ownership is known: this is the agent that asked.
         target: crate::state::SubmissionTarget::Agent(owner.clone()),
         text,
@@ -2590,11 +2591,18 @@ mod wasm_tests {
             "a healthy queued answer must not show recovery actions"
         );
         state.active_connection_instance_ids.update(|instances| {
-            instances.insert(record.local_host_id.clone(), record.connection_instance_id);
+            instances.insert(
+                record.local_host_id.clone(),
+                record
+                    .connection_instance_id
+                    .expect("This fixture input was admitted on a connection"),
+            );
         });
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::DeliveryUnknown,
         );
         next_tick().await;
@@ -2629,7 +2637,10 @@ mod wasm_tests {
         state.active_connection_instance_ids.update(|instances| {
             instances.insert(
                 record.local_host_id.clone(),
-                record.connection_instance_id + 1,
+                record
+                    .connection_instance_id
+                    .expect("This fixture input was admitted on a connection")
+                    + 1,
             );
         });
         next_tick().await;
@@ -2960,7 +2971,9 @@ mod wasm_tests {
         // The connection dies while it was going out.
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::DeliveryUnknown,
         );
         next_tick().await;
@@ -3009,7 +3022,9 @@ mod wasm_tests {
             .clone();
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::NotSent,
         );
         next_tick().await;
@@ -3053,7 +3068,9 @@ mod wasm_tests {
             .clone();
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
         );
         next_tick().await;
@@ -3090,7 +3107,8 @@ mod wasm_tests {
                 local_submission_id: crate::bridge::LocalSubmissionId(10_000 + id),
                 origin: crate::state::SubmissionOriginId(10_000 + id),
                 local_host_id: host.clone(),
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: crate::state::SubmissionTarget::NewChat,
                 text: format!("stuck {id}"),
                 images: Vec::new(),
@@ -3212,7 +3230,9 @@ mod wasm_tests {
             .unwrap();
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::NotSent,
         );
         next_tick().await;
@@ -3277,7 +3297,9 @@ mod wasm_tests {
         let origin = record.origin;
         state.apply_submission_outcome(
             record.local_submission_id,
-            record.connection_instance_id,
+            record
+                .connection_instance_id
+                .expect("This fixture input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::NotSent,
         );
         next_tick().await;
@@ -3309,7 +3331,8 @@ mod wasm_tests {
                 local_submission_id: attempt,
                 origin: crate::state::SubmissionOriginId(50_000 + id),
                 local_host_id: host.clone(),
-                connection_instance_id: 7,
+                connection_instance_id: Some(7),
+                spawn_payload: None,
                 target: crate::state::SubmissionTarget::NewChat,
                 text: format!("junk {id}"),
                 images: Vec::new(),
@@ -3378,7 +3401,9 @@ mod wasm_tests {
             .unwrap();
         state.apply_submission_outcome(
             original.local_submission_id,
-            original.connection_instance_id,
+            original
+                .connection_instance_id
+                .expect("The original input was admitted on a connection"),
             crate::bridge::SubmissionTransportOutcome::NotSent,
         );
         next_tick().await;
@@ -3392,7 +3417,8 @@ mod wasm_tests {
             local_submission_id: crate::bridge::LocalSubmissionId(777),
             origin: original.origin,
             local_host_id: original.local_host_id.clone(),
-            connection_instance_id: 9,
+            connection_instance_id: Some(9),
+            spawn_payload: None,
             target: original.target.clone(),
             text: original.text.clone(),
             images: original.images.clone(),

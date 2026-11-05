@@ -29,6 +29,7 @@ pub enum SendRejected {
     NotConnected,
     QueueFull,
     ConnectionClosed,
+    InputCustodyUnavailable,
 }
 
 impl std::fmt::Display for SendRejected {
@@ -37,6 +38,9 @@ impl std::fmt::Display for SendRejected {
             Self::NotConnected => f.write_str("host is not connected"),
             Self::QueueFull => f.write_str("host outbound queue is full"),
             Self::ConnectionClosed => f.write_str("host connection closed"),
+            Self::InputCustodyUnavailable => {
+                f.write_str("input recovery is unavailable; request was not transmitted")
+            }
         }
     }
 }
@@ -151,7 +155,7 @@ impl UnlistenHandle {
 }
 
 macro_rules! dispatch {
-    ($name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty) => {
+    ($name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) -> $ret:ty) => {
         pub async fn $name( $( $arg : $ty ),* ) -> $ret {
             web::$name( $( $arg ),* ).await
         }
@@ -168,7 +172,11 @@ dispatch!(reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), Strin
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(
-    send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<Accepted, SendRejected>
+    send_host_line(
+        local_host_id: &LocalHostId,
+        line: &str,
+        custody: Option<crate::recovery::InputCustody>,
+    ) -> Result<Accepted, SendRejected>
 );
 dispatch!(ack_host_line(local_host_id: &LocalHostId, delivery_id: u64) -> Result<(), String>);
 dispatch!(scan_qr() -> Result<BarcodeScanResult, String>);
