@@ -1,12 +1,13 @@
+import { nativeBridgeVersion, nativeBootstrapVersion, nativeBackSurfaceVersion, nativeLoadingPresentation } from './native-contract.js';
 import { resolveNativeHost, resolveNativeOffer, nativeSignIn, NativeBootstrapError, nativeDescriptorIsLive, nativeBootstrapFailure } from './native-service.js';
 import { artifactSetSha256, nativeBridgeCompatible } from './manifest-policy.js';
 
 // Discovery chooses identity; executable selection and delivery stay in loader.js.
 export async function startNativeBootstrap(hooks) {
   const bridge = window.__tydeNativeHost;
-  if (bridge.bootstrapVersion !== 1 || bridge.version !== 6) throw new Error('Native bootstrap ABI is incompatible');
-  await bridge.post('presentation', JSON.stringify({version:bridge.version, client_ready:false, workspace:false, tab:'home', route:'root',
-    title:'Tyde', subtitle:null, chat_actions:false, modal:false, theme:'dark', sidebar_available:false, sidebar_open:false}));
+  if (bridge.bootstrapVersion !== nativeBootstrapVersion || bridge.version !== nativeBridgeVersion) throw new NativeBootstrapError('native_version', 'Update the app: this publisher requires a different native bridge.');
+  if (bridge.backSurfaceVersion !== undefined && bridge.backSurfaceVersion !== nativeBackSurfaceVersion) throw new NativeBootstrapError('native_version', 'Update the app: this publisher requires a different Back surface contract.');
+  await bridge.post('presentation', JSON.stringify(nativeLoadingPresentation));
 
   let selected = hooks.selected();
   let allowed = false;

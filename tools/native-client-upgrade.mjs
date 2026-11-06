@@ -1,5 +1,5 @@
 // Canonical server sim: immutable first shell + actual source-built clients.
-import {readFile, writeFile, mkdtemp, rm} from 'node:fs/promises';
+import {readFile, writeFile, mkdtemp, mkdir, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {resolve as resolvePath, sep, extname} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -363,7 +363,7 @@ try {
     if(endpoint==='presentation'){
       presentation=body;
       await frame.evaluate(value=>window.__thinPresentation=value,body);
-      await writeFile(resolvePath(evidence,'main-presentation-state.json'),JSON.stringify({workspace:body.workspace,tab:body.tab,route:body.route,modal:body.modal},null,2)+'\n');
+      await writeFile(resolvePath(evidence,'main-presentation-state.json'),JSON.stringify({workspace:body.workspace,tab:body.tab,route:body.route,modal:body.modal,connected_status:body.root_connected_status!=null},null,2)+'\n');
       return null;
     }
     if(endpoint==='secret_scope'){
@@ -400,6 +400,7 @@ try {
     const ready=window.__nativePlatform('begin_bootstrap','{}');
     window.webkit={messageHandlers:Object.fromEntries(${JSON.stringify(Object.keys(contract.requests))}.map(endpoint=>[endpoint,{postMessage:body=>ready.then(()=>window.__nativePlatform(endpoint,body))}]))};
     const tydeNativeBridgeVersion=${metadata.bridge_version},tydeNativeBootstrapVersion=${metadata.bootstrap_version},tydeNativeShellRelease=${JSON.stringify(metadata.release)};
+    const tydeNativeBootstrapOrigin='https://tycode.dev',tydeNativeRootStatusOwner='shell',tydeNativeChatHeaderOwner='client';
     const tydeNativeSecretScopeEndpoint='secret_scope',tydeNativeHttpEndpoint='http',tydeNativeHttpCancelEndpoint='http_cancel';
     ${bridgeScript}
   }`});
@@ -420,6 +421,7 @@ try {
     await Promise.race([(async()=>{
       await page.waitForFunction(release=>window.__tydeLoader?.bootVersion()===release,release);
       await page.locator('[data-mobile-test="connection-banner-dot-connected"]').waitFor({state:'visible'});
+      if(await page.evaluate(()=>window.__thinPresentation?.back_surface_version!=null))throw Error('The unchanged ABI6 shell must not acknowledge live Back surfaces');
     })(),page.locator('[data-mobile-test="connection-banner-update-required"], [data-mobile-test="mobile-shell-error-banner"], [data-mobile-test="connection-banner-repair"]').first().waitFor({state:'visible'}).then(()=>{throw Error('Client refused the current authenticated target');})]);
   };
   const chat=async(title,prompt,reply,phase)=>{
@@ -435,6 +437,93 @@ try {
     await boundary(`${phase} authoritative reply and idle`);
     await page.waitForFunction(reply=>document.querySelector('[data-mobile-test="chat-messages"]')?.textContent.includes(reply),reply);
     await page.waitForFunction(()=>document.querySelector('[data-mobile-test="chat-input"]')?.value===''&&document.querySelector('[data-mobile-test="chat-send"]')?.getAttribute('aria-label')==='Send message');
+  };
+  const compatibilityMatrix=[];
+  const consumerFixtures=[];
+  for(const name of ['native-bootstrap-testflight8-v1','native-bootstrap-compatible-back-v1']){
+    const record=JSON.parse(await readFile(`tests/fixtures/${name}.json`,'utf8'));
+    const archive=resolvePath(`tests/fixtures/${name}.tar.gz`);
+    if(sha(await readFile(archive))!==record.archive_sha256)throw Error('Compatibility consumer custody failed');
+    const destination=resolvePath(temporary,name);await mkdir(destination);
+    execFileSync('tar',['-xzf',archive,'-C',destination],{stdio:'ignore'});
+    const base=resolvePath(destination,'Shell');
+    const schemaBytes=await readFile(resolvePath(base,'NativeBridgeContract.json'));
+    const script=await readFile(resolvePath(base,'native-host.js'),'utf8');
+    if(sha(schemaBytes)!==record.native_contract_sha256||sha(script)!==record.bridge_sha256)throw Error('Compatibility consumer bytes changed');
+    consumerFixtures.push({name,record,script,schema:JSON.parse(schemaBytes)});
+  }
+  const compatibilityProbe=async(release,phase)=>{
+    await boundary(`frozen consumer compatibility ${phase}`);
+    // These are independent browser consumers of the same real paired host, not
+    // a second product connection/session owner or a claim of physical iOS proof.
+    const stored=await page.evaluate(()=>new Promise((resolve,reject)=>{
+      const open=indexedDB.open('tyde-mobile',1);open.onerror=reject;open.onsuccess=()=>{
+        const db=open.result,tx=db.transaction('paired_hosts'),get=tx.objectStore('paired_hosts').get('all');
+        get.onsuccess=()=>resolve({rows:get.result,selected:localStorage.getItem('tyde.selected-host.v1')});tx.oncomplete=()=>db.close();
+      };
+    }));
+    for(const consumer of consumerFixtures){
+      const currentFullClient=release===entryFor(initial.current_bundle);
+      const expectedBackSurface=currentFullClient?consumer.record.back_surface_version:null;
+      const probeContext=await browser.newContext({viewport:{width:466,height:678}});
+      const probe=await probeContext.newPage();probe.setDefaultTimeout(0);probe.setDefaultNavigationTimeout(0);
+      const pending=new Map();let secretScope=null,discoveries=0;
+      await probeContext.exposeBinding('__nativePlatform',async({frame},endpoint,encoded)=>{
+        if(frame!==probe.mainFrame())throw Error('Unexpected compatibility frame');
+        const body=JSON.parse(encoded);
+        if(endpoint==='begin_bootstrap'){secretScope=null;return null;}
+        if(!consumer.schema.requests[endpoint]||!accepts(body,consumer.schema.requests[endpoint]))throw Error('Frozen compatibility consumer rejected request');
+        if(endpoint==='presentation'){
+          if(body.client_ready&&body.workspace&&((body.back_surface_version??null)!==expectedBackSurface))throw Error('Back capability acknowledgement differs from installed consumer');
+          await frame.evaluate(value=>window.__thinPresentation=value,body);return null;
+        }
+        if(endpoint==='secret_scope'){if(secretScope&&body.keys.some(key=>!secretScope.has(key)))throw Error('Compatibility scope expanded');secretScope=new Set(body.keys);return null;}
+        if(endpoint==='secret_read'){if(secretScope&&!secretScope.has(body.key))throw Error('Compatibility scope violation');return secrets.get(body.key)??null;}
+        if(endpoint==='http_cancel'){pending.get(body.id)?.destroy();return null;}
+        if(endpoint!=='http')throw Error('Compatibility probe attempted a persistent mutation');
+        const url=new URL(body.url),address=targets.get(url.hostname);
+        if(!address||url.protocol!=='https:')throw Error('Unexpected compatibility HTTP authority');
+        const discovery=url.pathname==='/tyde/bootstrap';
+        if(discovery&&JSON.parse(body.body).native_bridge_abi!==6)throw Error('Stable platform baseline ratcheted');
+        return new Promise((resolve,reject)=>{
+          const request=httpRequest(`http://${address}${url.pathname}`,{method:body.method.toUpperCase(),headers:body.headers},response=>{
+            let data='';response.on('data',part=>data+=part);response.on('end',()=>{
+              pending.delete(body.id);
+              if(discovery){if(response.statusCode!==200||JSON.parse(data).descriptor.native_bridge_abi!==6){reject(Error('Real host rejected stable ABI6'));return;}discoveries++;}
+              resolve({status:response.statusCode,body:data});
+            });
+          });requests.add(request);request.on('close',()=>requests.delete(request));pending.set(body.id,request);request.on('error',()=>{pending.delete(body.id);reject(Error('Compatibility HTTP failed'));});request.end(body.body);
+        });
+      });
+      await probeContext.addInitScript({content:`if(location.origin==='https://tycode.dev'){
+        const ready=window.__nativePlatform('begin_bootstrap','{}');
+        window.webkit={messageHandlers:Object.fromEntries(${JSON.stringify(Object.keys(consumer.schema.requests))}.map(endpoint=>[endpoint,{postMessage:body=>ready.then(()=>window.__nativePlatform(endpoint,body))}]))};
+        const tydeNativeBridgeVersion=6,tydeNativeBootstrapVersion=1,tydeNativeShellRelease=${JSON.stringify(consumer.record.shell_release)};
+        const tydeNativeBackSurfaceVersion=1,tydeNativeBootstrapOrigin='https://tycode.dev',tydeNativeRootStatusOwner='shell',tydeNativeChatHeaderOwner='client';
+        const tydeNativeSecretScopeEndpoint='secret_scope',tydeNativeHttpEndpoint='http',tydeNativeHttpCancelEndpoint='http_cancel';
+        ${consumer.script}
+      }`});
+      try{
+        // Seed a disposable consumer only after its real IDB completion; no race/delay.
+        await probe.goto('https://tycode.dev/tyde/manifest.json',{waitUntil:'domcontentloaded'});
+        await probe.evaluate(stored=>new Promise((resolve,reject)=>{
+          const open=indexedDB.open('tyde-mobile',1);open.onupgradeneeded=()=>open.result.createObjectStore('paired_hosts');open.onerror=reject;
+          open.onsuccess=()=>{const db=open.result,tx=db.transaction('paired_hosts','readwrite');tx.objectStore('paired_hosts').put(stored.rows,'all');tx.onerror=reject;tx.oncomplete=()=>{localStorage.setItem('tyde.selected-host.v1',stored.selected);db.close();resolve();};};
+        }),stored);
+        await probe.goto('https://tycode.dev/tyde/?native=1',{waitUntil:'domcontentloaded'});
+        await probe.waitForFunction(({release,currentFullClient})=>window.__tydeLoader?.bootVersion()===release&&
+          (currentFullClient?window.__thinPresentation?.root_connected_status!=null:
+            window.__thinPresentation?.client_ready&&window.__thinPresentation?.workspace),{release,currentFullClient});
+        if(discoveries<1)throw Error('Compatibility journey did not cross real authenticated discovery');
+        compatibilityMatrix.push({phase,consumer:consumer.name,source:consumer.record.source_commit??consumer.record.source_base,shell_release:consumer.record.shell_release,host_client_release:release,platform_abi:6,bootstrap:1,shell_back_surface_version:consumer.record.back_surface_version,back_surface_version:expectedBackSurface,archive_sha256:consumer.record.archive_sha256,authenticated_real_server:true,frozen_consumer_serialization_accepted:true,expected_acknowledgement_matched:true,connection_scope:currentFullClient?'current_native_health':'historical_baseline_presentation',physical_testflight_or_native_gesture:false});
+        await writeFile(resolvePath(evidence,'native-compatibility-matrix.json'),JSON.stringify({rows:compatibilityMatrix,original_integrated_consumer_unchanged:true,exact_old_server29_executed:false,limit:'Actual source-mapped Build8 and new-capability consumers cross real current/restarted host/browser boundaries; not physical TestFlight, old29 binary, Swift gesture or raster proof.'},null,2)+'\n');
+      }catch(error){
+        await writeFile(resolvePath(evidence,'compatibility-probe-error.json'),JSON.stringify({phase,consumer:consumer.name,
+          api:String(error?.message??'').split(':',1)[0],network_code:String(error?.message??'').match(/net::ERR_[A-Z_]+/)?.[0]??null})+'\n');
+        throw error;
+      }finally{for(const request of pending.values())request.destroy();await probeContext.close();}
+    }
+    await page.bringToFront();
   };
   const managedContexts=[];
   const managedProbe=async host=>{
@@ -489,7 +578,8 @@ try {
       const ready=window.__nativePlatform('begin_bootstrap','{}');
       window.webkit={messageHandlers:Object.fromEntries(${JSON.stringify(Object.keys(contract.requests))}.map(endpoint=>[endpoint,{postMessage:body=>ready.then(()=>window.__nativePlatform(endpoint,body))}]))};
       const tydeNativeBridgeVersion=${metadata.bridge_version},tydeNativeBootstrapVersion=${metadata.bootstrap_version},tydeNativeShellRelease=${JSON.stringify(metadata.release)};
-      const tydeNativeSecretScopeEndpoint='secret_scope',tydeNativeHttpEndpoint='http',tydeNativeHttpCancelEndpoint='http_cancel';
+      const tydeNativeBootstrapOrigin='https://tycode.dev',tydeNativeRootStatusOwner='shell',tydeNativeChatHeaderOwner='client';
+    const tydeNativeSecretScopeEndpoint='secret_scope',tydeNativeHttpEndpoint='http',tydeNativeHttpCancelEndpoint='http_cancel';
       ${bridgeScript}
     }`});
     const rows=()=>probe.evaluate(()=>new Promise((resolve,reject)=>{
@@ -621,6 +711,18 @@ try {
   if((await receive()).event!=='release-publisher'||!releasePublisher)throw Error('Missing publication boundary');
   releasePublisher();emit({event:'publisher-released'});
   const first=await receive();targets.set('native-host.test',first.address);
+  await boundary('unsupported optional Back contract rejected before client execution');
+  const incompatibleContext=await browser.newContext({viewport:{width:466,height:678}});
+  const incompatible=await incompatibleContext.newPage();
+  incompatible.setDefaultTimeout(0);incompatible.setDefaultNavigationTimeout(0);
+  let incompatibleClientRequests=0;
+  incompatible.on('request',request=>{if(new URL(request.url()).pathname.startsWith('/tyde/v'))incompatibleClientRequests++;});
+  await incompatibleContext.addInitScript({content:`Object.defineProperty(window,'__tydeNativeHost',{value:Object.freeze({version:6,backSurfaceVersion:2,bootstrapVersion:1,shellRelease:'0.9.6-beta.22',post:()=>{throw Error('Full client must not execute')}})})`});
+  await incompatible.goto('https://tycode.dev/tyde/?native=1',{waitUntil:'domcontentloaded'});
+  await incompatible.locator('#view-error').waitFor({state:'visible'});
+  if(incompatibleClientRequests!==0||!await incompatible.locator('#error-message').innerText().then(text=>/Back surface contract|Update the app/.test(text)))throw Error('Unsupported Back contract was not rejected before full-client execution');
+  await writeFile(resolvePath(evidence,'native-abi-admission.json'),JSON.stringify({shell_abi:6,unsupported_back_surface_version:2,rejected_before_client_fetch:true,client_requests:incompatibleClientRequests})+'\n');
+  await incompatibleContext.close();
   await boundary('trusted publisher navigation');
   await page.goto('https://tycode.dev/tyde/?native=1',{waitUntil:'domcontentloaded'});
   await boundary('bootstrap pairing chooser');
@@ -649,7 +751,7 @@ try {
   await page.locator('[data-mobile-test="agents-view"]').waitFor({state:'visible'});
   await page.screenshot({path:resolvePath(evidence,'integrated-landscape-content.png')});
   await intent('toggle_sidebar');
-  await page.locator('[data-mobile-test="agents-view"]').waitFor({state:'hidden'});
+  await page.waitForFunction(()=>window.__thinPresentation?.sidebar_open===false);
   await page.setViewportSize({width:466,height:678});await intent('compact_width');
   await page.waitForFunction(()=>window.__thinPresentation?.sidebar_available===false);
   const paired=await identity(),secretCount=secrets.size;
@@ -667,6 +769,7 @@ try {
   await loaded(first.release);
   if(pairRequests!==1||JSON.stringify(await identity())!==JSON.stringify(paired))throw Error();
   await writeFile(resolvePath(evidence,'authenticated-transport-recovery.json'),JSON.stringify({network_drops:networkDrops,rediscovered:true,retained_pairing:true,pair_requests:pairRequests},null,2)+'\n');
+  await compatibilityProbe(first.release,'before_host_update');
   await boundary('initial core pair and conversation complete');emit({event:'paired'});
   const managed=initial.service?await managedProbe(await receive()):null;
   const stopped=await receive();if(stopped.event!=='host-stopped')throw Error();
@@ -686,6 +789,20 @@ try {
   await chat(update.title,'Native after source upgrade','Compatibility post-upgrade response','replacement');
   if(JSON.stringify(await identity())!==JSON.stringify(paired)||pairRequests!==1||secrets.size!==secretCount)throw Error();
   await page.screenshot({path:resolvePath(initial.evidence,'upgraded-client-chat.png')});
+  await compatibilityProbe(update.release,'after_host_update');
+  await loaded(update.release);
+  await page.waitForFunction(()=>window.__thinPresentation?.modal===false&&!document.querySelector('dialog[open]'));
+  const renameBoundary=async phase=>{
+    await boundary(phase);
+    const state=await page.evaluate(()=>({
+      route:window.__thinPresentation?.route??null,tab:window.__thinPresentation?.tab??null,
+      modal:window.__thinPresentation?.modal??null,dialog_open:!!document.querySelector('dialog[open]'),
+      safety:window.__thinReloadSafety??null,
+      rename_present:!!document.querySelector('[data-mobile-test="chat-rename-input"]'),
+      rename_length:document.querySelector('[data-mobile-test="chat-rename-input"]')?.value.length??null,
+    }));
+    await writeFile(resolvePath(evidence,'retained-rename-state.json'),JSON.stringify({phase,...state},null,2)+'\n');
+  };
   await boundary('retained rename draft fences client reload');
   await page.evaluate(()=>{
     const original=window.__tydeLoader.nativeReloadAllowed.bind(window.__tydeLoader);
@@ -699,14 +816,18 @@ try {
   await rename.fill('Retained rename edit');
   await page.evaluate(()=>window.__thinRenameNode=document.querySelector('[data-mobile-test="chat-rename-input"]'));
   await intent('home');
+  await renameBoundary('retained rename Home safety assertion');
   await page.waitForFunction(()=>window.__thinReloadSafety?.allowed===false&&window.__thinReloadSafety?.pairingSafe===false);
+  await renameBoundary('retained rename Home fence observed');
   await intent('agents');
   await rename.waitFor({state:'visible'});
   if(documents!==renameDocuments||await rename.inputValue()!=='Retained rename edit'||
       !await page.evaluate(()=>window.__thinRenameNode===document.querySelector('[data-mobile-test="chat-rename-input"]')))throw Error('Rename edit lost its retained document');
   await page.locator('[data-mobile-test="chat-rename-cancel"]').click();
   await intent('home');
+  await renameBoundary('retained rename cancelled Home safety assertion');
   await page.waitForFunction(()=>window.__thinReloadSafety?.allowed===true&&window.__thinReloadSafety?.pairingSafe===true);
+  await renameBoundary('retained rename cancellation released safety');
   await writeFile(resolvePath(evidence,'retained-rename-safety-proof.json'),JSON.stringify({same_document:true,same_input_node:true,
     edited_value_retained:true,home_emits_reload_and_pairing_unsafe:true,cancel_releases_safety:true,
     limit:'Actual source-built client DOM and canonical loader safety API; not Swift runtime.'},null,2)+'\n');

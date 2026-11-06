@@ -95,6 +95,21 @@ readonly BUNDLE_DIR="${OUT_DIR}/v${VERSION}"
 log "building v${VERSION} into ${OUT_DIR}"
 
 
+# Refuse drift between the typed shell contract and its generated loader consumer.
+native_contract="$(mktemp)"
+trap 'rm -f "$native_contract"' EXIT
+cargo run --quiet -p mobile-shell-types --bin native-bindings -- --javascript > "$native_contract"
+cmp "$native_contract" "$LOADER_DIR/native-contract.js" || die "generated native loader contract is stale"
+"$PYTHON" - "$native_contract" "$REPO_ROOT/mobile-frontend/index.html" <<'NATIVE_ABI'
+from pathlib import Path
+import re
+import sys
+native = re.search(r'nativeBridgeVersion = ([0-9]+);', Path(sys.argv[1]).read_text())
+client = re.search(r'name="tyde-native-bridge" content="([0-9]+)"', Path(sys.argv[2]).read_text())
+if not native or not client or native[1] != client[1]:
+    raise SystemExit("Native client manifest and generated shell ABI differ")
+NATIVE_ABI
+
 # 1. The immutable app bundle. --public-url has to match where it is served
 #    from, or the loader's absolute asset URLs miss.
 (

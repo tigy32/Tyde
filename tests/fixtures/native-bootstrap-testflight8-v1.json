@@ -1,0 +1,28 @@
+{
+  "status": "FROZEN_BUILD8_SOURCE_MAPPED_CONSUMER",
+  "source_commit": "18edb87dab683e2b2cb399827d7bd7a43889008a",
+  "shell_release": "0.9.6-beta.28",
+  "bootstrap_version": 1,
+  "native_bridge_abi": 6,
+  "back_surface_version": null,
+  "build": "8",
+  "ipa_sha256": "e214935b417cc72a7728bc39de3dc91cc709f49a1fce919905add18428e4dc54",
+  "custody_receipt": "testflight-native-recovery-build8-20261105-lander/ACTIVATION-READBACK.safe.json",
+  "limits": "Bridge and native-manifest bytes read from retained Build8 signed archive; generated Swift/schema from its exact retained source resources. Actual native JS equals source bytes. Real browser contract proof, NOT physical TestFlight execution, UIKit, Keychain, signing or camera proof. Older integrated-v1 fixture is distinct and unchanged.",
+  "archive_sha256": "801435f5a4f7dcbe890e12623a7d8d5fb9a3056d7965f5485b5bd1f56ddcbc5f",
+  "bridge_sha256": "cba58f8b80652bafe2dcd9041a36edca20d50eca0a008b01eff2f1bc856fb513",
+  "native_contract_sha256": "130bef41c63199b4042dcac8ed546c95b93b9cce79577a0e88a90f72e6e79fa2",
+  "files_sha256": {
+    "native-host.js": "cba58f8b80652bafe2dcd9041a36edca20d50eca0a008b01eff2f1bc856fb513",
+    "NativeBridgeContract.json": "130bef41c63199b4042dcac8ed546c95b93b9cce79577a0e88a90f72e6e79fa2",
+    "NativeBridge.swift": "87953bc492d3f4f79647502838cf856791b91afe23a483509e7d604b7944f6e9",
+    "Web/native-manifest.json": "34bca4bb71b4c99bbe2cbe122e1672f8c88bed0ac17b0b648901426f600558fc"
+  },
+  "source_manifest_fingerprint": "fd44ebbeaf0da59a20fa711bd06f44378d0c85f255e2b5d64eda792e43d2f69e",
+  "source_manifest_file_sha256": "8beb1aec2f16a6044cda4518dac013971bc45188335375a7d56f2cd8f6d7ffa7",
+  "verified_source_inputs_sha256": {
+    "mobile-shell-types/src/native.rs": "3ccf29318ed11c23c3bd83197078ee37c7344b077f20953e57d3906de1cd1228",
+    "mobile-shell-types/src/bin/native-bindings.rs": "7e7753a8f6cb9bb5983c4a5c4630af37eb7e4491219d03889232a7a94ea649ed",
+    "ios/Tyde/native-host.js": "cba58f8b80652bafe2dcd9041a36edca20d50eca0a008b01eff2f1bc856fb513"
+  }
+}

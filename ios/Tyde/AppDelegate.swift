@@ -5,9 +5,22 @@ import OSLog
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    #if DEBUG
+    override init() {
+        super.init()
+        NativeStartupDiagnostics.record(.app_delegate_initialized)
+    }
+    #endif
+
     func application(_ application: UIApplication, configurationForConnecting session: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        #if DEBUG
+        NativeStartupDiagnostics.record(.scene_configuration_requested)
+        #endif
         let config = UISceneConfiguration(name: "Tyde", sessionRole: session.role)
         config.delegateClass = SceneDelegate.self
+        #if DEBUG
+        NativeStartupDiagnostics.record(.scene_configuration_returned)
+        #endif
         return config
     }
 }
@@ -17,10 +30,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     private var host: TydeHostController?
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+        #if DEBUG
+        NativeStartupDiagnostics.record(.scene_will_connect)
+        #endif
         guard let scene = scene as? UIWindowScene else { return }
         let window: UIWindow
         let host = TydeHostController()
         #if DEBUG
+        NativeStartupDiagnostics.record(.host_created)
         if ProcessInfo.processInfo.environment["TYDE_IOS_NAVIGATION_DIAGNOSTICS"] == "1" {
             do {
                 let diagnostics = try NativeNavigationDiagnostics()
@@ -41,7 +58,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         self.host = host
         self.window = window
         window.makeKeyAndVisible()
+        #if DEBUG
+        NativeStartupDiagnostics.record(.window_visible)
+        #endif
         host.start()
+        #if DEBUG
+        NativeStartupDiagnostics.record(.host_start_returned)
+        #endif
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) { host?.send(.background) }
@@ -50,6 +73,28 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 }
 
 #if DEBUG
+@MainActor
+enum NativeStartupDiagnostics {
+    enum Stage: String {
+        case app_delegate_initialized, scene_configuration_requested, scene_configuration_returned
+        case scene_will_connect, host_created, window_visible, host_start_entered, host_start_returned
+        case wk_create_begin, wk_create_complete, entry_attached
+        case resources_requested, resources_loaded, resources_failed, wk_load_requested, wk_load_created
+        case wk_entry_admitted, wk_provisional_started, wk_committed, wk_finished
+        case wk_provisional_failed, wk_navigation_failed, wk_process_terminated
+        case presentation_received, client_ready, workspace_attached, back1_acknowledged, back1_ready
+    }
+
+    private static let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "host")
+    private static var recorded: Set<Stage> = []
+
+    static func record(_ stage: Stage) {
+        // A finite, once-per-process trace; never include document or user data.
+        guard recorded.insert(stage).inserted else { return }
+        logger.notice("Native startup stage=\(stage.rawValue, privacy: .public)")
+    }
+}
+
 @MainActor
 final class NativeNavigationWindow: UIWindow {
     var diagnostics: NativeNavigationDiagnostics?

@@ -131,6 +131,7 @@ impl<T: NativeWire> NativeWire for std::collections::BTreeMap<String, T> {
 }
 
 pub const NATIVE_BRIDGE_VERSION: u32 = 6;
+pub const NATIVE_BACK_SURFACE_VERSION: u32 = 1;
 pub const NATIVE_BOOTSTRAP_VERSION: u32 = 1;
 pub const NATIVE_CLIENT_RELEASE: &str = env!("TYDE_NATIVE_CLIENT_RELEASE");
 
@@ -157,14 +158,30 @@ native_enum!(NativeEndpoint {
 native_enum!(NativeAuthProvider { Apple = "apple", Google = "google" });
 native_enum!(NativeHttpMethod { Get = "get", Post = "post" });
 
+native_enum!(NativeBackPhase { Progress = "progress", Cancel = "cancel", Complete = "complete" });
+native_struct!(NativeBackUpdate {
+    version: [u32],
+    phase: [NativeBackPhase],
+    source_revision: [u64],
+    progress: [u32]
+});
 native_struct!(NativeConnectedStatus { round_trip_ms: [Option<u64>] });
+native_struct!(NativeBackChatDock {
+    back_label: [String], connected_status: [Option<NativeConnectedStatus>],
+    sidebar_available: [bool], sidebar_open: [bool], chat_actions: [bool]
+});
+native_struct!(NativeBackDestination {
+    tab: [NativeTab], route: [NativeRoute], title: [String],
+    connected_status: [Option<NativeConnectedStatus>], chat_dock: [Option<NativeBackChatDock>]
+});
 native_struct!(NativePresentation {
     version: [u32], client_ready: [bool], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
     title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme],
     sidebar_available: [bool], sidebar_open: [bool], chat_header_owner: [Option<NativeChatHeaderOwner>],
     root_status_owner: [Option<NativeRootStatusOwner>], root_connected_status: [Option<NativeConnectedStatus>],
     chat_dock_owner: [Option<NativeChatDockOwner>], chat_connected_status: [Option<NativeConnectedStatus>],
-    chat_back_label: [Option<String>]
+    chat_back_label: [Option<String>],
+    back_surface_version: [Option<u32>], navigation_revision: [Option<u64>], back_ready_revision: [Option<u64>], back_destination: [Option<NativeBackDestination>]
 });
 native_struct!(NativeHttpRequest {
     id: [u32],
@@ -186,9 +203,40 @@ native_struct!(NativeAuthRequest {
     provider: [NativeAuthProvider]
 });
 
+pub fn bootstrap_javascript() -> Result<String, serde_json::Error> {
+    let loading = NativePresentation {
+        version: NATIVE_BRIDGE_VERSION,
+        client_ready: false,
+        workspace: false,
+        tab: NativeTab::Home,
+        route: NativeRoute::Root,
+        title: "Tyde".into(),
+        subtitle: None,
+        chat_actions: false,
+        modal: false,
+        theme: NativeTheme::Dark,
+        sidebar_available: false,
+        sidebar_open: false,
+        chat_header_owner: None,
+        root_status_owner: None,
+        root_connected_status: None,
+        chat_dock_owner: None,
+        chat_connected_status: None,
+        chat_back_label: None,
+        back_surface_version: None,
+        navigation_revision: None,
+        back_ready_revision: None,
+        back_destination: None,
+    };
+    Ok(format!(
+        "// Generated from mobile-shell-types/src/native.rs. Do not edit.\nexport const nativeBridgeVersion = {NATIVE_BRIDGE_VERSION};\nexport const nativeBootstrapVersion = {NATIVE_BOOTSTRAP_VERSION};\nexport const nativeBackSurfaceVersion = {NATIVE_BACK_SURFACE_VERSION};\nexport const nativeLoadingPresentation = Object.freeze({});\n",
+        serde_json::to_string(&loading)?
+    ))
+}
+
 pub fn swift_source() -> String {
     let mut output = format!(
-        "// Generated from mobile-shell-types/src/native.rs. Do not edit.\nimport Foundation\n\nlet nativeBridgeVersion: UInt32 = {NATIVE_BRIDGE_VERSION}\n\n"
+        "// Generated from mobile-shell-types/src/native.rs. Do not edit.\nimport Foundation\n\nlet nativeBridgeVersion: UInt32 = {NATIVE_BRIDGE_VERSION}\nlet nativeBackSurfaceVersion: UInt32 = {NATIVE_BACK_SURFACE_VERSION}\n\n"
     );
     output.push_str(&format!(
         "let nativeShellRelease = \"{}\"\nlet nativeBootstrapVersion: UInt32 = {}\n\n",
@@ -203,6 +251,10 @@ pub fn swift_source() -> String {
         NativeChatDockOwner::swift(),
         NativeRootStatusOwner::swift(),
         NativeConnectedStatus::swift(),
+        NativeBackPhase::swift(),
+        NativeBackUpdate::swift(),
+        NativeBackChatDock::swift(),
+        NativeBackDestination::swift(),
         NativeIntent::swift(),
         NativeEndpoint::swift(),
         NativeHttpMethod::swift(),
@@ -226,6 +278,8 @@ pub fn swift_source() -> String {
 /// The real DOM guard consumes that old artifact, never today's regenerated ABI.
 pub fn wire_contract() -> serde_json::Value {
     serde_json::json!({"bridge_version":NATIVE_BRIDGE_VERSION, "bootstrap_version":NATIVE_BOOTSTRAP_VERSION,
+        "back_surface_version": NATIVE_BACK_SURFACE_VERSION,
+        "back_update": NativeBackUpdate::contract(),
         "intents":NativeIntent::contract(),
         "requests":{
             (NativeEndpoint::Presentation.to_string()):NativePresentation::contract(),

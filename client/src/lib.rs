@@ -2383,8 +2383,30 @@ pub async fn connect<S>(config: &ClientConfig, stream: S) -> Result<Connection, 
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let parts = connect_parts(config, stream).await?;
+    connect_with_wait(config, stream, HandshakeWait::Network).await
+}
 
+/// A child command can still be starting when its stdin accepts Hello.
+/// Its completion/EOF, rather than network latency, bounds that local work.
+pub async fn connect_owned_process<S>(
+    config: &ClientConfig,
+    stream: S,
+) -> Result<Connection, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    connect_with_wait(config, stream, HandshakeWait::OwnedProcess).await
+}
+
+async fn connect_with_wait<S>(
+    config: &ClientConfig,
+    stream: S,
+    wait: HandshakeWait,
+) -> Result<Connection, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let parts = connect_parts_with_wait(config, stream, wait).await?;
     Ok(Connection {
         reader: parts.reader,
         writer: parts.writer,
@@ -2417,9 +2439,25 @@ pub async fn connect_uds(
     }
 }
 
+enum HandshakeWait {
+    Network,
+    OwnedProcess,
+}
+
 pub(crate) async fn connect_parts<S>(
     config: &ClientConfig,
     stream: S,
+) -> Result<ConnectedParts, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    connect_parts_with_wait(config, stream, HandshakeWait::Network).await
+}
+
+async fn connect_parts_with_wait<S>(
+    config: &ClientConfig,
+    stream: S,
+    wait: HandshakeWait,
 ) -> Result<ConnectedParts, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2438,9 +2476,12 @@ where
         .map_err(HandshakeError::InvalidPayload)?;
     write_envelope(&mut write_half, &hello_envelope).await?;
 
-    let response = timeout(HANDSHAKE_TIMEOUT, read_envelope(&mut reader))
-        .await
-        .map_err(|_| HandshakeError::Timeout)??;
+    let response = match wait {
+        HandshakeWait::Network => timeout(HANDSHAKE_TIMEOUT, read_envelope(&mut reader))
+            .await
+            .map_err(|_| HandshakeError::Timeout)??,
+        HandshakeWait::OwnedProcess => read_envelope(&mut reader).await?,
+    };
 
     let response = match response {
         Some(envelope) => envelope,

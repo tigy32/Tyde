@@ -207,7 +207,10 @@ impl MobileWebAssets {
         {
             return Err("Published mobile client protocol does not match this host".into());
         }
-        if !entry.native_bridge_versions.contains(&6) {
+        if !entry
+            .native_bridge_versions
+            .contains(&mobile_shell_types::native::NATIVE_BRIDGE_VERSION)
+        {
             return Err("Published mobile client native ABI is incompatible".into());
         }
         let mut artifacts = BTreeMap::from([(entry.entry.clone(), entry.integrity.clone())]);
@@ -265,7 +268,7 @@ impl MobileWebAssets {
             transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
             client_release_version: host_release,
             artifact_set_sha256: format!("{:x}", Sha256::digest(canonical)),
-            native_bridge_abi: 6,
+            native_bridge_abi: mobile_shell_types::native::NATIVE_BRIDGE_VERSION,
         })
     }
 

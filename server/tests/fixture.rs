@@ -218,6 +218,136 @@ impl FixtureUds {
 }
 
 impl Fixture {
+    // Each integration binary includes this shared fixture; only native
+    // compatibility qualification supplies an immutable historical executable.
+    #[allow(dead_code)]
+    pub async fn qualify_literal_server29(evidence: &Path) {
+        use sha2::{Digest, Sha256};
+        let Some(binary) = std::env::var_os("TYDE_NATIVE_LITERAL_SERVER29") else {
+            return;
+        };
+        let binary = PathBuf::from(binary);
+        let expected = "3ec284310502bf47a9804334ebee1d5b24a26532fb7ae0aac9aa631f8df72cf5";
+        let actual = format!(
+            "{:x}",
+            Sha256::digest(
+                tokio::fs::read(&binary)
+                    .await
+                    .expect("literal29 immutable binary")
+            )
+        );
+        assert!(actual == expected, "literal29 executable custody mismatch");
+        let stores = tempfile::tempdir().expect("literal29 disposable stores");
+        let settings = stores.path().join("settings.json");
+        tokio::fs::write(&settings, br#"{"settings":{"enabled_backends":[],"enable_mobile_connections":false,"mobile_direct_hosting_enabled":false}}"#)
+            .await.expect("literal29 private disabled settings");
+        let log = std::fs::File::create(evidence.join("literal29-host.private.log"))
+            .expect("literal29 diagnostic log");
+        let mut command = tokio::process::Command::new(&binary);
+        for (name, _) in std::env::vars_os() {
+            let key = name.to_string_lossy();
+            if key.starts_with("TYDE_")
+                && (key.ends_with("_STORE_PATH") || key.ends_with("_STORE_DIR"))
+            {
+                command.env_remove(name);
+            }
+        }
+        let mut child = command
+            .current_dir(stores.path())
+            .args(["host", "--stdio"])
+            .env("HOME", stores.path())
+            .env("XDG_CONFIG_HOME", stores.path().join("config"))
+            .env("XDG_CACHE_HOME", stores.path().join("cache"))
+            .env(
+                "TYDE_SESSION_STORE_PATH",
+                stores.path().join("sessions.json"),
+            )
+            .env(
+                "TYDE_PROJECT_STORE_PATH",
+                stores.path().join("projects.json"),
+            )
+            .env("TYDE_SETTINGS_STORE_PATH", &settings)
+            .env("TYDE_SKILLS_DIR_PATH", stores.path().join("skills"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(log)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("literal29 owned process");
+        let stream = tokio::io::join(
+            child.stdout.take().expect("literal29 stdout"),
+            child.stdin.take().expect("literal29 stdin"),
+        );
+        let result: Result<(), &'static str> = async {
+            let mut client =
+                client::connect_owned_process(&client::ClientConfig::current(), stream)
+                    .await
+                    .map_err(|error| match error {
+                        client::HandshakeError::Timeout => {
+                            "literal29 unexpected owned-process handshake timeout"
+                        }
+                        client::HandshakeError::InvalidPayload(_) => {
+                            "literal29 Welcome payload invalid"
+                        }
+                        client::HandshakeError::Frame(_) => {
+                            "literal29 handshake frame or EOF error"
+                        }
+                        _ => "literal29 rejected current production client handshake",
+                    })?;
+            let host_stream = client
+                .outgoing_seq
+                .keys()
+                .next()
+                .cloned()
+                .ok_or("literal29 host stream missing")?;
+            let frame = client
+                .next_event()
+                .await
+                .map_err(|_| "literal29 protocol validation failed")?
+                .ok_or("literal29 closed before HostBootstrap")?;
+            if frame.kind != FrameKind::HostBootstrap
+                || frame.stream != host_stream
+                || frame.seq != 1
+            {
+                return Err("literal29 bootstrap stream or sequence differs");
+            }
+            let state: HostBootstrapPayload = frame
+                .parse_payload()
+                .map_err(|_| "literal29 current typed bootstrap rejected")?;
+            if !state.projects.is_empty()
+                || !state.agents.is_empty()
+                || !state.mobile_access.paired_devices.is_empty()
+            {
+                return Err("literal29 did not use empty owned stores");
+            }
+            // Dropping the actual client closes stdin; the owned stdio server
+            // performs its ordinary graceful EOF shutdown before we join it.
+            Ok(())
+        }
+        .await;
+        let status = child.wait().await.expect("literal29 process joined");
+        tokio::fs::write(evidence.join("literal29-wire-compatibility.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "source":"c67383a0b45fddd6e9742466e4d7237fad91c33a", "binary_sha256":actual,
+            "custodied_release":"0.9.6-beta.29", "protocol":protocol::PROTOCOL_VERSION,
+            "production_client_handshake_bootstrap":result.is_ok(), "bootstrap_stream_and_seq_validated":result.is_ok(),
+            "handshake_error":result.as_ref().err(),
+            "process_joined":true, "exit_success":status.success(), "private_empty_stores":true,
+            "agents_spawned":0, "live_producer_mutated":false,
+            "limit":"Literal packaged server and current production protocol client only; not native paired discovery, literal old full-client rendering, physical TestFlight or raster proof."
+        })).expect("literal29 safe receipt encoding")).await.expect("literal29 safe receipt");
+        assert!(
+            result.is_ok(),
+            "{}",
+            result.err().unwrap_or("literal29 boundary failed")
+        );
+        assert!(
+            status.success(),
+            "literal29 owned process failed to shut down cleanly"
+        );
+    }
+}
+
+impl Fixture {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub async fn serve_uds(&self) -> FixtureUds {

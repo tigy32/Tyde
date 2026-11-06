@@ -7697,6 +7697,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "mobile-pairing",
+ "mobile-shell-types",
  "notify 8.2.0",
  "notify 9.0.0-rc.5",
  "opus",

@@ -1447,8 +1447,10 @@ async function init() {
         clearPairing: () => { clearPendingFragment(); sessionStorage.removeItem(PAIR_URI_KEY); },
         show, error: message => setError(message, ""),
       });
-    } catch {
-      setError("The native host client could not start.", "");
+    } catch (error) {
+      setError(error?.code === "native_version"
+        ? "Update the app: this publisher requires a different native bridge."
+        : "The native host client could not start.", "");
     }
     return;
   }

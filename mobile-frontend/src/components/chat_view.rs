@@ -11,8 +11,8 @@ use crate::components::chat_message::{ChatMessageView, ContextCompactionMarkerVi
 use crate::components::pending_submissions::AgentPendingSubmissions;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState, Spinner};
 use crate::state::{
-    AgentRef, AppState, ChatMessageEntry, LocalHostId, PendingSessionHistoryRequest,
-    PositionedCompactionMarker,
+    ActiveAgentRef, AgentRef, AppState, BackDestination, ChatMessageEntry, LocalHostId,
+    PendingSessionHistoryRequest, PositionedCompactionMarker,
 };
 
 #[component]
@@ -348,63 +348,22 @@ pub fn ChatView() -> impl IntoView {
         })
     };
 
-    let s_context = state.clone();
-    // Occupancy of the active agent's most recent request, as (used, window).
-    // Same precedence as desktop's chat view: a `CurrentContextUsage` on the
-    // activity stats wins outright — Known renders, Unknown is a gap and renders
-    // nothing — and only backends that report per message fall back to the
-    // latest assistant row's breakdown.
-    let context_occupancy = Memo::new(move |_| -> Option<(u64, u64)> {
-        let active = s_context.active_agent.get()?;
-        let agent_ref = active.as_agent_ref();
-        let backend = s_context.agents.with(|agents| {
-            agents
-                .iter()
-                .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
-                .map(|a| a.backend_kind)
-        })?;
-        let reported = s_context.agent_activity_stats.with(|stats| {
-            stats
-                .get(&agent_ref)
-                .and_then(|stats| stats.current_context_usage.clone())
-        });
-        match reported {
-            Some(protocol::CurrentContextUsage::Known {
-                input_tokens,
-                context_window,
-            }) => return Some((input_tokens, context_window)),
-            Some(protocol::CurrentContextUsage::Unknown) => return None,
-            None => {}
-        }
-        if backend == protocol::BackendKind::Codex {
-            return None;
-        }
-        s_context.chat_messages.with(|messages| {
-            let rows = messages.get(&agent_ref)?;
-            for entry in rows.iter().rev() {
-                if !matches!(
-                    entry.message.sender,
-                    protocol::MessageSender::Assistant { .. }
-                ) {
-                    continue;
-                }
-                if let Some(breakdown) = &entry.message.context_breakdown {
-                    return Some((breakdown.input_tokens, breakdown.context_window));
-                }
-                if entry.message.tool_calls.is_empty() {
-                    return None;
-                }
-            }
-            None
-        })
-    });
-
     // Rename state: when `rename_editing` is true the title becomes an
     // input. The draft is kept separate from the agent's actual name so
     // we don't push a partial edit through to the bridge on every keystroke.
     let rename_editing: RwSignal<bool> = RwSignal::new(false);
     let rename_draft: RwSignal<String> = RwSignal::new(String::new());
     crate::native::track_unsaved(rename_editing);
+
+    let action_owner = state.active_agent;
+    let action_draft = state.chat_draft_id;
+    Effect::new(move |_| {
+        action_owner.track();
+        action_draft.track();
+        more_open.set(false);
+        rename_editing.set(false);
+        rename_draft.set(String::new());
+    });
 
     let s_rename_open = state.clone();
     let on_rename_open = Callback::new(move |_: ()| {
@@ -480,31 +439,6 @@ pub fn ChatView() -> impl IntoView {
     let s_has_active = state.clone();
     let has_active_agent = move || s_has_active.active_agent.with(|a| a.is_some());
 
-    let s_compaction = state.clone();
-    let compaction_label = move || {
-        let active = s_compaction.active_agent.get()?;
-        let ar = AgentRef {
-            local_host_id: active.local_host_id.clone(),
-            agent_id: active.agent_id.clone(),
-        };
-        if let Some(payload) = s_compaction
-            .context_compaction_operations
-            .with(|m| m.get(&ar).cloned())
-        {
-            return context_compaction_status_label(&payload.status).map(str::to_owned);
-        }
-        let payload = s_compaction
-            .agent_compactions
-            .with(|m| m.get(&ar).cloned())?;
-        Some(match payload.status {
-            protocol::types::AgentCompactStatus::Started => "Compacting…".to_string(),
-            protocol::types::AgentCompactStatus::Completed => "Compacted".to_string(),
-            protocol::types::AgentCompactStatus::Failed => payload
-                .message
-                .unwrap_or_else(|| "Compaction failed".to_string()),
-        })
-    };
-
     let header_subtitle = active_backend;
     let menu_state = state.clone();
     let on_send_actions = Callback::new(move |()| {
@@ -543,7 +477,7 @@ pub fn ChatView() -> impl IntoView {
     }
 
     let s_pending = state.clone();
-    let s_body = state.clone();
+    let content_owner = state.active_agent;
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let auto_scroll_pending = Rc::new(Cell::new(false));
@@ -567,63 +501,20 @@ pub fn ChatView() -> impl IntoView {
             .active_agent
             .get()
             .map(|ar| ar.as_agent_ref());
-        let active_agent_stream = active_agent.as_ref().and_then(|key| {
-            state_for_auto.agents.with(|agents| {
-                agents
-                    .iter()
-                    .find(|agent| {
-                        agent.local_host_id == key.local_host_id && agent.agent_id == key.agent_id
-                    })
-                    .map(|agent| agent.instance_stream.clone())
-            })
-        });
         if *last_active_for_auto.borrow() != active_agent {
             *last_active_for_auto.borrow_mut() = active_agent.clone();
             user_scrolled_up.set(false);
         }
 
         if let Some(key) = active_agent.as_ref() {
-            if active_agent_stream.is_some()
-                && state_for_auto
-                    .host_stream_untracked(&key.local_host_id)
-                    .is_some()
-                && !state_for_auto
-                    .agent_load_requests
-                    .with_untracked(|loads| loads.contains(key))
-            {
-                state_for_auto.agent_load_requests.update(|loads| {
-                    loads.insert(key.clone());
-                });
-                let state_for_load = state_for_auto.clone();
-                let key_for_load = key.clone();
-                spawn_local(async move {
-                    if let Err(error) =
-                        crate::actions::load_agent(&state_for_load, &key_for_load).await
-                    {
-                        log::error!(
-                            "load_agent failed host={} agent_id={}: {}",
-                            key_for_load.local_host_id,
-                            key_for_load.agent_id,
-                            error
-                        );
-                        // Record the failure and *keep* the latch. Clearing it
-                        // would let this effect re-send `LoadAgent` on its next
-                        // run, and the server rejects a duplicate load on an
-                        // already-attached stream as a conflict — so an in-place
-                        // retry cannot succeed. The typed error is what ends the
-                        // spinner; recovery is a deliberate reconnect, which
-                        // clears both the latch and the error and loads again on
-                        // a fresh instance stream.
-                        state_for_load.agent_load_errors.update(|errors| {
-                            errors.insert(
-                                key_for_load.clone(),
-                                format!("Could not open this conversation: {error}"),
-                            );
-                        });
-                    }
-                });
-            }
+            ensure_conversation_loaded(&state_for_auto, key);
             track_active_chat_content(&state_for_auto, key);
+        }
+
+        if crate::native::is_native()
+            && let Some(BackDestination::Chat(Some(parent))) = state_for_auto.back_destination()
+        {
+            ensure_conversation_loaded(&state_for_auto, &parent.as_agent_ref());
         }
 
         if (crate::native::is_native() && !crate::native::chat_visible(&state_for_auto))
@@ -742,6 +633,7 @@ pub fn ChatView() -> impl IntoView {
             on:touchmove=on_touch_move
             on:touchend=on_touch_end
         >
+            <div class="chat-conversation-surface">
             <div class="chat-header tws-header">
                 <button type="button" class="chat-back-button"
                     aria-label={let state = state.clone(); move || state.chat_back_label()}
@@ -901,6 +793,89 @@ pub fn ChatView() -> impl IntoView {
                         }.into_any()
                     }
                 }}
+                <ConversationContext owner=Signal::derive(move || content_owner.get()) />
+            </div>
+            <div
+                class="chat-messages tws-content"
+                id="chat-messages-scroll"
+                data-mobile-test="chat-messages"
+                node_ref=scroll_ref
+                on:scroll=on_scroll
+            >
+                <ConversationContent owner=Signal::derive(move || content_owner.get()) />
+            </div>
+            </div>
+            // Submissions addressed to *this* agent that the transport could not
+            // account for. Ownership is known — this is the agent we sent to —
+            // so they belong in the conversation rather than on the host-scoped
+            // surface. Directly above the composer, so they stay reachable with
+            // the keyboard open. New-chat records never appear here: they have
+            // no agent, and the client does not guess one.
+            <div class="chat-bottom-dock tws-bottom" data-mobile-test="chat-bottom-dock">
+                {move || {
+                    s_pending
+                        .active_agent
+                        .get()
+                        .map(|active| view! {
+                            <AgentPendingSubmissions agent_ref=active.as_agent_ref() />
+                        })
+                }}
+                <ChatInput />
+            </div>
+        </div>
+        {crate::native::is_native().then(|| view! { <NativeParentConversation /> })}
+    }
+}
+
+#[component]
+fn ConversationContext(owner: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let s_context = expect_context::<AppState>();
+    let context_occupancy = Memo::new(move |_| -> Option<(u64, u64)> {
+        let active = owner.get()?;
+        let agent_ref = active.as_agent_ref();
+        let backend = s_context.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
+                .map(|a| a.backend_kind)
+        })?;
+        let reported = s_context.agent_activity_stats.with(|stats| {
+            stats
+                .get(&agent_ref)
+                .and_then(|stats| stats.current_context_usage.clone())
+        });
+        match reported {
+            Some(protocol::CurrentContextUsage::Known {
+                input_tokens,
+                context_window,
+            }) => return Some((input_tokens, context_window)),
+            Some(protocol::CurrentContextUsage::Unknown) => return None,
+            None => {}
+        }
+        if backend == protocol::BackendKind::Codex {
+            return None;
+        }
+        s_context.chat_messages.with(|messages| {
+            let rows = messages.get(&agent_ref)?;
+            for entry in rows.iter().rev() {
+                if !matches!(
+                    entry.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                ) {
+                    continue;
+                }
+                if let Some(breakdown) = &entry.message.context_breakdown {
+                    return Some((breakdown.input_tokens, breakdown.context_window));
+                }
+                if entry.message.tool_calls.is_empty() {
+                    return None;
+                }
+            }
+            None
+        })
+    });
+
+    view! {
                 {move || context_occupancy.get().map(|(used, window)| {
                     let window = window.max(1);
                     let pct = ((used as f64 / window as f64) * 100.0).clamp(0.0, 100.0);
@@ -944,17 +919,85 @@ pub fn ChatView() -> impl IntoView {
                         </svg>
                     }
                 })}
-            </div>
-            <div
-                class="chat-messages tws-content"
-                id="chat-messages-scroll"
-                data-mobile-test="chat-messages"
-                node_ref=scroll_ref
-                on:scroll=on_scroll
-            >
+    }
+}
+
+fn ensure_conversation_loaded(state_for_auto: &AppState, key: &AgentRef) {
+    if state_for_auto
+        .agents
+        .with(|agents| agents.iter().any(|agent| agent.agent_ref() == *key))
+        && state_for_auto
+            .host_stream_untracked(&key.local_host_id)
+            .is_some()
+        && !state_for_auto
+            .agent_load_requests
+            .with_untracked(|loads| loads.contains(key))
+    {
+        state_for_auto.agent_load_requests.update(|loads| {
+            loads.insert(key.clone());
+        });
+        let state_for_load = state_for_auto.clone();
+        let key_for_load = key.clone();
+        spawn_local(async move {
+            if let Err(error) = crate::actions::load_agent(&state_for_load, &key_for_load).await {
+                log::error!(
+                    "load_agent failed host={} agent_id={}: {}",
+                    key_for_load.local_host_id,
+                    key_for_load.agent_id,
+                    error
+                );
+                // Record the failure and *keep* the latch. Clearing it
+                // would let this effect re-send `LoadAgent` on its next
+                // run, and the server rejects a duplicate load on an
+                // already-attached stream as a conflict — so an in-place
+                // retry cannot succeed. The typed error is what ends the
+                // spinner; recovery is a deliberate reconnect, which
+                // clears both the latch and the error and loads again on
+                // a fresh instance stream.
+                state_for_load.agent_load_errors.update(|errors| {
+                    errors.insert(
+                        key_for_load.clone(),
+                        format!("Could not open this conversation: {error}"),
+                    );
+                });
+            }
+        });
+    }
+}
+
+#[component]
+fn ConversationContent(owner: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let s_body = state.clone();
+    let s_compaction = state.clone();
+    let compaction_label = move || {
+        let active = owner.get()?;
+        let ar = AgentRef {
+            local_host_id: active.local_host_id.clone(),
+            agent_id: active.agent_id.clone(),
+        };
+        if let Some(payload) = s_compaction
+            .context_compaction_operations
+            .with(|m| m.get(&ar).cloned())
+        {
+            return context_compaction_status_label(&payload.status).map(str::to_owned);
+        }
+        let payload = s_compaction
+            .agent_compactions
+            .with(|m| m.get(&ar).cloned())?;
+        Some(match payload.status {
+            protocol::types::AgentCompactStatus::Started => "Compacting…".to_string(),
+            protocol::types::AgentCompactStatus::Completed => "Compacted".to_string(),
+            protocol::types::AgentCompactStatus::Failed => payload
+                .message
+                .unwrap_or_else(|| "Compaction failed".to_string()),
+        })
+    };
+
+    view! {
                 <div class="shell-flow">
                 {move || {
-                    let active = s_body.active_agent.get();
+                    let active = owner.get();
                     let Some(ar) = active else {
                         // No active agent: invite the user to send the first
                         // message. The composer below is still live and will
@@ -1327,24 +1370,63 @@ pub fn ChatView() -> impl IntoView {
                 }}
                 {move || compaction_label().map(|label| view! { <div class="chat-working-status" role="status">{label}</div> })}
                 </div>
+    }
+}
+
+#[component]
+fn NativeParentConversation() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let chat_dock_owner = state.native_chat_dock_owner;
+    let owner_state = state.clone();
+    let owner = Signal::derive(move || match owner_state.back_destination() {
+        Some(BackDestination::Chat(parent))
+            if owner_state.app_mode.get() == crate::state::AppMode::Workspace =>
+        {
+            parent
+        }
+        _ => None,
+    });
+    let visible_state = state.clone();
+    let visible = Signal::derive(move || {
+        crate::native::chat_visible(&visible_state)
+            && matches!(
+                visible_state.back_destination(),
+                Some(BackDestination::Chat(_))
+            )
+    });
+    let heading_state = state.clone();
+    let heading = move || {
+        owner.get().and_then(|parent| {
+            heading_state.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.agent_ref() == parent.as_agent_ref())
+                    .map(|agent| (agent.name.clone(), format!("{:?}", agent.backend_kind)))
+            })
+        })
+    };
+    view! {
+        <div class="native-parent-conversation view chat-view" data-native-parent-conversation="" data-native-back-destination=move || visible.get().then_some("") hidden=move || !visible.get() inert="" aria-hidden="true">
+            <Show when=move || visible.get()>
+            <div class="chat-header tws-header">
+                <button type="button" class="chat-back-button" tabindex="-1" aria-label="Back"><span class="chat-back-chevron">"‹"</span></button>
+                <div class="chat-header-center">
+                    <div class="chat-header-title">{move || heading().map(|(name, _)| name)}</div>
+                    <div class="chat-header-subtitle">{move || heading().map(|(_, backend)| backend)}</div>
+                    <Show when=move || chat_dock_owner.get().is_none()>
+                        <crate::components::ChatConnectionStatus />
+                    </Show>
+                </div>
+                <div class="chat-header-actions">
+                    <Show when=move || chat_dock_owner.get() == Some(mobile_shell_types::native::NativeChatDockOwner::Client)>
+                        <crate::components::ChatConnectionStatus />
+                    </Show>
+                    <button type="button" class="chat-more-button" tabindex="-1" aria-label="More agent actions">"…"</button>
+                </div>
+                <ConversationContext owner=owner />
             </div>
-            // Submissions addressed to *this* agent that the transport could not
-            // account for. Ownership is known — this is the agent we sent to —
-            // so they belong in the conversation rather than on the host-scoped
-            // surface. Directly above the composer, so they stay reachable with
-            // the keyboard open. New-chat records never appear here: they have
-            // no agent, and the client does not guess one.
-            <div class="chat-bottom-dock tws-bottom" data-mobile-test="chat-bottom-dock">
-                {move || {
-                    s_pending
-                        .active_agent
-                        .get()
-                        .map(|active| view! {
-                            <AgentPendingSubmissions agent_ref=active.as_agent_ref() />
-                        })
-                }}
-                <ChatInput />
-            </div>
+            <div class="chat-messages tws-content"><ConversationContent owner=owner /></div>
+            </Show>
         </div>
     }
 }

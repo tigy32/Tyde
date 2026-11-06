@@ -63,33 +63,40 @@ enum NativeChatDock {
         guard state.chat_header_owner == .client, let backLabel = state.chat_back_label else {
             throw HostError("Native chat dock requires its chat-local heading and Back label")
         }
+        let dock = NativeBackChatDock(back_label: backLabel, connected_status: state.chat_connected_status,
+            sidebar_available: state.sidebar_available, sidebar_open: state.sidebar_open, chat_actions: state.chat_actions)
+        apply(to: content, dock: dock, modal: state.modal, menu: menu, send: send)
+    }
+
+    static func apply(to content: ContentController, dock: NativeBackChatDock, modal: Bool, menu: UIMenu,
+                      send: @escaping (NativeIntent) -> Void) {
         content.connectedStatusView = nil
         content.navigationItem.title = nil
         content.navigationItem.titleView = nil
         content.navigationItem.leftBarButtonItems = []
         content.navigationItem.rightBarButtonItems = []
         content.navigationItem.trailingItemGroups = []
-        content.navigationItem.hidesBackButton = state.modal
-        content.navigationItem.leftItemsSupplementBackButton = !state.modal
+        content.navigationItem.hidesBackButton = modal
+        content.navigationItem.leftItemsSupplementBackButton = !modal
         // Duo's shared bar is outside navigationBar's interaction/accessibility exclusion.
-        guard !state.modal else {
+        guard !modal else {
             content.navigationItem.backAction = nil
             content.navigationItem.leadingItemGroups = []
             content.navigationItem.additionalOverflowItems = nil
             return
         }
-        content.navigationItem.backAction = UIAction(title: backLabel,
+        content.navigationItem.backAction = UIAction(title: dock.back_label,
             image: UIImage(systemName: "chevron.backward")) { _ in send(.back) }
         var groups: [UIBarButtonItemGroup] = []
-        if state.sidebar_available {
-            let title = state.sidebar_open ? "Hide Agents" : "Show Agents"
+        if dock.sidebar_available {
+            let title = dock.sidebar_open ? "Hide Agents" : "Show Agents"
             let sidebar = UIBarButtonItem(title: title, image: UIImage(systemName: "sidebar.left"),
                 primaryAction: UIAction(title: title) { _ in send(.toggle_sidebar) })
             sidebar.accessibilityLabel = title
             sidebar.accessibilityIdentifier = "native-toggle-agents"
             groups.append(UIBarButtonItemGroup(barButtonItems: [sidebar], representativeItem: nil))
         }
-        if let status = state.chat_connected_status {
+        if let status = dock.connected_status {
             let health = NativeConnectionDockView(frame: .zero)
             health.render(status)
             let item = UIBarButtonItem(customView: health)

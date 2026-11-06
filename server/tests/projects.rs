@@ -6934,13 +6934,13 @@ async fn project_watcher_prunes_ignored_build_trees() {
         let race_file = pruned.join("created-before-dispatch.rs");
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        // Observation acknowledges a real protocol read without scheduling refresh.
-        // Hold after its acknowledgement, before any child event is classified.
+        // Hold only the raced native delivery, not the worker. Unrelated events
+        // must drain while the listing runs so this race cannot force overflow.
         let held = fixture.on_project_scan(
-            repo.path().to_owned(),
-            server::ScanPoint::WatcherObservationComplete,
+            race_file.clone(),
+            server::ScanPoint::WatcherDispatch,
             move || {
-                eprintln!("PROJECT WATCH RACE phase=watcher-held");
+                eprintln!("PROJECT WATCH RACE phase=native-create-held");
                 held_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             },
@@ -6957,14 +6957,15 @@ async fn project_watcher_prunes_ignored_build_trees() {
             )
             .await
             .unwrap();
-        eprintln!("PROJECT WATCH RACE wait=watcher-held");
-        held_rx.await.unwrap();
-        eprintln!("PROJECT WATCH RACE phase=watcher-hold-observed");
         let observed =
             expect_project_file_contents(&mut barrier_reader, "non-refreshing worker barrier")
                 .await;
         assert_eq!(observed.contents.as_deref(), Some("initial\n"));
+        let (created, created_rx) =
+            watch_completion(&fixture, &race_file, server::ScanPoint::WatcherQueued);
         fs::write(&race_file, "visible before watcher classification\n").unwrap();
+        held_rx.await.unwrap();
+        eprintln!("PROJECT WATCH RACE phase=native-create-hold-observed");
         let (settled, settled_rx) =
             watch_completion(&fixture, repo.path(), server::ScanPoint::FileRefreshSettled);
         scan_release_tx.send(()).unwrap();
@@ -6983,16 +6984,20 @@ async fn project_watcher_prunes_ignored_build_trees() {
             server::ScanPoint::WatcherRemovalQueued,
         );
         fs::remove_file(&race_file).unwrap();
+        release_tx.send(()).unwrap();
+        created_rx.await.unwrap();
+        eprintln!("PROJECT WATCH RACE phase=native-create-queued");
         removed_rx.await.unwrap();
         eprintln!("PROJECT WATCH RACE phase=native-removal-queued");
         eprintln!(
-            "PROJECT WATCH RACE EVIDENCE file_listed=true prior_refreshes_settled=true removed_before_create_classified=true"
+            "PROJECT WATCH RACE EVIDENCE file_listed=true prior_refreshes_settled=true removed_before_create_classified=true raw_removal_required=true"
         );
-        release_tx.send(()).unwrap();
-        observe_project_file(&mut barrier_reader, &project, "src/main.rs").await;
-        let (drained, drained_rx) =
-            watch_completion(&fixture, repo.path(), server::ScanPoint::FileRefreshSettled);
-        drained_rx.await.unwrap();
+        expect_watched_listing(
+            &mut fixture.client,
+            "pruned/deep/created-before-dispatch.rs",
+            false,
+        )
+        .await;
         let mut replay = fixture.connect().await;
         let snapshot = expect_project_bootstrap(&mut replay, "settled removal snapshot").await;
         assert_eq!(snapshot.project.id, project.id);
@@ -7004,13 +7009,7 @@ async fn project_watcher_prunes_ignored_build_trees() {
             }),
             "settled cached listing must omit the removed uninventoried child"
         );
-        expect_watched_listing(
-            &mut fixture.client,
-            "pruned/deep/created-before-dispatch.rs",
-            false,
-        )
-        .await;
-        drop((scan, held, settled, removed, drained));
+        drop((scan, held, created, settled, removed));
     }
 
     for relative in [

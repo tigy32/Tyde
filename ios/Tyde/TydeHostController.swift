@@ -97,15 +97,53 @@ private final class NativeInputDiagnostics: NSObject, WKScriptMessageHandler {
 #endif
 
 @MainActor
+private final class NativeBackAnimator: NSObject, UIViewControllerAnimatedTransitioning {
+    private var animator: UIViewPropertyAnimator?
+    private let onFailure: (String) -> Void
+
+    init(onFailure: @escaping (String) -> Void) { self.onFailure = onFailure }
+
+    func transitionDuration(using context: UIViewControllerContextTransitioning?) -> TimeInterval { 0.35 }
+
+    func interruptibleAnimator(using context: UIViewControllerContextTransitioning) -> UIViewImplicitlyAnimating {
+        if let animator { return animator }
+        guard let source = context.view(forKey: .from), let target = context.view(forKey: .to) else {
+            onFailure("Native Back transition views are unavailable")
+            context.completeTransition(false)
+            return UIViewPropertyAnimator()
+        }
+        let container = context.containerView
+        target.frame = container.bounds
+        target.transform = CGAffineTransform(translationX: -container.bounds.width * 0.3, y: 0)
+        container.insertSubview(target, belowSubview: source)
+        let animation = UIViewPropertyAnimator(duration: transitionDuration(using: context), curve: .easeOut) {
+            source.transform = CGAffineTransform(translationX: container.bounds.width, y: 0)
+            target.transform = .identity
+        }
+        animation.addCompletion { _ in
+            source.transform = .identity
+            target.transform = .identity
+            context.completeTransition(!context.transitionWasCancelled)
+        }
+        animator = animation
+        return animation
+    }
+
+    func animateTransition(using context: UIViewControllerContextTransitioning) {
+        interruptibleAnimator(using: context).startAnimation()
+    }
+}
+
+@MainActor
 final class ContentController: UIViewController {
     var onVisible: ((ContentController) -> Void)?
     weak var connectedStatusView: UIView?
-    override func viewDidLoad() { super.viewDidLoad(); view.backgroundColor = .systemBackground }
+    override func viewDidLoad() { super.viewDidLoad(); view.backgroundColor = .clear }
     override func viewWillAppear(_ animated: Bool) { super.viewWillAppear(animated); onVisible?(self) }
 }
 
 @MainActor
-final class TydeHostController: UIViewController, UITabBarControllerDelegate, UINavigationControllerDelegate, WKNavigationDelegate, WKUIDelegate {
+final class TydeHostController: UIViewController, UITabBarControllerDelegate, UINavigationControllerDelegate, UIGestureRecognizerDelegate, WKNavigationDelegate, WKUIDelegate {
     private let tabs = UITabBarController()
     private let entry = ContentController()
     private var activeContainer: UIViewController?
@@ -120,12 +158,28 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     private var presentation: NativePresentation?
     private let logger = Logger(subsystem: "dev.tyde.mobile.nativeqa", category: "host")
     private var applyingPresentation = false
+    private var backGestures: [NativeTab: UIScreenEdgePanGestureRecognizer] = [:]
+    private var backInteraction: UIPercentDrivenInteractiveTransition?
+    private var backSourceRevision: UInt64?
+    private var backCommitRevision: UInt64?
+    private var backDisplayLink: CADisplayLink?
+    private weak var backSource: UIView?
+    private var backEpoch: UInt64 = 0
+    private var backScriptInFlight = false
+    private var backPendingProgress: UInt32?
+    private var backSamples = 0
+    private var backMaximum: UInt32 = 0
     private enum DocumentState: String { case loading, live, terminated, recovering, failed }
     private var documentState = DocumentState.loading {
         didSet {
             guard documentState != oldValue else { return }
             logger.notice("Native document state=\(self.documentState.rawValue, privacy: .public)")
             if documentState != .live {
+                stopBackSurface()
+                backInteraction?.cancel()
+                backInteraction = nil
+                backCommitRevision = nil
+                for gesture in backGestures.values { gesture.isEnabled = false }
                 for content in Array(roots.values) + Array(detailControllers.values) {
                     content.connectedStatusView?.isHidden = true
                 }
@@ -161,6 +215,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
 
     func start() {
         #if DEBUG
+        NativeStartupDiagnostics.record(.host_start_entered)
         let environment = ProcessInfo.processInfo.environment
         let inputControl = environment["TYDE_IOS_INPUT_CONTROL"] ?? ""
         let plainWebKitControl = inputControl == "plain-webkit"
@@ -186,7 +241,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         let plainWebKitControl = false
         #endif
         tabs.delegate = self
-        entry.onVisible = { [weak self] controller in self?.attach(to: controller) }
+        entry.onVisible = { [weak self] controller in self?.contentWillAppear(controller) }
         overrideUserInterfaceStyle = .dark
         view.backgroundColor = UIColor(white: 0.071, alpha: 1)
         let configuration = WKWebViewConfiguration()
@@ -222,8 +277,12 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             } catch { fail("Native acceptance pairing input could not be encoded"); return }
         }
         #endif
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_create_begin)
+        #endif
         webView = WKWebView(frame: .zero, configuration: configuration)
         #if DEBUG
+        NativeStartupDiagnostics.record(.wk_create_complete)
         webView.isInspectable = environment["TYDE_IOS_WEB_INSPECTOR"] == "1"
         #endif
         webView.navigationDelegate = self
@@ -234,9 +293,15 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         for (tab, title, image) in [(NativeTab.home, "Home", "house"), (.agents, "Agents", "play.fill"), (.sessions, "Sessions", "list.bullet"), (.settings, "Settings", "gearshape")] {
             let root = ContentController()
             root.title = title
-            root.onVisible = { [weak self] controller in self?.attach(to: controller) }
+            root.onVisible = { [weak self] controller in self?.contentWillAppear(controller) }
             let navigation = UINavigationController(rootViewController: root)
             navigation.delegate = self
+            navigation.interactivePopGestureRecognizer?.isEnabled = false
+            let edge = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(interactiveBack(_:)))
+            edge.edges = .left
+            edge.delegate = self
+            view.addGestureRecognizer(edge)
+            backGestures[tab] = edge
             navigation.tabBarItem = UITabBarItem(title: title, image: UIImage(systemName: image), selectedImage: nil)
             navigation.tabBarItem.accessibilityIdentifier = "native-tab-" + tab.rawValue
             roots[tab] = root
@@ -245,6 +310,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         tabs.viewControllers = [navigations[.home]!, navigations[.agents]!, navigations[.sessions]!, navigations[.settings]!]
         showContainer(entry)
         attach(to: entry)
+        #if DEBUG
+        NativeStartupDiagnostics.record(.entry_attached)
+        #endif
         var scriptsInstalled = false
         loadDocument = { [weak self] in
             guard let self else { return }
@@ -252,8 +320,14 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             let generation = self.loadGeneration
             Task { @MainActor [weak self] in
                 do {
+                    #if DEBUG
+                    NativeStartupDiagnostics.record(.resources_requested)
+                    #endif
                     let (url, bridge) = try await Task.detached { try ClientBootstrap.load() }.value
                     guard let self, self.loadGeneration == generation else { return }
+                    #if DEBUG
+                    NativeStartupDiagnostics.record(.resources_loaded)
+                    #endif
                     if !scriptsInstalled {
                         if !plainWebKitControl {
                             let chatDockOwner: String
@@ -262,7 +336,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                             } else {
                                 chatDockOwner = "null"
                             }
-                            let bootstrap = "const tydeNativeChatDockOwner = \(chatDockOwner); const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
+                            let bootstrap = "const tydeNativeChatDockOwner = \(chatDockOwner); const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBackSurfaceVersion = \(nativeBackSurfaceVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
                             configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
                         }
                         for script in startupScripts { configuration.userContentController.addUserScript(script) }
@@ -274,13 +348,22 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                         return
                     }
                     #endif
+                    #if DEBUG
+                    NativeStartupDiagnostics.record(.wk_load_requested)
+                    #endif
                     guard let navigation = self.webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)) else {
                         self.documentFailed("Native client navigation could not start")
                         return
                     }
                     self.documentNavigation = navigation
+                    #if DEBUG
+                    NativeStartupDiagnostics.record(.wk_load_created)
+                    #endif
                 } catch {
                     guard let self, self.loadGeneration == generation else { return }
+                    #if DEBUG
+                    NativeStartupDiagnostics.record(.resources_failed)
+                    #endif
                     self.documentFailed("Native bootstrap could not start")
                 }
             }
@@ -483,8 +566,34 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         if let failureOverlay { view.bringSubviewToFront(failureOverlay) }
     }
 
-    private func attach(to controller: ContentController) {
-        guard webView != nil, webView.superview !== controller.view else { return }
+    private func contentWillAppear(_ controller: ContentController) {
+        #if DEBUG
+        logger.debug("Native back stage=will-appear root=\(self.roots.values.contains { $0 === controller }) route=\(self.presentation?.route.rawValue ?? "none", privacy: .public)")
+        #endif
+    }
+
+    private func updateWorkspaceViewport() {
+        guard ready, presentation?.workspace == true, webView.superview === view,
+              let navigation = tabs.selectedViewController as? UINavigationController,
+              let content = navigation.topViewController?.view else { return }
+        webView.frame = content.convert(content.safeAreaLayoutGuide.layoutFrame, to: view)
+    }
+
+    private func attach(to controller: UIViewController) {
+        guard webView != nil else { return }
+        if controller is UINavigationController {
+            if webView.superview !== view {
+                logger.debug("Native back stage=attach owner=workspace route=\(self.presentation?.route.rawValue ?? "none", privacy: .public)")
+                webView.removeFromSuperview()
+                webView.translatesAutoresizingMaskIntoConstraints = true
+                view.addSubview(webView)
+            }
+            updateWorkspaceViewport()
+            if let failureOverlay { view.bringSubviewToFront(failureOverlay) }
+            return
+        }
+        guard webView.superview !== controller.view else { return }
+        logger.debug("Native back stage=attach owner=entry route=\(self.presentation?.route.rawValue ?? "none", privacy: .public)")
         webView.removeFromSuperview()
         webView.translatesAutoresizingMaskIntoConstraints = false
         controller.view.addSubview(webView)
@@ -496,12 +605,47 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     }
 
     private func render(_ state: NativePresentation) {
+        #if DEBUG
+        NativeStartupDiagnostics.record(.presentation_received)
+        #endif
         guard state.version == nativeBridgeVersion else { fail("Native presentation version mismatch"); return }
-        applyingPresentation = true
-        defer { applyingPresentation = false }
+        if let version = state.back_surface_version, version != nativeBackSurfaceVersion {
+            fail("Native Back surface contract mismatch"); return
+        }
+        if state.back_surface_version != nil && state.navigation_revision == nil {
+            fail("Native Back surface revision is missing"); return
+        }
         logger.debug("Native projection tab=\(state.tab.rawValue, privacy: .public) route=\(state.route.rawValue, privacy: .public) workspace=\(state.workspace)")
         guard documentState == .loading || documentState == .recovering || documentState == .live else { return }
+        #if DEBUG
+        if state.back_surface_version == nativeBackSurfaceVersion {
+            NativeStartupDiagnostics.record(.back1_acknowledged)
+            if state.navigation_revision != nil, state.back_ready_revision == state.navigation_revision,
+               state.back_destination != nil {
+                NativeStartupDiagnostics.record(.back1_ready)
+            }
+        }
+        #endif
         presentation = state
+        if let revision = backCommitRevision {
+            guard state.navigation_revision != revision else { return }
+            backCommitRevision = nil
+        }
+        // UIKit owns the in-flight gesture; heartbeat projections must not reset its stack.
+        if state.client_ready, state.workspace,
+           let navigation = tabs.selectedViewController as? UINavigationController,
+           navigation.transitionCoordinator != nil {
+            #if DEBUG
+            logger.debug("Native back stage=projection-deferred route=\(state.route.rawValue, privacy: .public)")
+            #endif
+            return
+        }
+        applyPresentation(state)
+    }
+
+    private func applyPresentation(_ state: NativePresentation) {
+        applyingPresentation = true
+        defer { applyingPresentation = false }
         guard state.client_ready else {
             if documentState == .live { documentState = .loading }
             showContainer(entry)
@@ -510,6 +654,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         }
         documentState = .live
         #if DEBUG
+        NativeStartupDiagnostics.record(.client_ready)
         navigationDiagnostics?.record(.projection, window: view.window, state: state, ready: ready)
         let observeApplied = { [self] in
             let selected = navigations.first { $0.value === tabs.selectedViewController }?.key
@@ -529,23 +674,29 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             return
         }
         showContainer(tabs)
+        #if DEBUG
+        NativeStartupDiagnostics.record(.workspace_attached)
+        #endif
         // iPad's floating tabs are not descendants of the legacy tabBar view.
         tabs.setTabBarHidden(state.modal, animated: false)
         for navigation in navigations.values {
             navigation.tabBarItem.isEnabled = !state.modal
-            navigation.setNavigationBarHidden(state.route == .chat && state.chat_header_owner == .client && state.chat_dock_owner != .shell, animated: false)
-            navigation.navigationBar.isUserInteractionEnabled = !state.modal
+            navigation.setNavigationBarHidden(navigationBarHidden(for: state.route, state: state), animated: false)
+            navigation.navigationBar.isUserInteractionEnabled = !state.modal && (state.route == .root || state.back_surface_version == nil || state.back_ready_revision == state.navigation_revision)
             navigation.navigationBar.accessibilityElementsHidden = state.modal
-            navigation.interactivePopGestureRecognizer?.isEnabled = !state.modal
+            navigation.interactivePopGestureRecognizer?.isEnabled = false
         }
         guard let navigation = navigations[state.tab], let root = roots[state.tab] else { fail("Unknown native destination"); return }
         tabs.selectedViewController = navigation
+        for (tab, edge) in backGestures {
+            edge.isEnabled = tab == state.tab && state.back_surface_version == nativeBackSurfaceVersion && state.back_destination != nil && state.back_ready_revision == state.navigation_revision && !state.modal && !state.sidebar_open
+        }
         let content: ContentController
         if state.route != .root && state.workspace {
             if let existing = detailControllers[state.tab] { content = existing }
             else {
                 content = ContentController()
-                content.onVisible = { [weak self] controller in self?.attach(to: controller) }
+                content.onVisible = { [weak self] controller in self?.contentWillAppear(controller) }
                 detailControllers[state.tab] = content
             }
             if navigation.topViewController !== content { navigation.setViewControllers([root, content], animated: false) }
@@ -553,17 +704,89 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             content = root
             if navigation.topViewController !== root { navigation.setViewControllers([root], animated: false) }
         }
+        resetNavigationItem(content)
+        if let destination = state.back_destination {
+            resetNavigationItem(root)
+            configureHeading(root, title: destination.title, subtitle: nil, chat: destination.route == .chat,
+                connectedStatus: destination.connected_status)
+            root.navigationItem.leftBarButtonItems = []
+            if destination.route == .root { configureRootActions(root, tab: destination.tab) }
+            else { root.navigationItem.rightBarButtonItems = [] }
+            if destination.route == .chat, state.chat_dock_owner == .shell {
+                guard state.chat_header_owner == .client, let dock = destination.chat_dock else {
+                    fail("Native Back chat destination dock is missing"); return
+                }
+                if #available(iOS 27.1, *) {
+                    NativeChatDock.apply(to: root, dock: dock, modal: state.modal,
+                        menu: moreMenu(agentActions: dock.chat_actions, composerActions: true),
+                        send: { [weak self] intent in self?.send(intent) })
+                } else { fail("Native chat dock requires iOS 27.1 or later"); return }
+            }
+        }
+        configureHeading(content, title: state.title, subtitle: state.subtitle, chat: state.route == .chat,
+            connectedStatus: state.route != .chat && state.root_status_owner == .shell ? state.root_connected_status : nil)
+        if state.route == .chat {
+            content.navigationItem.rightBarButtonItems = [moreButton(agentActions: state.chat_actions, composerActions: state.chat_header_owner == .client)]
+        } else if state.route == .root {
+            configureRootActions(content, tab: state.tab)
+        } else {
+            content.navigationItem.rightBarButtonItems = []
+        }
+        content.navigationItem.hidesBackButton = state.sidebar_open
+        content.navigationItem.leftItemsSupplementBackButton = !state.sidebar_open
+        if state.sidebar_available {
+            let sidebar = UIBarButtonItem(title: state.sidebar_open ? "Hide Agents" : "Show Agents",
+                image: UIImage(systemName: "sidebar.left"),
+                primaryAction: UIAction { [weak self] _ in self?.send(.toggle_sidebar) })
+            sidebar.accessibilityLabel = state.sidebar_open ? "Hide Agents" : "Show Agents"
+            sidebar.accessibilityIdentifier = "native-toggle-agents"
+            sidebar.isEnabled = !state.modal
+            content.navigationItem.leftBarButtonItems = [sidebar]
+        } else {
+            content.navigationItem.leftBarButtonItems = []
+        }
+        content.navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = !state.modal }
+        if state.route == .chat, state.chat_dock_owner == .shell {
+            if #available(iOS 27.1, *) {
+                do {
+                    try NativeChatDock.apply(to: content, state: state,
+                        menu: moreMenu(agentActions: state.chat_actions, composerActions: true),
+                        send: { [weak self] intent in self?.send(intent) })
+                } catch { fail(error.localizedDescription); return }
+            } else {
+                fail("Native chat dock requires iOS 27.1 or later")
+                return
+            }
+        }
+        attach(to: navigation)
+        reportLayout()
+        #if DEBUG
+        observeApplied()
+        #endif
+    }
+
+    private func navigationBarHidden(for route: NativeRoute, state: NativePresentation) -> Bool {
+        route == .chat && state.chat_header_owner == .client && state.chat_dock_owner != .shell
+    }
+
+    private func resetNavigationItem(_ content: ContentController) {
         content.navigationItem.backAction = nil
         content.navigationItem.additionalOverflowItems = nil
-        content.navigationItem.title = state.title
+        content.navigationItem.leadingItemGroups = []
+        content.navigationItem.trailingItemGroups = []
+    }
+
+    private func configureHeading(_ content: ContentController, title headingTitle: String, subtitle: String?, chat: Bool,
+                                  connectedStatus: NativeConnectedStatus?) {
+        content.navigationItem.title = headingTitle
         content.connectedStatusView = nil
-        if ready, state.route != .chat, state.root_status_owner == .shell, let status = state.root_connected_status {
+        if let status = connectedStatus {
             let heading = UIStackView()
             heading.axis = .horizontal
             heading.spacing = 8
             heading.alignment = .center
             let title = UILabel()
-            title.text = state.title
+            title.text = headingTitle
             title.font = .preferredFont(forTextStyle: .headline)
             title.adjustsFontForContentSizeCategory = true
             title.lineBreakMode = .byTruncatingTail
@@ -596,70 +819,39 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             heading.addArrangedSubview(health)
             content.connectedStatusView = health
             content.navigationItem.titleView = heading
-        } else if let subtitle = state.subtitle {
+        } else if let subtitle = subtitle {
             let heading = UIStackView()
-            heading.axis = state.route == .chat ? .horizontal : .vertical
-            heading.spacing = state.route == .chat ? 8 : 0
+            heading.axis = chat ? .horizontal : .vertical
+            heading.spacing = chat ? 8 : 0
             heading.alignment = .center
             let title = UILabel()
-            title.text = state.title
+            title.text = headingTitle
             title.font = .preferredFont(forTextStyle: .headline)
             title.adjustsFontForContentSizeCategory = true
-            if state.route == .chat {
+            if chat {
                 title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             }
             let detail = UILabel()
             detail.text = subtitle
-            detail.font = .preferredFont(forTextStyle: state.route == .chat ? .subheadline : .caption1)
+            detail.font = .preferredFont(forTextStyle: chat ? .subheadline : .caption1)
             detail.adjustsFontForContentSizeCategory = true
             detail.textColor = .secondaryLabel
             heading.addArrangedSubview(title)
             heading.addArrangedSubview(detail)
             content.navigationItem.titleView = heading
         } else { content.navigationItem.titleView = nil }
-        if state.route == .chat {
-            content.navigationItem.rightBarButtonItems = [moreButton(agentActions: state.chat_actions, composerActions: state.chat_header_owner == .client)]
-        } else if state.route == .root && state.tab == .agents {
-            content.navigationItem.rightBarButtonItems = [newChatButton()]
-        } else if state.route == .root && state.tab == .home {
+    }
+
+    private func configureRootActions(_ content: ContentController, tab: NativeTab) {
+        switch tab {
+        case .agents: content.navigationItem.rightBarButtonItems = [newChatButton()]
+        case .home:
             let hosts = UIBarButtonItem(title: "Hosts", primaryAction: UIAction(title: "Hosts") { [weak self] _ in self?.send(.hosts) })
             hosts.accessibilityLabel = "Hosts"
             hosts.accessibilityIdentifier = "native-hosts"
             content.navigationItem.rightBarButtonItems = [hosts]
-        } else {
-            content.navigationItem.rightBarButtonItems = []
+        case .sessions, .settings: content.navigationItem.rightBarButtonItems = []
         }
-        content.navigationItem.hidesBackButton = state.sidebar_open
-        content.navigationItem.leftItemsSupplementBackButton = !state.sidebar_open
-        if state.sidebar_available {
-            let sidebar = UIBarButtonItem(title: state.sidebar_open ? "Hide Agents" : "Show Agents",
-                image: UIImage(systemName: "sidebar.left"),
-                primaryAction: UIAction { [weak self] _ in self?.send(.toggle_sidebar) })
-            sidebar.accessibilityLabel = state.sidebar_open ? "Hide Agents" : "Show Agents"
-            sidebar.accessibilityIdentifier = "native-toggle-agents"
-            sidebar.isEnabled = !state.modal
-            content.navigationItem.leftBarButtonItems = [sidebar]
-        } else {
-            content.navigationItem.leftBarButtonItems = []
-        }
-        content.navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = !state.modal }
-        if state.route == .chat, state.chat_dock_owner == .shell {
-            if #available(iOS 27.1, *) {
-                do {
-                    try NativeChatDock.apply(to: content, state: state,
-                        menu: moreMenu(agentActions: state.chat_actions, composerActions: true),
-                        send: { [weak self] intent in self?.send(intent) })
-                } catch { fail(error.localizedDescription); return }
-            } else {
-                fail("Native chat dock requires iOS 27.1 or later")
-                return
-            }
-        }
-        attach(to: content)
-        reportLayout()
-        #if DEBUG
-        observeApplied()
-        #endif
     }
 
     private func newChatButton() -> UIBarButtonItem {
@@ -692,6 +884,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     func send(_ intent: NativeIntent) {
         #if DEBUG
         navigationDiagnostics?.record(.intent_requested, window: view.window, state: presentation, ready: ready, intent: intent)
+        if intent == .back { logger.debug("Native back stage=intent-requested ready=\(self.ready)") }
         #endif
         guard ready else { return }
         do {
@@ -699,6 +892,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('tyde-native-intent', {detail: \(json)}))") { [weak self] _, error in
                 #if DEBUG
                 if let self {
+                    if intent == .back { self.logger.debug("Native back stage=script-completed failed=\(error != nil)") }
                     self.navigationDiagnostics?.record(.script_completed, window: self.view.window,
                         state: self.presentation, ready: self.ready, intent: intent, scriptFailed: error != nil)
                 }
@@ -738,6 +932,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        updateWorkspaceViewport()
         reportLayout()
         #if DEBUG
         navigationDiagnostics?.record(.layout, window: view.window, state: presentation, ready: ready)
@@ -751,10 +946,163 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         return false
     }
 
+    private func sendBackUpdate(_ update: NativeBackUpdate, completion: (() -> Void)? = nil) {
+        guard ready else { return }
+        let generation = loadGeneration
+        do {
+            let json = String(decoding: try JSONEncoder().encode(update), as: UTF8.self)
+            webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('tyde-native-back', {detail: \(json)}))") { [weak self] _, error in
+                guard let self, self.ready, self.loadGeneration == generation else { return }
+                if error != nil { self.fail("Native Back could not reach the retained client"); return }
+                completion?()
+            }
+        } catch { fail("Native Back progress could not be encoded") }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard ready, let state = presentation, state.back_surface_version == nativeBackSurfaceVersion, !state.modal, !state.sidebar_open,
+              state.back_destination != nil, state.back_ready_revision == state.navigation_revision, backCommitRevision == nil,
+              gestureRecognizer === backGestures[state.tab],
+              let navigation = navigations[state.tab] else { return false }
+        return navigation.viewControllers.count > 1 && navigation.transitionCoordinator == nil
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        backGestures.values.contains { $0 === gestureRecognizer }
+            && otherGestureRecognizer.view?.isDescendant(of: webView) == true
+    }
+
+    @objc private func interactiveBack(_ gesture: UIScreenEdgePanGestureRecognizer) {
+        guard let state = presentation, let navigation = navigations[state.tab] else { return }
+        let width = navigation.view.bounds.width
+        guard width > 0 else { return }
+        let progress = min(1, max(0, gesture.translation(in: navigation.view).x / width))
+        switch gesture.state {
+        case .began:
+            logger.debug("Native back stage=gesture-began route=\(state.route.rawValue, privacy: .public) headerHidden=\(navigation.isNavigationBarHidden) surfaceReady=\(state.back_ready_revision == state.navigation_revision)")
+            let interaction = UIPercentDrivenInteractiveTransition()
+            interaction.completionCurve = .easeOut
+            backInteraction = interaction
+            navigation.popViewController(animated: true)
+        case .changed:
+            backInteraction?.update(progress)
+        case .ended:
+            if progress > 0.5 || gesture.velocity(in: navigation.view).x > 500 {
+                backInteraction?.finish()
+            } else { backInteraction?.cancel() }
+        case .cancelled, .failed: backInteraction?.cancel()
+        default: break
+        }
+    }
+
+    func navigationController(_ navigationController: UINavigationController,
+                              animationControllerFor operation: UINavigationController.Operation,
+                              from fromVC: UIViewController, to toVC: UIViewController) -> UIViewControllerAnimatedTransitioning? {
+        operation == .pop && presentation?.back_surface_version == nativeBackSurfaceVersion ? NativeBackAnimator { [weak self] message in self?.fail(message) } : nil
+    }
+
+    func navigationController(_ navigationController: UINavigationController,
+                              interactionControllerFor animationController: UIViewControllerAnimatedTransitioning) -> UIViewControllerInteractiveTransitioning? {
+        backInteraction
+    }
+
+    @objc private func sampleBackSurface() {
+        updateWorkspaceViewport()
+        guard ready, backSourceRevision != nil, let source = backSource, let frame = source.layer.presentation()?.frame,
+              let container = source.superview, container.bounds.width > 0 else { return }
+        let fraction = min(1, max(0, frame.minX / container.bounds.width))
+        let progress = UInt32((fraction * 1000).rounded())
+        backSamples += 1
+        backMaximum = max(backMaximum, progress)
+        backPendingProgress = progress
+        flushBackProgress()
+    }
+
+    private func flushBackProgress() {
+        guard !backScriptInFlight, let progress = backPendingProgress,
+              let revision = backSourceRevision else { return }
+        backPendingProgress = nil
+        backScriptInFlight = true
+        let epoch = backEpoch
+        sendBackUpdate(NativeBackUpdate(version: nativeBackSurfaceVersion, phase: .progress, source_revision: revision, progress: progress)) { [weak self] in
+            guard let self, self.backEpoch == epoch else { return }
+            self.backScriptInFlight = false
+            self.flushBackProgress()
+        }
+    }
+
+    private func stopBackSurface() {
+        backDisplayLink?.invalidate()
+        backDisplayLink = nil
+        backSource = nil
+        backSourceRevision = nil
+        backEpoch += 1
+        backPendingProgress = nil
+        backScriptInFlight = false
+        logger.debug("Native back stage=surface-ended samples=\(self.backSamples) maximum=\(self.backMaximum)")
+    }
+
+    func navigationController(_ navigationController: UINavigationController, willShow viewController: UIViewController, animated: Bool) {
+        #if DEBUG
+        logger.debug("Native back stage=will-show root=\(self.roots.values.contains { $0 === viewController }) interactive=\(navigationController.transitionCoordinator?.isInteractive == true) applying=\(self.applyingPresentation) route=\(self.presentation?.route.rawValue ?? "none", privacy: .public)")
+        navigationController.transitionCoordinator?.notifyWhenInteractionChanges { [weak self] context in
+            self?.logger.debug("Native back stage=interaction-ended cancelled=\(context.isCancelled)")
+        }
+        #endif
+        if !applyingPresentation, ready, let state = presentation,
+           navigationController === navigations[state.tab] {
+            if viewController === roots[state.tab], let destination = state.back_destination {
+                navigationController.setNavigationBarHidden(navigationBarHidden(for: destination.route, state: state), animated: animated)
+            } else {
+                navigationController.setNavigationBarHidden(navigationBarHidden(for: state.route, state: state), animated: animated)
+            }
+        }
+        guard !applyingPresentation, ready, let state = presentation,
+              navigationController === navigations[state.tab], state.back_surface_version == nativeBackSurfaceVersion,
+              let revision = state.navigation_revision, state.back_destination != nil,
+              viewController === roots[state.tab],
+              let coordinator = navigationController.transitionCoordinator,
+              let source = coordinator.viewController(forKey: .from)?.view else { return }
+        stopBackSurface()
+        backSamples = 0
+        backMaximum = 0
+        backSource = source
+        backSourceRevision = revision
+        sendBackUpdate(NativeBackUpdate(version: nativeBackSurfaceVersion, phase: .progress, source_revision: revision, progress: 0))
+        let link = CADisplayLink(target: self, selector: #selector(sampleBackSurface))
+        backDisplayLink = link
+        link.add(to: .main, forMode: .common)
+    }
+
     func navigationController(_ navigationController: UINavigationController, didShow viewController: UIViewController, animated: Bool) {
-        guard !applyingPresentation, let state = presentation, state.route != .root, state.workspace,
-              navigationController === navigations[state.tab], viewController === roots[state.tab] else { return }
-        send(.back)
+        #if DEBUG
+        logger.debug("Native back stage=did-show root=\(self.roots.values.contains { $0 === viewController }) applying=\(self.applyingPresentation) route=\(self.presentation?.route.rawValue ?? "none", privacy: .public)")
+        #endif
+        guard !applyingPresentation, ready, let state = presentation else { return }
+        let sourceRevision = backSourceRevision
+        stopBackSurface()
+        backInteraction = nil
+        if navigationController === navigations[state.tab], state.route != .root,
+           state.workspace, viewController === roots[state.tab] {
+            if state.back_surface_version == nil {
+                // ABI6 clients predate live surfaces; their one canonical Back intent remains supported.
+                send(.back)
+                return
+            }
+            guard let revision = sourceRevision else { fail("Native Back completed without its surface revision"); return }
+            backCommitRevision = revision
+            logger.debug("Native back stage=intent-requested ready=\(self.ready)")
+            #if DEBUG
+            navigationDiagnostics?.record(.intent_requested, window: view.window, state: presentation, ready: ready, intent: .back)
+            #endif
+            sendBackUpdate(NativeBackUpdate(version: nativeBackSurfaceVersion, phase: .complete, source_revision: revision, progress: 1000))
+        } else {
+            if let revision = sourceRevision {
+                sendBackUpdate(NativeBackUpdate(version: nativeBackSurfaceVersion, phase: .cancel, source_revision: revision, progress: 0))
+            }
+            applyPresentation(state)
+        }
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -784,6 +1132,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             UIApplication.shared.open(url, options: [:]) { [weak self] opened in if !opened { self?.fail("External link could not open") } }
 
         } else if ClientBootstrap.permitsEntry(url) {
+            #if DEBUG
+            NativeStartupDiagnostics.record(.wk_entry_admitted)
+            #endif
             platform.suspendClient()
             decisionHandler(.allow)
         } else {
@@ -793,6 +1144,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_provisional_started)
+        #endif
         documentNavigation = navigation
         if documentState == .live { documentState = .loading }
         platform.suspendClient()
@@ -801,6 +1155,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         guard navigation === documentNavigation else { return }
         guard webView.url?.host == ClientBootstrap.origin.host else { fail("Untrusted native document"); return }
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_committed)
+        #endif
         if documentState != .recovering { documentState = .loading }
         lastLayout = nil
         platform.beginBootstrap()
@@ -809,6 +1166,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard navigation === documentNavigation else { return }
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_finished)
+        #endif
         webView.evaluateJavaScript("JSON.stringify({secureContext:window.isSecureContext,webCrypto:!!window.crypto?.subtle,indexedDB:!!window.indexedDB,webRTC:typeof RTCPeerConnection==='function',mediaCapture:typeof navigator.mediaDevices?.getUserMedia==='function',audioWorklet:typeof AudioWorkletNode==='function'})") { [weak self] value, error in
             guard let self, self.documentNavigation === navigation else { return }
             if let value = value as? String, error == nil {
@@ -819,13 +1179,22 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         guard navigation === documentNavigation else { return }
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_navigation_failed)
+        #endif
         documentFailed("Native client navigation failed")
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         guard navigation === documentNavigation else { return }
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_provisional_failed)
+        #endif
         documentFailed("Native client could not load")
     }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        #if DEBUG
+        NativeStartupDiagnostics.record(.wk_process_terminated)
+        #endif
         let interruptedRecovery = documentState == .recovering
         loadGeneration += 1
         documentState = .terminated

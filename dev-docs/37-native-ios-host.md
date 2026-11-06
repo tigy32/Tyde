@@ -1405,3 +1405,63 @@ its selection by the failed native document and the original TypeError cause
 remain unproved. Linux HTTP/module/worker and archived ABI-contract flows are
 not physical native acceptance. Same-origin QA hosting and retained-device
 requests stay with their designated custodians through the PM.
+
+### Live native Back surfaces on the stable platform baseline
+
+Bootstrap1/platform ABI6 is stable across nightly host/client releases. The
+proposed ABI7 minimum was withdrawn before publication: Back does not require a
+new discovery, HTTP, credential or presentation baseline. Server descriptors,
+Service registration/resolution and full-client manifests remain ABI6. There
+is no ABI range/floor reinterpretation or Service/account change. A publisher
+still selects the exact authenticated host's client/wire; that is NOT an exact
+native-binary release lock. Normal nightly wire/client updates do not raise the
+native minimum.
+
+The new binary advertises generated `backSurfaceVersion: 1`; the current full
+client explicitly echoes `back_surface_version: 1`, with typed optional
+navigation/readiness revisions and destination. Only this acknowledged contract
+admits native live Back. Unknown extension versions fail before full-client
+fetch/execution. Missing capability means the supported base contract, not an
+error recovery or a second renderer/reducer. Neither endpoint failures nor
+missing destination data select another path. A declared but malformed surface
+contract fails explicitly. The same full client, AppState, registry and editor
+serve both consumers.
+
+| Installed native / client | Old/current server29 (ABI6) | Updated nightly host/current client |
+| --- | --- | --- |
+| TestFlight8, platform6, no Back extension | Ordinary existing paired operation; known old-binary native Back flash remains | Ordinary paired operation remains supported; current client emits no live-Back acknowledgement |
+| New Back binary (formerly proposed ABI7; now platform6 + Back1) | Existing ABI6 full client boots; canonical Back taps remain supported, live gesture withheld without client acknowledgement | Same baseline admission; live native pop enabled only after Back1 destination readiness |
+
+A native update is needed once for the new native compositor/gesture behavior,
+not once per nightly. Updating only the host/client cannot fix old Swift content
+ownership. No reset/re-pair, store migration, alternate old-client selection or
+credential rewrite is required. New binary + old full client intentionally has
+no new interactive-pop claim; the existing canonical Back intent/tap remains.
+
+`native-bootstrap-integrated-v1` is the unchanged UI78 ABI6 consumer, not an
+exact TestFlight8 fixture. `native-bootstrap-testflight8-v1` maps real retained
+Build8 archive bridge/manifest bytes and its exact generated source consumer
+from18edb87d, IPA SHA256 e214935b417cc72a7728bc39de3dc91cc709f49a1fce919905add18428e4dc54.
+Its custody names the activation receipt and source manifest; real browser proof
+is not physical TestFlight execution. `native-bootstrap-compatible-back-v1`
+freezes the independent new platform6/Back1 consumer. The existing real-server
+bootstrap/upgrade journey keeps the old integrated consumer and exercises both
+mapped consumers before/after host restart, authenticated discovery and frozen
+serialization. The inline mounted Wasm journey covers ordinary base-contract
+Back/draft/selection and Back1 acknowledgement, progress and canonical commits. Unknown Back2 is refused before any
+full-client fetch. Literal old server29/native installation and original native
+pixels remain the sole GUI custodian's explicit matrix, not inferred from schema.
+
+The workspace WK remains in the host ancestor across pops and tabs, with viewport
+from the current public safe-area guide. One native edge recognizer drives a real
+UIKit percent-driven pop even with client-owned/hidden-bar chat; stock gesture is
+disabled. Modal/open-sidebar states exclude Back. The live target comes from the
+same canonical ancestry that completion commits. Its typed chrome carries root
+health or the parent chat's Back label, health, sidebar and action ownership;
+prepared and active chat chrome use the same native dock renderer. Transition
+bar visibility uses the same header/dock ownership rule as settled rendering.
+Cancel changes presentation only; Complete commits once, qualified by source revision. Layout readiness and
+injected-progress DOM tests do not prove native raster. Sole1f must record genuine
+Hosts and hidden-bar root/nested chat entry, cancel/complete, continuously live
+destination pixels and exact draft/range/photos; Root owns original-frame signoff.
+No Back tap substitutes for a pan in that live-surface acceptance matrix.

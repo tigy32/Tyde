@@ -5977,3 +5977,48 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 .connection-banner-inner.reconnecting .ui-status-dot {
     box-shadow: none;
 }
+
+/* The one WebKit scene stays attached while UIKit transitions its chrome. */
+[data-native-host] .native-workspace:not(.native-split) { position: relative; isolation: isolate; }
+[data-native-host] .native-workspace:not(.native-split) > .native-pane {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-base);
+}
+[data-native-host] .native-back-target {
+    z-index: 0;
+    transform: translateX(calc((var(--native-back-progress, 0) - 1) * 30%));
+    pointer-events: none;
+}
+[data-native-host] .native-workspace:not(.native-split):not([data-native-back-nested]) > [data-native-shell-active] {
+    z-index: 1;
+    transform: translateX(calc(var(--native-back-progress, 0) * 100%));
+}
+[data-native-host] .native-workspace[data-native-back-running] > .native-pane { pointer-events: none; }
+[data-native-host] .native-parent-conversation { display: none; }
+[data-native-host] [data-native-back-nested] .native-chat-pane { transform: none; background: transparent; }
+[data-native-host] [data-native-back-nested] .native-parent-conversation:not([hidden]) {
+    display: grid;
+    position: absolute;
+    inset: 0;
+    background: var(--bg-base);
+    transform: translateX(calc((var(--native-back-progress, 0) - 1) * 30%));
+    pointer-events: none;
+}
+[data-native-host] [data-native-back-nested] .native-chat-pane > .chat-view:not(.native-parent-conversation) {
+    position: relative;
+    background: transparent;
+}
+ .chat-conversation-surface { display: contents; }
+[data-native-host] .chat-conversation-surface {
+    display: grid;
+    grid-area: 1 / 1;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-base);
+}
+[data-native-host] [data-native-back-nested] .native-chat-pane > .chat-view:not(.native-parent-conversation) { z-index: 1; }
+[data-native-host] [data-native-back-nested] .chat-conversation-surface {
+    transform: translateX(calc(var(--native-back-progress, 0) * 100%));
+}
+[data-native-host] .native-chat-pane { position: relative; isolation: isolate; }

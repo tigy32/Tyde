@@ -545,6 +545,12 @@ pub enum AppMode {
     Pairing(PairingScreen),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackDestination {
+    Root(MobileTab),
+    Chat(Option<ActiveAgentRef>),
+}
+
 // ── Refs ───────────────────────────────────────────────────────────────
 
 /// Composite key for per-agent state (chat, tasks, streaming, etc).
@@ -1053,6 +1059,7 @@ pub struct AppState {
     pub chat_back_stack: RwSignal<Vec<ActiveAgentRef>>,
     pub chat_draft_id: RwSignal<uuid::Uuid>,
     pub chat_edit_id: RwSignal<uuid::Uuid>,
+    pub native_back_progress: RwSignal<Option<u32>>,
     pub native_layout: RwSignal<mobile_shell_types::native::NativeLayout>,
     pub native_sidebar_open: RwSignal<bool>,
     pub native_modal_sources: RwSignal<Vec<Signal<bool>>>,
@@ -1328,29 +1335,62 @@ impl AppState {
         self.viewing_chat.set(true);
     }
 
+    pub fn back_destination(&self) -> Option<BackDestination> {
+        self.active_local_host_id.get()?;
+        if self.app_mode.get() == AppMode::HostPicker {
+            return Some(
+                if self.viewing_chat.get() && self.chat_origin_tab.get() == MobileTab::Home {
+                    BackDestination::Chat(self.active_agent.get())
+                } else {
+                    BackDestination::Root(MobileTab::Home)
+                },
+            );
+        }
+        if !crate::native::chat_visible(self) {
+            return None;
+        }
+        Some(self.chat_back_destination())
+    }
+
+    fn chat_back_destination(&self) -> BackDestination {
+        self.chat_back_stack.with(|parents| match parents.last() {
+            Some(parent) => BackDestination::Chat(Some(parent.clone())),
+            None => BackDestination::Root(MobileTab::Agents),
+        })
+    }
+
     pub fn back_from_chat(&self) {
         self.native_chat_destination.set(None);
-        // This is navigation history, not a live catalog lookup: connection recovery
-        // may retire agent records while the user still needs to leave the chat.
-        let parent = self
-            .chat_back_stack
-            .try_update(|parents| parents.pop())
-            .flatten();
-        if let Some(parent) = parent {
-            self.active_agent.set(Some(parent));
-        } else {
-            batch(|| {
+        // Navigation history remains valid when a connection retires live records.
+        let destination = self.chat_back_destination();
+        batch(|| {
+            if let BackDestination::Chat(parent) = destination {
+                self.chat_back_stack.update(|parents| {
+                    parents.pop();
+                });
+                self.active_agent.set(parent);
+            } else {
                 self.active_tab.set(MobileTab::Agents);
                 self.chat_origin_tab.set(MobileTab::Agents);
                 self.viewing_chat.set(false);
-            });
-        }
+            }
+        });
     }
 
     pub fn chat_back_label(&self) -> String {
+        self.chat_back_label_at(0)
+    }
+
+    pub(crate) fn back_destination_chat_back_label(&self) -> String {
+        self.chat_back_label_at(usize::from(self.app_mode.get() != AppMode::HostPicker))
+    }
+
+    fn chat_back_label_at(&self, depth: usize) -> String {
         self.chat_back_stack.with(|parents| {
             parents
-                .last()
+                .iter()
+                .rev()
+                .nth(depth)
                 .map(|parent| {
                     self.agents.with(|agents| {
                         agents
@@ -1403,6 +1443,7 @@ impl AppState {
             chat_back_stack: RwSignal::new(Vec::new()),
             chat_draft_id: RwSignal::new(uuid::Uuid::new_v4()),
             chat_edit_id: RwSignal::new(uuid::Uuid::new_v4()),
+            native_back_progress: RwSignal::new(None),
             native_layout: RwSignal::new(mobile_shell_types::native::NativeLayout::Compact),
             native_sidebar_open: RwSignal::new(true),
             native_modal_sources: RwSignal::new(Vec::new()),

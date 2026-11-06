@@ -1,0 +1,18 @@
+{
+  "status": "UNRELEASED_BASE6_BACK_SURFACE1_CONSUMER",
+  "source_base": "6181ca012be80741aeb62a33cc3f866afad2e5e3",
+  "shell_release": "0.9.6-beta.29",
+  "bootstrap_version": 1,
+  "native_bridge_abi": 6,
+  "back_surface_version": 1,
+  "limits": "Independent consumer snapshot; proposed ABI7 minimum withdrawn before publication. This native capability extends stable bootstrap1/platform6, not the server wire. Not a signed/installed binary or native raster/gesture acceptance. Both original ABI6 fixtures and actual Build8 source-mapped consumer remain independent.",
+  "archive_sha256": "3673f88ab474a7ada37b8e74f94503955635955fe1ad3ab60dd42e4b95299ab0",
+  "bridge_sha256": "1babfddfeb0a4df0d5ac752a873cc4f274ca7a522f070ecf884db6172ab5a200",
+  "native_contract_sha256": "a069a48bc75be279956683ff6a5ef388de71bac7c626a745976bca5aa15fd0e2",
+  "files_sha256": {
+    "NativeBridge.swift": "ee7abb29b2a15998e8a44d752d46efdc54fd2f2b9a447a8a45a14bda0ff3d252",
+    "NativeBridgeContract.json": "a069a48bc75be279956683ff6a5ef388de71bac7c626a745976bca5aa15fd0e2",
+    "Web/native-manifest.json": "7d52d7fa1e63f96ce65372d7ca7ef74fc8cd9e8ee36db72680c5043923fd7b77",
+    "native-host.js": "1babfddfeb0a4df0d5ac752a873cc4f274ca7a522f070ecf884db6172ab5a200"
+  }
+}

@@ -9,7 +9,7 @@
         return handler.postMessage(payload);
     };
     Object.defineProperty(window, "__tydeNativeHost", {
-        value: Object.freeze({ chatDockOwner: tydeNativeChatDockOwner, rootStatusOwner: tydeNativeRootStatusOwner, chatHeaderOwner: tydeNativeChatHeaderOwner, version: tydeNativeBridgeVersion, bootstrapVersion: tydeNativeBootstrapVersion, shellRelease: tydeNativeShellRelease, scopeSecrets: keys => post(tydeNativeSecretScopeEndpoint, JSON.stringify({keys})), post }), writable: false, configurable: false
+        value: Object.freeze({ chatDockOwner: tydeNativeChatDockOwner, rootStatusOwner: tydeNativeRootStatusOwner, chatHeaderOwner: tydeNativeChatHeaderOwner, version: tydeNativeBridgeVersion, backSurfaceVersion: tydeNativeBackSurfaceVersion, bootstrapVersion: tydeNativeBootstrapVersion, shellRelease: tydeNativeShellRelease, scopeSecrets: keys => post(tydeNativeSecretScopeEndpoint, JSON.stringify({keys})), post }), writable: false, configurable: false
     });
     const localFetch = window.fetch.bind(window);
     let nextRequestId = 1;

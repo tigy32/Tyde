@@ -1673,6 +1673,7 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
     let evidence_root = root.join("target/thin-native-proof");
     tokio::fs::create_dir_all(&evidence_root).await.unwrap();
     let evidence = tempfile::tempdir_in(&evidence_root).unwrap().keep();
+    Fixture::qualify_literal_server29(&evidence).await;
     let mut child = tokio::process::Command::new("node")
         .arg("tools/native-client-upgrade.mjs")
         .current_dir(root)
@@ -1733,7 +1734,7 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
     let authority = independent
         .post(format!("http://{}/tyde/bootstrap", baseline.address))
         .json(&protocol::MobileDirectBootstrapRequest {
-            native_bridge_abi: 6,
+            native_bridge_abi: mobile_shell_types::native::NATIVE_BRIDGE_VERSION,
             offer_id: None,
             offer_secret: None,
         })
@@ -1925,7 +1926,7 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
         let admission = reqwest::Client::new()
             .post(format!("http://{}/tyde/bootstrap", witness.address))
             .json(&protocol::MobileDirectBootstrapRequest {
-                native_bridge_abi: 6,
+                native_bridge_abi: mobile_shell_types::native::NATIVE_BRIDGE_VERSION,
                 offer_id: Some(seed.offer_id),
                 offer_secret: Some(seed.offer_secret),
             })
@@ -1945,7 +1946,7 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
             .post(format!("http://{}/tyde/bootstrap", witness.address))
             .bearer_auth("invalid-disposable-device")
             .json(&protocol::MobileDirectBootstrapRequest {
-                native_bridge_abi: 6,
+                native_bridge_abi: mobile_shell_types::native::NATIVE_BRIDGE_VERSION,
                 offer_id: None,
                 offer_secret: None,
             })

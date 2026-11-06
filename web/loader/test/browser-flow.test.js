@@ -84,7 +84,7 @@ test("installed storage migrates once, then follows exact targets without losing
     .match(/<script src="\.\/(decoder\/jsqr[^"/]*\.js)"/)[1];
   const decoderBytes = await readFile(new URL(decoderPath, root));
   const legacyWorker = await readFile(new URL("test/fixtures/pre-cache-classifier-sw.js", root));
-  const assets = new Set(["index.html", "loader.js", "native-bootstrap.js", "native-service.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js", "icons/icon.svg"]);
+  const assets = new Set(["index.html", "loader.js", "native-bootstrap.js", "native-contract.js", "native-service.js", "loader.css", "sw.js", "mobile-service-config.js", "cbor.js", "pairing.js", "pairing-ui.js", "styles.js", "manifest-policy.js", "integrity.js", "manifest.webmanifest", "decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js", "icons/icon.svg"]);
   const server = createServer(async (req, res) => {
     try {
       const path = new URL(req.url, "http://fixture.invalid").pathname;

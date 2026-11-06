@@ -21,6 +21,7 @@ hmac = "0.12"
 client = { path = "../client" }
 devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
+mobile-shell-types = { path = "../mobile-shell-types" }
 settings-model = { path = "../settings-model" }
 mobile-pairing = { path = "../mobile-pairing" }
 rtc-transport = { path = "../rtc-transport" }

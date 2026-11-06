@@ -419,13 +419,17 @@ fn RetainedNativePane(tab: MobileTab, children: ChildrenFn) -> impl IntoView {
         visible_state.app_mode.get() == AppMode::Workspace
             && ((selected == tab && !chat) || (tab == MobileTab::Agents && split))
     });
+    let target_state = state.clone();
+    let target = Signal::derive(move || {
+        target_state.back_destination() == Some(crate::state::BackDestination::Root(tab))
+    });
     Effect::new(move |_| {
-        if visible.get() {
+        if visible.get() || target.get() {
             visited.set(true);
         }
     });
     view! {
-        <div class="native-pane" class:native-agents-pane=tab == MobileTab::Agents hidden=move || !visible.get()
+        <div class="native-pane" data-native-back-destination=move || (target.get() && !visible.get()).then_some("") class:native-back-target=move || target.get() && !visible.get() inert=move || (!visible.get()).then_some("") aria-hidden=move || (!visible.get()).to_string() class:native-agents-pane=tab == MobileTab::Agents hidden=move || !visible.get() && !target.get()
             data-native-shell-active=move || (visible.get() && !crate::native::chat_visible(&state)).then_some("")>
             <Show when=move || visited.get()>{children()}</Show>
         </div>
@@ -451,6 +455,10 @@ fn NativeWorkspace() -> impl IntoView {
         </div>
         <crate::voice::MobileVoiceRuntime />
         <div class="mobile-content native-workspace"
+            style=move || format!("--native-back-progress:{}", state.native_back_progress.get().unwrap_or(0) as f64 / 1000.0)
+            data-native-back-running=move || state.native_back_progress.get().map(|_| "")
+            data-native-back-nested={let state = state.clone(); move || (crate::native::chat_visible(&state)
+                && matches!(state.back_destination(), Some(crate::state::BackDestination::Chat(_)))).then_some("")}
             class:native-pairing=move || matches!(state.app_mode.get(), AppMode::Pairing(_))
             class:native-split=move || {
             crate::native::sidebar_visible(&split_state)
@@ -466,16 +474,17 @@ fn NativeWorkspace() -> impl IntoView {
                     _ => ().into_any(),
                 }}
             </div>
-            <div class="native-pane" hidden=move || state.app_mode.get() != AppMode::HostPicker
+            <div class="native-pane native-hosts-pane" hidden=move || state.app_mode.get() != AppMode::HostPicker
                 data-native-shell-active=move || (state.app_mode.get() == AppMode::HostPicker).then_some("")>
                 <Show when=move || state.app_mode.get() == AppMode::HostPicker>
                     <components::PairedHostsPicker />
                 </Show>
             </div>
-            <div class="native-pane native-chat-pane" hidden={let state = state.clone(); move || !crate::native::chat_visible(&state)}
+            <div class="native-pane native-chat-pane" data-native-back-destination={let state = state.clone(); move || (state.app_mode.get() == AppMode::HostPicker && matches!(state.back_destination(), Some(crate::state::BackDestination::Chat(_)))).then_some("")} inert={let state = state.clone(); move || (!crate::native::chat_visible(&state)).then_some("")} aria-hidden={let state = state.clone(); move || (!crate::native::chat_visible(&state)).to_string()} class:native-back-target={let state = state.clone(); move || state.app_mode.get() == AppMode::HostPicker && matches!(state.back_destination(), Some(crate::state::BackDestination::Chat(_)))} hidden={let state = state.clone(); move || !crate::native::chat_visible(&state)
+                && !(state.app_mode.get() == AppMode::HostPicker && matches!(state.back_destination(), Some(crate::state::BackDestination::Chat(_))))}
                 data-native-shell-active=move || crate::native::chat_visible(&visible_state).then_some("")>
                 <Show when=move || chat_visited.get()>
-                    <For each=move || vec![(state.active_agent.get().map(|active| active.as_agent_ref()), state.chat_draft_id.get())] key=Clone::clone let:_chat>
+                    <For each=move || vec![state.chat_draft_id.get()] key=Clone::clone let:_draft>
                         <components::ChatView />
                     </For>
                 </Show>
@@ -1882,9 +1891,15 @@ mod wasm_tests {
         let window = web_sys::window().unwrap();
         let native = js_sys::Object::new();
         js_sys::Reflect::set(&native, &"version".into(), &NATIVE_BRIDGE_VERSION.into()).unwrap();
+        js_sys::Reflect::set(
+            &native,
+            &"backSurfaceVersion".into(),
+            &mobile_shell_types::native::NATIVE_BACK_SURFACE_VERSION.into(),
+        )
+        .unwrap();
         let post = js_sys::Function::new_with_args(
             "endpoint,payload",
-            "if (endpoint === 'presentation') this.presentations.push(JSON.parse(payload)); return Promise.resolve(null)",
+            "if (endpoint === 'presentation') {const p=JSON.parse(payload);this.presentations.push(p);window.dispatchEvent(new CustomEvent('test-native-presentation',{detail:p}));} return Promise.resolve(null)",
         );
         js_sys::Reflect::set(&native, &"post".into(), &post).unwrap();
         js_sys::Reflect::set(&native, &"presentations".into(), &js_sys::Array::new()).unwrap();
@@ -1903,7 +1918,7 @@ mod wasm_tests {
             view! { <AppSurface /> }
         });
         // Wasm panics do not unwind. Restore the platform boundary before reporting failures.
-        let result: Result<(), String> = async {
+        let mut result: Result<(), String> = async {
             let check = |condition: bool, message: &str| {
                 if condition { Ok(()) } else { Err(message.to_owned()) }
             };
@@ -2137,7 +2152,7 @@ mod wasm_tests {
                     let chat = find("[data-mobile-test='chat-messages']")?;
                     let wide = layout == NativeIntent::RegularLandscape;
                     check(home_entry.sidebar_available == wide && home_entry.sidebar_open == open
-                        && (hierarchy.get_bounding_client_rect().height() > 0.0) == open
+                        && (hierarchy.get_bounding_client_rect().height() > 0.0 && hierarchy.closest("[inert]").unwrap().is_none()) == open
                         && chat.get_bounding_client_rect().height() > 0.0,
                         "Home entry preserves the layout and deliberate hierarchy visibility choice")?;
                     if open {
@@ -2178,7 +2193,11 @@ mod wasm_tests {
                     find(&format!("[data-mobile-test='agents-view'] [aria-label='Open chat with {name}']"))?
                         .dyn_into::<HtmlElement>().unwrap().click();
                     next_tick().await;
-                    check(projected()? == home_entry,
+                    let mut repeated_entry = projected()?;
+                    // Navigation generations differ; every rendered field must still match.
+                    repeated_entry.navigation_revision = home_entry.navigation_revision;
+                    repeated_entry.back_ready_revision = home_entry.back_ready_revision;
+                    check(repeated_entry == home_entry,
                         "Home and Agents entry must emit identical native presentation")?;
                     if !open && wide {
                         navigate(NativeIntent::ToggleSidebar)?;
@@ -2194,6 +2213,75 @@ mod wasm_tests {
                     next_tick().await;
                 }
             }
+            let native_ready = js_sys::Function::new_with_args("native", r#"
+                return new Promise(resolve => {
+                    const ready=p=>p?.back_destination&&p.back_ready_revision===p.navigation_revision;
+                    if(ready(native.presentations.at(-1))){resolve();return;}
+                    const observed=event=>{if(ready(event.detail)){window.removeEventListener('test-native-presentation',observed);resolve();}};
+                    window.addEventListener('test-native-presentation',observed);
+                });
+            "#);
+            let back_progress = |phase: mobile_shell_types::native::NativeBackPhase, progress: u32| -> Result<(), String> {
+                let update = mobile_shell_types::native::NativeBackUpdate { version: mobile_shell_types::native::NATIVE_BACK_SURFACE_VERSION, phase, source_revision: projected()?.navigation_revision.ok_or("Missing acknowledged navigation revision")?, progress };
+                let options = web_sys::CustomEventInit::new();
+                options.set_detail(&serde_wasm_bindgen::to_value(&update).map_err(|_| "Invalid Back update")?);
+                let event = web_sys::CustomEvent::new_with_event_init_dict("tyde-native-back", &options).map_err(|_| "Missing Back event")?;
+                window.dispatch_event(&event).map_err(|_| "Back update failed")?;
+                Ok(())
+            };
+            let exposed_parent = js_sys::Function::new_with_args("source,target,before,progress", r#"
+                const pane = source.closest('.native-chat-pane');
+                const rect = el => el.getBoundingClientRect();
+                const p = rect(pane), s = rect(source), t = rect(target);
+                const report = {
+                    progress, pane: p.toJSON(), source: s.toJSON(), target: t.toJSON(),
+                    paneTransform: getComputedStyle(pane).transform,
+                    sourceTransform: getComputedStyle(source).transform,
+                    targetTransform: getComputedStyle(target).transform,
+                };
+                console.log('Native nested Back geometry ' + JSON.stringify(report));
+                const fail = message => { throw new Error(message + ': ' + JSON.stringify(report)); };
+                const near = (a,b) => Math.abs(a-b) < 1;
+                if (!near(p.left, before.left) || !near(p.width, before.width))
+                    fail('The shared ancestor must stay fixed while its two conversations move');
+                if (!near(s.left, before.left + progress * before.width))
+                    fail('The outgoing conversation must receive exactly one progress translation');
+                if (!near(t.left, before.left + (progress-1) * 0.3 * before.width)
+                    || !near(t.width, before.width) || t.left > before.left || t.right < Math.min(s.left, before.right))
+                    fail('The live parent must cover the entire exposed horizontal interval');
+                const scroller = target.querySelector('.chat-messages');
+                const clip = rect(scroller);
+                // Inert/pointer-events exclude the preview from hit testing, not painting.
+                // Change only hit-test eligibility synchronously, then restore it in finally.
+                const inert = target.getAttribute('inert');
+                const styles = [target, source].map(el => el.getAttribute('style'));
+                try {
+                    target.removeAttribute('inert');
+                    for (const el of [target, source]) el.style.setProperty('pointer-events','auto','important');
+                    let paintedText = false;
+                    for (const content of target.querySelectorAll('[data-mobile-test="chat-message-content"]')) {
+                        if (!content.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) continue;
+                        const range = document.createRange();
+                        range.selectNodeContents(content);
+                        for (const r of range.getClientRects()) {
+                            const left = Math.max(r.left, clip.left, before.left);
+                            const right = Math.min(r.right, clip.right, s.left, before.right);
+                            const top = Math.max(r.top, clip.top, p.top);
+                            const bottom = Math.min(r.bottom, clip.bottom, p.bottom);
+                            if (right-left <= 2 || bottom-top <= 2) continue;
+                            const hit = document.elementFromPoint((left+right)/2, (top+bottom)/2);
+                            if (content.contains(hit)) paintedText = true;
+                        }
+                    }
+                    if (!paintedText) fail('The exposed destination must contain visible, unclipped, unoccluded parent text');
+                } finally {
+                    if (inert !== null) target.setAttribute('inert',inert);
+                    [target,source].forEach((el,i) => {
+                        if (styles[i] === null) el.removeAttribute('style');
+                        else el.setAttribute('style',styles[i]);
+                    });
+                }
+            "#);
             // Actual server-emitted relationships drive a nested route, not tool text.
             let stream = protocol::StreamPath("/host/native-hierarchy".into());
             for (seq, id, parent) in [(0, "Navigation child", "entry-loose"), (1, "Navigation grandchild", "Navigation child")] {
@@ -2203,6 +2291,21 @@ mod wasm_tests {
                 child.origin = protocol::AgentOrigin::AgentControl;
                 dispatch_envelope(&state, &host_id,
                     protocol::Envelope::from_payload(stream.clone(), FrameKind::NewAgent, seq, &child).unwrap());
+            }
+            for id in ["entry-loose", "Navigation child", "Navigation grandchild"] {
+                let owner = crate::state::AgentRef { local_host_id: host_id.clone(), agent_id: protocol::AgentId(id.into()) };
+                state.agent_loaded.update(|loaded| { loaded.insert(owner.clone()); });
+                for index in 0..12 {
+                    state.push_chat_message_entry(&owner, crate::state::ChatMessageEntry {
+                        message: protocol::ChatMessage {
+                            origin: None, message_id: None, timestamp: index,
+                            sender: protocol::MessageSender::User,
+                            content: format!("Live parent destination {id} row {index}\nA second line\nA third line"),
+                            reasoning: None, tool_calls: Vec::new(), model_info: None,
+                            token_usage: None, context_breakdown: None, images: None,
+                        }, tool_requests: Vec::new(),
+                    });
+                }
             }
             let other_host = LocalHostId("different-navigation-host".into());
             let mut collision = fixture_user_agent("entry-loose", "other-session");
@@ -2230,14 +2333,111 @@ mod wasm_tests {
                     check(back.get_attribute("aria-label").as_deref() == Some(format!("Back to {parent}").as_str())
                         && back.get_bounding_client_rect().width() >= 44.0,
                         "Nested Back names the same-host parent and remains visible")?;
-                    back.dyn_into::<HtmlElement>().unwrap().click();
+                    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(native_ready.call1(&wasm_bindgen::JsValue::NULL, &native).unwrap())).await.unwrap();
+                    let before_agent = state.active_agent.get_untracked();
+                    let before_stack = state.chat_back_stack.get_untracked();
+                    let editor = find("[data-mobile-test='chat-input']")?.dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+                    editor.set_selection_range(0, 0).unwrap();
+                    let original_dock_owner = state.native_chat_dock_owner.get_untracked();
+                    navigate(NativeIntent::ChatDockShell)?;
                     next_tick().await;
+                    let preview = projected()?.back_destination.ok_or("Missing canonical Back target")?;
+                    let preview_dock = preview.chat_dock.ok_or("Missing canonical parent dock")?;
+                    let expected_parent_back = if parent == "Navigation child" { "Back to Loose agent" } else { "Back to Agents" };
+                    check(preview.title == parent && preview_dock.back_label == expected_parent_back
+                        && preview_dock.connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
+                        && preview_dock.chat_actions
+                        && preview_dock.sidebar_available == (layout == NativeIntent::RegularLandscape)
+                        && !preview_dock.sidebar_open
+                        && projected()?.root_connected_status.is_none()
+                        && projected()?.chat_back_label.as_deref() == Some(format!("Back to {parent}").as_str()),
+                        "A parent preview projects its own canonical Back/actions and host health, not the source label or root health")?;
+                    let source = find(".chat-conversation-surface")?;
+                    let source_before = source.get_bounding_client_rect();
+                    back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 500)?;
+                    next_tick().await;
+                    let inactive_modal = RwSignal::new(false);
+                    let inactive_modal_source = Signal::derive(move || inactive_modal.get());
+                    state.native_modal_sources.update(|sources| sources.push(inactive_modal_source));
+                    next_tick().await;
+                    state.native_modal_sources.update(|sources| sources.retain(|source| *source != inactive_modal_source));
+                    next_tick().await;
+                    let target = find(".native-parent-conversation")?;
+                    check(target.get_bounding_client_rect().height() > 0.0
+                        && target.text_content().unwrap_or_default().contains(parent)
+                        && target.text_content().unwrap_or_default().contains("Live parent destination")
+                        && source.get_bounding_client_rect().left() > source_before.left() + source_before.width() * 0.4
+                        && state.active_agent.get_untracked() == before_agent
+                        && state.chat_back_stack.get_untracked() == before_stack,
+                        "Live inactive modal owners cannot reset the half-pop or commit its canonical parent")?;
+                    let before = js_sys::Object::new();
+                    for (name, value) in [("left", source_before.left()), ("right", source_before.right()), ("width", source_before.width())] {
+                        js_sys::Reflect::set(&before, &name.into(), &value.into()).unwrap();
+                    }
+                    for progress in [250, 500, 750, 1000] {
+                        back_progress(mobile_shell_types::native::NativeBackPhase::Progress, progress)?;
+                        next_tick().await;
+                        exposed_parent.call4(&wasm_bindgen::JsValue::NULL, &source, &target, &before, &(f64::from(progress) / 1000.0).into())
+                            .map_err(|error| format!("Nested native destination paint failed: {error:?}"))?;
+                    }
+                    back_progress(mobile_shell_types::native::NativeBackPhase::Cancel, 0)?;
+                    next_tick().await;
+                    check(state.active_agent.get_untracked() == before_agent
+                        && state.chat_back_stack.get_untracked() == before_stack
+                        && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&editor)),
+                        "Cancel retains the current route, canonical history and singleton editor")?;
+                    check(projected()?.chat_back_label.as_deref() == Some(format!("Back to {parent}").as_str())
+                        && projected()?.chat_dock_owner == Some(mobile_shell_types::native::NativeChatDockOwner::Shell),
+                        "Cancelling a shell-dock Back keeps source ownership and source ancestry")?;
+                    state.native_chat_dock_owner.set(original_dock_owner);
+                    next_tick().await;
+                    find("[data-mobile-test='chat-more']")?.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    find("[data-mobile-test='chat-menu-rename']")?.dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    find("[data-mobile-test='chat-rename-input']")?.dyn_into::<web_sys::HtmlInputElement>().unwrap().set_value("Do not rename the parent");
+                    state.native_chat_dock_owner.set(Some(mobile_shell_types::native::NativeChatDockOwner::Shell));
+                    next_tick().await;
+                    back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 500)?;
+                    next_tick().await;
+                    back_progress(mobile_shell_types::native::NativeBackPhase::Complete, 1000)?;
+                    next_tick().await;
+                    check(container.query_selector("[data-mobile-test='chat-rename-input']").unwrap().is_none(),
+                        "An agent-owned Rename edit cannot survive a completed parent Back")?;
+                    check(find("[data-mobile-test='chat-input']")?.is_same_node(Some(&editor)),
+                        "Completing parent Back retains the same editor node")?;
                     check(projected()?.route == mobile_shell_types::native::NativeRoute::Chat
                         && find("[data-mobile-test='chat-title']")?.text_content().as_deref() == Some(parent),
                         "Nested Back pops exactly one parent chat, never the list or a colliding host")?;
+                    let committed = projected()?;
+                    check(committed.chat_dock_owner == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
+                        && committed.chat_back_label.as_deref() == Some(preview_dock.back_label.as_str())
+                        && committed.chat_connected_status == preview_dock.connected_status
+                        && committed.sidebar_available == preview_dock.sidebar_available
+                        && committed.sidebar_open == preview_dock.sidebar_open
+                        && committed.chat_actions == preview_dock.chat_actions
+                        && committed.root_connected_status.is_none(),
+                        "Completing nested Back commits exactly the previewed parent dock without moving chat health into root state")?;
+                    state.native_chat_dock_owner.set(original_dock_owner);
+                    next_tick().await;
                 }
-                find("[data-mobile-test='chat-back']")?.dyn_into::<HtmlElement>().unwrap().click();
+                wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(native_ready.call1(&wasm_bindgen::JsValue::NULL, &native).unwrap())).await.unwrap();
+                back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 1000)?;
                 next_tick().await;
+                let row = find("[data-mobile-test='agents-view'] [data-mobile-test='agent-row-idle']")?;
+                let before_commit = row.get_bounding_client_rect();
+                let root_health = projected()?.back_destination.ok_or("Missing Agents Back target")?.connected_status;
+                check(projected()?.root_connected_status.is_none()
+                    && root_health.as_ref().and_then(|status| status.round_trip_ms) == Some(47),
+                    "Preparing Agents carries root health only in the destination projection")?;
+                back_progress(mobile_shell_types::native::NativeBackPhase::Complete, 1000)?;
+                next_tick().await;
+                let after_commit = row.get_bounding_client_rect();
+                check(projected()?.root_connected_status == root_health,
+                    "The revealed root commits the exact health projected for its native heading")?;
+                check((before_commit.top() - after_commit.top()).abs() < 0.5
+                    && (before_commit.height() - after_commit.height()).abs() < 0.5,
+                    "The revealed Agents row keeps its actual geometry across native Back commit")?;
                 check(projected()?.route == mobile_shell_types::native::NativeRoute::Root
                     && projected()?.tab == mobile_shell_types::native::NativeTab::Agents,
                     "Back after the final parent lands at Agents")?;
@@ -2334,8 +2534,35 @@ mod wasm_tests {
             next_tick().await;
             check(projected()?.route == mobile_shell_types::native::NativeRoute::Hosts,
                 "Hosts must be a native navigation detail over the retained workspace")?;
-            navigate(NativeIntent::Back)?;
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(native_ready.call1(&wasm_bindgen::JsValue::NULL, &native).unwrap())).await.unwrap();
+            let chooser = find(".native-hosts-pane")?;
+            let chooser_before = chooser.get_bounding_client_rect();
+            let home = find(".home-view")?;
+            check(home.get_bounding_client_rect().height() > 0.0,
+                "Hosts keeps the actual Home destination laid out before an interactive pop")?;
+            let before_projection = projected()?;
+            back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 500)?;
             next_tick().await;
+            check(chooser.get_bounding_client_rect().left() > chooser_before.left() + chooser_before.width() * 0.4
+                && home.get_bounding_client_rect().height() > 0.0 && projected()? == before_projection,
+                "Native progress reveals live destination geometry without changing the logical route")?;
+            back_progress(mobile_shell_types::native::NativeBackPhase::Cancel, 0)?;
+            next_tick().await;
+            check((chooser.get_bounding_client_rect().left() - chooser_before.left()).abs() < 1.0
+                && projected()? == before_projection && composer.selection_start().unwrap() == Some(2)
+                && composer.selection_end().unwrap() == Some(7),
+                "Cancel returns the actual outgoing surface and preserves exact draft selection")?;
+            back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 1000)?;
+            next_tick().await;
+            // The native host heading intentionally hides .home-hero; measure an actual visible summary card.
+            let home_card = home.query_selector(".home-grid > :first-child").unwrap().ok_or("Missing live Home card")?;
+            check(home_card.get_bounding_client_rect().height() > 0.0,
+                "The destination summary card must actually be rendered")?;
+            let before_commit = home_card.get_bounding_client_rect();
+            back_progress(mobile_shell_types::native::NativeBackPhase::Complete, 1000)?;
+            next_tick().await;
+            check((home_card.get_bounding_client_rect().top() - before_commit.top()).abs() < 0.5,
+                "Hosts reveals the actual Home card with destination-owned clearance before commit")?;
             navigate(NativeIntent::Hosts)?;
             next_tick().await;
             find("[data-mobile-test='paired-host-open']")?.dyn_into::<HtmlElement>().unwrap().click();
@@ -2415,6 +2642,9 @@ mod wasm_tests {
                         let controls = content.query_selector_all("button,input,textarea,select,a,[role='button'],[role='option']").unwrap();
                         for index in 0..controls.length() {
                             let control = controls.item(index).unwrap().dyn_into::<web_sys::Element>().unwrap();
+                            // Prepared Agents search measured (-72,8,200,48) under the opaque outgoing
+                            // pane. Inert destination controls are not user-active HUD collision targets.
+                            if control.closest("[inert]").unwrap().is_some() { continue; }
                             let bounds = control.get_bounding_client_rect();
                             if let Some(hud) = &hud
                                 && bounds.width() > 0.0 && bounds.height() > 0.0 {
@@ -2641,7 +2871,9 @@ mod wasm_tests {
                 check(container.query_selector("[data-mobile-test='chat-sidebar-toggle']").unwrap().is_some() == expected_available,
                     "Only layouts with an available hierarchy render its toggle")?;
                 let presentation = projected()?;
-                let visible = agents.get_bounding_client_rect().height() > 0.0;
+                // A prepared Back destination is laid out but inert behind the active chat.
+                let visible = agents.get_bounding_client_rect().height() > 0.0
+                    && agents.closest("[inert]").unwrap().is_none();
                 check(visible == expected_open && presentation.sidebar_open == expected_open,
                     "Toggle closes/reopens the hierarchy and layout changes preserve the user's choice")?;
                 check(presentation.sidebar_available == expected_available,
@@ -2680,7 +2912,7 @@ mod wasm_tests {
             state.session_settings_open.set(false);
             navigate(NativeIntent::CompactWidth)?;
             next_tick().await;
-            check(agents.get_bounding_client_rect().height() == 0.0,
+            check(agents.closest("[inert]").unwrap().is_some() && !projected()?.sidebar_open,
                 "Compact chat has no competing global sidebar")?;
             navigate(NativeIntent::Sessions)?;
             next_tick().await;
@@ -2830,7 +3062,8 @@ mod wasm_tests {
                     && current_composer.selection_end().unwrap() == Some(7)
                     && state.active_agent.get_untracked().as_ref().map(|agent| &agent.agent_id) == Some(&current.agent_id),
                     "DOM size changes retain the same selected conversation, scroll offset and draft selection")?;
-                check((agents.get_bounding_client_rect().height() > 0.0) == sidebar,
+                check((agents.get_bounding_client_rect().height() > 0.0
+                    && agents.closest("[inert]").unwrap().is_none()) == sidebar,
                     "The DOM hierarchy is pinned only in expanded landscape")?;
                 let send = find("[data-mobile-test='chat-send']")?.get_bounding_client_rect();
                 let bounds = shell.get_bounding_client_rect();
@@ -3096,6 +3329,81 @@ mod wasm_tests {
         }.await;
         drop(handle);
         container.remove();
+        if result.is_ok() {
+            // Exercise the supported baseline consumer sequentially, never as a
+            // second live AppState/editor alongside the Back1 workspace.
+            js_sys::Reflect::delete_property(&native, &"backSurfaceVersion".into()).unwrap();
+            let baseline = AppState::new();
+            let baseline_view = baseline.clone();
+            let baseline_container = make_container();
+            let baseline_handle = mount_to(baseline_container.clone(), move || {
+                provide_context(baseline_view);
+                view! { <AppSurface /> }
+            });
+            next_tick().await;
+            result = async {
+                baseline
+                    .paired_hosts
+                    .set(vec![fixture_host("native-baseline-host", "Baseline host")]);
+                baseline
+                    .active_local_host_id
+                    .set(Some(LocalHostId("native-baseline-host".into())));
+                baseline.app_mode.set(AppMode::Workspace);
+                baseline.active_tab.set(MobileTab::Agents);
+                baseline.show_chat();
+                next_tick().await;
+                let input = baseline_container
+                    .query_selector("[data-mobile-test='chat-input']")
+                    .unwrap()
+                    .ok_or("Baseline platform must render its ordinary editor")?
+                    .dyn_into::<web_sys::HtmlTextAreaElement>()
+                    .map_err(|_| "Missing baseline editor")?;
+                input.set_value("Baseline paired draft");
+                input
+                    .dispatch_event(&web_sys::Event::new("input").unwrap())
+                    .unwrap();
+                input.set_selection_range(2, 7).unwrap();
+                next_tick().await;
+                let values = js_sys::Array::from(
+                    &js_sys::Reflect::get(&native, &"presentations".into()).unwrap(),
+                );
+                let projection: mobile_shell_types::native::NativePresentation =
+                    serde_wasm_bindgen::from_value(values.get(values.length() - 1))
+                        .map_err(|_| "Invalid baseline projection")?;
+                if projection.version != 6
+                    || projection.back_surface_version.is_some()
+                    || projection.navigation_revision.is_some()
+                    || projection.back_destination.is_some()
+                {
+                    return Err(
+                        "The base consumer must not acknowledge a live Back contract".into(),
+                    );
+                }
+                baseline_container
+                    .query_selector("[data-mobile-test='chat-back']")
+                    .unwrap()
+                    .ok_or("Baseline paired chat must retain canonical Back")?
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+                next_tick().await;
+                if baseline.viewing_chat.get_untracked()
+                    || baseline.active_tab.get_untracked() != MobileTab::Agents
+                    || input.value() != "Baseline paired draft"
+                    || input.selection_start().unwrap() != Some(2)
+                    || input.selection_end().unwrap() != Some(7)
+                {
+                    return Err(
+                        "Baseline Back must reach Agents without losing the draft or selection"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            drop(baseline_handle);
+            baseline_container.remove();
+        }
         PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(None));
         js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
         restore_loader_boundary();

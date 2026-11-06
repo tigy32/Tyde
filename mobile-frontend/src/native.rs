@@ -1,16 +1,33 @@
 use leptos::prelude::*;
 use mobile_shell_types::native::{
-    NATIVE_BRIDGE_VERSION, NativeEndpoint, NativeIntent, NativeLayout, NativePresentation,
-    NativeRoute, NativeTab, NativeTheme,
+    NATIVE_BACK_SURFACE_VERSION, NATIVE_BRIDGE_VERSION, NativeBackDestination, NativeBackPhase,
+    NativeBackUpdate, NativeEndpoint, NativeIntent, NativeLayout, NativePresentation, NativeRoute,
+    NativeTab, NativeTheme,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
-use crate::state::{AppMode, AppState, LocalHostId, MobileTab};
+use crate::state::{AppMode, AppState, BackDestination, LocalHostId, MobileTab};
 
 pub fn is_native() -> bool {
     web_sys::window().is_some_and(|window| {
         js_sys::Reflect::has(&window, &"__tydeNativeHost".into()).unwrap_or(false)
     })
+}
+
+fn back_surface_version() -> Result<Option<u32>, String> {
+    let window = web_sys::window().ok_or("Native host window is unavailable")?;
+    let api = js_sys::Reflect::get(&window, &"__tydeNativeHost".into())
+        .map_err(|_| "Native host bridge is unavailable")?;
+    let value = js_sys::Reflect::get(&api, &"backSurfaceVersion".into())
+        .map_err(|_| "Native Back capability is unavailable")?;
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    if value.as_f64() == Some(f64::from(NATIVE_BACK_SURFACE_VERSION)) {
+        Ok(Some(NATIVE_BACK_SURFACE_VERSION))
+    } else {
+        Err("Native Back surface contract is incompatible".into())
+    }
 }
 
 pub async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -72,6 +89,13 @@ pub fn install(state: AppState) {
     if !is_native() {
         return;
     }
+    let live_back = match back_surface_version() {
+        Ok(version) => version.is_some(),
+        Err(error) => {
+            report(&state, error);
+            return;
+        }
+    };
     // The immutable installed v6 shell owns chrome unless it explicitly transfers it.
     let owner = (|| {
         let window = web_sys::window().ok_or("Native host window is unavailable")?;
@@ -135,9 +159,154 @@ pub fn install(state: AppState) {
             callback.as_ref().unchecked_ref(),
         );
     });
+    let modal_state = state.clone();
+    let modal_barrier = Memo::new(move |_| modal_open(&modal_state));
+    let revision_state = state.clone();
+    let navigation_revision = Memo::new(move |previous: Option<&u64>| {
+        revision_state.app_mode.track();
+        revision_state.active_tab.track();
+        revision_state.viewing_chat.track();
+        revision_state.active_agent.track();
+        revision_state.chat_back_stack.track();
+        revision_state.chat_draft_id.track();
+        revision_state.native_layout.track();
+        revision_state.native_sidebar_open.track();
+        let _ = modal_barrier.get();
+        previous.map_or(1, |revision| revision + 1)
+    });
+    let back_ready_revision = RwSignal::new(None::<u64>);
+    let readiness_state = state.clone();
+    Effect::new(move |_| {
+        if !live_back {
+            return;
+        }
+        let revision = navigation_revision.get();
+        readiness_state.native_back_progress.set(None);
+        back_ready_revision.set(None);
+        if readiness_state.back_destination().is_none() || sidebar_visible(&readiness_state) {
+            return;
+        }
+        let frame_state = readiness_state.clone();
+        let callback = Closure::once(move || {
+            if navigation_revision.get_untracked() != revision {
+                return;
+            }
+            let laid_out = (|| -> Result<(), String> {
+                let document = web_sys::window()
+                    .and_then(|window| window.document())
+                    .ok_or("Native Back document is unavailable")?;
+                let targets = document
+                    .query_selector_all("[data-native-back-destination]")
+                    .map_err(|_| "Native Back destination query failed")?;
+                if targets.length() != 1 {
+                    return Err("Native Back requires exactly one live destination surface".into());
+                }
+                let target = targets
+                    .item(0)
+                    .ok_or("Native Back destination is unavailable")?
+                    .dyn_into::<web_sys::Element>()
+                    .map_err(|_| "Native Back destination is not an element")?;
+                let app = target
+                    .closest(".mobile-app[data-native-host]")
+                    .map_err(|_| "Native Back owner query failed")?
+                    .ok_or("Native Back document owner is unavailable")?
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .map_err(|_| "Native Back owner is invalid")?;
+                crate::shell::synchronize_native_surfaces(&app)
+                    .map_err(|_| "Native Back destination geometry could not synchronize")?;
+                let bounds = target.get_bounding_client_rect();
+                if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+                    return Err("Native Back destination was not laid out".into());
+                }
+                Ok(())
+            })();
+            match laid_out {
+                Ok(()) => back_ready_revision.set(Some(revision)),
+                Err(error) => report(&frame_state, error),
+            }
+        });
+        let Some(window) = web_sys::window() else {
+            report(&readiness_state, "Native Back window is unavailable".into());
+            return;
+        };
+        match window.request_animation_frame(callback.as_ref().unchecked_ref()) {
+            Ok(frame) => {
+                let held = send_wrapper::SendWrapper::new((window, frame, callback));
+                on_cleanup(move || {
+                    let (window, frame, callback) = held.take();
+                    if window.cancel_animation_frame(frame).is_err() {
+                        log::error!("Native Back layout frame could not be cancelled");
+                    }
+                    drop(callback);
+                });
+            }
+            Err(_) => report(
+                &readiness_state,
+                "Could not schedule native Back layout".into(),
+            ),
+        }
+    });
+    if live_back {
+        let back_state = state.clone();
+        let progress =
+            Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+                match serde_wasm_bindgen::from_value::<NativeBackUpdate>(event.detail()) {
+                    Ok(update)
+                        if update.version == NATIVE_BACK_SURFACE_VERSION
+                            && update.progress <= 1000
+                            && update.source_revision == navigation_revision.get_untracked() =>
+                    {
+                        match update.phase {
+                            NativeBackPhase::Progress => {
+                                back_state.native_back_progress.set(Some(update.progress))
+                            }
+                            NativeBackPhase::Cancel => back_state.native_back_progress.set(None),
+                            NativeBackPhase::Complete => {
+                                if back_state.native_back_progress.get_untracked().is_none() {
+                                    report(
+                                        &back_state,
+                                        "Native Back completed without an active transition".into(),
+                                    );
+                                    return;
+                                }
+                                handle_intent(&back_state, NativeIntent::Back);
+                            }
+                        }
+                    }
+                    _ => report(
+                        &back_state,
+                        "Native Back was invalidated by a navigation change".into(),
+                    ),
+                }
+            });
+        let Some(window) = web_sys::window() else {
+            report(&state, "Native host window is unavailable".into());
+            return;
+        };
+        if window
+            .add_event_listener_with_callback("tyde-native-back", progress.as_ref().unchecked_ref())
+            .is_err()
+        {
+            report(&state, "Could not subscribe to native Back progress".into());
+            return;
+        }
+        let held = send_wrapper::SendWrapper::new((window, progress));
+        on_cleanup(move || {
+            let (window, progress) = held.take();
+            let _ = window.remove_event_listener_with_callback(
+                "tyde-native-back",
+                progress.as_ref().unchecked_ref(),
+            );
+        });
+    }
     let projection_state = state.clone();
     Effect::new(move |_| {
-        let presentation = presentation(&projection_state);
+        let presentation = presentation(
+            &projection_state,
+            navigation_revision.get(),
+            back_ready_revision.get(),
+            live_back,
+        );
         let state = projection_state.clone();
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(error) = call::<_, ()>(NativeEndpoint::Presentation, &presentation).await {
@@ -229,11 +398,14 @@ pub(crate) fn handle_intent(state: &AppState, intent: NativeIntent) {
             state.app_mode.set(AppMode::HostPicker);
         }
         NativeIntent::Back => {
-            if state.app_mode.get_untracked() == AppMode::HostPicker {
-                state.app_mode.set(AppMode::Workspace);
-            } else {
-                state.back_from_chat();
-            }
+            batch(|| {
+                if state.app_mode.get_untracked() == AppMode::HostPicker {
+                    state.app_mode.set(AppMode::Workspace);
+                } else {
+                    state.back_from_chat();
+                }
+                state.native_back_progress.set(None);
+            });
         }
         NativeIntent::NewChat => crate::actions::begin_new_chat(state),
         NativeIntent::ChatDockShell => state
@@ -432,7 +604,12 @@ fn home_title(state: &AppState) -> String {
     }
 }
 
-fn presentation(state: &AppState) -> NativePresentation {
+fn presentation(
+    state: &AppState,
+    navigation_revision: u64,
+    back_ready_revision: Option<u64>,
+    live_back: bool,
+) -> NativePresentation {
     let tab = state.active_tab.get();
     let hosts = state.app_mode.get() == AppMode::HostPicker;
     let chat = !hosts && chat_visible(state);
@@ -452,7 +629,91 @@ fn presentation(state: &AppState) -> NativePresentation {
             None,
         )
     };
+    let connected_status = matches!(
+        state.active_host_connection_status(),
+        crate::state::ConnectionStatus::Connected
+    )
+    .then(|| mobile_shell_types::native::NativeConnectedStatus {
+        round_trip_ms: state.active_local_host_id.get().and_then(|host| {
+            state
+                .heartbeat_round_trip_ms_by_host
+                .with(|values| values.get(&host).copied())
+        }),
+    });
     NativePresentation {
+        back_surface_version: live_back.then_some(NATIVE_BACK_SURFACE_VERSION),
+        navigation_revision: live_back.then_some(navigation_revision),
+        back_ready_revision: if live_back { back_ready_revision } else { None },
+        back_destination: (if live_back {
+            state.back_destination()
+        } else {
+            None
+        })
+        .map(|target| match target {
+            BackDestination::Root(tab) => NativeBackDestination {
+                tab: match tab {
+                    MobileTab::Home => NativeTab::Home,
+                    MobileTab::Agents => NativeTab::Agents,
+                    MobileTab::Sessions => NativeTab::Sessions,
+                    MobileTab::Settings => NativeTab::Settings,
+                },
+                route: NativeRoute::Root,
+                connected_status: if state.native_root_status_owner.get()
+                    == Some(mobile_shell_types::native::NativeRootStatusOwner::Shell)
+                {
+                    connected_status.clone()
+                } else {
+                    None
+                },
+                chat_dock: None,
+                title: match tab {
+                    MobileTab::Home => home_title(state),
+                    MobileTab::Agents => "Agents".into(),
+                    MobileTab::Sessions => "Sessions".into(),
+                    MobileTab::Settings => "Settings".into(),
+                },
+            },
+            BackDestination::Chat(owner) => NativeBackDestination {
+                tab: match tab {
+                    MobileTab::Home => NativeTab::Home,
+                    MobileTab::Agents => NativeTab::Agents,
+                    MobileTab::Sessions => NativeTab::Sessions,
+                    MobileTab::Settings => NativeTab::Settings,
+                },
+                route: NativeRoute::Chat,
+                title: owner
+                    .as_ref()
+                    .and_then(|owner| {
+                        state.agents.with(|agents| {
+                            agents
+                                .iter()
+                                .find(|agent| agent.agent_ref() == owner.as_agent_ref())
+                                .map(|agent| agent.name.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        if owner.is_some() {
+                            "Conversation".into()
+                        } else {
+                            "New Chat".into()
+                        }
+                    }),
+                connected_status: None,
+                chat_dock: (state.native_chat_dock_owner.get()
+                    == Some(mobile_shell_types::native::NativeChatDockOwner::Shell))
+                .then(|| {
+                    let sidebar_available = tab == MobileTab::Agents
+                        && state.native_layout.get() == NativeLayout::RegularLandscape;
+                    mobile_shell_types::native::NativeBackChatDock {
+                        back_label: state.back_destination_chat_back_label(),
+                        connected_status: connected_status.clone(),
+                        sidebar_available,
+                        sidebar_open: sidebar_available && state.native_sidebar_open.get(),
+                        chat_actions: owner.is_some(),
+                    }
+                }),
+            },
+        }),
         version: NATIVE_BRIDGE_VERSION,
         client_ready: matches!(
             state.recovery_status.get(),
@@ -490,33 +751,14 @@ fn presentation(state: &AppState) -> NativePresentation {
         chat_connected_status: if chat
             && state.native_chat_dock_owner.get()
                 == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
-            && matches!(
-                state.active_host_connection_status(),
-                crate::state::ConnectionStatus::Connected
-            ) {
-            Some(mobile_shell_types::native::NativeConnectedStatus {
-                round_trip_ms: state.active_local_host_id.get().and_then(|host| {
-                    state
-                        .heartbeat_round_trip_ms_by_host
-                        .with(|values| values.get(&host).copied())
-                }),
-            })
+        {
+            connected_status.clone()
         } else {
             None
         },
         root_status_owner: state.native_root_status_owner.get(),
-        root_connected_status: if root_status_owned(state)
-            && matches!(
-                state.active_host_connection_status(),
-                crate::state::ConnectionStatus::Connected
-            ) {
-            Some(mobile_shell_types::native::NativeConnectedStatus {
-                round_trip_ms: state.active_local_host_id.get().and_then(|host| {
-                    state
-                        .heartbeat_round_trip_ms_by_host
-                        .with(|values| values.get(&host).copied())
-                }),
-            })
+        root_connected_status: if root_status_owned(state) {
+            connected_status
         } else {
             None
         },
@@ -563,6 +805,7 @@ pub fn validate_environment() -> Result<(), String> {
         if version.as_f64() != Some(f64::from(NATIVE_BRIDGE_VERSION)) {
             return Err("Native app and client bridge versions differ".into());
         }
+        back_surface_version()?;
     }
     Ok(())
 }

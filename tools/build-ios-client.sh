@@ -10,6 +10,8 @@ python3 tools/ios-source-manifest.py write
 cargo run --quiet -p mobile-shell-types --bin native-bindings > "$output/NativeBridge.swift"
 cargo run --quiet -p mobile-shell-types --bin native-bindings -- --metadata > "$output/build-metadata.json"
 cargo run --quiet -p mobile-shell-types --bin native-bindings -- --contract > "$output/NativeBridgeContract.json"
+cargo run --quiet -p mobile-shell-types --bin native-bindings -- --javascript > "$output/native-contract.js"
+cmp "$output/native-contract.js" web/loader/native-contract.js || { echo 'Generated loader contract is stale' >&2; exit 1; }
 python3 - "$output" <<'METADATA'
 import hashlib
 import json
