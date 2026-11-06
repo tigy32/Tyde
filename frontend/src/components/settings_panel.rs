@@ -6713,13 +6713,64 @@ fn schema_json_field_control(
 #[component]
 fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
+    use crate::perf::CaptureAction;
+    let initial = crate::perf::capture_state();
+    let capture = RwSignal::new(initial.as_ref().ok().copied());
+    let error = RwSignal::new(initial.err());
+    let busy = RwSignal::new(false);
+    let copied = RwSignal::new(false);
+    let changed = window_event_listener(
+        leptos::ev::Custom::<web_sys::Event>::new("tyde-stall-capture-state"),
+        move |_| {
+            match crate::perf::capture_state() {
+                Ok(actual) => capture.set(Some(actual)),
+                Err(message) => {
+                    capture.set(None);
+                    error.set(Some(message));
+                }
+            }
+            copied.set(false);
+        },
+    );
+    on_cleanup(move || changed.remove());
+    let run = move |action| {
+        busy.set(true);
+        error.set(None);
+        copied.set(false);
+        spawn_local(async move {
+            match crate::perf::capture_action(action).await {
+                Ok(actual) => {
+                    capture.set(Some(actual));
+                    copied.set(action == CaptureAction::Copy);
+                }
+                Err(message) => {
+                    capture.set(crate::perf::capture_state().ok());
+                    error.set(Some(message));
+                }
+            }
+            busy.set(false);
+        });
+    };
 
     view! {
             <h2 class="settings-panel-title">"Debug"</h2>
 
-            <p class="settings-description settings-panel-intro">
-                "Diagnostics for developing Tyde itself. Everything here is off by default."
-            </p>
+    <SettingsSection title="Desktop stall capture">
+        <div class="settings-action-buttons">
+            <button class="settings-btn" disabled=move || busy.get() || capture.get().is_none()
+                on:click=move |_| match crate::perf::capture_state() {
+                    Ok(actual) => run(if actual.running { CaptureAction::Stop } else { CaptureAction::Start }),
+                    Err(message) => error.set(Some(message)),
+                }>
+                {move || if capture.get().is_some_and(|state| state.running) { "Stop capture" } else { "Start capture" }}
+            </button>
+            <button class="settings-btn" disabled=move || busy.get() || !capture.get().is_some_and(|state| state.captured) || capture.get().is_some_and(|state| state.running)
+                on:click=move |_| run(CaptureAction::Copy)>
+                {move || if copied.get() { "Copied" } else { "Copy capture" }}
+            </button>
+        </div>
+        {move || error.get().map(|message| view! { <p role="alert">{message}</p> })}
+    </SettingsSection>
 
     <SettingsSection title="Frontend tools">
             <div class="settings-schema-fields">
@@ -15103,6 +15154,18 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn debug_primitive_row_is_driven_by_bootstrap_schema() {
+        let _capture = crate::perf::diagnostic_tests::Capture::browser();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let identity = document.create_element("link").unwrap();
+        identity.set_attribute("rel", "preload").unwrap();
+        identity.set_attribute("type", "application/wasm").unwrap();
+        identity
+            .set_attribute("href", "/frontend-0123456789abcdef_bg.wasm")
+            .unwrap();
+        identity
+            .set_attribute("integrity", &format!("sha384-{}", "A".repeat(64)))
+            .unwrap();
+        document.head().unwrap().append_child(&identity).unwrap();
         let calls = install_settings_send_stub();
         let container = make_container();
         let state = AppState::new();
@@ -15124,6 +15187,93 @@ mod wasm_tests {
         next_tick().await;
         click_tab(&container, "Debug");
         next_tick().await;
+
+        let wait_for_label = js_sys::Function::new_with_args(
+            "root,label",
+            r#"
+            return new Promise(resolve => {
+                const settled = () => [...root.querySelectorAll('button')]
+                    .some(b => b.textContent.trim() === label && !b.disabled);
+                if (settled()) { resolve(); return; }
+                const observer = new MutationObserver(() => {
+                    if (settled()) { observer.disconnect(); resolve(); }
+                });
+                observer.observe(root, {subtree: true, childList: true, attributes: true, characterData: true});
+            });
+        "#,
+        );
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+            js_sys::eval("window.__tydeDiagnostics.start()").unwrap(),
+        ))
+        .await
+        .unwrap();
+        next_tick().await;
+        assert!(
+            find_button_by_text(&container, "Stop capture").is_some(),
+            "the open Debug UI must project captures started through the supported API"
+        );
+        find_button_by_text(&container, "Stop capture")
+            .unwrap()
+            .click();
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+            wait_for_label
+                .call2(
+                    &JsValue::NULL,
+                    &container,
+                    &JsValue::from_str("Start capture"),
+                )
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        for (action, completed) in [
+            ("Start capture", "Stop capture"),
+            ("Stop capture", "Start capture"),
+            ("Copy capture", "Copied"),
+        ] {
+            find_button_by_text(&container, action).unwrap().click();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                wait_for_label
+                    .call2(&JsValue::NULL, &container, &JsValue::from_str(completed))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        }
+        let copied = calls
+            .iter()
+            .filter_map(|entry| entry.dyn_into::<js_sys::Array>().ok())
+            .find(|entry| {
+                entry.get(0).as_string().as_deref() == Some("plugin:clipboard-manager|write_text")
+            })
+            .expect("Copy capture reaches the native clipboard boundary");
+        let args: Value = serde_json::from_str(&copied.get(1).as_string().unwrap()).unwrap();
+        let exported: Value = serde_json::from_str(args["text"].as_str().unwrap()).unwrap();
+        assert_eq!(exported["running"], false);
+        assert_eq!(
+            exported["build"]["module"],
+            "frontend-0123456789abcdef_bg.wasm"
+        );
+        assert!(exported["lifecycle"].is_array());
+        assert!(
+            !args["text"]
+                .as_str()
+                .unwrap()
+                .contains("Schema supplied debug switch")
+        );
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+            js_sys::eval("window.__tydeDiagnostics.clear()").unwrap(),
+        ))
+        .await
+        .unwrap();
+        next_tick().await;
+        let copy = find_button_by_text(&container, "Copy capture").unwrap();
+        assert!(
+            copy.has_attribute("disabled"),
+            "external clear must disable export in the open UI"
+        );
+        identity.remove();
 
         let toggle = toggle_for_label(&container, "Schema supplied debug switch");
         toggle.set_checked(true);

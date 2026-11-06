@@ -50,6 +50,9 @@ pub fn read_clipboard() -> Result<Option<ImageData>, String> {
 pub async fn read_clipboard(app: tauri::AppHandle) -> Result<Option<ImageData>, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.run_on_main_thread(move || {
+        let _scope = crate::native_diagnostics::Scope::enter(
+            crate::native_diagnostics::Callback::ClipboardRequest,
+        );
         // Use the webview's GDK display, not a separate Wayland/X11 backend.
         let Some(display) = gtk::gdk::Display::default() else {
             let _ = sender.send(Err(
@@ -61,11 +64,17 @@ pub async fn read_clipboard(app: tauri::AppHandle) -> Result<Option<ImageData>, 
         clipboard.request_contents(
             &gtk::gdk::Atom::intern("TARGETS"),
             move |clipboard, data| {
+                let _scope = crate::native_diagnostics::Scope::enter(
+                    crate::native_diagnostics::Callback::ClipboardTargets,
+                );
                 if !data.targets_include_image(false) {
                     let _ = sender.send(Ok(None));
                     return;
                 }
                 clipboard.request_image(move |_, image| {
+                    let _scope = crate::native_diagnostics::Scope::enter(
+                        crate::native_diagnostics::Callback::ClipboardImage,
+                    );
                     let result = image
                         .ok_or_else(|| {
                             "The clipboard offered an image but did not provide its pixels"

@@ -35,6 +35,19 @@ function ring(capacity) {
     };
 }
 
+// Never export Error.stack itself: it can contain URLs and application paths.
+// Numeric wasm frames are relative to the exact built module, not native PCs.
+function wasmBoundaryFrames() {
+    const stack = new Error().stack;
+    if (typeof stack !== 'string') return {status: 'unsupported', engineTruncation: 'unknown', frames: []};
+    const matches = [...stack.matchAll(/wasm-function\[(\d+)\](?::(0x[0-9a-f]+))?/gi)];
+    return {status: matches.length ? 'observed' : 'unavailable_in_engine_stack',
+        engineTruncation: 'unknown',
+        observedFramesOmitted: Math.max(0, matches.length - 12),
+        frames: matches.slice(0, 12).map(m => ({functionIndex: Number(m[1]),
+            moduleOffset: m[2] ? Number(m[2]) : null}))};
+}
+
 export function createRecorder(env) {
     let capture = null, nextId = 1;
     const now = () => env.performance.now();
@@ -86,7 +99,9 @@ export function createRecorder(env) {
         if (!registered) c.unregisteredEvents++;
         c.lifecycleEvents++;
         c.lifecycle.push({future: registered ? token - c.firstFuture + 1 : null,
-            poll: registered ? poll || null : null, event, producer, site, atMs: now() - c.startMs});
+            poll: registered ? poll || null : null, event, producer, site, atMs: now() - c.startMs,
+            boundaryFrames: event === 'register' || (event === 'poll_enter' && poll === 1)
+                ? wasmBoundaryFrames() : null});
     }
     function stop() {
         const c = capture;
@@ -118,7 +133,8 @@ export function createRecorder(env) {
                 unregisteredEvents: c.unregisteredEvents,
                 renderEffectHooks: 'sync_new_with_value_erased',
                 durations: 'inclusive_wall_not_cpu',
-                otherExecutors: 'not_observed'},
+                otherExecutors: 'not_observed',
+                boundaryFrames: 'registration_and_first_poll_only; exact_wasm_artifact_required; not_executing_leaf'},
             samples: {...c.samples}, records: c.records.read(), active, gaps: c.gaps.read(),
         };
     }
@@ -220,7 +236,8 @@ export function createRecorder(env) {
         c.frame = env.requestAnimationFrame(frame);
         return {schema: 2, running: true};
     }
-    return {begin, end, setFrame, setItems, register, lifecycle, start, stop, snapshot, enabled: () => capture?.running === true,
+    return {begin, end, setFrame, setItems, register, lifecycle, start, stop, snapshot,
+        state: () => ({running: capture?.running === true, captured: capture !== null}), enabled: () => capture?.running === true,
         export: () => JSON.stringify(snapshot()),
         clear() { stop(); capture = null; }};
 }
@@ -228,8 +245,31 @@ export function createRecorder(env) {
 export function installDiagnostics() {
     if (recorder || typeof window === 'undefined') return;
     recorder = createRecorder(window);
-    window.__tydeDiagnostics = Object.freeze({start: recorder.start, stop: recorder.stop,
-        snapshot: recorder.snapshot, export: recorder.export, clear: recorder.clear});
+    installCaptureApi();
+}
+
+function installCaptureApi() {
+    const native = action => window.__TAURI__.core.invoke('native_ui_diagnostic', {action});
+    function buildIdentity() {
+        const links = [...document.querySelectorAll('link[rel="preload"][type="application/wasm"]')];
+        if (links.length !== 1) throw new Error('Expected one packaged wasm identity');
+        const module = /(?:^|\/)(frontend-[0-9a-f]+_bg\.wasm)$/.exec(links[0].getAttribute('href'));
+        const integrity = /^sha384-[A-Za-z0-9+/]{64}$/.test(links[0].integrity) ? links[0].integrity : null;
+        if (!module || !integrity) throw new Error('Packaged wasm identity is unavailable');
+        return {module: module[1], integrity};
+    }
+    const snapshot = async () => ({...recorder.snapshot(), build: buildIdentity(), native: await native('snapshot')});
+    const changed = () => window.dispatchEvent(new Event('tyde-stall-capture-state'));
+    window.__tydeDiagnostics = Object.freeze({
+        async start() {
+            recorder.stop(); changed();
+            await native('start');
+            const result = recorder.start(); changed(); return result;
+        },
+        async stop() { recorder.stop(); changed(); return await native('stop'); },
+        state: recorder.state, snapshot, export: async () => JSON.stringify(await snapshot()),
+        async clear() { recorder.clear(); changed(); await native('stop'); },
+    });
 }
 
 export function diagnosticBegin(operation, detail, bytes, items, waiting, token, poll) {
@@ -244,6 +284,7 @@ export function diagnosticSetItems(id, items) { if (id) recorder.setItems(id, it
 export function installTestDiagnostics(env) {
     if (recorder) recorder.clear();
     recorder = createRecorder(env);
+    if (env === window) installCaptureApi();
     return recorder;
 }
 
@@ -251,3 +292,17 @@ export function diagnosticEnabled() { return recorder?.enabled() === true; }
 
 export function diagnosticRegister(producer, site) { return recorder?.register(producer, site) ?? 0; }
 export function diagnosticLifecycle(token, poll, event) { recorder?.lifecycle(token, poll, event); }
+
+// The installed Settings surface and DEV evaluation use the same recorder API.
+export function diagnosticCaptureState() { return recorder.state(); }
+export async function diagnosticCaptureAction(action) {
+    if (action === 'copy') {
+        const text = await window.__tydeDiagnostics.export();
+        await window.__TAURI__.core.invoke('plugin:clipboard-manager|write_text', {text});
+    } else if (action === 'start' || action === 'stop') {
+        await window.__tydeDiagnostics[action]();
+    } else {
+        throw new Error('Unknown stall capture action');
+    }
+    return recorder.state();
+}

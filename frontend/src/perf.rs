@@ -90,6 +90,10 @@ fn operation_label(operation: UiOperation) -> &'static str {
 
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/stall_diagnostics.js")]
 extern "C" {
+    #[wasm_bindgen(catch, js_name = diagnosticCaptureState)]
+    fn diagnostic_capture_state() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = diagnosticCaptureAction)]
+    async fn diagnostic_capture_action(action: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = installDiagnostics)]
     pub(crate) fn install_diagnostics();
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = diagnosticEnabled)]
@@ -120,6 +124,38 @@ extern "C" {
     fn local_monitor_now(monitor: &JsValue) -> f64;
     #[wasm_bindgen(js_name = stopLocalMonitor)]
     fn stop_local_monitor(monitor: &JsValue);
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+pub(crate) struct CaptureState {
+    pub(crate) running: bool,
+    pub(crate) captured: bool,
+}
+
+pub(crate) fn capture_state() -> Result<CaptureState, String> {
+    serde_wasm_bindgen::from_value(
+        diagnostic_capture_state().map_err(|_| "Stall recorder is unavailable".to_owned())?,
+    )
+    .map_err(|_| "Cannot read stall capture state".to_owned())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureAction {
+    Start,
+    Stop,
+    Copy,
+}
+
+pub(crate) async fn capture_action(action: CaptureAction) -> Result<CaptureState, String> {
+    let action = match action {
+        CaptureAction::Start => "start",
+        CaptureAction::Stop => "stop",
+        CaptureAction::Copy => "copy",
+    };
+    let state = diagnostic_capture_action(action)
+        .await
+        .map_err(|_| "Stall capture action failed".to_owned())?;
+    serde_wasm_bindgen::from_value(state).map_err(|_| "Invalid stall capture state".to_owned())
 }
 
 pub(crate) fn install_task_diagnostics() -> Result<(), any_spawner::ExecutorError> {

@@ -273,7 +273,10 @@ impl LogBudget {
     }
 }
 
-pub(crate) fn start_ui_diagnostics(app: &tauri::AppHandle) -> DiagnosticSink {
+pub(crate) fn start_ui_diagnostics(
+    app: &tauri::AppHandle,
+    native_recorder: crate::native_diagnostics::Recorder,
+) -> DiagnosticSink {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<DiagnosticRequest>(16);
     tauri::async_runtime::spawn(async move {
         let mut budget = LogBudget::new();
@@ -306,6 +309,9 @@ pub(crate) fn start_ui_diagnostics(app: &tauri::AppHandle) -> DiagnosticSink {
             let (done, mut completion) = tokio::sync::oneshot::channel();
             if app
                 .run_on_main_thread(move || {
+                    let _scope = crate::native_diagnostics::Scope::enter(
+                        crate::native_diagnostics::Callback::MainDispatchProbe,
+                    );
                     let _ = done.send(std::time::Instant::now());
                 })
                 .is_err()
@@ -316,6 +322,7 @@ pub(crate) fn start_ui_diagnostics(app: &tauri::AppHandle) -> DiagnosticSink {
             let completed = tokio::select! {
                 result = &mut completion => result,
                 _ = ticks.tick() => {
+                    native_recorder.dispatch_pending().await;
                     if let Some(dropped) = budget.admit() {
                         tracing::warn!("ui.diagnostic layer=native event=dispatch_pending elapsed_ms={} dropped={dropped}", queued.elapsed().as_millis());
                     }

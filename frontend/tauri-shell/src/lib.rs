@@ -8,6 +8,7 @@ mod host_stdio;
 mod host_store;
 mod host_uds;
 mod logging;
+mod native_diagnostics;
 mod remote_bootstrap;
 mod router;
 #[cfg(desktop)]
@@ -1138,6 +1139,14 @@ async fn log_ui_diagnostic(
     state.write(record).await
 }
 
+#[tauri::command]
+async fn native_ui_diagnostic(
+    state: tauri::State<'_, native_diagnostics::Recorder>,
+    action: native_diagnostics::Action,
+) -> Result<native_diagnostics::Snapshot, &'static str> {
+    state.control(action).await
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FrontendLifecycleEvent {
@@ -1278,6 +1287,7 @@ where
     let voice_output_handler: Box<dyn Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync> =
         Box::new(tauri::generate_handler![voice_media_push_output]);
     move |invoke| {
+        let _scope = native_diagnostics::Scope::enter(native_diagnostics::Callback::InvokeDispatch);
         let command = invoke.message.command();
         if matches!(
             command,
@@ -1305,7 +1315,10 @@ where
     R: tauri::Runtime,
     F: Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
 {
-    other_handler
+    move |invoke| {
+        let _scope = native_diagnostics::Scope::enter(native_diagnostics::Callback::InvokeDispatch);
+        other_handler(invoke)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1332,6 +1345,7 @@ macro_rules! other_production_invoke_handler {
             mark_ui_debug_ready,
             mark_frontend_ready,
             log_ui_diagnostic,
+            native_ui_diagnostic,
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
@@ -1363,6 +1377,7 @@ macro_rules! other_production_invoke_handler {
             mark_ui_debug_ready,
             mark_frontend_ready,
             log_ui_diagnostic,
+            native_ui_diagnostic,
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
@@ -1554,6 +1569,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .on_page_load(move |webview, payload| {
+            let _scope = native_diagnostics::Scope::enter(native_diagnostics::Callback::PageLoad);
             let label = webview.label().to_owned();
             let (generation, ticket) =
                 with_recovery_policies(&recovery_for_page_load, |policies| {
@@ -1587,84 +1603,88 @@ pub fn run() {
                 );
             }
         })
-        .on_window_event(move |window, event| match event {
-            WindowEvent::Focused(focused) => {
-                tracing::info!(
-                    "webview.lifecycle event=window_focus label={} focused={focused}",
-                    window.label()
-                );
-                let label = window.label().to_owned();
-                let (ticket, failure, generation) =
-                    with_recovery_policies(&recovery_for_window, |policies| {
-                        let policy = policies.for_label(&label);
-                        let ticket = policy.native_window_focus_changed(*focused);
-                        let failure = policy.escalate_repeated_termination_if_observable();
-                        (ticket, failure, policy.generation)
-                    });
-                if let Some(failure) = failure {
-                    show_web_content_recovery_notice(
-                        window.app_handle().clone(),
-                        label,
-                        generation,
-                        failure,
+        .on_window_event(move |window, event| {
+            let _scope =
+                native_diagnostics::Scope::enter(native_diagnostics::Callback::WindowEvent);
+            match event {
+                WindowEvent::Focused(focused) => {
+                    tracing::info!(
+                        "webview.lifecycle event=window_focus label={} focused={focused}",
+                        window.label()
                     );
-                } else if let Some(ticket) = ticket {
-                    schedule_recovery_readiness_deadline(
-                        window.app_handle().clone(),
-                        label,
-                        ticket,
-                        recovery_for_window.clone(),
-                    );
+                    let label = window.label().to_owned();
+                    let (ticket, failure, generation) =
+                        with_recovery_policies(&recovery_for_window, |policies| {
+                            let policy = policies.for_label(&label);
+                            let ticket = policy.native_window_focus_changed(*focused);
+                            let failure = policy.escalate_repeated_termination_if_observable();
+                            (ticket, failure, policy.generation)
+                        });
+                    if let Some(failure) = failure {
+                        show_web_content_recovery_notice(
+                            window.app_handle().clone(),
+                            label,
+                            generation,
+                            failure,
+                        );
+                    } else if let Some(ticket) = ticket {
+                        schedule_recovery_readiness_deadline(
+                            window.app_handle().clone(),
+                            label,
+                            ticket,
+                            recovery_for_window.clone(),
+                        );
+                    }
                 }
-            }
-            #[cfg(target_os = "linux")]
-            WindowEvent::DragDrop(event) => {
-                use host_config::{DesktopClientPoint, DesktopFileDragEvent};
-                use tauri::{DragDropEvent, Emitter};
+                #[cfg(target_os = "linux")]
+                WindowEvent::DragDrop(event) => {
+                    use host_config::{DesktopClientPoint, DesktopFileDragEvent};
+                    use tauri::{DragDropEvent, Emitter};
 
-                // Wry passes GTK widget coordinates unchanged, despite naming
-                // them PhysicalPosition. They are already webview-client units.
-                let point = |position: &tauri::PhysicalPosition<f64>| DesktopClientPoint {
-                    x: position.x,
-                    y: position.y,
-                };
-                let event = match event {
-                    DragDropEvent::Enter { position, .. } => DesktopFileDragEvent::Enter {
-                        position: point(position),
-                    },
-                    DragDropEvent::Over { position } => DesktopFileDragEvent::Over {
-                        position: point(position),
-                    },
-                    DragDropEvent::Leave => DesktopFileDragEvent::Leave,
-                    DragDropEvent::Drop { position, paths } => DesktopFileDragEvent::Drop {
-                        position: point(position),
-                        paths: paths.clone(),
-                    },
-                    _ => {
-                        tracing::error!("Unsupported native file drag event");
+                    // Wry passes GTK widget coordinates unchanged, despite naming
+                    // them PhysicalPosition. They are already webview-client units.
+                    let point = |position: &tauri::PhysicalPosition<f64>| DesktopClientPoint {
+                        x: position.x,
+                        y: position.y,
+                    };
+                    let event = match event {
+                        DragDropEvent::Enter { position, .. } => DesktopFileDragEvent::Enter {
+                            position: point(position),
+                        },
+                        DragDropEvent::Over { position } => DesktopFileDragEvent::Over {
+                            position: point(position),
+                        },
+                        DragDropEvent::Leave => DesktopFileDragEvent::Leave,
+                        DragDropEvent::Drop { position, paths } => DesktopFileDragEvent::Drop {
+                            position: point(position),
+                            paths: paths.clone(),
+                        },
+                        _ => {
+                            tracing::error!("Unsupported native file drag event");
+                            return;
+                        }
+                    };
+                    if let Err(error) = window.emit_to(
+                        tauri::EventTarget::labeled(window.label()),
+                        "tyde://desktop-file-drag",
+                        event,
+                    ) {
+                        tracing::error!("Native file drag delivery failed: {error}");
+                    }
+                }
+                WindowEvent::CloseRequested { api, .. } => {
+                    if quit_confirmation_for_window.is_confirmed_exit() {
                         return;
                     }
-                };
-                if let Err(error) = window.emit_to(
-                    tauri::EventTarget::labeled(window.label()),
-                    "tyde://desktop-file-drag",
-                    event,
-                ) {
-                    tracing::error!("Native file drag delivery failed: {error}");
-                }
-            }
-            WindowEvent::CloseRequested { api, .. } => {
-                if quit_confirmation_for_window.is_confirmed_exit() {
-                    return;
-                }
 
-                api.prevent_close();
-                request_quit_confirmation(
-                    window.app_handle().clone(),
-                    quit_confirmation_for_window.clone(),
-                );
+                    api.prevent_close();
+                    request_quit_confirmation(
+                        window.app_handle().clone(),
+                        quit_confirmation_for_window.clone(),
+                    );
+                }
+                _ => {}
             }
-            _ => {}
         });
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1756,6 +1776,7 @@ pub fn run() {
 
     #[cfg(desktop)]
     let builder = builder.menu(settings_menu).on_menu_event(|app, event| {
+        let _scope = native_diagnostics::Scope::enter(native_diagnostics::Callback::MenuEvent);
         use tauri::Emitter;
 
         if event.id().as_ref() == "settings" {
@@ -1776,7 +1797,9 @@ pub fn run() {
             let setup_phase = logging::startup(logging::StartupPhase::Setup);
             app.handle()
                 .run_on_main_thread(|| tracing::debug!(target: crate::logging::HOST_IO_TRACE_TARGET, "host.config event=ui_thread"))?;
-            app.manage(logging::start_ui_diagnostics(app.handle()));
+            let native_recorder = native_diagnostics::Recorder::start(app.handle().clone());
+            app.manage(logging::start_ui_diagnostics(app.handle(), native_recorder.clone()));
+            app.manage(native_recorder);
             tracing::info!("setup: spawning host and router");
             let router = ProxyRouterHandle::new();
             let ui_debug = Arc::new(devtools::UiDebugBridgeState::default());
@@ -1861,6 +1884,7 @@ pub fn run() {
     }
 
     app.run(move |app, event| {
+        let _scope = native_diagnostics::Scope::enter(native_diagnostics::Callback::RunEvent);
         if let RunEvent::ExitRequested { code, api, .. } = event {
             #[cfg(not(target_os = "windows"))]
             if let Err(error) = app.state::<ShellState>().voice_media.stop() {

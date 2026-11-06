@@ -62,3 +62,87 @@ times and bounded counts only: no chat/source/model text, paths, native/host/
 agent/session IDs, credentials, argv or environment. Existing detailed operation
 records retain their pre-existing timing fields. This change adds no durable
 wire record or separate lifecycle state model.
+
+## Native ownership and generic future boundaries
+
+The installed Debug capture API is asynchronous: **await** `start()`, `stop()`,
+`snapshot()` and `export()`. Starting first enables the native recorder, then the
+frontend recorder; stopping ends frontend collection, then native collection.
+Their monotonic origins are separate, not synchronized clocks. Native samples
+are returned under `snapshot.native`; they are not written to the default log.
+The existing-log exporter cannot reconstruct these observations retroactively.
+
+Native collection keeps 64 observations, with an overwrite counter. The bounded
+16-request channel waits for admission (no silently dropped sample requests).
+It observes at a pending main-dispatch probe and explicit snapshot/start/stop,
+not every callback. Each observation queries the OS main-thread state off the
+UI thread and brackets that query with the synchronous callback scope sequence.
+Query start/end bracket the OS read, including blocking-worker scheduling; the
+OS state was observed somewhere inside that interval, not necessarily at export.
+If the sequence changes, ownership is unknown, never assigned by overlap.
+
+The static native callback enum maps directly to the invoke dispatcher,
+page/window/menu/run event callbacks, main-dispatch probe, and Linux clipboard
+request/targets/image callbacks. Scopes nest and restore their actual caller;
+off-main invocations do not acquire main-thread ownership. No guard crosses an
+await. `gated_dev_fixture` is a debug-only, owned-DEV boundary exercise: it holds
+an actual main-dispatch callback on an explicit channel gate, observes from the
+recorder task, then releases and joins it. It does not simulate a customer cause.
+
+Linux reads only the state field from its own main thread's procfs status;
+macOS uses public `pthread_mach_thread_np` / `thread_info(THREAD_BASIC_INFO)` on
+its own thread. Handles, IDs, names and all other returned fields are discarded.
+Unsupported platforms and query failures are explicit. Running/runnable is not
+CPU time or proof of continuous execution. Waiting is an instantaneous OS state,
+not a wait-stack, App Nap diagnosis, or proof of which resource is awaited.
+An unchanged non-null callback identifies the product scope containing the OS
+observation; nested framework work can still be inside it. A null callback is
+**unknown**, not proof that framework/OS code caused the delay. Uninstrumented
+callbacks, native stacks and exclusive leaf work remain outside coverage.
+Linux evidence does not establish macOS acceptance.
+
+Registration and first-poll lifecycle rows additionally retain at most 12 numeric
+wasm frames from the immediate boundary stack: function indices and module
+byte offsets when the engine supplies them. Raw stacks, URLs and symbol strings
+are never retained. Unsupported stack formats and observed-frame slice omissions are explicit.
+Engine-side stack truncation is always unknown (including Chrome's default
+stack depth); zero slice omissions never promises a complete caller stack. Later polls correlate by future ordinal, not an inherited/guessed
+producer. These are call sites at the registration/first-poll boundary, **not**
+a sample of a future's executing leaf or its wake source. Other executors and
+futures registered before capture remain outside this coverage.
+
+Retain the exact DEV `frontendBuild` attestation and matching wasm artifact
+alongside a capture. Function indices/offsets belong only to that module; use
+its name/debug sections for offline mapping to compiler symbols/module-relative
+source. Do not map against a merely similar build. If the engine supplies only
+an index or the artifact lacks line tables, report that symbol/line coverage
+limit instead of inventing a source location. This is bounded opt-in boundary
+observation, not a sampling profiler, stall repair or customer RCA.
+
+### Installed desktop collection
+
+In the ordinary installed desktop client, open **Settings → Debug → Desktop stall
+capture**, click **Start capture** before the operation, then **Stop capture**
+after it settles and **Copy capture**. Paste the resulting JSON into a local
+file for inspection/sharing. This uses the existing recorder and native
+clipboard plugin; no DEV launcher, console, SSH or reproduction request is
+required. Closing Settings does not stop collection. Copy is disabled until a
+capture has stopped. Failures appear in the same section, not as success.
+Nothing is automatically uploaded. The copied capture includes the packaged
+wasm preload's sanitized module filename and SHA-384 integrity hash, so an
+installed build can be matched to its exact artifact without a DEV attestation.
+The existing log exporter remains a distinct route for old aggregate logs;
+it cannot produce this opt-in capture. A permanently frozen UI cannot stop or
+copy until responsive again; this does not promise crash-proof persistence.
+
+Validation scope for this extension: owned Linux DEV exercises the real native
+callback gate and rendered recorder controls/clipboard route. It does not attest
+a shipped installer, the old beta29 client, macOS main-thread observation, or a
+customer incident. Mac acceptance requires an authorized, device-scoped MCP run;
+no automated Mac tests, global inputs or additional OS privileges are required
+or authorized by these hooks. No root-cause repair belongs in this change.
+
+The recorder emits a state-change event for API/UI start, stop and clear.
+Mounted Debug controls project that authority, including changes initiated
+through DEV evaluation; they never decide to reset a capture from stale UI state.
+The desktop capture always observes the current client, not the selected host.

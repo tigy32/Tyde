@@ -2599,6 +2599,29 @@ mod wasm_tests {
             .find(|row| row["event"] == "register" && row["site"] == "render_effect_loop")
             .expect("actual render-effect registration");
         assert!(registration["future"].as_u64().is_some());
+        let generic = events
+            .iter()
+            .find(|row| row["event"] == "register" && row["site"] == "other_spawn_local")
+            .expect("generic future registration");
+        let first_poll = events
+            .iter()
+            .find(|row| {
+                row["event"] == "poll_enter"
+                    && row["future"] == generic["future"]
+                    && row["poll"] == 1
+            })
+            .expect("generic future first poll");
+        for boundary in [registration, generic, first_poll] {
+            assert_eq!(boundary["boundaryFrames"]["status"], "observed");
+            let frames = boundary["boundaryFrames"]["frames"].as_array().unwrap();
+            assert!(!frames.is_empty() && frames.len() <= 12);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame["functionIndex"].as_u64().is_some())
+            );
+        }
+
         let callback = events
             .iter()
             .find(|row| row["event"] == "callback_enter" && row["future"].as_u64().is_some())
