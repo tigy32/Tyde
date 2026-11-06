@@ -88,13 +88,10 @@ pub(crate) fn NativeCommandErrorRecovery() -> impl IntoView {
 }
 
 fn chat_owns_connection_status(state: &AppState) -> bool {
-    if crate::native::is_native() {
-        crate::native::chat_visible(state)
-            && state.native_chat_header_owner.get()
-                == Some(mobile_shell_types::native::NativeChatHeaderOwner::Client)
-    } else {
-        state.viewing_chat.get()
-    }
+    crate::native::is_native()
+        && crate::native::chat_visible(state)
+        && state.native_chat_header_owner.get()
+            == Some(mobile_shell_types::native::NativeChatHeaderOwner::Client)
 }
 
 #[component]
@@ -462,19 +459,19 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn connected_status_shows_round_trip_time() {
         let host = LocalHostId("host-1".to_owned());
-        let host_for_mount = host.clone();
         let container = make_container();
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+            round_trips.insert(host, 42);
+        });
+        let mount_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_local_host_id.set(Some(host_for_mount.clone()));
-            state.connection_statuses.update(|statuses| {
-                statuses.insert(host_for_mount.clone(), ConnectionStatus::Connected);
-            });
-            state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
-                round_trips.insert(host_for_mount.clone(), 42);
-            });
-            provide_context(state);
-            view! { <ConnectionBanner /> }
+            provide_context(mount_state);
+            view! { <ConnectionBanner /><ChatConnectionStatus /> }
         });
         next_tick().await;
 
@@ -490,6 +487,24 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='connection-banner-rtt']")
             .unwrap()
             .expect("connected indicator should render round-trip feedback");
+        assert_eq!(round_trip.text_content().as_deref(), Some("42 ms"));
+        state.viewing_chat.set(true);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".chat-connection-status")
+                .unwrap()
+                .is_none(),
+            "PWA chat must not claim the native inline status location"
+        );
+        let banner = container
+            .query_selector("[data-mobile-test='connection-banner']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !banner.has_attribute("hidden"),
+            "PWA retains its floating latency pill while viewing chat"
+        );
         assert_eq!(round_trip.text_content().as_deref(), Some("42 ms"));
     }
 

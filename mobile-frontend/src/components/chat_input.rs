@@ -1614,6 +1614,14 @@ pub fn ChatInput() -> impl IntoView {
     let s_input = state.clone();
     let running_state = state.clone();
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
+    let working_state = state.clone();
+    let is_working = Memo::new(move |_| {
+        working_state.active_agent.get().is_some_and(|active| {
+            working_state
+                .agent_turn_active
+                .with(|turns| turns.get(&active.as_agent_ref()).copied().unwrap_or(false))
+        })
+    });
     let awaiting_state = state.clone();
     let is_awaiting_user =
         Memo::new(move |_| active_agent_is_awaiting_user_tracked(&awaiting_state));
@@ -2140,6 +2148,16 @@ pub fn ChatInput() -> impl IntoView {
             </Show>
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
+                <Show when=move || is_working.get()>
+                    <div
+                        class="chat-thinking-ring"
+                        data-mobile-test="chat-thinking-ring"
+                        aria-hidden="true"
+                    ></div>
+                </Show>
+                <span class="visually-hidden" role="status" data-mobile-test="chat-working-announcement">
+                    {move || if is_working.get() { "Working" } else { "" }}
+                </span>
                 <button
                     type="button"
                     class="chat-attach-button"
@@ -6195,5 +6213,236 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[wasm_bindgen_test]
+    async fn a_running_turn_lights_the_composer_rim_and_idle_puts_it_out() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let host = LocalHostId("host-1".to_owned());
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        };
+        let state = AppState::new();
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        }));
+        crate::dispatch::apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::TypingStatusChanged(true),
+        );
+        let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
+        let mount_state = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let ring = |container: &HtmlElement| {
+            container
+                .query_selector("[data-mobile-test='chat-thinking-ring']")
+                .unwrap()
+        };
+        let capsule = container
+            .query_selector("[data-mobile-test='chat-input-capsule']")
+            .unwrap()
+            .expect("composer capsule");
+        let ring_el = ring(&container).expect("a running turn draws the ring");
+
+        // The ring traces the whole capsule, not one of its edges.
+        let capsule_box = capsule.get_bounding_client_rect();
+        let ring_box = ring_el.get_bounding_client_rect();
+        for (edge, ring_edge, capsule_edge) in [
+            ("left", ring_box.left(), capsule_box.left()),
+            ("right", ring_box.right(), capsule_box.right()),
+            ("top", ring_box.top(), capsule_box.top()),
+            ("bottom", ring_box.bottom(), capsule_box.bottom()),
+        ] {
+            assert!(
+                (ring_edge - capsule_edge).abs() < 1.0,
+                "the ring hugs the capsule's {edge} edge ({ring_edge} vs {capsule_edge})"
+            );
+        }
+
+        let window = web_sys::window().unwrap();
+        let capsule_radius = window
+            .get_computed_style(&capsule)
+            .unwrap()
+            .expect("capsule style")
+            .get_property_value("border-top-left-radius")
+            .unwrap();
+        let capsule_radius: f64 = capsule_radius
+            .trim_end_matches("px")
+            .parse()
+            .expect("capsule radius in px");
+        let style = window.get_computed_style(&ring_el).unwrap().unwrap();
+        let prop = |name: &str| style.get_property_value(name).unwrap();
+        assert_eq!(prop("pointer-events"), "none");
+        assert_eq!(prop("filter"), "none", "no glowing orbit");
+        assert_eq!(prop("padding-top"), "1px", "a one-pixel edge");
+        assert_eq!(
+            prop("mask-composite"),
+            "exclude, exclude",
+            "the center is cut out"
+        );
+        assert_eq!(prop("background-size"), "200% 100%");
+        assert_eq!(prop("animation-duration"), "1.6s");
+        assert_eq!(prop("animation-timing-function"), "ease-in-out");
+        assert_eq!(prop("animation-iteration-count"), "infinite");
+        let radius: f64 = prop("border-top-left-radius")
+            .trim_end_matches("px")
+            .parse()
+            .expect("radius in px");
+        assert!((radius - capsule_radius).abs() < 0.01);
+        let seek = js_sys::Function::new_with_args(
+            "element, time",
+            "const animation = element.getAnimations()[0]; animation.pause(); animation.currentTime = time;",
+        );
+        for (time, position) in [(0, "100% 0px"), (800, "0% 0px"), (1600, "100% 0px")] {
+            seek.call2(&wasm_bindgen::JsValue::NULL, &ring_el, &time.into())
+                .unwrap();
+            assert_eq!(prop("background-position"), position, "horizontal sweep");
+        }
+        for (theme, accent) in [("light", "rgb(37, 99, 235)"), ("dark", "rgb(0, 122, 204)")] {
+            container.set_attribute("data-theme", theme).unwrap();
+            let gradient = prop("background-image");
+            assert_eq!(
+                gradient,
+                format!(
+                    "linear-gradient(90deg, rgba(0, 0, 0, 0) 0%, {accent} 40%, {accent} 60%, rgba(0, 0, 0, 0) 100%)"
+                ),
+                "one selected-theme accent fades through transparent edges"
+            );
+        }
+
+        let field: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        type_text(&container, "Keep this draft");
+        for native in [false, true] {
+            if native {
+                container.set_attribute("data-native-host", "").unwrap();
+            } else {
+                container.remove_attribute("data-native-host").unwrap();
+            }
+            for width in [320, 390, 820] {
+                container
+                    .style()
+                    .set_property("width", &format!("{width}px"))
+                    .unwrap();
+                field.focus().unwrap();
+                next_tick().await;
+                let bounds = capsule.get_bounding_client_rect();
+                let outline = ring(&container).unwrap().get_bounding_client_rect();
+                for (actual, expected) in [
+                    (outline.left(), bounds.left()),
+                    (outline.right(), bounds.right()),
+                    (outline.top(), bounds.top()),
+                    (outline.bottom(), bounds.bottom()),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 0.5,
+                        "working rim follows the composer at every width"
+                    );
+                }
+                let focused_shadow = window
+                    .get_computed_style(&capsule)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("box-shadow")
+                    .unwrap();
+                field.blur().unwrap();
+                assert_eq!(
+                    focused_shadow,
+                    window
+                        .get_computed_style(&capsule)
+                        .unwrap()
+                        .unwrap()
+                        .get_property_value("box-shadow")
+                        .unwrap(),
+                    "focus must not cover the moving edge with solid accent"
+                );
+                crate::dispatch::apply_chat_event(
+                    &state,
+                    &agent_ref,
+                    protocol::ChatEvent::TypingStatusChanged(false),
+                );
+                next_tick().await;
+                assert!(ring(&container).is_none(), "typed idle removes the rim");
+                assert!(
+                    (capsule.get_bounding_client_rect().height() - bounds.height()).abs() < 0.5,
+                    "working must add no vertical space"
+                );
+                assert_eq!(field.value(), "Keep this draft");
+                crate::dispatch::apply_chat_event(
+                    &state,
+                    &agent_ref,
+                    protocol::ChatEvent::TypingStatusChanged(true),
+                );
+                next_tick().await;
+            }
+        }
+        let ring_el = ring(&container).unwrap();
+        let reduced = js_sys::Function::new_with_args("ring", r#"
+            const changed = [];
+            try {
+                for (const sheet of document.styleSheets) {
+                    for (const rule of sheet.cssRules) {
+                        if (rule.media?.mediaText === '(prefers-reduced-motion: reduce)' && rule.cssText.includes('.chat-thinking-ring')) {
+                            changed.push(rule);
+                            rule.media.mediaText = 'all';
+                        }
+                    }
+                }
+                const style = getComputedStyle(ring);
+                return [changed.length, style.animationName, style.backgroundImage, style.opacity];
+            } finally {
+                for (const rule of changed) rule.media.mediaText = '(prefers-reduced-motion: reduce)';
+            }
+        "#).call1(&wasm_bindgen::JsValue::NULL, &ring_el).unwrap();
+        let reduced = js_sys::Array::from(&reduced);
+        assert!(reduced.get(0).as_f64().unwrap() >= 1.0);
+        assert_eq!(reduced.get(1).as_string().unwrap(), "none");
+        assert_eq!(reduced.get(2).as_string().unwrap(), "none");
+        assert_eq!(reduced.get(3).as_string().unwrap(), "0.45");
+        let announcement = container
+            .query_selector("[data-mobile-test='chat-working-announcement']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            announcement.get_attribute("role").as_deref(),
+            Some("status")
+        );
+        assert_eq!(announcement.text_content().unwrap(), "Working");
+        assert!(
+            announcement.get_bounding_client_rect().height() <= 1.0,
+            "status is accessible, not a new visible row"
+        );
+        crate::dispatch::apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::TypingStatusChanged(false),
+        );
+        let other = AgentRef {
+            local_host_id: host,
+            agent_id: AgentId("other-working-agent".into()),
+        };
+        crate::dispatch::apply_chat_event(
+            &state,
+            &other,
+            protocol::ChatEvent::TypingStatusChanged(true),
+        );
+        next_tick().await;
+        assert!(
+            ring(&container).is_none(),
+            "another agent's work never lights this composer"
+        );
+        assert_eq!(announcement.text_content().unwrap(), "");
     }
 }

@@ -4708,16 +4708,16 @@ mod wasm_tests {
                 dock_bounds.width() <= 840.0,
                 "the composer retains its readable rail"
             );
-            let shell_bounds = container
-                .query_selector(".mobile-app")
-                .unwrap()
-                .unwrap()
-                .get_bounding_client_rect();
-            // The approved flat header spans chat; only the composer remains inset.
+            // This browser fixture has no native-host marker. Its restored capsule
+            // shares the composer rails, not the native-only full-width header.
             assert!(
-                (header_bounds.left() - shell_bounds.left()).abs() <= 1.0
-                    && (header_bounds.right() - shell_bounds.right()).abs() <= 1.0,
-                "the flat header must span the chat's full width"
+                header_bounds.width() <= 840.0,
+                "the browser header retains its readable rail"
+            );
+            assert!(
+                (header_bounds.left() - dock_bounds.left()).abs() <= 1.0
+                    && (header_bounds.right() - dock_bounds.right()).abs() <= 1.0,
+                "browser header and composer must share the same rails"
             );
             for selector in [".chat-back-button", ".send-button"] {
                 let control = container.query_selector(selector).unwrap().unwrap();
@@ -5042,6 +5042,13 @@ mod wasm_tests {
             crate::dispatch::apply_chat_event(
                 &state,
                 &agent_ref,
+                protocol::ChatEvent::TypingStatusChanged(
+                    activity == protocol::AgentActivity::Thinking,
+                ),
+            );
+            crate::dispatch::apply_chat_event(
+                &state,
+                &agent_ref,
                 protocol::ChatEvent::StreamStart(protocol::StreamStartData {
                     agent: "fixture".to_owned(),
                     model: None,
@@ -5077,19 +5084,29 @@ mod wasm_tests {
             assert_eq!(send.text_content().unwrap().trim(), "Send");
             assert!(!send.has_attribute("disabled"));
             assert!(reachable() && send.contains(Some(&hit_at(point))));
-            let thinking = container
-                .query_selector("[data-mobile-test='chat-thinking']")
+            let ring = container
+                .query_selector("[data-mobile-test='chat-thinking-ring']")
                 .unwrap();
             assert_eq!(
-                thinking.is_some(),
+                ring.is_some(),
                 activity == protocol::AgentActivity::Thinking
             );
-            if let Some(thinking) = thinking {
-                assert!(thinking.text_content().unwrap().contains("Thinking"));
-                assert_eq!(thinking.get_attribute("role").as_deref(), Some("status"));
+            if let Some(ring) = ring {
+                let style = frame
+                    .content_window()
+                    .unwrap()
+                    .get_computed_style(&ring)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
             }
-            // The indicator is now in the transcript; the hit test above still
-            // proves that every lifecycle edge leaves Send unobstructed.
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='chat-thinking']")
+                    .unwrap()
+                    .is_none(),
+                "the restored working edge never adds a transcript status row"
+            );
             down_or_up("pointerup", point);
             send.unchecked_ref::<HtmlElement>().click();
             next_tick().await;

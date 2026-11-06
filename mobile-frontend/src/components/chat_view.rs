@@ -151,21 +151,6 @@ fn context_compaction_status_label(
 /// independently of the stylesheet.
 const RECOVERY_TOUCH_TARGET: &str = "min-width:44px;min-height:44px;";
 
-/// Tracked predicate for render-time checks: true when the active agent
-/// died with `AgentError { fatal: true }`.
-fn agent_is_terminated_tracked(
-    agents: RwSignal<Vec<crate::state::AgentInfo>>,
-    active: &crate::state::ActiveAgentRef,
-) -> bool {
-    agents.with(|agents| {
-        agents.iter().any(|a| {
-            a.local_host_id == active.local_host_id
-                && a.agent_id == active.agent_id
-                && a.fatal_error.is_some()
-        })
-    })
-}
-
 /// The terminal state of a conversation that could not be loaded.
 ///
 /// This is what the spinner turns into. It is an `alert`, not a status: the
@@ -521,15 +506,6 @@ pub fn ChatView() -> impl IntoView {
     };
 
     let header_subtitle = active_backend;
-    let thinking_state = state.clone();
-    let thinking = move || {
-        let active = thinking_state.active_agent.get()?;
-        let working = thinking_state
-            .agent_turn_active
-            .with(|turns| turns.get(&active.as_agent_ref()).copied().unwrap_or(false));
-        (!agent_is_terminated_tracked(thinking_state.agents, &active) && working)
-            .then_some("••• Thinking")
-    };
     let menu_state = state.clone();
     let on_send_actions = Callback::new(move |()| {
         more_open.set(false);
@@ -770,6 +746,9 @@ pub fn ChatView() -> impl IntoView {
                     aria-label={let state = state.clone(); move || state.chat_back_label()}
                     data-mobile-test="chat-back" on:click=move |_| on_back.run(())>
                     <span class="chat-back-chevron" aria-hidden="true">"\u{2039}"</span>
+                    <span class="chat-back-label">{let state = state.clone(); move || {
+                        if state.chat_back_stack.with(Vec::is_empty) { "Agents" } else { "Back" }
+                    }}</span>
                 </button>
                 {crate::native::is_native().then(|| view! {
                     <Show when=move || crate::native::sidebar_available(&sidebar_visibility_state)>
@@ -1284,10 +1263,10 @@ pub fn ChatView() -> impl IntoView {
                                                     {
                                                         let r = r_render.clone();
                                                         view! {
-                                                            <details class="reasoning-block">
-                                                                <summary class="reasoning-label">"Thinking"</summary>
+                                                            <div class="reasoning-block">
+                                                                <div class="reasoning-label">"Thinking..."</div>
                                                                 <div class="reasoning-text">{move || r.get()}</div>
-                                                            </details>
+                                                            </div>
                                                         }
                                                     }
                                                 </Show>
@@ -1340,11 +1319,6 @@ pub fn ChatView() -> impl IntoView {
                         </div>
                     }.into_any()
                 }}
-                <Show when=move || thinking().is_some()>
-                    <div class="chat-working-status" role="status" data-mobile-test="chat-thinking">
-                        {thinking}
-                    </div>
-                </Show>
                 {move || compaction_label().map(|label| view! { <div class="chat-working-status" role="status">{label}</div> })}
                 </div>
             </div>
@@ -2825,13 +2799,26 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn typed_live_reasoning_is_visible_in_the_active_stream() {
+        crate::components::test_styles::ensure_styles_loaded();
         let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
         let (state, _mount) = mount_active_chat(container.clone());
         let agent_ref = state
             .active_agent
             .get_untracked()
             .expect("active agent")
             .as_agent_ref();
+        state.chat_messages.update(|messages| {
+            messages.insert(
+                agent_ref.clone(),
+                vec![make_message(
+                    MessageSender::Assistant {
+                        agent: "codex".into(),
+                    },
+                    "Completed reply",
+                )],
+            );
+        });
         let reasoning = ArcRwSignal::new(String::new());
         state.streaming_text.update(|streams| {
             streams.insert(
@@ -2879,6 +2866,68 @@ mod wasm_tests {
             "reasoning-only preview must not create a second empty bubble"
         );
 
+        let window = web_sys::window().unwrap();
+        let property = |element: &web_sys::Element, name: &str| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value(name)
+                .unwrap()
+        };
+        let completed = container
+            .query_selector(".chat-message.assistant:not(.streaming)")
+            .unwrap()
+            .unwrap();
+        let block = reasoning_text.parent_element().unwrap();
+        for native in [false, true] {
+            if native {
+                container.set_attribute("data-native-host", "").unwrap();
+                container
+                    .set_attribute("data-native-chat-header", "client")
+                    .unwrap();
+            } else {
+                container.remove_attribute("data-native-host").unwrap();
+                container
+                    .remove_attribute("data-native-chat-header")
+                    .unwrap();
+            }
+            next_tick().await;
+            assert!(
+                reasoning_text.get_bounding_client_rect().height() > 0.0,
+                "live reasoning is visible by default, not hidden in a closed disclosure"
+            );
+            assert_eq!(
+                block
+                    .query_selector(".reasoning-label")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                Some("Thinking...")
+            );
+            assert_eq!(property(&block, "border-left-width"), "2px");
+            assert_eq!(property(&block, "padding-left"), "12px");
+            for row in [&streaming, &completed] {
+                assert_eq!(
+                    property(row, "border-left-width"),
+                    "3px",
+                    "both assistant and live replies retain their grouping rail"
+                );
+                assert_ne!(
+                    property(row, "box-shadow"),
+                    "none",
+                    "the original inset divider remains visible"
+                );
+            }
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='chat-thinking']")
+                    .unwrap()
+                    .is_none(),
+                "reasoning never adds a second live working-status row"
+            );
+        }
         reasoning.set("inspect the eventual assistant item".to_owned());
         next_tick().await;
         assert_eq!(
@@ -4249,7 +4298,6 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-back']")
             .unwrap()
             .expect("back button");
-        // The compact icon's destination is its accessible name, not duplicated visible text.
         assert_eq!(
             back.get_attribute("aria-label").as_deref(),
             Some("Back to Agents")
@@ -4323,11 +4371,11 @@ mod wasm_tests {
                 assert_eq!(subtitle.text_content().unwrap(), "Claude");
                 assert_eq!(
                     container
-                        .query_selector("[data-mobile-test='chat-thinking']")
+                        .query_selector("[data-mobile-test='chat-thinking-ring']")
                         .unwrap()
                         .is_some(),
                     running,
-                    "only typed turn state controls the quiet thinking indicator"
+                    "only typed turn state controls the composer working edge"
                 );
                 let bounds = header.get_bounding_client_rect();
                 let back_bounds = back.get_bounding_client_rect();
@@ -5273,19 +5321,77 @@ mod wasm_tests {
         let bar =
             context_bar(&container).expect("an assistant row with a breakdown puts the bar up");
         assert_eq!(context_bar_value(&container).as_deref(), Some("60"));
-        // The approved header replaces the perimeter ring with one thin line.
+        let header = bar.parent_element().unwrap();
+        let perimeter = bar.get_bounding_client_rect();
+        let browser_header = header.get_bounding_client_rect();
+        for (actual, expected) in [
+            (perimeter.top(), browser_header.top()),
+            (perimeter.bottom(), browser_header.bottom()),
+            (perimeter.left(), browser_header.left()),
+            (perimeter.right(), browser_header.right()),
+        ] {
+            assert!(
+                (actual - expected).abs() < 1.0,
+                "PWA retains the original header perimeter"
+            );
+        }
+        let window = web_sys::window().unwrap();
+        let property = |element: &web_sys::Element, name: &str| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value(name)
+                .unwrap()
+        };
+        let title = container
+            .query_selector("[data-mobile-test='chat-title']")
+            .unwrap()
+            .unwrap();
+        let center = title.parent_element().unwrap();
+        assert_eq!(property(&center, "flex-direction"), "column");
+        let label = container
+            .query_selector(".chat-back-label")
+            .unwrap()
+            .unwrap();
+        assert_eq!(label.text_content().as_deref(), Some("Agents"));
+        assert!(
+            label.get_bounding_client_rect().width() > 0.0,
+            "PWA restores its visible Back destination"
+        );
+        assert_ne!(property(&header, "border-radius"), "0px");
+        container.set_attribute("data-native-host", "").unwrap();
+        container
+            .set_attribute("data-native-chat-header", "client")
+            .unwrap();
+        next_tick().await;
         let line = bar.get_bounding_client_rect();
-        let header = bar.parent_element().unwrap().get_bounding_client_rect();
-        assert!((line.left() - header.left()).abs() < 1.0);
-        assert!((line.right() - header.right()).abs() < 1.0);
-        assert!((line.bottom() - header.bottom()).abs() <= 1.0);
-        assert!(line.height() <= 2.0, "context usage must be a hairline");
+        let native_header = header.get_bounding_client_rect();
+        assert!((line.left() - native_header.left()).abs() < 1.0);
+        assert!((line.right() - native_header.right()).abs() < 1.0);
+        assert!((line.bottom() - native_header.bottom()).abs() <= 1.0);
+        assert!(
+            line.height() <= 2.0,
+            "only native context usage is a hairline"
+        );
+        assert_eq!(property(&center, "flex-direction"), "row");
+        assert_eq!(
+            label.get_bounding_client_rect().width(),
+            0.0,
+            "native retains its compact icon-only Back control"
+        );
+        assert_eq!(property(&header, "border-radius"), "0px");
         let stroke_width = px(&context_bar_fill_style(&container, "stroke-width"));
         assert!((0.5..=2.0).contains(&stroke_width));
         assert!(
             bar.text_content().unwrap().is_empty(),
             "no visible usage text"
         );
+        container.remove_attribute("data-native-host").unwrap();
+        container
+            .remove_attribute("data-native-chat-header")
+            .unwrap();
+        next_tick().await;
         let clip = context_bar_fill_style(&container, "clip-path");
         assert!(
             clip.contains("40%"),
