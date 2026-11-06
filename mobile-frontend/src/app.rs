@@ -1450,12 +1450,29 @@ mod wasm_tests {
         // arrived. No wall-time requirement or replacement product timeout.
         let clock = BrowserOverride(js_sys::Function::new_no_args(r#"
             const originalSet = window.setTimeout, originalClear = window.clearTimeout;
-            const deadlines = new Map(); let id = 0;
-            window.setTimeout = (callback, ms, ...args) => ms === 60000
-                ? (deadlines.set(--id, () => callback(...args)), id)
-                : originalSet(callback, ms, ...args);
-            window.clearTimeout = handle => handle < 0 ? deadlines.delete(handle) : originalClear(handle);
+            const deadlines = new Map(), backoffs = new Map(); let id = 0, armed;
+            // Hold the next existing jittered reconnect tick until the DOM is inspected.
+            window.setTimeout = (callback, ms, ...args) => {
+                if (ms === 60000) {
+                    deadlines.set(--id, () => callback(...args)); return id;
+                }
+                if (armed && ms >= 750 && ms <= 30000) {
+                    backoffs.set(--id, () => callback(...args));
+                    const notify = armed; armed = undefined; notify(); return id;
+                }
+                return originalSet(callback, ms, ...args);
+            };
+            window.clearTimeout = handle => {
+                if (handle < 0) { deadlines.delete(handle); backoffs.delete(handle); }
+                else originalClear(handle);
+            };
             const restore = () => { window.setTimeout = originalSet; window.clearTimeout = originalClear; };
+            restore.pauseReconnect = () => new Promise(resolve => { armed = resolve; });
+            restore.resumeReconnect = () => {
+                const next = backoffs.entries().next().value;
+                if (!next) throw new Error('No reconnect tick is armed');
+                backoffs.delete(next[0]); next[1]();
+            };
             restore.expire = () => {
                 const next = deadlines.entries().next().value;
                 if (!next) throw new Error('No connection deadline is armed');
@@ -1463,6 +1480,14 @@ mod wasm_tests {
             };
             return restore;
         "#).call0(&wasm_bindgen::JsValue::NULL).unwrap());
+        let pause_reconnect = js_sys::Reflect::get(&clock.0, &"pauseReconnect".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        let resume_reconnect = js_sys::Reflect::get(&clock.0, &"resumeReconnect".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
         let state = AppState::new();
         state.app_mode.set(AppMode::Workspace);
         let container = make_container();
@@ -1485,10 +1510,13 @@ mod wasm_tests {
         .await
         .unwrap();
         let observed = state.clone();
-        let unlisten_lines =
-            bridge::listen_host_line(move |event| handle_host_line_event(&observed, event))
-                .await
-                .unwrap();
+        let (line_tx, mut lines) = mpsc::unbounded_channel();
+        let unlisten_lines = bridge::listen_host_line(move |event| {
+            handle_host_line_event(&observed, event);
+            line_tx.send(()).unwrap();
+        })
+        .await
+        .unwrap();
         let http = js_sys::Function::new_with_args(
             "url,method,body",
             r#"
@@ -1644,6 +1672,80 @@ mod wasm_tests {
                     break;
                 }
             }
+            while !matches!(state.active_host_connection_status(), ConnectionStatus::Connected) {
+                lines.recv().await.unwrap();
+            }
+            let previous_instance = state.active_connection_instance_ids.get_untracked()[&host];
+            let reconnect_armed = pause_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            // Inject the suspension clock, not a transport result or a lifecycle delay.
+            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Background);
+            PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(Some(
+                unix_time_ms() - BACKGROUND_RECONNECT_AFTER.as_millis() as u64,
+            )));
+            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Foreground);
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(reconnect_armed)).await.unwrap();
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id != host {
+                    continue;
+                }
+                ensure!(
+                    !matches!(event.status, PairedHostConnectionStatus::Failed { .. }
+                        | PairedHostConnectionStatus::Disconnected { .. }),
+                    "routine foreground suspension must emit Connecting, never a failure or disconnect"
+                );
+                if event.status == PairedHostConnectionStatus::Connecting {
+                    break;
+                }
+            }
+            next_tick().await;
+            ensure!(container.text_content().unwrap().contains("Connecting…"),
+                "foreground recovery must render the canonical Connecting label");
+            ensure!(container.query_selector("[role='alert']").unwrap().is_none(),
+                "routine suspension must not render a red technical error");
+            ensure!(container.query_selector("[data-mobile-test='connection-banner-spinner']").unwrap().is_some(),
+                "foreground recovery must render the existing connecting spinner");
+            resume_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id != host {
+                    continue;
+                }
+                ensure!(!matches!(event.status, PairedHostConnectionStatus::Failed { .. }),
+                    "routine reconnect must stay neutral until the new transport connects");
+                if event.status == PairedHostConnectionStatus::Connected {
+                    ensure!(event.connection_instance_id != Some(previous_instance),
+                        "foreground recovery must establish a fresh transport epoch");
+                    break;
+                }
+            }
+            while !matches!(state.active_host_connection_status(), ConnectionStatus::Connected) {
+                lines.recv().await.unwrap();
+            }
+            next_tick().await;
+            ensure!(container.query_selector("[aria-label^='Connected,']").unwrap().is_some(),
+                "the real host Welcome must restore the connected presentation");
+            ensure!(container.query_selector("[role='alert']").unwrap().is_none(),
+                "successful recovery must leave no stale suspension error");
+            let reconnect_armed = pause_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            bridge::invalidate_host_connection(&host, bridge::ConnectionInvalidation::ProtocolViolation {
+                message: "Regression protocol boundary violation".into(),
+            }).unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(reconnect_armed)).await.unwrap();
+            loop {
+                let event = statuses.recv().await.unwrap();
+                if event.local_host_id == host
+                    && let PairedHostConnectionStatus::Failed { message, .. } = event.status {
+                    ensure!(message.contains("Regression protocol boundary violation"),
+                        "a genuine protocol violation must retain its diagnostic cause");
+                    break;
+                }
+            }
+            next_tick().await;
+            ensure!(container.query_selector("[role='alert']").unwrap().is_some(),
+                "a genuine protocol violation must still render an error alert");
+            ensure!(container.query_selector("[data-mobile-test='connection-banner-spinner']").unwrap().is_none(),
+                "genuine errors must not be disguised as Connecting");
             let after = IndexedDbHostStore.get(&host).await.unwrap().unwrap();
             ensure!(
                 (before.managed) == (after.managed),
@@ -1654,6 +1756,30 @@ mod wasm_tests {
                 "Connection boundary result changed"
             );
             configure(&format!("{endpoint}/unanswered"));
+            resume_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &"GET".into(), &"".into(),
+                ).unwrap(),
+            )).await.unwrap();
+            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Background);
+            PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(Some(
+                unix_time_ms() - BACKGROUND_RECONNECT_AFTER.as_millis() as u64,
+            )));
+            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Foreground);
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &"GET".into(), &"".into(),
+                ).unwrap(),
+            )).await.unwrap();
+            next_tick().await;
+            ensure!(container.query_selector("[role='alert']").unwrap().is_some()
+                && container.text_content().unwrap().contains("Regression protocol boundary violation"),
+                "foreground interruption of a pending retry must preserve the already observed real failure");
             bridge::reconnect_paired_host(&host).await.unwrap();
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
                 http.call3(

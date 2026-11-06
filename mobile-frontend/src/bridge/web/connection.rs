@@ -1194,6 +1194,19 @@ fn handle_retryable_connect_failure(
         manager.emit_final_failure(local_host_id, actor_instance_id, error);
         return false;
     }
+    #[cfg(target_arch = "wasm32")]
+    if matches!(
+        error,
+        ConnectErr::Invalidated(ConnectionInvalidation::ForegroundResume { .. })
+    ) {
+        log::info!("mobile_foreground_reconnect observed_failure={has_failed}");
+        // Suspension requests a fresh transport epoch, not a failure verdict.
+        // An already observed failure remains authoritative until reconnection.
+        if !*has_failed {
+            manager.emit_connecting(local_host_id, actor_instance_id);
+        }
+        return true;
+    }
     *has_failed = true;
     manager.emit_persistent_failure(local_host_id, actor_instance_id, error);
     true
