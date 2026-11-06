@@ -134,6 +134,7 @@ pub(crate) fn AppSurface() -> impl IntoView {
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />
+            <components::ReconnectOverlay />
             {crate::native::is_native().then(|| view! { <components::NativeAuthRecoverySheet /> })}
             {move || {
                 // A Hosts/Back round trip must not dispose component-owned drafts.
@@ -1495,7 +1496,7 @@ mod wasm_tests {
         let rendered = state.clone();
         let handle = mount_to(container.clone(), move || {
             provide_context(rendered);
-            view! { <components::ConnectionBanner /> }
+            view! { <components::ReconnectOverlay /><components::ConnectionBanner /> }
         });
         let (tx, mut statuses) = mpsc::unbounded_channel();
         let observed = state.clone();
@@ -1586,7 +1587,7 @@ mod wasm_tests {
                 );
                 ensure!(
                     container
-                        .query_selector("[data-mobile-test='connection-banner-spinner']")
+                        .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
                         .unwrap()
                         .is_none(),
                     "Connection DOM boundary assertion failed"
@@ -1641,7 +1642,7 @@ mod wasm_tests {
             );
             ensure!(
                 container
-                    .query_selector("[data-mobile-test='connection-banner-spinner']")
+                    .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
                     .unwrap()
                     .is_none(),
                 "Connection DOM boundary assertion failed"
@@ -1700,12 +1701,19 @@ mod wasm_tests {
                 }
             }
             next_tick().await;
-            ensure!(container.text_content().unwrap().contains("Connecting…"),
-                "foreground recovery must render the canonical Connecting label");
+            // The approved reconnect UI replaces the old spinner/label with a modal and quiet dot.
+            let overlay = container.query_selector("dialog.reconnect-dialog").unwrap().unwrap()
+                .dyn_into::<web_sys::HtmlDialogElement>().unwrap();
+            ensure!(overlay.open() && overlay.text_content().unwrap().contains("Reconnecting"),
+                "foreground recovery must open the neutral reconnect overlay");
             ensure!(container.query_selector("[role='alert']").unwrap().is_none(),
                 "routine suspension must not render a red technical error");
-            ensure!(container.query_selector("[data-mobile-test='connection-banner-spinner']").unwrap().is_some(),
-                "foreground recovery must render the existing connecting spinner");
+            ensure!(container.query_selector("[data-mobile-test='connection-banner-dot-reconnecting']").unwrap().is_some(),
+                "foreground recovery must retain the compact pending indicator");
+            overlay.query_selector("button").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            ensure!(!overlay.open() && state.active_host_connection_status() == ConnectionStatus::Connecting,
+                "Dismiss must leave the same actor reconnecting without a parallel UI lifecycle");
             resume_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
             loop {
                 let event = statuses.recv().await.unwrap();
@@ -1745,7 +1753,7 @@ mod wasm_tests {
             next_tick().await;
             ensure!(container.query_selector("[role='alert']").unwrap().is_some(),
                 "a genuine protocol violation must still render an error alert");
-            ensure!(container.query_selector("[data-mobile-test='connection-banner-spinner']").unwrap().is_none(),
+            ensure!(container.query_selector("[data-mobile-test='connection-banner-dot-reconnecting']").unwrap().is_none(),
                 "genuine errors must not be disguised as Connecting");
             let after = IndexedDbHostStore.get(&host).await.unwrap().unwrap();
             ensure!(
@@ -1821,7 +1829,7 @@ mod wasm_tests {
             next_tick().await;
             ensure!(
                 container
-                    .query_selector("[data-mobile-test='connection-banner-spinner']")
+                    .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
                     .unwrap()
                     .is_none(),
                 "Connection DOM boundary assertion failed"
@@ -3417,7 +3425,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn bundle_selection_survives_replay_and_multiple_hosts_require_a_choice() {
         install_loader_boundary();
-        let _sends = bridge::test_clean_sends();
+        // Synthetic Connected inputs still send real Hello/Heartbeat frames; capture their boundary here.
+        let _sends = bridge::test_capture_sends();
         let state = AppState::new();
         state.app_mode.set(AppMode::Workspace);
         let a = fixture_host("bundle-choice-a", "First host");
@@ -3443,6 +3452,100 @@ mod wasm_tests {
         assert_eq!(
             state.active_local_host_id.get_untracked(),
             Some(b.local_host_id.clone())
+        );
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "The selection fixture must not manufacture a transport failure"
+        );
+        apply_connection_status(
+            &state,
+            b.local_host_id.clone(),
+            PairedHostConnectionStatus::Connecting,
+            None,
+        );
+        next_tick().await;
+        let overlay = container
+            .query_selector("[data-mobile-test='reconnect-dialog']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlDialogElement>()
+            .unwrap();
+        assert!(
+            overlay.open(),
+            "Reconnect dialog closed: native={}, workspace={}, pending={}, bundle_notice={}, command_error={}, shell_error={}",
+            crate::native::is_native(),
+            state.app_mode.get_untracked() == AppMode::Workspace,
+            matches!(
+                state.active_host_connection_status(),
+                ConnectionStatus::Connecting | ConnectionStatus::Bootstrapping
+            ),
+            state.bundle_status.get_untracked().message().is_some(),
+            state.active_host_command_error().is_some(),
+            state.mobile_shell_error.get_untracked().is_some(),
+        );
+        overlay
+            .query_selector("button")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let banner = container
+            .query_selector("[data-mobile-test='connection-banner']")
+            .unwrap()
+            .unwrap();
+        state.app_mode.set(AppMode::HostPicker);
+        next_tick().await;
+        container
+            .query_selector(".picker-pair-another")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        container
+            .query_selector("[data-mobile-test='pairing-scanner-cancel']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert_eq!(state.app_mode.get_untracked(), AppMode::Workspace);
+        assert_eq!(
+            state.active_local_host_id.get_untracked(),
+            Some(b.local_host_id.clone())
+        );
+        assert_eq!(
+            state.active_host_connection_status(),
+            ConnectionStatus::Connecting
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='reconnect-dialog']")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(overlay.as_ref()))
+        );
+        assert!(
+            !overlay.open(),
+            "PWA Pair/Cancel must retain dismissal while the connection stays pending"
+        );
+        assert!(
+            !container
+                .query_selector("[data-mobile-test='connection-banner']")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(&banner)),
+            "Exercise actual PWA workspace teardown, not an isolated banner"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
+                .unwrap()
+                .is_some()
         );
         let stream = make_host_stream();
         state.host_streams.update(|streams| {
@@ -3748,6 +3851,17 @@ mod wasm_tests {
                         options.set_detail(&serde_wasm_bindgen::to_value(&intent).unwrap());
                         web_sys::window().unwrap().dispatch_event(&web_sys::CustomEvent::new_with_event_init_dict("tyde-native-intent", &options).unwrap()).unwrap();
                     };
+                    // Pair completion is still Connecting here; its modal must be dismissed before native navigation.
+                    let overlay = container.query_selector("dialog.reconnect-dialog").unwrap()
+                        .ok_or("Connecting must expose its dismissible overlay")?
+                        .dyn_into::<web_sys::HtmlDialogElement>().unwrap();
+                    if !overlay.open() { return Err("Connecting must open the reconnect dialog".into()); }
+                    let pending = state.active_host_connection_status();
+                    overlay.query_selector("button").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
+                    next_tick().await;
+                    if overlay.open() || state.active_host_connection_status() != pending {
+                        return Err("Dismissing the overlay must leave connection state unchanged".into());
+                    }
                     intent(NativeIntent::Hosts);
                     next_tick().await;
                     if container.query_selector(".picker-pair-another").unwrap().is_none()

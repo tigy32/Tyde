@@ -3284,6 +3284,256 @@ mod wasm_tests {
         ).call0(&wasm_bindgen::JsValue::NULL).unwrap().unchecked_into()
     }
 
+    fn next_dialog_close(dialog: &web_sys::HtmlDialogElement) -> js_sys::Promise {
+        js_sys::Function::new_with_args("dialog",
+            "return new Promise(resolve => dialog.addEventListener('close', resolve, {once:true}));")
+            .call1(&wasm_bindgen::JsValue::NULL, dialog).unwrap().unchecked_into()
+    }
+
+    #[wasm_bindgen_test]
+    async fn reconnect_dialog_preserves_cached_chat_and_unsent_selection() {
+        use crate::state::ConnectionStatus;
+        crate::components::test_styles::ensure_styles_loaded();
+        let _sends = crate::bridge::test_capture_sends();
+        let container = make_container();
+        container.set_class_name("mobile-app");
+        container
+            .style()
+            .set_css_text("width:393px;height:800px;position:fixed;top:0;left:0");
+        let state = AppState::new();
+        let host = LocalHostId("host-1".to_owned());
+        seed_connected_agent(&state, &host);
+        state.app_mode.set(crate::state::AppMode::Workspace);
+        fill_chat(&state, 20);
+        let owner = state.active_agent.get_untracked().unwrap().as_agent_ref();
+        state.agent_loaded.update(|loaded| {
+            loaded.insert(owner);
+        });
+        state.set_chat_input("Keep this unsent draft".into());
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <crate::components::ReconnectOverlay /><crate::components::ConnectionBanner /><ChatView /> }
+        });
+        settle_autoscroll().await;
+        let document = web_sys::window().unwrap().document().unwrap();
+        let input = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        input.focus().unwrap();
+        input
+            .set_selection_range_with_direction(2, 8, "backward")
+            .unwrap();
+        // Reproduce mobile Chromium's focus-side collapse on the real DOM focus event.
+        let focus_input = input.clone();
+        let collapse = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            focus_input.set_selection_range(0, 0).unwrap();
+        });
+        input
+            .add_event_listener_with_callback("focus", collapse.as_ref().unchecked_ref())
+            .unwrap();
+        let scroller = chat_scroller(&container);
+        scroller.set_scroll_top(30);
+        scroller
+            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        next_tick().await;
+        let top = scroller.get_bounding_client_rect().top();
+        let scroll = scroller.scroll_top();
+        let cached = scroller.text_content();
+        let sent = crate::bridge::test_send_attempts();
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connecting);
+        });
+        next_tick().await;
+        let dialog = container
+            .query_selector("dialog.reconnect-dialog")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlDialogElement>()
+            .unwrap();
+        assert!(
+            dialog.open(),
+            "Transient connection state opens the overlay"
+        );
+        let rect = dialog.get_bounding_client_rect();
+        let window = web_sys::window().unwrap();
+        assert!(
+            (rect.left() * 2.0 + rect.width() - window.inner_width().unwrap().as_f64().unwrap())
+                .abs()
+                < 1.0,
+            "The modal must be centered, not pinned over the chat header"
+        );
+        assert!(
+            (rect.top() * 2.0 + rect.height() - window.inner_height().unwrap().as_f64().unwrap())
+                .abs()
+                < 1.0
+        );
+        let dismiss = dialog
+            .query_selector("button")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(dismiss.as_ref()))
+        );
+        assert_eq!(
+            scroller.get_bounding_client_rect().top(),
+            top,
+            "The overlay must not displace chat"
+        );
+        let closed = next_dialog_close(&dialog);
+        dismiss.click();
+        wasm_bindgen_futures::JsFuture::from(closed).await.unwrap();
+        next_tick().await;
+        assert!(!dialog.open());
+        assert_eq!(
+            state.active_host_connection_status(),
+            ConnectionStatus::Connecting
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Bootstrapping);
+        });
+        next_tick().await;
+        assert!(!dialog.open(), "Bootstrap cannot undo dismissal");
+        assert_eq!(input.value(), "Keep this unsent draft");
+        assert_eq!(input.selection_start().unwrap(), Some(2));
+        assert_eq!(input.selection_end().unwrap(), Some(8));
+        assert_eq!(
+            input.selection_direction().unwrap().as_deref(),
+            Some("backward")
+        );
+
+        assert!(
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(input.as_ref()))
+        );
+        assert!(
+            container
+                .query_selector("textarea")
+                .unwrap()
+                .unwrap()
+                .is_same_node(Some(input.as_ref()))
+        );
+        assert_eq!(scroller.get_bounding_client_rect().top(), top);
+        assert_eq!(scroller.scroll_top(), scroll);
+        assert_eq!(scroller.text_content(), cached);
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            sent,
+            "Reconnect presentation must not submit the draft"
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-dot-connected']")
+                .unwrap()
+                .is_some()
+        );
+        input.blur().unwrap();
+        let reader_selection = window.get_selection().unwrap().unwrap();
+        let paragraph = scroller.query_selector("p").unwrap().unwrap();
+        reader_selection.select_all_children(&paragraph).unwrap();
+        let selected_text = String::from(reader_selection.to_string());
+        let reader_focus_before = document.active_element().unwrap();
+        let reader_anchor = reader_selection.anchor_node().unwrap();
+        let reader_focus = reader_selection.focus_node().unwrap();
+
+        assert!(!selected_text.is_empty());
+        let clearing_selection = reader_selection.clone();
+        let collapse_reader = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            clearing_selection.collapse_to_start().unwrap();
+        });
+        dismiss
+            .add_event_listener_with_callback("focus", collapse_reader.as_ref().unchecked_ref())
+            .unwrap();
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connecting);
+        });
+        next_tick().await;
+        assert!(
+            dialog.open(),
+            "A subsequent connection interruption opens a new overlay"
+        );
+        let event = web_sys::Event::new_with_event_init_dict("cancel", &{
+            let init = web_sys::EventInit::new();
+            init.set_cancelable(true);
+            init
+        })
+        .unwrap();
+        let closed = next_dialog_close(&dialog);
+        dialog.dispatch_event(&event).unwrap();
+        wasm_bindgen_futures::JsFuture::from(closed).await.unwrap();
+        next_tick().await;
+        assert!(
+            !dialog.open(),
+            "Escape cancellation dismisses only presentation"
+        );
+        assert!(
+            String::from(reader_selection.to_string()) == selected_text,
+            "Dismissal must restore the selected cached transcript text: before_focus={}, after_focus={}, same_focus={}, anchor_connected={}, focus_connected={}, shell_error={}, before_length={}, after_length={}",
+            reader_focus_before.tag_name(),
+            document.active_element().unwrap().tag_name(),
+            document
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(reader_focus_before.as_ref())),
+            reader_anchor.is_connected(),
+            reader_focus.is_connected(),
+            state.mobile_shell_error.get_untracked().is_some(),
+            selected_text.len(),
+            String::from(reader_selection.to_string()).len(),
+        );
+        dismiss
+            .remove_event_listener_with_callback("focus", collapse_reader.as_ref().unchecked_ref())
+            .unwrap();
+        drop(collapse_reader);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                host,
+                ConnectionStatus::NeedsAction {
+                    code: protocol::MobileAccessErrorCode::RepairRequired,
+                    message: "Pairing was revoked".into(),
+                },
+            );
+        });
+        next_tick().await;
+        assert!(!dialog.open());
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-needs-action']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Pairing was revoked")
+        );
+        input
+            .remove_event_listener_with_callback("focus", collapse.as_ref().unchecked_ref())
+            .unwrap();
+        drop(collapse);
+        drop(handle);
+        container.remove();
+    }
+
     #[wasm_bindgen_test]
     async fn generated_images_keep_chat_intact_in_a_phone_viewer() {
         use crate::state::{ToolOutputMode, ToolRequestEntry};

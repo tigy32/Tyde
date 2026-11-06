@@ -1,9 +1,10 @@
 use leptos::prelude::*;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
 use crate::bridge::AuthProvider;
-use crate::components::ui::{Spinner, StatusDot, StatusTone};
+use crate::components::ui::{StatusDot, StatusTone};
 use crate::state::{AppMode, AppState, ConnectionStatus, PairingScreen};
 
 /// Minimum touch-target size, inline so the recovery control stays tappable
@@ -94,6 +95,224 @@ fn chat_owns_connection_status(state: &AppState) -> bool {
             == Some(mobile_shell_types::native::NativeChatHeaderOwner::Client)
 }
 
+pub(crate) fn connection_pending(status: &ConnectionStatus) -> bool {
+    matches!(
+        status,
+        ConnectionStatus::Connecting | ConnectionStatus::Bootstrapping
+    )
+}
+
+#[component]
+fn ReconnectingHostStatus() -> impl IntoView {
+    view! {
+        <div class="connection-banner-inner connected reconnecting" role="status">
+            <StatusDot label="Reconnecting".to_string() tone=StatusTone::Pending
+                data_mobile_test="connection-banner-dot-reconnecting" />
+            <span class="status-text">"Reconnecting"</span>
+        </div>
+    }
+}
+
+type RestoreReconnectSelection = Box<dyn Fn() -> Result<(), JsValue>>;
+
+fn capture_reconnect_selection(
+    dialog: &web_sys::HtmlDialogElement,
+) -> Result<Option<RestoreReconnectSelection>, JsValue> {
+    let window = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("Reconnect dialog window is unavailable"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("Reconnect dialog document is unavailable"))?;
+    let Some(active) = document.active_element() else {
+        return Ok(None);
+    };
+    if let Some(textarea) = active.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        let start = textarea
+            .selection_start()?
+            .ok_or_else(|| JsValue::from_str("Editor selection start is unavailable"))?;
+        let end = textarea
+            .selection_end()?
+            .ok_or_else(|| JsValue::from_str("Editor selection end is unavailable"))?;
+        let direction = textarea
+            .selection_direction()?
+            .ok_or_else(|| JsValue::from_str("Editor selection direction is unavailable"))?;
+        let textarea = textarea.clone();
+        return Ok(Some(Box::new(move || {
+            if textarea.is_connected()
+                && document
+                    .active_element()
+                    .is_some_and(|active| active.is_same_node(Some(textarea.as_ref())))
+            {
+                textarea.set_selection_range_with_direction(start, end, &direction)?;
+            }
+            Ok(())
+        })));
+    }
+    if let Some(input) = active.dyn_ref::<web_sys::HtmlInputElement>()
+        && let Some(start) = input.selection_start()?
+    {
+        let end = input
+            .selection_end()?
+            .ok_or_else(|| JsValue::from_str("Editor selection end is unavailable"))?;
+        let direction = input
+            .selection_direction()?
+            .ok_or_else(|| JsValue::from_str("Editor selection direction is unavailable"))?;
+        let input = input.clone();
+        return Ok(Some(Box::new(move || {
+            if input.is_connected()
+                && document
+                    .active_element()
+                    .is_some_and(|active| active.is_same_node(Some(input.as_ref())))
+            {
+                input.set_selection_range_with_direction(start, end, &direction)?;
+            }
+            Ok(())
+        })));
+    }
+    let Some(selection) = window.get_selection()? else {
+        return Ok(None);
+    };
+    if selection.range_count() == 0 {
+        return Ok(None);
+    }
+    let anchor = selection
+        .anchor_node()
+        .ok_or_else(|| JsValue::from_str("Document selection anchor is unavailable"))?;
+    let focus = selection
+        .focus_node()
+        .ok_or_else(|| JsValue::from_str("Document selection focus is unavailable"))?;
+    let anchor_offset = selection.anchor_offset();
+    let focus_offset = selection.focus_offset();
+    let dialog = dialog.clone();
+    #[cfg(debug_assertions)]
+    web_sys::console::debug_1(
+        &format!(
+            "reconnect selection capture: document, collapsed={}",
+            selection.is_collapsed()
+        )
+        .into(),
+    );
+    Ok(Some(Box::new(move || {
+        #[cfg(debug_assertions)]
+        web_sys::console::debug_1(&format!(
+            "reconnect selection restore: anchor_connected={}, focus_connected={}, same_focus={}, neutral_focus={}, owned_dialog_focus={}, collapsed={}",
+            anchor.is_connected(), focus.is_connected(),
+            document.active_element().is_some_and(|current| current.is_same_node(Some(active.as_ref()))),
+            document.active_element().is_some_and(|current| document.body().is_some_and(|body| current.is_same_node(Some(body.as_ref())))),
+            document.active_element().is_some_and(|current| dialog.contains(Some(current.as_ref()))),
+            selection.is_collapsed(),
+        ).into());
+        if anchor.is_connected()
+            && focus.is_connected()
+            && document.active_element().is_some_and(|current| {
+                current.is_same_node(Some(active.as_ref()))
+                    || dialog.contains(Some(current.as_ref()))
+            })
+        {
+            // An unfocusable return target can leave focus on our closed dialog's button.
+            selection.set_base_and_extent(&anchor, anchor_offset, &focus, focus_offset)?;
+        }
+        Ok(())
+    })))
+}
+
+#[component]
+pub(crate) fn ReconnectOverlay() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let dismissed = RwSignal::new(None);
+    let status_state = state.clone();
+    let status_pending =
+        Memo::new(move |_| connection_pending(&status_state.active_host_connection_status()));
+    let pending_state = state.clone();
+    let pending = Memo::new(move |_| {
+        matches!(
+            pending_state.app_mode.get(),
+            AppMode::Workspace | AppMode::HostPicker
+        ) && connection_pending(&pending_state.active_host_connection_status())
+            && native_bundle_message(&pending_state).is_none()
+            && pending_state.active_host_command_error().is_none()
+            && pending_state.mobile_shell_error.get().is_none()
+    });
+    let host = state.active_local_host_id;
+    Effect::new(move |_| {
+        let active = host.get();
+        if !status_pending.get() || dismissed.get_untracked() != active {
+            log::debug!("mobile reconnect dismissal reset by authoritative connection/host change");
+            dismissed.set(None);
+        }
+    });
+    let open = Signal::derive(move || {
+        pending.get() && host.get().is_some() && dismissed.get() != host.get()
+    });
+    crate::native::track_modal(open);
+    let dialog = NodeRef::<leptos::html::Dialog>::new();
+    let dialog_closing = RwSignal::new(false);
+    let selection = StoredValue::new_local(None::<RestoreReconnectSelection>);
+    let shell_error = state.mobile_shell_error;
+    let report = move |message: &'static str| {
+        shell_error.set(Some(crate::state::MobileShellError {
+            code: protocol::MobileAccessErrorCode::Internal,
+            message: message.into(),
+        }));
+    };
+    Effect::new(move |_| {
+        let Some(dialog) = dialog.get() else {
+            return;
+        };
+        let should_open = open.get();
+        if dialog_closing.get() {
+            return;
+        }
+        if should_open {
+            if !dialog.open() {
+                match capture_reconnect_selection(&dialog) {
+                    Ok(saved) => selection.set_value(saved),
+                    Err(error) => {
+                        log::error!("Reconnect dialog could not preserve selection: {error:?}");
+                        report("Reconnect dialog could not preserve selection.");
+                        return;
+                    }
+                }
+                if let Err(error) = dialog.show_modal() {
+                    log::error!("Reconnect dialog could not open: {error:?}");
+                    selection.set_value(None);
+                    report("Reconnect dialog could not open.");
+                }
+            }
+        } else if dialog.open() {
+            log::debug!("mobile reconnect overlay close requested; presentation only");
+            dialog_closing.set(true);
+            dialog.close();
+        }
+    });
+    view! {
+        <dialog node_ref=dialog class="reconnect-dialog" aria-labelledby="reconnect-dialog-title"
+            data-mobile-test="reconnect-dialog"
+            on:close=move |_: web_sys::Event| {
+                // Native close completion, not close()'s transitional focus, owns restoration.
+                let restored = selection.with_value(|saved| match saved {
+                    Some(restore) => restore(),
+                    None => Ok(()),
+                });
+                selection.set_value(None);
+                if let Err(error) = restored {
+                    log::error!("Reconnect dialog could not restore selection: {error:?}");
+                    report("Reconnect dialog could not restore selection.");
+                }
+                log::debug!("mobile reconnect overlay close completed; presentation only");
+                dialog_closing.set(false);
+            }
+            on:cancel=move |event: web_sys::Event| {
+                event.prevent_default();
+                dismissed.set(host.get_untracked());
+            }>
+            <h2 id="reconnect-dialog-title">"Reconnecting"</h2>
+            <button type="button" autofocus data-mobile-test="reconnect-dismiss"
+                on:click=move |_| dismissed.set(host.get_untracked())>"Dismiss"</button>
+        </dialog>
+    }
+}
+
 #[component]
 fn ConnectedHostStatus() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -137,12 +356,17 @@ fn ConnectedHostStatus() -> impl IntoView {
 #[component]
 pub(crate) fn ChatConnectionStatus() -> impl IntoView {
     let state = expect_context::<AppState>();
-    view! { <Show when=move || chat_owns_connection_status(&state)
-        && matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
-        && native_bundle_message(&state).is_none()
-        && state.active_host_command_error().is_none()
-        && state.mobile_shell_error.get().is_none()>
-        <span class="chat-connection-status"><ConnectedHostStatus /></span>
+    let pending = Memo::new(move |_| connection_pending(&state.active_host_connection_status()));
+    let visible_state = expect_context::<AppState>();
+    view! { <Show when=move || chat_owns_connection_status(&visible_state)
+        && (matches!(visible_state.active_host_connection_status(), ConnectionStatus::Connected)
+            || connection_pending(&visible_state.active_host_connection_status()))
+        && native_bundle_message(&visible_state).is_none()
+        && visible_state.active_host_command_error().is_none()
+        && visible_state.mobile_shell_error.get().is_none()>
+        <span class="chat-connection-status">{move || if pending.get() {
+            view! { <ReconnectingHostStatus /> }.into_any()
+        } else { view! { <ConnectedHostStatus /> }.into_any() }}</span>
     </Show> }
 }
 
@@ -160,7 +384,8 @@ pub fn ConnectionBanner() -> impl IntoView {
         <div class="connection-banner" data-mobile-test="connection-banner"
             hidden=move || (crate::native::is_native() && state.mobile_shell_error.get().is_some())
                 || ((chat_owns_connection_status(&state) || crate::native::root_status_owned(&state))
-                    && matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
+                    && (matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
+                        || (chat_owns_connection_status(&state) && connection_pending(&state.active_host_connection_status())))
                     && native_bundle_message(&state).is_none()
                     && state.active_host_command_error().is_none())>
             {move || native_bundle_message(&bundle_state).map(|message| view! {
@@ -182,28 +407,12 @@ pub fn ConnectionBanner() -> impl IntoView {
                             view! { <ConnectedHostStatus /> }.into_any()
                         }
                     }
-                    ConnectionStatus::Connecting => {
-                        view! {
-                            <div class="connection-banner-inner connecting">
-                                <Spinner
-                                    data_mobile_test="connection-banner-spinner"
-                                    aria_label="Connecting to host".to_string()
-                                />
-                                <span class="status-text">"Connecting…"</span>
-                                <HostReconnectButton />
-                            </div>
-                        }.into_any()
-                    }
-                    ConnectionStatus::Bootstrapping => {
-                        view! {
-                            <div class="connection-banner-inner connecting" data-mobile-test="connection-banner-bootstrapping">
-                                <Spinner
-                                    data_mobile_test="connection-banner-bootstrap-spinner"
-                                    aria_label="Loading host state".to_string()
-                                />
-                                <span class="status-text">"Loading host…"</span>
-                            </div>
-                        }.into_any()
+                    ConnectionStatus::Connecting | ConnectionStatus::Bootstrapping => {
+                        if chat_owns_connection_status(&status_state) {
+                            ().into_any()
+                        } else {
+                            view! { <ReconnectingHostStatus /> }.into_any()
+                        }
                     }
                     ConnectionStatus::Disconnected => {
                         // Disconnected is a terminal state: nothing else on screen
@@ -224,7 +433,6 @@ pub fn ConnectionBanner() -> impl IntoView {
                     }
                     ConnectionStatus::Error(ref msg) => {
                         let msg = msg.clone();
-                        let dismiss_state = status_state.clone();
                         view! {
                             <div class="connection-banner-inner error connection-failure" role="alert">
                                 <StatusDot
@@ -234,15 +442,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                                 />
                                 <span class="status-text">{msg}</span>
                                 <HostReconnectButton />
-                                <button
-                                    type="button"
-                                    class="connection-banner-dismiss error-banner-dismiss"
-                                    data-mobile-test="connection-error-dismiss"
-                                    aria-label="Dismiss connection error"
-                                    on:click=move |_| dismiss_active_connection_error(&dismiss_state)
-                                >
-                                    "×"
-                                </button>
+
                             </div>
                         }.into_any()
                     }
@@ -396,17 +596,6 @@ fn connection_banner_auth_provider_test_id(provider: AuthProvider) -> &'static s
     }
 }
 
-fn dismiss_active_connection_error(state: &AppState) {
-    let Some(host) = state.active_local_host_id.get_untracked() else {
-        return;
-    };
-    state.connection_statuses.update(|statuses| {
-        if matches!(statuses.get(&host), Some(ConnectionStatus::Error(_))) {
-            statuses.insert(host, ConnectionStatus::Disconnected);
-        }
-    });
-}
-
 fn dismiss_active_command_error(state: &AppState) {
     let Some(host) = state.active_local_host_id.get_untracked() else {
         return;
@@ -526,22 +715,22 @@ mod wasm_tests {
 
         assert!(
             container
-                .query_selector("[data-mobile-test='connection-banner-bootstrapping']")
+                .query_selector("[data-mobile-test='connection-banner-dot-reconnecting']")
                 .unwrap()
                 .is_some(),
-            "bootstrapping status should render a visible loading banner"
+            "Bootstrapping retains the pending indicator until authoritative connected state"
         );
         assert!(
             container
                 .text_content()
                 .unwrap_or_default()
-                .contains("Loading host"),
-            "bootstrapping status should distinguish host bootstrap from transport connect"
+                .contains("Reconnecting"),
+            "Host bootstrap must not prematurely show connected"
         );
     }
 
     #[wasm_bindgen_test]
-    async fn connection_error_can_be_dismissed() {
+    async fn terminal_connection_error_stays_visible() {
         crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-error".to_owned());
         let host_for_mount = host.clone();
@@ -607,14 +796,9 @@ mod wasm_tests {
                     .query_selector("[data-mobile-test='connection-banner-reconnect']")
                     .unwrap()
                     .unwrap();
-                let dismiss = alert
-                    .query_selector("[data-mobile-test='connection-error-dismiss']")
-                    .unwrap()
-                    .unwrap();
                 let alert_box = alert.get_bounding_client_rect();
                 let text_box = message.get_bounding_client_rect();
                 let reconnect_box = reconnect.get_bounding_client_rect();
-                let dismiss_box = dismiss.get_bounding_client_rect();
                 assert_eq!(message.text_content().as_deref(), Some(cause));
                 if cause == crate::bridge::loader::UnavailableReason::HostUnavailable.message() {
                     assert_eq!(
@@ -634,18 +818,16 @@ mod wasm_tests {
                     "A failure must reserve space above the host heading"
                 );
                 assert!(
-                    text_box.right() <= reconnect_box.left()
-                        && reconnect_box.right() <= dismiss_box.left(),
+                    text_box.right() <= reconnect_box.left(),
                     "Cause and recovery controls must not overlap"
                 );
-                assert_eq!(
-                    reconnect_box.top(),
-                    dismiss_box.top(),
-                    "Dismiss must stay beside Reconnect, not on a separate row"
-                );
+                assert!(reconnect_box.height() >= 44.0, "Recovery stays tappable");
                 assert!(
-                    reconnect_box.height() >= 44.0 && dismiss_box.height() >= 44.0,
-                    "Phone recovery controls remain tappable"
+                    alert
+                        .query_selector("[data-mobile-test='connection-error-dismiss']")
+                        .unwrap()
+                        .is_none(),
+                    "Terminal failures cannot be dismissed"
                 );
                 assert!(
                     message.scroll_width() <= message.client_width()
@@ -654,35 +836,10 @@ mod wasm_tests {
                 );
             }
         }
-        state.connection_statuses.update(|statuses| {
-            statuses.insert(
-                host.clone(),
-                ConnectionStatus::Error("host unreachable".into()),
-            );
-        });
-        next_tick().await;
-        let dismiss: HtmlElement = container
-            .query_selector("[data-mobile-test='connection-error-dismiss']")
-            .unwrap()
-            .expect("connection error dismiss should render")
-            .dyn_into()
-            .unwrap();
-        dismiss.click();
-        next_tick().await;
-
-        let state = state_handle.borrow().as_ref().unwrap().clone();
-        assert_eq!(
-            state.connection_statuses.get_untracked().get(&host),
-            Some(&ConnectionStatus::Disconnected),
-            "dismissing should downgrade the visible connection error"
-        );
-        assert!(
-            !container
-                .text_content()
-                .unwrap_or_default()
-                .contains("host unreachable"),
-            "connection error text should disappear after dismissal"
-        );
+        assert!(matches!(
+            state.active_host_connection_status(),
+            ConnectionStatus::Error(_)
+        ));
     }
 
     #[wasm_bindgen_test]

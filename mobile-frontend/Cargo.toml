@@ -85,6 +85,7 @@ web-sys = { version = "0.3", features = [
     "MutationObserverInit",
     "MutationRecord",
     "Screen",
+    "Selection",
     "Storage",
     "VisualViewport",
     "MediaQueryList",

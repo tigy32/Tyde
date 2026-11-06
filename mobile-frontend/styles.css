@@ -5953,3 +5953,27 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .chat-header-actions { min-width: 0; }
 
 [data-native-host] .chat-back-label { display: none; }
+
+.reconnect-dialog {
+    margin: auto;
+    color: var(--text-primary);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: var(--space-5);
+    width: min(320px, calc(100vw - 48px));
+    box-shadow: var(--shadow-sm);
+}
+.reconnect-dialog::backdrop { background: rgb(0 0 0 / 35%); }
+.reconnect-dialog h2 { margin: 0 0 var(--space-4); font-size: 18px; }
+.reconnect-dialog button {
+    min-height: 44px;
+    width: 100%;
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+}
+.connection-banner-inner.reconnecting .ui-status-dot {
+    box-shadow: none;
+}

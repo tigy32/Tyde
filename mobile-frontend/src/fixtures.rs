@@ -363,6 +363,36 @@ pub fn seed_state(state: &AppState) {
         drop(envelope.take());
     });
 
+    let connection_state = state.clone();
+    let connection_host = host.clone();
+    let connection =
+        wasm_bindgen::closure::Closure::<dyn Fn(String) -> bool>::new(move |line: String| {
+            match serde_json::from_str::<crate::state::PairedHostConnectionStatus>(&line) {
+                Ok(status) => {
+                    crate::app::apply_connection_status(
+                        &connection_state,
+                        connection_host.clone(),
+                        status,
+                        None,
+                    );
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_CONNECTION__".into(),
+        connection.as_ref(),
+    )
+    .expect("fixture connection hook");
+    let connection = send_wrapper::SendWrapper::new(connection);
+    on_cleanup(move || {
+        js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_CONNECTION__".into())
+            .expect("remove fixture connection hook");
+        drop(connection.take());
+    });
+
     let navigation_state = state.clone();
     let navigation = wasm_bindgen::closure::Closure::<dyn Fn(bool)>::new(move |connected: bool| {
         navigation_state
