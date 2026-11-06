@@ -1273,7 +1273,7 @@ if name=='aws':
   if not path.is_file(): raise SystemExit(34)
   if '--query' in args:
    query=args[args.index('--query')+1]
-   print('application/wasm' if query=='ContentType' else 'no-store, max-age=0, must-revalidate' if key=='tyde/manifest.json' else 'public, max-age=60, must-revalidate')
+   print('application/wasm' if query=='ContentType' else 'no-store, max-age=0, must-revalidate' if key=='tyde/manifest.json' else 'public, max-age=31536000, immutable' if key.startswith('tyde/sdk/') else 'public, max-age=60, must-revalidate')
   else: print('{}')
   sys.exit()
  if args[0]=='s3':

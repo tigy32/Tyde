@@ -1337,3 +1337,39 @@ and requires that document to execute the corrected decoder. This reproduced
 `window.jsQR` being unavailable with the hash still under `vendor/`; moving
 the canonical asset to `decoder/` does not weaken the old worker's verified
 bundle enforcement.
+
+### SDK shell generation identity
+
+The static publisher and direct-bundle builder use
+`web/deploy/assemble-shell.mjs`. A SHA-256 generation names the shell source
+snapshot (including the document, worker, module names and bytes). The root
+`index.html` selects `sdk/<generation>/loader.js`; config, CSS and decoder
+references select that same generation. Static and dynamic SDK imports remain
+relative within that directory. The generation is independent of client release,
+global wire version, bootstrap1 and ABI6. Exact-client manifest/SRI admission,
+worker scope/script URL, native secrets and pairing storage are unchanged.
+
+Publish every immutable generation member before the root selector. The S3
+publisher checks generation presence/cache metadata before publishing the
+selector; it never deletes old generations or rewrites legacy root modules.
+Direct builds retain prior published assets and reject different bytes at an
+existing generated path. Root document/worker writes use atomic replacement. The worker precaches
+identified members, not mutable SDK modules; no new CacheStorage epoch or purge
+is introduced. An older controlling worker passes
+these non-release paths through without invoking native verified-client rules.
+The worker remains at `/tyde/sw.js` for installed clients and push subscriptions.
+
+Origin root cache headers do not control all delivery layers: observed edge
+responses allowed four hours of freshness. A stale *generated* document still
+names its complete old generation; neither prompt revalidation nor HTTP-cache
+invalidation is required for coherence. A missing member fails module loading,
+not selection of another URL. No cache clear, query buster, compatibility module,
+new ABI or alternate import path is introduced. Direct hosting may still use its
+existing short shell TTL for `sdk/`; identity does not depend on the TTL.
+
+This does not repair a previously cached, unversioned document retroactively.
+In particular, the recovered six-module0904 native cache graph is coherent;
+its selection by the failed native document and the original TypeError cause
+remain unproved. Linux HTTP/module/worker and archived ABI-contract flows are
+not physical native acceptance. Same-origin QA hosting and retained-device
+requests stay with their designated custodians through the PM.

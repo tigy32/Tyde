@@ -20,7 +20,7 @@
 #   tools/build-mobile-web-bundle.sh [--out DIR] [--version X.Y.Z]
 #
 #   --out DIR       Where to write the bundle. Default: target/mobile-web.
-#                   Rebuilt from scratch every run.
+#                   Updated additively; retains prior published assets.
 #   --version V     Release version to stamp. Default: the canonical version
 #                   from tools/check_release_version.py.
 #
@@ -80,8 +80,8 @@ esac
 echo "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
   || die "invalid release version '${VERSION}' (must be major.minor.patch[-prerelease])"
 
-# Refuse to point at something that is not ours to delete. Everything under
-# OUT_DIR is rebuilt, so a mistyped path would otherwise erase a real tree.
+# Refuse unsafe output roots. Publication is additive: retained documents may
+# still import their old SDK or legacy root modules.
 case "${OUT_DIR}" in
   ""|"/"|"."|"..") die "refusing to build into '${OUT_DIR}'" ;;
 esac
@@ -93,7 +93,7 @@ OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 readonly BUNDLE_DIR="${OUT_DIR}/v${VERSION}"
 
 log "building v${VERSION} into ${OUT_DIR}"
-rm -rf "${OUT_DIR:?}"/*
+
 
 # 1. The immutable app bundle. --public-url has to match where it is served
 #    from, or the loader's absolute asset URLs miss.
@@ -106,26 +106,10 @@ rm -rf "${OUT_DIR:?}"/*
     "${REPO_ROOT}/mobile-frontend/index.html"
 ) || die "trunk build failed"
 
-# 2. The loader shell. Same exclusion rules as the published deploy: tests,
-#    package metadata, docs and editor droppings are not served artifacts, and
-#    manifest.json is generated below rather than copied.
-log "copying loader shell"
-( cd "${LOADER_DIR}" && find . \
-    -name 'node_modules' -prune -o \
-    -name 'test' -prune -o \
-    -type f \
-    ! -name 'manifest.json' \
-    ! -name 'package.json' \
-    ! -name '*.test.js' \
-    ! -name '*.md' \
-    ! -name '.*' \
-    ! -name '._*' \
-    -print ) \
-  | while IFS= read -r rel; do
-      rel="${rel#./}"
-      mkdir -p "${OUT_DIR}/$(dirname "${rel}")"
-      cp "${LOADER_DIR}/${rel}" "${OUT_DIR}/${rel}"
-    done
+# 2. The canonical generation-bound shell, identical to the static publisher.
+log "assembling SDK generation"
+node "${REPO_ROOT}/web/deploy/assemble-shell.mjs" "${LOADER_DIR}" "${OUT_DIR}" \
+  || die "SDK shell assembly failed"
 
 # 3. The manifest, with real sha384 SRI over what was just built. This is the
 #    authority the loader checks every executable artifact against, so it must

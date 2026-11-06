@@ -256,7 +256,7 @@ try {
     try{
     decoded=await target.evaluate(async ({png,uri,svg,layout})=>{
       const observation=window.__thinQrDecodeObservation={stage:'import'};
-      const {decodeQrImageData,isPairingScanValue}=await import('/tyde/loader.js');
+      const {decodeQrImageData,isPairingScanValue}=await import(document.querySelector('script[type="module"][src]').src);
       observation.stage='image';
       const image=new Image();image.src='data:image/png;base64,'+png;await image.decode();
       const canvas=document.createElement('canvas');canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;

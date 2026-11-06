@@ -7,25 +7,25 @@ that compiles into the *versioned* bundles).
 
 ## Why `web/loader/`
 
-- The loader is **not** Rust and **not** versioned — it is a tiny, stable,
-  hand-written HTML+JS shell that must change as rarely as possible (every byte
-  is permanent, un-versioned attack surface). Keeping it out of the Cargo
-  workspace makes that separation obvious and keeps `cargo`/`trunk` from trying
-  to build it.
-- `web/` is the namespace for everything published to the static origin
-  (`https://tycode.dev/tyde/`). Phase 6 deploy tooling will also live under
-  `web/` (e.g. `web/deploy/`), so the loader sits beside, not inside, it.
-- `web/loader/` maps 1:1 onto what is served at the origin **root** (`/tyde/`).
-  The immutable per-version app bundles are published *next to it* at
-  `/tyde/v<version>/` by the Phase 6 release pipeline (built from
-  `mobile-frontend` via `trunk`), so the deployed tree looks like:
+- The hand-written shell is separate from Rust/Trunk. Both publishers assemble
+  it with `web/deploy/assemble-shell.mjs`; do not serve the source directory as
+  a production publication.
+- The root document selects one content-identified SDK graph. Relative imports
+  remain in that generation, independently of HTTP/worker cache freshness.
 
   ```
-  /tyde/                      <- web/loader/ (this dir: stable shell)
-  /tyde/manifest.json         <- allowlist authority (server-controlled)
-  /tyde/v0.8.19-beta.2/...    <- immutable app bundle (from mobile-frontend)
-  /tyde/v0.8.19/...           <- immutable app bundle
+  /tyde/index.html                 <- mutable generation selector
+  /tyde/sw.js                      <- stable worker URL/scope
+  /tyde/sdk/<sha256>/loader.js      <- immutable shell graph
+  /tyde/manifest.json              <- live client allowlist authority
+  /tyde/v<version>/...              <- immutable full-client bundle
   ```
+
+Retain SDK generations on forward and rollback publication. Publish their files
+before selecting them; never overwrite legacy root modules as a compatibility
+path. ABI6/bootstrap1, client-release admission and pairing storage do not change.
+Pre-generation documents cannot be retroactively identified. See
+[SDK generation limits](../dev-docs/37-native-ios-host.md#sdk-shell-generation-identity).
 
 ## What's here
 
@@ -45,9 +45,9 @@ that compiles into the *versioned* bundles).
 | `icons/` | `icon.svg` + a README on the PNG sizes still needed for iOS. |
 | `test/` | Parser/policy fixtures plus the real-browser loader/storage/worker flow, run through `./dev.sh check`. |
 
-## Run / test locally (no loader build step)
+## Validation
 
-The loader is plain ES modules served as files. Run repository validation from
+The loader is plain ES modules assembled into a generation before publication. Run repository validation from
 the repository root with `./dev.sh check`; it provisions the exact Chrome and
 chromedriver used by the loader's real-browser lifecycle flow as well as the
 Rust/wasm suites. The browser flow owns its temporary HTTP server, browser
@@ -233,11 +233,11 @@ web/deploy/deploy.sh 0.8.19-beta.16 --confirm
    break `WebAssembly.instantiateStreaming`). Real deploys then `HEAD` every
    listed executable artifact and assert uploaded `.wasm` objects have
    `Content-Type: application/wasm`.
-4. Uploads `web/loader/` → `s3://tycode-static/tyde/` with **short cache**
-   (`max-age=60`) so loader logic + revocations propagate, excluding
-   `manifest.json`. This uses metadata-rewriting copy behavior rather than
-   metadata-preserving sync, so unchanged shell keys still get the short cache
-   headers.
+4. Assembles the shell, uploads `sdk/<sha256>/` with immutable cache metadata
+   and verifies every member exists before publishing the root document last.
+   Root resources use `max-age=60`; edge freshness can be longer without mixing
+   identified graphs. Retained SDK generations and legacy root modules are not
+   deleted or overwritten.
 5. Re-fetches the live manifest on real deploys, merges only this release's
    generated entry into that latest live manifest, validates the target entry
    and all still-supported entries, then uploads `manifest.json`

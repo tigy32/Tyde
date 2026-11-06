@@ -5,9 +5,11 @@ import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { chromium } from "playwright";
 import { once } from "node:events";
+import { assembleShell } from "../../deploy/assemble-shell.mjs";
 
 // Real browser + HTTP + CacheStorage + IndexedDB + worker lifecycle. The tiny
 // immutable modules are executable loader fixtures, not fake agent backends.
@@ -19,6 +21,8 @@ test("installed storage migrates once, then follows exact targets without losing
   const code = version => Buffer.from(`export default async function() { document.getElementById('app-root').textContent = 'Client ${version}'; }`);
   const directory = await mkdtemp(join(tmpdir(), "tyde-loader-flow-"));
   t.after(() => rm(directory, {recursive:true,force:true}));
+  const shell = join(directory, "shell");
+  const sdkGeneration = await assembleShell(fileURLToPath(root), shell);
   const protocolSource = join(directory, "types.rs");
   const manifestPath = join(directory, "manifest.json");
   await writeFile(protocolSource, "pub const PROTOCOL_VERSION: u32 = 66;");
@@ -104,8 +108,8 @@ test("installed storage migrates once, then follows exact targets without losing
       if (asset === "vendor/jsqr.js") {
         res.setHeader("Content-Type", "text/javascript"); res.end(decoderBytes); return;
       }
-      if (!path.startsWith("/tyde/") || !assets.has(asset)) { res.statusCode=404;res.end();return; }
-      let body = await readFile(new URL(asset, root));
+      if (!path.startsWith("/tyde/") || !assets.has(asset) && !asset.startsWith(`sdk/${sdkGeneration}/`)) { res.statusCode=404;res.end();return; }
+      let body = legacy ? await readFile(new URL(asset, root)) : await readFile(join(shell, asset));
       if (legacy && asset === "loader.js") body = Buffer.from(legacyLoader);
       if (legacyWorkerActive && asset === "sw.js") body = legacyWorker;
       res.setHeader("Content-Type", asset.endsWith(".js") ? "text/javascript" : asset.endsWith(".css") ? "text/css" : asset.endsWith(".svg") ? "image/svg+xml" : asset.endsWith(".html") ? "text/html" : "application/json");
@@ -202,7 +206,7 @@ test("installed storage migrates once, then follows exact targets without losing
       assert.ok(Buffer.from(bytes).equals(decoderBytes),
         "the worker must fetch current decoder bytes instead of a stale bundle-cache entry");
       const identity = await page.evaluate(async path => {
-        const script = document.querySelector(`script[src="./${path}"]`);
+        const script = document.querySelector(`script[src$="/${path}"]`);
         const bytes = await (await fetch(script.src)).arrayBuffer();
         const hex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
           byte => byte.toString(16).padStart(2, '0')).join('');
@@ -423,6 +427,9 @@ test("installed storage migrates once, then follows exact targets without losing
 test("native discovery surfaces credential loss and host absence without inventing revocation", async t => {
   assert.ok(process.env.CHROME, "dev.sh must provision Chrome");
   const root = new URL("../", import.meta.url);
+  const shell = await mkdtemp(join(tmpdir(), "tyde-native-discovery-"));
+  t.after(() => rm(shell, {recursive:true,force:true}));
+  await assembleShell(fileURLToPath(root), shell);
   let mode = "missing", requests = 0;
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, "http://owned.invalid").pathname;
@@ -442,7 +449,7 @@ test("native discovery surfaces credential loss and host absence without inventi
     try {
       if (!path.startsWith("/tyde/") || path.includes("..")) throw Error("asset path");
       const relative = path === "/tyde/" ? "index.html" : path.slice(6);
-      const bytes = await readFile(new URL(relative, root));
+      const bytes = await readFile(join(shell, relative));
       const type = relative.endsWith(".html") ? "text/html" : relative.endsWith(".css") ? "text/css" : relative.endsWith(".js") ? "text/javascript" : "image/svg+xml";
       res.setHeader("content-type",type); res.end(bytes);
     } catch { res.writeHead(404).end(); }

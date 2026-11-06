@@ -52,25 +52,6 @@ readonly DISTRIBUTION_ID="E3JJ1OF4I8TP6U"
 readonly INVALIDATION_PATHS="/tyde/*"
 readonly LOADER_SHELL_CACHE_CONTROL="public, max-age=60, must-revalidate"
 readonly MANIFEST_CACHE_CONTROL="no-store, max-age=0, must-revalidate"
-readonly -a LOADER_SHELL_KEYS=(
-  "index.html"
-  "sw.js"
-  "mobile-service-config.js"
-  "loader.js"
-  "native-bootstrap.js"
-  "native-service.js"
-  "loader.css"
-  "cbor.js"
-  "pairing.js"
-  "pairing-ui.js"
-  "styles.js"
-  "manifest-policy.js"
-  "integrity.js"
-  "decoder/jsqr-5f0b827026fedad24be5147cc65e8217e06a643b3967206e91c9d1332e1b3101.js"
-  "manifest.webmanifest"
-  "icons/icon.svg"
-)
-
 # --- locate repo + tooling -------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -87,8 +68,12 @@ SOURCE_ROOT="${REPO_ROOT}"
 LIVE_MANIFEST_BASE=0
 LIVE_MANIFEST=""
 LATEST_MANIFEST=""
+SHELL_STAGE=""
 
 cleanup() {
+  if [ -n "${SHELL_STAGE}" ]; then
+    rm -rf "${SHELL_STAGE}"
+  fi
   if [ -n "${LIVE_MANIFEST}" ]; then
     rm -f "${LIVE_MANIFEST}"
   fi
@@ -362,43 +347,45 @@ PY
 fi
 
 # ===========================================================================
-# 4. Publish the loader shell -> /tyde/  (short/no-cache so logic + revocations
-#    propagate). NEVER --delete; scoped to tyde/. Exclude manifest.json: the
-#    manifest is uploaded last, after the versioned bundle is verified.
+# 4. Publish a complete SDK generation before its root-document selector.
+#    Never replace legacy root modules or delete retained generations.
 # ===========================================================================
-# Short cache for the un-versioned shell (index.html, sw.js, loader .js modules,
-# css, webmanifest, icons) so loader fixes + blocked/minSupported revocations go
-# live within ~a minute. Use `cp --recursive`, not `sync`: `sync` skips
-# unchanged keys and leaves their old S3 metadata/cache headers in place.
-echo "deploy: publishing loader shell -> ${S3_LOADER} (${MODE})…" >&2
-aws s3 cp "${LOADER_DIR}/" "${S3_LOADER}" \
-  --region "${AWS_REGION}" \
-  --recursive \
-  --exclude 'manifest.json' \
-  --exclude 'test/*' \
-  --exclude 'node_modules/*' \
-  --exclude '*.test.js' \
-  --exclude 'package.json' \
-  --exclude '*.md' \
-  --exclude '.*' \
-  --exclude '._*' \
-  --exclude '*/._*' \
-  --cache-control "${LOADER_SHELL_CACHE_CONTROL}" \
-  ${DRYFLAG} \
-  ${AWS_S3_SYNC_EXTRA_ARGS:-}
+SHELL_STAGE="$(mktemp -d)"
+node "${SCRIPT_DIR}/assemble-shell.mjs" "${LOADER_DIR}" "${SHELL_STAGE}" \
+  || die "SDK shell assembly failed"
+aws s3 cp "${SHELL_STAGE}/sdk/" "${S3_LOADER}sdk/" \
+  --region "${AWS_REGION}" --recursive \
+  --cache-control 'public, max-age=31536000, immutable' ${DRYFLAG}
+
+# A partial upload must not become selectable. Presence/metadata are checked
+# before publishing the document; the generation name binds the source bytes.
+if [ "${CONFIRM}" -eq 1 ]; then
+  while IFS= read -r shell_key; do
+    cache_control="$(aws s3api head-object \
+      --bucket "${BUCKET}" --key "${PREFIX}/${shell_key}" \
+      --region "${AWS_REGION}" --query CacheControl --output text)"
+    [ "${cache_control}" = 'public, max-age=31536000, immutable' ] \
+      || die "SDK generation missing or cache metadata drift: ${shell_key}"
+  done < <(cd "${SHELL_STAGE}" && find sdk -type f)
+fi
+
+# Copy root non-code resources and the worker first, selector last. Metadata
+# rewriting avoids retaining stale origin headers on unchanged root keys.
+aws s3 cp "${SHELL_STAGE}/" "${S3_LOADER}" \
+  --region "${AWS_REGION}" --recursive --exclude 'sdk/*' --exclude 'index.html' \
+  --cache-control "${LOADER_SHELL_CACHE_CONTROL}" ${DRYFLAG}
+aws s3 cp "${SHELL_STAGE}/index.html" "${S3_LOADER}index.html" \
+  --region "${AWS_REGION}" --content-type 'text/html' \
+  --cache-control "${LOADER_SHELL_CACHE_CONTROL}" ${DRYFLAG}
 
 if [ "${CONFIRM}" -eq 1 ]; then
-  echo "deploy: validating loader shell cache metadata…" >&2
-  for shell_key in "${LOADER_SHELL_KEYS[@]}"; do
+  while IFS= read -r shell_key; do
     cache_control="$(aws s3api head-object \
-      --bucket "${BUCKET}" \
-      --key "${PREFIX}/${shell_key}" \
-      --region "${AWS_REGION}" \
-      --query CacheControl \
-      --output text)"
+      --bucket "${BUCKET}" --key "${PREFIX}/${shell_key}" \
+      --region "${AWS_REGION}" --query CacheControl --output text)"
     [ "${cache_control}" = "${LOADER_SHELL_CACHE_CONTROL}" ] \
-      || die "loader shell cache metadata drift for s3://${BUCKET}/${PREFIX}/${shell_key}: ${cache_control}"
-  done
+      || die "loader shell cache metadata drift: ${shell_key}"
+  done < <(cd "${SHELL_STAGE}" && find . -path './sdk' -prune -o -type f -print | sed 's|^./||')
 fi
 
 if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then

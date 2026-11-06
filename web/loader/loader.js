@@ -8,8 +8,7 @@
 // This file is the ONLY part of the loader that touches the DOM/network. All
 // parsing and policy logic lives in the pure, unit-tested modules it imports.
 //
-// Keep this file small and rarely-changed: it is the one piece that is NOT
-// versioned, so every byte here is permanent surface.
+// The publisher binds this module and its dependencies to one SDK generation.
 
 import { parsePairingUri, extractPairingUri } from "./pairing.js";
 import {
