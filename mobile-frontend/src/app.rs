@@ -2500,6 +2500,14 @@ mod wasm_tests {
                 "A disconnected host keeps global recovery and removes healthy toolbar feedback")?;
             state.connection_statuses.set(saved_connection_statuses);
             next_tick().await;
+            // Photos now live beside the draft; give this menu-route check a real speech action.
+            let mut speech_settings = settings_model::HostSettings::default();
+            speech_settings.voice.dictation_enabled = true;
+            state.host_settings_by_host.update(|settings| { settings.insert(host_id.clone(), speech_settings); });
+            state.voice_capabilities_by_host.update(|caps| {
+                caps.insert(host_id.clone(), protocol::VoiceCapabilitiesPayload::for_connection(false, true, false));
+            });
+            next_tick().await;
             navigate(NativeIntent::SendActions)?;
             next_tick().await;
             check(find("[data-mobile-test='chat-send-menu']")?.get_bounding_client_rect().height() > 0.0,
@@ -4319,7 +4327,8 @@ mod wasm_tests {
             workspace_roots: Vec::new(),
             project_id: None,
             parent_agent_id: None,
-            session_id: None,
+            // Keep a real Fork action while the lifecycle toggles idle/working.
+            session_id: Some(protocol::SessionId("composer-session".to_owned())),
             custom_agent_id: None,
             created_at_ms: 0,
             instance_stream: protocol::StreamPath("/agent/composer-agent/instance".to_owned()),

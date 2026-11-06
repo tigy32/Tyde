@@ -1227,7 +1227,7 @@ pub(super) fn NewChatOptions() -> impl IntoView {
 ///
 /// The primary sends the draft, cancelling the current turn when busy, or
 /// cancels without sending when the running composer's draft is empty.
-/// One primary button sends or cancels; its hold menu contains photos, speech,
+/// One primary button sends or cancels; its hold menu contains speech,
 /// and state-specific secondary actions. They live in the
 /// shared menu so the textarea keeps the width of the capsule.
 #[component]
@@ -1677,13 +1677,18 @@ pub fn ChatInput() -> impl IntoView {
             let _ = textarea.focus();
         }
     });
+    let voice_menu_available = crate::voice::composer_menu_available(&state);
+    let menu_has_items = Memo::new(move |_| {
+        voice_menu_available.get() || can_btw.get() || can_set_goal.get() || can_cancel.get()
+    });
     let menu_open = state.chat_send_menu_open;
     let send_button_ref = NodeRef::<leptos::html::Button>::new();
     let send_menu_ref = NodeRef::<leptos::html::Div>::new();
     Effect::new(move |_| {
-        if menu_open.get()
-            && let Some(menu) = send_menu_ref.get()
-        {
+        let open = menu_open.get();
+        if !menu_has_items.get() && open {
+            menu_open.set(false);
+        } else if open && let Some(menu) = send_menu_ref.get() {
             let _ = menu.focus();
         }
     });
@@ -1729,7 +1734,9 @@ pub fn ChatInput() -> impl IntoView {
         }
         if ev.key() == "ArrowDown" || (ev.shift_key() && ev.key() == "F10") {
             ev.prevent_default();
-            menu_open.set(true);
+            if menu_has_items.get_untracked() {
+                menu_open.set(true);
+            }
         } else if ev.key() == "Escape" && menu_open.get() {
             ev.prevent_default();
             close_menu.run(());
@@ -2133,6 +2140,19 @@ pub fn ChatInput() -> impl IntoView {
             </Show>
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
+                <button
+                    type="button"
+                    class="chat-attach-button"
+                    aria-label="Attach image"
+                    title="Attach image"
+                    data-mobile-test="chat-add-photo"
+                    disabled=move || loading_photos.get() || submitting.get()
+                    on:click=move |_| on_add_photo.run(())
+                >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                    </svg>
+                </button>
                 <textarea
                     class="chat-input-field"
                     // Visible, not just a tooltip. On a touch UI `title` never
@@ -2169,10 +2189,10 @@ pub fn ChatInput() -> impl IntoView {
                         type="button"
                         class="send-button"
                         node_ref=send_button_ref
-                        aria-haspopup="menu"
-                        aria-expanded=move || menu_open.get().to_string()
+                        aria-haspopup=move || if menu_has_items.get() { "menu" } else { "false" }
+                        aria-expanded=move || (menu_open.get() && menu_has_items.get()).to_string()
                         on:pointerdown=move |event: web_sys::PointerEvent| {
-                            if event.button() != 0 { return; }
+                            if event.button() != 0 || !menu_has_items.get_untracked() { return; }
                             cancel_press();
                             long_pressed.set(false);
                             match set_timeout_with_handle(move || {
@@ -2190,8 +2210,10 @@ pub fn ChatInput() -> impl IntoView {
                         on:contextmenu=move |event: web_sys::MouseEvent| {
                             event.prevent_default();
                             cancel_press();
-                            long_pressed.set(true);
-                            menu_open.set(true);
+                            if menu_has_items.get_untracked() {
+                                long_pressed.set(true);
+                                menu_open.set(true);
+                            }
                         }
                         aria-label={move || {
                             if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
@@ -2230,7 +2252,7 @@ pub fn ChatInput() -> impl IntoView {
                         }}
                     </button>
                     {move || {
-                        if !menu_open.get() {
+                        if !menu_open.get() || !menu_has_items.get() {
                             return view! { <div></div> }.into_any();
                         }
                         let on_btw = btw_for_menu.clone();
@@ -2255,24 +2277,6 @@ pub fn ChatInput() -> impl IntoView {
                                 aria-label="Send actions"
                                 data-mobile-test="chat-send-menu"
                             >
-                                <button
-                                    type="button"
-                                    class="chat-send-menu-item"
-                                    role="menuitem"
-                                    data-mobile-test="chat-add-photo"
-                                    disabled=move || loading_photos.get() || submitting.get()
-                                    on:click=move |_| {
-                                        menu_open.set(false);
-                                        on_add_photo.run(());
-                                    }
-                                >
-                                    <span class="chat-send-menu-icon" aria-hidden="true">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                                            <path d="M12 5v14M5 12h14" />
-                                        </svg>
-                                    </span>
-                                    <span class="chat-send-menu-label">"Add photos"</span>
-                                </button>
                                 <crate::voice::MobileVoiceComposerMenuItems
                                     on_select=Callback::new(move |_| menu_open.set(false))
                                 />
@@ -3107,9 +3111,8 @@ mod wasm_tests {
         element.get_bounding_client_rect()
     }
 
-    /// **The idle composer shows only the field and one send split.** Photos and
-    /// speech live in its hold menu; a live voice session still sits above the
-    /// capsule without overlapping it.
+    /// The paperclip stays left of the draft; speech lives in the hold menu.
+    /// A live voice session stays above the capsule without overlapping it.
     #[wasm_bindgen_test]
     async fn voice_controls_live_inside_the_composer() {
         ensure_styles_loaded();
@@ -3133,10 +3136,39 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-input-capsule']")
             .unwrap()
             .expect("the composer capsule renders");
+        let attach = capsule
+            .query_selector("[data-mobile-test='chat-add-photo']")
+            .unwrap()
+            .expect("visible paperclip left of the draft");
+        let attach_box = rect(&attach);
+        assert_eq!(attach_box.width(), 44.0);
+        assert_eq!(attach_box.height(), 44.0);
+        let field_box = rect(&capsule.query_selector("textarea").unwrap().unwrap());
+        assert!(
+            attach_box.right() <= field_box.left(),
+            "paperclip precedes the draft"
+        );
+        assert_eq!(
+            attach.get_attribute("aria-label").as_deref(),
+            Some("Attach image")
+        );
+        let icon = attach.query_selector("svg").unwrap().unwrap();
+        assert_eq!(rect(&icon).width(), 24.0);
+        assert_eq!(rect(&icon).height(), 24.0);
+        js_sys::Function::new_with_args("root", r#"
+            const picker = root.querySelector('input[type=file]');
+            root.pickerClicks = 0;
+            picker.addEventListener('click', event => {
+                event.preventDefault();
+                root.pickerClicks++;
+            });
+            root.querySelector('[data-mobile-test=chat-add-photo]').click();
+            if (root.pickerClicks !== 1) throw new Error('Paperclip did not activate the existing picker');
+        "#).call1(&wasm_bindgen::JsValue::NULL, &container).unwrap();
         assert_eq!(
             capsule.query_selector_all("button").unwrap().length(),
-            1,
-            "the approved composer has one Send/Cancel button and no caret"
+            2,
+            "the composer has a paperclip and one Send/Cancel button, without a caret"
         );
         let split = container
             .query_selector("[data-mobile-test='chat-send-split']")
@@ -3173,8 +3205,8 @@ mod wasm_tests {
             container
                 .query_selector("[data-mobile-test='chat-add-photo']")
                 .unwrap()
-                .is_none(),
-            "the attachment action must not clutter the closed composer"
+                .is_some(),
+            "the attachment action is visible without opening Send actions"
         );
         assert!(
             container
@@ -3227,10 +3259,19 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-send-menu']")
             .unwrap()
             .expect("the shared send menu opens");
+        assert!(
+            container
+                .query_selector(
+                    "[data-mobile-test='chat-send-menu'] [data-mobile-test='chat-add-photo']"
+                )
+                .unwrap()
+                .is_none(),
+            "Send actions must not duplicate the visible paperclip"
+        );
         let photo = container
             .query_selector("[data-mobile-test='chat-add-photo']")
             .unwrap()
-            .expect("attachments move into the send menu");
+            .expect("paperclip stays outside the send menu");
         let dictation = container
             .query_selector("[data-test='mobile-voice-mode-dictation']")
             .unwrap()
@@ -3239,12 +3280,12 @@ mod wasm_tests {
             photo
                 .closest("[data-mobile-test='chat-send-menu']")
                 .unwrap()
-                .is_some()
+                .is_none()
                 && dictation
                     .closest("[data-mobile-test='chat-send-menu']")
                     .unwrap()
                     .is_some(),
-            "photo and microphone actions share the long-press menu"
+            "photos stay in the capsule while speech stays in the long-press menu"
         );
         assert!(
             container
@@ -3304,6 +3345,8 @@ mod wasm_tests {
                 .is_none(),
             "Dismiss closes the strip"
         );
+        // An empty action menu closes while the voice strip owns the controls.
+        open_menu(&container).await;
         assert!(
             container
                 .query_selector("[data-test='mobile-voice-mode-dictation']")
@@ -3443,13 +3486,13 @@ mod wasm_tests {
                 .is_some(),
             "empty draft chats expose composer utilities through More without holding a disabled action"
         );
-        container
-            .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
-            .unwrap()
-            .unwrap()
-            .unchecked_ref::<HtmlElement>()
-            .click();
-        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+                .unwrap()
+                .is_none(),
+            "the paperclip no longer creates an otherwise empty Send popup"
+        );
         let backend: web_sys::HtmlSelectElement = container
             .query_selector("[data-mobile-test='new-chat-backend']")
             .unwrap()
@@ -4466,7 +4509,7 @@ mod wasm_tests {
         let c = menu_trigger(&container);
         assert!(
             !c.has_attribute("disabled"),
-            "the menu must remain available for attachments and speech"
+            "the menu remains available for speech and turn actions"
         );
 
         let picker: web_sys::HtmlInputElement = container
@@ -4483,7 +4526,7 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='chat-add-photo']")
                 .unwrap()
                 .is_some(),
-            "the photo picker needs a touch target in the send menu"
+            "the photo picker has a permanent touch target"
         );
     }
 
@@ -5196,10 +5239,7 @@ mod wasm_tests {
             "composer utilities remain available while a turn is running"
         );
         open_menu(&container).await;
-        assert_eq!(
-            menu_item_texts(&container),
-            vec!["Add photos".to_owned(), "Cancel".to_owned()]
-        );
+        assert_eq!(menu_item_texts(&container), vec!["Cancel".to_owned()]);
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
@@ -5252,12 +5292,7 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec![
-                "Add photos".to_owned(),
-                "Queue".to_owned(),
-                "Steer".to_owned(),
-                "Cancel".to_owned()
-            ],
+            vec!["Queue".to_owned(), "Steer".to_owned(), "Cancel".to_owned()],
             "thinking+input menu must include utilities before turn actions"
         );
     }
@@ -5501,8 +5536,35 @@ mod wasm_tests {
             "menu must expose composer utilities before there is a draft"
         );
 
+        open_menu(&container).await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_none()
+        );
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        field.focus().unwrap();
         type_text(&container, "why is this slow?");
         next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_none(),
+            "typing after an unavailable-menu request must not open a popup"
+        );
+        assert_eq!(
+            field.owner_document().unwrap().active_element(),
+            Some(field.unchecked_into::<web_sys::Element>()),
+            "typing must retain editor focus"
+        );
 
         // Now has draft → menu available, menu has "Fork + send" only.
         let c = menu_trigger(&container);
@@ -5521,8 +5583,8 @@ mod wasm_tests {
         );
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Add photos".to_owned(), "Fork + send".to_owned()],
-            "idle+session menu must include attachments and Fork + send"
+            vec!["Fork + send".to_owned()],
+            "idle+session menu retains Fork + send"
         );
         // Fork + send must only exist inside the dropdown, not as a standalone button.
         assert!(
@@ -5586,7 +5648,19 @@ mod wasm_tests {
             "menu must retain composer utilities without a session"
         );
         open_menu(&container).await;
-        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_none(),
+            "no actions means no empty popup or blocking backdrop"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
@@ -5659,7 +5733,6 @@ mod wasm_tests {
         assert_eq!(
             menu_item_texts(&container),
             vec![
-                "Add photos".to_owned(),
                 "Queue".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
@@ -5863,7 +5936,7 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Add photos".to_owned(), "Fork + send".to_owned()],
+            vec!["Fork + send".to_owned()],
             "a dead agent's menu offers composer utilities and recovery — never Steer or Cancel"
         );
 
@@ -6109,6 +6182,18 @@ mod wasm_tests {
             "attachments remain available even though Fork + send is absent"
         );
         open_menu(&container).await;
-        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_none(),
+            "no actions means no empty popup or blocking backdrop"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+                .unwrap()
+                .is_none()
+        );
     }
 }

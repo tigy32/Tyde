@@ -1157,6 +1157,12 @@ pub fn MobileVoiceRuntime() -> impl IntoView {
     });
 }
 
+pub(crate) fn composer_menu_available(state: &AppState) -> Memo<bool> {
+    let offer = voice_offer(state);
+    let voice_ui = state.voice_ui;
+    Memo::new(move |_| offer.get().any() && matches!(voice_ui.get(), MobileVoiceState::Idle))
+}
+
 /// Speech actions rendered inside the composer's shared send menu.
 ///
 /// Both modes stay visible so an unavailable mode can explain why it cannot
@@ -1166,10 +1172,7 @@ pub fn MobileVoiceRuntime() -> impl IntoView {
 pub fn MobileVoiceComposerMenuItems(on_select: Callback<()>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let offer = voice_offer(&state);
-    let idle_state = state.clone();
-    let show = Memo::new(move |_| {
-        offer.get().any() && matches!(idle_state.voice_ui.get(), MobileVoiceState::Idle)
-    });
+    let show = composer_menu_available(&state);
     let choice_state = StoredValue::new(state.clone());
     let start_state = StoredValue::new(state);
     let mode_item = move |mode: protocol::VoiceMode| {

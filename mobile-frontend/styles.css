@@ -2359,18 +2359,18 @@ input, textarea, select {
     position: relative;
     display: flex;
     align-items: center;
-    justify-content: flex-start;
-    gap: 6px;
-    width: 100%;
-    min-width: 0;
+    justify-content: center;
+    gap: 12px;
+    width: max-content;
+    min-width: 68%;
     max-width: 100%;
     min-height: 36px;
-    margin: 0;
-    padding: 8px 10px;
-    border: 0;
-    border-top: 1px solid var(--border-default);
-    border-radius: 0;
-    background: var(--bg-base);
+    margin: 0 auto;
+    padding: 8px 18px;
+    border: 1px solid var(--border-strong);
+    border-bottom: 0;
+    border-radius: 28px 28px 0 0;
+    background: var(--surface-float);
     color: var(--text-secondary);
     font-size: 12px;
     white-space: nowrap;
@@ -2636,6 +2636,33 @@ input, textarea, select {
 
 .chat-input-row:focus-within {
     box-shadow: inset 0 0 0 1px var(--accent-primary), var(--shadow-float);
+}
+
+.chat-attach-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-primary);
+}
+
+.chat-attach-button:hover {
+    background: var(--bg-hover);
+}
+
+.chat-attach-button:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: -2px;
+}
+
+.chat-attach-button:disabled {
+    opacity: var(--button-disabled-opacity);
 }
 
 .chat-photo-input {

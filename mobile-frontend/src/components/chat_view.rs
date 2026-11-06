@@ -1730,6 +1730,19 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(
             computed
+                .get_property_value("border-top-left-radius")
+                .unwrap(),
+            "28px",
+            "the canonical paper peek has a rounded top, not a flat rule"
+        );
+        assert_eq!(
+            computed
+                .get_property_value("border-top-right-radius")
+                .unwrap(),
+            "28px"
+        );
+        assert_eq!(
+            computed
                 .get_property_value("border-bottom-left-radius")
                 .unwrap(),
             "0px"
@@ -1751,6 +1764,25 @@ mod wasm_tests {
                 .unwrap(),
             "hidden"
         );
+        for fraction in [0.15, 0.5, 0.85] {
+            js_sys::Function::new_with_args("toggle, fraction", r#"
+                const r = toggle.getBoundingClientRect();
+                const target = document.elementFromPoint(r.left + r.width * fraction, r.top + r.height / 2);
+                if (!target || !toggle.contains(target)) throw new Error('Activity header is not a hit target');
+                target.click();
+            "#).call2(&wasm_bindgen::JsValue::NULL, &toggle, &fraction.into()).unwrap();
+            wait_for_drawer_motion(&container).await;
+            assert_eq!(
+                toggle.get_attribute("aria-expanded").as_deref(),
+                Some("true")
+            );
+            click(&toggle);
+            wait_for_drawer_motion(&container).await;
+            assert_eq!(
+                toggle.get_attribute("aria-expanded").as_deref(),
+                Some("false")
+            );
+        }
         click(&toggle);
         wait_for_drawer_motion(&container).await;
         assert_eq!(
@@ -2640,7 +2672,34 @@ mod wasm_tests {
             .get_untracked()
             .expect("active agent")
             .as_agent_ref();
-        state.set_chat_input("Apply my correction".to_owned());
+        next_tick().await;
+        container
+            .query_selector("[data-mobile-test='chat-more']")
+            .unwrap()
+            .unwrap()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        container
+            .query_selector("[data-mobile-test='chat-menu-send-actions']")
+            .unwrap()
+            .unwrap()
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        field.focus().unwrap();
+        field.set_value("Apply my correction");
+        field
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
         next_tick().await;
         let primary = container
             .query_selector("[data-mobile-test='chat-send']")
@@ -2683,6 +2742,26 @@ mod wasm_tests {
         state.native_goals.update(|goals| {
             goals.insert(owner.clone(), goal.clone());
         });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_none(),
+            "Header More must not leave a latent popup request when no actions exist"
+        );
+        assert_eq!(
+            field.owner_document().unwrap().active_element(),
+            Some(field.unchecked_into::<web_sys::Element>()),
+            "enabling an action must not steal draft focus after an unavailable header request"
+        );
+        // Capability arrival does not resurrect an unavailable menu request.
+        primary
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &options)
+                    .unwrap(),
+            )
+            .unwrap();
         next_tick().await;
         assert!(
             container
