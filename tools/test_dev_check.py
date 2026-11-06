@@ -490,6 +490,9 @@ def expected_native_voice_patch_surface(root_manifest: str) -> bool:
         value = parse_toml_patch_value(pieces[1])
         if value is None or not insert_toml_value(patch, patch_path, value):
             return False
+    graph = {"path": "vendor/reactive_graph"}
+    if patch.get("crates-io", {}).get("reactive_graph") == graph:
+        del patch["crates-io"]["reactive_graph"]
     aec = {"webrtc-audio-processing-sys": {"path": NATIVE_VOICE_AEC_VENDOR}}
     return saw_patch and patch in (
         {"crates-io": aec},
@@ -506,7 +509,7 @@ def native_voice_vendor_surface_violations(
 ) -> list[str]:
     violations = []
     if not expected_native_voice_patch_surface(root_manifest):
-        violations.append("root [patch.crates-io] must contain only the pinned AEC DSP and mobile transport")
+        violations.append("root [patch.crates-io] must contain only the pinned AEC DSP, mobile transport and diagnostic graph")
 
     vendor_roots = {
         "/".join(pathlib.PurePosixPath(path).parts[:2])
@@ -515,6 +518,7 @@ def native_voice_vendor_surface_violations(
     }
     # SCTP is the existing mobile transport's fragmentation layer. Its pinned
     # MTU patch fixes real relay bootstrap failures, not a new voice network stack.
+    vendor_roots.discard("vendor/reactive_graph")
     if vendor_roots not in (
         {NATIVE_VOICE_AEC_VENDOR},
         {NATIVE_VOICE_AEC_VENDOR, MOBILE_RTC_VENDOR},
@@ -1503,7 +1507,7 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
 """,
             encoding="utf-8",
         )
-        for suite in ("test_release_tooling.py", "test_release_cadence.py"):
+        for suite in ("test_release_tooling.py", "test_release_cadence.py", "test_desktop_stalls_export.py"):
             (self.root / "tools" / suite).write_text("", encoding="utf-8")
         (self.root / ".gitignore").write_text("/target\n", encoding="utf-8")
         (self.root / "tracked.txt").write_text("base\n", encoding="utf-8")

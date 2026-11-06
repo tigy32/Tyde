@@ -715,7 +715,7 @@ run_check_stages() {
             run_stage_at "$n_docs" "customer documentation" 1 \
                 python3 docs/build.py --check &&
             run_stage_at "$n_contract" "dev check contract tests" 1 \
-                bash -c 'python3 tools/check_ios_app_icon.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_dev_check.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_tooling.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_cadence.py'
+                bash -c 'python3 tools/test_desktop_stalls_export.py && python3 tools/check_ios_app_icon.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_dev_check.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_tooling.py && python3 tools/run-test-hang-guard.py --python-tests tools/test_release_cadence.py'
     ) &
     tail_pid=$!
 

@@ -10,6 +10,7 @@ devtools-protocol = { path = "../devtools-protocol", default-features = false }
 host-config = { path = "../host-config" }
 leptos = { version = "0.8.17", features = ["csr"] }
 any_spawner = "0.3"
+reactive_graph = { version = "=0.2.14", features = ["tyde-diagnostics"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-wasm-bindgen = "0.6"

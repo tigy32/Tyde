@@ -2536,6 +2536,8 @@ mod wasm_tests {
     /// pane, and forbids Home from ever seeding a second pane.
     #[wasm_bindgen_test]
     async fn closing_the_last_closeable_tab_falls_back_to_home() {
+        let capture = crate::perf::diagnostic_tests::Capture::browser();
+        capture.start();
         let container = make_container();
         let state = AppState::new();
         let clock = crate::perf::diagnostic_tests::LocalMonitorClock::install();
@@ -2588,6 +2590,39 @@ mod wasm_tests {
             text_of(&visible_mount(&container)).contains("Manage Hosts"),
             "Home should become the visible tab after the last closeable tab closes"
         );
+        capture.stop();
+        let trace = capture.export();
+        let events = trace["lifecycle"].as_array().expect("lifecycle trace");
+        assert_eq!(trace["loss"]["lifecycleOverwritten"], 0);
+        let registration = events
+            .iter()
+            .find(|row| row["event"] == "register" && row["site"] == "render_effect_loop")
+            .expect("actual render-effect registration");
+        assert!(registration["future"].as_u64().is_some());
+        let callback = events
+            .iter()
+            .find(|row| row["event"] == "callback_enter" && row["future"].as_u64().is_some())
+            .expect("actual deferred callback");
+        let same_poll = |row: &&serde_json::Value| {
+            row["future"] == callback["future"] && row["poll"] == callback["poll"]
+        };
+        let observed: Vec<_> = events
+            .iter()
+            .filter(same_poll)
+            .filter_map(|row| row["event"].as_str())
+            .collect();
+        for event in [
+            "poll_enter",
+            "receiver_ready",
+            "dependency_enter",
+            "dependency_changed",
+            "callback_enter",
+            "callback_exit",
+            "poll_pending",
+        ] {
+            assert!(observed.contains(&event), "missing boundary: {event}");
+        }
+        assert!(!trace.to_string().contains("Chat"));
         clock.visibility(false);
         clock.advance(2000.0);
         clock.tick();

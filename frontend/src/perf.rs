@@ -101,6 +101,8 @@ extern "C" {
         bytes: usize,
         items: usize,
         waiting: bool,
+        token: f64,
+        poll: u32,
     ) -> f64;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = diagnosticEnd)]
     fn diagnostic_end(id: f64, outcome: &str);
@@ -108,6 +110,10 @@ extern "C" {
     fn diagnostic_set_frame(id: f64, frame: &str);
     #[wasm_bindgen(js_name = diagnosticSetItems)]
     fn diagnostic_set_items(id: f64, items: usize);
+    #[wasm_bindgen(js_name = diagnosticRegister)]
+    fn diagnostic_register(producer: &str, site: &str) -> f64;
+    #[wasm_bindgen(js_name = diagnosticLifecycle)]
+    fn diagnostic_lifecycle(token: f64, poll: u32, event: &str);
     #[wasm_bindgen(js_name = createLocalMonitor)]
     fn create_local_monitor(env: &JsValue, tick: &JsValue, reset: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = localMonitorNow)]
@@ -117,11 +123,42 @@ extern "C" {
 }
 
 pub(crate) fn install_task_diagnostics() -> Result<(), any_spawner::ExecutorError> {
+    reactive_graph::lifecycle_diagnostics::set_observer(render_effect_event);
     any_spawner::Executor::init_custom_executor(UiExecutor)
 }
 
 thread_local! {
+    static CURRENT_POLL: Cell<(f64, u32)> = const { Cell::new((0.0, 0)) };
     static TASK_ORIGIN: Cell<UiTaskProducer> = const { Cell::new(UiTaskProducer::Unattributed) };
+}
+
+fn render_effect_event(event: reactive_graph::lifecycle_diagnostics::Event) {
+    use reactive_graph::lifecycle_diagnostics::Event;
+    if !diagnostic_enabled() {
+        return;
+    }
+    let label = match event {
+        Event::InitialCallbackEnter => "initial_callback_enter",
+        Event::InitialCallbackExit => "initial_callback_exit",
+        Event::ReceiverReady => "receiver_ready",
+        Event::ReceiverClosed => "receiver_closed",
+        Event::OwnerPaused => "owner_paused",
+        Event::DependencyEnter => "dependency_enter",
+        Event::DependencyChanged => "dependency_changed",
+        Event::DependencyUnchanged => "dependency_unchanged",
+        Event::CallbackEnter => "callback_enter",
+        Event::CallbackExit => "callback_exit",
+    };
+    let (token, poll) = CURRENT_POLL.get();
+    diagnostic_lifecycle(token, poll, label);
+}
+
+struct PollContext((f64, u32));
+
+impl Drop for PollContext {
+    fn drop(&mut self) {
+        CURRENT_POLL.set(self.0);
+    }
 }
 
 // Only the synchronous registration scope labels the future actually spawned
@@ -149,9 +186,28 @@ impl any_spawner::CustomExecutor for UiExecutor {
     }
 
     fn spawn_local(&self, future: any_spawner::PinnedLocalFuture<()>) {
+        let producer = TASK_ORIGIN.get();
+        let producer_label = match producer {
+            UiTaskProducer::Unattributed => "unattributed",
+            UiTaskProducer::ChatScrollRestore => "chat_scroll_restore",
+            UiTaskProducer::ChatAutoScroll => "chat_auto_scroll",
+            UiTaskProducer::ChatRowMeasure => "chat_row_measure",
+            UiTaskProducer::TabStripVisibility => "tab_strip_visibility",
+        };
+        let site = if reactive_graph::lifecycle_diagnostics::registering_render_effect() {
+            "render_effect_loop"
+        } else {
+            "other_spawn_local"
+        };
         wasm_bindgen_futures::spawn_local(UiTask {
             future: Some(future),
-            producer: TASK_ORIGIN.get(),
+            producer,
+            token: if diagnostic_enabled() {
+                diagnostic_register(producer_label, site)
+            } else {
+                0.0
+            },
+            polls: 0,
         });
     }
 
@@ -159,6 +215,8 @@ impl any_spawner::CustomExecutor for UiExecutor {
 }
 
 struct UiTask {
+    token: f64,
+    polls: u32,
     producer: UiTaskProducer,
     future: Option<any_spawner::PinnedLocalFuture<()>>,
 }
@@ -167,21 +225,48 @@ impl Future for UiTask {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let _span = UiSpan::task(UiOperation::TaskPoll, self.producer);
-        self.get_mut()
+        let task = self.get_mut();
+        task.polls = task.polls.saturating_add(1);
+        let _context = PollContext(CURRENT_POLL.replace((task.token, task.polls)));
+        let _span = UiSpan::task(UiOperation::TaskPoll, task.producer);
+        let tracing = diagnostic_enabled();
+        if tracing {
+            diagnostic_lifecycle(task.token, task.polls, "poll_enter");
+        }
+        let result = task
             .future
             .as_mut()
             .expect("A UI task is retired only when dropped")
             .as_mut()
-            .poll(cx)
+            .poll(cx);
+        if tracing {
+            diagnostic_lifecycle(
+                task.token,
+                task.polls,
+                if result.is_ready() {
+                    "poll_ready"
+                } else {
+                    "poll_pending"
+                },
+            );
+        }
+        result
     }
 }
 
 impl Drop for UiTask {
     fn drop(&mut self) {
+        let _context = PollContext(CURRENT_POLL.replace((self.token, self.polls)));
         let _span = UiSpan::task(UiOperation::TaskDrop, self.producer);
-        // Field destruction otherwise happens after this scope has ended.
+        let tracing = diagnostic_enabled();
+        if tracing {
+            diagnostic_lifecycle(self.token, self.polls, "drop_enter");
+        }
+        // Destruction is synchronous and must be observed inside the drop interval.
         drop(self.future.take());
+        if tracing {
+            diagnostic_lifecycle(self.token, self.polls, "retired");
+        }
     }
 }
 
@@ -571,7 +656,15 @@ impl UiSpan {
     pub(crate) fn new(operation: UiOperation, bytes: usize, items: usize) -> Self {
         Self {
             capture: if diagnostic_enabled() {
-                diagnostic_begin(operation_label(operation), "", bytes, items, false)
+                diagnostic_begin(
+                    operation_label(operation),
+                    "",
+                    bytes,
+                    items,
+                    false,
+                    CURRENT_POLL.get().0,
+                    CURRENT_POLL.get().1,
+                )
             } else {
                 0.0
             },
@@ -609,6 +702,8 @@ impl UiSpan {
                     0,
                     1,
                     false,
+                    CURRENT_POLL.get().0,
+                    CURRENT_POLL.get().1,
                 )
             } else {
                 0.0
@@ -620,7 +715,15 @@ impl UiSpan {
     pub(crate) fn waiting(command: &'static str) -> Self {
         Self {
             capture: if diagnostic_enabled() {
-                diagnostic_begin(operation_label(UiOperation::Bridge), command, 0, 0, true)
+                diagnostic_begin(
+                    operation_label(UiOperation::Bridge),
+                    command,
+                    0,
+                    0,
+                    true,
+                    CURRENT_POLL.get().0,
+                    CURRENT_POLL.get().1,
+                )
             } else {
                 0.0
             },

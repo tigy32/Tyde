@@ -1,6 +1,7 @@
 // Detailed captures remain opt-in and memory-only. The separate local monitor
 // schedules aggregate diagnostics through the typed Rust desktop bridge.
 let recorder;
+let nextFuture = 1;
 
 export function createLocalMonitor(env, tick, reset) {
     let timer;
@@ -38,7 +39,7 @@ export function createRecorder(env) {
     let capture = null, nextId = 1;
     const now = () => env.performance.now();
     const visible = () => env.document.visibilityState === 'visible';
-    function begin(operation, detail, bytes, items, waiting) {
+    function begin(operation, detail, bytes, items, waiting, token, poll) {
         const c = capture;
         if (!c?.running) return 0;
         // Reserve synchronous capacity: many pending remote calls must not hide UI work.
@@ -46,7 +47,9 @@ export function createRecorder(env) {
         const id = nextId++;
         const row = {id, parent: c.stack.at(-1) ?? null,
             kind: waiting ? 'async_wait' : 'client_work', operation, detail,
-            startMs: now(), bytes, items};
+            startMs: now(), bytes, items,
+            future: token >= c.firstFuture && token < nextFuture ? token - c.firstFuture + 1 : null,
+            poll: token >= c.firstFuture && token < nextFuture ? poll || null : null};
         c.active.set(id, row);
         if (waiting) c.waiting++;
         else c.stack.push(id);
@@ -69,6 +72,22 @@ export function createRecorder(env) {
         const row = capture?.running && capture.active.get(id);
         if (row) row.items = items;
     }
+    function register(producer, site) {
+        const c = capture;
+        if (!c?.running) return 0;
+        const token = nextFuture++;
+        lifecycle(token, 0, 'register', producer, site);
+        return token;
+    }
+    function lifecycle(token, poll, event, producer = null, site = null) {
+        const c = capture;
+        if (!c?.running) return;
+        const registered = token >= c.firstFuture && token < nextFuture;
+        if (!registered) c.unregisteredEvents++;
+        c.lifecycleEvents++;
+        c.lifecycle.push({future: registered ? token - c.firstFuture + 1 : null,
+            poll: registered ? poll || null : null, event, producer, site, atMs: now() - c.startMs});
+    }
     function stop() {
         const c = capture;
         if (!c?.running) return;
@@ -89,11 +108,17 @@ export function createRecorder(env) {
         const active = Array.from(c.active.values()).map(row => ({...row,
             endMs, durationMs: endMs - row.startMs, outcome: 'incomplete'}));
         return {
-            schema: 1, running: c.running, startedUnixMs: c.startedUnixMs,
+            schema: 2, running: c.running, startedUnixMs: c.startedUnixMs,
             startMs: c.startMs, endMs, capabilities: {...c.capabilities},
-            limits: {records: 1024, gaps: 64, activeClient: 32, activeAsync: 32},
+            limits: {records: 1024, gaps: 64, activeClient: 32, activeAsync: 32, lifecycle: 4096},
             loss: {recordsOverwritten: c.records.overwritten(), gapsOverwritten: c.gaps.overwritten(),
-                activeDropped: c.droppedActive},
+                activeDropped: c.droppedActive, lifecycleOverwritten: c.lifecycle.overwritten()},
+            lifecycle: c.lifecycle.read(),
+            coverage: {registeredFutures: nextFuture - c.firstFuture, lifecycleEvents: c.lifecycleEvents,
+                unregisteredEvents: c.unregisteredEvents,
+                renderEffectHooks: 'sync_new_with_value_erased',
+                durations: 'inclusive_wall_not_cpu',
+                otherExecutors: 'not_observed'},
             samples: {...c.samples}, records: c.records.read(), active, gaps: c.gaps.read(),
         };
     }
@@ -101,6 +126,7 @@ export function createRecorder(env) {
         stop();
         const startMs = now();
         const c = capture = {running: true, startMs, startedUnixMs: env.Date.now(),
+            firstFuture: nextFuture, lifecycle: ring(4096), lifecycleEvents: 0, unregisteredEvents: 0,
             records: ring(1024), gaps: ring(64), active: new Map(), stack: [], waiting: 0,
             droppedActive: 0, samples: {timer: 0, frame: 0, input: 0, hiddenTransitions: 0},
             listeners: [], observers: [], timer: null, frame: null,
@@ -192,9 +218,9 @@ export function createRecorder(env) {
         }
         c.timer = env.setTimeout(tick, 100);
         c.frame = env.requestAnimationFrame(frame);
-        return {schema: 1, running: true};
+        return {schema: 2, running: true};
     }
-    return {begin, end, setFrame, setItems, start, stop, snapshot, enabled: () => capture?.running === true,
+    return {begin, end, setFrame, setItems, register, lifecycle, start, stop, snapshot, enabled: () => capture?.running === true,
         export: () => JSON.stringify(snapshot()),
         clear() { stop(); capture = null; }};
 }
@@ -206,8 +232,8 @@ export function installDiagnostics() {
         snapshot: recorder.snapshot, export: recorder.export, clear: recorder.clear});
 }
 
-export function diagnosticBegin(operation, detail, bytes, items, waiting) {
-    return recorder ? recorder.begin(operation, detail, bytes, items, waiting) : 0;
+export function diagnosticBegin(operation, detail, bytes, items, waiting, token, poll) {
+    return recorder ? recorder.begin(operation, detail, bytes, items, waiting, token, poll) : 0;
 }
 export function diagnosticEnd(id, outcome) { if (id) recorder.end(id, outcome); }
 export function diagnosticSetFrame(id, frame) { if (id) recorder.setFrame(id, frame); }
@@ -222,3 +248,6 @@ export function installTestDiagnostics(env) {
 }
 
 export function diagnosticEnabled() { return recorder?.enabled() === true; }
+
+export function diagnosticRegister(producer, site) { return recorder?.register(producer, site) ?? 0; }
+export function diagnosticLifecycle(token, poll, event) { recorder?.lifecycle(token, poll, event); }
