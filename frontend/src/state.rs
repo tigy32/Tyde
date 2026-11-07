@@ -6859,10 +6859,10 @@ impl AppState {
             });
         }
 
-        let restored = next.as_ref().and_then(|r| {
-            self.project_view_memory
-                .with_untracked(|m| m.get(r).cloned())
-        });
+        // Active views own their bodies; only inactive projects keep snapshots.
+        let restored = next
+            .as_ref()
+            .and_then(|project| self.project_view_memory.write().remove(project));
 
         #[cfg(target_arch = "wasm32")]
         let refresh_files = restored.as_ref().is_some_and(|memory| memory.needs_refresh);

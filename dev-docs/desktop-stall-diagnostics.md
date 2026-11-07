@@ -258,3 +258,27 @@ failure or erased by the corrected probe. This remains hidden Linux WebKit
 acceptance, not a shipped installer or macOS acceptance. Receipts and copied
 captures are in `~/tyde-evidence/desktop-memory-growth-20261106/installed-route-green02/`;
 the predecessor RED is in `installed-route-red/` beside it.
+
+#### Project snapshot lifetime repair, 2026-11-07
+
+A real-server Linux desktop file/diff flow demonstrated obsolete ownership:
+opening a 16,384-byte file and a 16,264-byte diff, switching away and back,
+then closing both tabs left those bodies in the active project's saved
+`ProjectViewMemory`. Active owners and connected file/diff rows were zero;
+the saved owners still held one file and one diff (32,648 logical body bytes).
+The obsolete snapshot survived until another project switch replaced it.
+
+`apply_active_project` restored with `get(...).cloned()` without removing the
+saved entry. This ownership pattern originated in `44392cfc36f4b52d05f4dc6e0bbb8b4a49dac0e0`
+(single-file/diff snapshots); the multi-tab maps inherited it. Restoration now
+removes and consumes the snapshot. Inactive projects still retain their readable
+views; active views exclusively own their current file/diff bodies. No cache
+budget, history eviction, protocol/lifecycle inference or UI styling changes.
+The mounted-DOM regression walks cold retention, repeated restoration, readable
+file/diff tabs and their actual close controls using the existing owner reader.
+
+This is a bounded obsolete-copy defect, not proof of unbounded growth under
+constant state and not a root cause for the customer's 57.14 GB incident.
+Transcripts and the completion-result index are unchanged. Logical named-owner
+counts do not establish allocator, detached reactive owner, worker, JS, native
+or compositor reclamation. Linux WebKit evidence is not macOS acceptance.

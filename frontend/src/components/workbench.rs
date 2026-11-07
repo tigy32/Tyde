@@ -1553,4 +1553,256 @@ mod wasm_tests {
         }
         crate::components::center_zone::CenterWorkspaceWidth::forget_measurement();
     }
+
+    #[wasm_bindgen_test]
+    async fn restored_project_releases_closed_file_and_diff_bodies() {
+        use crate::state::{
+            ActiveProjectRef, DiffKey, DiffViewState, FileResourceKey, OpenFile, ProjectInfo,
+            TabContent,
+        };
+        use crate::wasm_test_support::{Mounted, ScopedRoot};
+        use protocol::{
+            DiffContextMode, Project, ProjectDiffScope, ProjectFileVersion, ProjectId, ProjectPath,
+            ProjectRootPath, ProjectSource,
+        };
+
+        struct Bridge(wasm_bindgen::JsValue);
+        impl Drop for Bridge {
+            fn drop(&mut self) {
+                js_sys::Reflect::set(&web_sys::window().unwrap(), &"__TAURI__".into(), &self.0)
+                    .unwrap();
+            }
+        }
+        let window = web_sys::window().unwrap();
+        let _bridge = Bridge(js_sys::Reflect::get(&window, &"__TAURI__".into()).unwrap());
+        js_sys::eval("window.__TAURI__ = {core: {invoke: () => Promise.resolve(null)}};").unwrap();
+        let storage = window.local_storage().unwrap().unwrap();
+        let previous_project = storage.get_item("tyde-active-project").unwrap();
+        let document = window.document().unwrap();
+        let root = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&root).unwrap();
+        let container = ScopedRoot::new(root, "project-body-lifetime");
+        let state = AppState::new();
+        state.tabs_enabled.set(true);
+        state.diff_context_mode.set(DiffContextMode::Hunks);
+        state
+            .sidebar_layout
+            .update(|layouts| layouts.mode = crate::sidebar_layout::InterfaceMode::Dinosaur);
+        let host = host_config::ConfiguredHost {
+            id: "ownership-host".into(),
+            label: "Local".into(),
+            transport: host_config::HostTransportConfig::LocalEmbedded,
+            auto_connect: false,
+        };
+        state.configured_hosts.set(vec![host]);
+        state.projects.set(
+            ["A", "B"]
+                .into_iter()
+                .map(|name| ProjectInfo {
+                    host_id: "ownership-host".into(),
+                    project: Project {
+                        id: ProjectId(name.into()),
+                        name: format!("Ownership {name}"),
+                        sort_order: 0,
+                        source: ProjectSource::Standalone {
+                            roots: vec![ProjectRootPath("/repo".into())],
+                        },
+                    },
+                })
+                .collect(),
+        );
+        let mounted_state = state.clone();
+        let mounted = Mounted::new(
+            mount_to(container.clone(), move || {
+                provide_context(mounted_state);
+                view! {
+                    <style>{include_str!("../../styles.css")}</style>
+                    <div style="height:720px;width:1100px;display:flex">
+                        <crate::components::project_rail::ProjectRail /><CenterZone />
+                    </div>
+                }
+            }),
+            (),
+        );
+        tick().await;
+        element(&container, "[title='Ownership A']").click();
+        let project = ActiveProjectRef {
+            host_id: "ownership-host".into(),
+            project_id: ProjectId("A".into()),
+        };
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".into()),
+            relative_path: "lifetime.txt".into(),
+        };
+        let key = FileResourceKey {
+            host_id: project.host_id.clone(),
+            project_id: project.project_id.clone(),
+            path: path.clone(),
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("Readable file body".into()),
+                    is_binary: false,
+                    missing: false,
+                },
+            );
+        });
+        let file_tab = state
+            .open_tab(TabContent::File { key }, "lifetime.txt".into(), true)
+            .expect("File tab");
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Readable file body")
+        );
+        let diff_key = DiffKey::new(
+            &project.host_id,
+            project.project_id.clone(),
+            path.root.clone(),
+            ProjectDiffScope::Unstaged,
+            "lifetime.txt",
+        );
+        state.diff_contents.update(|diffs| {
+            diffs.insert(
+                diff_key,
+                DiffViewState {
+                    root: path.root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: Some("lifetime.txt".into()),
+                    context_mode: DiffContextMode::Hunks,
+                    pending: false,
+                    files: vec![protocol::ProjectGitDiffFile {
+                        relative_path: "lifetime.txt".into(),
+                        change_kind: None,
+                        is_binary: false,
+                        unmerged: false,
+                        hunks: vec![protocol::ProjectGitDiffHunk {
+                            hunk_id: "hunk".into(),
+                            old_start: 1,
+                            old_count: 0,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: vec![protocol::ProjectGitDiffLine {
+                                kind: protocol::ProjectGitDiffLineKind::Added,
+                                text: "Readable diff body".into(),
+                                old_line_number: None,
+                                new_line_number: Some(1),
+                            }],
+                        }],
+                    }],
+                },
+            );
+        });
+        state.open_tab(
+            TabContent::Diff {
+                host_id: project.host_id,
+                project_id: project.project_id,
+                root: path.root,
+                scope: ProjectDiffScope::Unstaged,
+                revision: Default::default(),
+                path: "lifetime.txt".into(),
+            },
+            "Lifetime diff".into(),
+            true,
+        );
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Readable diff body")
+        );
+        for _ in 0..3 {
+            element(&container, "[title='Ownership B']").click();
+            tick().await;
+            let cold = crate::devtools::memory_owners(&state);
+            assert_eq!((cold.active_files.files, cold.active_files.diffs), (0, 0));
+            assert_eq!(
+                (cold.saved_files.files, cold.saved_files.diffs),
+                (1, 1),
+                "Inactive readable views keep their bodies"
+            );
+            element(&container, "[title='Ownership A']").click();
+            tick().await;
+            assert!(
+                container
+                    .text_content()
+                    .unwrap()
+                    .contains("Readable diff body")
+            );
+            let restored = crate::devtools::memory_owners(&state);
+            assert_eq!(
+                (restored.active_files.files, restored.active_files.diffs),
+                (1, 1)
+            );
+            assert_eq!(
+                (restored.saved_files.files, restored.saved_files.diffs),
+                (0, 0),
+                "Restoration must transfer ownership, not clone an obsolete generation"
+            );
+        }
+        state.activate_tab(file_tab);
+        tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Readable file body")
+        );
+        element(&container, "button.tab[title='lifetime.txt'] .tab-close").click();
+        element(&container, "button.tab[title='Lifetime diff'] .tab-close").click();
+        tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Readable file body")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Readable diff body")
+        );
+        let closed = crate::devtools::memory_owners(&state);
+        assert_eq!(
+            (
+                closed.active_files.files,
+                closed.active_files.diffs,
+                closed.saved_files.files,
+                closed.saved_files.diffs
+            ),
+            (0, 0, 0, 0)
+        );
+        element(&container, "[title='Ownership B']").click();
+        element(&container, "[title='Ownership A']").click();
+        tick().await;
+        assert!(
+            container
+                .query_selector("button.tab[title='lifetime.txt']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .query_selector("button.tab[title='Lifetime diff']")
+                .unwrap()
+                .is_none()
+        );
+        drop(mounted);
+        match previous_project {
+            Some(value) => storage.set_item("tyde-active-project", &value).unwrap(),
+            None => storage.remove_item("tyde-active-project").unwrap(),
+        }
+    }
 }
