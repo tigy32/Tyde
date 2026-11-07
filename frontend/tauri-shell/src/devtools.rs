@@ -9,7 +9,7 @@ use devtools_protocol::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
@@ -240,14 +240,54 @@ fn webview_data_store(
     })
 }
 
+enum PendingUiDebugRequest {
+    Register {
+        id: String,
+        response: oneshot::Sender<UiDebugResponse>,
+    },
+    Remove {
+        id: String,
+    },
+    Submit {
+        submission: UiDebugResponseSubmission,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 pub struct UiDebugBridgeState {
     ready: AtomicBool,
-    pending: Mutex<HashMap<String, oneshot::Sender<UiDebugResponse>>>,
+    pending: mpsc::UnboundedSender<PendingUiDebugRequest>,
     startup: tokio::sync::mpsc::UnboundedSender<oneshot::Sender<Result<(), String>>>,
 }
 
 impl Default for UiDebugBridgeState {
     fn default() -> Self {
+        let (pending, mut pending_requests) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(async move {
+            let mut responses = HashMap::new();
+            while let Some(request) = pending_requests.recv().await {
+                match request {
+                    PendingUiDebugRequest::Register { id, response } => {
+                        assert!(
+                            responses.insert(id, response).is_none(),
+                            "duplicate pending UI debug request"
+                        );
+                    }
+                    PendingUiDebugRequest::Remove { id } => {
+                        responses.remove(&id);
+                    }
+                    PendingUiDebugRequest::Submit { submission, reply } => {
+                        let result = match responses.remove(&submission.request_id) {
+                            Some(response) => response
+                                .send(submission.response)
+                                .map_err(|_| "failed to deliver UI debug response".to_owned()),
+                            None => Err("unknown UI debug request".to_owned()),
+                        };
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        });
         let (startup, mut requests) =
             tokio::sync::mpsc::unbounded_channel::<oneshot::Sender<Result<(), String>>>();
         tauri::async_runtime::spawn(async move {
@@ -277,7 +317,7 @@ impl Default for UiDebugBridgeState {
         });
         Self {
             ready: AtomicBool::new(false),
-            pending: Mutex::new(HashMap::new()),
+            pending,
             startup,
         }
     }
@@ -301,49 +341,60 @@ impl UiDebugBridgeState {
         request: UiDebugRequest,
     ) -> Result<UiDebugResponse, String> {
         let timeout_ms = request_timeout_ms(&request);
-        self.wait_until_ready(timeout_ms).await?;
+        match timeout_ms {
+            Some(timeout_ms) => self.wait_until_ready(timeout_ms).await?,
+            None if !self.ready.load(Ordering::Acquire) => {
+                return Err("UI debug frontend is not ready".to_owned());
+            }
+            None => {}
+        }
 
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        let previous = self.pending.lock().await.insert(request_id.clone(), tx);
-        assert!(
-            previous.is_none(),
-            "duplicate pending UI debug request_id {request_id}"
-        );
+        self.pending
+            .send(PendingUiDebugRequest::Register {
+                id: request_id.clone(),
+                response: tx,
+            })
+            .map_err(|_| "UI debug pending-request owner stopped".to_owned())?;
 
         let event = UiDebugRequestEvent {
             request_id: request_id.clone(),
             request,
         };
         if let Err(err) = app.emit("tyde://ui-debug-request", event) {
-            self.pending.lock().await.remove(&request_id);
+            self.pending
+                .send(PendingUiDebugRequest::Remove { id: request_id })
+                .map_err(|_| "UI debug pending-request owner stopped".to_owned())?;
             return Err(format!("failed to emit UI debug request: {err}"));
         }
 
-        match timeout(Duration::from_millis(timeout_ms), rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err("UI debug frontend dropped the response channel".to_string()),
-            Err(_) => {
-                self.pending.lock().await.remove(&request_id);
-                Err(format!("UI debug request timed out after {timeout_ms}ms"))
-            }
-        }
+        let result = match timeout_ms {
+            None => rx.await,
+            Some(timeout_ms) => match timeout(Duration::from_millis(timeout_ms), rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pending
+                        .send(PendingUiDebugRequest::Remove { id: request_id })
+                        .map_err(|_| "UI debug pending-request owner stopped".to_owned())?;
+                    return Err(format!("UI debug request timed out after {timeout_ms}ms"));
+                }
+            },
+        };
+        result.map_err(|_| "UI debug frontend dropped the response channel".to_owned())
     }
 
     pub async fn submit_response(
         &self,
         submission: UiDebugResponseSubmission,
     ) -> Result<(), String> {
-        let tx = self.pending.lock().await.remove(&submission.request_id);
-        let Some(tx) = tx else {
-            return Err(format!(
-                "unknown UI debug request_id '{}'",
-                submission.request_id
-            ));
-        };
-
-        tx.send(submission.response)
-            .map_err(|_| "failed to deliver UI debug response".to_string())
+        let (reply, result) = oneshot::channel();
+        self.pending
+            .send(PendingUiDebugRequest::Submit { submission, reply })
+            .map_err(|_| "UI debug pending-request owner stopped".to_owned())?;
+        result
+            .await
+            .map_err(|_| "UI debug pending-request owner dropped its result".to_owned())?
     }
 
     async fn wait_until_ready(&self, timeout_ms: u64) -> Result<(), String> {
@@ -450,13 +501,14 @@ async fn handle_client(
     Ok(())
 }
 
-fn request_timeout_ms(request: &UiDebugRequest) -> u64 {
+fn request_timeout_ms(request: &UiDebugRequest) -> Option<u64> {
     match request {
+        UiDebugRequest::MemoryOwners => None,
         UiDebugRequest::Evaluate { timeout_ms, .. } => {
-            timeout_ms.unwrap_or(UI_DEBUG_DEFAULT_TIMEOUT_MS)
+            Some(timeout_ms.unwrap_or(UI_DEBUG_DEFAULT_TIMEOUT_MS))
         }
         UiDebugRequest::Ping | UiDebugRequest::CaptureScreenshot { .. } => {
-            UI_DEBUG_DEFAULT_TIMEOUT_MS
+            Some(UI_DEBUG_DEFAULT_TIMEOUT_MS)
         }
     }
 }

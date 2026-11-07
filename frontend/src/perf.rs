@@ -90,6 +90,10 @@ fn operation_label(operation: UiOperation) -> &'static str {
 
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/stall_diagnostics.js")]
 extern "C" {
+    #[wasm_bindgen(js_name = registerMemoryOwnerReader)]
+    fn register_memory_owner_reader(reader: &JsValue);
+    #[wasm_bindgen(js_name = unregisterMemoryOwnerReader)]
+    fn unregister_memory_owner_reader(reader: &JsValue);
     #[wasm_bindgen(catch, js_name = diagnosticCaptureState)]
     fn diagnostic_capture_state() -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = diagnosticCaptureAction)]
@@ -124,6 +128,25 @@ extern "C" {
     fn local_monitor_now(monitor: &JsValue) -> f64;
     #[wasm_bindgen(js_name = stopLocalMonitor)]
     fn stop_local_monitor(monitor: &JsValue);
+}
+
+pub(crate) struct MemoryOwnerReader(Closure<dyn Fn() -> Result<JsValue, JsValue>>);
+
+impl MemoryOwnerReader {
+    pub(crate) fn new(state: crate::state::AppState) -> Self {
+        let reader = Closure::new(move || {
+            serde_wasm_bindgen::to_value(&crate::devtools::memory_owners(&state))
+                .map_err(|_| JsValue::from_str("Cannot serialize memory owner snapshot"))
+        });
+        register_memory_owner_reader(reader.as_ref());
+        Self(reader)
+    }
+}
+
+impl Drop for MemoryOwnerReader {
+    fn drop(&mut self) {
+        unregister_memory_owner_reader(self.0.as_ref());
+    }
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]

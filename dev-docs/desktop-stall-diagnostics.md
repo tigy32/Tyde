@@ -146,3 +146,115 @@ The recorder emits a state-change event for API/UI start, stop and clear.
 Mounted Debug controls project that authority, including changes initiated
 through DEV evaluation; they never decide to reset a capture from stale UI state.
 The desktop capture always observes the current client, not the selected host.
+
+### On-demand desktop memory owners (DEV)
+
+The existing loopback UI debug endpoint accepts the typed `UiDebugRequest`
+`{"kind":"memory_owners"}` and returns `UiDebugResponse::MemoryOwners`.
+Use the `uiDebugAddr` from an owned, ready dev-instance attestation: send one
+JSON request over TCP, shut down the socket's write side, then read the JSON
+response to EOF. This is not a new MCP tool or a production collection loop.
+It reads the current AppState synchronously, untracked and without cloning
+payloads; it retains no snapshots, starts no recorder, and emits no content,
+identifiers, paths, command arguments or credentials.
+
+The snapshot separates transcript rows/attached results, live streaming buffers,
+the completion-result index, and active versus saved-project file/diff bodies.
+Index, question and progress counts are reported independently. Shared live
+streaming signals are visited through `streaming_text`, not again through rows.
+`len_bytes` is the current named buffer length; `capacity_bytes` is its actual
+Rust String/Vec backing capacity, **not** a serialized-size estimate or the
+capacity of Wasm linear memory. Row-vector slot capacity is a separate field.
+
+This is deliberately not a total-heap measurement. It excludes IDs, paths,
+request arguments, message/tool metadata, notice/compaction bodies, collection
+and signal overhead, renderer/worker caches, detached reactive owners, JS,
+native/compositor allocations and allocator overhead/free arenas. Result-body
+measurement visits every result variant, including failure/cancellation text,
+JSON strings/keys, native text and image data; typed IDs/paths are excluded.
+Reasoning text includes its signature; reasoning blobs are counted separately.
+Counts can establish named-owner lifetimes; they cannot prove that all memory
+was released or explain a process footprint.
+
+#### Fixed-workload incident observation, 2026-11-06
+
+An owned Linux Tauri/WebKit desktop exercised the existing event bridge,
+production dispatcher/AppState and rendered Leptos chat. The above-backend
+fixture supplied 8 messages (32 KiB text) and 8 command results (16 KiB stdout),
+without executing tools or starting a provider/backend actor. Synchronization
+used typed completions and DOM predicates with MutationObserver, not sleeps,
+GC requests, host-speed thresholds or timeout increases.
+
+| Settled boundary | Message rows / attached results / indexed results | Message / attached-result / indexed-result backing capacity |
+| --- | --- | --- |
+| Baseline | 0 / 0 / 0 | 0 / 0 / 0 |
+| Append | 8 / 8 / 8 | 32 / 16 / 16 KiB |
+| Each of 8 same-size authoritative replacements | 8 / 8 / 8 | 32 / 16 / 16 KiB |
+| Each of 3 tab close/reopens, without replay on reopen | 8 / 8 / 8 | 32 / 16 / 16 KiB |
+| AgentClosed projection | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Every post-replacement and tab-boundary snapshot equaled the append snapshot,
+including 768 bytes of row slots and 8 entries in each transcript index. The
+final snapshot equaled baseline across every measured owner. Reopened chat
+rendered all 8 tool cards and preserved the messages. Streaming, question,
+progress and active/saved file/diff owners were empty in this workload; their
+nonempty paths were not exercised. Evidence and executable workload are retained
+locally under `~/tyde-evidence/desktop-memory-growth-20261106/owned-linux03/`,
+with scalar-only owner snapshots in `BOUNDARY-RESULT.safe.json`.
+
+This observes the additional 16 KiB owned by `completed_tool_results`; it does
+not establish that the index is defective. No accumulating named-owner leak was
+demonstrated by these fixed-state boundaries. Cached-chat retention is preserved.
+The native document was hidden: this is real Linux WebKit execution, not
+foreground rendering/compositor or macOS WK validation. There is no current
+Mac allocation profile, customer workload/version match, total allocator-live
+measurement, or retained-root proof. The reported 57.14 GB incident remains
+unattributed; this change is observability, not a causal repair.
+
+The memory-owner request requires the frontend's typed ready state and then
+awaits completion/channel failure without an elapsed deadline. Existing debug
+Evaluate/Ping/screenshot deadlines are unchanged. Pending debug replies are
+owned by a channel-driven task, not an async mutex; this is diagnostic bridge
+plumbing only, not a change to host/server lifecycle or application retention.
+
+The final owned build also completed concurrent typed snapshots and pings and
+rejected an unregistered response without echoing its request identity. A
+proposed held-submission probe could not install: Tauri exposes `invoke` as a
+read-only getter. That apparatus failure is preserved; it is not a product
+failure, a held-request pass, or a reason to weaken the boundary. Both owned
+instances were canonically stopped; their ephemeral stores and application
+directories were confirmed removed. No installed app was restarted.
+
+#### Ordinary installed-client memory collection
+
+The ordinary **Settings → Debug → Desktop stall capture → Start capture →
+Stop capture → Copy capture** route now exports `memoryOwners` and
+`memoryOwnersObservedUnixMs` alongside the existing bounded stall capture and
+packaged build identity. Paste the clipboard JSON into a local evidence file.
+No DEV instance, debug TCP endpoint, console, host selection or backend turn is
+required. This source change must reach a shipped build before it is available
+in an already-installed client; it does not update or restart that client.
+
+The owner snapshot is taken **at each Copy/export**, not at Start/Stop and not
+periodically. Use separate exported files for before/after boundaries. The
+observation timestamp distinguishes current owners from the earlier stopped
+stall interval; it is not a memory-growth rate or allocation history. The same
+Rust reader serves both installed export and typed DEV requests, without a
+payload cache. Its callback lives with App and is unregistered during App
+cleanup. A missing reader fails export explicitly rather than copying a
+capture that silently lacks memory observations. No new controls or appearance
+changes are introduced. A fully paused/frozen client still cannot execute this
+reader until responsive; this is not crash-proof collection or a substitute for
+a current macOS allocation profile. The customer incident remains OPEN.
+
+Installed-route boundary evidence: the pre-integration owned build exported no
+`memoryOwners` (RED). The integrated build's rendered Debug controls wrote real
+native clipboard JSON that matched the typed owner snapshot after the 8-message /
+8-result workload and again after AgentClosed (GREEN). Capture was stopped
+before append, proving Copy reads current owners rather than a stopped snapshot.
+The first GREEN apparatus attempt had a malformed selector expression and
+failed before collection; that attempt is retained, not reported as a product
+failure or erased by the corrected probe. This remains hidden Linux WebKit
+acceptance, not a shipped installer or macOS acceptance. Receipts and copied
+captures are in `~/tyde-evidence/desktop-memory-growth-20261106/installed-route-green02/`;
+the predecessor RED is in `installed-route-red/` beside it.

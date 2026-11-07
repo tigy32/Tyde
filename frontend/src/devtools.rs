@@ -1,5 +1,11 @@
-use devtools_protocol::{UiDebugRequest, UiDebugResponse};
+use crate::state::{AppState, ChatRowContent, ToolRequestEntry};
+use devtools_protocol::{
+    UiDebugRequest, UiDebugResponse, UiFileOwners, UiMemoryOwners, UiPayloadBytes,
+    UiTranscriptOwners,
+};
 use js_sys::Promise;
+use leptos::prelude::*;
+use protocol::{ToolExecutionOutcome, ToolExecutionResult};
 use serde_json::Value;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -9,10 +15,11 @@ use crate::bridge::{
     submit_ui_debug_response,
 };
 
-pub async fn install_listener() -> Result<bridge::UnlistenHandle, String> {
+pub async fn install_listener(state: AppState) -> Result<bridge::UnlistenHandle, String> {
     let handle = listen_ui_debug_request(move |event| {
+        let state = state.clone();
         spawn_local(async move {
-            let response = handle_request(event.request).await;
+            let response = handle_request(&state, event.request).await;
             let submit = SubmitUiDebugResponseRequest {
                 request_id: event.request_id,
                 response,
@@ -28,9 +35,12 @@ pub async fn install_listener() -> Result<bridge::UnlistenHandle, String> {
     Ok(handle)
 }
 
-async fn handle_request(request: UiDebugRequest) -> UiDebugResponse {
+async fn handle_request(state: &AppState, request: UiDebugRequest) -> UiDebugResponse {
     match request {
         UiDebugRequest::Ping => UiDebugResponse::Pong,
+        UiDebugRequest::MemoryOwners => UiDebugResponse::MemoryOwners {
+            snapshot: Box::new(memory_owners(state)),
+        },
         UiDebugRequest::Evaluate { expression, .. } => match evaluate_expression(&expression).await
         {
             Ok(value) => UiDebugResponse::EvaluateResult { value },
@@ -40,6 +50,247 @@ async fn handle_request(request: UiDebugRequest) -> UiDebugResponse {
             message: "capture_screenshot is handled by the desktop shell".to_string(),
         },
     }
+}
+
+fn buffer_bytes(bytes: &mut UiPayloadBytes, value: &String) {
+    bytes.len_bytes += value.len();
+    bytes.capacity_bytes += value.capacity();
+}
+
+fn json_bytes(bytes: &mut UiPayloadBytes, value: &Value) {
+    match value {
+        Value::String(text) => buffer_bytes(bytes, text),
+        Value::Array(values) => values.iter().for_each(|value| json_bytes(bytes, value)),
+        Value::Object(values) => {
+            for (key, value) in values {
+                buffer_bytes(bytes, key);
+                json_bytes(bytes, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn image_bytes(bytes: &mut UiPayloadBytes, image: &protocol::ImageData) {
+    buffer_bytes(bytes, &image.data);
+}
+
+fn result_bytes(bytes: &mut UiPayloadBytes, outcome: &ToolExecutionOutcome) {
+    let result = match outcome {
+        ToolExecutionOutcome::Succeeded { result } => Some(result),
+        ToolExecutionOutcome::Failed {
+            message,
+            details,
+            result,
+            ..
+        } => {
+            buffer_bytes(bytes, message);
+            if let Some(details) = details {
+                buffer_bytes(bytes, details);
+            }
+            result.as_ref()
+        }
+        ToolExecutionOutcome::Cancelled { message } => {
+            buffer_bytes(bytes, message);
+            None
+        }
+    };
+    let Some(result) = result else {
+        return;
+    };
+    match result {
+        ToolExecutionResult::RunCommand { stdout, stderr, .. } => {
+            buffer_bytes(bytes, stdout);
+            buffer_bytes(bytes, stderr);
+        }
+        ToolExecutionResult::NativeContent { text, images } => {
+            buffer_bytes(bytes, text);
+            for image in images {
+                image_bytes(bytes, image);
+            }
+        }
+        ToolExecutionResult::Other { result } => json_bytes(bytes, result),
+        ToolExecutionResult::GetTypeDocs { documentation } => buffer_bytes(bytes, documentation),
+        ToolExecutionResult::SearchTypes { types } => {
+            for text in types {
+                buffer_bytes(bytes, text);
+            }
+        }
+        ToolExecutionResult::ViewImage {
+            image,
+            preview_error,
+        } => {
+            if let Some(image) = image {
+                image_bytes(bytes, image);
+            }
+            if let Some(error) = preview_error {
+                buffer_bytes(bytes, error);
+            }
+        }
+        ToolExecutionResult::GenerateImage { revised_prompt, .. } => {
+            if let Some(prompt) = revised_prompt {
+                buffer_bytes(bytes, prompt);
+            }
+        }
+        ToolExecutionResult::ExitPlanMode { feedback, plan, .. } => {
+            if let Some(feedback) = feedback {
+                buffer_bytes(bytes, feedback);
+            }
+            if let Some(plan) = plan {
+                buffer_bytes(bytes, plan);
+            }
+        }
+        ToolExecutionResult::AskUserQuestion { answers } => {
+            for answer in answers {
+                match &answer.answer {
+                    protocol::UserQuestionAnswerValue::Selected { labels, note } => {
+                        for label in labels {
+                            buffer_bytes(bytes, label);
+                        }
+                        if let Some(note) = note {
+                            buffer_bytes(bytes, note);
+                        }
+                    }
+                    protocol::UserQuestionAnswerValue::FreeText { text, note } => {
+                        buffer_bytes(bytes, text);
+                        if let Some(note) = note {
+                            buffer_bytes(bytes, note);
+                        }
+                    }
+                }
+            }
+        }
+        ToolExecutionResult::ModifyFile { .. }
+        | ToolExecutionResult::ReadFiles { .. }
+        | ToolExecutionResult::TydeSendAgentMessage
+        | ToolExecutionResult::TydeAwaitAgents { .. }
+        | ToolExecutionResult::WebSearch
+        | ToolExecutionResult::Sleep => {}
+    }
+}
+
+fn tool_bytes(owners: &mut UiTranscriptOwners, tool: &ToolRequestEntry) {
+    owners.tool_requests += 1;
+    if let Some(result) = &tool.result {
+        owners.attached_results += 1;
+        result_bytes(&mut owners.result_payloads, &result.outcome);
+    }
+}
+
+fn file_bytes<'a>(
+    owners: &mut UiFileOwners,
+    files: impl Iterator<Item = &'a crate::state::OpenFile>,
+    diffs: impl Iterator<Item = &'a crate::state::DiffViewState>,
+) {
+    for file in files {
+        owners.files += 1;
+        if let Some(contents) = &file.contents {
+            buffer_bytes(&mut owners.contents, contents);
+        }
+    }
+    for diff in diffs {
+        owners.diffs += 1;
+        owners.diff_files += diff.files.len();
+        for file in &diff.files {
+            for hunk in &file.hunks {
+                owners.diff_lines += hunk.lines.len();
+                for line in &hunk.lines {
+                    buffer_bytes(&mut owners.diff_text, &line.text);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn memory_owners(state: &AppState) -> UiMemoryOwners {
+    let mut snapshot = UiMemoryOwners::default();
+    state.chat_rows.with_untracked(|agents| {
+        let owners = &mut snapshot.transcript;
+        owners.agents = agents.len();
+        for rows in agents.values() {
+            owners.rows += rows.len();
+            owners.row_slots_capacity_bytes +=
+                rows.capacity() * std::mem::size_of::<crate::state::ChatRowHandle>();
+            for row in rows {
+                match &row.content {
+                    ChatRowContent::Message(entry) => entry.with_untracked(|entry| {
+                        owners.messages += 1;
+                        buffer_bytes(&mut owners.message_text, &entry.message.content);
+                        if let Some(reasoning) = &entry.message.reasoning {
+                            buffer_bytes(&mut owners.reasoning_text, &reasoning.text);
+                            if let Some(signature) = &reasoning.signature {
+                                buffer_bytes(&mut owners.reasoning_text, signature);
+                            }
+                            if let Some(blob) = &reasoning.blob {
+                                owners.reasoning_blobs.len_bytes += blob.len();
+                                owners.reasoning_blobs.capacity_bytes += blob.capacity();
+                            }
+                        }
+                        if let Some(images) = &entry.message.images {
+                            for image in images {
+                                image_bytes(&mut owners.message_images, image);
+                            }
+                        }
+                        for tool in &entry.tool_requests {
+                            tool_bytes(owners, tool);
+                        }
+                    }),
+                    ChatRowContent::Streaming(_)
+                    | ChatRowContent::ContextCompaction(_)
+                    | ChatRowContent::Notice(_) => {}
+                }
+            }
+        }
+    });
+    state.streaming_text.with_untracked(|agents| {
+        let owners = &mut snapshot.streaming;
+        owners.agents = agents.len();
+        for stream in agents.values() {
+            stream
+                .text
+                .with_untracked(|text| buffer_bytes(&mut owners.message_text, text));
+            stream
+                .reasoning
+                .with_untracked(|text| buffer_bytes(&mut owners.reasoning_text, text));
+            stream.tool_requests.with_untracked(|tools| {
+                for tool in tools {
+                    tool.entry.with_untracked(|entry| tool_bytes(owners, entry));
+                }
+            });
+        }
+    });
+    state.completed_tool_results.with_untracked(|results| {
+        snapshot.completed_results = results.len();
+        for result in results.values() {
+            result_bytes(&mut snapshot.completed_result_payloads, &result.outcome);
+        }
+    });
+    snapshot.tool_row_index_entries = state
+        .chat_tool_rows
+        .with_untracked(|agents| agents.values().map(|rows| rows.len()).sum());
+    snapshot.message_row_index_entries = state
+        .chat_message_rows
+        .with_untracked(|agents| agents.values().map(|rows| rows.len()).sum());
+    snapshot.pending_questions = state
+        .pending_user_questions
+        .with_untracked(|agents| agents.values().map(|questions| questions.len()).sum());
+    snapshot.progress_entries = state.tool_progress.with_untracked(|entries| entries.len());
+    state.open_files.with_untracked(|files| {
+        state.diff_contents.with_untracked(|diffs| {
+            file_bytes(&mut snapshot.active_files, files.values(), diffs.values())
+        })
+    });
+    state.project_view_memory.with_untracked(|projects| {
+        snapshot.saved_projects = projects.len();
+        for project in projects.values() {
+            file_bytes(
+                &mut snapshot.saved_files,
+                project.open_files.values(),
+                project.diff_contents.values(),
+            );
+        }
+    });
+    snapshot
 }
 
 async fn evaluate_expression(expression: &str) -> Result<Value, String> {
@@ -209,7 +460,7 @@ mod wasm_tests {
         );
         assert_eq!(mount.text_content().as_deref(), Some("Mounted"));
         let transport = BrowserTransport::new();
-        let listener = install_listener()
+        let listener = install_listener(AppState::new())
             .await
             .expect("install production listener");
 

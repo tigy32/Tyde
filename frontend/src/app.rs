@@ -97,6 +97,7 @@ thread_local! {
     static APP_LISTENER_TOKEN: Cell<u64> = const { Cell::new(0) };
     static HOST_LISTENER_HANDLES: RefCell<Vec<bridge::UnlistenHandle>> = const { RefCell::new(Vec::new()) };
     static SETTINGS_MENU_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
+    static MEMORY_OWNER_READER: RefCell<Option<crate::perf::MemoryOwnerReader>> = const { RefCell::new(None) };
     static DEVTOOLS_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
     static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static KEYUP_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
@@ -136,6 +137,9 @@ fn app_listener_token_is_current(token: u64) -> bool {
 /// leaked listener would fire against a stale `AppState` in later tests.
 pub(crate) fn clear_app_listeners() {
     set_app_listeners_active(false);
+    MEMORY_OWNER_READER.with(|reader| {
+        reader.borrow_mut().take();
+    });
     HOST_LISTENER_HANDLES.with(|handles| {
         for handle in handles.borrow_mut().drain(..) {
             handle.remove();
@@ -827,6 +831,9 @@ pub fn App() -> impl IntoView {
     });
 
     let listener_token = begin_app_listener_lifecycle();
+    MEMORY_OWNER_READER.with(|reader| {
+        *reader.borrow_mut() = Some(crate::perf::MemoryOwnerReader::new(state.clone()));
+    });
     set_app_listeners_active(true);
     on_cleanup(cleanup_app_lifecycle);
 
@@ -874,10 +881,12 @@ pub fn App() -> impl IntoView {
         });
     });
 
+    let state_for_devtools = state.clone();
     Effect::new(move |_| {
+        let state = state_for_devtools.clone();
         let listener_token = listener_token;
         spawn_local(async move {
-            match devtools::install_listener().await {
+            match devtools::install_listener(state).await {
                 Ok(handle) => {
                     if app_listener_token_is_current(listener_token) {
                         DEVTOOLS_LISTENER_HANDLE.with(|slot| {

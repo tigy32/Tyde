@@ -1374,10 +1374,65 @@ impl BoundedDebugOutput {
     }
 }
 
+/// Live backing buffers, not serialized size, allocator overhead, Wasm pages,
+/// resident memory, or allocations retained outside the named AppState owners.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiPayloadBytes {
+    pub len_bytes: usize,
+    pub capacity_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiTranscriptOwners {
+    pub agents: usize,
+    pub rows: usize,
+    pub row_slots_capacity_bytes: usize,
+    pub messages: usize,
+    pub tool_requests: usize,
+    pub attached_results: usize,
+    pub message_text: UiPayloadBytes,
+    pub reasoning_text: UiPayloadBytes,
+    pub reasoning_blobs: UiPayloadBytes,
+    pub message_images: UiPayloadBytes,
+    pub result_payloads: UiPayloadBytes,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiFileOwners {
+    pub files: usize,
+    pub contents: UiPayloadBytes,
+    pub diffs: usize,
+    pub diff_files: usize,
+    pub diff_lines: usize,
+    pub diff_text: UiPayloadBytes,
+}
+
+/// Content-free aggregates read on demand without cloning payloads. Byte
+/// fields cover named body buffers only: IDs, paths, request arguments,
+/// metadata, container/node/signal overhead and renderer caches are excluded.
+/// Result payloads include all strings (including JSON keys) and image bodies,
+/// but not IDs/paths in typed result metadata. Shared streaming signals are
+/// visited through streaming_text only, not again through transcript rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiMemoryOwners {
+    pub transcript: UiTranscriptOwners,
+    pub streaming: UiTranscriptOwners,
+    pub completed_results: usize,
+    pub completed_result_payloads: UiPayloadBytes,
+    pub tool_row_index_entries: usize,
+    pub message_row_index_entries: usize,
+    pub pending_questions: usize,
+    pub progress_entries: usize,
+    pub active_files: UiFileOwners,
+    pub saved_projects: usize,
+    pub saved_files: UiFileOwners,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiDebugRequest {
     Ping,
+    MemoryOwners,
     Evaluate {
         expression: String,
         timeout_ms: Option<u64>,
@@ -1391,6 +1446,9 @@ pub enum UiDebugRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiDebugResponse {
     Pong,
+    MemoryOwners {
+        snapshot: Box<UiMemoryOwners>,
+    },
     EvaluateResult {
         value: Value,
     },

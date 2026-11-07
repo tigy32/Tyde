@@ -15169,6 +15169,12 @@ mod wasm_tests {
         let calls = install_settings_send_stub();
         let container = make_container();
         let state = AppState::new();
+        let memory_reader = crate::perf::MemoryOwnerReader::new(state.clone());
+        let stream = crate::state::StreamingState::new("private-agent-marker".to_owned(), None);
+        stream.text.set("private-body-marker".to_owned());
+        state.streaming_text.update(|streams| {
+            streams.insert(protocol::AgentId("private-id-marker".to_owned()), stream);
+        });
         install_general_host_settings(&state, true, false, None);
         let mut schema = settings_model::host_settings_schema().clone();
         schema
@@ -15256,11 +15262,61 @@ mod wasm_tests {
             "frontend-0123456789abcdef_bg.wasm"
         );
         assert!(exported["lifecycle"].is_array());
+        assert_eq!(exported["memoryOwners"]["streaming"]["agents"], 1);
+        assert_eq!(
+            exported["memoryOwners"]["streaming"]["message_text"]["len_bytes"],
+            19
+        );
+        assert_eq!(
+            exported["memoryOwners"]["streaming"]["message_text"]["capacity_bytes"],
+            19
+        );
+        assert!(exported["memoryOwnersObservedUnixMs"].is_number());
+        assert!(!args["text"].as_str().unwrap().contains("private-"));
         assert!(
             !args["text"]
                 .as_str()
                 .unwrap()
                 .contains("Schema supplied debug switch")
+        );
+        drop(memory_reader);
+        find_button_by_text(&container, "Copied").unwrap().click();
+        let error_visible = js_sys::Function::new_with_args(
+            "root",
+            r#"
+            return new Promise(resolve => {
+                const ready = () => root.querySelector('[role="alert"]') !== null;
+                if (ready()) { resolve(); return; }
+                const observer = new MutationObserver(() => {
+                    if (ready()) { observer.disconnect(); resolve(); }
+                });
+                observer.observe(root, {subtree:true,childList:true,characterData:true});
+            });
+        "#,
+        );
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+            error_visible.call1(&JsValue::NULL, &container).unwrap(),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            container
+                .query_selector("[role=alert]")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Stall capture action failed")
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter_map(|entry| entry.dyn_into::<js_sys::Array>().ok())
+                .filter(|entry| entry.get(0).as_string().as_deref()
+                    == Some("plugin:clipboard-manager|write_text"))
+                .count(),
+            1,
+            "missing memory reader must not copy an incomplete capture"
         );
         wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
             js_sys::eval("window.__tydeDiagnostics.clear()").unwrap(),

@@ -1,6 +1,7 @@
 // Detailed captures remain opt-in and memory-only. The separate local monitor
 // schedules aggregate diagnostics through the typed Rust desktop bridge.
 let recorder;
+let memoryOwnerReader;
 let nextFuture = 1;
 
 export function createLocalMonitor(env, tick, reset) {
@@ -258,7 +259,13 @@ function installCaptureApi() {
         if (!module || !integrity) throw new Error('Packaged wasm identity is unavailable');
         return {module: module[1], integrity};
     }
-    const snapshot = async () => ({...recorder.snapshot(), build: buildIdentity(), native: await native('snapshot')});
+    const snapshot = async () => {
+        if (typeof memoryOwnerReader !== 'function') throw new Error('Memory owner reader is unavailable');
+        const memoryOwners = memoryOwnerReader();
+        const memoryOwnersObservedUnixMs = Date.now();
+        return {...recorder.snapshot(), build: buildIdentity(), memoryOwners, memoryOwnersObservedUnixMs,
+            native: await native('snapshot')};
+    };
     const changed = () => window.dispatchEvent(new Event('tyde-stall-capture-state'));
     window.__tydeDiagnostics = Object.freeze({
         async start() {
@@ -270,6 +277,11 @@ function installCaptureApi() {
         state: recorder.state, snapshot, export: async () => JSON.stringify(await snapshot()),
         async clear() { recorder.clear(); changed(); await native('stop'); },
     });
+}
+
+export function registerMemoryOwnerReader(reader) { memoryOwnerReader = reader; }
+export function unregisterMemoryOwnerReader(reader) {
+    if (memoryOwnerReader === reader) memoryOwnerReader = undefined;
 }
 
 export function diagnosticBegin(operation, detail, bytes, items, waiting, token, poll) {
