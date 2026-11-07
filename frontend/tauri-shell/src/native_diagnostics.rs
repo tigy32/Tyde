@@ -168,17 +168,15 @@ impl MainThread {
         }
         #[cfg(target_os = "macos")]
         {
+            // libc types the C macro as c_int, but Mach takes a natural_t flavor.
+            let flavor = libc::thread_flavor_t::try_from(libc::THREAD_BASIC_INFO)
+                .map_err(|_| "thread_info_flavor_invalid")?;
             let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::uninit();
             let mut count = libc::THREAD_BASIC_INFO_COUNT;
             // Public Mach query of our own main thread; no suspension or task
             // port acquisition, elevated privilege, or private framework API.
             let result = unsafe {
-                libc::thread_info(
-                    self.port,
-                    libc::THREAD_BASIC_INFO,
-                    info.as_mut_ptr().cast(),
-                    &mut count,
-                )
+                libc::thread_info(self.port, flavor, info.as_mut_ptr().cast(), &mut count)
             };
             if result != libc::KERN_SUCCESS || count != libc::THREAD_BASIC_INFO_COUNT {
                 return Err("thread_info_failed");
