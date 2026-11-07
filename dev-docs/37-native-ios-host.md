@@ -140,7 +140,7 @@ acceptance, nor close the earlier native QA limits. The Lander owns clean-main
 validation/push; the distribution owner owns signing, archive, compliance,
 upload and private TestFlight availability after the required approvals.
 
-## Current private preview build 8 preparation
+## Historical private preview build 8 preparation
 
 Release tracks build 8; Debug stays build 1. The attested GET-only ASC preflight
 at `2026-11-05T19:35:16.043962Z` found builds 2–7 VALID/COMPLETE, old build 1
@@ -198,6 +198,48 @@ activation is authorized here; existing A availability for 7 is preserved.
 No account, Service, IAM, deployment, host/device update or restart is authorized.
 The Lander alone owns landing/check/push and publisher steps; this bookkeeping
 executor performs no Apple API, archive, upload or native QA operations.
+
+## Current private preview build 9 preparation
+
+Release tracks build 9; Debug remains build 1. The GET-only ASC catalog check
+at `2026-11-07T13:55:01.717180+00:00` found builds 2–8 VALID/COMPLETE,
+old build 1 AWAITING_UPLOAD, and no build 9 record or reservation. This does
+not reserve 9; recheck allocation before distribution and stop if taken.
+The existing TydeAgentStudio app is cataloged as Tyde Agent Studio
+(`6829602646`), bundle `dev.tycode.tyde`, macOS team `743QY8VN34`.
+The sole existing internal group, Private Preview (A), is
+`0da66ed5-d509-48c1-9ffe-517772097422`; preserve its membership and availability.
+
+Source base `23fe9c53` includes native status-dock actions (`f261a4c5`),
+dismissible reconnect overlays (`32d0fc87`), live Back destinations
+(`8170571a`) and native dock reconnect projection (`23fe9c53`). This commit
+changes only Release build metadata and preparation provenance. It changes no
+implementation, UI, protocol, ABI, bootstrap, marketing or host release version.
+Existing native QA limitations remain; preparation is not native acceptance.
+
+The Lander must land this bookkeeping commit, pass the clean-main gate and push
+before build follow-up. PM's upload-versus-wait question remains unanswered:
+no archive, upload or group enablement is authorized by this preparation.
+Build/upload follow-up requires exact landed main source and explicit PM GO;
+coordinate all Mac resources through PM and sole executor 1f. Do not run GUI,
+global input, XCTest or runtime QA on air for this preparation.
+
+From the exact checked landed source, generate fresh production resources with
+`./dev.sh ios-bundle`, never `--qa-origin` or frozen/substituted resources.
+Verify `tools/ios-source-manifest.py verify`, production bootstrap
+`https://tycode.dev/tyde/?native=1`, generated marketing version 0.9.6,
+tracked Release 9 and Debug 1. Archive the Tyde scheme using Release and
+`generic/platform=iOS`, with the existing same-team distribution certificate
+and valid App Store profile for `743QY8VN34.dev.tycode.tyde`. The distribution
+owner must verify current signing prerequisites in its owned Mac session;
+this preparation does not establish their present validity. Use normal archive
+and export, no version/build overrides; export must set
+`manageAppVersionAndBuildNumber` false. Verify signed archive and IPA identity,
+source/resource hashes, arm64 iOS platform, matching dSYM, opaque marketing icon,
+unchanged entitlements and export compliance before any approved upload.
+A native archive does not publish the host-selected full client. No Git beta,
+account/IAM/team/tester/agreement change, deployment, host/device update or
+restart is authorized. Preserve credentials, tools, simulators and pairings.
 
 ## Adaptive Agents hierarchy
 
