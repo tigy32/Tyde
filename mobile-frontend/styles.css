@@ -5890,6 +5890,7 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     border-radius: 0;
 }
 [data-native-host][data-native-chat-header="client"] .chat-header:not(:has(.chat-rename-bar)) > :not(.chat-context-bar) { display: flex; }
+[data-native-host][data-native-chat-header="client"][data-native-chat-dock="shell"] .chat-header > :is(.chat-back-button, .chat-sidebar-toggle, .chat-header-actions) { display: none; }
 [data-native-host] .native-split .agents-view .view-header { display: none; }
 [data-native-host] .native-split .agents-view .search-bar { margin: 0; }
 [data-native-host] .chat-send-split { background: transparent; }

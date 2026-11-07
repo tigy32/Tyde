@@ -1062,6 +1062,7 @@ pub struct AppState {
     pub chat_send_menu_open: RwSignal<bool>,
     pub native_chat_header_owner:
         RwSignal<Option<mobile_shell_types::native::NativeChatHeaderOwner>>,
+    pub native_chat_dock_owner: RwSignal<Option<mobile_shell_types::native::NativeChatDockOwner>>,
     pub native_root_status_owner:
         RwSignal<Option<mobile_shell_types::native::NativeRootStatusOwner>>,
     pub native_chat_action: RwSignal<Option<mobile_shell_types::native::NativeIntent>>,
@@ -1410,6 +1411,7 @@ impl AppState {
             native_auth_recovery: RwSignal::new(None),
             chat_send_menu_open: RwSignal::new(false),
             native_chat_header_owner: RwSignal::new(None),
+            native_chat_dock_owner: RwSignal::new(None),
             native_root_status_owner: RwSignal::new(None),
             native_chat_action: RwSignal::new(None),
             native_chat_heading: RwSignal::new(("New Chat".into(), None)),

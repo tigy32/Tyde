@@ -216,6 +216,38 @@ visible, respects existing modal exclusion, and retains its choice across size
 changes. Existing retained panes and the shared shell keep owning mounted
 content, scrolling and keyboard geometry. Native ABI 6 adds these projections.
 
+An iOS 27.1-or-newer shell separately declares `chatDockOwner` from UIKit's
+actual `verticalBarEdge` trait: `shell` on the vertical axis, `client` on the
+horizontal axis. Typed `chat_dock_shell`/`chat_dock_client` presentation intents
+update that ownership on layout changes; they never navigate. Horizontal poses
+keep one compact chat-local header, with latency at its action edge rather than
+inside its title. There is no second native horizontal action row.
+The client keeps the compact chat-local title and full-height untitled Agents
+hierarchy, but transfers Back, sidebar, menu and healthy latency to UIKit.
+`NativeChatDock` uses the navigation item's system Back action, leading groups
+and system overflow, not a bottom toolbar or manually positioned rail. UIKit
+places those controls below system status and above tabs on Duo's vertical
+axis and manages safe areas and overflow as the device resizes. The compact
+custom latency item explicitly permits vertical placement with `axisBehavior`.
+Its single-line metric omits the redundant status dot and unit spacing so it
+fits the narrow system item; longer values scale within the item and retain
+their complete accessible round-trip description. The first actual portrait
+capture exposed a two-line `59` / `ms` label, not a permitted compact layout.
+While a modal is open, the shared dock omits Back, leading groups and overflow;
+disabling the legacy navigation bar cannot exclude the separate shared bar.
+Closing the modal restores those controls from the same typed presentation.
+
+The additive optional `chat_dock_owner`, `chat_connected_status` and
+`chat_back_label` presentation fields acknowledge ownership and project the
+existing selected-host heartbeat and canonical Back label. No title parsing,
+new navigation action, route stack, gesture or WK attachment behavior is added.
+Shells without this declaration retain their existing header ownership. Root
+status and actionable connection-error/recovery surfaces are unchanged. The
+mounted DOM navigation flow covers ownership, duplicate-control removal,
+chat/sidebar geometry, live latency, retained editing and modal exclusion;
+actual native placement, gesture behavior and fold/safe-area acceptance still
+require the sole native GUI custodian and Root-approved original screenshots.
+
 Opening an existing agent from Home selects the native Agents destination,
 just like selecting its Agents row. Both entries use the same landscape
 hierarchy availability and preserve the user's sidebar visibility choice.

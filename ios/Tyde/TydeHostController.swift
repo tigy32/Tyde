@@ -256,7 +256,13 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                     guard let self, self.loadGeneration == generation else { return }
                     if !scriptsInstalled {
                         if !plainWebKitControl {
-                            let bootstrap = "const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
+                            let chatDockOwner: String
+                            if #available(iOS 27.1, *) {
+                                chatDockOwner = "'\(NativeChatDock.owner(for: self.traitCollection).rawValue)'"
+                            } else {
+                                chatDockOwner = "null"
+                            }
+                            let bootstrap = "const tydeNativeChatDockOwner = \(chatDockOwner); const tydeNativeRootStatusOwner = '\(NativeRootStatusOwner.shell.rawValue)'; const tydeNativeChatHeaderOwner = '\(NativeChatHeaderOwner.client.rawValue)'; const tydeNativeBootstrapOrigin = '\(ClientBootstrap.origin.absoluteString)'; const tydeNativeBridgeVersion = \(nativeBridgeVersion); const tydeNativeBootstrapVersion = \(nativeBootstrapVersion); const tydeNativeShellRelease = '\(nativeShellRelease)'; const tydeNativeSecretScopeEndpoint = '\(NativeEndpoint.secret_scope.rawValue)'; const tydeNativeHttpEndpoint = '\(NativeEndpoint.http.rawValue)'; const tydeNativeHttpCancelEndpoint = '\(NativeEndpoint.http_cancel.rawValue)';\n" + bridge
                             configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
                         }
                         for script in startupScripts { configuration.userContentController.addUserScript(script) }
@@ -527,7 +533,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         tabs.setTabBarHidden(state.modal, animated: false)
         for navigation in navigations.values {
             navigation.tabBarItem.isEnabled = !state.modal
-            navigation.setNavigationBarHidden(state.route == .chat && state.chat_header_owner == .client, animated: false)
+            navigation.setNavigationBarHidden(state.route == .chat && state.chat_header_owner == .client && state.chat_dock_owner != .shell, animated: false)
             navigation.navigationBar.isUserInteractionEnabled = !state.modal
             navigation.navigationBar.accessibilityElementsHidden = state.modal
             navigation.interactivePopGestureRecognizer?.isEnabled = !state.modal
@@ -547,6 +553,8 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             content = root
             if navigation.topViewController !== root { navigation.setViewControllers([root], animated: false) }
         }
+        content.navigationItem.backAction = nil
+        content.navigationItem.additionalOverflowItems = nil
         content.navigationItem.title = state.title
         content.connectedStatusView = nil
         if ready, state.route != .chat, state.root_status_owner == .shell, let status = state.root_connected_status {
@@ -635,6 +643,18 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             content.navigationItem.leftBarButtonItems = []
         }
         content.navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = !state.modal }
+        if state.route == .chat, state.chat_dock_owner == .shell {
+            if #available(iOS 27.1, *) {
+                do {
+                    try NativeChatDock.apply(to: content, state: state,
+                        menu: moreMenu(agentActions: state.chat_actions, composerActions: true),
+                        send: { [weak self] intent in self?.send(intent) })
+                } catch { fail(error.localizedDescription); return }
+            } else {
+                fail("Native chat dock requires iOS 27.1 or later")
+                return
+            }
+        }
         attach(to: content)
         reportLayout()
         #if DEBUG
@@ -649,7 +669,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         return button
     }
 
-    private func moreButton(agentActions: Bool, composerActions: Bool) -> UIBarButtonItem {
+    private func moreMenu(agentActions: Bool, composerActions: Bool) -> UIMenu {
         var actions: [UIAction] = []
         if composerActions {
             actions.append(UIAction(title: "Send actions", image: UIImage(systemName: "paperplane")) { [weak self] _ in self?.send(.send_actions) })
@@ -659,7 +679,12 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             actions.append(UIAction(title: "Rename agent", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.send(.rename_agent) })
             actions.append(UIAction(title: "Close agent", image: UIImage(systemName: "xmark.circle"), attributes: .destructive) { [weak self] _ in self?.send(.close_agent) })
         }
-        let button = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: UIMenu(children: actions))
+        return UIMenu(children: actions)
+    }
+
+    private func moreButton(agentActions: Bool, composerActions: Bool) -> UIBarButtonItem {
+        let button = UIBarButtonItem(image: UIImage(systemName: "ellipsis"),
+            menu: moreMenu(agentActions: agentActions, composerActions: composerActions))
         button.accessibilityLabel = "More agent actions"
         return button
     }
@@ -688,6 +713,12 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         let size = view.bounds.size
         let layout: NativeLayout = traitCollection.horizontalSizeClass != .regular ? .compact
             : size.width > size.height ? .regular_landscape : .regular_portrait
+        if #available(iOS 27.1, *), let declaredOwner = presentation?.chat_dock_owner {
+            let owner = NativeChatDock.owner(for: traitCollection)
+            if owner != declaredOwner {
+                send(owner == .shell ? .chat_dock_shell : .chat_dock_client)
+            }
+        }
         guard lastLayout != layout else { return }
         lastLayout = layout
         logger.notice("Native layout=\(layout.rawValue, privacy: .public) width=\(size.width) height=\(size.height)")

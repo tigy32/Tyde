@@ -717,6 +717,7 @@ pub fn ChatView() -> impl IntoView {
         });
     });
 
+    let chat_dock_owner = state.native_chat_dock_owner;
     let scroll_ref_for_scroll = scroll_ref;
     let on_scroll = move |_| {
         let Some(el) = scroll_ref_for_scroll.get_untracked() else {
@@ -812,9 +813,14 @@ pub fn ChatView() -> impl IntoView {
                                         {subtitle}
                                     </div>
                                 })}
-                                <crate::components::ChatConnectionStatus />
+                                <Show when=move || chat_dock_owner.get().is_none()>
+                                    <crate::components::ChatConnectionStatus />
+                                </Show>
                             </div>
                             <div class="chat-header-actions">
+                                <Show when=move || chat_dock_owner.get() == Some(mobile_shell_types::native::NativeChatDockOwner::Client)>
+                                    <crate::components::ChatConnectionStatus />
+                                </Show>
                                 {move || {
                                     let rename_cb = on_rename_open;
                                     let close_cb = on_close_agent;

@@ -120,6 +120,7 @@ pub(crate) fn AppSurface() -> impl IntoView {
             data-theme=move || state.theme.get()
             data-native-host=crate::native::is_native().then_some("")
             data-native-chat-header=move || state.native_chat_header_owner.get().map(|owner| owner.to_string())
+            data-native-chat-dock=move || state.native_chat_dock_owner.get().map(|owner| owner.to_string())
             data-native-root-status=move || state.native_root_status_owner.get().map(|owner| owner.to_string())
             data-mobile-fixture={
                 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
@@ -1881,6 +1882,7 @@ mod wasm_tests {
         js_sys::Reflect::set(&native, &"presentations".into(), &js_sys::Array::new()).unwrap();
         js_sys::Reflect::set(&native, &"chatHeaderOwner".into(), &"client".into()).unwrap();
         js_sys::Reflect::set(&native, &"rootStatusOwner".into(), &"shell".into()).unwrap();
+        js_sys::Reflect::set(&native, &"chatDockOwner".into(), &"shell".into()).unwrap();
         install_loader_boundary();
         js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
         let state = AppState::new();
@@ -1917,6 +1919,13 @@ mod wasm_tests {
                 window.dispatch_event(&event).map_err(|_| "Could not dispatch native intent")?;
                 Ok(())
             };
+            next_tick().await;
+            check(state.native_chat_dock_owner.get_untracked()
+                == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
+                && projected()?.chat_dock_owner == Some(mobile_shell_types::native::NativeChatDockOwner::Shell),
+                "The mounted client acknowledges the shell's explicit dock ownership")?;
+            // Keep the installed-shell acceptance below; exercise the new dock after it.
+            state.native_chat_dock_owner.set(None);
             install_page_visibility_recovery(state.clone());
             PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(None));
             js_sys::Function::new_no_args(r#"
@@ -2498,6 +2507,87 @@ mod wasm_tests {
             check(find("[data-mobile-test='connection-banner-reconnect']")?.get_bounding_client_rect().height() >= 44.0
                 && container.query_selector(".chat-header [data-mobile-test='connection-banner-rtt']").unwrap().is_none(),
                 "A disconnected host keeps global recovery and removes healthy toolbar feedback")?;
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+            state.native_chat_dock_owner.set(Some(mobile_shell_types::native::NativeChatDockOwner::Shell));
+            next_tick().await;
+            for selector in ["[data-mobile-test='chat-back']", "[data-mobile-test='chat-sidebar-toggle']", "[data-mobile-test='chat-more']"] {
+                check(find(selector)?.get_bounding_client_rect().height() == 0.0,
+                    "Shell-owned dock actions and latency must not also appear in the chat title")?;
+            }
+            check(container.query_selector(".chat-connection-status").unwrap().is_none(),
+                "Shell dock owns the only healthy status surface")?;
+            let dock = projected()?;
+            check(dock.chat_back_label.as_deref() == Some(state.chat_back_label().as_str())
+                && dock.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
+                && dock.root_connected_status.is_none(),
+                "The dock receives canonical Back ancestry and selected-host heartbeat, not title text or root status")?;
+            let header_bounds = find(".chat-header")?.get_bounding_client_rect();
+            let chat_bounds = find("[data-mobile-test='chat-view']")?.get_bounding_client_rect();
+            let sidebar_bounds = find(".native-agents-pane")?.get_bounding_client_rect();
+            check(header_bounds.height() == 45.0 && (header_bounds.left() - chat_bounds.left()).abs() < 1.0
+                && (header_bounds.right() - chat_bounds.right()).abs() < 1.0
+                && (sidebar_bounds.top() - chat_bounds.top()).abs() < 1.0,
+                "Only chat has a compact title; the untitled Agents sidebar keeps its full height")?;
+            state.heartbeat_round_trip_ms_by_host.update(|values| { values.insert(host_id.clone(), 71); });
+            next_tick().await;
+            check(projected()?.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
+                && composer.value() == "Retained draft",
+                "Live dock latency updates without replacing the retained composer")?;
+            navigate(NativeIntent::SessionSettings)?;
+            next_tick().await;
+            let sidebar_open = state.native_sidebar_open.get_untracked();
+            navigate(NativeIntent::Back)?;
+            navigate(NativeIntent::ToggleSidebar)?;
+            navigate(NativeIntent::SendActions)?;
+            navigate(NativeIntent::SessionSettings)?;
+            navigate(NativeIntent::RenameAgent)?;
+            navigate(NativeIntent::CloseAgent)?;
+            next_tick().await;
+            check(projected()?.modal && state.viewing_chat.get_untracked()
+                && sidebar_open == state.native_sidebar_open.get_untracked()
+                && !state.chat_send_menu_open.get_untracked()
+                && state.native_chat_action.get_untracked().is_none()
+                && find("[data-mobile-test='session-settings-sheet']")?.get_bounding_client_rect().height() > 0.0,
+                "Session settings excludes dock Back/sidebar and every overflow action without changing the chat")?;
+            find("[data-mobile-test='session-settings-done']")?.dyn_into::<HtmlElement>().unwrap().click();
+            next_tick().await;
+            let sidebar_choice = state.native_sidebar_open.get_untracked();
+            for (layout, sidebar_available) in [(NativeIntent::CompactWidth, false), (NativeIntent::RegularWidth, false), (NativeIntent::RegularLandscape, true)] {
+                navigate(layout)?;
+                next_tick().await;
+                check(projected()?.sidebar_available == sidebar_available
+                    && state.native_sidebar_open.get_untracked() == sidebar_choice
+                    && find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().height() == 0.0
+                    && find("[data-mobile-test='chat-more']")?.get_bounding_client_rect().height() == 0.0
+                    && find(".chat-header")?.get_bounding_client_rect().height() == 45.0
+                    && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer)),
+                    "Resizing preserves dock ownership, compact chat title, sidebar choice and the same editor")?;
+            }
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Disconnected); });
+            next_tick().await;
+            check(projected()?.chat_connected_status.is_none()
+                && find("[data-mobile-test='connection-banner-reconnect']")?.get_bounding_client_rect().height() > 0.0,
+                "Disconnected host clears dock health and retains the existing recovery action")?;
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+            navigate(NativeIntent::ChatDockClient)?;
+            next_tick().await;
+            let horizontal_header = find(".chat-header")?.get_bounding_client_rect();
+            let horizontal_status = find(".chat-header-actions [data-mobile-test='connection-banner-rtt']")?;
+            check(horizontal_header.height() == 45.0
+                && find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().height() >= 44.0
+                && find("[data-mobile-test='chat-more']")?.get_bounding_client_rect().height() >= 44.0
+                && horizontal_status.text_content().as_deref() == Some("71 ms")
+                && horizontal_status.get_bounding_client_rect().right() <= horizontal_header.right()
+                && container.query_selector(".chat-header-center .chat-connection-status").unwrap().is_none()
+                && projected()?.chat_connected_status.is_none(),
+                "A horizontal bar keeps one compact chat-local header, with live latency at its action edge, not inside the title")?;
+            navigate(NativeIntent::ChatDockShell)?;
+            next_tick().await;
+            check(find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().height() == 0.0
+                && projected()?.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
+                && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer)),
+                "UIKit's vertical-bar notification returns actions/status to the dock without remounting chat")?;
+            state.native_chat_dock_owner.set(None);
             state.connection_statuses.set(saved_connection_statuses);
             next_tick().await;
             // Photos now live beside the draft; give this menu-route check a real speech action.

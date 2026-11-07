@@ -89,12 +89,19 @@ pub fn install(state: AppState) {
             Option<mobile_shell_types::native::NativeRootStatusOwner>,
         >(root)
         .map_err(|error| format!("Invalid native root status ownership: {error}"))?;
-        Ok((chat, root))
+        let dock = js_sys::Reflect::get(&api, &"chatDockOwner".into())
+            .map_err(|_| "Native chat dock ownership is unavailable".to_owned())?;
+        let dock = serde_wasm_bindgen::from_value::<
+            Option<mobile_shell_types::native::NativeChatDockOwner>,
+        >(dock)
+        .map_err(|error| format!("Invalid native chat dock ownership: {error}"))?;
+        Ok((chat, root, dock))
     })();
     match owner {
-        Ok((chat, root)) => {
+        Ok((chat, root, dock)) => {
             state.native_chat_header_owner.set(chat);
             state.native_root_status_owner.set(root);
+            state.native_chat_dock_owner.set(dock);
         }
         Err(error) => {
             report(&state, error);
@@ -229,6 +236,12 @@ pub(crate) fn handle_intent(state: &AppState, intent: NativeIntent) {
             }
         }
         NativeIntent::NewChat => crate::actions::begin_new_chat(state),
+        NativeIntent::ChatDockShell => state
+            .native_chat_dock_owner
+            .set(Some(mobile_shell_types::native::NativeChatDockOwner::Shell)),
+        NativeIntent::ChatDockClient => state.native_chat_dock_owner.set(Some(
+            mobile_shell_types::native::NativeChatDockOwner::Client,
+        )),
         NativeIntent::RegularWidth => state.native_layout.set(NativeLayout::RegularPortrait),
         NativeIntent::RegularLandscape => state.native_layout.set(NativeLayout::RegularLandscape),
         NativeIntent::CompactWidth => state.native_layout.set(NativeLayout::Compact),
@@ -469,6 +482,28 @@ fn presentation(state: &AppState) -> NativePresentation {
         sidebar_available: sidebar_available(state),
         sidebar_open: sidebar_visible(state),
         chat_header_owner: state.native_chat_header_owner.get(),
+        chat_dock_owner: state.native_chat_dock_owner.get(),
+        chat_back_label: (chat
+            && state.native_chat_dock_owner.get()
+                == Some(mobile_shell_types::native::NativeChatDockOwner::Shell))
+        .then(|| state.chat_back_label()),
+        chat_connected_status: if chat
+            && state.native_chat_dock_owner.get()
+                == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
+            && matches!(
+                state.active_host_connection_status(),
+                crate::state::ConnectionStatus::Connected
+            ) {
+            Some(mobile_shell_types::native::NativeConnectedStatus {
+                round_trip_ms: state.active_local_host_id.get().and_then(|host| {
+                    state
+                        .heartbeat_round_trip_ms_by_host
+                        .with(|values| values.get(&host).copied())
+                }),
+            })
+        } else {
+            None
+        },
         root_status_owner: state.native_root_status_owner.get(),
         root_connected_status: if root_status_owned(state)
             && matches!(
