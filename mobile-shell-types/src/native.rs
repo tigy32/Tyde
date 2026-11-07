@@ -166,8 +166,12 @@ native_struct!(NativeBackUpdate {
     progress: [u32]
 });
 native_struct!(NativeConnectedStatus { round_trip_ms: [Option<u64>] });
+native_enum!(NativeChatConnectionPhase { Connected = "connected", Pending = "pending" });
+native_struct!(NativeChatConnectionStatus {
+    phase: [NativeChatConnectionPhase], round_trip_ms: [Option<u64>]
+});
 native_struct!(NativeBackChatDock {
-    back_label: [String], connected_status: [Option<NativeConnectedStatus>],
+    back_label: [String], connection_status: [Option<NativeChatConnectionStatus>],
     sidebar_available: [bool], sidebar_open: [bool], chat_actions: [bool]
 });
 native_struct!(NativeBackDestination {
@@ -179,7 +183,7 @@ native_struct!(NativePresentation {
     title: [String], subtitle: [Option<String>], chat_actions: [bool], modal: [bool], theme: [NativeTheme],
     sidebar_available: [bool], sidebar_open: [bool], chat_header_owner: [Option<NativeChatHeaderOwner>],
     root_status_owner: [Option<NativeRootStatusOwner>], root_connected_status: [Option<NativeConnectedStatus>],
-    chat_dock_owner: [Option<NativeChatDockOwner>], chat_connected_status: [Option<NativeConnectedStatus>],
+    chat_dock_owner: [Option<NativeChatDockOwner>], chat_connection_status: [Option<NativeChatConnectionStatus>],
     chat_back_label: [Option<String>],
     back_surface_version: [Option<u32>], navigation_revision: [Option<u64>], back_ready_revision: [Option<u64>], back_destination: [Option<NativeBackDestination>]
 });
@@ -221,7 +225,7 @@ pub fn bootstrap_javascript() -> Result<String, serde_json::Error> {
         root_status_owner: None,
         root_connected_status: None,
         chat_dock_owner: None,
-        chat_connected_status: None,
+        chat_connection_status: None,
         chat_back_label: None,
         back_surface_version: None,
         navigation_revision: None,
@@ -251,6 +255,8 @@ pub fn swift_source() -> String {
         NativeChatDockOwner::swift(),
         NativeRootStatusOwner::swift(),
         NativeConnectedStatus::swift(),
+        NativeChatConnectionPhase::swift(),
+        NativeChatConnectionStatus::swift(),
         NativeBackPhase::swift(),
         NativeBackUpdate::swift(),
         NativeBackChatDock::swift(),

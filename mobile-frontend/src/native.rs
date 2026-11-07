@@ -640,6 +640,21 @@ fn presentation(
                 .with(|values| values.get(&host).copied())
         }),
     });
+    let chat_connection_status = if crate::components::connection_banner::connection_pending(
+        &state.active_host_connection_status(),
+    ) {
+        Some(mobile_shell_types::native::NativeChatConnectionStatus {
+            phase: mobile_shell_types::native::NativeChatConnectionPhase::Pending,
+            round_trip_ms: None,
+        })
+    } else {
+        connected_status.as_ref().map(|status| {
+            mobile_shell_types::native::NativeChatConnectionStatus {
+                phase: mobile_shell_types::native::NativeChatConnectionPhase::Connected,
+                round_trip_ms: status.round_trip_ms,
+            }
+        })
+    };
     NativePresentation {
         back_surface_version: live_back.then_some(NATIVE_BACK_SURFACE_VERSION),
         navigation_revision: live_back.then_some(navigation_revision),
@@ -706,7 +721,7 @@ fn presentation(
                         && state.native_layout.get() == NativeLayout::RegularLandscape;
                     mobile_shell_types::native::NativeBackChatDock {
                         back_label: state.back_destination_chat_back_label(),
-                        connected_status: connected_status.clone(),
+                        connection_status: chat_connection_status.clone(),
                         sidebar_available,
                         sidebar_open: sidebar_available && state.native_sidebar_open.get(),
                         chat_actions: owner.is_some(),
@@ -748,11 +763,11 @@ fn presentation(
             && state.native_chat_dock_owner.get()
                 == Some(mobile_shell_types::native::NativeChatDockOwner::Shell))
         .then(|| state.chat_back_label()),
-        chat_connected_status: if chat
+        chat_connection_status: if chat
             && state.native_chat_dock_owner.get()
                 == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
         {
-            connected_status.clone()
+            chat_connection_status
         } else {
             None
         },

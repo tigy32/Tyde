@@ -2345,7 +2345,7 @@ mod wasm_tests {
                     let preview_dock = preview.chat_dock.ok_or("Missing canonical parent dock")?;
                     let expected_parent_back = if parent == "Navigation child" { "Back to Loose agent" } else { "Back to Agents" };
                     check(preview.title == parent && preview_dock.back_label == expected_parent_back
-                        && preview_dock.connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
+                        && preview_dock.connection_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
                         && preview_dock.chat_actions
                         && preview_dock.sidebar_available == (layout == NativeIntent::RegularLandscape)
                         && !preview_dock.sidebar_open
@@ -2412,7 +2412,7 @@ mod wasm_tests {
                     let committed = projected()?;
                     check(committed.chat_dock_owner == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
                         && committed.chat_back_label.as_deref() == Some(preview_dock.back_label.as_str())
-                        && committed.chat_connected_status == preview_dock.connected_status
+                        && committed.chat_connection_status == preview_dock.connection_status
                         && committed.sidebar_available == preview_dock.sidebar_available
                         && committed.sidebar_open == preview_dock.sidebar_open
                         && committed.chat_actions == preview_dock.chat_actions
@@ -2756,7 +2756,7 @@ mod wasm_tests {
                 "Shell dock owns the only healthy status surface")?;
             let dock = projected()?;
             check(dock.chat_back_label.as_deref() == Some(state.chat_back_label().as_str())
-                && dock.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
+                && dock.chat_connection_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
                 && dock.root_connected_status.is_none(),
                 "The dock receives canonical Back ancestry and selected-host heartbeat, not title text or root status")?;
             let header_bounds = find(".chat-header")?.get_bounding_client_rect();
@@ -2768,9 +2768,48 @@ mod wasm_tests {
                 "Only chat has a compact title; the untitled Agents sidebar keeps its full height")?;
             state.heartbeat_round_trip_ms_by_host.update(|values| { values.insert(host_id.clone(), 71); });
             next_tick().await;
-            check(projected()?.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
+            check(projected()?.chat_connection_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
                 && composer.value() == "Retained draft",
                 "Live dock latency updates without replacing the retained composer")?;
+            composer.set_selection_range(2, 7).unwrap();
+            for pending_status in [ConnectionStatus::Connecting, ConnectionStatus::Bootstrapping] {
+                state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), pending_status); });
+                next_tick().await;
+                let wire = serde_json::to_value(projected()?).map_err(|error| error.to_string())?;
+                check(wire["chat_connection_status"]["phase"] == "pending"
+                    && wire["chat_connection_status"]["round_trip_ms"].is_null()
+                    && projected()?.root_connected_status.is_none(),
+                    "Connecting and Bootstrapping project explicit pending without stale RTT or root status")?;
+                check(projected()?.modal, "Reconnect overlay excludes native dock interactions")?;
+                find("[data-mobile-test='reconnect-dismiss']")?.dyn_into::<HtmlElement>().unwrap().click();
+                next_tick().await;
+                let dismissed_wire = serde_json::to_value(projected()?).map_err(|error| error.to_string())?;
+                check(!projected()?.modal && dismissed_wire["chat_connection_status"]["phase"] == "pending"
+                    && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
+                    && composer.value() == "Retained draft"
+                    && composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7)
+                    && find(".chat-header")?.get_bounding_client_rect().height() == header_bounds.height()
+                    && find("[data-mobile-test='chat-view']")?.get_bounding_client_rect().top() == chat_bounds.top(),
+                    "Dismiss leaves dock pending, the same readable chat geometry, draft and selection")?;
+                state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+                next_tick().await;
+            }
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::UpdateRequired {
+                host_protocol: protocol::PROTOCOL_VERSION + 1, app_protocol: protocol::PROTOCOL_VERSION, release_version: None,
+            }); });
+            next_tick().await;
+            check(projected()?.chat_connection_status.is_none() && !projected()?.modal
+                && find("[data-mobile-test='connection-banner-update-required']")?.get_bounding_client_rect().height() > 0.0,
+                "Terminal incompatibility stays actionable, never healthy or pending dock feedback")?;
+            state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
+            state.heartbeat_round_trip_ms_by_host.update(|values| { values.remove(&host_id); });
+            next_tick().await;
+            let wire = serde_json::to_value(projected()?).map_err(|error| error.to_string())?;
+            check(wire["chat_connection_status"]["phase"] == "connected"
+                && wire["chat_connection_status"]["round_trip_ms"].is_null() && !projected()?.modal,
+                "Connected without RTT remains explicitly connected, never pending")?;
+            state.heartbeat_round_trip_ms_by_host.update(|values| { values.insert(host_id.clone(), 71); });
+            next_tick().await;
             navigate(NativeIntent::SessionSettings)?;
             next_tick().await;
             let sidebar_open = state.native_sidebar_open.get_untracked();
@@ -2803,7 +2842,7 @@ mod wasm_tests {
             }
             state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Disconnected); });
             next_tick().await;
-            check(projected()?.chat_connected_status.is_none()
+            check(projected()?.chat_connection_status.is_none()
                 && find("[data-mobile-test='connection-banner-reconnect']")?.get_bounding_client_rect().height() > 0.0,
                 "Disconnected host clears dock health and retains the existing recovery action")?;
             state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
@@ -2817,12 +2856,12 @@ mod wasm_tests {
                 && horizontal_status.text_content().as_deref() == Some("71 ms")
                 && horizontal_status.get_bounding_client_rect().right() <= horizontal_header.right()
                 && container.query_selector(".chat-header-center .chat-connection-status").unwrap().is_none()
-                && projected()?.chat_connected_status.is_none(),
+                && projected()?.chat_connection_status.is_none(),
                 "A horizontal bar keeps one compact chat-local header, with live latency at its action edge, not inside the title")?;
             navigate(NativeIntent::ChatDockShell)?;
             next_tick().await;
             check(find("[data-mobile-test='chat-back']")?.get_bounding_client_rect().height() == 0.0
-                && projected()?.chat_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
+                && projected()?.chat_connection_status.as_ref().and_then(|status| status.round_trip_ms) == Some(71)
                 && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer)),
                 "UIKit's vertical-bar notification returns actions/status to the dock without remounting chat")?;
             state.native_chat_dock_owner.set(None);
