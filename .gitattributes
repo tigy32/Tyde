@@ -1,0 +1,2 @@
+# The byte-exact Rust-generated loader contract must survive Windows checkout.
+/web/loader/native-contract.js text eol=lf

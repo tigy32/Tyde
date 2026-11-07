@@ -477,6 +477,95 @@ class ReleaseValidationTests(unittest.TestCase):
 
 
 class MobileWebVerificationTests(unittest.TestCase):
+    def test_native_contract_survives_git_checkout_and_rejects_stale_content(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = pathlib.Path(raw_dir)
+            source = root / "checkout"
+            source.mkdir()
+            env = os.environ.copy()
+            for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+                env.pop(name, None)
+            env["LC_ALL"] = "C"
+            git_env = {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=source, env=git_env, check=True,
+                               capture_output=True)
+
+            git("init", "-q")
+            git("config", "core.autocrlf", "false")
+            contract_path = pathlib.Path("web/loader/native-contract.js")
+            contract = source / contract_path
+            contract.parent.mkdir(parents=True)
+            original = (REPO_ROOT / contract_path).read_bytes()
+            contract.write_bytes(original)
+            control = source / "checkout-control.txt"
+            control.write_bytes(b"checkout control\n")
+            git("add", str(contract_path), control.name)
+
+            for relative in ("tools/build-mobile-web-bundle.sh", "mobile-frontend/index.html"):
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO_ROOT / relative, target)
+            commands = root / "bin"
+            commands.mkdir()
+            # Use the real Rust generator; stop at trunk after both native guards.
+            for name, body in {
+                "cargo": 'cd "$NATIVE_CONTRACT_SOURCE_ROOT"\nexec "$NATIVE_CONTRACT_CARGO" "$@"',
+                "trunk": 'echo "native guards passed; trunk reached" >&2\nexit 73',
+            }.items():
+                command = commands / name
+                command.write_text(f"#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+                command.chmod(0o755)
+            cargo = shutil.which("cargo")
+            self.assertIsNotNone(cargo, "The bundle guard requires real Cargo")
+            env.update(NATIVE_CONTRACT_SOURCE_ROOT=str(REPO_ROOT),
+                       NATIVE_CONTRACT_CARGO=cargo,
+                       PATH=f"{commands}{os.pathsep}{env['PATH']}")
+
+            def build() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", "tools/build-mobile-web-bundle.sh", "--version", TAG[1:],
+                     "--out", str(root / "bundle")],
+                    cwd=source, env=env, capture_output=True, text=True,
+                )
+
+            git("config", "core.autocrlf", "true")
+            contract.unlink()
+            control.unlink()
+            git("checkout-index", "--force", "--all")
+            self.assertEqual(control.read_bytes(), b"checkout control\r\n")
+            red = build()
+            self.assertEqual(red.returncode, 1, red.stderr)
+            self.assertRegex(red.stdout, r"differ: (byte|char) 65, line 1")
+            self.assertIn("generated native loader contract is stale", red.stderr)
+            self.assertNotIn("trunk reached", red.stderr)
+
+            shutil.copy2(REPO_ROOT / ".gitattributes", source / ".gitattributes")
+            git("add", ".gitattributes")
+            for autocrlf in ("true", "false", "input"):
+                with self.subTest(autocrlf=autocrlf):
+                    git("config", "core.autocrlf", autocrlf)
+                    contract.unlink()
+                    control.unlink()
+                    git("checkout-index", "--force", "--all")
+                    self.assertEqual(contract.read_bytes(), original)
+                    green = build()
+                    self.assertIn("native guards passed; trunk reached", green.stderr)
+                    self.assertNotIn("generated native loader contract is stale", green.stderr)
+
+            for stale in (
+                original.replace(b"nativeBridgeVersion = ", b"nativeBridgeVersion = 99", 1),
+                original.replace(b'"client_ready":false', b'"client_ready":true'),
+                original.replace(b"\n", b"\r\n"),
+            ):
+                self.assertNotEqual(stale, original)
+                contract.write_bytes(stale)
+                rejected = build()
+                self.assertEqual(rejected.returncode, 1, rejected.stderr)
+                self.assertIn("generated native loader contract is stale", rejected.stderr)
+                self.assertNotIn("trunk reached", rejected.stderr)
+
     def test_manifest_plan_and_download_validation(self) -> None:
         entry_data = b"console.log('tyde');"
         wasm_data = b"\x00asm\x01\x00\x00\x00"
