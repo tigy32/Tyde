@@ -18,7 +18,6 @@ use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
 use crate::components::launch_menu::LaunchChooser;
 use crate::components::review_view::ReviewCommentsSurface;
-use crate::components::settings_panel::SettingsPanel;
 use crate::components::swarm_view::SwarmView;
 use crate::components::workflow_view::WorkflowView;
 use crate::send::send_frame;
@@ -1871,7 +1870,6 @@ pub fn CenterZone() -> impl IntoView {
                 {move || alert.get()}
             </div>
 
-            <SettingsPanel />
             {move || context_menu.get().map(|menu| {
                 view! {
                     <TabContextMenu

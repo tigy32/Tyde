@@ -14,7 +14,7 @@ use crate::components::help_tour::HelpTour;
 use crate::components::host_browser::HostBrowser;
 use crate::components::hover_popover::HoverPopover;
 use crate::components::project_rail::ProjectRail;
-use crate::components::settings_panel::restore_appearance;
+use crate::components::settings_panel::{SettingsPanel, restore_appearance};
 use crate::components::workbench::Workbench;
 use crate::components::workflows_panel::WorkflowRunModal;
 use crate::devtools;
@@ -981,10 +981,7 @@ pub fn App() -> impl IntoView {
             <Header />
             <crate::components::app_updates::AppUpdateRuntime />
             <crate::components::app_updates::UpdatePrompt />
-            <div class="app-body">
-                <ProjectRail />
-                <Workbench />
-            </div>
+            <AppBody />
             <CommandPalette />
             <WorkflowRunModal />
             <FeedbackModal />
@@ -994,6 +991,17 @@ pub fn App() -> impl IntoView {
             <crate::components::home_view::GettingStarted />
             <HoverPopover />
             <crate::voice::VoiceRuntime />
+        </div>
+    }
+}
+
+#[component]
+pub fn AppBody() -> impl IntoView {
+    view! {
+        <div class="app-body">
+            <ProjectRail />
+            <Workbench />
+            <SettingsPanel />
         </div>
     }
 }

@@ -386,7 +386,7 @@ mod wasm_tests {
             view! {
                 <style>{include_str!("../../styles.css")}</style>
                 <div style="height:720px;width:1100px;display:flex;flex-direction:column">
-                    <crate::components::header::Header /><div class="app-body"><crate::components::project_rail::ProjectRail /><Workbench /></div>
+                    <crate::components::header::Header /><crate::app::AppBody />
                 </div>
             }
         })
@@ -405,6 +405,224 @@ mod wasm_tests {
                     .unwrap(),
             )
             .unwrap();
+    }
+
+    fn top_element_at(container: &web_sys::HtmlElement, x: f64, y: f64) -> web_sys::Element {
+        js_sys::Function::new_with_args(
+            "container, x, y",
+            "return document.elementsFromPoint(x, y).filter(e => container.contains(e))[0];",
+        )
+        .call3(
+            &wasm_bindgen::JsValue::NULL,
+            container,
+            &x.into(),
+            &y.into(),
+        )
+        .unwrap()
+        .dyn_into()
+        .unwrap_or_else(|_| panic!("Nothing from the shell at ({x}, {y})"))
+    }
+
+    fn assert_center_hits(
+        container: &web_sys::HtmlElement,
+        rect: &web_sys::DomRect,
+        owner: &str,
+        probe: &str,
+    ) {
+        let hit = top_element_at(
+            container,
+            rect.x() + rect.width() / 2.0,
+            rect.y() + rect.height() / 2.0,
+        );
+        assert!(
+            hit.closest(owner).unwrap().is_some(),
+            "{probe}: expected {owner} to own the hit, got <{}> .{}",
+            hit.tag_name(),
+            hit.class_name()
+        );
+    }
+
+    fn assert_spans(actual: &web_sys::DomRect, expected: &web_sys::DomRect, probe: &str) {
+        for (edge, got, want) in [
+            ("left", actual.left(), expected.left()),
+            ("right", actual.right(), expected.right()),
+            ("top", actual.top(), expected.top()),
+            ("bottom", actual.bottom(), expected.bottom()),
+        ] {
+            assert!(
+                (got - want).abs() < 0.5,
+                "{probe}: {edge} is {got}, expected {want}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn settings_owns_rail_and_docks_while_header_stays_reachable() {
+        use crate::sidebar_layout::STORAGE_KEY;
+        let window = web_sys::window().unwrap();
+        let storage = window.local_storage().unwrap().unwrap();
+        let previous = storage.get_item(STORAGE_KEY).unwrap();
+        storage.remove_item(STORAGE_KEY).unwrap();
+        let document = window.document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let state = AppState::new();
+        let handle = shell(&container, state.clone());
+        tick().await;
+        mode(&container, "dinosaur").await;
+        tick().await;
+        let body = element(&container, ".app-body");
+        let frame: web_sys::HtmlElement = body.parent_element().unwrap().dyn_into().unwrap();
+        let width = window.inner_width().unwrap().as_f64().unwrap().min(1100.0);
+        let height = window.inner_height().unwrap().as_f64().unwrap().min(720.0);
+        frame
+            .style()
+            .set_css_text(&format!(
+                "position:fixed;left:0;top:0;width:{width}px;height:{height}px;display:flex;flex-direction:column"
+            ));
+        tick().await;
+
+        let rail = element(&container, ".project-rail").get_bounding_client_rect();
+        let left = element(&container, ".sidebar-bar-left").get_bounding_client_rect();
+        let right = element(&container, ".sidebar-bar-right").get_bounding_client_rect();
+        let center = element(&container, ".sidebar-center").get_bounding_client_rect();
+        let header = element(&container, ".header").get_bounding_client_rect();
+        for (name, rect) in [
+            ("rail", &rail),
+            ("left dock", &left),
+            ("right dock", &right),
+            ("center", &center),
+        ] {
+            assert!(
+                rect.width() > 0.0
+                    && rect.height() > 0.0
+                    && rect.right() <= width
+                    && rect.bottom() <= height,
+                "{name} must be on screen for hit testing"
+            );
+        }
+        assert_center_hits(&container, &rail, ".project-rail", "rail before Settings");
+        assert_center_hits(&container, &left, ".workbench", "left dock before Settings");
+        assert_center_hits(
+            &container,
+            &right,
+            ".workbench",
+            "right dock before Settings",
+        );
+
+        let home = element(&container, ".rail-home").get_bounding_client_rect();
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_client_x((home.x() + home.width() / 2.0) as i32);
+        init.set_client_y((home.y() + home.height() / 2.0) as i32);
+        element(&container, ".rail-home")
+            .dispatch_event(
+                &web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &init).unwrap(),
+            )
+            .unwrap();
+        tick().await;
+        let menu = element(&container, ".rail-context-menu").get_bounding_client_rect();
+        assert_center_hits(
+            &container,
+            &menu,
+            ".rail-context-menu",
+            "rail menu before Settings",
+        );
+
+        element(&container, "button[title='Settings']").click();
+        tick().await;
+        let overlay = element(&container, ".settings-overlay").get_bounding_client_rect();
+        let body_rect = body.get_bounding_client_rect();
+        assert_spans(&overlay, &body_rect, "Settings fills the app body");
+        assert!(overlay.left() <= rail.left() + 0.5);
+        assert!(overlay.top() >= header.bottom() - 0.5);
+        for (probe, rect) in [
+            ("rail", &rail),
+            ("left dock", &left),
+            ("right dock", &right),
+            ("center", &center),
+            ("rail context menu", &menu),
+        ] {
+            assert_center_hits(&container, rect, ".settings-overlay", probe);
+        }
+
+        element(&container, ".rail-context-backdrop").click();
+        tick().await;
+        assert_center_hits(&container, &header, ".header", "header above Settings");
+
+        frame.style().set_property("width", "390px").unwrap();
+        tick().await;
+        let narrow_body = body.get_bounding_client_rect();
+        assert!((narrow_body.width() - 390.0).abs() < 0.5);
+        let narrow_overlay = element(&container, ".settings-overlay").get_bounding_client_rect();
+        assert_spans(
+            &narrow_overlay,
+            &narrow_body,
+            "Settings fills a narrow app body",
+        );
+        let narrow_rail = element(&container, ".project-rail").get_bounding_client_rect();
+        assert_center_hits(&container, &narrow_rail, ".settings-overlay", "narrow rail");
+
+        state.settings_open.set(false);
+        tick().await;
+        assert!(
+            container
+                .query_selector(".settings-overlay")
+                .unwrap()
+                .is_none()
+        );
+        assert_center_hits(
+            &container,
+            &narrow_rail,
+            ".project-rail",
+            "rail after Settings",
+        );
+
+        let settings_closed = || {
+            container
+                .query_selector(".settings-overlay")
+                .unwrap()
+                .is_none()
+        };
+        let left_visible = state.sidebar_layout.get_untracked().current().left.visible;
+        state.settings_open.set(true);
+        tick().await;
+        assert!(!settings_closed());
+        element(&container, "button[title='Toggle Left Dock']")
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap()
+            .click();
+        tick().await;
+        assert!(settings_closed(), "a dock toggle must not happen unseen");
+        assert_ne!(
+            state.sidebar_layout.get_untracked().current().left.visible,
+            left_visible
+        );
+
+        state.settings_open.set(true);
+        tick().await;
+        assert!(!settings_closed());
+        crate::actions::open_search_panel(&state);
+        tick().await;
+        assert!(settings_closed(), "Search must not focus a covered input");
+        assert!(
+            element(&container, ".search-input")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0
+        );
+
+        drop(handle);
+        container.remove();
+        match previous {
+            Some(value) => storage.set_item(STORAGE_KEY, &value).unwrap(),
+            None => storage.remove_item(STORAGE_KEY).unwrap(),
+        }
     }
 
     #[wasm_bindgen_test]

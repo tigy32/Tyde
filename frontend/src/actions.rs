@@ -1430,6 +1430,7 @@ pub fn cancel_project_search(state: &AppState) {
 
 /// Reveal and focus the Search panel in the left dock (Cmd/Ctrl+Shift+F).
 pub fn open_search_panel(state: &AppState) {
+    state.settings_open.set(false);
     state.activate_sidebar_tab(SidebarTab::Search);
     state
         .search_focus_seq

@@ -305,12 +305,12 @@ pub fn Header() -> impl IntoView {
     let feedback = state.feedback_open;
     let settings = state.settings_open;
     let left_state = state.clone();
-    let toggle_left = move |_| left_state.toggle_sidebar(SidebarSide::Left);
+    let toggle_left = move |_| left_state.toggle_dock(SidebarSide::Left);
     let right_state = state.clone();
-    let toggle_right = move |_| right_state.toggle_sidebar(SidebarSide::Right);
+    let toggle_right = move |_| right_state.toggle_dock(SidebarSide::Right);
     let layouts = state.sidebar_layout;
     let bottom_state = state.clone();
-    let toggle_bottom = move |_| bottom_state.toggle_sidebar(SidebarSide::Bottom);
+    let toggle_bottom = move |_| bottom_state.toggle_dock(SidebarSide::Bottom);
 
     let user_notice_for_show = user_notice.clone();
     let user_notice_for_kind = user_notice.clone();

@@ -532,10 +532,11 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         CommandId::NewChat => {
             begin_new_chat(state, None);
         }
-        CommandId::ToggleLeftPanel => state.toggle_sidebar(crate::state::SidebarSide::Left),
-        CommandId::ToggleRightPanel => state.toggle_sidebar(crate::state::SidebarSide::Right),
-        CommandId::ToggleBottomPanel => state.toggle_sidebar(crate::state::SidebarSide::Bottom),
+        CommandId::ToggleLeftPanel => state.toggle_dock(crate::state::SidebarSide::Left),
+        CommandId::ToggleRightPanel => state.toggle_dock(crate::state::SidebarSide::Right),
+        CommandId::ToggleBottomPanel => state.toggle_dock(crate::state::SidebarSide::Bottom),
         CommandId::OpenWorkflows => {
+            state.settings_open.set(false);
             state.activate_sidebar_tab(SidebarTab::Workflows);
         }
         CommandId::OpenAgentMonitor => {

@@ -445,6 +445,13 @@ impl AppState {
         });
         self.cancel_self_improvement_open_after_hide(was_visible);
     }
+    /// Settings covers every dock, so a user's toggle has to dismiss it.
+    pub fn toggle_dock(&self, side: SidebarSide) {
+        if !self.sidebar_storage_blocked.get_untracked() {
+            self.settings_open.set(false);
+        }
+        self.toggle_sidebar(side);
+    }
     pub fn move_sidebar_tab(&self, tab: SidebarTab, side: SidebarSide, before: Option<SidebarTab>) {
         if self.sidebar_storage_blocked.get_untracked() {
             return;

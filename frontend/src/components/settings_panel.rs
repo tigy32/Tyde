@@ -3236,6 +3236,8 @@ fn UsageManagementTab() -> impl IntoView {
 #[component]
 fn BackendsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let settings_open = state.settings_open;
+    let close_for_terminal = Callback::new(move |()| settings_open.set(false));
 
     view! {
             <h2 class="settings-panel-title">"Backends"</h2>
@@ -3359,7 +3361,7 @@ fn BackendsTab() -> impl IntoView {
                 <div class="settings-backend-list">
                     {all_backends()
                         .into_iter()
-                        .map(|kind| view! { <BackendCard kind /> })
+                        .map(|kind| view! { <BackendCard kind on_setup=close_for_terminal /> })
                         .collect::<Vec<_>>()}
                 </div>
             </div>
@@ -7755,12 +7757,12 @@ pub(super) fn BackendCard(
                                         class="settings-btn settings-btn-primary settings-backend-install-btn"
                                         disabled=!install_runnable
                                         on:click=move |_| {
-                                            send_run_backend_setup(
+                                            let sent = send_run_backend_setup(
                                                 &state_for_install,
                                                 kind,
                                                 BackendSetupAction::Install,
                                             );
-                                            if let Some(on_setup) = on_setup {
+                                            if sent && let Some(on_setup) = on_setup {
                                                 on_setup.run(());
                                             }
                                         }
@@ -7833,14 +7835,14 @@ pub(super) fn send_run_backend_setup(
     state: &AppState,
     backend_kind: BackendKind,
     action: BackendSetupAction,
-) {
+) -> bool {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("send_run_backend_setup called without a selected host stream");
         crate::notices::report_settings_error(
             state,
             "Tyde cannot run backend setup because the selected host is not connected.",
         );
-        return;
+        return false;
     };
 
     state.activate_sidebar_tab(crate::state::SidebarTab::Terminal);
@@ -7861,6 +7863,7 @@ pub(super) fn send_run_backend_setup(
             log::error!("failed to send RunBackendSetup: {error}");
         }
     });
+    true
 }
 
 pub(super) fn backend_setup_status_label(info: Option<&BackendSetupInfo>) -> &'static str {
@@ -17911,8 +17914,10 @@ mod wasm_tests {
         let container = make_container();
         let diagnostic_message =
             "Hermes CLI found but unusable: re-run the Hermes installer or set HERMES_PYTHON";
+        let state = AppState::new();
+        let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
+            let state = mounted_state;
             install_backend_config_host(
                 &state,
                 BackendConfigValues::default(),
@@ -17977,10 +17982,43 @@ mod wasm_tests {
             "a runnable install command must keep the repair action live"
         );
 
+        let stream = state.host_streams.get_untracked()["host-cfg"].clone();
+        state.host_streams.update(|streams| {
+            streams.remove("host-cfg");
+        });
+        repair.click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".settings-overlay")
+                .unwrap()
+                .is_some(),
+            "setup that never started must leave Settings open"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("the selected host is not connected"),
+            "the failure must stay on screen: {text:?}"
+        );
+        crate::notices::clear_host("host-cfg");
+        state.host_streams.update(|streams| {
+            streams.insert("host-cfg".to_owned(), stream);
+        });
+        next_tick().await;
+
+        let repair = find_button_by_text(&container, "Repair install")
+            .expect("the repair action must survive the failed attempt");
         repair.click();
         for _ in 0..3 {
             next_tick().await;
         }
+        assert!(
+            container
+                .query_selector(".settings-overlay")
+                .unwrap()
+                .is_none(),
+            "Settings covers the Terminal dock, so running setup must close it"
+        );
 
         let setup_frames: Vec<serde_json::Value> = calls
             .iter()

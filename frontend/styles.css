@@ -778,10 +778,17 @@ details summary:focus:not(:focus-visible) {
 
 /* ===== App Body ===== */
 .app-body {
+    position: relative;
     display: flex;
     flex: 1;
     min-height: 0;
     overflow: hidden;
+}
+
+/* Rail and dock floats use z-index 1000+; confine them beneath Settings. */
+.app-body:has(> .settings-overlay) > .project-rail,
+.app-body:has(> .settings-overlay) > .workbench {
+    isolation: isolate;
 }
 
 /* ===== Project Rail ===== */
