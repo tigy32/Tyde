@@ -2899,12 +2899,21 @@ mod wasm_tests {
         state.chat_messages.update(|messages| {
             messages.insert(
                 agent_ref.clone(),
-                vec![make_message(
-                    MessageSender::Assistant {
-                        agent: "codex".into(),
-                    },
-                    "Completed reply",
-                )],
+                vec![
+                    make_message(MessageSender::User, "Requested reply"),
+                    make_message(
+                        MessageSender::Agent {
+                            agent: "Reviewer".into(),
+                        },
+                        "Agent input",
+                    ),
+                    make_message(
+                        MessageSender::Assistant {
+                            agent: "codex".into(),
+                        },
+                        "Completed reply",
+                    ),
+                ],
             );
         });
         let reasoning = ArcRwSignal::new(String::new());
@@ -2996,11 +3005,19 @@ mod wasm_tests {
             );
             assert_eq!(property(&block, "border-left-width"), "2px");
             assert_eq!(property(&block, "padding-left"), "12px");
-            for row in [&streaming, &completed] {
+            let user = container
+                .query_selector(".chat-message.user")
+                .unwrap()
+                .unwrap();
+            let agent = container
+                .query_selector(".chat-message.agent")
+                .unwrap()
+                .unwrap();
+            for row in [&user, &agent, &streaming, &completed] {
                 assert_eq!(
                     property(row, "border-left-width"),
-                    "3px",
-                    "both assistant and live replies retain their grouping rail"
+                    "0px",
+                    "mobile message rows have no vertical rail in either shell"
                 );
                 assert_ne!(
                     property(row, "box-shadow"),
@@ -3023,6 +3040,7 @@ mod wasm_tests {
             Some("inspect the eventual assistant item"),
             "the same preview updates without rebinding"
         );
+        container.remove();
     }
 
     #[wasm_bindgen_test]
