@@ -617,6 +617,34 @@ mod wasm_tests {
                 > 0.0
         );
 
+        let settings_title = || {
+            element(&container, ".settings-panel-title")
+                .text_content()
+                .unwrap_or_default()
+        };
+        state.settings_open.set(true);
+        tick().await;
+        state.settings_tab_request.set(Some("Backends"));
+        tick().await;
+        assert_eq!(settings_title(), "Backends");
+        element(&container, ".settings-close-btn").click();
+        tick().await;
+        state.settings_open.set(true);
+        tick().await;
+        assert_eq!(
+            settings_title(),
+            "Appearance",
+            "the app-body mount outlives a close, so reopening must reset the page"
+        );
+        state.settings_open.set(false);
+        tick().await;
+        state.settings_tab_request.set(Some("Hosts"));
+        state.settings_open.set(true);
+        tick().await;
+        assert_eq!(settings_title(), "Hosts");
+        state.settings_open.set(false);
+        tick().await;
+
         drop(handle);
         container.remove();
         match previous {

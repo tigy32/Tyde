@@ -1325,7 +1325,7 @@ projects at once.
   dev instance), `tyde-agent-control` (spawn/read agents), `tyde-agent-await`
   (long-running agent waits), and `tyde-config` (yours).
 - **Task complexity tiers.** Optional Low/High spawn configurations per
-  backend (model + reasoning effort) under Settings → Backends.
+  backend (model + reasoning effort) under Settings → Subagents.
 - **Review.** Workspace-level code review of pending changes from the
   review panel.
 - **Mobile.** Pair a phone from Settings → Mobile to monitor and steer

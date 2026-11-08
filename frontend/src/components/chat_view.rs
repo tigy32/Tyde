@@ -99,7 +99,7 @@ const DID_YOU_KNOW_TIPS: &[(&str, &str)] = &[
     ),
     (
         "Task complexity tiers",
-        "Turn on tiers in Settings \u{2192} Backends to run cheap fast agents for small tasks and maximum-power agents for hard ones.",
+        "Turn on tiers in Settings \u{2192} Subagents to run cheap fast agents for small tasks and maximum-power agents for hard ones.",
     ),
     (
         "Agent teams",

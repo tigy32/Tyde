@@ -166,7 +166,7 @@ pub fn UpdatesSettings() -> impl IntoView {
                 "Tyde tells you when a signed update is available. Nothing is downloaded or installed until you approve it."
             </p>
 
-    <crate::components::settings_panel::SettingsSection title="Update delivery">
+    <crate::components::settings_panel::SettingsSection title="Update delivery" scope=crate::components::settings_panel::SettingsScope::Device>
             <div class="settings-field">
                 <div class="app-update-card">
                     <div class="app-update-card-info">

@@ -430,16 +430,8 @@ enum SettingsTab {
     Updates,
     Hosts,
     Appearance,
-    Display,
-    ToolOutput,
-    BackendPreferences,
-    ComplexityTiers,
-    AutoCompaction,
-    AgentRestoration,
-    Composer,
     AiSummaries,
     Supervisor,
-    UsageManagement,
     Subagents,
     Backends,
     CustomAgents,
@@ -451,7 +443,6 @@ enum SettingsTab {
     CodeIntelligence,
     Workbenches,
     Voice,
-    Dictation,
     Tychat,
     ChatgptDots,
     Mobile,
@@ -462,9 +453,17 @@ enum SettingsTab {
 /// installation; `Host` pages read and write the settings of whichever host is
 /// selected in the scope bar, so switching hosts changes what they show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsScope {
+pub(crate) enum SettingsScope {
     Device,
     Host,
+}
+
+/// How a page declares what it writes to: one scope for the whole page, or one
+/// on each of its `SettingsSection`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageScope {
+    Whole(SettingsScope),
+    PerCategory,
 }
 
 impl SettingsTab {
@@ -473,16 +472,8 @@ impl SettingsTab {
             Self::Updates => "Updates",
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
-            Self::Display => "Code display",
-            Self::ToolOutput => "Tool output",
-            Self::BackendPreferences => "Backend preferences",
-            Self::ComplexityTiers => "Complexity tiers",
-            Self::AutoCompaction => "Auto-compaction",
-            Self::AgentRestoration => "Agent restoration",
-            Self::Composer => "Composer",
             Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
-            Self::UsageManagement => "Usage Limits",
             Self::Subagents => "Subagents",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
@@ -494,31 +485,19 @@ impl SettingsTab {
             Self::CodeIntelligence => "Code Intelligence",
             Self::Workbenches => "Workbenches",
             Self::Voice => "Voice",
-            Self::Dictation => "Dictation",
-            Self::ChatgptDots => "Remote MCP",
+            Self::ChatgptDots => "Integrations",
             Self::Tychat => "Tychat",
             Self::Mobile => "Mobile",
             Self::Debug => "Debug",
         }
     }
 
-    /// The page's primary scope. Updates names its host-scoped restoration
-    /// control separately from device-local updater preferences.
-    fn scope(self) -> SettingsScope {
+    fn scope(self) -> PageScope {
         match self {
-            Self::Updates
-            | Self::Hosts
-            | Self::Appearance
-            | Self::Display
-            | Self::ToolOutput
-            | Self::Composer => SettingsScope::Device,
-            Self::BackendPreferences
-            | Self::ComplexityTiers
-            | Self::AutoCompaction
-            | Self::AgentRestoration
-            | Self::AiSummaries
+            Self::Updates => PageScope::PerCategory,
+            Self::Hosts | Self::Appearance => PageScope::Whole(SettingsScope::Device),
+            Self::AiSummaries
             | Self::Supervisor
-            | Self::UsageManagement
             | Self::Subagents
             | Self::Backends
             | Self::Review
@@ -530,45 +509,16 @@ impl SettingsTab {
             | Self::CodeIntelligence
             | Self::Workbenches
             | Self::Voice
-            | Self::Dictation
             | Self::ChatgptDots
             | Self::Tychat
             | Self::Mobile
-            | Self::Debug => SettingsScope::Host,
+            | Self::Debug => PageScope::Whole(SettingsScope::Host),
         }
     }
 
     /// All searchable text for this tab: labels, descriptions, option names.
     fn search_text(self) -> &'static [&'static str] {
         match self {
-            Self::ToolOutput => &["Tool output", "Summary", "Compact", "Full", "Preview"],
-            Self::BackendPreferences => &[
-                "Backend preferences",
-                "Delegation preference",
-                "Launch profiles",
-                "Order",
-            ],
-            Self::ComplexityTiers => &[
-                "Complexity tiers",
-                "Low",
-                "High",
-                "Model",
-                "Effort",
-                "Speed",
-            ],
-            Self::AutoCompaction => &[
-                "Auto-compaction",
-                "Auto-compact",
-                "Inactivity",
-                "Context",
-                "Tokens",
-            ],
-            Self::AgentRestoration => &[
-                "Agent restoration",
-                "Resume previous agents",
-                "Pause swarms",
-                "Restart",
-            ],
             Self::Updates => &[
                 "Updates",
                 "Release",
@@ -577,6 +527,11 @@ impl SettingsTab {
                 "Check for updates",
                 "Automatic updates",
                 "Restart",
+                "Update delivery",
+                "On restart",
+                "Agent restoration",
+                "Resume previous agents",
+                "Pause swarms",
             ],
             Self::Hosts => &[
                 "Hosts",
@@ -619,8 +574,10 @@ impl SettingsTab {
                 "Dinosaur",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
-            ],
-            Self::Composer => &[
+                "Workspace",
+                "Interface",
+                "Open views",
+                "Sending",
                 "Composer",
                 "Chat",
                 "Interrupt",
@@ -629,8 +586,7 @@ impl SettingsTab {
                 "Queue",
                 "Steer",
                 "Enter",
-            ],
-            Self::Display => &[
+                "Files and diffs",
                 "Code display",
                 "Display",
                 "Syntax Theme",
@@ -643,6 +599,12 @@ impl SettingsTab {
                 "Diff Context",
                 "Hunks",
                 "Full File",
+                "Tool cards",
+                "Tool output",
+                "Summary",
+                "Compact",
+                "Full",
+                "Preview",
             ],
             Self::AiSummaries => &[
                 "AI Summaries",
@@ -660,6 +622,20 @@ impl SettingsTab {
                 "Spawn",
                 "Orchestrate",
                 "Agent control",
+                "Delegation",
+                "Preferred profiles",
+                "Backend preferences",
+                "Delegation preference",
+                "Launch profiles",
+                "Order",
+                "Task routing",
+                "Backend tiers",
+                "Complexity tiers",
+                "Low",
+                "High",
+                "Model",
+                "Effort",
+                "Speed",
             ],
             Self::Workbenches => &[
                 "Workbenches",
@@ -678,7 +654,6 @@ impl SettingsTab {
                 "Find references",
                 "custom toolchain",
             ],
-            Self::Dictation => &["Dictation", "Transcribe", "Language", "Speech to text"],
             Self::Voice => &[
                 "Voice",
                 "Native voice",
@@ -691,19 +666,12 @@ impl SettingsTab {
                 "AWS profile",
                 "AWS region",
                 "Bedrock",
-            ],
-            Self::UsageManagement => &[
-                "Usage Limits",
-                "Usage management",
-                "Enable usage limit management",
-                "Pause at usage percentage",
-                "Compact before waiting for reset",
-                "Compact at context percentage",
-                "Auto-start short usage windows",
-                "Auto-start weekly usage windows",
-                "Hourly wake-up",
-                "Quota",
-                "Automatic resume",
+                "AWS identity",
+                "Conversation",
+                "Dictation",
+                "Transcribe",
+                "Language",
+                "Speech to text",
             ],
             Self::Supervisor => &[
                 "Supervisor",
@@ -722,6 +690,15 @@ impl SettingsTab {
                 "Continue",
                 "Task list",
                 "Compaction",
+                "Monitoring",
+                "Stalled turns",
+                "Follow-ups",
+                "Finished agents",
+                "Auto-compaction",
+                "Auto-compact",
+                "Inactivity",
+                "Context",
+                "Tokens",
             ],
             Self::Backends => &[
                 "Backends",
@@ -847,11 +824,24 @@ impl SettingsTab {
     }
 }
 
-const APPEARANCE_TABS: &[SettingsTab] = &[
-    SettingsTab::Appearance,
-    SettingsTab::Display,
-    SettingsTab::ToolOutput,
-    SettingsTab::Composer,
+const SYSTEM_TABS: &[SettingsTab] = &[SettingsTab::Appearance, SettingsTab::Updates];
+const REMOTE_TABS: &[SettingsTab] = &[
+    SettingsTab::Hosts,
+    SettingsTab::Mobile,
+    SettingsTab::Tychat,
+    SettingsTab::ChatgptDots,
+];
+const FEATURE_TABS: &[SettingsTab] = &[
+    SettingsTab::CodeIntelligence,
+    SettingsTab::Voice,
+    SettingsTab::AiSummaries,
+    SettingsTab::Workbenches,
+];
+const SUBAGENT_TABS: &[SettingsTab] = &[
+    SettingsTab::Subagents,
+    SettingsTab::CustomAgents,
+    SettingsTab::Review,
+    SettingsTab::Supervisor,
 ];
 const STEERING_TABS: &[SettingsTab] = &[
     SettingsTab::Steering,
@@ -859,58 +849,26 @@ const STEERING_TABS: &[SettingsTab] = &[
     SettingsTab::McpServers,
     SettingsTab::SelfImprovement,
 ];
-const SUBAGENT_TABS: &[SettingsTab] = &[
-    SettingsTab::Subagents,
-    SettingsTab::BackendPreferences,
-    SettingsTab::ComplexityTiers,
-    SettingsTab::Supervisor,
-    SettingsTab::AutoCompaction,
-    SettingsTab::Review,
-    SettingsTab::CustomAgents,
-    SettingsTab::AiSummaries,
-];
-const SYSTEM_TABS: &[SettingsTab] = &[
+const ALL_TABS: &[SettingsTab] = &[
+    SettingsTab::Appearance,
+    SettingsTab::Updates,
+    SettingsTab::Backends,
     SettingsTab::Hosts,
-    SettingsTab::Workbenches,
-    SettingsTab::CodeIntelligence,
-    SettingsTab::Voice,
-    SettingsTab::Dictation,
     SettingsTab::Mobile,
     SettingsTab::Tychat,
     SettingsTab::ChatgptDots,
-    SettingsTab::AgentRestoration,
-    SettingsTab::Updates,
-    SettingsTab::Debug,
-];
-const ALL_TABS: &[SettingsTab] = &[
-    SettingsTab::Appearance,
-    SettingsTab::Display,
-    SettingsTab::ToolOutput,
-    SettingsTab::Composer,
-    SettingsTab::Backends,
-    SettingsTab::UsageManagement,
+    SettingsTab::CodeIntelligence,
+    SettingsTab::Voice,
+    SettingsTab::AiSummaries,
+    SettingsTab::Workbenches,
+    SettingsTab::Subagents,
+    SettingsTab::CustomAgents,
+    SettingsTab::Review,
+    SettingsTab::Supervisor,
     SettingsTab::Steering,
     SettingsTab::Skills,
     SettingsTab::McpServers,
     SettingsTab::SelfImprovement,
-    SettingsTab::Subagents,
-    SettingsTab::BackendPreferences,
-    SettingsTab::ComplexityTiers,
-    SettingsTab::Supervisor,
-    SettingsTab::AutoCompaction,
-    SettingsTab::Review,
-    SettingsTab::CustomAgents,
-    SettingsTab::AiSummaries,
-    SettingsTab::Hosts,
-    SettingsTab::Workbenches,
-    SettingsTab::CodeIntelligence,
-    SettingsTab::Voice,
-    SettingsTab::Dictation,
-    SettingsTab::Mobile,
-    SettingsTab::Tychat,
-    SettingsTab::ChatgptDots,
-    SettingsTab::AgentRestoration,
-    SettingsTab::Updates,
     SettingsTab::Debug,
 ];
 
@@ -925,18 +883,20 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    fn scope(self) -> SettingsScope {
+    fn scope(self) -> PageScope {
         match self {
             Self::Tab(tab) => tab.scope(),
             // All three are derived from the selected host's server-owned
             // state: its catalog, its profiles, its backends' own accounts.
-            Self::LaunchProfiles | Self::Usage | Self::Backend(_) => SettingsScope::Host,
+            Self::LaunchProfiles | Self::Usage | Self::Backend(_) => {
+                PageScope::Whole(SettingsScope::Host)
+            }
         }
     }
 }
 
-/// Backends that get their own sidebar page on the selected host, in the
-/// canonical backend order. Derived purely from server-owned state — never
+/// Backends that have a settings page on the selected host, in the canonical
+/// backend order. Derived purely from server-owned state — never
 /// from `enabled_backends`, and never hardcoded per backend. A backend earns a
 /// page if it exposes a typed deep-config schema or the server has published
 /// a backend-native settings snapshot for it.
@@ -1013,6 +973,15 @@ pub fn SettingsPanel() -> impl IntoView {
         }
     });
 
+    let settings_open = state.settings_open;
+    Effect::new(move |was_open: Option<bool>| {
+        let open = settings_open.get();
+        if was_open == Some(true) && !open {
+            active_page.set(SettingsPage::Tab(SettingsTab::Appearance));
+        }
+        open
+    });
+
     // Honor deep-link requests (e.g. the onboarding "Set up an AI engine" CTA
     // asking to open straight to the Backends tab).
     {
@@ -1073,12 +1042,16 @@ pub fn SettingsPanel() -> impl IntoView {
                                     autocomplete="off"
                                 />
                             </div>
-                            <SettingsNavGroup title=Signal::derive(|| "Appearance".to_owned()) tabs=APPEARANCE_TABS.to_vec() active_page search_query />
-                            <BackendsNavGroup active_page search_query />
-                            <SettingsNavGroup title=Signal::derive(|| "Steering".to_owned()) tabs=STEERING_TABS.to_vec() active_page search_query />
-                            <SettingsNavGroup title=Signal::derive(|| "Subagents".to_owned()) tabs=SUBAGENT_TABS.to_vec() active_page search_query />
                             <SettingsNavGroup title=Signal::derive(|| "System".to_owned()) tabs=SYSTEM_TABS.to_vec() active_page search_query />
+                            <BackendsNavGroup active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Remote".to_owned()) tabs=REMOTE_TABS.to_vec() active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Features".to_owned()) tabs=FEATURE_TABS.to_vec() active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Subagents".to_owned()) tabs=SUBAGENT_TABS.to_vec() active_page search_query />
+                            <SettingsNavGroup title=Signal::derive(|| "Steering".to_owned()) tabs=STEERING_TABS.to_vec() active_page search_query />
                             <div class="settings-nav-footer">
+                                <Show when=move || SettingsTab::Debug.matches_query(&search_query.get())>
+                                    <SettingsNavItem class="settings-feedback-link" label=SettingsTab::Debug.label() page=SettingsPage::Tab(SettingsTab::Debug) active_page />
+                                </Show>
                                 <button class="settings-feedback-link" on:click=move |_| {
                                     state.settings_open.set(false);
                                     state.feedback_open.set(true);
@@ -1087,6 +1060,7 @@ pub fn SettingsPanel() -> impl IntoView {
                         </nav>
 
                         <div class="settings-content" node_ref=content_ref>
+                            <div class="settings-page">
                             <SettingsScopeBar active_page />
                             <crate::notices::InlineNotices scopes=Signal::derive(move || {
                                 let mut scopes = vec![crate::notices::NoticeScope::Settings(None)];
@@ -1096,20 +1070,15 @@ pub fn SettingsPanel() -> impl IntoView {
                             {move || match active_page.get() {
                                 SettingsPage::Tab(tab) => match tab {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
-                                    SettingsTab::Updates => view! { <crate::components::app_updates::UpdatesSettings /> }.into_any(),
+                                    SettingsTab::Updates => view! {
+                                        <crate::components::app_updates::UpdatesSettings />
+                                        <AgentRestorationSettings />
+                                    }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
-                                    SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
-                                    SettingsTab::ToolOutput => view! { <ToolOutputTab /> }.into_any(),
-                                    SettingsTab::BackendPreferences => view! { <BackendPreferencesTab /> }.into_any(),
-                                    SettingsTab::ComplexityTiers => view! { <ComplexityTiersTab /> }.into_any(),
-                                    SettingsTab::AutoCompaction => view! { <AutoCompactionTab /> }.into_any(),
-                                    SettingsTab::AgentRestoration => view! { <AgentRestorationSettings /> }.into_any(),
-                                    SettingsTab::Composer => view! { <ComposerTab /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
-                                    SettingsTab::UsageManagement => view! { <UsageManagementTab /> }.into_any(),
                                     SettingsTab::Subagents => view! { <SubagentsTab /> }.into_any(),
-                                    SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
+                                    SettingsTab::Backends => view! { <BackendsTab active_page /> }.into_any(),
                                     SettingsTab::Review => view! { <ReviewSettingsTab /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
@@ -1119,20 +1088,20 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Workbenches => view! { <WorkbenchesTab /> }.into_any(),
                                     SettingsTab::CodeIntelligence => view! { <CodeIntelligenceTab /> }.into_any(),
                                     SettingsTab::Voice => view! { <VoiceTab /> }.into_any(),
-                                    SettingsTab::Dictation => view! { <DictationTab /> }.into_any(),
                                     SettingsTab::ChatgptDots => view! { <super::dots_settings::DotsTab /> }.into_any(),
                                     SettingsTab::Tychat => view! { <super::tychat_settings::TychatTab /> }.into_any(),
                                     SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
                                     SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
                                 },
                                 SettingsPage::Backend(kind) => {
-                                    view! { <BackendSettingsPage kind /> }.into_any()
+                                    view! { <BackendSettingsPage kind active_page /> }.into_any()
                                 }
                                 SettingsPage::LaunchProfiles => {
                                     view! { <LaunchProfilesPage /> }.into_any()
                                 }
                                 SettingsPage::Usage => view! { <UsagePage /> }.into_any(),
                             }}
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1189,13 +1158,7 @@ fn SettingsNavGroup(
             .into_iter()
             .map(|tab| {
                 view! {
-                    <button
-                        class="settings-nav-item"
-                        class:active=move || active_page.get() == SettingsPage::Tab(tab)
-                        on:click=move |_| active_page.set(SettingsPage::Tab(tab))
-                    >
-                        {tab.label()}
-                    </button>
+                    <SettingsNavItem label=tab.label() page=SettingsPage::Tab(tab) active_page />
                 }
             })
             .collect_view();
@@ -1209,15 +1172,50 @@ fn SettingsNavGroup(
     view! { {group} }
 }
 
+/// A sidebar entry for one page. A backend page is a child of the Backends
+/// list, so the Backends entry stays current while one is open.
+#[component]
+fn SettingsNavItem(
+    #[prop(default = "settings-nav-item")] class: &'static str,
+    label: &'static str,
+    page: SettingsPage,
+    active_page: RwSignal<SettingsPage>,
+) -> impl IntoView {
+    let is_active = move || {
+        let current = active_page.get();
+        current == page
+            || (page == SettingsPage::Tab(SettingsTab::Backends)
+                && matches!(current, SettingsPage::Backend(_)))
+    };
+    view! {
+        <button
+            class=class
+            class:active=is_active
+            aria-current=move || is_active().then_some("page")
+            on:click=move |_| active_page.set(page)
+        >
+            {label}
+        </button>
+    }
+}
+
 /// Persistent banner naming what the visible page writes to. Host-scoped pages
 /// all read `selected_host_settings()`, which used to be selectable only from a
 /// single field buried in the Hosts tab.
 #[component]
 fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
+    move || match active_page.get().scope() {
+        PageScope::Whole(scope) => Some(view! { <SettingsScopeIndicator scope /> }),
+        PageScope::PerCategory => None,
+    }
+}
+
+#[component]
+fn SettingsScopeIndicator(scope: SettingsScope) -> impl IntoView {
     // Type-erased branches: the wasm test module runs every frontend test in
     // one browser instance, and each distinct nested view type it monomorphizes
     // costs module size against that ceiling.
-    let body = move || match active_page.get().scope() {
+    let body = match scope {
         SettingsScope::Host => view! { <SettingsHostScope /> }.into_any(),
         SettingsScope::Device => view! {
             <span class="settings-scope-text">"This device"</span>
@@ -1228,11 +1226,18 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
 }
 
 #[component]
-pub(super) fn SettingsSection(title: &'static str, children: Children) -> impl IntoView {
+pub(super) fn SettingsSection(
+    title: &'static str,
+    #[prop(optional)] scope: Option<SettingsScope>,
+    children: Children,
+) -> impl IntoView {
     view! {
         <section class="settings-section">
             <h3 class="settings-section-rail settings-section-title">{title}</h3>
-            <div class="settings-section-body">{children()}</div>
+            <div class="settings-section-body">
+                {scope.map(|scope| view! { <SettingsScopeIndicator scope /> })}
+                {children()}
+            </div>
         </section>
     }
 }
@@ -1308,9 +1313,7 @@ fn WorkbenchesTab() -> impl IntoView {
 pub(crate) fn AgentRestorationSettings() -> impl IntoView {
     let state = expect_context::<AppState>();
     view! {
-        <h2 class="settings-panel-title">"Agent restoration"</h2>
-        <p class="settings-description settings-panel-intro">"Choose what resumes when this host restarts or updates."</p>
-        <SettingsSection title="On restart">{move || host_schema_section(&state, "updates")}</SettingsSection>
+        <SettingsSection title="On restart" scope=SettingsScope::Host>{move || host_schema_section(&state, "updates")}</SettingsSection>
     }
 }
 
@@ -1490,8 +1493,8 @@ fn SettingsScopeNotices(
     view! { {notices} }
 }
 
-/// The "Backends" sidebar group: a stable Backends entry plus one page per
-/// backend in the selected host's server-owned schema catalog.
+/// The "Backends" sidebar group. Per-backend pages open from the Backends list
+/// and appear here only as search results.
 #[component]
 fn BackendsNavGroup(
     active_page: RwSignal<SettingsPage>,
@@ -1501,7 +1504,6 @@ fn BackendsNavGroup(
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
-            || SettingsTab::UsageManagement.matches_query(&query)
             || usage_page_matches_query(&query)
             || launch_profiles_page_matches_query(&query)
             || schema_backends(&state)
@@ -1514,39 +1516,13 @@ fn BackendsNavGroup(
                 <div class="settings-nav-group-title">"Backends"</div>
                 <div class="settings-nav-group-items">
                     <Show when=move || SettingsTab::Backends.matches_query(&search_query.get())>
-                        <button
-                            class="settings-nav-item"
-                            class:active=move || {
-                                active_page.get() == SettingsPage::Tab(SettingsTab::Backends)
-                            }
-                            on:click=move |_| {
-                                active_page.set(SettingsPage::Tab(SettingsTab::Backends))
-                            }
-                        >
-                            "Backends"
-                        </button>
-                    </Show>
-                    <Show when=move || usage_page_matches_query(&search_query.get())>
-                        <button
-                            class="settings-nav-item"
-                            class:active=move || active_page.get() == SettingsPage::Usage
-                            on:click=move |_| active_page.set(SettingsPage::Usage)
-                        >
-                            "Usage"
-                        </button>
-                    </Show>
-                    <Show when=move || SettingsTab::UsageManagement.matches_query(&search_query.get())>
-                        <button class="settings-nav-item" class:active=move || active_page.get() == SettingsPage::Tab(SettingsTab::UsageManagement)
-                            on:click=move |_| active_page.set(SettingsPage::Tab(SettingsTab::UsageManagement))>"Usage Limits"</button>
+                        <SettingsNavItem label=SettingsTab::Backends.label() page=SettingsPage::Tab(SettingsTab::Backends) active_page />
                     </Show>
                     <Show when=move || launch_profiles_page_matches_query(&search_query.get())>
-                        <button
-                            class="settings-nav-item"
-                            class:active=move || active_page.get() == SettingsPage::LaunchProfiles
-                            on:click=move |_| active_page.set(SettingsPage::LaunchProfiles)
-                        >
-                            "Launch Profiles"
-                        </button>
+                        <SettingsNavItem label="Launch Profiles" page=SettingsPage::LaunchProfiles active_page />
+                    </Show>
+                    <Show when=move || usage_page_matches_query(&search_query.get())>
+                        <SettingsNavItem label="Usage" page=SettingsPage::Usage active_page />
                     </Show>
                     <BackendNavItems active_page search_query />
                 </div>
@@ -1566,16 +1542,10 @@ fn BackendNavItems(
             let query = search_query.get();
             schema_backends(&state)
                 .into_iter()
-                .filter(|kind| backend_page_matches_query(&state, *kind, &query))
+                .filter(|kind| !query.is_empty() && backend_page_matches_query(&state, *kind, &query))
                 .map(|kind| {
                     view! {
-                        <button
-                            class="settings-nav-item"
-                            class:active=move || active_page.get() == SettingsPage::Backend(kind)
-                            on:click=move |_| active_page.set(SettingsPage::Backend(kind))
-                        >
-                            {backend_label(kind)}
-                        </button>
+                        <SettingsNavItem label=backend_label(kind) page=SettingsPage::Backend(kind) active_page />
                     }
                 })
                 .collect_view()
@@ -2085,7 +2055,6 @@ fn AppearanceTab() -> impl IntoView {
 
     view! {
             <h2 class="settings-panel-title">"Appearance"</h2>
-            <p class="settings-description settings-panel-intro">"Customize this device’s colors, text and workspace layout."</p>
     <SettingsSection title="Workspace">
             <div class="settings-field">
                 <label class="settings-label">"Sidebar layout"</label>
@@ -2126,7 +2095,6 @@ fn AppearanceTab() -> impl IntoView {
     <SettingsSection title="Interface">
             <div class="settings-field">
                 <label class="settings-label" for="appearance-theme">"Appearance theme"</label>
-                <p class="settings-description">"Code colors are set in Code display."</p>
                 <select
                     id="appearance-theme"
                     aria-label="Appearance theme"
@@ -2278,6 +2246,9 @@ fn AppearanceTab() -> impl IntoView {
                 </div>
             </div>
             </SettingsSection>
+            <SettingsSection title="Sending"><ComposerSendActionField concise=true /></SettingsSection>
+            <FilesAndDiffsSection />
+            <ToolCardsSection />
 
         }
 }
@@ -2287,15 +2258,6 @@ pub(crate) fn ComposerSettings() -> impl IntoView {
     view! {
         <h2 class="settings-panel-title">"Composer"</h2>
         <ComposerSendActionField />
-    }
-}
-
-#[component]
-fn ComposerTab() -> impl IntoView {
-    view! {
-        <h2 class="settings-panel-title">"Composer"</h2>
-        <p class="settings-description settings-panel-intro">"Choose what sending a message does while an agent is working."</p>
-        <SettingsSection title="Sending"><ComposerSendActionField concise=true /></SettingsSection>
     }
 }
 
@@ -2344,13 +2306,8 @@ fn ComposerSendActionField(#[prop(optional)] concise: bool) -> impl IntoView {
     }
 }
 
-/// How code and diffs are rendered. Split out of
-/// [`AppearanceTab`] because these are reading-defaults for content an agent
-/// produced, not chrome: the questions they answer ("how much of this diff do I
-/// want to see?") are asked at a different time than "what font do I like?".
-/// Every value here is device-local and persisted through `local_storage`.
 #[component]
-fn DisplayTab() -> impl IntoView {
+fn FilesAndDiffsSection() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let on_syntax_theme = move |ev: web_sys::Event| {
@@ -2366,12 +2323,6 @@ fn DisplayTab() -> impl IntoView {
     let syntax_themes: Vec<String> = crate::syntax_highlight::available_themes();
 
     view! {
-            <h2 class="settings-panel-title">"Code display"</h2>
-
-            <p class="settings-description settings-panel-intro">
-                "Set code colors and the default view for files and diffs."
-            </p>
-
     <SettingsSection title="Files and diffs">
             <div class="settings-field">
                 <label class="settings-label">"Syntax theme"</label>
@@ -2436,11 +2387,9 @@ fn DisplayTab() -> impl IntoView {
 }
 
 #[component]
-fn ToolOutputTab() -> impl IntoView {
+fn ToolCardsSection() -> impl IntoView {
     let state = expect_context::<AppState>();
     view! {
-        <h2 class="settings-panel-title">"Tool output"</h2>
-        <p class="settings-description settings-panel-intro">"Choose how much output tool cards show by default."</p>
         <SettingsSection title="Tool cards">
         <div class="settings-field">
             <label class="settings-label">"Tool output"</label>
@@ -3202,39 +3151,12 @@ fn SupervisorTab() -> impl IntoView {
         <SettingsSection title="Monitoring">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/enabled", "/supervisor/supervise_restored_agents"])}</SettingsSection>
         <SettingsSection title="Stalled turns">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/stall_timeout_enabled", "/supervisor/stall_timeout_seconds"])}</SettingsSection>
         <SettingsSection title="Follow-ups">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/max_kicks_per_task", "/supervisor/retry_attempts", "/supervisor/cost_tier"])}</SettingsSection>
+        <SettingsSection title="Finished agents">{move || host_schema_fields(&state.get_value(), "supervisor", &["/supervisor/auto_compact_on_success", "/supervisor/auto_compact_inactivity_delay_seconds", "/supervisor/auto_compact_min_context_tokens"])}</SettingsSection>
     }
 }
 
 #[component]
-fn AutoCompactionTab() -> impl IntoView {
-    let state = expect_context::<AppState>();
-    view! {
-        <h2 class="settings-panel-title">"Auto-compaction"</h2>
-        <p class="settings-description settings-panel-intro">"Compact completed agents after they become idle. Requires Supervisor to be enabled."</p>
-        <SettingsSection title="Finished agents">{move || host_schema_fields(&state, "supervisor", &["/supervisor/auto_compact_on_success", "/supervisor/auto_compact_inactivity_delay_seconds", "/supervisor/auto_compact_min_context_tokens"])}</SettingsSection>
-    }
-}
-
-#[component]
-fn UsageManagementTab() -> impl IntoView {
-    let usage_state = expect_context::<AppState>();
-
-    view! {
-            <h2 class="settings-panel-title">"Usage Limits"</h2>
-            <p class="settings-description settings-panel-intro">
-                "Pause agents before they exhaust a shared subscription quota, and resume them when it resets."
-            </p>
-    <SettingsSection title="Quota management">
-            <div class="settings-schema-fields">
-                {move || host_schema_section(&usage_state, "usage_limits")}
-            </div>
-            </SettingsSection>
-
-        }
-}
-
-#[component]
-fn BackendsTab() -> impl IntoView {
+fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let settings_open = state.settings_open;
     let close_for_terminal = Callback::new(move |()| settings_open.set(false));
@@ -3361,7 +3283,13 @@ fn BackendsTab() -> impl IntoView {
                 <div class="settings-backend-list">
                     {all_backends()
                         .into_iter()
-                        .map(|kind| view! { <BackendCard kind on_setup=close_for_terminal /> })
+                        .map(|kind| view! {
+                            <BackendCard
+                                kind
+                                on_setup=close_for_terminal
+                                on_configure=Callback::new(move |()| active_page.set(SettingsPage::Backend(kind)))
+                            />
+                        })
                         .collect::<Vec<_>>()}
                 </div>
             </div>
@@ -3383,6 +3311,18 @@ fn usage_page_matches_query(query: &str) -> bool {
         "Rate limit",
         "Credits",
         "Plan",
+        "Account capacity",
+        "Quota management",
+        "Usage Limits",
+        "Usage management",
+        "Enable usage limit management",
+        "Pause at usage percentage",
+        "Compact before waiting for reset",
+        "Compact at context percentage",
+        "Auto-start short usage windows",
+        "Auto-start weekly usage windows",
+        "Hourly wake-up",
+        "Automatic resume",
     ]
     .iter()
     .any(|text| text.to_lowercase().contains(&query))
@@ -3394,13 +3334,16 @@ fn usage_page_matches_query(query: &str) -> bool {
 /// inside an enable row.
 #[component]
 fn UsagePage() -> impl IntoView {
+    let usage_state = expect_context::<AppState>();
     view! {
             <h2 class="settings-panel-title">"Usage"</h2>
-            <p class="settings-description settings-panel-intro">
-                "Subscription capacity each backend reports for its signed-in account on this host. Advisory only: Tyde never switches backends because of it, and never estimates a figure from its own token counts."
-            </p>
     <SettingsSection title="Account capacity">
             <SubscriptionCapacitySection />
+            </SettingsSection>
+    <SettingsSection title="Quota management">
+            <div class="settings-schema-fields">
+                {move || host_schema_section(&usage_state, "usage_limits")}
+            </div>
             </SettingsSection>
 
         }
@@ -3994,29 +3937,12 @@ fn LaunchProfileEditor(
 
 #[component]
 fn SubagentsTab() -> impl IntoView {
-    let state = expect_context::<AppState>();
+    let state = StoredValue::new(expect_context::<AppState>());
     view! {
         <h2 class="settings-panel-title">"Subagents"</h2>
         <p class="settings-description settings-panel-intro">"Let agents delegate work to child agents. Each child adds model usage."</p>
-        <SettingsSection title="Delegation">{move || host_schema_fields(&state, "subagents", &["/tyde_agent_control_mcp_enabled", "/tyde_agent_control_max_depth"])}</SettingsSection>
-    }
-}
-
-#[component]
-fn BackendPreferencesTab() -> impl IntoView {
-    view! {
-        <h2 class="settings-panel-title">"Backend preferences"</h2>
-        <p class="settings-description settings-panel-intro">"Order the launch profiles agents should prefer for children. Explicit backend or profile requests take precedence."</p>
+        <SettingsSection title="Delegation">{move || host_schema_fields(&state.get_value(), "subagents", &["/tyde_agent_control_mcp_enabled", "/tyde_agent_control_max_depth"])}</SettingsSection>
         <SettingsSection title="Preferred profiles"><DelegationPreference /></SettingsSection>
-    }
-}
-
-#[component]
-fn ComplexityTiersTab() -> impl IntoView {
-    let state = StoredValue::new(expect_context::<AppState>());
-    view! {
-        <h2 class="settings-panel-title">"Complexity tiers"</h2>
-        <p class="settings-description settings-panel-intro">"Choose low and high cost configurations for delegated tasks."</p>
         <SettingsSection title="Task routing">{move || host_schema_fields(&state.get_value(), "subagents", &["/complexity_tiers_enabled"])}</SettingsSection>
         {move || complexity_tier_rows(&state.get_value()).map(|rows| view! {
             <SettingsSection title="Backend tiers">{rows}</SettingsSection>
@@ -4379,7 +4305,7 @@ fn update_tier_setting(
 /// backend's `BackendConfigSchema`, so a backend controls exactly which fields
 /// appear here with no frontend changes.
 #[component]
-fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
+fn BackendSettingsPage(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_body = state.clone();
     let state_for_status = state.clone();
@@ -4426,7 +4352,16 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
 
     view! {
         <div class="settings-panel-header">
-            <h2 class="settings-panel-title">{backend_label(kind)}</h2>
+            <div class="settings-panel-title-row">
+                <button
+                    class="settings-back-btn"
+                    aria-label="Back to Backends"
+                    on:click=move |_| active_page.set(SettingsPage::Tab(SettingsTab::Backends))
+                >
+                    "←"
+                </button>
+                <h2 class="settings-panel-title">{backend_label(kind)}</h2>
+            </div>
             <span class=move || backend_setup_status_class(setup_info_for_class().as_ref())>
                 {move || backend_setup_status_label(setup_info().as_ref())}
             </span>
@@ -6795,19 +6730,16 @@ fn VoiceTab() -> impl IntoView {
     view! {
         <h2 class="settings-panel-title">"Voice"</h2>
 
-        <p class="settings-description settings-panel-intro">
-            "Talk to agents with Amazon Nova Sonic using this host’s AWS credentials. The AWS profile is also used by Dictation."
-        </p>
-
         <Show
             when=move || state_for_support.native_voice_supported.get()
             fallback=|| view! {
                 <p class="settings-description">
-                    "This host was built without native audio support, so voice is unavailable."
+                    "This host was built without native audio support, so voice and dictation are unavailable."
                 </p>
             }
         >
             <NativeVoiceSettings state=state.clone() />
+            <NativeDictationSettings state=state.clone() />
         </Show>
     }
 }
@@ -6892,19 +6824,6 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
 
             </div>
         }
-}
-
-#[component]
-fn DictationTab() -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let support = state.native_voice_supported;
-    view! {
-        <h2 class="settings-panel-title">"Dictation"</h2>
-        <p class="settings-description settings-panel-intro">"Transcribe speech into the composer without sending or rewriting it. Uses the host’s AWS profile configured in Voice."</p>
-        <Show when=move || support.get() fallback=|| view! { <p class="settings-description">"This host was built without native audio support, so dictation is unavailable."</p> }>
-            <NativeDictationSettings state=state.clone() />
-        </Show>
-    }
 }
 
 #[component]
@@ -7662,8 +7581,10 @@ fn MobileDirectField(
 pub(super) fn BackendCard(
     kind: BackendKind,
     #[prop(optional)] on_setup: Option<Callback<()>>,
+    #[prop(optional)] on_configure: Option<Callback<()>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let state_for_configure = state.clone();
     let name = backend_label(kind);
     let badge_class = backend_badge_class(kind);
     let state_for_checked = state.clone();
@@ -7775,6 +7696,17 @@ pub(super) fn BackendCard(
                     }
                     None => ().into_any(),
                 }}
+                {on_configure.map(|on_configure| view! {
+                    <Show when=move || schema_backends(&state_for_configure).contains(&kind)>
+                        <button
+                            class="settings-btn settings-backend-configure"
+                            aria-label=format!("Configure {name}")
+                            on:click=move |_| on_configure.run(())
+                        >
+                            "Configure"
+                        </button>
+                    </Show>
+                })}
                 <label class="settings-toggle">
                     <input
                         type="checkbox"
@@ -10784,10 +10716,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        // Syntax highlighting is a code-rendering default, so it lives on the
-        // Display tab rather than with the interface chrome on Appearance.
-        click_tab(&container, "Code display");
-        next_tick().await;
+        // Files and diffs is a category of Appearance, the page Settings opens on.
 
         let select =
             find_syntax_theme_select(&container).expect("syntax theme dropdown should be present");
@@ -12490,17 +12419,18 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        // The approved flat navigation moves both integrations to System;
-        // their shared group and searchable one-click pages remain required.
+        // The approved navigation moves both integrations to Remote and renames
+        // Remote MCP to Integrations; their shared group and searchable
+        // one-click pages remain required.
         let labels = container.query_selector_all(".settings-nav-group").unwrap();
         let groups = (0..labels.length())
             .map(|i| labels.item(i).unwrap().text_content().unwrap())
             .collect::<Vec<_>>();
         assert!(
-            groups.iter().any(|text| text.starts_with("System")
+            groups.iter().any(|text| text.starts_with("Remote")
                 && text.contains("Tychat")
-                && text.contains("Remote MCP")),
-            "Tychat and Remote MCP must remain together under System"
+                && text.contains("Integrations")),
+            "Tychat and Integrations must remain together under Remote"
         );
         let search: web_sys::HtmlInputElement = container
             .query_selector(".settings-search-input")
@@ -12518,14 +12448,14 @@ mod wasm_tests {
         assert!(
             filtered_group_text
                 .iter()
-                .any(|text| text.contains("System") && text.contains("Remote MCP")),
-            "Searching MCP must keep Remote MCP visible under System"
+                .any(|text| text.contains("Remote") && text.contains("Integrations")),
+            "Searching MCP must keep Integrations visible under Remote"
         );
         assert!(
-            find_button_by_text(&container, "Remote MCP").is_some(),
-            "Searching MCP must show the Remote MCP navigation item"
+            find_button_by_text(&container, "Integrations").is_some(),
+            "Searching MCP must show the Integrations navigation item"
         );
-        click_tab(&container, "Remote MCP");
+        click_tab(&container, "Integrations");
         next_tick().await;
         assert!(
             container
@@ -12618,7 +12548,7 @@ mod wasm_tests {
                 "pairing={pairing} title_is_remote_mcp={} page_tag={} page_class={:?} checkbox_count={} inputs(id,type)={input_id_types:?}",
                 title
                     .text_content()
-                    .is_some_and(|text| text.trim() == "Remote MCP"),
+                    .is_some_and(|text| text.trim() == "Integrations"),
                 page.tag_name(),
                 page.get_attribute("class").unwrap_or_default(),
                 checkbox_count,
@@ -14939,7 +14869,19 @@ mod wasm_tests {
         next_tick().await;
         click_tab(&container, "Updates");
         next_tick().await;
-        assert!(scope_bar_text(&container).contains("This device"));
+        // Updates now holds a device-scoped and a host-scoped category, so no
+        // single page-level indicator can be true. Each category names its own.
+        assert_eq!(
+            container
+                .query_selector_all(".settings-scope-bar")
+                .unwrap()
+                .length(),
+            2
+        );
+        let delivery = category_scope_text(&container, "Update delivery");
+        assert!(delivery.contains("This device") && !delivery.contains("Host:"));
+        let restart = category_scope_text(&container, "On restart");
+        assert!(restart.contains("Host:") && !restart.contains("This device"));
         assert!(
             container
                 .query_selector(".settings-content")
@@ -14949,18 +14891,6 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Update channel")
         );
-        assert!(
-            !container
-                .query_selector(".settings-content")
-                .unwrap()
-                .unwrap()
-                .text_content()
-                .unwrap()
-                .contains("Resume previous agents")
-        );
-        click_tab(&container, "Agent restoration");
-        next_tick().await;
-        assert!(scope_bar_text(&container).contains("Host:"));
         let toggle = toggle_for_label(&container, "Resume previous agents");
         assert!(
             toggle.checked(),
@@ -14992,12 +14922,12 @@ mod wasm_tests {
         );
         click_tab(&container, "Appearance");
         next_tick().await;
-        click_tab(&container, "Agent restoration");
+        click_tab(&container, "Updates");
         next_tick().await;
         let toggle = toggle_for_label(&container, "Resume previous agents");
         assert!(
             !toggle.checked(),
-            "reopening Agent restoration retains the server preference"
+            "reopening Updates retains the server preference"
         );
         toggle.set_checked(true);
         dispatch_change(&toggle);
@@ -15057,20 +14987,9 @@ mod wasm_tests {
             "the committed frame must carry enabled=true: {frame:?}"
         );
 
-        // Auto-compaction is now a separate page, but Supervisor still owns
-        // its enable dependency and the exact same typed setting paths.
-        assert!(
-            !container
-                .query_selector(".settings-content")
-                .unwrap()
-                .unwrap()
-                .text_content()
-                .unwrap()
-                .contains("Auto-compact on success")
-        );
-        click_tab(&container, "Auto-compaction");
-        next_tick().await;
-        assert_eq!(panel_title(&container), "Auto-compaction");
+        // Finished agents is a category of Supervisor, which still owns its
+        // enable dependency and the exact same typed setting paths.
+        assert_eq!(panel_title(&container), "Supervisor");
         assert!(scope_bar_text(&container).contains("host-general"));
         let compact = toggle_for_label(&container, "Auto-compact on success");
         assert!(compact.disabled(), "intent alone cannot enable compaction");
@@ -15373,7 +15292,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Auto-compaction");
+        click_tab(&container, "Supervisor");
         next_tick().await;
 
         let compact_min: web_sys::HtmlInputElement = container
@@ -15633,7 +15552,7 @@ mod wasm_tests {
         let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(mounted_state);
-            view! { <SupervisorTab /> <AutoCompactionTab /> }
+            view! { <SupervisorTab /> }
         });
         next_tick().await;
 
@@ -15735,7 +15654,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Usage Limits");
+        click_tab(&container, "Usage");
         next_tick().await;
         let enabled = toggle_for_label(&container, "Enable usage limit management");
         let compact = toggle_for_label(&container, "Compact before waiting for reset");
@@ -16103,7 +16022,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16162,7 +16081,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Claude /> }
+            view! { <BackendSettingsPage kind=BackendKind::Claude active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Claude)) /> }
         });
         next_tick().await;
 
@@ -16186,7 +16105,7 @@ mod wasm_tests {
         let state_for_hermes = state.clone();
         let _hermes_handle = mount_to(hermes_container.clone(), move || {
             provide_context(state_for_hermes.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16230,7 +16149,16 @@ mod wasm_tests {
         values: BackendConfigValues,
         enabled_backends: Vec<BackendKind>,
     ) {
-        let host_id = "host-cfg".to_owned();
+        install_backend_config_for_host(state, "host-cfg", values, enabled_backends);
+    }
+
+    fn install_backend_config_for_host(
+        state: &AppState,
+        host_id: &str,
+        values: BackendConfigValues,
+        enabled_backends: Vec<BackendKind>,
+    ) {
+        let host_id = host_id.to_owned();
         state.selected_host_id.set(Some(host_id.clone()));
         state.host_streams.update(|m| {
             m.insert(
@@ -16263,6 +16191,287 @@ mod wasm_tests {
                 )],
             );
         });
+    }
+
+    fn settings_nav_outline(container: &HtmlElement) -> Vec<(String, Vec<String>)> {
+        let groups = container.query_selector_all(".settings-nav-group").unwrap();
+        (0..groups.length())
+            .map(|i| {
+                let group = groups.item(i).unwrap().unchecked_into::<web_sys::Element>();
+                let title = group
+                    .query_selector(".settings-nav-group-title")
+                    .unwrap()
+                    .and_then(|title| title.text_content())
+                    .unwrap_or_default();
+                let items = group.query_selector_all("button").unwrap();
+                let items = (0..items.length())
+                    .map(|j| items.item(j).unwrap().text_content().unwrap())
+                    .collect();
+                (title, items)
+            })
+            .collect()
+    }
+
+    fn nav_item_is_current(container: &HtmlElement, label: &str) -> bool {
+        find_button_by_text(container, label)
+            .unwrap_or_else(|| panic!("{label} must be in the sidebar"))
+            .get_attribute("aria-current")
+            .as_deref()
+            == Some("page")
+    }
+
+    fn set_settings_search(container: &HtmlElement, query: &str) {
+        let search: HtmlInputElement = container
+            .query_selector(".settings-search-input")
+            .unwrap()
+            .expect("settings search input must render")
+            .dyn_into()
+            .unwrap();
+        search.set_value(query);
+        dispatch_event_from_js(&search, "input", None);
+    }
+
+    /// Walks the reorganized navigation as a user does: the sidebar at rest,
+    /// every merged page's categories, search landing on merged pages, and
+    /// the Backends list routing to a backend page and back.
+    #[wasm_bindgen_test]
+    async fn settings_navigation_merges_pages_and_routes_backends() {
+        let container = make_container();
+        let state = AppState::new();
+        let host_id = "host-settings-navigation";
+        install_backend_config_for_host(
+            &state,
+            host_id,
+            BackendConfigValues::default(),
+            vec![BackendKind::Codex],
+        );
+        state.host_settings_schema_by_host.update(|schemas| {
+            schemas.insert(
+                host_id.to_owned(),
+                settings_model::host_settings_schema().clone(),
+            );
+        });
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut(host_id)
+                .expect("fixture host")
+                .complexity_tiers_enabled = true;
+        });
+        state.session_schemas.update(|hosts| {
+            hosts.entry(host_id.to_owned()).or_default().insert(
+                BackendKind::Codex,
+                SessionSchemaEntry::Ready {
+                    schema: SessionSettingsSchema {
+                        model_resolutions: Default::default(),
+                        backend_kind: BackendKind::Codex,
+                        fields: vec![SessionSettingField {
+                            key: "model".to_owned(),
+                            label: "Model".to_owned(),
+                            description: None,
+                            use_slider: false,
+                            select_options_by_setting: None,
+                            field_type: SessionSettingFieldType::Select {
+                                options: Vec::new(),
+                                default: None,
+                                nullable: true,
+                            },
+                        }],
+                    },
+                },
+            );
+        });
+        state.native_voice_supported.set(true);
+        state.settings_open.set(true);
+        let mounted = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        assert_eq!(panel_title(&container), "Appearance");
+        let outline = settings_nav_outline(&container);
+        let expected = [
+            ("System", vec!["Appearance", "Updates"]),
+            ("Backends", vec!["Backends", "Launch Profiles", "Usage"]),
+            ("Remote", vec!["Hosts", "Mobile", "Tychat", "Integrations"]),
+            (
+                "Features",
+                vec!["Code Intelligence", "Voice", "AI Summaries", "Workbenches"],
+            ),
+            (
+                "Subagents",
+                vec!["Subagents", "Custom Agents", "Review", "Supervisor"],
+            ),
+            (
+                "Steering",
+                vec!["Steering", "Skills", "MCP Servers", "Self-improvement"],
+            ),
+        ]
+        .map(|(title, items)| {
+            (
+                title.to_owned(),
+                items.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(outline, expected);
+        let footer = container
+            .query_selector(".settings-nav-footer")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap();
+        assert_eq!(footer, "DebugSend Feedback");
+
+        for (page, categories) in [
+            (
+                "Appearance",
+                vec![
+                    "Workspace",
+                    "Interface",
+                    "Open views",
+                    "Sending",
+                    "Files and diffs",
+                    "Tool cards",
+                ],
+            ),
+            ("Updates", vec!["Update delivery", "On restart"]),
+            ("Usage", vec!["Account capacity", "Quota management"]),
+            ("Voice", vec!["AWS identity", "Conversation", "Dictation"]),
+            (
+                "Subagents",
+                vec![
+                    "Delegation",
+                    "Preferred profiles",
+                    "Task routing",
+                    "Backend tiers",
+                ],
+            ),
+            (
+                "Supervisor",
+                vec![
+                    "Monitoring",
+                    "Stalled turns",
+                    "Follow-ups",
+                    "Finished agents",
+                ],
+            ),
+        ] {
+            click_tab(&container, page);
+            next_tick().await;
+            assert_eq!(panel_title(&container), page);
+            let rails = container
+                .query_selector_all(".settings-section-title")
+                .unwrap();
+            let rails = (0..rails.length())
+                .map(|i| rails.item(i).unwrap().text_content().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rails, categories, "categories of {page}");
+        }
+
+        for (query, page, setting) in [
+            ("Default send action", "Appearance", "Default send action"),
+            ("Syntax Theme", "Appearance", "Syntax"),
+            ("Tool cards", "Appearance", "Tool output"),
+            ("Resume previous", "Updates", "Resume previous agents"),
+            (
+                "Compact before",
+                "Usage",
+                "Compact before waiting for reset",
+            ),
+            ("Transcribe", "Voice", "Dictation with Amazon Transcribe"),
+            ("Complexity tiers", "Subagents", "Task complexity tiers"),
+            (
+                "Delegation preference",
+                "Subagents",
+                "Delegation preference",
+            ),
+            ("Auto-compact", "Supervisor", "Auto-compact on success"),
+            ("Remote MCP", "Integrations", "Enable remote MCP"),
+        ] {
+            set_settings_search(&container, query);
+            next_tick().await;
+            click_tab(&container, page);
+            next_tick().await;
+            assert_eq!(panel_title(&container), page, "search for {query:?}");
+            let content = container
+                .query_selector(".settings-content")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap();
+            assert!(
+                content.contains(setting),
+                "{query:?} must land on {setting:?}"
+            );
+        }
+        set_settings_search(&container, "");
+        next_tick().await;
+        assert_eq!(settings_nav_outline(&container), expected);
+
+        click_tab(&container, "Backends");
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("input[aria-label='Enable Claude']")
+                .unwrap()
+                .is_some()
+                && configure_button(&container, "Claude").is_none(),
+            "a backend without settings has no Configure"
+        );
+        configure_button(&container, "Hermes")
+            .expect("a disabled backend with settings keeps Configure")
+            .click();
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Hermes");
+        assert!(nav_item_is_current(&container, "Backends"));
+        assert_eq!(settings_nav_outline(&container), expected);
+        container
+            .query_selector("button[aria-label='Back to Backends']")
+            .unwrap()
+            .expect("a backend page must offer the way back")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Backends");
+        assert!(nav_item_is_current(&container, "Backends"));
+
+        set_settings_search(&container, "default provider");
+        next_tick().await;
+        let backends_group = settings_nav_outline(&container)
+            .into_iter()
+            .find(|(title, _)| title == "Backends")
+            .expect("a backend match keeps the Backends group");
+        assert!(backends_group.1.contains(&"Hermes".to_owned()));
+        click_tab(&container, "Hermes");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Hermes");
+        set_settings_search(&container, "");
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Hermes").is_none());
+        assert_eq!(panel_title(&container), "Hermes");
+
+        let close_settings = || {
+            container
+                .query_selector(".settings-close-btn")
+                .unwrap()
+                .expect("open settings can be closed")
+                .unchecked_into::<HtmlElement>()
+                .click();
+        };
+        close_settings();
+        next_tick().await;
+        state.settings_open.set(true);
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Appearance");
+        assert!(nav_item_is_current(&container, "Appearance"));
+
+        close_settings();
+        next_tick().await;
+        state.settings_tab_request.set(Some("Hosts"));
+        state.settings_open.set(true);
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Hosts");
     }
 
     /// Set an input's value and fire a `change` event, then drop the dispatch id
@@ -16320,7 +16529,7 @@ mod wasm_tests {
                 vec![BackendKind::Hermes],
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16423,7 +16632,7 @@ mod wasm_tests {
             );
             set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16463,7 +16672,7 @@ mod wasm_tests {
             );
             set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16507,7 +16716,7 @@ mod wasm_tests {
                 Some("Hermes gateway not reachable"),
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -16528,6 +16737,22 @@ mod wasm_tests {
 
     // ---- Backends sidebar group + per-backend pages ----
 
+    fn configure_button(container: &HtmlElement, backend: &str) -> Option<HtmlElement> {
+        container
+            .query_selector(&format!("button[aria-label='Configure {backend}']"))
+            .unwrap()
+            .map(|button| button.unchecked_into())
+    }
+
+    async fn open_backend_page(container: &HtmlElement, backend: &str) {
+        click_tab(container, "Backends");
+        next_tick().await;
+        configure_button(container, backend)
+            .unwrap_or_else(|| panic!("{backend} must offer Configure"))
+            .click();
+        next_tick().await;
+    }
+
     fn panel_title(container: &HtmlElement) -> String {
         container
             .query_selector(".settings-panel-title")
@@ -16536,7 +16761,7 @@ mod wasm_tests {
             .unwrap_or_default()
     }
 
-    /// Delegation, backend preferences and tiers have separate pages. The
+    /// Delegation, backend preferences and tiers share the Subagents page. The
     /// master toggle is `tyde_agent_control_mcp_enabled` under a name that says
     /// what it does, so this pins the label to the wire setting — a rename that
     /// silently pointed the switch at a different setting would leave the UI
@@ -16562,8 +16787,10 @@ mod wasm_tests {
             .unwrap()
             .text_content()
             .unwrap();
-        assert!(!text.contains("Task complexity tiers"));
-        assert!(!text.contains("Delegation preference"));
+        // The approved merge puts every delegation control on this page; the
+        // old negative checks pinned the three-page split.
+        assert!(text.contains("Task complexity tiers"));
+        assert!(text.contains("Delegation preference"));
 
         let toggle = toggle_for_label(&container, "Tyde sub-agents");
         assert!(
@@ -16600,8 +16827,6 @@ mod wasm_tests {
             .find(|op| replacement_value(op, "/tyde_agent_control_max_depth").is_some())
             .expect("the depth input must commit its settings path");
         assert_eq!(depth_frame.get("value").and_then(Value::as_u64), Some(4));
-        click_tab(&container, "Complexity tiers");
-        next_tick().await;
         let tiers = toggle_for_label(&container, "Task complexity tiers");
         tiers.set_checked(true);
         dispatch_change(&tiers);
@@ -16610,8 +16835,6 @@ mod wasm_tests {
             replacement_value(op, "/complexity_tiers_enabled").and_then(Value::as_bool)
                 == Some(true)
         }));
-        click_tab(&container, "Backend preferences");
-        next_tick().await;
         assert!(
             container
                 .query_selector(".settings-content")
@@ -16621,9 +16844,12 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Delegation preference")
         );
+        // Maximum agent depth now shares this page and is a number input, so
+        // the no-number-input guarantee is scoped to the preference list it
+        // was written for.
         assert!(
             container
-                .query_selector("input[type=number]")
+                .query_selector(".delegation-preference input[type=number]")
                 .unwrap()
                 .is_none()
         );
@@ -16732,7 +16958,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Complexity tiers");
+        click_tab(&container, "Subagents");
         next_tick().await;
 
         let selects = container.query_selector_all("select").unwrap();
@@ -16993,13 +17219,12 @@ mod wasm_tests {
         );
     }
 
-    /// The sidebar has a dedicated Backends group: a stable Backends entry, a
-    /// Usage page, a Launch Profiles page, plus one schema-derived item per
-    /// configurable backend. The overview page renders no backend config
-    /// fields and no launch-profile editor; navigation to a backend's own page
-    /// is the sidebar's job, so the overview row carries no duplicate link.
+    /// The sidebar's Backends group holds only Backends, Launch Profiles and
+    /// Usage. The overview page renders no backend config fields and no
+    /// launch-profile editor; a configurable backend's page opens from its
+    /// overview row.
     #[wasm_bindgen_test]
-    async fn backends_group_lists_schema_pages_and_overview_has_no_config_fields() {
+    async fn backends_group_is_fixed_and_overview_routes_to_backend_pages() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -17016,9 +17241,11 @@ mod wasm_tests {
 
         let overview = find_button_by_text(&container, "Backends")
             .expect("the Backends group must have a stable Overview item");
+        // The approved navigation moves this route onto the overview's Configure
+        // button, so a schema backend no longer has a resting nav item.
         assert!(
-            find_button_by_text(&container, "Hermes").is_some(),
-            "a backend in the host's schema catalog must get its own nav item"
+            find_button_by_text(&container, "Hermes").is_none(),
+            "a backend in the host's schema catalog must not get a resting nav item"
         );
         let launch_profiles = find_button_by_text(&container, "Launch Profiles")
             .expect("Launch Profiles must have its own Backends nav item");
@@ -17065,21 +17292,15 @@ mod wasm_tests {
         overview.click();
         next_tick().await;
 
-        // The backend's own page is reached from the sidebar item, which is the
-        // single route to it: the enable row no longer duplicates the link.
-        assert!(
-            find_button_by_text(&container, "Configure Hermes").is_none(),
-            "the enable row must not duplicate the sidebar's route to the backend page"
-        );
-        find_button_by_text(&container, "Hermes")
-            .expect("the Backends group must list the configurable backend")
+        configure_button(&container, "Hermes")
+            .expect("the overview row must route to the configurable backend")
             .click();
         next_tick().await;
 
         assert_eq!(
             panel_title(&container),
             "Hermes",
-            "the sidebar item opens the backend's own settings page"
+            "Configure opens the backend's own settings page"
         );
         assert_eq!(
             container
@@ -17331,6 +17552,10 @@ mod wasm_tests {
                 .retain(|entry| entry.id().0 != "focus");
         });
         state.settings_open.set(true);
+        next_tick().await;
+        // Settings now always reopens on Appearance, as the approved spec
+        // requires, so the unavailable choice is reached through Backends.
+        click_tab(&container, "Backends");
         next_tick().await;
         let select = default_select();
         let unavailable = option_named(&select, "unavailable launch profile");
@@ -17645,8 +17870,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        click_tab(&container, "Hermes");
-        next_tick().await;
+        open_backend_page(&container, "Hermes").await;
 
         let text = container.text_content().unwrap_or_default();
         assert!(
@@ -17738,7 +17962,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -18075,8 +18299,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        click_tab(&container, "Hermes");
-        next_tick().await;
+        open_backend_page(&container, "Hermes").await;
         assert_eq!(panel_title(&container), "Hermes");
 
         state.selected_host_id.set(Some("host-other".to_owned()));
@@ -18637,6 +18860,34 @@ mod wasm_tests {
         state.settings_open.set(true);
     }
 
+    fn category_section(container: &HtmlElement, title: &str) -> web_sys::Element {
+        let sections = container.query_selector_all(".settings-section").unwrap();
+        (0..sections.length())
+            .map(|i| {
+                sections
+                    .item(i)
+                    .unwrap()
+                    .unchecked_into::<web_sys::Element>()
+            })
+            .find(|section| {
+                section
+                    .query_selector(".settings-section-title")
+                    .unwrap()
+                    .and_then(|rail| rail.text_content())
+                    .as_deref()
+                    == Some(title)
+            })
+            .unwrap_or_else(|| panic!("category {title:?} must render"))
+    }
+
+    fn category_scope_text(container: &HtmlElement, title: &str) -> String {
+        category_section(container, title)
+            .query_selector(".settings-scope-bar")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_else(|| panic!("category {title:?} must name its scope"))
+    }
+
     fn scope_bar_text(container: &HtmlElement) -> String {
         container
             .query_selector(".settings-scope-bar")
@@ -18726,20 +18977,21 @@ mod wasm_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             labels,
-            ["Appearance", "Backends", "Steering", "Subagents", "System"]
+            [
+                "System",
+                "Backends",
+                "Remote",
+                "Features",
+                "Subagents",
+                "Steering"
+            ]
         );
         for label in [
             "Appearance",
             "Backends",
             "Steering",
             "Subagents",
-            "Backend preferences",
-            "Complexity tiers",
             "Supervisor",
-            "Auto-compaction",
-            "Agent restoration",
-            "Code display",
-            "Tool output",
         ] {
             assert!(
                 find_button_by_text(&container, label).is_some(),
@@ -18747,9 +18999,39 @@ mod wasm_tests {
             );
         }
 
+        let title_left = |container: &HtmlElement| {
+            container
+                .query_selector(".settings-panel-title")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect()
+                .left()
+        };
+        let custom_agents_left = title_left(&container);
         click_tab(&container, "Review");
         next_tick().await;
         assert_eq!(panel_title(&container), "Review");
+        assert_eq!(
+            title_left(&container),
+            custom_agents_left,
+            "every settings page starts at the same left edge"
+        );
+        let active_nav = container
+            .query_selector("[aria-current='page']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_nav.text_content().as_deref(), Some("Review"));
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&active_nav)
+                .unwrap()
+                .unwrap()
+                .get_property_value("border-left-width")
+                .unwrap(),
+            "0px",
+            "the selected row carries no left-edge stripe"
+        );
         let workspace_width = container.client_width() as f64;
         let layout = container
             .query_selector(".settings-layout")
@@ -18767,6 +19049,32 @@ mod wasm_tests {
             content.get_bounding_client_rect().width() > workspace_width * 0.7,
             "settings pages and Review columns should use the available workspace"
         );
+        let page_width = container
+            .query_selector(".settings-page")
+            .unwrap()
+            .expect("the capped settings page must render")
+            .get_bounding_client_rect()
+            .width();
+        let content_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&content)
+            .unwrap()
+            .unwrap();
+        let padding = |side: &str| {
+            content_style
+                .get_property_value(side)
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .expect("computed padding is in px")
+        };
+        let content_box_width = content.get_bounding_client_rect().width()
+            - padding("padding-left")
+            - padding("padding-right");
+        assert!(
+            page_width + 1.0 < content_box_width,
+            "a wide window must cap the page, not stretch it across the overlay"
+        );
         let columns = container
             .query_selector_all(".review-configuration-columns > section")
             .unwrap();
@@ -18775,16 +19083,29 @@ mod wasm_tests {
             2,
             "Review must keep both configuration columns"
         );
+        // The columns sit beside the category rail on the capped page, so
+        // their available width is their own row, not the page or window.
+        let columns_row = container
+            .query_selector(".review-configuration-columns")
+            .unwrap()
+            .expect("Review must render its configuration columns")
+            .get_bounding_client_rect();
+        let column_rect = |index: u32| {
+            columns
+                .item(index)
+                .unwrap()
+                .unchecked_into::<HtmlElement>()
+                .get_bounding_client_rect()
+        };
         for index in 0..columns.length() {
             assert!(
-                columns
-                    .item(index)
-                    .unwrap()
-                    .unchecked_into::<HtmlElement>()
-                    .get_bounding_client_rect()
-                    .width()
-                    > workspace_width * 0.3,
-                "both Review columns should expand to use the available workspace"
+                column_rect(index).width() > columns_row.width() * 0.45,
+                "both Review columns should expand to fill their row"
+            );
+            assert_eq!(
+                column_rect(index).top(),
+                column_rect(0).top(),
+                "both Review columns should stay side by side"
             );
         }
 
@@ -20651,7 +20972,7 @@ mod wasm_tests {
         let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(mounted_state.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Codex /> }
+            view! { <BackendSettingsPage kind=BackendKind::Codex active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Codex)) /> }
         });
         next_tick().await;
         assert_eq!(
@@ -20860,7 +21181,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -20906,7 +21227,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -20940,7 +21261,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21037,7 +21358,7 @@ mod wasm_tests {
             };
             install_tycode_native_host(&state, snapshot);
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21139,7 +21460,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21202,7 +21523,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21232,7 +21553,7 @@ mod wasm_tests {
                 vec![BackendKind::Hermes],
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Hermes)) /> }
         });
         next_tick().await;
 
@@ -21312,7 +21633,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21368,7 +21689,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21397,7 +21718,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21489,7 +21810,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21528,7 +21849,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21562,7 +21883,7 @@ mod wasm_tests {
                 ]),
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21600,7 +21921,7 @@ mod wasm_tests {
                 ]),
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21662,7 +21983,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21704,7 +22025,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21747,7 +22068,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -21901,7 +22222,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
         assert!(
@@ -22056,7 +22377,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22111,7 +22432,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22161,7 +22482,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22228,7 +22549,7 @@ mod wasm_tests {
             provide_context(state_for_mount.clone());
             view! { <crate::components::header::Header />
             <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Settings(Some("host-tyc-native".to_owned()))] />
-            <BackendSettingsPage kind=BackendKind::Tycode /> }
+            <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22348,7 +22669,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22406,7 +22727,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22457,7 +22778,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22588,7 +22909,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22625,7 +22946,7 @@ mod wasm_tests {
             let state = AppState::new();
             install_tycode_native_host(&state, tycode_ready_snapshot());
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22662,7 +22983,7 @@ mod wasm_tests {
             snapshot.groups.reverse(); // Module now precedes Core in server order.
             install_tycode_native_host(&state, snapshot);
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22713,7 +23034,7 @@ mod wasm_tests {
                 },
             );
             provide_context(state);
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 
@@ -22751,7 +23072,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <BackendSettingsPage kind=BackendKind::Tycode active_page=RwSignal::new(SettingsPage::Backend(BackendKind::Tycode)) /> }
         });
         next_tick().await;
 

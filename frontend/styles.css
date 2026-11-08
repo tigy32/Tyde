@@ -10130,9 +10130,8 @@ math merror {
     font-size: 1rem;
     color: var(--text-secondary);
     border-radius: 6px;
-    border-left: 2px solid transparent;
     text-align: left;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    transition: background 0.15s, color 0.15s;
 }
 
 .settings-nav-item:hover {
@@ -10143,7 +10142,6 @@ math merror {
 .settings-nav-item.active {
     color: var(--text-primary);
     background: var(--accent-subtle);
-    border-left-color: var(--accent-primary);
 }
 
 /* --- Settings Content Area --- */
@@ -10670,6 +10668,14 @@ math merror {
 
 .settings-backend-row > .settings-toggle {
     margin-left: auto;
+}
+
+.settings-backend-row > .settings-backend-configure {
+    margin-left: auto;
+}
+
+.settings-backend-row > .settings-backend-configure + .settings-toggle {
+    margin-left: 0;
 }
 
 /* Fixed columns keep versions aligned across backend rows. */
@@ -11861,6 +11867,28 @@ math merror {
     margin-bottom: 0;
 }
 
+.settings-panel-title-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-back-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.settings-back-btn:hover {
+    color: var(--text-primary);
+    background: var(--surface-hover);
+}
+
 .settings-panel-intro {
     margin-bottom: var(--space-5);
 }
@@ -12938,6 +12966,8 @@ math merror {
 }
 
 .settings-nav-footer {
+    display: flex;
+    gap: var(--space-2);
     margin-top: auto;
     padding: 12px 8px;
     border-top: 1px solid var(--border-primary);
@@ -12951,8 +12981,12 @@ math merror {
     cursor: pointer;
     padding: 4px 8px;
     border-radius: 4px;
-    width: 100%;
     text-align: left;
+}
+
+.settings-feedback-link.active {
+    color: var(--text-primary);
+    background: var(--accent-subtle);
 }
 
 .settings-feedback-link:hover {
@@ -18185,7 +18219,9 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .settings-overlay .settings-nav-group + .settings-nav-group { margin-top: 20px; }
 .settings-overlay .settings-nav-item { white-space: normal; overflow-wrap: anywhere; }
 .settings-overlay .settings-content { padding: 0 16px 24px 32px; }
+.settings-overlay .settings-page { max-width: 64rem; }
 .settings-overlay .settings-scope-bar { float: right; max-width: 50%; margin: 0 28px 12px 16px; padding: 0; border: 0; background: none; justify-content: flex-end; }
+.settings-overlay .settings-section-body > .settings-scope-bar { float: none; max-width: none; margin: 0 0 8px; justify-content: flex-start; }
 .settings-overlay .settings-panel-header { flex-wrap: wrap; align-items: flex-start; }
 .settings-overlay .settings-panel-intro { max-width: 70ch; margin-bottom: 28px; }
 .settings-overlay .settings-section { clear: both; display: grid; grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr); gap: 0 28px; padding: 20px 0; min-width: 0; }

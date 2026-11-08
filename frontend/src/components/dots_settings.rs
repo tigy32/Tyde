@@ -54,7 +54,7 @@ pub fn DotsTab() -> impl IntoView {
     view! {
             <div class="settings-tychat settings-dots">
                 <div class="settings-panel-header">
-                    <h2 class="settings-panel-title">"Remote MCP"</h2>
+                    <h2 class="settings-panel-title">"Integrations"</h2>
                     <span class=move || match snapshot.get().map(|s| s.status) {
                         None | Some(DotsConnectionStatus::Connecting) => "settings-status-chip loading",
                         Some(DotsConnectionStatus::Disabled) => "settings-status-chip unsupported",

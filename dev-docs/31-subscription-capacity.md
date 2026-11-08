@@ -448,7 +448,7 @@ offer a dead button on a host where that CLI is absent.
 
 **Desktop** — `frontend/src/components/backend_capacity.rs`:
 
-- `SubscriptionCapacitySection` (Settings → Backends) is the full authoritative
+- `SubscriptionCapacitySection` (Settings → Usage) is the full authoritative
   view: every backend the host reports, **including the unsupported ones**; the
   state and its explanation; the mandatory coverage line; the plan label when
   reported (and "plan not reported by this source" when not); and one row per
@@ -546,7 +546,7 @@ Stated plainly so none of it is mistaken for a gap to be quietly filled later.
 
 ## Opt-in usage limit management
 
-Host Settings → Usage management connects account capacity to agent
+Host Settings → Usage → Quota management connects account capacity to agent
 scheduling. Usage management and automatic compaction both default off. The
 initial thresholds are 90% quota used and 60% context occupancy; each accepts
 1–100%. These settings are independent of the model-based supervisor.

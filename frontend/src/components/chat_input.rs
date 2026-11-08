@@ -1965,7 +1965,7 @@ pub fn ChatInput(
             </Show>
 
             <Show when=move || default_send_action.get().is_none()>
-                <p class="chat-input-error" role="alert">"Could not load default send action. Enable local storage and choose Default send action in Settings → Composer. Explicit send actions remain available."</p>
+                <p class="chat-input-error" role="alert">"Could not load default send action. Enable local storage and choose Default send action in Settings → Appearance. Explicit send actions remain available."</p>
             </Show>
 
             // Queued messages render in the In-flight tray (above this
@@ -2144,10 +2144,10 @@ pub fn ChatInput(
                                     Some(DefaultSendAction::CancelAndSend) => "Cancel + send (Enter)",
                                     Some(DefaultSendAction::Queue) => "Queue message (Enter)",
                                     Some(DefaultSendAction::Steer) => "Steer (Enter)",
-                                    None => "Choose Default send action in Settings → Composer",
+                                    None => "Choose Default send action in Settings → Appearance",
                                 }
                             }
-                            else if default_send_action.get().is_none() { "Choose Default send action in Settings → Composer" }
+                            else if default_send_action.get().is_none() { "Choose Default send action in Settings → Appearance" }
                             else { "Send message (Enter)" }
                         }
                     >
