@@ -271,10 +271,10 @@ and system overflow, not a bottom toolbar or manually positioned rail. UIKit
 places those controls below system status and above tabs on Duo's vertical
 axis and manages safe areas and overflow as the device resizes. The compact
 custom latency item explicitly permits vertical placement with `axisBehavior`.
-Its single-line metric omits the redundant status dot and unit spacing so it
-fits the narrow system item; longer values scale within the item and retain
-their complete accessible round-trip description. The first actual portrait
-capture exposed a two-line `59` / `ms` label, not a permitted compact layout.
+It is a status readout, not a control, so it hides the shared glass background
+and stacks its status dot above the value inside the 40pt slot. The shared
+`NativeLatencyText` keeps the value to at most three digits plus a unit, also
+for the root header; the accessible description retains exact milliseconds.
 While a modal is open, the shared dock omits Back, leading groups and overflow;
 disabling the legacy navigation bar cannot exclude the separate shared bar.
 Closing the modal restores those controls from the same typed presentation.

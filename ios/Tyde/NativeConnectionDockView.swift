@@ -1,5 +1,20 @@
 import UIKit
 
+enum NativeLatencyText {
+    /// Fixed-width readout: at most three digits plus a unit, for any `UInt64`.
+    static func format(milliseconds ms: UInt64) -> String {
+        if ms < 1_000 { return "\(ms)ms" }
+        if ms < 9_950 {
+            let tenths = (ms + 50) / 100
+            return "\(tenths / 10).\(tenths % 10)s"
+        }
+        if ms < 999_500 { return "\((ms + 500) / 1_000)s" }
+        if ms < 3_570_000 { return "\((ms + 30_000) / 60_000)m" }
+        let hours = ms / 3_600_000 + (ms % 3_600_000 >= 1_800_000 ? 1 : 0)
+        return "\(min(hours, 999))h"
+    }
+}
+
 @MainActor
 final class NativeConnectionDockView: UILabel {
     override init(frame: CGRect) {
@@ -15,15 +30,14 @@ final class NativeConnectionDockView: UILabel {
     override var intrinsicContentSize: CGSize { CGSize(width: 40, height: 40) }
 
     private func configure() {
+        // The slot is fixed at 40pt, so Dynamic Type stops where five characters still fit.
         font = UIFontMetrics(forTextStyle: .caption2).scaledFont(
-            for: .monospacedDigitSystemFont(ofSize: 11, weight: .regular))
+            for: .monospacedDigitSystemFont(ofSize: 11, weight: .regular), maximumPointSize: 12)
         adjustsFontForContentSizeCategory = true
         textColor = .secondaryLabel
         textAlignment = .center
-        numberOfLines = 1
-        lineBreakMode = .byTruncatingTail
-        adjustsFontSizeToFitWidth = true
-        minimumScaleFactor = 0.75
+        numberOfLines = 2
+        lineBreakMode = .byClipping
         isUserInteractionEnabled = false
         isAccessibilityElement = true
         accessibilityIdentifier = "native-connection-status"
@@ -50,7 +64,7 @@ final class NativeConnectionDockView: UILabel {
         case .connected:
             dotColor = .systemGreen
             if let milliseconds = status.round_trip_ms {
-                label = "\(milliseconds)ms"
+                label = NativeLatencyText.format(milliseconds: milliseconds)
                 accessibilityLabel = "Connected, round trip \(milliseconds) milliseconds"
             } else {
                 label = "—ms"
@@ -59,7 +73,7 @@ final class NativeConnectionDockView: UILabel {
         }
         let display = NSMutableAttributedString(string: "●", attributes: [.foregroundColor: dotColor])
         if !label.isEmpty {
-            display.append(NSAttributedString(string: " " + label, attributes: [.foregroundColor: UIColor.secondaryLabel]))
+            display.append(NSAttributedString(string: "\n" + label, attributes: [.foregroundColor: UIColor.secondaryLabel]))
         }
         attributedText = display
         isHidden = false
@@ -130,8 +144,10 @@ enum NativeChatDock {
         if let status = dock.connection_status {
             let health = NativeConnectionDockView(frame: .zero)
             health.render(status)
+            // Leave the item enabled: disabling it greys the label, including its status dot.
             let item = UIBarButtonItem(customView: health)
             item.axisBehavior = .verticalPreferred
+            item.hidesSharedBackground = true
             groups.append(UIBarButtonItemGroup(barButtonItems: [item], representativeItem: nil))
             content.connectedStatusView = health
         }

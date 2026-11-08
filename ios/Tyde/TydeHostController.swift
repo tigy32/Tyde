@@ -805,7 +805,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             latency.adjustsFontForContentSizeCategory = true
             latency.textColor = .secondaryLabel
             if let milliseconds = status.round_trip_ms {
-                latency.text = "\(milliseconds) ms"
+                latency.text = NativeLatencyText.format(milliseconds: milliseconds)
                 latency.accessibilityLabel = "Connected, round trip \(milliseconds) milliseconds"
             } else {
                 latency.text = "Checking…"
