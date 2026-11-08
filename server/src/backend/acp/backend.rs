@@ -7799,6 +7799,14 @@ fn resolve_agent_session_settings(config: &BackendSpawnConfig) -> protocol::Sess
 }
 
 impl Backend for KiroBackend {
+    async fn relocate_stopped_session(
+        _session_id: &SessionId,
+        _relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        // ACP `session/load` finds the session by its id alone.
+        Ok(())
+    }
+
     fn reserved_launch_profile_error(id: &protocol::LaunchProfileId) -> Option<String> {
         (id.0 == protocol::KIRO_LAUNCH_PROFILE_ID)
             .then(|| format!("launch profile {id} conflicts with the built-in Kiro agent profile"))
@@ -7885,6 +7893,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::RestartInWorkspace,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::SessionSettings,

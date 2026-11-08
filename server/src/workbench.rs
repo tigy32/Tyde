@@ -377,6 +377,34 @@ pub(crate) fn bubblewrap_environment(project: &Project) -> Option<&WorkbenchEnvi
     }
 }
 
+/// A running process cannot change mount namespace, so crossing a Bubblewrap
+/// boundary always relaunches the backend inside the destination.
+pub(crate) fn requires_backend_restart(
+    source: Option<&Project>,
+    destination: Option<&Project>,
+) -> bool {
+    let id = |project: Option<&Project>| project.map(|project| project.id.clone());
+    id(source) != id(destination)
+        && [source, destination]
+            .into_iter()
+            .flatten()
+            .any(|project| bubblewrap_environment(project).is_some())
+}
+
+pub(crate) fn require_backend_restart_capability(
+    kind: protocol::BackendKind,
+) -> Result<(), String> {
+    if crate::backend::capabilities_for_backend_kind(kind)
+        .contains(tyde_agent_adapter::BackendCapability::RestartInWorkspace)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind:?} cannot restart a conversation inside a Bubblewrap workbench. Create a new agent in the destination project."
+        ))
+    }
+}
+
 pub(crate) fn environment_directory(store_path: &Path) -> AppResult<PathBuf> {
     let parent = store_path
         .parent()

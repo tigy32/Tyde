@@ -126,8 +126,14 @@ pub(crate) async fn relocate_workspace_session(
     let previous = tyde_process_env::launch::WorkspacePath::host(previous)?.execution_string()?;
     let destination =
         tyde_process_env::launch::WorkspacePath::host(destination)?.execution_string()?;
-    let previous = previous.as_str();
-    let destination = destination.as_str();
+    relocate_execution_session(session_id, &previous, &destination).await
+}
+
+async fn relocate_execution_session(
+    session_id: &str,
+    previous: &str,
+    destination: &str,
+) -> Result<(), String> {
     fn write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
         let mut temporary =
             tempfile::NamedTempFile::new_in(path.parent().ok_or("Invalid native metadata path")?)
@@ -334,6 +340,37 @@ pub(crate) fn resolve_session_settings(
 pub struct GrokBackend(crate::backend::acp::backend::KiroBackend);
 
 impl crate::backend::Backend for GrokBackend {
+    // Unreachable until real_bubblewrap_session_move passes on Grok and
+    // capabilities() declares RestartInWorkspace.
+    async fn relocate_stopped_session(
+        session_id: &SessionId,
+        relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        let working_directory = |target: &crate::backend::BackendExecutionTarget| {
+            let root = crate::backend::acp::adapters::stock::pick_local_workspace_root(
+                &target.roots,
+                "grok",
+            )?;
+            target.scope.run_sync(|| {
+                tyde_process_env::launch::WorkspacePath::host(&root)?.execution_string()
+            })
+        };
+        let previous = working_directory(&relocation.source)?;
+        let destination = working_directory(&relocation.destination)?;
+        if previous == destination {
+            return Ok(());
+        }
+        relocation
+            .destination
+            .scope
+            .run(relocate_execution_session(
+                &session_id.0,
+                &previous,
+                &destination,
+            ))
+            .await
+    }
+
     async fn prepare_context_replacement(
         _config: BackendSpawnConfig,
         _seed: crate::backend::compaction::BackendContextSeed,

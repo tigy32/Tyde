@@ -10,7 +10,9 @@ use protocol::{
     ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
 };
 use server::backend::{
-    Backend, BackendEvent, BackendSpawnConfig, EventStream, SendOutcome, SteerOutcome,
+    Backend, BackendEvent, BackendRestartCancel, BackendRestartOutcome, BackendSessionRelocation,
+    BackendSpawnConfig, EventStream, SendOutcome, SteerOutcome, restart_backend_session,
+    shut_down_until_exited,
 };
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -899,6 +901,142 @@ impl<B: Backend> Harness<B> {
             }
             _ => panic!("Bubblewrap workbench was not prepared"),
         }
+    }
+
+    /// Moves the running session through the production restart path and
+    /// returns the execution scope its new process runs in. `baseline` holds
+    /// this test's child processes from before the agent launched.
+    pub async fn restart_session(
+        &mut self,
+        relocation: BackendSessionRelocation,
+        baseline: &std::collections::HashSet<u32>,
+    ) -> tyde_process_env::launch::ExecutionScope {
+        let running = self.backend.take().expect("backend must be running");
+        let events = self.events.take().expect("backend events must be open");
+        let session_id = running.session_id();
+        let owned: Vec<u32> = direct_child_processes()
+            .await
+            .difference(baseline)
+            .copied()
+            .collect();
+        assert!(
+            !owned.is_empty(),
+            "the backend must be a child of this test"
+        );
+        let outcome = restart_backend_session::<B, _, _>(
+            session_id,
+            self.config.clone(),
+            relocation,
+            (running, events),
+            |(backend, events): (B, EventStream)| async move {
+                shut_down_until_exited(backend.shutdown(), events).await;
+                let survivors = owned.iter().filter(|pid| process_is_running(**pid)).count();
+                assert_eq!(
+                    survivors, 0,
+                    "the session moved while its process still ran"
+                );
+            },
+            Box::pin(std::future::ready(Ok(()))),
+            tokio::sync::watch::channel(BackendRestartCancel::None).1,
+        )
+        .await;
+        match outcome {
+            BackendRestartOutcome::Moved(restarted) => {
+                self.backend = Some(restarted.backend);
+                self.events = Some(restarted.events);
+                restarted.scope
+            }
+            BackendRestartOutcome::Refused { error, .. } => panic!("restart refused: {error}"),
+            BackendRestartOutcome::Restored { error, .. } => {
+                panic!("restart returned to the source: {error}")
+            }
+            BackendRestartOutcome::Abandoned => panic!("restart was abandoned"),
+            BackendRestartOutcome::Lost(error) => panic!("restart lost the session: {error}"),
+        }
+    }
+
+    /// Stops the process, hangs the provider the resume launches so it can
+    /// never answer, then cancels the restart. A cancelled resume must leave no
+    /// destination process behind, even when its provider is unresponsive. The
+    /// commit waits for the cancellation, so a resume that returned before the
+    /// hang took effect is torn down through the same path.
+    pub async fn restart_session_cancelled_during_resume(
+        &mut self,
+        relocation: BackendSessionRelocation,
+        baseline: &std::collections::HashSet<u32>,
+    ) -> tyde_process_env::launch::ExecutionScope {
+        const CANCELLED_RESTART: &str = "Project entry cancelled. Your project is unchanged.";
+        let running = self.backend.take().expect("backend must be running");
+        let events = self.events.take().expect("backend events must be open");
+        let session_id = running.session_id();
+        let (cancel, cancel_requests) = tokio::sync::watch::channel(BackendRestartCancel::None);
+        let (stopped_tx, mut stopped_rx) = tokio::sync::watch::channel(false);
+        let mut commit_cancel = cancel.subscribe();
+        let restart = restart_backend_session::<B, _, _>(
+            session_id,
+            self.config.clone(),
+            relocation,
+            (running, events),
+            |(backend, events): (B, EventStream)| async move {
+                shut_down_until_exited(backend.shutdown(), events).await;
+                stopped_tx.send_replace(true);
+            },
+            Box::pin(async move {
+                commit_cancel
+                    .wait_for(|request| *request == BackendRestartCancel::Restore)
+                    .await
+                    .expect("the test holds the cancel sender");
+                Err(CANCELLED_RESTART.to_owned())
+            }),
+            cancel_requests,
+        );
+        tokio::pin!(restart);
+        let mut stopped = false;
+        let mut launched = std::collections::HashSet::new();
+        let mut hung = Vec::new();
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut restart => break outcome,
+                _ = stopped_rx.changed(), if !stopped => stopped = *stopped_rx.borrow(),
+                children = direct_child_processes(), if stopped && launched.is_empty() => {
+                    let candidates = children
+                        .difference(baseline)
+                        .copied()
+                        .filter(|pid| has_piped_stdin(*pid))
+                        .collect();
+                    let providers = bubblewrap_workloads(&candidates).await;
+                    if !providers.is_empty() {
+                        for pid in providers {
+                            hung.extend(stop_process_tree(pid).await);
+                        }
+                        launched = candidates;
+                        cancel.send_replace(BackendRestartCancel::Restore);
+                    }
+                }
+            }
+        };
+        let settled = match outcome {
+            BackendRestartOutcome::Restored { binding, error } => {
+                assert_eq!(
+                    error, CANCELLED_RESTART,
+                    "only the cancellation may return the session to its source"
+                );
+                #[cfg(target_os = "linux")]
+                for pid in launched.iter().chain(&hung) {
+                    process_exited(*pid).await;
+                }
+                eprintln!("cancelled restart: restored to the source");
+                binding
+            }
+            BackendRestartOutcome::Moved(_) => panic!("a cancelled restart must not move"),
+            BackendRestartOutcome::Refused { error, .. } => panic!("restart refused: {error}"),
+            BackendRestartOutcome::Abandoned => panic!("restart was abandoned"),
+            BackendRestartOutcome::Lost(error) => panic!("restart lost the session: {error}"),
+        };
+        self.backend = Some(settled.backend);
+        self.events = Some(settled.events);
+        settled.scope
     }
 
     pub fn bubblewrap_parent(&self) -> &Path {
@@ -3952,6 +4090,174 @@ pub async fn wait_for_process_probe<B: Backend>(host: &mut Harness<B>, probe: &P
             );
         }
     }
+}
+
+/// This test's live child processes, excluding the `ps` taking the sample.
+pub async fn direct_child_processes() -> std::collections::HashSet<u32> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,stat=,comm="])
+        .output()
+        .await
+        .expect("read process table");
+    assert!(output.status.success(), "cannot inspect child processes");
+    let owner = std::process::id().to_string();
+    String::from_utf8(output.stdout)
+        .expect("process table encoding")
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields[1] == owner && !fields[2].starts_with('Z') && fields[3] != "ps")
+                .then(|| fields[0].parse().expect("pid"))
+        })
+        .collect()
+}
+
+/// A provider converses over a stdin pipe. One-shot relocation and quota
+/// helpers do not, and hanging one of those would wedge the move instead.
+fn has_piped_stdin(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/fd/0")).is_ok_and(|target| {
+        let target = target.to_string_lossy();
+        target.starts_with("pipe:") || target.starts_with("socket:")
+    })
+}
+
+/// The native commands `runner.py inside` started beneath `roots`. Everything
+/// above them is Tyde's own supervision, which has to stay responsive to kill
+/// a hung provider.
+async fn bubblewrap_workloads(roots: &std::collections::HashSet<u32>) -> Vec<u32> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,args="])
+        .output()
+        .await
+        .expect("read process table");
+    assert!(output.status.success(), "cannot inspect the process tree");
+    let table = String::from_utf8_lossy(&output.stdout);
+    let processes = table
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: u32 = fields.next().expect("pid").parse().expect("pid");
+            let parent: u32 = fields.next().expect("ppid").parse().expect("ppid");
+            (pid, parent, fields.collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
+    let mut within = roots.clone();
+    loop {
+        let known = within.len();
+        for (pid, parent, _) in &processes {
+            if within.contains(parent) {
+                within.insert(*pid);
+            }
+        }
+        if within.len() == known {
+            break;
+        }
+    }
+    let supervisors = processes
+        .iter()
+        .filter(|(pid, _, args)| {
+            within.contains(pid)
+                && args
+                    .windows(2)
+                    .any(|pair| pair[0].ends_with("/runner.py") && pair[1] == "inside")
+        })
+        .map(|(pid, _, _)| *pid)
+        .collect::<std::collections::HashSet<_>>();
+    processes
+        .iter()
+        .filter(|(_, parent, _)| supervisors.contains(parent))
+        .map(|(pid, _, _)| *pid)
+        .collect()
+}
+
+fn signal_processes(pids: &[u32], signal: libc::c_int) {
+    for pid in pids {
+        // SAFETY: `kill` takes no pointers.
+        if unsafe { libc::kill(*pid as libc::pid_t, signal) } != 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "cannot signal a process: {error}"
+            );
+        }
+    }
+}
+
+/// Stops a process and its descendants, parents first so that a stopped
+/// process cannot add another descendant.
+async fn stop_process_tree(root: u32) -> Vec<u32> {
+    let mut stopped = Vec::new();
+    let mut pending = vec![root];
+    while !pending.is_empty() {
+        signal_processes(&pending, libc::SIGSTOP);
+        stopped.append(&mut pending);
+        let output = tokio::process::Command::new("ps")
+            .args(["-eo", "pid=,ppid="])
+            .output()
+            .await
+            .expect("read process tree");
+        assert!(output.status.success(), "cannot inspect the process tree");
+        pending = String::from_utf8(output.stdout)
+            .expect("process table encoding")
+            .lines()
+            .filter_map(|line| {
+                let (pid, parent) = line.trim().split_once(char::is_whitespace)?;
+                let pid: u32 = pid.parse().expect("pid");
+                let parent: u32 = parent.trim().parse().expect("parent pid");
+                (stopped.contains(&parent) && !stopped.contains(&pid)).then_some(pid)
+            })
+            .collect();
+    }
+    stopped
+}
+
+/// Resolves once a process has exited, even one that is not this process's
+/// child: a provider sits beneath Tyde's Bubblewrap supervisor.
+#[cfg(target_os = "linux")]
+async fn process_exited(pid: u32) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: `pidfd_open` takes no pointers.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "cannot watch a process: {error}"
+            );
+            return;
+        }
+        // SAFETY: the kernel just returned this descriptor; nothing else owns it.
+        let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as libc::c_int) };
+        let mut exit = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `exit` outlives the call and the count matches.
+        while unsafe { libc::poll(&mut exit, 1, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "cannot watch a process: {error}"
+            );
+        }
+    })
+    .await
+    .expect("process exit watcher");
+}
+
+/// Reads the kernel's state in-process so the answer describes this instant,
+/// not the moment a `ps` child finally samples the table.
+fn process_is_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let (_, fields) = stat.rsplit_once(") ").expect("process stat format");
+    !matches!(fields.chars().next(), Some('Z' | 'X'))
 }
 
 pub async fn running_group_members(group: i32) -> Vec<u32> {

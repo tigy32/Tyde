@@ -880,7 +880,9 @@ schedules entry. `tyde_move_to_project` enters an existing workbench or returns
 to its canonical parent. After scheduling entry, the agent must end its turn
 immediately, without editing or requesting review. At the safe idle boundary,
 Tyde moves the backend workspace and saved conversation together, emits the
-canonical project assignment to clients, then continues automatically. Reviews
+canonical project assignment to clients, then continues automatically. Crossing
+a Bubblewrap boundary restarts the backend process inside the destination and
+resumes the same native session; the agent keeps its identity. Reviews
 follow that assignment, never the shell directory. Coordinators create only
 and spawn workers with the returned project id. Team, workflow, and swarm
 members cannot move independently. Independent Tyde children must be closed

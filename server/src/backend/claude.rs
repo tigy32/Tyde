@@ -14762,6 +14762,45 @@ fn claude_workspace_sessions_dir(workspace_root: &str) -> Result<PathBuf, String
     Ok(directory)
 }
 
+/// Moves one transcript and its sub-agent directory. There is never a copy,
+/// because two transcripts for one session would diverge on later resumes.
+async fn move_claude_session_files(
+    session_id: &str,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
+    let transcript = format!("{id}.jsonl");
+    let target = destination.join(&transcript);
+    tokio_fs::create_dir_all(destination)
+        .await
+        .map_err(|error| format!("Cannot prepare Claude destination index: {error}"))?;
+    if tokio_fs::try_exists(&target)
+        .await
+        .map_err(|error| format!("Cannot inspect Claude destination index: {error}"))?
+    {
+        return Err(
+            "Destination already contains a Claude conversation with this identity".to_owned(),
+        );
+    }
+    tokio_fs::rename(source.join(&transcript), &target)
+        .await
+        .map_err(|error| format!("Cannot move Claude conversation: {error}"))?;
+    match tokio_fs::rename(source.join(&id), destination.join(&id)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            let error = format!("Cannot move Claude sub-agent transcripts: {error}");
+            match tokio_fs::rename(&target, source.join(&transcript)).await {
+                Ok(()) => Err(error),
+                Err(restore) => Err(format!(
+                    "{error}; restoring the transcript failed: {restore}"
+                )),
+            }
+        }
+    }
+}
+
 fn claude_session_file_path(workspace_root: &str, session_id: &str) -> Result<PathBuf, String> {
     let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
     Ok(claude_workspace_sessions_dir(workspace_root)?.join(format!("{id}.jsonl")))
@@ -17143,6 +17182,25 @@ pub(crate) fn forward_passive_rate_limit_event(
 }
 
 impl Backend for ClaudeBackend {
+    async fn relocate_stopped_session(
+        session_id: &SessionId,
+        relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        // Claude finds a session through the encoded directory it runs in, and
+        // inside a namespace that directory need not match the host root.
+        let index = |target: &crate::backend::BackendExecutionTarget| {
+            target
+                .scope
+                .run_sync(|| claude_workspace_sessions_dir(&pick_workspace_root(&target.roots)?))
+        };
+        let source = index(&relocation.source)?;
+        let destination = index(&relocation.destination)?;
+        if source == destination {
+            return Ok(());
+        }
+        move_claude_session_files(&session_id.0, &source, &destination).await
+    }
+
     fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
         for category in categories {
             match category {
@@ -17181,6 +17239,7 @@ impl Backend for ClaudeBackend {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::RestartInWorkspace,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ForkSession,
             tyde_agent_adapter::BackendCapability::ImageInput,

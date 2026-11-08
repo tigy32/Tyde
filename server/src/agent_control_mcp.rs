@@ -1938,7 +1938,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Create a git workbench under the authenticated caller's project. Choose action=enter to create and schedule moving yourself into it; finish this turn immediately without editing or requesting review, and Tyde will move your conversation and automatically continue in that project. Choose action=create_only (the default) when coordinating workers; it leaves your project unchanged. Never work in a workbench just by changing shell directories. Writable host/project swarms may create only, within their explicit workspace scope. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Native workbenches disclose but never copy uncommitted and untracked parent changes; Bubblewrap workbenches clone the parent's whole working tree (including ignored build outputs) at its current HEAD and reject any other base_ref. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
+        description = "Create a git workbench under the authenticated caller's project. Choose action=enter to create and schedule moving yourself into it; finish this turn immediately without editing or requesting review, and Tyde will move your conversation and automatically continue in that project (a Bubblewrap workbench restarts your backend process inside it and resumes the same session). Choose action=create_only (the default) when coordinating workers; it leaves your project unchanged. Never work in a workbench just by changing shell directories. Writable host/project swarms may create only, within their explicit workspace scope. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Native workbenches disclose but never copy uncommitted and untracked parent changes; Bubblewrap workbenches clone the parent's whole working tree (including ignored build outputs) at its current HEAD and reject any other base_ref. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
     )]
     async fn tyde_create_workbench(
         &self,
@@ -1957,7 +1957,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Move yourself or an authorized agent into any existing project or workbench on this host, preserving the conversation. Use project_id from tyde_config_list_projects; null or omitted means Home and retains workspace roots. Omit agent_id for yourself: entry is scheduled at the end of your turn, so finish immediately without editing or requesting review; Tyde updates backend workspace, UI project, and review target together, then continues automatically. An ordinary Agent may move only itself or direct children; Orchestrator and Root retain host-wide agent control. Other agents move immediately and must be idle. Close the moving agent’s children and background work first. Team, workflow, swarm, and Tychat agents cannot move independently."
+        description = "Move yourself or an authorized agent into any existing project or workbench on this host, preserving the conversation. Use project_id from tyde_config_list_projects; null or omitted means Home and retains workspace roots. Omit agent_id for yourself: entry is scheduled at the end of your turn, so finish immediately without editing or requesting review; Tyde updates backend workspace, UI project, and review target together, then continues automatically; crossing a Bubblewrap boundary restarts the backend process in the destination and resumes the same session. An ordinary Agent may move only itself or direct children; Orchestrator and Root retain host-wide agent control. Other agents move immediately and must be idle. Close the moving agent’s children and background work first. Team, workflow, swarm, and Tychat agents cannot move independently."
     )]
     async fn tyde_move_to_project(
         &self,
@@ -3397,9 +3397,16 @@ async fn do_create_workbench(
         ));
     }
     if input.action == protocol::WorkbenchCreateAction::Enter {
-        host.validate_agent_project_entry(caller).await?;
-        if host.selected_workbench_engine().await? == protocol::WorkbenchEngine::Bubblewrap {
-            return Err("Bubblewrap workbenches require a new agent process. Use create_only and spawn a new agent in the returned project; live namespace transfer is unsupported".to_owned());
+        let handle = host.validate_agent_project_entry(caller).await?;
+        let start = handle.snapshot();
+        let leaves_bubblewrap = host
+            .project_move_source(start.project_id.as_ref())
+            .await?
+            .is_some_and(|source| crate::workbench::bubblewrap_environment(&source).is_some());
+        if leaves_bubblewrap
+            || host.selected_workbench_engine().await? == protocol::WorkbenchEngine::Bubblewrap
+        {
+            crate::workbench::require_backend_restart_capability(start.backend_kind)?;
         }
     }
     let branch = input.branch.trim();

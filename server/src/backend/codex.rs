@@ -9,7 +9,7 @@ use std::io::{Read, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
@@ -22830,6 +22830,7 @@ pub struct CodexBackend {
     steer_tx: mpsc::UnboundedSender<CodexSteer>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     compaction_handle: Arc<std::sync::Mutex<Option<CodexCommandHandle>>>,
+    resume_startup: Option<CodexResumeStartupGuard>,
 }
 
 struct CodexSettingsUpdate {
@@ -23226,6 +23227,7 @@ impl CodexBackend {
                 session_id: backend_session_id,
                 compaction_handle,
                 relocation_wake,
+                resume_startup: None,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -24166,6 +24168,23 @@ struct CodexStartupCancelGuard(
     crate::backend::subprocess::ProcessOwner,
 );
 
+/// A resumed backend is returned before its app-server adopts the saved thread.
+/// Until then the startup task is waiting on the provider and cannot see the
+/// backend go away, so losing the backend must stop the provider for it.
+struct CodexResumeStartupGuard {
+    settled: Arc<AtomicBool>,
+    processes: crate::backend::subprocess::ProcessOwner,
+}
+
+impl Drop for CodexResumeStartupGuard {
+    fn drop(&mut self) {
+        if !self.settled.load(Ordering::SeqCst) {
+            self.processes.kill_all();
+            tracing::info!("Codex pending native restore cancelled");
+        }
+    }
+}
+
 fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     crate::steering::write_codex_steering_tempfile(content)
 }
@@ -24223,6 +24242,14 @@ fn codex_raw_event_message(value: &Value, default_message: &str) -> String {
 }
 
 impl Backend for CodexBackend {
+    async fn relocate_stopped_session(
+        _session_id: &SessionId,
+        _relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        // Codex resumes a thread by its id alone.
+        Ok(())
+    }
+
     fn resolve_tier_config(
         schema: Option<&SessionSettingsSchema>,
         selected_values: &protocol::SessionSettingsValues,
@@ -24293,6 +24320,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::NativeSkillContentCollisions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::RestartInWorkspace,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ForkSession,
             tyde_agent_adapter::BackendCapability::ImageInput,
@@ -24395,30 +24423,37 @@ impl Backend for CodexBackend {
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
         let transcript_session_id = Arc::clone(&backend_session_id);
+        let startup_processes = crate::backend::subprocess::ProcessOwner::child();
+        let resume_settled = Arc::new(AtomicBool::new(false));
+        let resume_startup = CodexResumeStartupGuard {
+            settled: Arc::clone(&resume_settled),
+            processes: startup_processes.clone(),
+        };
 
         crate::backend::subprocess::spawn(async move {
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
-            let (session, mut raw_events) = match CodexSession::spawn_with_mode(
-                &workspace_roots,
-                None,
-                &config.startup_mcp_servers,
-                combined_instructions.as_deref(),
-                CodexSessionSpawnOptions {
-                    relocation_wake: task_relocation_wake,
-                    ephemeral: false,
-                    access_mode: config.resolved_spawn_config.access_mode,
-                    subagent_emitter: None,
-                    execution_mode: BackendExecutionMode::Agent,
-                    installed_provider_version: config.provider_version.as_deref(),
-                    excluded_tool_categories: &config
-                        .resolved_spawn_config
-                        .excluded_tool_categories,
-                    selected_skills: &config.resolved_spawn_config.skills,
-                    skill_selection: config.resolved_spawn_config.skill_selection,
-                },
-            )
-            .await
+            let (session, mut raw_events) = match startup_processes
+                .scope(CodexSession::spawn_with_mode(
+                    &workspace_roots,
+                    None,
+                    &config.startup_mcp_servers,
+                    combined_instructions.as_deref(),
+                    CodexSessionSpawnOptions {
+                        relocation_wake: task_relocation_wake,
+                        ephemeral: false,
+                        access_mode: config.resolved_spawn_config.access_mode,
+                        subagent_emitter: None,
+                        execution_mode: BackendExecutionMode::Agent,
+                        installed_provider_version: config.provider_version.as_deref(),
+                        excluded_tool_categories: &config
+                            .resolved_spawn_config
+                            .excluded_tool_categories,
+                        selected_skills: &config.resolved_spawn_config.skills,
+                        skill_selection: config.resolved_spawn_config.skill_selection,
+                    },
+                ))
+                .await
             {
                 Ok(value) => value,
                 Err(err) => {
@@ -24470,6 +24505,7 @@ impl Backend for CodexBackend {
                 session.shutdown().await;
                 return;
             }
+            resume_settled.store(true, Ordering::SeqCst);
 
             let mut normalization_failures = HashMap::new();
             *task_compaction_handle
@@ -24583,6 +24619,7 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 compaction_handle,
                 relocation_wake,
+                resume_startup: Some(resume_startup),
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -24883,6 +24920,7 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 compaction_handle,
                 relocation_wake,
+                resume_startup: None,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
                 codex_transcript_event_metadata(&transcript_session_id, event)
@@ -25125,6 +25163,6 @@ impl Backend for CodexBackend {
     }
 
     async fn shutdown(self) {
-        drop(self);
+        drop(self.resume_startup);
     }
 }

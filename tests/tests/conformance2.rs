@@ -18,7 +18,10 @@ use protocol::{
     ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
 };
 use serde_json::Value;
-use server::backend::{Backend, SendOutcome, SteerOutcome, TokenUsageTrackingMode};
+use server::backend::{
+    Backend, BackendExecutionTarget, BackendSessionRelocation, SendOutcome, SteerOutcome,
+    TokenUsageTrackingMode,
+};
 use tyde_agent_adapter::BackendCapability;
 use uuid::Uuid;
 
@@ -168,7 +171,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_question_usage_accounting" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_feedback_analysis"
+                    "real_async_user_question" | "real_user_question" | "real_question_usage_accounting" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_bubblewrap_session_move" | "real_feedback_analysis"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -184,8 +187,8 @@ macro_rules! conformance2_scenario {
                 grok,
                 server::backend::grok::GrokBackend,
                 Profile::new(
-                    &["grok-4.6", "grok-4.6-build"],
-                    &[("model", "grok-4.6"), ("mode", "low")]
+                    &["grok-4.7", "grok-4.7-build"],
+                    &[("model", "grok-4.7"), ("mode", "low")]
                 )
             );
             provider!(
@@ -18238,6 +18241,164 @@ async fn collect_owned_background_turn<B: Backend>(host: &mut Harness<B>, prompt
             return turn;
         }
     }
+}
+
+conformance2_scenario!(
+    real_bubblewrap_session_move,
+    [BackendCapability::RestartInWorkspace]
+);
+
+fn session_move_prompt(
+    phase: &str,
+    root: &str,
+    marker: &str,
+    namespace_test: &str,
+    host_namespace: &str,
+) -> String {
+    format!(
+        r#"Use your real shell tool with the default workspace cwd to execute this exact Python 3 script. Do not change directory or substitute an explanation. Briefly confirm completion.
+python3 - <<'TYDE_MOVE_PY'
+import json, os, pathlib
+root = pathlib.Path({root:?})
+marker = (root / 'session-move-marker.txt').read_text() == {marker:?}
+(root / 'session-move-written.txt').write_text({phase:?})
+print(json.dumps({{'boundary': {phase:?}, 'cwd': os.getcwd() == str(root), 'marker': marker, 'namespace': os.readlink('/proc/self/ns/mnt') {namespace_test} {host_namespace:?}}}))
+TYDE_MOVE_PY"#
+    )
+}
+
+async fn real_bubblewrap_session_move<B: Backend>(host: &mut Harness<B>) {
+    let (project, _peer) = host.prepare_bubblewrap().await;
+    let backend = host.backend();
+    let logical_root = host.bubblewrap_logical_root();
+    let parent = host.bubblewrap_parent().to_path_buf();
+    let destination_root = host.workspace().to_string_lossy().into_owned();
+    let native = tempfile::tempdir().expect("native source workspace");
+    let native_root = std::fs::canonicalize(native.path())
+        .expect("canonical native source")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        native_root, logical_root,
+        "the move must cross execution paths"
+    );
+    let host_namespace = std::fs::read_link("/proc/self/ns/mnt")
+        .expect("host mount namespace")
+        .to_string_lossy()
+        .into_owned();
+    let marker_file = "session-move-marker.txt";
+    let written_file = "session-move-written.txt";
+    std::fs::write(Path::new(&native_root).join(marker_file), "native source")
+        .expect("native-only marker");
+    std::fs::write(
+        Path::new(&destination_root).join(marker_file),
+        "destination clone",
+    )
+    .expect("destination-only marker");
+
+    let secret = unique_payload();
+    let remember = remember_prompt(&secret);
+    let children_before_agent = direct_child_processes().await;
+    let agent = spawn_agent_at_roots(host, vec![native_root.clone()], &remember).await;
+    let first = collect_turn(host, &agent, &remember).await;
+
+    let entry = BackendSessionRelocation {
+        source: BackendExecutionTarget {
+            scope: tyde_process_env::launch::ExecutionScope::new(None),
+            roots: vec![native_root.clone()],
+        },
+        destination: BackendExecutionTarget {
+            scope: tyde_process_env::launch::ExecutionScope::new(Some(project)),
+            roots: vec![destination_root.clone()],
+        },
+    };
+    let exit = BackendSessionRelocation {
+        source: entry.destination.clone(),
+        destination: entry.source.clone(),
+    };
+    let cancelled_entry = entry.clone();
+
+    let inside = host.restart_session(entry, &children_before_agent).await;
+    assert!(
+        host.backend_ref().session_id() == agent.session_id,
+        "{backend:?}: entry must resume the same native session"
+    );
+    let entered_recall = inside.run(ask(host, &agent, recall_prompt())).await;
+    assert!(
+        entered_recall.final_text().contains(&secret),
+        "{backend:?}: the conversation did not survive entering the workbench"
+    );
+    let entered_prompt = session_move_prompt(
+        "entered",
+        &logical_root,
+        "destination clone",
+        "!=",
+        &host_namespace,
+    );
+    let entered = inside.run(ask(host, &agent, &entered_prompt)).await;
+    assert_bubblewrap_process_output(&entered, "entered", &["cwd", "marker", "namespace"]);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&destination_root).join(written_file))
+            .expect("provider write inside the destination clone"),
+        "entered"
+    );
+    assert!(
+        !Path::new(&native_root).join(written_file).exists() && !parent.join(written_file).exists(),
+        "{backend:?}: the restarted process must write only inside the destination"
+    );
+
+    let outside = host.restart_session(exit, &children_before_agent).await;
+    assert!(
+        host.backend_ref().session_id() == agent.session_id,
+        "{backend:?}: exit must resume the same native session"
+    );
+    let returned_recall = outside.run(ask(host, &agent, recall_prompt())).await;
+    assert!(
+        returned_recall.final_text().contains(&secret),
+        "{backend:?}: the conversation did not survive leaving the workbench"
+    );
+    let returned_prompt = session_move_prompt(
+        "returned",
+        &native_root,
+        "native source",
+        "==",
+        &host_namespace,
+    );
+    let returned = outside.run(ask(host, &agent, &returned_prompt)).await;
+    assert_bubblewrap_process_output(&returned, "returned", &["cwd", "marker", "namespace"]);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&native_root).join(written_file))
+            .expect("provider write back in the native source"),
+        "returned"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&destination_root).join(written_file))
+            .expect("destination keeps its own state"),
+        "entered",
+        "{backend:?}: the returned process must not write inside the workbench"
+    );
+    let settled = host
+        .restart_session_cancelled_during_resume(cancelled_entry, &children_before_agent)
+        .await;
+    assert!(
+        host.backend_ref().session_id() == agent.session_id,
+        "{backend:?}: a cancelled entry must keep the same native session"
+    );
+    let settled_recall = settled.run(ask(host, &agent, recall_prompt())).await;
+    assert!(
+        settled_recall.final_text().contains(&secret),
+        "{backend:?}: the conversation did not survive a cancelled entry"
+    );
+    assert_universal_contract(&[
+        first,
+        entered_recall,
+        entered,
+        returned_recall,
+        returned,
+        settled_recall,
+    ]);
+    let shutdown = settled.run(close_agent(host, &agent)).await;
+    assert_no_error_message("Bubblewrap session move shutdown", &shutdown);
 }
 
 conformance2_scenario!(real_bubblewrap_workbench, []);

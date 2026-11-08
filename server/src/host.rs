@@ -2333,6 +2333,7 @@ impl HostHandle {
                     config.mock_launch = state
                         .usage_wakeup_mock_script
                         .take()
+                        .map(Box::new)
                         .map(crate::backend::mock::MockLaunch::Script);
                 }
                 config
@@ -2604,7 +2605,9 @@ impl HostHandle {
     ) -> MockLaunchReservation {
         self.reserve_next_mock_launch_behavior(
             expected_name,
-            PendingMockLaunchBehavior::Launch(crate::backend::mock::MockLaunch::Script(script)),
+            PendingMockLaunchBehavior::Launch(crate::backend::mock::MockLaunch::Script(Box::new(
+                script,
+            ))),
         )
         .await
     }
@@ -2659,7 +2662,7 @@ impl HostHandle {
                     (
                         name,
                         PendingMockLaunchBehavior::Launch(
-                            crate::backend::mock::MockLaunch::Script(script),
+                            crate::backend::mock::MockLaunch::Script(Box::new(script)),
                         ),
                     )
                 })
@@ -8453,8 +8456,12 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     .ok_or("Destination project no longer exists")
             })
             .transpose()?;
-        self.validate_native_project_move(start.project_id.as_ref(), destination.as_ref())
-            .await?;
+        self.validate_project_move_execution(
+            start.backend_kind,
+            start.project_id.as_ref(),
+            destination.as_ref(),
+        )
+        .await?;
         if start.origin == AgentOrigin::Tychat {
             return Err("The Tychat agent belongs to the host, not a project".into());
         }
@@ -8507,7 +8514,9 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             // Removing the assignment must not change the conversation's workspace.
             None => handle.snapshot().workspace_roots,
         };
-        handle.move_to_project(project_id.cloned(), roots).await
+        handle
+            .move_to_project(project_id.cloned(), destination, roots)
+            .await
     }
 
     pub(crate) async fn validate_agent_project_entry(
@@ -8573,38 +8582,41 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             }
         };
 
-        self.validate_native_project_move(start.project_id.as_ref(), None)
-            .await?;
+        self.project_move_source(start.project_id.as_ref()).await?;
         Ok(handle)
     }
 
-    async fn validate_native_project_move(
+    pub(crate) async fn project_move_source(
         &self,
         source_id: Option<&ProjectId>,
-        destination: Option<&Project>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Project>, String> {
         let store = {
             self.state
                 .with(move |state| state.project_store.clone())
                 .await
         };
-        let source = match source_id {
-            Some(id) => Some(
+        source_id
+            .map(|id| {
                 store
                     .get(id)
-                    .ok_or_else(|| "Source project no longer exists".to_owned())?,
-            ),
-            None => None,
-        };
-        if source
-            .as_ref()
-            .is_some_and(|project| crate::workbench::bubblewrap_environment(project).is_some())
-            || destination
-                .is_some_and(|project| crate::workbench::bubblewrap_environment(project).is_some())
-        {
-            return Err("Moving live conversations into or out of Bubblewrap workbenches is unsupported; create a new session in the destination project".to_owned());
+                    .ok_or_else(|| "Source project no longer exists".to_owned())
+            })
+            .transpose()
+    }
+
+    async fn validate_project_move_execution(
+        &self,
+        backend_kind: protocol::BackendKind,
+        source_id: Option<&ProjectId>,
+        destination: Option<&Project>,
+    ) -> Result<bool, String> {
+        let source = self.project_move_source(source_id).await?;
+        let restarts_backend =
+            crate::workbench::requires_backend_restart(source.as_ref(), destination);
+        if restarts_backend {
+            crate::workbench::require_backend_restart_capability(backend_kind)?;
         }
-        Ok(())
+        Ok(restarts_backend)
     }
 
     pub(crate) async fn schedule_agent_project_move(
@@ -8633,7 +8645,12 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             )?;
         }
         let destination = project_id.and_then(|id| project_store.get(id));
-        self.validate_native_project_move(current_id.as_ref(), destination.as_ref())
+        let restarts_backend = self
+            .validate_project_move_execution(
+                handle.snapshot().backend_kind,
+                current_id.as_ref(),
+                destination.as_ref(),
+            )
             .await?;
         tracing::info!(
             caller_has_project = current_id.is_some(),
@@ -8684,6 +8701,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 project_id: project_id.cloned(),
                 project_store,
                 guard: move_guard,
+                restarts_backend,
             })
             .await
     }

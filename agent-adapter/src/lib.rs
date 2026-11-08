@@ -86,6 +86,10 @@ exhaustive_capabilities! {
     ListSessions,
     ResumeSession,
     SetWorkspaceRoots,
+    // A stopped session can resume in a different execution environment, such
+    // as a Bubblewrap workbench whose mount namespace a live process cannot
+    // enter. Proven by real_bubblewrap_session_move.
+    RestartInWorkspace,
     SetMultipleWorkspaceRoots,
     ForkSession,
     ImageInput,

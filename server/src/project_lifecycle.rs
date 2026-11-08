@@ -9,6 +9,7 @@ use super::{HostHandle, ProjectCatalogHandle};
 // owner of its backend mutation, without a catalog/agent request cycle.
 pub(crate) struct ProjectEntryExecution {
     pub(crate) roots: Vec<String>,
+    pub(crate) destination: Option<Box<protocol::Project>>,
     completion: Option<oneshot::Sender<ProjectEntrySettlement>>,
 }
 
@@ -100,23 +101,33 @@ pub(crate) async fn run_entry(
     let roots = async {
         for id in source.iter().chain(destination.iter()) {
             let project = catalog.get(id).ok_or("Project no longer exists")?;
-            if project.is_removing_workbench() { return Err("Workbench removal is in progress".to_owned()); }
-            if crate::workbench::bubblewrap_environment(&project).is_some() {
-                return Err("Moving live conversations into or out of Bubblewrap workbenches is unsupported; create a new session in the destination project".to_owned());
+            if project.is_removing_workbench() {
+                return Err("Workbench removal is in progress".to_owned());
             }
         }
         match destination {
-            None => Ok(workspace_roots),
+            None => Ok((workspace_roots, None)),
             Some(id) => {
-                let roots = catalog.get(&id).ok_or("Destination project was removed before entry")?
-                    .root_paths().into_iter().map(|root| root.0).collect();
-                tokio::task::spawn_blocking(move || crate::backend::validate_local_workspace_roots(roots))
-                    .await.map_err(|_| "Project root validation worker stopped".to_owned())?
+                let project = catalog
+                    .get(&id)
+                    .ok_or("Destination project was removed before entry")?;
+                let roots = project
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect();
+                let roots = tokio::task::spawn_blocking(move || {
+                    crate::backend::validate_local_workspace_roots(roots)
+                })
+                .await
+                .map_err(|_| "Project root validation worker stopped".to_owned())??;
+                Ok((roots, Some(project)))
             }
         }
-    }.await;
-    let roots = match roots {
-        Ok(roots) => roots,
+    }
+    .await;
+    let (roots, destination) = match roots {
+        Ok(target) => target,
         Err(error) => {
             let _ = reply.send(Err(error));
             return;
@@ -126,6 +137,7 @@ pub(crate) async fn run_entry(
     if reply
         .send(Ok(ProjectEntryExecution {
             roots,
+            destination: destination.map(Box::new),
             completion: Some(completion),
         }))
         .is_ok()

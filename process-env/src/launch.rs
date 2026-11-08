@@ -24,12 +24,52 @@ pub async fn project_scope<F: std::future::Future>(
     project: Option<protocol::Project>,
     future: F,
 ) -> F::Output {
-    EXECUTION_ENVIRONMENT
-        .scope(
-            Arc::default(),
-            WORKBENCH_PROJECT.scope(project, Box::pin(future)),
-        )
-        .await
+    ExecutionScope::new(project).run(future).await
+}
+
+/// One workspace's execution binding, re-enterable from a task whose ambient
+/// scope was fixed before the workspace changed.
+#[derive(Clone)]
+pub struct ExecutionScope {
+    project: Option<protocol::Project>,
+    environment: Arc<std::sync::OnceLock<Arc<ExecutionEnvironment>>>,
+}
+
+impl ExecutionScope {
+    pub fn new(project: Option<protocol::Project>) -> Self {
+        Self {
+            project,
+            environment: Arc::default(),
+        }
+    }
+
+    pub fn capture() -> Self {
+        Self {
+            project: current_project(),
+            environment: EXECUTION_ENVIRONMENT
+                .try_with(Arc::clone)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn project(&self) -> Option<&protocol::Project> {
+        self.project.as_ref()
+    }
+
+    pub async fn run<F: std::future::Future>(&self, future: F) -> F::Output {
+        EXECUTION_ENVIRONMENT
+            .scope(
+                Arc::clone(&self.environment),
+                WORKBENCH_PROJECT.scope(self.project.clone(), Box::pin(future)),
+            )
+            .await
+    }
+
+    pub fn run_sync<T>(&self, operation: impl FnOnce() -> T) -> T {
+        EXECUTION_ENVIRONMENT.sync_scope(Arc::clone(&self.environment), || {
+            WORKBENCH_PROJECT.sync_scope(self.project.clone(), operation)
+        })
+    }
 }
 
 pub fn project_scope_sync<T>(

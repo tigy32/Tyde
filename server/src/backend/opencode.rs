@@ -25,6 +25,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::ListSessions,
         BackendCapability::ResumeSession,
         BackendCapability::SetWorkspaceRoots,
+        BackendCapability::RestartInWorkspace,
         BackendCapability::SetMultipleWorkspaceRoots,
         BackendCapability::ImageInput,
         BackendCapability::SessionSettings,
@@ -92,26 +93,27 @@ pub(crate) async fn relocate_workspace_session(
     let previous = tyde_process_env::launch::WorkspacePath::host(previous)?.execution_string()?;
     let destination =
         tyde_process_env::launch::WorkspacePath::host(destination)?.execution_string()?;
-    let previous = previous.as_str();
-    let destination = destination.as_str();
-    let before = export_session(program, session_id, previous).await?;
-    if before
-        .pointer("/info/id")
-        .and_then(serde_json::Value::as_str)
-        != Some(session_id)
-        || before
-            .pointer("/info/directory")
-            .and_then(serde_json::Value::as_str)
-            != Some(previous)
-    {
-        return Err("OpenCode conversation identity or directory changed concurrently".to_owned());
-    }
+    let scope = tyde_process_env::launch::ExecutionScope::capture();
+    relocate_between_scopes(
+        program,
+        session_id,
+        (&scope, &previous),
+        (&scope, &destination),
+    )
+    .await
+}
+
+async fn import_session(
+    program: &str,
+    export: &serde_json::Value,
+    workspace_root: &str,
+) -> Result<(), String> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|error| format!("Cannot prepare private OpenCode export: {error}"))?;
-    serde_json::to_writer(file.as_file_mut(), &before)
+    serde_json::to_writer(file.as_file_mut(), export)
         .map_err(|error| format!("Cannot save private OpenCode export: {error}"))?;
     let output = crate::process_env::command(program)?
-        .current_dir(destination)
+        .current_dir(workspace_root)
         .arg("import")
         .arg(file.path())
         .output()
@@ -123,21 +125,65 @@ pub(crate) async fn relocate_workspace_session(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let after = export_session(program, session_id, destination).await?;
-    if after
+    Ok(())
+}
+
+/// OpenCode binds a session to the directory it sees, so each step runs in the
+/// namespace that owns that directory.
+async fn relocate_between_scopes(
+    program: &str,
+    session_id: &str,
+    (source_scope, previous): (&tyde_process_env::launch::ExecutionScope, &str),
+    (destination_scope, destination): (&tyde_process_env::launch::ExecutionScope, &str),
+) -> Result<(), String> {
+    let before = source_scope
+        .run(export_session(program, session_id, previous))
+        .await?;
+    if before
         .pointer("/info/id")
         .and_then(serde_json::Value::as_str)
         != Some(session_id)
-        || after
+        || before
             .pointer("/info/directory")
             .and_then(serde_json::Value::as_str)
-            != Some(destination)
-        || after.get("messages") != before.get("messages")
+            != Some(previous)
     {
-        return Err("OpenCode import did not preserve conversation identity/history and acknowledge the destination".to_owned());
+        return Err("OpenCode conversation identity or directory changed concurrently".to_owned());
     }
-    tracing::info!(%session_id, %destination, "Native OpenCode import relocated session metadata and preserved every message");
-    Ok(())
+    destination_scope
+        .run(import_session(program, &before, destination))
+        .await?;
+    let verified = match destination_scope
+        .run(export_session(program, session_id, destination))
+        .await
+    {
+        Ok(after)
+            if after
+                .pointer("/info/id")
+                .and_then(serde_json::Value::as_str)
+                == Some(session_id)
+                && after
+                    .pointer("/info/directory")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(destination)
+                && after.get("messages") == before.get("messages") =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err("OpenCode import did not preserve conversation identity/history and acknowledge the destination".to_owned()),
+        Err(error) => Err(error),
+    };
+    let Err(error) = verified else {
+        tracing::info!(%destination, "Native OpenCode import relocated session metadata and preserved every message");
+        return Ok(());
+    };
+    match source_scope
+        .run(import_session(program, &before, previous))
+        .await
+    {
+        Ok(()) => Err(error),
+        Err(restore) => Err(format!("{error}; restoring the source failed: {restore}")),
+    }
 }
 
 pub(crate) async fn list_sessions(
@@ -238,6 +284,33 @@ pub(crate) fn resolve_session_settings(
 pub struct OpencodeBackend(crate::backend::acp::backend::KiroBackend);
 
 impl crate::backend::Backend for OpencodeBackend {
+    async fn relocate_stopped_session(
+        session_id: &SessionId,
+        relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        let working_directory = |target: &crate::backend::BackendExecutionTarget| {
+            let root = crate::backend::acp::adapters::stock::pick_local_workspace_root(
+                &target.roots,
+                "opencode",
+            )?;
+            target.scope.run_sync(|| {
+                tyde_process_env::launch::WorkspacePath::host(&root)?.execution_string()
+            })
+        };
+        let previous = working_directory(&relocation.source)?;
+        let destination = working_directory(&relocation.destination)?;
+        if previous == destination {
+            return Ok(());
+        }
+        relocate_between_scopes(
+            &agent_spec().command,
+            &session_id.0,
+            (&relocation.source.scope, &previous),
+            (&relocation.destination.scope, &destination),
+        )
+        .await
+    }
+
     fn default_child_workspace_roots(parent_roots: &[String]) -> Vec<String> {
         // OpenCode's native task calls omit Tyde's explicit workspace arguments.
         parent_roots.to_vec()

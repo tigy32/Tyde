@@ -1093,6 +1093,9 @@ struct Supervisor {
     /// When the account's quota was last read, so a busy session does not spawn
     /// a probe per turn.
     capacity_read_at: Option<std::time::Instant>,
+    /// The quota read in flight, which `shutdown` waits for so that the end of
+    /// the event stream still means no process of this backend remains.
+    capacity_read: Option<tokio::task::JoinHandle<()>>,
     shutdown_complete: oneshot::Sender<()>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     native_pending: BTreeMap<u64, (String, Vec<super::antigravity_stream::AgySubagent>)>,
@@ -1740,13 +1743,13 @@ impl Supervisor {
             return;
         };
         self.capacity_read_at = Some(std::time::Instant::now());
-        crate::backend::subprocess::spawn(async move {
+        self.capacity_read = Some(crate::backend::subprocess::spawn(async move {
             let state = match read_antigravity_capacity().await {
                 Ok(report) => protocol::BackendCapacityState::Known { report },
                 Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
             };
             emitter.on_backend_capacity(BackendKind::Antigravity, state);
-        });
+        }));
     }
 
     async fn set_workspace_roots(
@@ -1917,6 +1920,11 @@ impl Supervisor {
         self.native_children.abort_all();
         while self.native_children.join_next().await.is_some() {}
         process.terminate().await;
+        if let Some(read) = self.capacity_read.take()
+            && let Err(error) = read.await
+        {
+            tracing::warn!(%error, "Antigravity quota read ended abnormally");
+        }
         // Nothing to unregister: the shared config holds only the static,
         // credential-free bridge entry. Dropping the descriptor directory
         // removes this session's endpoints and bearer tokens from disk.
@@ -3186,6 +3194,14 @@ fn antigravity_brain_dir(conversations_dir: &Path) -> PathBuf {
 }
 
 impl Backend for AntigravityBackend {
+    async fn relocate_stopped_session(
+        _session_id: &SessionId,
+        _relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        // Starting with a resume id rewrites the conversation's stored roots.
+        Ok(())
+    }
+
     fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
         Some(self.inner.relocation_wake.subscribe())
     }
@@ -3278,6 +3294,7 @@ impl Backend for AntigravityBackend {
         [
             Cap::ResumeSession,
             Cap::SetWorkspaceRoots,
+            Cap::RestartInWorkspace,
             Cap::SetMultipleWorkspaceRoots,
             Cap::Interrupt,
             Cap::SessionSettings,
@@ -3735,6 +3752,7 @@ impl AntigravityBackend {
             pending_questions: Vec::new(),
             deferred_answers: VecDeque::new(),
             capacity_read_at: None,
+            capacity_read: None,
             shutdown_complete: shutdown_complete_tx,
             subagent_emitter: config.subagent_emitter.clone(),
             native_pending: BTreeMap::new(),

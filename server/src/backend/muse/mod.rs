@@ -241,6 +241,13 @@ impl MuseBackend {
 }
 
 impl Backend for MuseBackend {
+    async fn relocate_stopped_session(
+        _session_id: &SessionId,
+        _relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        Err("Muse cannot restart a conversation in another workspace".to_owned())
+    }
+
     fn compaction_capability(&self) -> super::BackendCompactionCapability {
         super::BackendCompactionCapability::native(
             super::BackendCompactionMechanism::JsonRpcRequest,

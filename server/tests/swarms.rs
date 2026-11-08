@@ -1469,8 +1469,8 @@ async fn preview_pins_stale_revisions_and_partial_launch_retry_survive_reconnect
             (
                 draft.members[0].name.clone(),
                 server::PendingMockLaunchBehavior::Launch(
-                    server::backend::mock::MockLaunch::Script(MockScript::one(MockTurn::text(
-                        "Successful approved member activation",
+                    server::backend::mock::MockLaunch::Script(Box::new(MockScript::one(
+                        MockTurn::text("Successful approved member activation"),
                     ))),
                 ),
             ),

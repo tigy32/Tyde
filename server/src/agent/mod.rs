@@ -27,9 +27,11 @@ use uuid::Uuid;
 
 use crate::backend::mock::MockBackend;
 use crate::backend::{
-    Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
-    BackendStartupError, EventStream, SendOutcome, SteerOutcome, apply_session_settings_update,
-    resolve_backend_session_settings, validate_runtime_session_settings_update,
+    Backend, BackendEvent, BackendExecutionMode, BackendExecutionTarget, BackendRestartCancel,
+    BackendRestartCommit, BackendRestartOutcome, BackendRestartRequest, BackendSession,
+    BackendSessionRelocation, BackendSpawnConfig, BackendStartupError, EventStream, RunningBackend,
+    SendOutcome, SteerOutcome, apply_session_settings_update, resolve_backend_session_settings,
+    restart_agent_backend, validate_runtime_session_settings_update,
     validate_session_settings_values, validate_startup_mcp_configuration, with_backend_type,
 };
 use crate::host::{
@@ -44,6 +46,7 @@ use crate::store::session::{
 use crate::store::transcript::{SessionJournal, TranscriptStore};
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
+use tyde_process_env::launch::ExecutionScope;
 
 pub(crate) mod customization;
 pub(crate) mod registry;
@@ -610,6 +613,7 @@ enum AgentCommand {
     },
     MoveToProject {
         project_id: Option<protocol::ProjectId>,
+        destination: Option<protocol::Project>,
         roots: Vec<String>,
         reply: oneshot::Sender<Result<AgentStartPayload, String>>,
     },
@@ -1138,6 +1142,7 @@ pub(crate) struct ScheduledProjectMove {
     pub project_id: Option<protocol::ProjectId>,
     pub project_store: Arc<crate::host::ProjectCatalogHandle>,
     pub guard: AgentProjectMoveGuard,
+    pub restarts_backend: bool,
 }
 
 #[derive(Default)]
@@ -1148,6 +1153,9 @@ struct AgentProjectMoves {
     entry_pending:
         Option<oneshot::Receiver<Result<crate::host::lifecycle::ProjectEntryExecution, String>>>,
     entry_execution: Option<Result<crate::host::lifecycle::ProjectEntryExecution, String>>,
+    /// The turn that scheduled a restart has ended, but the UI still shows it
+    /// working so the restart does not read as an idle agent.
+    idle_withheld: bool,
 }
 
 impl AgentProjectMoves {
@@ -1224,11 +1232,24 @@ enum ProjectMoveOrigin {
     },
 }
 
+type ProjectBackendRestart = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = BackendRestartOutcome<BackendHandle, RunningBackend>>
+            + Send,
+    >,
+>;
+
 enum ProjectMoveStage {
     Provider(ProjectMoveOperation),
+    BackendRestart(ProjectBackendRestart),
     Registration,
     Children(ProjectMoveOperation),
     Publication,
+}
+
+enum ProjectMoveStageResult {
+    Plain(Result<(), ProjectMoveFailure>),
+    Restart(Box<BackendRestartOutcome<BackendHandle, RunningBackend>>),
 }
 
 struct PendingAgentProjectMove {
@@ -1237,6 +1258,89 @@ struct PendingAgentProjectMove {
     stage: ProjectMoveStage,
     origin: ProjectMoveOrigin,
     readiness_epoch: u64,
+    restart_typing_published: bool,
+    restart_cancel: watch::Sender<BackendRestartCancel>,
+}
+
+struct AgentProjectMoveRequest<'a> {
+    backend: &'a mut Option<BackendHandle>,
+    events: &'a mut EventStream,
+    session_store: &'a Arc<SessionStoreHandle>,
+    session_id: Option<&'a SessionId>,
+    current_start: &'a AgentStartPayload,
+    native_registrations: &'a std::sync::atomic::AtomicUsize,
+    execution_scope: &'a ExecutionScope,
+    spawn_config: &'a BackendSpawnConfig,
+    session_settings: &'a SessionSettingsValues,
+    use_mock_backend: bool,
+    project_id: Option<protocol::ProjectId>,
+    destination: Option<protocol::Project>,
+    roots: Vec<String>,
+    restart_cancel: watch::Receiver<BackendRestartCancel>,
+}
+
+fn rejected_project_move_stage(failure: ProjectMoveFailure) -> ProjectMoveStage {
+    ProjectMoveStage::Provider(Box::pin(std::future::ready(Err(failure))))
+}
+
+fn begin_project_move_stage(request: AgentProjectMoveRequest<'_>) -> ProjectMoveStage {
+    if !crate::workbench::requires_backend_restart(
+        request.execution_scope.project(),
+        request.destination.as_ref(),
+    ) {
+        return ProjectMoveStage::Provider(begin_agent_project_move(
+            request.backend.as_mut().expect("running actor has backend"),
+            request.session_store,
+            request.session_id,
+            request.current_start,
+            request.native_registrations,
+            request.project_id,
+            request.roots,
+        ));
+    }
+    let Some(session_id) = request.session_id.cloned() else {
+        return rejected_project_move_stage(ProjectMoveFailure::Rejected(
+            "Agent has no saved conversation to move".to_owned(),
+        ));
+    };
+    if request.native_registrations.load(Ordering::SeqCst) > 0 || !request.events.is_drained() {
+        return rejected_project_move_stage(ProjectMoveFailure::Busy);
+    }
+    let running = request.backend.take().expect("running actor has backend");
+    let running_events = std::mem::replace(
+        request.events,
+        EventStream::new_backend(mpsc::unbounded_channel().1),
+    );
+    let native_session_id = running.session_id();
+    let session_store = Arc::clone(request.session_store);
+    let project_id = request.project_id;
+    let commit_roots = request.roots.clone();
+    let commit: BackendRestartCommit = Box::pin(async move {
+        session_store
+            .move_to_project(&session_id, project_id, commit_roots)
+            .await
+    });
+    let mut spawn = request.spawn_config.clone();
+    spawn.session_settings = Some(request.session_settings.clone());
+    ProjectMoveStage::BackendRestart(Box::pin(restart_agent_backend(BackendRestartRequest {
+        kind: request.current_start.backend_kind,
+        use_mock_backend: request.use_mock_backend,
+        session_id: native_session_id,
+        spawn,
+        relocation: BackendSessionRelocation {
+            source: BackendExecutionTarget {
+                scope: request.execution_scope.clone(),
+                roots: request.current_start.workspace_roots.clone(),
+            },
+            destination: BackendExecutionTarget {
+                scope: ExecutionScope::new(request.destination),
+                roots: request.roots,
+            },
+        },
+        running: (running, running_events),
+        commit,
+        cancel: request.restart_cancel,
+    })))
 }
 
 fn begin_agent_project_move(
@@ -2535,6 +2639,7 @@ impl AgentHandle {
     pub async fn move_to_project(
         &self,
         project_id: Option<protocol::ProjectId>,
+        destination: Option<protocol::Project>,
         roots: Vec<String>,
     ) -> Result<AgentStartPayload, String> {
         if !self.accepting_input.load(Ordering::SeqCst) {
@@ -2544,6 +2649,7 @@ impl AgentHandle {
         self.tx
             .send(AgentCommand::MoveToProject {
                 project_id,
+                destination,
                 roots,
                 reply,
             })
@@ -5157,6 +5263,8 @@ pub(crate) fn spawn_agent_actor(
         let mut relocation_wake = backend.workspace_relocation_wake();
         tracing::info!(target: "tyde_project_entry_diagnostic", available = relocation_wake.is_some(), "Actor captured backend relocation subscription");
         let mut backend = Some(backend);
+        // Fixed by the spawn until a restart relaunches inside another workspace.
+        let mut execution_scope = ExecutionScope::capture();
         let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
         // Last typing value the backend itself emitted. While this is true the
@@ -5834,35 +5942,63 @@ pub(crate) fn spawn_agent_actor(
                     .scheduled
                     .as_ref()
                     .expect("scheduled entry owns its execution");
-                let roots = match &mut execution {
-                    Ok(execution) => Ok(std::mem::take(&mut execution.roots)),
+                let target = match &mut execution {
+                    Ok(execution) => Ok((
+                        std::mem::take(&mut execution.roots),
+                        execution.destination.take().map(|project| *project),
+                    )),
                     Err(error) => Err(ProjectMoveFailure::Rejected(error.clone())),
                 };
-                let (roots, operation) = match roots {
-                    Ok(roots) => {
-                        let operation = begin_agent_project_move(
-                            backend.as_mut().expect("running actor has backend"),
-                            &session_store,
-                            current_session_id.as_ref(),
-                            &current_start,
-                            &actor_native_registrations,
-                            movement.project_id.clone(),
-                            roots.clone(),
-                        );
-                        (roots, operation)
+                let (restart_cancel, restart_cancel_requests) =
+                    watch::channel(BackendRestartCancel::None);
+                let (roots, stage) = match target {
+                    Ok((roots, destination)) => {
+                        let stage = begin_project_move_stage(AgentProjectMoveRequest {
+                            backend: &mut backend,
+                            events: &mut events,
+                            session_store: &session_store,
+                            session_id: current_session_id.as_ref(),
+                            current_start: &current_start,
+                            native_registrations: &actor_native_registrations,
+                            execution_scope: &execution_scope,
+                            spawn_config: &compaction_spawn_config,
+                            session_settings: &current_session_settings,
+                            use_mock_backend,
+                            project_id: movement.project_id.clone(),
+                            destination,
+                            roots: roots.clone(),
+                            restart_cancel: restart_cancel_requests,
+                        });
+                        (roots, stage)
                     }
-                    Err(error) => (
-                        Vec::new(),
-                        Box::pin(std::future::ready(Err(error))) as ProjectMoveOperation,
-                    ),
+                    Err(error) => (Vec::new(), rejected_project_move_stage(error)),
                 };
                 project_moves.pending = Some(PendingAgentProjectMove {
                     project_id: movement.project_id.clone(),
                     roots,
-                    stage: ProjectMoveStage::Provider(operation),
+                    stage,
                     origin: ProjectMoveOrigin::Scheduled { execution },
                     readiness_epoch: project_readiness_epoch,
+                    restart_typing_published: std::mem::take(&mut project_moves.idle_withheld),
+                    restart_cancel,
                 });
+            }
+            if project_moves.idle_withheld
+                && project_moves.pending.is_none()
+                && !project_entry_ready
+            {
+                project_moves.idle_withheld = false;
+                publish_backend_restart_typing(
+                    BackendRestartTypingContext {
+                        canonical_stream: &canonical_stream,
+                        event_log: &mut event_log,
+                        subscribers: &mut subscribers,
+                        replay_state: &mut replay_state,
+                        status_handle: &status_handle,
+                    },
+                    false,
+                )
+                .await;
             }
             latest_output
                 .observe_event_log(&event_log)
@@ -6105,6 +6241,7 @@ pub(crate) fn spawn_agent_actor(
                     && pause.compaction_reply.is_none()
                     && pause.compaction_operation.is_none()
                     && !resume_replay_gate_pending
+                    && backend.is_some()
                 {
                     let queued_user_work = queue
                         .iter()
@@ -6366,21 +6503,94 @@ pub(crate) fn spawn_agent_actor(
                     }
             });
             let project_move_in_flight = project_moves.pending.is_some();
+            let backend_restart_in_flight =
+                project_moves.pending.as_ref().is_some_and(|movement| {
+                    matches!(movement.stage, ProjectMoveStage::BackendRestart(_))
+                });
+            if backend_restart_in_flight
+                && let Some(movement) = project_moves.pending.as_mut()
+                && !movement.restart_typing_published
+            {
+                // The process is gone until the destination resumes, so this
+                // is the only source of working state across the move.
+                movement.restart_typing_published = true;
+                publish_backend_restart_typing(
+                    BackendRestartTypingContext {
+                        canonical_stream: &canonical_stream,
+                        event_log: &mut event_log,
+                        subscribers: &mut subscribers,
+                        replay_state: &mut replay_state,
+                        status_handle: &status_handle,
+                    },
+                    true,
+                )
+                .await;
+            }
             tokio::select! {
                 result = async {
                         match project_moves.pending.as_mut() {
                             Some(movement) => match &mut movement.stage {
-                                ProjectMoveStage::Provider(operation) | ProjectMoveStage::Children(operation) => operation.as_mut().await,
-                                ProjectMoveStage::Publication if actor_native_registrations.load(Ordering::SeqCst) == 0 => Ok(()),
+                                ProjectMoveStage::Provider(operation) | ProjectMoveStage::Children(operation) => ProjectMoveStageResult::Plain(operation.as_mut().await),
+                                ProjectMoveStage::BackendRestart(restart) => ProjectMoveStageResult::Restart(Box::new(restart.as_mut().await)),
+                                ProjectMoveStage::Publication if actor_native_registrations.load(Ordering::SeqCst) == 0 => ProjectMoveStageResult::Plain(Ok(())),
                                 ProjectMoveStage::Registration | ProjectMoveStage::Publication => std::future::pending().await,
                             },
                             None => std::future::pending().await,
                         }
                     }, if project_moves.pending.is_some() => {
+                        let result = match result {
+                            ProjectMoveStageResult::Plain(result) => result,
+                            ProjectMoveStageResult::Restart(outcome) => {
+                                let (binding, result) = match *outcome {
+                                    BackendRestartOutcome::Refused { backend: (running, running_events), error } => {
+                                        backend = Some(running);
+                                        events = running_events;
+                                        (None, Err(ProjectMoveFailure::Rejected(error)))
+                                    }
+                                    BackendRestartOutcome::Moved(binding) => (Some(binding), Ok(())),
+                                    BackendRestartOutcome::Restored { binding, error } => {
+                                        (Some(binding), Err(ProjectMoveFailure::Rejected(error)))
+                                    }
+                                    BackendRestartOutcome::Abandoned => {
+                                        relocation_wake = None;
+                                        (None, Err(ProjectMoveFailure::Rejected(crate::backend::PROJECT_ENTRY_CANCELLED.to_owned())))
+                                    }
+                                    BackendRestartOutcome::Lost(error) => {
+                                        relocation_wake = None;
+                                        (None, Err(ProjectMoveFailure::Unreconciled(error)))
+                                    }
+                                };
+                                if let Some(binding) = binding {
+                                    relocation_wake = binding.backend.workspace_relocation_wake();
+                                    let capability = binding.backend.compaction_capability();
+                                    backend = Some(binding.backend);
+                                    events = binding.events;
+                                    execution_scope = binding.scope;
+                                    if let Some(session_id) = current_session_id.as_ref() {
+                                        upsert_context_compaction_capability(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &ContextCompactionCapabilityPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                logical_session_id: session_id.clone(),
+                                                availability: crate::host::requested_compaction_availability(
+                                                    &capability,
+                                                    &crate::host::CompactionRoutingPolicy::default(),
+                                                    transcript_is_authoritative(&transcript_store, session_id).await,
+                                                ),
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                                result
+                            }
+                        };
                         let movement = project_moves.pending.as_mut().expect("project move owns its completion");
                         if result.is_ok() {
                             match movement.stage {
-                                ProjectMoveStage::Provider(_) => {
+                                ProjectMoveStage::Provider(_) | ProjectMoveStage::BackendRestart(_) => {
                                     current_start.project_id = movement.project_id.clone();
                                     current_start.workspace_roots = movement.roots.clone();
                                     overwrite_agent_start_payload(&mut event_log, &current_start);
@@ -6399,6 +6609,30 @@ pub(crate) fn spawn_agent_actor(
                         let movement_job = project_moves.pending.take().expect("project move owns its completion");
                         let mut result = result.map(|()| current_start.clone());
                         let readiness_changed = movement_job.readiness_epoch != project_readiness_epoch;
+                        let cancelled = *movement_job.restart_cancel.borrow() != BackendRestartCancel::None;
+                        if cancelled {
+                            answer_interrupts_consumed_by_cancelled_restart(&mut project_moves.held_commands);
+                        }
+                        // A delivered continuation owns the working state from
+                        // here; every other ending has nothing left to clear it.
+                        if movement_job.restart_typing_published
+                            && (!matches!(movement_job.origin, ProjectMoveOrigin::Scheduled { .. })
+                                || matches!(&result, Err(ProjectMoveFailure::Unreconciled(_) | ProjectMoveFailure::Busy))
+                                || usage_paused
+                                || cancelled)
+                        {
+                            publish_backend_restart_typing(
+                                BackendRestartTypingContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                    replay_state: &mut replay_state,
+                                    status_handle: &status_handle,
+                                },
+                                false,
+                            )
+                            .await;
+                        }
                         match movement_job.origin {
                             ProjectMoveOrigin::Scheduled { execution } => {
                                 let movement = project_moves.scheduled.take().expect("scheduled move retains its reservation");
@@ -6439,11 +6673,11 @@ pub(crate) fn spawn_agent_actor(
                                             &start,
                                         )
                                         .await;
-                                        pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
+                                        if !cancelled { pending_inputs.push_front(AgentInput::SendMessage(SendMessagePayload {
                                             message: format!("Tyde has moved this conversation into project {}. Your workspace roots are now {}. Continue the user's task in this project. Reviews target this project; do not edit another workbench by changing shell directories.",
                                                 movement.project_id.as_ref().map_or_else(|| "Home (no project)".to_owned(), ToString::to_string), current_start.workspace_roots.join(", ")),
                                             images: None, origin: Some(MessageOrigin::System), tool_response: None,
-                                        }));
+                                        })); }
                                     }
                                     Err(
                                         ProjectMoveFailure::Rejected(message)
@@ -6473,7 +6707,7 @@ pub(crate) fn spawn_agent_actor(
                                             accepting_input_task.store(false, Ordering::SeqCst);
                                             lifecycle = ActorLifecycle::Closing;
                                             close_deadline = Some(tokio::time::Instant::now());
-                                        } else {
+                                        } else if !cancelled {
                                             pending_inputs.push_front(AgentInput::SendMessage(
                                                 SendMessagePayload {
                                                     message: SCHEDULED_ENTRY_FAILED_MESSAGE.to_owned(),
@@ -6504,6 +6738,34 @@ pub(crate) fn spawn_agent_actor(
                                 };
                                 let _ = reply.send(result);
                             }
+                        }
+                        if backend.is_none() {
+                            // Only a restart that did not resume anywhere gets
+                            // here; there is no process left to wait for, and a
+                            // Close held behind the restart is answered now.
+                            let held_close = project_moves.held_commands.iter()
+                                .position(|command| matches!(command, AgentCommand::Close { .. }))
+                                .and_then(|index| project_moves.held_commands.remove(index));
+                            let reply = close_reply.take().or(match held_close {
+                                Some(AgentCommand::Close { reply }) => Some(reply),
+                                _ => None,
+                            });
+                            terminalize_live_activity(
+                                LiveActivityTerminalContext {
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    active_agent_await_ids: &mut active_agent_await_ids,
+                                },
+                                LiveActivityTerminalStatus::Stopped,
+                                "agent closed",
+                            )
+                            .await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            return;
                         }
                     }
 
@@ -6589,10 +6851,11 @@ pub(crate) fn spawn_agent_actor(
                                     .begin_verdict(supervisor_settings.settings, attempts_started);
                                 let verdict_tx = supervisor_verdict_tx.clone();
                                 let launched_at = supervisor_status.activity_counter;
+                                let scope = execution_scope.clone();
                                 crate::backend::subprocess::spawn(async move {
                                     let result = match tokio::time::timeout(
                                         supervisor::SUPERVISION_GENERATION_TIMEOUT,
-                                        supervisor::generate_supervision_verdict(request),
+                                        scope.run(supervisor::generate_supervision_verdict(request)),
                                     )
                                     .await
                                     {
@@ -6776,7 +7039,8 @@ pub(crate) fn spawn_agent_actor(
                 }
                 _ = &mut stall_sleep, if stall_deadline.is_some() => {
                     let now = Instant::now();
-                    let stalled = !supervisor_status.terminated
+                    let stalled = backend.is_some()
+                        && !supervisor_status.terminated
                         && !matches!(lifecycle, ActorLifecycle::Closing)
                         && supervisor_status.is_active()
                         // Waiting on a person is not stalling.
@@ -6857,7 +7121,7 @@ pub(crate) fn spawn_agent_actor(
                     } else {
                         events.recv_backend().await
                     }
-                } => {
+                }, if !backend_restart_in_flight => {
                         project_readiness_epoch = project_readiness_epoch.wrapping_add(1);
                     project_move_waiting_for_backend = false;
                     let Some(event) = maybe_event else {
@@ -7827,6 +8091,7 @@ pub(crate) fn spawn_agent_actor(
                     // authoritative clock lives here and not in the scheduler.
                     last_backend_event_at = Some(Instant::now());
                     let mut real_idle_transition = false;
+                    let mut withhold_idle = false;
                     snapshot_viewed_image(
                         &mut event,
                         &open_tool_requests,
@@ -7939,6 +8204,9 @@ pub(crate) fn spawn_agent_actor(
                                 completed_by_idle = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
+                                withhold_idle = project_moves.scheduled.as_ref()
+                                    .is_some_and(|movement| movement.restarts_backend);
+                                project_moves.idle_withheld = withhold_idle;
                             } else if in_turn {
                                 tracing::warn!(
                                     agent_id = %current_start.agent_id,
@@ -7949,15 +8217,17 @@ pub(crate) fn spawn_agent_actor(
                                 typing,
                                 blocked_on_user,
                             );
-                            status_handle.update(|s| {
-                                s.is_thinking = visibly_busy;
-                                if typing {
-                                    s.turn_completed = false;
-                                } else if completed_by_idle {
-                                    s.turn_completed = true;
-                                }
-                                s.activity_counter = s.activity_counter.saturating_add(1);
-                            }).await;
+                            if !withhold_idle {
+                                status_handle.update(|s| {
+                                    s.is_thinking = visibly_busy;
+                                    if typing {
+                                        s.turn_completed = false;
+                                    } else if completed_by_idle {
+                                        s.turn_completed = true;
+                                    }
+                                    s.activity_counter = s.activity_counter.saturating_add(1);
+                                }).await;
+                            }
                         }
                         ChatEvent::OperationCancelled(_) => {
                             retire_cancelled_user_interactions(
@@ -8129,16 +8399,18 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                     }
-                    append_backend_chat_event(
-                        &canonical_stream,
-                        &mut event_log,
-                        &mut subscribers,
-                        &mut replay_state,
-                        backend_kind,
-                        &events,
-                        &event,
-                    )
-                    .await;
+                    if !withhold_idle {
+                        append_backend_chat_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut replay_state,
+                            backend_kind,
+                            &events,
+                            &event,
+                        )
+                        .await;
+                    }
                         tool_publication.observe(&event);
                     if current_start.origin == protocol::AgentOrigin::Tychat && real_idle_transition
                         && let Some(turn) = tychat_turn.take()
@@ -8256,6 +8528,7 @@ pub(crate) fn spawn_agent_actor(
                                 capacity_tx: &compaction_capacity_tx,
                                 backend_storage:
                                     &compaction_backend_storage,
+                                execution_scope: &execution_scope,
                             },
                             &mut context_compaction,
                             ContextCompactionDispatchReadiness {
@@ -8506,6 +8779,9 @@ pub(crate) fn spawn_agent_actor(
                         if project_moves.pending.is_some() && !matches!(&command,
                             AgentCommand::AwaitToolPublication { .. } | AgentCommand::NativeRegistrationSettled)
                         {
+                            if let Some(movement) = project_moves.pending.as_ref() {
+                                request_backend_restart_cancel(movement, &command);
+                            }
                             project_moves.held_commands.push_back(command);
                             #[cfg(feature = "test-support")]
                             notify_project_move_delivery_test_gate(&current_start.name, project_moves.held_commands.back().expect("buffered project command"));
@@ -10604,6 +10880,7 @@ pub(crate) fn spawn_agent_actor(
                                     capacity_tx: &compaction_capacity_tx,
                                     backend_storage:
                                         &compaction_backend_storage,
+                                    execution_scope: &execution_scope,
                                 },
                                 &mut context_compaction,
                                 ContextCompactionDispatchReadiness {
@@ -10673,6 +10950,7 @@ pub(crate) fn spawn_agent_actor(
                                     capacity_tx: &compaction_capacity_tx,
                                     backend_storage:
                                         &compaction_backend_storage,
+                                    execution_scope: &execution_scope,
                                 },
                                 &mut context_compaction,
                                 ContextCompactionDispatchReadiness {
@@ -10851,7 +11129,10 @@ pub(crate) fn spawn_agent_actor(
                                 continue;
                             }
                             let old_backend = backend
-                                .replace(prepared_backend)
+                                .replace(crate::backend::handle::ScopedBackendHandle::bind(
+                                    prepared_backend,
+                                    execution_scope.clone(),
+                                ))
                                 .expect("live actor must have old backend during fallback");
                             events = prepared_events;
                             let adopted_capability = backend
@@ -11382,15 +11663,33 @@ pub(crate) fn spawn_agent_actor(
                             let start = detach_agent_project(&project_id, &mut current_start, &start_tx, &mut event_log);
                             let _ = reply.send(start);
                         }
-                        AgentCommand::MoveToProject { project_id, roots, reply } => {
+                        AgentCommand::MoveToProject { project_id, destination, roots, reply } => {
                                 if actor_native_registrations.load(Ordering::SeqCst) > 0 || !matches!(lifecycle, ActorLifecycle::Running) || in_turn || backend_typing || compaction_blocked || active_compaction.is_some() || context_compaction.is_some() || resume_replay_gate_pending || !queue.is_empty() || !pending_inputs.is_empty() || !pending_tool_response_ids.is_empty() || !open_tool_call_ids.is_empty() || status_handle.snapshot().await.has_background_work {
                                     let _ = reply.send(Err("Wait until the agent has finished its turn, queued messages, and background work before moving it".to_owned()));
                             } else {
-                                    let operation = begin_agent_project_move(backend.as_mut().expect("running actor has backend"),
-                                        &session_store, current_session_id.as_ref(), &current_start, &actor_native_registrations, project_id.clone(), roots.clone());
+                                    let (restart_cancel, restart_cancel_requests) =
+                                        watch::channel(BackendRestartCancel::None);
+                                    let stage = begin_project_move_stage(AgentProjectMoveRequest {
+                                        backend: &mut backend,
+                                        events: &mut events,
+                                        session_store: &session_store,
+                                        session_id: current_session_id.as_ref(),
+                                        current_start: &current_start,
+                                        native_registrations: &actor_native_registrations,
+                                        execution_scope: &execution_scope,
+                                        spawn_config: &compaction_spawn_config,
+                                        session_settings: &current_session_settings,
+                                        use_mock_backend,
+                                        project_id: project_id.clone(),
+                                        destination,
+                                        roots: roots.clone(),
+                                        restart_cancel: restart_cancel_requests,
+                                    });
                                     project_moves.pending = Some(PendingAgentProjectMove {
-                                        project_id, roots, stage: ProjectMoveStage::Provider(operation), origin: ProjectMoveOrigin::Immediate { reply },
+                                        project_id, roots, stage, origin: ProjectMoveOrigin::Immediate { reply },
                                         readiness_epoch: project_readiness_epoch,
+                                        restart_typing_published: false,
+                                        restart_cancel,
                                     });
                                     }
                         }
@@ -11563,7 +11862,7 @@ pub(crate) fn spawn_agent_actor(
                                 append_event(&canonical_stream, &mut event_log, &mut subscribers,
                                     FrameKind::AgentError, &AgentErrorPayload {
                                         agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Internal,
-                                        message: "Project entry cancelled. Your project is unchanged.".to_owned(), fatal: false,
+                                        message: crate::backend::PROJECT_ENTRY_CANCELLED.to_owned(), fatal: false,
                                     }).await;
                             }
                             // A user stop supersedes the host's offer to
@@ -15176,6 +15475,65 @@ async fn close_untracked_background_card(
     open_tool_requests.remove(tool_call_id);
 }
 
+struct BackendRestartTypingContext<'a> {
+    canonical_stream: &'a str,
+    event_log: &'a mut AgentEventLog,
+    subscribers: &'a mut Vec<Stream>,
+    replay_state: &'a mut AgentReplayState,
+    status_handle: &'a registry::AgentStatusHandle,
+}
+
+/// Stop and Close stay held, so their normal handling still runs once the
+/// restart settles; this only tells the restart to stop waiting for them.
+/// A Stop held during a restart already took effect by cancelling it, and the
+/// backend it would reach now is idle.
+fn answer_interrupts_consumed_by_cancelled_restart(held_commands: &mut VecDeque<AgentCommand>) {
+    for command in std::mem::take(held_commands) {
+        match command {
+            AgentCommand::Interrupt { reply } => {
+                let _ = reply.send(InterruptOutcome::Interrupted);
+            }
+            command => held_commands.push_back(command),
+        }
+    }
+}
+
+fn request_backend_restart_cancel(movement: &PendingAgentProjectMove, command: &AgentCommand) {
+    let requested = match command {
+        AgentCommand::Close { .. } => BackendRestartCancel::Abandon,
+        AgentCommand::Interrupt { .. } => BackendRestartCancel::Restore,
+        _ => return,
+    };
+    if movement.restart_typing_published {
+        movement.restart_cancel.send_if_modified(|current| {
+            let raised = requested > *current;
+            if raised {
+                *current = requested;
+            }
+            raised
+        });
+    }
+}
+
+async fn publish_backend_restart_typing(context: BackendRestartTypingContext<'_>, typing: bool) {
+    append_chat_event(
+        context.canonical_stream,
+        context.event_log,
+        context.subscribers,
+        context.replay_state,
+        &ChatEvent::TypingStatusChanged(typing),
+    )
+    .await;
+    context
+        .status_handle
+        .update(|status| {
+            status.is_thinking = typing;
+            status.turn_completed = !typing;
+            status.activity_counter = status.activity_counter.saturating_add(1);
+        })
+        .await;
+}
+
 async fn append_chat_event(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
@@ -17464,6 +17822,7 @@ struct ContextCompactionDispatchContext<'a> {
     use_mock_backend: bool,
     capacity_tx: &'a HostCapacityTx,
     backend_storage: &'a crate::backend::BackendStorage,
+    execution_scope: &'a ExecutionScope,
 }
 
 struct ContextCompactionDispatchReadiness<'a> {
@@ -17855,8 +18214,9 @@ async fn begin_inline_context_fallback(
     };
     let operation_id = active.operation_id.clone();
     let tx = context.actor_tx.clone();
+    let scope = context.execution_scope.clone();
     active.fallback_task = Some(crate::backend::subprocess::spawn(async move {
-        let result = prepare_context_fallback(request).await;
+        let result = scope.run(prepare_context_fallback(request)).await;
         let _ = tx.send(AgentCommand::ContextCompactionFallbackPrepared {
             operation_id,
             result,

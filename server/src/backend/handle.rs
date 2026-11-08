@@ -1,6 +1,7 @@
 use std::pin::Pin;
 
 use protocol::AgentInput;
+use tyde_process_env::launch::ExecutionScope;
 
 use super::{Backend, SendOutcome, WorkspaceRelocationError};
 
@@ -8,6 +9,9 @@ pub(crate) type BackendHandle = Box<dyn BackendSender>;
 
 /// Type-erased backend handle for agent input and acknowledged settings edits.
 pub(crate) trait BackendSender: Send + Sync + 'static {
+    /// The provider's id for this live process, which fallback compaction can
+    /// leave different from the id Tyde keys the conversation by.
+    fn session_id(&self) -> protocol::SessionId;
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,
@@ -67,7 +71,117 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
     fn mock_control(&self) -> Option<crate::backend::mock::MockControl>;
 }
 
+/// Binds a relaunched backend to its destination. An actor's ambient scope is
+/// fixed at spawn, so every later call must re-enter the workspace it runs in.
+pub(crate) struct ScopedBackendHandle {
+    inner: BackendHandle,
+    scope: ExecutionScope,
+}
+
+impl ScopedBackendHandle {
+    pub(crate) fn bind(inner: BackendHandle, scope: ExecutionScope) -> BackendHandle {
+        Box::new(Self { inner, scope })
+    }
+}
+
+fn in_scope<'a, T: 'a>(
+    scope: &ExecutionScope,
+    operation: Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>,
+) -> Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+    let scope = scope.clone();
+    Box::pin(async move { scope.run(operation).await })
+}
+
+impl BackendSender for ScopedBackendHandle {
+    fn session_id(&self) -> protocol::SessionId {
+        self.inner.session_id()
+    }
+
+    fn set_workspace_roots(
+        &mut self,
+        roots: Vec<String>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), WorkspaceRelocationError>> + Send + 'static,
+        >,
+    > {
+        let operation = self
+            .scope
+            .run_sync(|| self.inner.set_workspace_roots(roots));
+        in_scope(&self.scope, operation)
+    }
+
+    fn workspace_relocation_wake(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.inner.workspace_relocation_wake()
+    }
+
+    fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
+        self.inner.compaction_capability()
+    }
+
+    fn begin_compaction<'a>(
+        &'a self,
+        request: crate::backend::BackendCompactionRequest,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
+    > {
+        in_scope(&self.scope, self.inner.begin_compaction(request))
+    }
+
+    fn send_with_outcome<'a>(
+        &'a self,
+        input: AgentInput,
+    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>> {
+        in_scope(&self.scope, self.inner.send_with_outcome(input))
+    }
+
+    fn update_session_settings<'a>(
+        &'a mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        in_scope(&self.scope, self.inner.update_session_settings(payload))
+    }
+
+    fn steer<'a>(
+        &'a self,
+        payload: protocol::SendMessagePayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::SteerOutcome> + Send + 'a>> {
+        in_scope(&self.scope, self.inner.steer(payload))
+    }
+
+    fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        in_scope(&self.scope, self.inner.interrupt())
+    }
+
+    fn cancel_background_task<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = crate::backend::CancelBackgroundTaskOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        in_scope(&self.scope, self.inner.cancel_background_task(tool_call_id))
+    }
+
+    fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let Self { inner, scope } = *self;
+        in_scope(&scope, inner.shutdown())
+    }
+
+    #[cfg(feature = "test-support")]
+    fn mock_control(&self) -> Option<crate::backend::mock::MockControl> {
+        self.inner.mock_control()
+    }
+}
+
 impl<B: Backend> BackendSender for B {
+    fn session_id(&self) -> protocol::SessionId {
+        Backend::session_id(self)
+    }
+
     fn set_workspace_roots(
         &mut self,
         roots: Vec<String>,

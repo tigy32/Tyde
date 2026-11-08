@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use protocol::{
     AgentId, ChatMessageId, ContextBreakdown, MessageMetadataUpdateData, MessageTokenUsage,
     SessionId, SlashCommand,
@@ -35,6 +37,24 @@ pub enum AbandonedResponse {
     Replaced,
 }
 
+/// What the next `resume` of a session does, consumed in order.
+#[derive(Debug, Clone)]
+pub enum MockResumeLaunch {
+    Script(MockScript),
+    Fail(String),
+    /// Never finishes; the gate signals once the resume has been entered.
+    Hang(MockResumeHang),
+}
+
+#[derive(Debug, Clone)]
+pub struct MockResumeHang(pub(super) MockGate);
+
+impl MockResumeLaunch {
+    pub fn hang(gate: &MockGateHandle) -> Self {
+        Self::Hang(MockResumeHang(gate.gate()))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockScript {
     #[cfg(all(feature = "test-support", target_os = "linux"))]
@@ -48,6 +68,7 @@ pub struct MockScript {
     pub(super) busy_self_turn_once: bool,
     pub(super) resume_continuation: Option<(MockGate, MockGate)>,
     pub(super) resume_replay: Option<MockResumeReplay>,
+    pub(super) resume_launches: VecDeque<MockResumeLaunch>,
     pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
     pub(super) native_child_idle_gate: Option<MockGate>,
@@ -121,6 +142,11 @@ impl MockScript {
         finish: &MockGateHandle,
     ) -> Self {
         self.resume_continuation = Some((replay.gate(), finish.gate()));
+        self
+    }
+
+    pub fn with_resume_launch(mut self, launch: MockResumeLaunch) -> Self {
+        self.resume_launches.push_back(launch);
         self
     }
 
@@ -287,7 +313,7 @@ impl MockResumeReplay {
 
 #[derive(Debug, Clone)]
 pub enum MockLaunch {
-    Script(MockScript),
+    Script(Box<MockScript>),
     CloseBeforeResumeBarrier,
 }
 
@@ -308,6 +334,7 @@ pub(super) enum MockTurnBody {
     },
     RenderedHistoryJoin,
     RenderedWorkspaceRoots,
+    RenderedLaunchBinding(Option<MockGate>),
 }
 
 impl MockTurn {
@@ -519,6 +546,21 @@ impl MockTurn {
     pub fn workspace_roots() -> Self {
         Self {
             body: MockTurnBody::RenderedWorkspaceRoots,
+            finish: MockTurnFinish::Done,
+        }
+    }
+
+    /// Replies with the project and roots the session last resumed in.
+    pub fn launch_binding() -> Self {
+        Self {
+            body: MockTurnBody::RenderedLaunchBinding(None),
+            finish: MockTurnFinish::Done,
+        }
+    }
+
+    pub fn gated_launch_binding(gate: &MockGateHandle) -> Self {
+        Self {
+            body: MockTurnBody::RenderedLaunchBinding(Some(gate.gate())),
             finish: MockTurnFinish::Done,
         }
     }
@@ -1351,7 +1393,8 @@ impl MockTurn {
             MockTurnBody::RenderedEcho(_)
             | MockTurnBody::RenderedTextForInput { .. }
             | MockTurnBody::RenderedHistoryJoin
-            | MockTurnBody::RenderedWorkspaceRoots => {
+            | MockTurnBody::RenderedWorkspaceRoots
+            | MockTurnBody::RenderedLaunchBinding(_) => {
                 panic!("goal state requires a frozen turn")
             }
         }
@@ -1610,7 +1653,8 @@ impl MockTurn {
             MockTurnBody::RenderedEcho(_)
             | MockTurnBody::RenderedTextForInput { .. }
             | MockTurnBody::RenderedHistoryJoin
-            | MockTurnBody::RenderedWorkspaceRoots => {
+            | MockTurnBody::RenderedWorkspaceRoots
+            | MockTurnBody::RenderedLaunchBinding(_) => {
                 panic!("post-idle step builders apply to frozen turns, not rendered ones")
             }
         }
@@ -1702,6 +1746,25 @@ impl MockTurn {
                 text_steps(
                     serde_json::to_string(&roots).expect("workspace roots JSON"),
                     TextShape::default(),
+                )
+            }
+            MockTurnBody::RenderedLaunchBinding(gate) => {
+                let report = {
+                    let store = super::session_store()
+                        .lock()
+                        .expect("mock backend session store mutex poisoned");
+                    let record = store.get(&session_id.0).expect("live mock session");
+                    super::launch_binding_report(
+                        record.launch_project.as_ref(),
+                        &record.workspace_roots,
+                    )
+                };
+                text_steps(
+                    report,
+                    TextShape {
+                        gate,
+                        ..TextShape::default()
+                    },
                 )
             }
         };

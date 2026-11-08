@@ -5858,6 +5858,619 @@ print('\n' + json.dumps({{'boundary': evidence}}))
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn running_agent_restarts_across_bubblewrap_boundary() {
+    use protocol::{ChatEvent, MessageSender, WorkbenchAvailability, WorkbenchEngine};
+    use server::backend::mock::{MockResumeLaunch, launch_binding_report};
+
+    const RELAUNCH_FAILURE: &str = "destination backend refused to launch";
+    const ENTRY_FAILED: &str = "Tyde could not enter the destination project";
+    const MOVED: &str = "Tyde has moved this conversation into project";
+
+    fn resumed_in(project: &ProjectId, roots: &[String]) -> String {
+        launch_binding_report(Some(project), roots)
+    }
+
+    fn system_continuations(turn: &fixture::Turn) -> Vec<(usize, &'static str)> {
+        turn.chat_events()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::System) =>
+                {
+                    [ENTRY_FAILED, MOVED]
+                        .into_iter()
+                        .find(|known| message.content.contains(known))
+                        .map(|known| (index, known))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_restarts_stayed_busy(turn: &fixture::Turn, expected: &[&str]) {
+        let events = turn.chat_events();
+        let continuations = system_continuations(turn);
+        let delivered: Vec<&str> = continuations.iter().map(|(_, known)| *known).collect();
+        let last_continuation = continuations.last().map(|(index, _)| *index);
+        let last_end = events
+            .iter()
+            .rposition(|event| matches!(event, ChatEvent::StreamEnd(_)));
+        let idle = events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::TypingStatusChanged(false)));
+        let order: Vec<String> = turn
+            .frames
+            .iter()
+            .map(|env| {
+                if env.kind != FrameKind::ChatEvent {
+                    return format!("{:?}", env.kind);
+                }
+                match env.parse_payload::<ChatEvent>().expect("parse ChatEvent") {
+                    ChatEvent::TypingStatusChanged(active) => format!("Typing({active})"),
+                    ChatEvent::MessageAdded(message) => {
+                        format!("MessageAdded({:?})", message.sender)
+                    }
+                    ChatEvent::StreamStart(_) => "StreamStart".to_owned(),
+                    ChatEvent::StreamDelta(_) => "StreamDelta".to_owned(),
+                    ChatEvent::StreamEnd(_) => "StreamEnd".to_owned(),
+                    _ => "OtherChatEvent".to_owned(),
+                }
+            })
+            .collect();
+        assert!(
+            delivered == expected
+                && matches!((last_continuation, last_end, idle), (Some(continuation), Some(end), Some(idle)) if continuation < end && end < idle),
+            "every restart must stay busy until its continuation finishes: {delivered:?}; order: {order:?}"
+        );
+    }
+
+    let repo = init_git_repo("bubblewrap-restart");
+    // Grok can move inside one engine but cannot restart, so it reaches the
+    // restart gate rather than the older gate for backends that cannot move.
+    let mut fixture = Fixture::new_with_mock_backend_for_enabled_backends(vec![
+        BackendKind::Claude,
+        BackendKind::Grok,
+    ])
+    .await;
+    assert!(
+        matches!(
+            fixture.bootstrap.workbench_support.bubblewrap,
+            WorkbenchAvailability::Available
+        ),
+        "restart regression requires Linux Bubblewrap with unprivileged namespaces; capability={:?}",
+        fixture.bootstrap.workbench_support.bubblewrap
+    );
+    for kind in [BackendKind::Claude, BackendKind::Grok] {
+        fixture
+            .host_for_test()
+            .set_session_schema_ready_for_test(kind)
+            .await;
+    }
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let parent_roots = project_roots(&parent);
+    let write = fixture
+        .client
+        .replace_setting(
+            "/workbenches/engine",
+            WorkbenchEngine::Bubblewrap,
+            WorkbenchEngine::Native,
+        )
+        .await
+        .expect("select Bubblewrap engine");
+    let applied = next_frame_matching_on(&mut fixture.client, "restart engine setting", |env| {
+        env.kind == FrameKind::SettingsWriteResult
+            && env
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .unwrap()
+                .write_id
+                == write
+    })
+    .await;
+    assert!(
+        applied
+            .parse_payload::<protocol::SettingsWriteResultPayload>()
+            .unwrap()
+            .applied
+    );
+
+    let initial = MockGateHandle::new();
+    let recovered = MockGateHandle::new();
+    let inside = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Restarting agent",
+            MockScript::one(MockTurn::gated_text("Before entry", &initial))
+                .with_user_bubbles()
+                .with_resume_launch(MockResumeLaunch::Fail(RELAUNCH_FAILURE.to_owned()))
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::gated_launch_binding(&recovered),
+                )))
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::gated_launch_binding(&inside),
+                )))
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::launch_binding(),
+                ))),
+        )
+        .await;
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Restarting agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: parent_roots.clone(),
+                prompt: "Work across the boundary".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    initial.wait_until_entered().await;
+
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    let observer_stream = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .expect("observer knows the restarting agent")
+        .instance_stream
+        .clone();
+    next_frame_matching_on(&mut observer, "observer attached", |env| {
+        env.kind == FrameKind::AgentBootstrap && env.stream == observer_stream
+    })
+    .await;
+
+    let (failed, created) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_create_workbench",
+        json!({
+            "parent_project_id": parent.id.0, "branch": "feature/bubblewrap-restart", "action": "enter"
+        }),
+    )
+    .await;
+    assert!(
+        !failed,
+        "a running agent must be able to enter a Bubblewrap workbench: {created}"
+    );
+    let created: Value = serde_json::from_str(&created).expect("entry JSON");
+    assert_eq!(created["entry_scheduled"], true);
+    let workbench_id = ProjectId(created["project_id"].as_str().unwrap().to_owned());
+    let workbench_roots: Vec<String> = created["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["worktree_root"].as_str().unwrap().to_owned())
+        .collect();
+
+    // The first destination launch fails: the session returns to the source.
+    initial.release_one();
+    recovered.wait_until_entered().await;
+    let (_, after_failure) = fixture.connect_with_bootstrap().await;
+    let summary = after_failure
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == start.agent_id)
+        .expect("failed entry keeps the agent");
+    assert_eq!(summary.project_id, Some(parent.id.clone()));
+    assert_eq!(summary.workspace_roots, parent_roots);
+
+    // The continuation of the failed entry retries explicitly by moving itself.
+    let (failed, moved) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": workbench_id.0}),
+    )
+    .await;
+    assert!(!failed, "self move into Bubblewrap must schedule: {moved}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&moved).expect("move JSON")["entry_scheduled"],
+        true
+    );
+    recovered.release_one();
+    inside.wait_until_entered().await;
+    let entered = expect_kind(
+        &mut observer,
+        FrameKind::AgentProjectChanged,
+        "Bubblewrap entry",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(
+        entered.project_id,
+        Some(workbench_id.clone()),
+        "the failed relaunch must not have published a project change"
+    );
+    assert_eq!(entered.agent_id, start.agent_id);
+    assert!(entered.session_id == start.session_id);
+    assert_eq!(entered.workspace_roots, workbench_roots);
+    let (_, inside_bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        inside_bootstrap
+            .agents
+            .iter()
+            .filter(|entry| entry.agent_id == start.agent_id
+                && entry.project_id == Some(workbench_id.clone()))
+            .count(),
+        1,
+    );
+    assert_eq!(
+        inside_bootstrap.agents.len(),
+        1,
+        "restart must not create another agent card"
+    );
+
+    let (failed, moved) = call_agent_control(
+        &fixture,
+        &start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": parent.id.0}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "self move out of Bubblewrap must schedule: {moved}"
+    );
+    inside.release_one();
+    let whole_flow = fixture.finish_turn(&agent).await;
+    let failed_launch = format!(
+        "{RELAUNCH_FAILURE}: {}",
+        resumed_in(&workbench_id, &workbench_roots)
+    );
+    assert!(
+        whole_flow
+            .frames
+            .iter()
+            .filter(|env| env.kind == FrameKind::AgentError)
+            .map(|env| env.parse_payload::<protocol::AgentErrorPayload>().unwrap())
+            .any(|error| !error.fatal && error.message.contains(&failed_launch)),
+        "a failed relaunch must be reported explicitly and leave the agent usable"
+    );
+    let replies: Vec<String> = whole_flow
+        .chat_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        [
+            "Before entry".to_owned(),
+            resumed_in(&parent.id, &parent_roots),
+            resumed_in(&workbench_id, &workbench_roots),
+            resumed_in(&parent.id, &parent_roots),
+        ],
+        "each restart must resume the session inside its own binding"
+    );
+    assert_restarts_stayed_busy(&whole_flow, &[ENTRY_FAILED, MOVED, MOVED]);
+    let returned = expect_kind(
+        &mut observer,
+        FrameKind::AgentProjectChanged,
+        "Bubblewrap exit",
+    )
+    .await
+    .parse_payload::<AgentStartPayload>()
+    .unwrap();
+    assert_eq!(returned.project_id, Some(parent.id.clone()));
+    assert_eq!(returned.agent_id, start.agent_id);
+    assert!(returned.session_id == start.session_id);
+    assert_eq!(returned.workspace_roots, parent_roots);
+
+    let unsupported_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Unsupported agent",
+            MockScript::one(MockTurn::gated_text("Stays put", &unsupported_gate)),
+        )
+        .await;
+    let (_unsupported, unsupported) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Unsupported agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: parent_roots.clone(),
+                prompt: "Try to cross the boundary".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Grok,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    unsupported_gate.wait_until_entered().await;
+    for (tool, arguments) in [
+        (
+            "tyde_create_workbench",
+            json!({"parent_project_id": parent.id.0, "branch": "feature/unsupported-restart", "action": "enter"}),
+        ),
+        (
+            "tyde_move_to_project",
+            json!({"project_id": workbench_id.0}),
+        ),
+    ] {
+        let (failed, body) =
+            call_agent_control(&fixture, &unsupported.agent_id, tool, arguments).await;
+        assert!(
+            failed && body.contains("cannot restart a conversation"),
+            "{tool} must reject a backend without restart support: {body}"
+        );
+    }
+    unsupported_gate.release_one();
+
+    // Stop gives up on a destination that never comes up and resumes the
+    // source; Close during the next hung relaunch leaves the session there.
+    let before_hang = MockGateHandle::new();
+    let hung = MockGateHandle::new();
+    let close_hung = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Cancelled restart agent",
+            MockScript::one(MockTurn::gated_text("Before the hang", &before_hang))
+                .with_user_bubbles()
+                .with_resume_launch(MockResumeLaunch::hang(&hung))
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::launch_binding(),
+                )))
+                .with_resume_launch(MockResumeLaunch::hang(&close_hung))
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::launch_binding(),
+                ))),
+        )
+        .await;
+    let (cancelled_agent, cancelled_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Cancelled restart agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: parent_roots.clone(),
+                prompt: "Move and get stuck".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    let cancelled_session = cancelled_start
+        .session_id
+        .clone()
+        .expect("cancelled restart session identity");
+    before_hang.wait_until_entered().await;
+    let (failed, moved) = call_agent_control(
+        &fixture,
+        &cancelled_start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": workbench_id.0}),
+    )
+    .await;
+    assert!(!failed, "hanging move must schedule: {moved}");
+    before_hang.release_one();
+    hung.wait_until_entered().await;
+    fixture
+        .client
+        .interrupt(&cancelled_agent.stream)
+        .await
+        .unwrap();
+    let stopped = fixture.finish_turn(&cancelled_agent).await;
+    assert_eq!(
+        system_continuations(&stopped),
+        Vec::new(),
+        "a stopped restart must not start another turn"
+    );
+    let cancelled_stream = cancelled_agent.stream.clone();
+    // AgentError has its own output lane, so it can land on either side of the idle.
+    let cancelled_error = match stopped
+        .frames
+        .iter()
+        .find(|env| env.kind == FrameKind::AgentError)
+    {
+        Some(env) => env.clone(),
+        None => {
+            fixture
+                .next_frame_matching("stopped restart reports cancellation", |env| {
+                    env.kind == FrameKind::AgentError && env.stream == cancelled_stream
+                })
+                .await
+        }
+    }
+    .parse_payload::<protocol::AgentErrorPayload>()
+    .unwrap();
+    assert!(!cancelled_error.fatal);
+    assert_eq!(
+        cancelled_error.message,
+        "Project entry cancelled. Your project is unchanged."
+    );
+    // Reading the control queues behind any held command, so a Stop replayed
+    // after its restart was cancelled has reached the backend by now.
+    assert_eq!(
+        fixture
+            .mock_by_id(&cancelled_start.agent_id)
+            .await
+            .unawaited_interrupt_requests(),
+        0,
+        "the Stop that cancelled the restart must not reach the restored backend"
+    );
+    let (_, after_stop) = fixture.connect_with_bootstrap().await;
+    let summary = after_stop
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == cancelled_start.agent_id)
+        .expect("Stop keeps the agent");
+    assert_eq!(summary.project_id, Some(parent.id.clone()));
+    assert_eq!(summary.workspace_roots, parent_roots);
+    fixture
+        .client
+        .send_message(
+            &cancelled_agent.stream,
+            "Report where you resumed".to_owned(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .finish_turn(&cancelled_agent)
+        .await
+        .assert_stream_end_contains(&resumed_in(&parent.id, &parent_roots));
+
+    let (failed, moved) = call_agent_control(
+        &fixture,
+        &cancelled_start.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": workbench_id.0}),
+    )
+    .await;
+    assert!(!failed, "the stopped agent can try again: {moved}");
+    close_hung.wait_until_entered().await;
+    fixture
+        .client
+        .close_agent(&cancelled_agent.stream)
+        .await
+        .unwrap();
+    let mut delivered_continuation = false;
+    fixture
+        .next_frame_matching("closed restart finishes the agent", |env| {
+            if env.stream == cancelled_stream
+                && env.kind == FrameKind::ChatEvent
+                && matches!(
+                    env.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::MessageAdded(message))
+                        if matches!(message.sender, MessageSender::System)
+                )
+            {
+                delivered_continuation = true;
+            }
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == cancelled_start.agent_id)
+        })
+        .await;
+    assert!(
+        !delivered_continuation,
+        "a cancelled restart must not start another turn"
+    );
+    // Close left the session stopped in its source, so the last scripted resume
+    // is still unused and only opens where the session was moved back to.
+    let (resumed, _) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Resumed after Close".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: cancelled_session,
+                prompt: Some("Report where you resumed".to_owned()),
+            },
+        })
+        .await;
+    fixture
+        .finish_turn(&resumed)
+        .await
+        .assert_stream_end_contains(&resumed_in(&parent.id, &parent_roots));
+
+    // Leaving Bubblewrap needs a restart even when new workbenches are native,
+    // and the refusal comes before a workbench exists.
+    let inside_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Unsupported agent inside",
+            MockScript::one(MockTurn::gated_text("Stays inside", &inside_gate)),
+        )
+        .await;
+    let (_inside_agent, inside_start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("Unsupported agent inside".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(workbench_id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: workbench_roots.clone(),
+                prompt: "Try to leave the boundary".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Grok,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    inside_gate.wait_until_entered().await;
+    let write = fixture
+        .client
+        .replace_setting(
+            "/workbenches/engine",
+            WorkbenchEngine::Native,
+            WorkbenchEngine::Bubblewrap,
+        )
+        .await
+        .expect("select native engine");
+    let applied = next_frame_matching_on(&mut fixture.client, "native engine setting", |env| {
+        env.kind == FrameKind::SettingsWriteResult
+            && env
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .unwrap()
+                .write_id
+                == write
+    })
+    .await;
+    assert!(
+        applied
+            .parse_payload::<protocol::SettingsWriteResultPayload>()
+            .unwrap()
+            .applied
+    );
+    let (failed, body) = call_agent_control(
+        &fixture,
+        &inside_start.agent_id,
+        "tyde_create_workbench",
+        json!({"parent_project_id": parent.id.0, "branch": "feature/leaves-bubblewrap", "action": "enter"}),
+    )
+    .await;
+    assert!(
+        failed && body.contains("cannot restart a conversation"),
+        "leaving Bubblewrap must reject a backend without restart support: {body}"
+    );
+    assert_eq!(
+        git_stdout(
+            repo.path(),
+            &["branch", "--list", "feature/leaves-bubblewrap"]
+        ),
+        "",
+        "the refused entry must not create a workbench"
+    );
+    inside_gate.release_one();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn bubblewrap_service_lifecycle_preserves_command_outcomes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut fixture = Fixture::new().await;

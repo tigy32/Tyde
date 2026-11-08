@@ -832,6 +832,7 @@ impl ConfigActor {
                 let script = self
                     .mock_script
                     .take()
+                    .map(Box::new)
                     .map(crate::backend::mock::MockLaunch::Script);
                 // A worker is one reusable native tool-free context. Results
                 // use a separate channel; it never calls back into an actor

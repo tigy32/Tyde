@@ -1559,6 +1559,14 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
 }
 
 impl Backend for HermesBackend {
+    async fn relocate_stopped_session(
+        _session_id: &SessionId,
+        _relocation: &crate::backend::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        // Hermes finds a session by its id alone; resume replaces its cwd.
+        Ok(())
+    }
+
     fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
         for category in categories {
             match category {
@@ -1678,6 +1686,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::RestartInWorkspace,
             tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
@@ -1884,6 +1893,22 @@ impl Backend for HermesBackend {
             )
             .await?;
         let live_session_id = required_string(&resume, &["session_id"], "session.resume")?;
+        // Hermes adopts the cwd stored with the session on resume, ignoring
+        // the directory this gateway launched in.
+        let cwd = tyde_process_env::launch::WorkspacePath::host(session_cwd(&workspace_roots)?)?
+            .execution_string()?;
+        if resume.pointer("/info/cwd").and_then(Value::as_str) != Some(cwd.as_str()) {
+            let moved = gateway
+                .request(
+                    "session.cwd.set",
+                    json!({"session_id": live_session_id, "cwd": cwd}),
+                )
+                .await?;
+            if moved.get("cwd").and_then(Value::as_str) != Some(cwd.as_str()) {
+                gateway.shutdown().await;
+                return Err("Hermes did not confirm the resumed session's workspace".to_string());
+            }
+        }
         let resumed = optional_string(&resume, &["resumed"])
             .or_else(|| optional_string(&resume, &["session_key"]))
             .unwrap_or_else(|| session_id.0.clone());

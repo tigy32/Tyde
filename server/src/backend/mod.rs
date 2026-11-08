@@ -40,6 +40,7 @@ use serde_json::Value;
 use settings_model::BackendTierConfig;
 use tokio::sync::mpsc;
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
+use tyde_process_env::launch::ExecutionScope;
 
 use self::subprocess::ImageAttachment;
 pub use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
@@ -451,6 +452,81 @@ impl BackendStorage {
     }
 }
 
+/// One side of a backend restart: the namespace to launch in and the host
+/// roots Tyde owns there.
+#[derive(Clone)]
+pub struct BackendExecutionTarget {
+    pub scope: ExecutionScope,
+    pub roots: Vec<String>,
+}
+
+impl BackendExecutionTarget {
+    /// The roots as the backend process sees them inside this target.
+    pub fn execution_roots(&self) -> Result<Vec<String>, String> {
+        self.scope.run_sync(|| {
+            self.roots
+                .iter()
+                .map(|root| tyde_process_env::launch::WorkspacePath::host(root)?.execution_string())
+                .collect()
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendSessionRelocation {
+    pub source: BackendExecutionTarget,
+    pub destination: BackendExecutionTarget,
+}
+
+impl BackendSessionRelocation {
+    fn reversed(&self) -> Self {
+        Self {
+            source: self.destination.clone(),
+            destination: self.source.clone(),
+        }
+    }
+}
+
+pub struct RestartedBackend<B> {
+    pub backend: B,
+    pub events: EventStream,
+    pub scope: ExecutionScope,
+}
+
+pub(crate) const PROJECT_ENTRY_CANCELLED: &str =
+    "Project entry cancelled. Your project is unchanged.";
+
+/// Why the owner wants a restart to stop waiting. Ordered so a later request
+/// can only raise it: Stop abandons the destination but still resumes the
+/// source, Close leaves the session stopped in its source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BackendRestartCancel {
+    #[default]
+    None,
+    Restore,
+    Abandon,
+}
+
+/// `Refused` and `Restored` leave the conversation usable in its source;
+/// `Abandoned` leaves it stopped there because its owner is closing; `Lost`
+/// means no process could be resumed anywhere.
+pub enum BackendRestartOutcome<B, R> {
+    Refused {
+        backend: R,
+        error: String,
+    },
+    Moved(RestartedBackend<B>),
+    Restored {
+        binding: RestartedBackend<B>,
+        error: String,
+    },
+    Abandoned,
+    Lost(String),
+}
+
+pub type BackendRestartCommit =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
 #[derive(Debug, Clone)]
 pub struct BackendSpawnConfig {
     pub execution_mode: BackendExecutionMode,
@@ -731,6 +807,24 @@ impl EventStream {
             response_started_streaming: false,
             open_tool_names: HashMap::new(),
             transcript_metadata_projector: Some(Arc::new(projector)),
+        }
+    }
+
+    /// Whether every event the backend has already emitted was delivered. A
+    /// restart abandons this stream, so anything still in it would be lost.
+    pub(crate) fn is_drained(&self) -> bool {
+        self.buffered.is_empty()
+            && self.pending_delta.is_none()
+            && match &self.rx {
+                EventStreamReceiver::Chat(rx) => rx.is_empty(),
+                EventStreamReceiver::Backend(rx) => rx.is_empty(),
+                EventStreamReceiver::Adapter(rx) => rx.is_empty(),
+            }
+    }
+
+    fn prepend(&mut self, events: Vec<BackendEvent>) {
+        for event in events.into_iter().rev() {
+            self.buffered.push_front(event);
         }
     }
 
@@ -1671,6 +1765,17 @@ pub trait Backend: Send + Sync + 'static {
     where
         Self: Sized;
 
+    /// Make a stopped session resumable from the destination workspace. Runs
+    /// after the old process has exited, before the destination launch, and
+    /// again with the targets reversed to undo. An `Err` must leave the session
+    /// resumable at the source.
+    fn relocate_stopped_session(
+        session_id: &SessionId,
+        relocation: &BackendSessionRelocation,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send
+    where
+        Self: Sized;
+
     /// Fork an existing backend-native session into a fresh independent
     /// backend-native session, then start it with `initial_input`.
     fn fork(
@@ -2153,6 +2258,300 @@ pub async fn list_sessions_for_backend_kind(
     context: &BackendProbeContext,
 ) -> Result<Vec<BackendSession>, String> {
     with_backend_type!(kind, |B| B::list_sessions(context).await, removed => Err("Tycode backend has been removed".to_owned()))
+}
+
+/// Consumes resume history so a restart does not republish a conversation the
+/// actor already holds. Session state and any live turn that began during the
+/// replay are put back for the normal event path.
+async fn settle_restart_replay(events: &mut EventStream) -> Result<(), String> {
+    let mut retained = Vec::new();
+    let mut live = false;
+    loop {
+        match events.recv_backend().await {
+            None => {
+                return Err("The backend exited before its session finished resuming".to_owned());
+            }
+            Some(BackendEvent::ResumeReplayComplete(result)) => {
+                result?;
+                events.prepend(retained);
+                return Ok(());
+            }
+            Some(event) => {
+                live |= matches!(
+                    &event,
+                    BackendEvent::Chat(ChatEvent::TypingStatusChanged(true))
+                );
+                if live
+                    || matches!(
+                        &event,
+                        BackendEvent::Chat(
+                            ChatEvent::GoalCapabilities(_)
+                                | ChatEvent::GoalChanged(_)
+                                | ChatEvent::SlashCommandsChanged(_)
+                        )
+                    )
+                {
+                    retained.push(event);
+                }
+            }
+        }
+    }
+}
+
+/// Resolves once `least` is requested. A dropped sender can no longer ask, so
+/// it never cancels.
+async fn restart_cancelled(
+    cancel: &tokio::sync::watch::Receiver<BackendRestartCancel>,
+    least: BackendRestartCancel,
+) {
+    let mut cancel = cancel.clone();
+    let sender_dropped = cancel
+        .wait_for(|requested| *requested >= least)
+        .await
+        .is_err();
+    if sender_dropped {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Completes `shutdown`, then waits for the backend's event stream to end.
+/// Every backend keeps its event sender until its provider process is reaped,
+/// so the end of the stream proves nothing still writes the session's files.
+pub async fn shut_down_until_exited(
+    shutdown: impl std::future::Future<Output = ()>,
+    mut events: EventStream,
+) {
+    shutdown.await;
+    while events.recv_backend().await.is_some() {}
+}
+
+async fn resume_at_restart_target<B: Backend>(
+    session_id: &SessionId,
+    spawn: &BackendSpawnConfig,
+    target: &BackendExecutionTarget,
+    cancel: &tokio::sync::watch::Receiver<BackendRestartCancel>,
+    least: BackendRestartCancel,
+) -> Result<RestartedBackend<B>, String> {
+    let (backend, mut events) = tokio::select! {
+        biased;
+        () = restart_cancelled(cancel, least) => {
+            return Err(PROJECT_ENTRY_CANCELLED.to_owned());
+        }
+        launched = target.scope.run(B::resume(
+            target.roots.clone(),
+            spawn.clone(),
+            session_id.clone(),
+        )) => launched?,
+    };
+    let settled = if backend.session_id() == *session_id {
+        tokio::select! {
+            biased;
+            () = restart_cancelled(cancel, least) => Err(PROJECT_ENTRY_CANCELLED.to_owned()),
+            settled = settle_restart_replay(&mut events) => settled,
+        }
+    } else {
+        Err("The backend resumed a different native session".to_owned())
+    };
+    match settled {
+        Ok(()) => Ok(RestartedBackend {
+            backend,
+            events,
+            scope: target.scope.clone(),
+        }),
+        Err(error) => {
+            target
+                .scope
+                .run(shut_down_until_exited(backend.shutdown(), events))
+                .await;
+            Err(error)
+        }
+    }
+}
+
+/// Stops `running`, then resumes the same native session inside the
+/// destination. `commit` runs only once the destination is proven usable; on
+/// any later failure the session goes back to, and resumes in, the source.
+pub async fn restart_backend_session<B, R, Stop>(
+    session_id: SessionId,
+    spawn: BackendSpawnConfig,
+    relocation: BackendSessionRelocation,
+    running: R,
+    stop: impl FnOnce(R) -> Stop,
+    commit: BackendRestartCommit,
+    cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
+) -> BackendRestartOutcome<B, R>
+where
+    B: Backend,
+    Stop: std::future::Future<Output = ()>,
+{
+    for target in [&relocation.source, &relocation.destination] {
+        if let Err(error) = target
+            .scope
+            .run(crate::workbench::prepare_backend_execution(
+                spawn.acp_agent.as_ref(),
+            ))
+            .await
+        {
+            return BackendRestartOutcome::Refused {
+                backend: running,
+                error,
+            };
+        }
+    }
+    if *cancel.borrow() != BackendRestartCancel::None {
+        return BackendRestartOutcome::Refused {
+            backend: running,
+            error: PROJECT_ENTRY_CANCELLED.to_owned(),
+        };
+    }
+    stop(running).await;
+    let mut relocated = false;
+    let error = match B::relocate_stopped_session(&session_id, &relocation).await {
+        Err(error) => error,
+        Ok(()) => {
+            relocated = true;
+            match resume_at_restart_target::<B>(
+                &session_id,
+                &spawn,
+                &relocation.destination,
+                &cancel,
+                BackendRestartCancel::Restore,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(binding) => match commit.await {
+                    Ok(()) => return BackendRestartOutcome::Moved(binding),
+                    Err(error) => {
+                        binding
+                            .scope
+                            .run(shut_down_until_exited(
+                                binding.backend.shutdown(),
+                                binding.events,
+                            ))
+                            .await;
+                        error
+                    }
+                },
+            }
+        }
+    };
+    tracing::error!(relocated, "Backend restart failed; restoring the source");
+    if relocated
+        && let Err(undo) = B::relocate_stopped_session(&session_id, &relocation.reversed()).await
+    {
+        return BackendRestartOutcome::Lost(format!(
+            "{error}. The session could not be returned to its source: {undo}. Reopen the saved conversation before continuing."
+        ));
+    }
+    if *cancel.borrow() == BackendRestartCancel::Abandon {
+        return BackendRestartOutcome::Abandoned;
+    }
+    match resume_at_restart_target::<B>(
+        &session_id,
+        &spawn,
+        &relocation.source,
+        &cancel,
+        BackendRestartCancel::Abandon,
+    )
+    .await
+    {
+        Ok(binding) => BackendRestartOutcome::Restored { binding, error },
+        Err(_) if *cancel.borrow() == BackendRestartCancel::Abandon => {
+            BackendRestartOutcome::Abandoned
+        }
+        Err(restore) => BackendRestartOutcome::Lost(format!(
+            "{error}. The session could not be resumed in its source: {restore}. Reopen the saved conversation before continuing."
+        )),
+    }
+}
+
+pub(crate) type RunningBackend = (handle::BackendHandle, EventStream);
+
+fn erase_restarted_backend<B: Backend>(
+    binding: RestartedBackend<B>,
+) -> RestartedBackend<handle::BackendHandle> {
+    RestartedBackend {
+        backend: handle::ScopedBackendHandle::bind(
+            Box::new(binding.backend),
+            binding.scope.clone(),
+        ),
+        events: binding.events,
+        scope: binding.scope,
+    }
+}
+
+async fn restart_erased_backend_session<B: Backend>(
+    session_id: SessionId,
+    spawn: BackendSpawnConfig,
+    relocation: BackendSessionRelocation,
+    running: RunningBackend,
+    commit: BackendRestartCommit,
+    cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
+) -> BackendRestartOutcome<handle::BackendHandle, RunningBackend> {
+    match restart_backend_session::<B, _, _>(
+        session_id,
+        spawn,
+        relocation,
+        running,
+        |(backend, events): RunningBackend| shut_down_until_exited(backend.shutdown(), events),
+        commit,
+        cancel,
+    )
+    .await
+    {
+        BackendRestartOutcome::Refused { backend, error } => {
+            BackendRestartOutcome::Refused { backend, error }
+        }
+        BackendRestartOutcome::Moved(binding) => {
+            BackendRestartOutcome::Moved(erase_restarted_backend(binding))
+        }
+        BackendRestartOutcome::Restored { binding, error } => BackendRestartOutcome::Restored {
+            binding: erase_restarted_backend(binding),
+            error,
+        },
+        BackendRestartOutcome::Abandoned => BackendRestartOutcome::Abandoned,
+        BackendRestartOutcome::Lost(error) => BackendRestartOutcome::Lost(error),
+    }
+}
+
+pub(crate) struct BackendRestartRequest {
+    pub kind: BackendKind,
+    pub use_mock_backend: bool,
+    pub session_id: SessionId,
+    pub spawn: BackendSpawnConfig,
+    pub relocation: BackendSessionRelocation,
+    pub running: RunningBackend,
+    pub commit: BackendRestartCommit,
+    pub cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
+}
+
+pub(crate) async fn restart_agent_backend(
+    request: BackendRestartRequest,
+) -> BackendRestartOutcome<handle::BackendHandle, RunningBackend> {
+    let BackendRestartRequest {
+        kind,
+        use_mock_backend,
+        session_id,
+        spawn,
+        relocation,
+        running,
+        commit,
+        cancel,
+    } = request;
+    if use_mock_backend {
+        return restart_erased_backend_session::<mock::MockBackend>(
+            session_id, spawn, relocation, running, commit, cancel,
+        )
+        .await;
+    }
+    with_backend_type!(kind, |B| restart_erased_backend_session::<B>(
+        session_id, spawn, relocation, running, commit, cancel
+    )
+    .await, removed => BackendRestartOutcome::Refused {
+        backend: running,
+        error: "Tycode backend has been removed".to_owned(),
+    })
 }
 
 pub(crate) struct PreparedBackendBinding {

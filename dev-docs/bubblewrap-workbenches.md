@@ -93,7 +93,10 @@ driver's live execution descriptor; closing the instance invalidates it.
 Private runtime files initialize afresh on each native driver launch,
 including resume. Host-only controls reject parent traversal and engine-private
 paths (`/mnt/tyde-runtime`, `/mnt/tyde-git`, `/mnt/tyde-producer-receipts`).
-Live cross-engine conversation moves remain unsupported. Modes requiring nested
+A running agent enters or leaves a Bubblewrap workbench by restarting its backend
+process inside the destination and resuming the same native session, keeping its
+agent identity; a backend without that capability is rejected explicitly, and a
+failed relaunch leaves the agent in its source. Modes requiring nested
 namespaces use freshly prepared runtime support and fail explicitly if host
 policy denies them. The foreground command owns its exit status, independently
 of runtime services. A launch owns its terminal only when started by the session

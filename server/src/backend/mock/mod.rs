@@ -38,8 +38,8 @@ use emit::{MockEventSender, WeakMockEventSender};
 pub use control::{MockControl, MockRequest, MockViolation};
 pub use gate::MockGateHandle;
 pub use script::{
-    AbandonedResponse, MockCompactionFailure, MockLaunch, MockNativeChildUsage, MockResumeReplay,
-    MockScript, MockTurn, RunningCommandShape,
+    AbandonedResponse, MockCompactionFailure, MockLaunch, MockNativeChildUsage, MockResumeLaunch,
+    MockResumeReplay, MockScript, MockTurn, RunningCommandShape,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -110,11 +110,15 @@ const MOCK_MODEL: &str = "mock";
 #[cfg_attr(feature = "test-support", derive(serde::Serialize, serde::Deserialize))]
 struct MockSessionRecord {
     workspace_roots: Vec<String>,
+    #[cfg_attr(feature = "test-support", serde(skip))]
+    launch_project: Option<protocol::ProjectId>,
     prompts: Vec<String>,
     #[cfg_attr(feature = "test-support", serde(skip))]
     resume_continuation: Option<(gate::MockGate, gate::MockGate)>,
     #[cfg_attr(feature = "test-support", serde(skip))]
     resume_replay: Option<MockResumeReplay>,
+    #[cfg_attr(feature = "test-support", serde(skip))]
+    resume_launches: std::collections::VecDeque<MockResumeLaunch>,
     /// Sticky across resume and fork.
     user_bubbles: bool,
     startup_mcp_servers: Vec<String>,
@@ -144,6 +148,12 @@ pub fn accepted_messages_in_order() -> Vec<(SessionId, protocol::SendMessagePayl
         .lock()
         .expect("mock accepted message log mutex poisoned")
         .clone()
+}
+
+/// What a launch-binding turn and a failed scripted resume tell the client.
+pub fn launch_binding_report(project: Option<&protocol::ProjectId>, roots: &[String]) -> String {
+    let project = project.map_or("none", |project| project.0.as_str());
+    format!("project={project} roots={}", roots.join(","))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -273,7 +283,7 @@ impl MockBackend {
     ) -> Result<(Self, EventStream), String> {
         let launch_script = match config.mock_launch.clone() {
             None => default_mock_script(),
-            Some(MockLaunch::Script(script)) => script,
+            Some(MockLaunch::Script(script)) => *script,
             Some(MockLaunch::CloseBeforeResumeBarrier) => {
                 return Err(
                     "mock close-before-resume-barrier launch behavior applies only to resume"
@@ -323,8 +333,10 @@ impl MockBackend {
                 session_id.0.clone(),
                 MockSessionRecord {
                     workspace_roots,
+                    launch_project: None,
                     prompts: Vec::new(),
                     resume_continuation: launch_script.resume_continuation.clone(),
+                    resume_launches: launch_script.resume_launches.clone(),
                     resume_replay: launch_script.resume_replay.clone(),
                     user_bubbles: launch_script.user_bubbles,
                     startup_mcp_servers: startup_mcp_servers.clone(),
@@ -401,11 +413,41 @@ impl MockBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (launch_script, close_before_barrier) = match config.mock_launch.clone() {
-            None => (default_mock_script(), false),
-            Some(MockLaunch::Script(script)) => (script, false),
-            Some(MockLaunch::CloseBeforeResumeBarrier) => (default_mock_script(), true),
-        };
+        let (scripted_launch, stored_roots) = session_store()
+            .lock()
+            .expect("mock backend session store mutex poisoned")
+            .get_mut(&session_id.0)
+            .map_or((None, None), |record| {
+                (
+                    record.resume_launches.pop_front(),
+                    Some(record.workspace_roots.clone()),
+                )
+            });
+        // Providers store a session under its workspace, so a scripted restart
+        // can only resume where the session was last relocated to.
+        if scripted_launch.is_some() && stored_roots.as_ref() != Some(&workspace_roots) {
+            return Err(format!(
+                "mock session is stored in {stored_roots:?}, not {workspace_roots:?}"
+            ));
+        }
+        let launch_project = tyde_process_env::launch::current_project().map(|project| project.id);
+        let (launch_script, close_before_barrier) =
+            match (scripted_launch, config.mock_launch.clone()) {
+                (Some(MockResumeLaunch::Fail(error)), _) => {
+                    return Err(format!(
+                        "{error}: {}",
+                        launch_binding_report(launch_project.as_ref(), &workspace_roots)
+                    ));
+                }
+                (Some(MockResumeLaunch::Hang(hang)), _) => {
+                    hang.0.signal();
+                    return std::future::pending().await;
+                }
+                (Some(MockResumeLaunch::Script(script)), _) => (script, false),
+                (None, None) => (default_mock_script(), false),
+                (None, Some(MockLaunch::Script(script))) => (*script, false),
+                (None, Some(MockLaunch::CloseBeforeResumeBarrier)) => (default_mock_script(), true),
+            };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
@@ -441,6 +483,7 @@ impl MockBackend {
             record.user_bubbles |= launch_script.user_bubbles;
             let user_bubbles = record.user_bubbles;
             record.workspace_roots = workspace_roots;
+            record.launch_project = launch_project;
             record.startup_mcp_servers = startup_mcp_servers;
             record.instructions = resolved_spawn_config.instructions;
             record.steering_body = resolved_spawn_config.steering_body;
@@ -586,7 +629,7 @@ impl MockBackend {
     ) -> Result<(Self, EventStream), BackendStartupError> {
         let launch_script = match config.mock_launch.clone() {
             None => default_mock_script(),
-            Some(MockLaunch::Script(script)) => script,
+            Some(MockLaunch::Script(script)) => *script,
             Some(MockLaunch::CloseBeforeResumeBarrier) => {
                 return Err(BackendStartupError::backend_failed(
                     "mock close-before-resume-barrier launch behavior applies only to resume",
@@ -631,8 +674,10 @@ impl MockBackend {
                 session_id.0.clone(),
                 MockSessionRecord {
                     workspace_roots,
+                    launch_project: None,
                     prompts: source.prompts,
                     resume_continuation: launch_script.resume_continuation.clone(),
+                    resume_launches: launch_script.resume_launches.clone(),
                     resume_replay: launch_script.resume_replay.clone(),
                     user_bubbles: source.user_bubbles || launch_script.user_bubbles,
                     startup_mcp_servers,
@@ -762,6 +807,7 @@ impl Backend for MockBackend {
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::SlashCommands,
+            tyde_agent_adapter::BackendCapability::RestartInWorkspace,
         ]
         .into()
     }
@@ -784,6 +830,26 @@ impl Backend for MockBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         Self::resume_with_launch(workspace_roots, config, session_id).await
+    }
+
+    async fn relocate_stopped_session(
+        session_id: &SessionId,
+        relocation: &super::BackendSessionRelocation,
+    ) -> Result<(), String> {
+        let mut store = session_store()
+            .lock()
+            .expect("mock backend session store mutex poisoned");
+        let record = store
+            .get_mut(&session_id.0)
+            .ok_or_else(|| "cannot relocate an unknown mock session".to_owned())?;
+        if record.workspace_roots != relocation.source.roots {
+            return Err(format!(
+                "mock session is stored in {:?}, not the relocation source {:?}",
+                record.workspace_roots, relocation.source.roots
+            ));
+        }
+        record.workspace_roots = relocation.destination.roots.clone();
+        Ok(())
     }
 
     async fn fork_in_workspace(
