@@ -720,6 +720,7 @@ impl HostHandle {
                 tracing::warn!(?reason, "Tychat lifecycle close failed");
                 error.to_string()
             })?;
+        self.await_agent_close_settlement(id).await?;
         tracing::info!(?reason, closed, "Tychat lifecycle close settled");
         Ok(())
     }

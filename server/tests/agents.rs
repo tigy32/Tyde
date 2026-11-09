@@ -3998,11 +3998,20 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         )
         .expect("inject late ownership marker");
     drop(marker_writer);
+    let closed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "grandchild AgentClosed",
+    )
+    .await;
+    let closed: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
+    assert_eq!(closed.agent_id, grandchild.agent_id);
+
     let failed_settled_marker = fixture.fail_next_session_commit();
     close_preparation.release_one();
     let failed = expect_command_error(
         &mut fixture.client,
-        "settled marker persistence must fail explicitly",
+        "settled marker persistence must fail explicitly after removal",
     )
     .await;
     assert!(failed.message.contains("settled close"));
@@ -4014,20 +4023,20 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
         .close_agent(&grandchild.instance_stream)
         .await
         .expect("retry settled close after storage recovery");
-    let closed = expect_kind(
-        &mut fixture.client,
-        FrameKind::AgentClosed,
-        "grandchild AgentClosed",
-    )
-    .await;
-    let closed: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
-    assert_eq!(closed.agent_id, grandchild.agent_id);
-
     let after_close = expect_task_token_usage_matching(
         &mut usage_client,
         &root.agent_id,
         "aggregate after grandchild close",
-        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 5,
+        |payload| {
+            payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 5
+                && payload.breakdown.iter().any(|entry| {
+                    entry.agent_id == grandchild.agent_id
+                        && matches!(
+                            entry.navigation,
+                            protocol::TaskUsageNavigation::SavedSession { .. }
+                        )
+                })
+        },
     )
     .await;
     assert_eq!(after_close.descendant_count, 2);
@@ -4088,11 +4097,21 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
             .agent_id,
         reopened.agent_id
     );
-    let reclosed_task_usages = fixture.task_usage_snapshot().await;
-    let reclosed = reclosed_task_usages
-        .iter()
-        .find(|payload| payload.root_agent_id == root.agent_id)
-        .expect("reclosed child rollup");
+    let reclosed = expect_task_token_usage_matching(
+        &mut usage_client,
+        &root.agent_id,
+        "reopened child final accounting replaces its retired descriptor",
+        |usage| {
+            usage.breakdown.iter().any(|entry| {
+                entry.agent_id == reopened.agent_id
+                    && matches!(
+                        entry.navigation,
+                        protocol::TaskUsageNavigation::SavedSession { .. }
+                    )
+            })
+        },
+    )
+    .await;
     assert_eq!(
         reclosed.total.usage.total_tokens,
         MOCK_TURN_TOKEN_TOTAL * 5,
@@ -5047,22 +5066,17 @@ async fn task_timing_observes_overlap_background_completion_and_restart_without_
             .close_agent(&root.stream)
             .await
             .expect("close open timing span");
-        loop {
-            let env = expect_kind(
-                &mut fixture.client,
-                FrameKind::AgentClosed,
-                "timing root closed",
-            )
-            .await;
-            if env
-                .parse_payload::<AgentClosedPayload>()
-                .expect("timing close event")
-                .agent_id
-                == root.new_agent.agent_id
-            {
-                break;
+        let mut removed = false;
+        let mut terminal = false;
+        fixture.next_frame_matching("close publishes removal and the observed tool endpoint", |env| {
+            if env.kind == FrameKind::AgentClosed {
+                removed |= env.parse_payload::<AgentClosedPayload>().is_ok_and(|closed| closed.agent_id == root.new_agent.agent_id);
             }
-        }
+            if env.stream == root.stream && env.kind == FrameKind::ChatEvent {
+                terminal |= env.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "interrupted-timing"));
+            }
+            removed && terminal
+        }).await;
         tokio::time::advance(Duration::from_secs(4)).await;
         fixture
             .client
@@ -6506,15 +6520,25 @@ async fn close_agent_recursively_closes_descendants_first() {
 /// is not necessarily the next frame on the connection.
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
     let host_stream = single_host_stream(client);
+    if let Some(env) = pop_pending_agent_event(client, &host_stream, FrameKind::NewAgent) {
+        return env.parse_payload().expect("parse pending NewAgent");
+    }
     loop {
-        if let Some(env) = pop_pending_agent_event(client, &host_stream, FrameKind::NewAgent) {
-            return env.parse_payload().expect("parse pending NewAgent");
-        }
-        let env = expect_next_event(client, context).await;
+        // Reading the general pending queue here requeues the same old agent
+        // event forever and prevents the new descriptor from reaching the test.
+        let env = client
+            .next_event()
+            .await
+            .expect(context)
+            .expect("connection remains open");
         if env.kind == FrameKind::NewAgent {
             return env.parse_payload().expect("parse NewAgent");
         }
-        push_pending_agent_event(client, env);
+        if env.kind == FrameKind::AgentBootstrap {
+            fixture::push_pending_frames_on(client, fixture::agent_bootstrap_frames(&env));
+        } else {
+            push_pending_agent_event(client, env);
+        }
     }
 }
 
@@ -6767,10 +6791,11 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
     )
     .await;
     assert!(
-        error.contains("closing"),
+        error.contains("closing") || error.contains("not found") || error.contains("Unknown"),
         "a spawn under a closing parent must say why it was refused, got: {error}"
     );
-    assert_eq!(fixture.agent_ids().await.len(), 1);
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.agents.is_empty(), "closed parent cannot replay");
     shutdown_gate.release_one();
     fixture
         .next_frame_matching("closing parent teardown completes without a child", |env| {
@@ -6780,11 +6805,12 @@ async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
                     .is_ok_and(|closed| closed.agent_id == parent.new_agent.agent_id)
         })
         .await;
-    assert!(fixture.agent_ids().await.is_empty());
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.agents.is_empty(), "closed parent cannot replay");
 }
 
 #[tokio::test]
-async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
+async fn close_agent_mid_turn_preserves_final_events_after_removal() {
     let mut fixture = Fixture::new().await;
     let gate = MockGateHandle::new();
     let agent = fixture
@@ -6813,7 +6839,8 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
     let mut saw_stream_end = false;
     let mut saw_typing_false = false;
 
-    let env = fixture
+    let mut closed_agent = None;
+    fixture
         .next_frame_matching("close-mid-turn AgentClosed", |env| {
             if env.kind == FrameKind::ChatEvent && env.stream == agent.stream {
                 let event: ChatEvent = env.parse_payload().expect("parse close-mid-turn ChatEvent");
@@ -6825,11 +6852,17 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
                     _ => {}
                 }
             }
-            env.kind == FrameKind::AgentClosed
+            if env.kind == FrameKind::AgentClosed {
+                closed_agent = Some(
+                    env.parse_payload::<AgentClosedPayload>()
+                        .expect("closed payload")
+                        .agent_id,
+                );
+            }
+            closed_agent.is_some() && saw_typing_false && saw_stream_end
         })
         .await;
-    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
-    assert_eq!(closed.agent_id, agent.new_agent.agent_id);
+    assert!(closed_agent.as_ref() == Some(&agent.new_agent.agent_id));
 
     assert!(saw_stream_start, "close should not drop StreamStart");
     assert!(saw_stream_delta, "close should not drop StreamDelta");
@@ -6840,63 +6873,244 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
     );
 }
 
-/// A close runs the backend's teardown to completion; it is never put on a clock.
-///
-/// Teardown used to run under a 3s `BACKEND_SHUTDOWN_TIMEOUT`. Cancelling a
-/// shutdown future mid-flight abandons whatever release work it had left, and
-/// the timeout could not distinguish a backend that was wedged from one that was
-/// simply still working — so it fired on healthy closes and reported an error
-/// for them. Park the backend inside `shutdown` and the close must not finish:
-/// the only thing that may end that wait is the backend actually returning.
-///
-/// The 4s window is deliberately longer than the timeout that used to be here,
-/// so reintroducing any clock around backend shutdown turns this red.
 #[tokio::test]
-async fn close_agent_waits_for_backend_shutdown_instead_of_timing_it_out() {
+async fn close_agent_removes_subtree_before_owned_parallel_shutdown() {
     let mut fixture = Fixture::new().await;
-    let shutdown_gate = MockGateHandle::new();
-    let agent = fixture
+    let parent_gate = MockGateHandle::new();
+    let child_gate = MockGateHandle::new();
+    let root = fixture
         .spawn_scripted(
-            "close-waits-for-shutdown",
-            MockScript::one(MockTurn::text("close waits for shutdown"))
-                .with_shutdown_gate(&shutdown_gate),
+            "surviving-close-root",
+            MockScript::one(MockTurn::text("root completed")),
         )
         .await;
-
-    let event = fixture
-        .next_chat_event_matching(&agent, "opening turn settles", |event| {
+    fixture
+        .next_chat_event_matching(&root, "root idle", |event| {
             matches!(event, ChatEvent::TypingStatusChanged(false))
         })
         .await;
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-
-    fixture
-        .client
-        .close_agent(&agent.stream)
-        .await
-        .expect("close_agent failed");
-
-    // Happens-before edge: the backend is now parked inside `shutdown`, so any
-    // AgentClosed after this point would mean the close abandoned teardown.
-    shutdown_gate.wait_until_entered().await;
-
-    fixture::assert_no_interesting_frame_on(
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "close-parallel-parent",
+            MockScript::one(MockTurn::text("mock backend response to: parent"))
+                .with_shutdown_gate(&parent_gate),
+        )
+        .await;
+    let parent = spawn_user_child(
         &mut fixture.client,
-        Duration::from_secs(4),
-        "AgentClosed while the backend is still shutting down",
-        |env| env.kind != FrameKind::AgentClosed,
+        &root.new_agent.agent_id,
+        "close-parallel-parent",
+        "parent",
+        "/tmp/close-parallel-parent",
     )
     .await;
-
-    shutdown_gate.release_one();
-
-    let env = fixture
-        .next_frame_matching("close-waits-for-shutdown AgentClosed", |env| {
-            env.kind == FrameKind::AgentClosed
-        })
+    drop(reservation);
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "close-parallel-child",
+            MockScript::one(MockTurn::text("mock backend response to: child"))
+                .with_shutdown_gate(&child_gate),
+        )
         .await;
-    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
-    assert_eq!(closed.agent_id, agent.new_agent.agent_id);
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &parent.agent_id,
+        "close-parallel-child",
+        "child",
+        "/tmp/close-parallel-child",
+    )
+    .await;
+    drop(reservation);
+    let (mut observer, _) = fixture.connect_with_bootstrap().await;
+    fixture
+        .client
+        .close_agent(&parent.instance_stream)
+        .await
+        .expect("close parent");
+    child_gate.wait_until_entered().await;
+    eprintln!("Close protocol diagnostic: stage=child-shutdown-held");
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.agents.len() == 1 && bootstrap.agents[0].agent_id == root.new_agent.agent_id,
+        "durable subtree removal must precede backend teardown"
+    );
+    let mut closed = Vec::new();
+    while closed.len() < 2 {
+        let frame = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentClosed,
+            "durable subtree removal before shutdown release",
+        )
+        .await;
+        closed.push(
+            frame
+                .parse_payload::<AgentClosedPayload>()
+                .expect("closed payload")
+                .agent_id,
+        );
+    }
+    assert!(closed[0] == child.agent_id && closed[1] == parent.agent_id);
+    // Both real backend shutdown boundaries must be entered before either is released.
+    parent_gate.wait_until_entered().await;
+    eprintln!("Close protocol diagnostic: stage=both-shutdowns-held");
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.agents.len() == 1 && bootstrap.agents[0].agent_id == root.new_agent.agent_id,
+        "closing agents cannot replay"
+    );
+    parent_gate.release_one();
+    eprintln!("Close protocol diagnostic: stage=parent-released");
+    let settled = expect_task_token_usage_matching(
+        &mut observer,
+        &root.new_agent.agent_id,
+        "parent final accounting settles independently while child shutdown is held",
+        |payload| {
+            payload.breakdown.iter().any(|entry| {
+                entry.agent_id == parent.agent_id
+                    && matches!(
+                        entry.navigation,
+                        protocol::TaskUsageNavigation::SavedSession { .. }
+                    )
+            })
+        },
+    )
+    .await;
+    eprintln!("Close protocol diagnostic: stage=parent-accounting-observed");
+    let archive_failure =
+        server::store::session::commit_hooks::InstalledHook::install_task_usage_archive(
+            server::store::session::SessionStore::database_path(&fixture.session_store_path()),
+            Box::new(|| Err("injected settled accounting failure".to_owned())),
+        );
+    child_gate.release_one();
+    eprintln!("Close protocol diagnostic: stage=child-released");
+    let error = expect_command_error(
+        &mut fixture.client,
+        "asynchronous accounting failure remains visible after removal",
+    )
+    .await;
+    assert!(
+        error
+            .message
+            .contains("Cannot save settled task accounting")
+    );
+    assert_eq!(error.code, CommandErrorCode::Internal);
+    drop(archive_failure);
+    eprintln!("Close protocol diagnostic: stage=archive-error-observed");
+    let (mut late, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = expect_command_error(
+        &mut late,
+        "failed asynchronous close replays after reconnect",
+    )
+    .await;
+    assert_eq!(replayed.code, CommandErrorCode::Internal);
+    eprintln!("Close protocol diagnostic: stage=sticky-error-replayed");
+    assert!(
+        bootstrap.agents.len() == 1 && bootstrap.agents[0].agent_id == root.new_agent.agent_id,
+        "teardown errors cannot resurrect closed agents"
+    );
+    fixture
+        .client
+        .close_agent(&child.instance_stream)
+        .await
+        .expect("retry failed accounting settlement");
+    eprintln!("Close protocol diagnostic: stage=retry-requested");
+    let child_session = settled
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == child.agent_id)
+        .and_then(|entry| entry.session_id.clone())
+        .expect("child session remains owned until finalization");
+    let parent_session = settled
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id == parent.agent_id)
+        .and_then(|entry| entry.session_id.clone())
+        .expect("parent saved session");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("recovered-close-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(root.new_agent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: parent_session,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume saved parent lineage");
+    let resumed_parent = expect_new_agent(&mut fixture.client, "saved parent descriptor").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &resumed_parent.instance_stream,
+        "saved parent bootstrap",
+    )
+    .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("recovered-close-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(resumed_parent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: child_session,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume after explicit close retry");
+    eprintln!("Close protocol diagnostic: stage=resume-requested");
+    let resumed = expect_new_agent(&mut fixture.client, "recovered teardown allows resume").await;
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        "recovered teardown bootstrap",
+    )
+    .await;
+    eprintln!("Close protocol diagnostic: stage=resume-bootstrap-observed");
+    let returned = fixture
+        .host_for_test()
+        .install_close_return_test_gate(&resumed.agent_id)
+        .await
+        .expect("install actor return boundary");
+    fixture
+        .client
+        .close_agent(&resumed.instance_stream)
+        .await
+        .expect("close before actor cancellation");
+    returned.wait_until_entered().await;
+    eprintln!("Close protocol diagnostic: stage=actor-return-held");
+    let archive_must_not_run =
+        server::store::session::commit_hooks::InstalledHook::install_task_usage_archive(
+            server::store::session::SessionStore::database_path(&fixture.session_store_path()),
+            Box::new(|| Err("abnormal termination reached clean accounting archive".to_owned())),
+        );
+    fixture
+        .host_for_test()
+        .abort_owned_agent_for_test(&resumed.agent_id)
+        .await
+        .expect("cancel actor after final checkpoint");
+    fixture
+        .host_for_test()
+        .wait_agent_termination_for_test(&resumed.agent_id)
+        .await;
+    let cancelled = expect_command_error(
+        &mut fixture.client,
+        "abnormal post-checkpoint termination remains visible",
+    )
+    .await;
+    assert_eq!(cancelled.code, CommandErrorCode::Internal);
+    assert!(
+        cancelled
+            .message
+            .contains("cancelled after close admission"),
+        "a checkpoint cannot certify abnormal teardown as a clean close"
+    );
+    drop(archive_must_not_run);
 }
 
 #[tokio::test]
@@ -14291,7 +14505,7 @@ async fn startup_fanout_advertises_all_subscribers_before_any_attach_wait() {
 
 #[tokio::test]
 async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
-    for fail_cleanup in [false, true] {
+    for (fail_cleanup, restart_cleanup) in [(false, false), (true, false), (false, true)] {
         let mut fixture = Fixture::new().await;
         let host = fixture.host_for_test();
         let (handoff, discarded, cleaned) =
@@ -14367,13 +14581,14 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
                 break;
             }
         }
-        let failure = if fail_cleanup {
-            let agent_id = host
-                .agent_ids()
-                .await
-                .into_iter()
-                .next()
-                .expect("unclaimed actor exists");
+        let agent_id = host
+            .agent_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("unclaimed actor exists");
+        let mut restart = None;
+        let failure = if fail_cleanup || restart_cleanup {
             host.wait_for_agent_startup_for_test(&agent_id)
                 .await
                 .expect("actual actor startup completed");
@@ -14381,15 +14596,37 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
             fixture.shutdown_spawn_operations().await;
             discarded.await.expect("creation reply discarded");
             withdrawal.wait_until_entered().await;
-            let failure = fixture.fail_next_session_commit();
-            withdrawal.release_one();
-            Some((failure, withdrawal))
+            let failure = if fail_cleanup {
+                Some(
+                    server::store::session::commit_hooks::InstalledHook::install_agent_close_intent(
+                        server::store::session::SessionStore::database_path(
+                            &fixture.session_store_path(),
+                        ),
+                        agent_id.clone(),
+                        Box::new(|| Err("injected close intent failure".to_owned())),
+                    ),
+                )
+            } else {
+                let stopping = host.clone();
+                restart = Some(tokio::spawn(async move {
+                    stopping.shutdown_for_restart().await
+                }));
+                host.wait_for_restart_started_for_test().await;
+                None
+            };
+            // Release every later visit too; this gate only holds close admission.
+            drop(withdrawal);
+            failure
         } else {
             fixture.shutdown_spawn_operations().await;
             discarded.await.expect("creation reply discarded");
             None
         };
-        drop(cleaned.await.expect("unclaimed cleanup settlement"));
+        let outcome = cleaned.await.expect("unclaimed cleanup settlement");
+        assert_eq!(outcome.is_err(), fail_cleanup, "cleanup admission result");
+        eprintln!(
+            "Cancelled creation diagnostic: phase=admission-settled injected_failure={fail_cleanup} restart={restart_cleanup}"
+        );
         if fail_cleanup {
             loop {
                 let frame = expect_kind(
@@ -14451,6 +14688,9 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
                 "recovered unclaimed cleanup",
             )
             .await;
+            host.await_agent_close_settlement_for_test(&agent_id)
+                .await
+                .expect("recovered cleanup settles");
             let (mut recovered, _) = fixture.connect_with_bootstrap().await;
             let bootstrap_task_usages = fixture.task_usage_snapshot().await;
             assert!(
@@ -14480,6 +14720,23 @@ async fn cancelling_an_unclaimed_creation_reply_removes_its_agent() {
                 }
             }
             continue;
+        }
+        host.await_agent_close_settlement_for_test(&agent_id)
+            .await
+            .expect("cancelled creation teardown settles");
+        if let Some(restart) = restart {
+            restart
+                .await
+                .expect("restart owner joins")
+                .expect("restart preserves cancelled creation retirement");
+            let restored = server::new_spawn_operation_test_gate();
+            fixture
+                .restart_host_with_runtime_config(|config| {
+                    config.restoration_complete_test_gate = Some(restored.shared());
+                })
+                .await;
+            restored.wait_until_entered().await;
+            drop(restored);
         }
         let (_, bootstrap) = fixture.connect_with_bootstrap().await;
         let bootstrap_task_usages = fixture.task_usage_snapshot().await;

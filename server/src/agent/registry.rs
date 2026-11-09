@@ -74,6 +74,7 @@ pub(crate) struct AgentStatus {
     /// Derived by the actor from unanswered canonical requests, not card presence.
     pub blocked_on_user_response: bool,
     pub last_error: Option<String>,
+    pub close_recovery_error: Option<String>,
     pub activity_counter: u64,
     /// This agent's transcript was replayed from a saved session and no live
     /// turn has begun since. The supervisor reads it to leave reopened history
@@ -308,7 +309,9 @@ enum RecoveryCommand {
     Bind {
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
-        reply: oneshot::Sender<Result<(), String>>,
+        restoration: Option<crate::store::session::SessionRestoreState>,
+        parent_agent_id: Option<AgentId>,
+        reply: oneshot::Sender<Result<crate::store::session::AgentRecoveryState, String>>,
     },
     Reserve {
         store: Arc<crate::store::session::SessionStoreHandle>,
@@ -319,6 +322,7 @@ enum RecoveryCommand {
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
         restore_state: Option<crate::store::session::SessionRestoreState>,
+        parent_agent_id: Option<AgentId>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Queue {
@@ -326,6 +330,7 @@ enum RecoveryCommand {
         reply: oneshot::Sender<Result<(), String>>,
     },
     Withdraw {
+        queued_at: std::time::Instant,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Admit {
@@ -348,8 +353,14 @@ async fn write_recovery_marker(
 ) -> Result<(), String> {
     match binding {
         Some(RecoveryBinding::Session { store, id }) => {
+            let id = id.clone();
+            let agent = agent_id.clone();
             store
-                .update(id, move |record| record.turn_recovery = marker)
+                .call(move |store| {
+                    store.update_agent_recovery(&id, &agent, move |record| {
+                        record.turn_recovery = marker
+                    })
+                })
                 .await
         }
         Some(RecoveryBinding::Reservation { store }) => {
@@ -377,9 +388,24 @@ async fn run_recovery_actor(
     let mut binding = None;
     while let Some(command) = commands.recv().await {
         match command {
-            RecoveryCommand::Bind { store, id, reply } => {
-                binding = Some(RecoveryBinding::Session { store, id });
-                let _ = reply.send(Ok(()));
+            RecoveryCommand::Bind {
+                store,
+                id,
+                restoration,
+                parent_agent_id,
+                reply,
+            } => {
+                let session = id.clone();
+                let agent = agent_id.clone();
+                let result = store
+                    .call(move |store| {
+                        store.bind_agent_recovery(&session, &agent, restoration, parent_agent_id)
+                    })
+                    .await;
+                if result.is_ok() {
+                    binding = Some(RecoveryBinding::Session { store, id });
+                }
+                let _ = reply.send(result);
             }
             RecoveryCommand::Reserve {
                 store,
@@ -396,14 +422,17 @@ async fn run_recovery_actor(
                 store,
                 id,
                 restore_state,
+                parent_agent_id,
                 reply,
             } => {
                 let result = if matches!(binding, Some(RecoveryBinding::Reservation { .. })) {
                     store
-                        .promote_startup_reservation(&agent_id, &id, restore_state)
+                        .promote_startup_reservation(&agent_id, &id, restore_state, parent_agent_id)
                         .await
                 } else if let Some(restore_state) = restore_state {
-                    store.set_restore_state(&id, restore_state).await
+                    store
+                        .set_restore_state(&id, restore_state, parent_agent_id)
+                        .await
                 } else {
                     Ok(())
                 };
@@ -415,8 +444,14 @@ async fn run_recovery_actor(
             RecoveryCommand::Queue { messages, reply } => {
                 let result = match &binding {
                     Some(RecoveryBinding::Session { store, id }) => {
+                        let id = id.clone();
+                        let agent = agent_id.clone();
                         store
-                            .update(id, move |record| record.queued_messages = messages)
+                            .call(move |store| {
+                                store.update_agent_recovery(&id, &agent, move |record| {
+                                    record.queued_messages = messages
+                                })
+                            })
                             .await
                     }
                     Some(RecoveryBinding::Reservation { store }) => {
@@ -426,16 +461,23 @@ async fn run_recovery_actor(
                             })
                             .await
                     }
+                    None if messages.is_empty() => Ok(()),
                     None => {
                         Err("the agent has no durable session or startup reservation".to_owned())
                     }
                 };
                 let _ = reply.send(result);
             }
-            RecoveryCommand::Withdraw { reply } => {
+            RecoveryCommand::Withdraw { queued_at, reply } => {
+                let started = std::time::Instant::now();
+                tracing::info!(target: "server::agent_close", queue_wait_ms = queued_at.elapsed().as_millis(), "recovery storage entered");
                 let result = match &binding {
-                    Some(RecoveryBinding::Session { .. }) => {
-                        write_recovery_marker(&binding, &agent_id, None).await
+                    Some(RecoveryBinding::Session { store, id }) => {
+                        let session = id.clone();
+                        let agent = agent_id.clone();
+                        store
+                            .call(move |store| store.withdraw_agent_recovery(&session, &agent))
+                            .await
                     }
                     Some(RecoveryBinding::Reservation { store }) => {
                         let result = store.remove_startup_reservation(&agent_id).await;
@@ -446,6 +488,7 @@ async fn run_recovery_actor(
                     }
                     None => Ok(()),
                 };
+                tracing::info!(target: "server::agent_close", elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "recovery storage finished");
                 let _ = reply.send(result);
             }
             RecoveryCommand::Admit { class, reply } => {
@@ -495,15 +538,13 @@ async fn run_recovery_actor(
                 restarting.store(true, Ordering::Release);
                 let result = match &binding {
                     Some(RecoveryBinding::Session { store, id }) => {
-                        store
-                            .update(id, |record| {
-                                if record.turn_recovery.is_some() {
-                                    record.turn_recovery = Some(
-                                        crate::store::session::TurnRecovery::InterruptedByRestart,
-                                    );
-                                }
-                            })
-                            .await
+                        let id = id.clone();
+                        let agent = agent_id.clone();
+                        store.call(move |store| store.update_agent_recovery(&id, &agent, |record| {
+                            if record.turn_recovery.is_some() {
+                                record.turn_recovery = Some(crate::store::session::TurnRecovery::InterruptedByRestart);
+                            }
+                        })).await
                     }
                     Some(RecoveryBinding::Reservation { store }) => {
                         store
@@ -648,7 +689,7 @@ impl AgentStatusHandle {
     async fn report_recovery_failure(&self, error: String) {
         tracing::error!(%error, "agent recovery persistence failed");
         self.update(|status| {
-            status.last_error = Some(format!("Cannot persist agent recovery: {error}"))
+            status.last_error = Some(format!("Cannot persist agent recovery: {error}"));
         })
         .await;
     }
@@ -657,13 +698,17 @@ impl AgentStatusHandle {
         &self,
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
-    ) {
-        if let Err(error) = self
-            .recovery_request(|reply| RecoveryCommand::Bind { store, id, reply })
-            .await
-        {
-            self.report_recovery_failure(error).await;
-        }
+        restoration: Option<crate::store::session::SessionRestoreState>,
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<crate::store::session::AgentRecoveryState, String> {
+        self.recovery_request(|reply| RecoveryCommand::Bind {
+            store,
+            id,
+            restoration,
+            parent_agent_id,
+            reply,
+        })
+        .await
     }
 
     pub async fn reserve_startup(
@@ -684,18 +729,16 @@ impl AgentStatusHandle {
         store: Arc<crate::store::session::SessionStoreHandle>,
         id: SessionId,
         restore_state: Option<crate::store::session::SessionRestoreState>,
-    ) {
-        if let Err(error) = self
-            .recovery_request(|reply| RecoveryCommand::Promote {
-                store,
-                id,
-                restore_state,
-                reply,
-            })
-            .await
-        {
-            self.report_recovery_failure(error).await;
-        }
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<(), String> {
+        self.recovery_request(|reply| RecoveryCommand::Promote {
+            store,
+            id,
+            restore_state,
+            parent_agent_id,
+            reply,
+        })
+        .await
     }
 
     pub async fn persist_queued_messages(
@@ -712,17 +755,24 @@ impl AgentStatusHandle {
     }
 
     pub async fn withdraw_recovery(&self) {
-        tracing::debug!("withdrawing agent recovery");
+        let started = std::time::Instant::now();
+        tracing::info!(target: "server::agent_close", "recovery withdrawal requested");
         #[cfg(feature = "test-support")]
         if let Some(gates) = self.recovery_test_gates.get() {
             crate::host::notify_spawn_operation_test_gate_inner(&gates.withdrawing);
         }
-        if let Err(error) = self
-            .recovery_request(|reply| RecoveryCommand::Withdraw { reply })
-            .await
-        {
+        let result = self
+            .recovery_request(|reply| RecoveryCommand::Withdraw {
+                queued_at: std::time::Instant::now(),
+                reply,
+            })
+            .await;
+        self.update(|status| status.close_recovery_error = result.as_ref().err().cloned())
+            .await;
+        if let Err(error) = result {
             self.report_recovery_failure(error).await;
         }
+        tracing::info!(target: "server::agent_close", elapsed_ms = started.elapsed().as_millis(), "recovery withdrawal acknowledged");
     }
 
     pub async fn admit_dispatch(&self, class: DispatchClass) -> DispatchAdmission {
@@ -815,6 +865,10 @@ impl AgentStatusHandle {
 
     pub async fn snapshot(&self) -> AgentStatus {
         self.current()
+    }
+
+    pub fn agent_id(&self) -> &AgentId {
+        &self.agent_id
     }
 
     pub fn current(&self) -> AgentStatus {
@@ -960,6 +1014,7 @@ impl AgentRegistry {
     pub fn spawn(
         &mut self,
         mut request: ResolvedSpawnRequest,
+        resumed_identity: Option<AgentId>,
         agent_control_mcp: &AgentControlMcpHandle,
         runtime: AgentActorRuntimeResources,
     ) -> SpawnedAgent {
@@ -967,6 +1022,7 @@ impl AgentRegistry {
             .restoration
             .as_ref()
             .and_then(|admission| admission.agent_id.clone())
+            .or(resumed_identity)
             .unwrap_or_else(|| AgentId(Uuid::new_v4().to_string()));
         for server in &mut request.resolved_spawn_config.mcp_servers {
             if !matches!(

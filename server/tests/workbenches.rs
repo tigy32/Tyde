@@ -1145,7 +1145,7 @@ async fn workbench_remove_cascades_team_member_reference() {
 }
 
 #[tokio::test]
-async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
+async fn lifecycle_completion_does_not_wait_for_unrelated_teardown() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("cleanup-usage-owner");
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
@@ -1235,9 +1235,6 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
     .await;
     let host = fixture.host_for_test();
     host.synchronize_task_usage_refresh_for_test().await;
-    let mut pending = host
-        .pending_agent_usage_reads_for_test(&unrelated_start.agent_id)
-        .await;
     teardown_client.close_agent(&teardown_stream).await.unwrap();
     teardown.wait_until_entered().await;
     fixture
@@ -1251,45 +1248,21 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
         .await
         .unwrap();
     fixture.finish_turn(&caller).await;
-    let synchronization = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
-        let host = host.clone();
-        async move { host.synchronize_task_usage_refresh_for_test().await }
-    }));
-    drop(pending.wait_for(|count| *count > 0).await.unwrap());
-    assert!(
-        *pending.borrow() == 1,
-        "one canonical usage worker is held on the unrelated actor"
-    );
-    eprintln!("CLEANUP USAGE: native teardown and canonical accounting reply are held");
-
-    let (mut inventory_client, inventory) = {
-        let bootstrap = fixture::connect_host(host.clone());
-        tokio::pin!(bootstrap);
-        tokio::select! {
-            result = &mut bootstrap => result,
-            extra = pending.wait_for(|count| *count > 1) => {
-                drop(extra.unwrap());
-                eprintln!("ACCOUNTING RED: desktop bootstrap requested another reply from the held unrelated actor");
-                teardown.release_one();
-                panic!("desktop initial inventory awaits unrelated accounting");
-            }
-        }
-    };
+    // Retired handles no longer queue usage reads behind native shutdown:
+    // accounting observes their published checkpoint or explicit unavailable state.
+    host.synchronize_task_usage_refresh_for_test().await;
+    let (mut inventory_client, inventory) = fixture::connect_host(host.clone()).await;
     let advertised = inventory
         .agents
         .iter()
         .map(|agent| &agent.agent_id)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        advertised,
-        [
-            &caller_start.agent_id,
-            &child_start.agent_id,
-            &unrelated_start.agent_id
-        ]
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>(),
-        "desktop inventory advertises every registered agent, not the closed saved agent"
+    assert!(
+        advertised
+            == [&caller_start.agent_id, &child_start.agent_id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        "desktop inventory excludes both retired agents while unrelated native shutdown remains held"
     );
     inventory_client
         .heartbeat(protocol::HeartbeatPayload {
@@ -1308,52 +1281,22 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
         },
     )
     .await;
-    assert!(
-        *pending.borrow() == 1,
-        "initial inventory and a new-connection command complete with accounting still held"
-    );
-    eprintln!("ACCOUNTING GREEN: desktop inventory and heartbeat completed before the held reply");
-
-    let (failed, _) = {
-        let removal = call_agent_control(
-            &fixture,
-            &caller_start.agent_id,
-            "tyde_remove_workbench",
-            json!({"project_id": workbench.id}),
-        );
-        tokio::pin!(removal);
-        tokio::select! {
-            result = &mut removal => result,
-            extra = pending.wait_for(|count| *count > 1) => {
-                drop(extra.unwrap());
-                assert!(!Path::new(&project_roots(&workbench)[0]).exists(),
-                    "the held accounting dependency follows actual worktree deletion");
-                eprintln!("CLEANUP USAGE RED: removal enqueued another accounting request to the held unrelated actor");
-                teardown.release_one();
-                panic!("workbench removal awaits unrelated accounting after filesystem deletion");
-            }
-        }
-    };
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &caller_start.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": workbench.id}),
+    )
+    .await;
     assert!(!failed, "normal MCP removal must complete successfully");
     assert!(!Path::new(&project_roots(&workbench)[0]).exists());
-    let (failed, _) = {
-        let close = call_agent_control(
-            &fixture,
-            &caller_start.agent_id,
-            "tyde_close_agent",
-            json!({"agent_id": child_start.agent_id}),
-        );
-        tokio::pin!(close);
-        tokio::select! {
-            result = &mut close => result,
-            extra = pending.wait_for(|count| *count > 1) => {
-                drop(extra.unwrap());
-                eprintln!("CLEANUP USAGE RED: close enqueued another accounting request to the held unrelated actor");
-                teardown.release_one();
-                panic!("agent close awaits unrelated accounting after registry removal");
-            }
-        }
-    };
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &caller_start.agent_id,
+        "tyde_close_agent",
+        json!({"agent_id": child_start.agent_id}),
+    )
+    .await;
     assert!(!failed, "normal MCP close must complete successfully");
     fixture::next_logical_frame_matching_on(&mut fixture.client, "canonical removal settlement", |env| {
         env.kind == FrameKind::ProjectOperation
@@ -1382,17 +1325,12 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
         unreachable!("matched replacement workbench upsert")
     };
     assert!(replacement.parent_project_id() == Some(&parent.id));
-    assert!(
-        *pending.borrow() == 1,
-        "cleanup and family admission completed before unrelated accounting replied"
-    );
-    eprintln!(
-        "CLEANUP USAGE GREEN: real MCP removal, close and same-family creation completed while unrelated teardown stayed held"
-    );
     teardown.release_one();
-    synchronization.await.unwrap();
     host.synchronize_task_usage_refresh_for_test().await;
-    for client in [&mut fixture.client, &mut inventory_client] {
+    // Removal is immediate; previous control waits may already consume accounting.
+    // Keep the unread observer for live fanout and fetch a fresh protocol snapshot.
+    let mut accounting = Vec::new();
+    for client in [&mut inventory_client] {
         client
             .list_sessions(protocol::ListSessionsPayload {
                 scope: Some(protocol::SessionListScope::RootSessions),
@@ -1427,7 +1365,21 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_usage() {
                     .unwrap(),
             );
         }
-        let usage = latest.expect("accounting publication precedes its protocol fence");
+        accounting.push(latest.expect("accounting publication precedes its protocol fence"));
+    }
+    accounting.extend(
+        fixture
+            .task_usage_snapshot()
+            .await
+            .into_iter()
+            .filter(|usage| usage.root_agent_id == caller_start.agent_id),
+    );
+    assert_eq!(
+        accounting.len(),
+        2,
+        "live and fresh clients both observe accounting"
+    );
+    for usage in accounting {
         assert!(
             usage
                 .breakdown
@@ -6353,6 +6305,8 @@ async fn running_agent_restarts_across_bubblewrap_boundary() {
         .await
         .unwrap();
     let mut delivered_continuation = false;
+    let mut removed = false;
+    let mut cancellation = None;
     fixture
         .next_frame_matching("closed restart finishes the agent", |env| {
             if env.stream == cancelled_stream
@@ -6365,12 +6319,27 @@ async fn running_agent_restarts_across_bubblewrap_boundary() {
             {
                 delivered_continuation = true;
             }
-            env.kind == FrameKind::AgentClosed
+            if env.stream == cancelled_stream && env.kind == FrameKind::AgentError {
+                cancellation = Some(
+                    env.parse_payload::<protocol::AgentErrorPayload>()
+                        .expect("close cancellation error"),
+                );
+            }
+            removed |= env.kind == FrameKind::AgentClosed
                 && env
                     .parse_payload::<protocol::AgentClosedPayload>()
-                    .is_ok_and(|closed| closed.agent_id == cancelled_start.agent_id)
+                    .is_ok_and(|closed| closed.agent_id == cancelled_start.agent_id);
+            // Removal precedes teardown; consume the cancelled restart's own
+            // terminal error before asking the strict spawn helper for a new card.
+            removed && cancellation.is_some()
         })
         .await;
+    let cancellation = cancellation.expect("close reports cancelled project entry");
+    assert!(!cancellation.fatal);
+    assert_eq!(
+        cancellation.message,
+        "Project entry cancelled. Your project is unchanged."
+    );
     assert!(
         !delivered_continuation,
         "a cancelled restart must not start another turn"

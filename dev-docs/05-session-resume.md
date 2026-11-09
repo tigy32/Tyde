@@ -254,6 +254,11 @@ the extension replaced by `.sqlite3` (default `~/.tyde/sessions.sqlite3`).
 
 - `sessions`: one JSON record per session, keyed by session ID.
 - `session_tasks`: one task-list JSON document per session.
+- `agent_recovery_states`: durable turn/queue custody per agent; the session
+  record projects the selected restoration owner's state. Other open cards
+  with accepted turn/queue custody are restored by their own agent identities
+  and parent bindings; an idle sibling cannot discard that work.
+- `agent_close_intents`: durable retirement fences for closed agents.
 - `archived_sessions`: obsolete Gemini records retained rather than destroyed.
 - `PRAGMA user_version`: the transactional schema/import version.
 
@@ -273,6 +278,27 @@ counts are logged without session identifiers or conversation content.
 This does not make saturated storage fast. Commits still await durable storage,
 reads can still experience disk latency, and broader host critical sections in
 cross-store operations remain a separate concern.
+
+### Durable close and owned teardown
+
+`CloseAgent` first commits close intent for the subtree in SQLite, removes
+startup reservations, and withdraws restoration for retired owners. Shared
+sessions retain a surviving owner's restoration state; the transaction checks
+close intents rather than trusting an earlier runtime snapshot. Late writes
+from retired owners cannot restore closed agents.
+
+The host then removes the subtree and emits post-order `AgentClosed` events in
+one owner turn. This is authoritative removal, not completion of native
+shutdown. Existing chat streams may still receive terminal events. Owned
+teardown runs independently for each agent and retains final accounting until
+it is archived. New clients cannot replay the removed cards. Resuming a closing
+session waits for settlement; restart drains admitted closes before capturing
+remaining live agents.
+
+Teardown errors are typed `CommandError` events, replayed on reconnect. A
+`CloseAgent` on the retired agent retries its retained teardown without
+publishing a second removal. Errors and accounting ownership are released only
+after successful settlement; an outstanding failure blocks restart.
 
 ### One-time JSON import and operational safety
 

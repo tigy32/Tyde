@@ -1801,20 +1801,9 @@ impl Connection {
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::AgentClosed => {
-                    let payload: AgentClosedPayload =
+                    let _: AgentClosedPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
-                    let streams_to_remove = self
-                        .outgoing_seq
-                        .keys()
-                        .filter(|stream| stream.0.starts_with("/agent/"))
-                        .filter_map(|stream| {
-                            let parts = parse_agent_stream(stream);
-                            (parts.agent_id == payload.agent_id).then_some(stream.clone())
-                        })
-                        .collect::<Vec<_>>();
-                    for stream in streams_to_remove {
-                        self.outgoing_seq.remove(&stream);
-                    }
+                    // Registry removal does not end subscribed chat streams or their sequence domains.
                 }
                 other => {
                     panic!(

@@ -1702,6 +1702,25 @@ Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(()))
                 .with(move |state| state.team_registry.clone())
                 .await
         };
+        let pending_bindings = registry
+            .snapshot()
+            .await
+            .map_err(|error| fail(SwarmErrorCode::Storage, error))?;
+        let members = pending_bindings
+            .members
+            .iter()
+            .filter(|member| member.team_id == *id)
+            .map(|member| &member.id)
+            .collect::<HashSet<_>>();
+        for binding in &pending_bindings.bindings {
+            if members.contains(&binding.member_id)
+                && let Some(agent) = &binding.current_agent_id
+            {
+                self.await_agent_close_settlement(agent)
+                    .await
+                    .map_err(|error| fail(SwarmErrorCode::Lifecycle, error))?;
+            }
+        }
         let snapshot = registry
             .snapshot()
             .await
@@ -2173,7 +2192,7 @@ async fn record_swarm_status_locked(
         None => (status, session, terminated, None),
     };
     let retiring_teardown_pending = terminated
-        && state.registry.agent_handle(&id).is_some()
+        && (state.registry.agent_handle(&id).is_some() || state.closing_agents.contains_key(&id))
         && registry.snapshot().await?.swarms.iter().any(|swarm| {
             swarm.members.iter().any(|member| {
                 member.agent_id.as_ref() == Some(&id)

@@ -95,6 +95,29 @@ pub(crate) struct SessionRestoreState {
     pub workflow: Option<AgentWorkflowMetadata>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct AgentRecoveryState {
+    pub(crate) turn_recovery: Option<TurnRecovery>,
+    pub(crate) queued_messages: Vec<protocol::QueuedMessageEntry>,
+    #[serde(default)]
+    restoration: Option<SessionRestoreState>,
+    parent: AgentRestorationParent,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) enum AgentRestorationParent {
+    #[default]
+    Root,
+    Agent(protocol::AgentId),
+    UnrestoredSession(SessionId),
+}
+
+pub(crate) struct AgentRestorationSnapshot {
+    pub(crate) records: Vec<SessionRecord>,
+    pub(crate) parents: HashMap<protocol::AgentId, AgentRestorationParent>,
+    pub(crate) work_owners: HashSet<protocol::AgentId>,
+}
+
 /// A new or forked agent whose provider session does not exist yet. It is
 /// durable before the agent's first prompt is admitted and carries that
 /// prompt, so a host that dies during startup re-issues it on the same agent
@@ -293,16 +316,24 @@ impl SessionStore {
                     .pragma_update(None, "user_version", 1)
                     .map_err(sql_error)?;
             }
-            1 => {}
+            1 | 2 => {}
             _ => return Err("session database schema is newer than this server".to_owned()),
         }
         transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS startup_reservations (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS agent_close_intents (agent_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE IF NOT EXISTS agent_recovery_states (agent_id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, record TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS task_usage_resets (id INTEGER PRIMARY KEY, record TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS task_usage_archive (agent_id TEXT PRIMARY KEY NOT NULL, session_id TEXT UNIQUE, record TEXT NOT NULL);",
             )
             .map_err(sql_error)?;
+        if version < 2 {
+            migrate_agent_recovery_ownership(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", 2)
+                .map_err(sql_error)?;
+        }
         let purged = {
             let mut statement = transaction
                 .prepare("SELECT id FROM archived_sessions")
@@ -611,14 +642,353 @@ impl SessionStore {
         })
     }
 
+    pub(crate) fn bind_agent_recovery(
+        &self,
+        session: &SessionId,
+        agent: &protocol::AgentId,
+        restoration: Option<SessionRestoreState>,
+        parent_agent_id: Option<protocol::AgentId>,
+    ) -> Result<AgentRecoveryState, String> {
+        self.reservation_transaction(|transaction| {
+            if agent_close_recorded(transaction, agent)? {
+                return Err("Agent recovery binding was closed".to_owned());
+            }
+            let mut records = read_records(transaction, &[session])?;
+            let record = records
+                .remove(&session.0)
+                .ok_or("Recovery binding session is missing")?;
+            #[cfg(feature = "test-support")]
+            commit_hooks::recovery_binding(&self.path, session)?;
+            let mut state = match read_agent_recovery(transaction, agent, session)? {
+                Some(state) => state,
+                None if record
+                    .restore_state
+                    .as_ref()
+                    .and_then(|owner| owner.agent_id.as_ref())
+                    == Some(agent) =>
+                {
+                    return Err("Selected agent recovery custody is missing".to_owned());
+                }
+                None => AgentRecoveryState::default(),
+            };
+            state.restoration = restoration;
+            state.parent = match parent_agent_id {
+                Some(id) => AgentRestorationParent::Agent(id),
+                None => AgentRestorationParent::Root,
+            };
+            write_agent_recovery(transaction, agent, session, &state)?;
+            Ok((state, true))
+        })
+    }
+
+    pub(crate) fn restoration_snapshot(&self) -> Result<AgentRestorationSnapshot, String> {
+        let mut reader = self.reader()?;
+        let connection = reader.transaction().map_err(sql_error)?;
+        let sessions = read_records(&connection, &[])?;
+        let mut snapshot = AgentRestorationSnapshot {
+            records: Vec::new(),
+            parents: HashMap::new(),
+            work_owners: HashSet::new(),
+        };
+        let mut candidates = HashMap::new();
+        let mut included = HashSet::new();
+        let mut required = Vec::new();
+        let mut query = connection
+            .prepare("SELECT agent_id, session_id, record FROM agent_recovery_states")
+            .map_err(sql_error)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (agent, session, json) = row.map_err(sql_error)?;
+            let agent = protocol::AgentId(agent);
+            let state: AgentRecoveryState = serde_json::from_str(&json)
+                .map_err(|error| format!("Cannot decode agent recovery: {error}"))?;
+            let Some(restoration) = state.restoration else {
+                continue;
+            };
+            if agent_close_recorded(&connection, &agent)? {
+                return Err("Closed agent retained restoration custody".to_owned());
+            }
+            let record = sessions
+                .get(&session)
+                .ok_or("Restoration custody session is missing")?;
+            let selected = record
+                .restore_state
+                .as_ref()
+                .and_then(|owner| owner.agent_id.as_ref())
+                == Some(&agent);
+            let owns_work = state.turn_recovery.is_some() || !state.queued_messages.is_empty();
+            if owns_work {
+                snapshot.work_owners.insert(agent.clone());
+            }
+            if selected || owns_work {
+                required.push(agent.clone());
+                included.insert(agent.clone());
+            }
+            let mut owned = record.clone();
+            owned.restore_state = Some(restoration);
+            owned.turn_recovery = state.turn_recovery;
+            owned.queued_messages = state.queued_messages;
+            snapshot.parents.insert(agent.clone(), state.parent);
+            candidates.insert(agent, owned);
+        }
+        for record in sessions
+            .values()
+            .filter(|record| record.restore_state.is_some())
+        {
+            let agent = record
+                .restore_state
+                .as_ref()
+                .and_then(|owner| owner.agent_id.as_ref())
+                .ok_or("Selected restoration identity is missing")?;
+            if !candidates.contains_key(agent) {
+                return Err("Selected restoration custody is missing".to_owned());
+            }
+        }
+        while let Some(agent) = required.pop() {
+            if let Some(AgentRestorationParent::Agent(parent)) = snapshot.parents.get(&agent)
+                && candidates.contains_key(parent)
+            {
+                included.insert(parent.clone());
+                if snapshot.work_owners.insert(parent.clone()) {
+                    required.push(parent.clone());
+                }
+            }
+        }
+        for agent in included {
+            snapshot.records.push(
+                candidates
+                    .remove(&agent)
+                    .ok_or("Included restoration custody is missing")?,
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn agent_restoration_wanted(
+        &self,
+        session: &SessionId,
+        agent: Option<&protocol::AgentId>,
+    ) -> Result<bool, String> {
+        let connection = self.reader()?;
+        let Some(record) = read_records(&connection, &[session])?.remove(&session.0) else {
+            return Ok(false);
+        };
+        match agent {
+            Some(agent) => {
+                if agent_close_recorded(&connection, agent)? {
+                    return Ok(false);
+                }
+                if record
+                    .restore_state
+                    .as_ref()
+                    .and_then(|owner| owner.agent_id.as_ref())
+                    == Some(agent)
+                {
+                    return Ok(true);
+                }
+                Ok(read_agent_recovery(&connection, agent, session)?
+                    .is_some_and(|state| state.restoration.is_some()))
+            }
+            None => Ok(record.restore_state.is_some()),
+        }
+    }
+
     pub(crate) fn set_restore_state(
         &self,
         session_id: &SessionId,
         restore_state: SessionRestoreState,
+        parent_agent_id: Option<protocol::AgentId>,
     ) -> Result<(), String> {
-        self.update(session_id, |record| {
+        self.reservation_transaction(|transaction| {
+            let original = read_raw_records(transaction, &[session_id])?;
+            let mut records = decode_records(&original)?;
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or("Restoration session is missing")?;
+            let agent = restore_state
+                .agent_id
+                .as_ref()
+                .ok_or("Restoration owner is missing its agent")?;
+            if agent_close_recorded(transaction, agent)? {
+                return Ok(((), false));
+            }
+            let mut state = read_agent_recovery(transaction, agent, session_id)?
+                .ok_or("Agent recovery custody is missing before promotion")?;
+            state.restoration = Some(restore_state.clone());
+            state.parent = match parent_agent_id {
+                Some(id) => AgentRestorationParent::Agent(id),
+                None => AgentRestorationParent::Root,
+            };
+            write_agent_recovery(transaction, agent, session_id, &state)?;
+            record.turn_recovery = state.turn_recovery;
+            record.queued_messages = state.queued_messages;
             record.origin = Some(restore_state.origin);
             record.restore_state = Some(restore_state);
+            write_records(transaction, &original, records)?;
+            Ok(((), true))
+        })
+    }
+
+    pub(crate) fn record_agent_close(
+        &self,
+        agents: &[protocol::AgentId],
+        sessions: &HashSet<SessionId>,
+        survivors: &HashMap<SessionId, Vec<SessionRestoreState>>,
+    ) -> Result<(), String> {
+        self.reservation_transaction(|transaction| {
+            for agent in agents {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO agent_close_intents VALUES (?1)",
+                        [&agent.0],
+                    )
+                    .map_err(sql_error)?;
+                transaction
+                    .execute("DELETE FROM startup_reservations WHERE id=?1", [&agent.0])
+                    .map_err(sql_error)?;
+                transaction
+                    .execute(
+                        "DELETE FROM agent_recovery_states WHERE agent_id=?1",
+                        [&agent.0],
+                    )
+                    .map_err(sql_error)?;
+            }
+            let ids = sessions.iter().collect::<Vec<_>>();
+            if !ids.is_empty() {
+                let original = read_raw_records(transaction, &ids)?;
+                let mut records = decode_records(&original)?;
+                for record in records.values_mut() {
+                    if record.restore_state.as_ref().is_some_and(|restore| {
+                        restore
+                            .agent_id
+                            .as_ref()
+                            .is_some_and(|owner| agents.contains(owner))
+                    }) {
+                        record.restore_state = None;
+                        if let Some(owners) = survivors.get(&record.id) {
+                            for owner in owners {
+                                let agent = owner
+                                    .agent_id
+                                    .as_ref()
+                                    .ok_or("Surviving restoration owner is missing its agent")?;
+                                if !agent_close_recorded(transaction, agent)? {
+                                    record.restore_state = Some(owner.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(owner) = &record.restore_state {
+                            record.origin = Some(owner.origin);
+                        }
+                        match record
+                            .restore_state
+                            .as_ref()
+                            .and_then(|owner| owner.agent_id.as_ref())
+                        {
+                            Some(agent) => {
+                                let state = read_agent_recovery(transaction, agent, &record.id)?
+                                    .ok_or("Surviving agent recovery state is missing")?;
+                                record.turn_recovery = state.turn_recovery;
+                                record.queued_messages = state.queued_messages;
+                            }
+                            None => {
+                                record.turn_recovery = None;
+                                record.queued_messages.clear();
+                            }
+                        }
+                    }
+                }
+                write_records(transaction, &original, records)?;
+                #[cfg(feature = "test-support")]
+                commit_hooks::run(&self.path, &sessions.iter().cloned().collect::<Vec<_>>())?;
+            }
+            #[cfg(feature = "test-support")]
+            commit_hooks::agent_close_intent(&self.path, agents)?;
+            Ok(((), true))
+        })
+    }
+
+    pub(crate) fn update_agent_recovery<F>(
+        &self,
+        session: &SessionId,
+        agent: &protocol::AgentId,
+        update: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&mut SessionRecord),
+    {
+        self.agent_recovery_transaction(session, agent, false, update)
+    }
+
+    pub(crate) fn withdraw_agent_recovery(
+        &self,
+        session: &SessionId,
+        agent: &protocol::AgentId,
+    ) -> Result<(), String> {
+        self.agent_recovery_transaction(session, agent, true, |record| record.turn_recovery = None)
+    }
+
+    fn agent_recovery_transaction<F>(
+        &self,
+        session: &SessionId,
+        agent: &protocol::AgentId,
+        withdraw: bool,
+        update: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&mut SessionRecord),
+    {
+        self.reservation_transaction(|transaction| {
+            if agent_close_recorded(transaction, agent)? {
+                return Ok(((), false));
+            }
+            let original = read_raw_records(transaction, &[session])?;
+            let mut records = decode_records(&original)?;
+            let record = records
+                .get_mut(&session.0)
+                .ok_or("Agent recovery session is missing")?;
+            let mut state = read_agent_recovery(transaction, agent, session)?
+                .ok_or("Agent recovery state is missing")?;
+            let selected_marker = record.turn_recovery;
+            let selected_queue = std::mem::replace(
+                &mut record.queued_messages,
+                std::mem::take(&mut state.queued_messages),
+            );
+            record.turn_recovery = state.turn_recovery;
+            update(record);
+            if withdraw {
+                state.restoration = None;
+                if record
+                    .restore_state
+                    .as_ref()
+                    .and_then(|owner| owner.agent_id.as_ref())
+                    == Some(agent)
+                {
+                    record.restore_state = None;
+                }
+            }
+            state.turn_recovery = record.turn_recovery;
+            state.queued_messages = record.queued_messages.clone();
+            write_agent_recovery(transaction, agent, session, &state)?;
+            if record
+                .restore_state
+                .as_ref()
+                .and_then(|owner| owner.agent_id.as_ref())
+                .is_some_and(|owner| owner != agent)
+            {
+                record.turn_recovery = selected_marker;
+                record.queued_messages = selected_queue;
+            }
+            write_records(transaction, &original, records)?;
+            Ok(((), true))
         })
     }
 
@@ -626,14 +996,48 @@ impl SessionStore {
         &self,
         session_ids: &HashSet<SessionId>,
     ) -> Result<(), String> {
-        self.cas(&[], |records| {
+        if session_ids.is_empty() {
+            return Ok(());
+        }
+        self.reservation_transaction(|transaction| {
+            let original = read_raw_records(transaction, &session_ids.iter().collect::<Vec<_>>())?;
+            let mut records = decode_records(&original)?;
             let mut changed = false;
-            for session_id in session_ids {
-                if let Some(record) = records.get_mut(&session_id.0)
-                    && record.restore_state.take().is_some()
-                {
-                    changed = true;
+            for record in records.values_mut() {
+                changed |= record.restore_state.take().is_some();
+            }
+            for session in session_ids {
+                let mut query = transaction
+                    .prepare(
+                        "SELECT agent_id, record FROM agent_recovery_states WHERE session_id=?1",
+                    )
+                    .map_err(sql_error)?;
+                let rows = query
+                    .query_map([&session.0], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                drop(query);
+                for (agent, json) in rows {
+                    let mut state: AgentRecoveryState =
+                        serde_json::from_str(&json).map_err(|error| {
+                            format!("Cannot decode restoration withdrawal custody: {error}")
+                        })?;
+                    if state.restoration.take().is_some() {
+                        write_agent_recovery(
+                            transaction,
+                            &protocol::AgentId(agent),
+                            session,
+                            &state,
+                        )?;
+                        changed = true;
+                    }
                 }
+            }
+            if changed {
+                write_records(transaction, &original, records)?;
             }
             Ok(((), changed))
         })
@@ -874,6 +1278,9 @@ impl SessionStore {
         mut snapshot: protocol::TaskAgentUsageSnapshot,
     ) -> Result<(), String> {
         self.reservation_transaction(move |transaction| {
+            #[cfg(feature = "test-support")]
+            commit_hooks::archive(&self.path)?;
+
             if let Some(session) = snapshot.start.session_id.as_ref() {
                 let mut query = transaction.prepare("SELECT id, record FROM task_usage_resets ORDER BY id").map_err(sql_error)?;
                 let resets = query.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(sql_error)?.collect::<Result<Vec<_>, _>>().map_err(sql_error)?;
@@ -1237,6 +1644,9 @@ impl SessionStore {
         mut reservation: StartupReservation,
     ) -> Result<Vec<protocol::QueuedMessageEntry>, String> {
         self.reservation_transaction(|transaction| {
+            if agent_close_recorded(transaction, &reservation.agent_id)? {
+                return Err("Agent startup was closed".to_owned());
+            }
             if let Some(existing) = read_reservation(transaction, &reservation.agent_id)? {
                 reservation.queued_messages = existing.queued_messages;
             }
@@ -1251,6 +1661,9 @@ impl SessionStore {
         update: impl FnOnce(&mut StartupReservation),
     ) -> Result<(), String> {
         self.reservation_transaction(|transaction| {
+            if agent_close_recorded(transaction, agent_id)? {
+                return Ok(((), false));
+            }
             let mut reservation = read_reservation(transaction, agent_id)?
                 .ok_or("the agent's startup reservation is missing")?;
             update(&mut reservation);
@@ -1298,8 +1711,12 @@ impl SessionStore {
         agent_id: &protocol::AgentId,
         session_id: &SessionId,
         restore_state: Option<SessionRestoreState>,
+        parent_agent_id: Option<protocol::AgentId>,
     ) -> Result<(), String> {
         self.reservation_transaction(|transaction| {
+            if agent_close_recorded(transaction, agent_id)? {
+                return Ok(((), false));
+            }
             let reservation = read_reservation(transaction, agent_id)?
                 .ok_or("the agent's startup reservation is missing")?;
             let original = read_raw_records(transaction, &[session_id])?;
@@ -1307,6 +1724,20 @@ impl SessionStore {
             let record = records
                 .get_mut(&session_id.0)
                 .ok_or("the agent's session record is missing")?;
+            write_agent_recovery(
+                transaction,
+                agent_id,
+                session_id,
+                &AgentRecoveryState {
+                    turn_recovery: reservation.turn_recovery,
+                    queued_messages: reservation.queued_messages.clone(),
+                    restoration: restore_state.clone(),
+                    parent: match parent_agent_id {
+                        Some(id) => AgentRestorationParent::Agent(id),
+                        None => AgentRestorationParent::Root,
+                    },
+                },
+            )?;
             record.turn_recovery = reservation.turn_recovery;
             record.queued_messages = reservation.queued_messages;
             if let Some(restore_state) = restore_state {
@@ -1328,17 +1759,20 @@ impl SessionStore {
         &self,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, bool), String>,
     ) -> Result<T, String> {
+        let queued_at = Instant::now();
         let mut connection = self.writer.lock().map_err(|_| "session writer poisoned")?;
+        let locked_at = Instant::now();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let entered_at = Instant::now();
         let (result, wrote) = body(&transaction)?;
         #[cfg(feature = "test-support")]
         if wrote {
             commit_hooks::run(&self.path, &[])?;
         }
         transaction.commit().map_err(sql_error)?;
-        tracing::debug!(wrote, "committed startup reservation transaction");
+        tracing::info!(target: "server::session_transaction", wrote, mutex_wait_ms = locked_at.duration_since(queued_at).as_millis(), begin_wait_ms = entered_at.duration_since(locked_at).as_millis(), transaction_ms = entered_at.elapsed().as_millis(), "committed ownership transaction");
         Ok(result)
     }
 
@@ -1371,7 +1805,9 @@ impl SessionStore {
             .map_err(sql_error)?;
         let acquired = Instant::now();
         let original = read_raw_records(&transaction, ids)?;
+        let read = Instant::now();
         let mut records = decode_records(&original)?;
+        let decoded = Instant::now();
         let (result, changed) = body(&mut records)?;
         #[cfg(feature = "test-support")]
         let withdrawn = records
@@ -1395,7 +1831,9 @@ impl SessionStore {
             commit_hooks::run(&self.path, &withdrawn)?;
         }
         transaction.commit().map_err(sql_error)?;
-        tracing::debug!(
+        tracing::info!(target: "server::session_transaction",
+            read_ms = read.duration_since(acquired).as_millis(),
+            decode_ms = decoded.duration_since(read).as_millis(),
             wait_ms = acquired.duration_since(started).as_millis(),
             transaction_ms = acquired.elapsed().as_millis(),
             records_written = writes,
@@ -1449,13 +1887,19 @@ impl SessionStoreHandle {
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
         crate::host::awaited_leaf(crate::host::HostStateLeaf::SessionStore, kind, async {
+            let admitted_at = Instant::now();
             let permit = admission
                 .acquire_owned()
                 .await
                 .map_err(|_| "session storage closed")?;
+            let admission_ms = admitted_at.elapsed().as_millis();
+            let queued_at = Instant::now();
             let store = Arc::clone(&self.store);
             tokio::task::spawn_blocking(move || {
+                let worker_ms = queued_at.elapsed().as_millis();
+                let operation_at = Instant::now();
                 let result = operation(&store);
+                tracing::info!(target: "server::session_transaction", kind, admission_ms, worker_ms, operation_ms = operation_at.elapsed().as_millis(), success = result.is_ok(), "session storage operation settled");
                 drop(permit);
                 result
             })
@@ -1615,9 +2059,10 @@ impl SessionStoreHandle {
         &self,
         session_id: &SessionId,
         restore_state: SessionRestoreState,
+        parent_agent_id: Option<protocol::AgentId>,
     ) -> Result<(), String> {
         let session_id = session_id.clone();
-        self.call(move |store| store.set_restore_state(&session_id, restore_state))
+        self.call(move |store| store.set_restore_state(&session_id, restore_state, parent_agent_id))
             .await
     }
 
@@ -1657,11 +2102,17 @@ impl SessionStoreHandle {
         agent_id: &protocol::AgentId,
         session_id: &SessionId,
         restore_state: Option<SessionRestoreState>,
+        parent_agent_id: Option<protocol::AgentId>,
     ) -> Result<(), String> {
         let agent_id = agent_id.clone();
         let session_id = session_id.clone();
         self.call(move |store| {
-            store.promote_startup_reservation(&agent_id, &session_id, restore_state)
+            store.promote_startup_reservation(
+                &agent_id,
+                &session_id,
+                restore_state,
+                parent_agent_id,
+            )
         })
         .await
     }
@@ -1835,9 +2286,25 @@ fn write_records(
         transaction
             .execute("DELETE FROM session_tasks WHERE id=?1", [id])
             .map_err(sql_error)?;
+        transaction
+            .execute(
+                "DELETE FROM agent_recovery_states WHERE session_id=?1",
+                [id],
+            )
+            .map_err(sql_error)?;
         writes += 1;
     }
-    for (id, record) in records {
+    for (id, mut record) in records {
+        if let Some(agent) = record
+            .restore_state
+            .as_ref()
+            .and_then(|restore| restore.agent_id.as_ref())
+            && agent_close_recorded(transaction, agent)?
+        {
+            record.restore_state = None;
+            record.turn_recovery = None;
+            record.queued_messages.clear();
+        }
         let mut value = original
             .get(&id)
             .cloned()
@@ -1850,6 +2317,166 @@ fn write_records(
         writes += 1;
     }
     Ok(writes)
+}
+
+fn read_agent_recovery(
+    connection: &Connection,
+    agent: &protocol::AgentId,
+    session: &SessionId,
+) -> Result<Option<AgentRecoveryState>, String> {
+    let row = connection
+        .query_row(
+            "SELECT session_id, record FROM agent_recovery_states WHERE agent_id=?1",
+            [&agent.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    row.map(|(saved_session, json)| {
+        if saved_session != session.0 {
+            return Err("Agent recovery session binding changed".to_owned());
+        }
+        serde_json::from_str(&json)
+            .map_err(|error| format!("Cannot decode agent recovery: {error}"))
+    })
+    .transpose()
+}
+
+fn write_agent_recovery(
+    connection: &Connection,
+    agent: &protocol::AgentId,
+    session: &SessionId,
+    state: &AgentRecoveryState,
+) -> Result<(), String> {
+    let json = serde_json::to_string(state)
+        .map_err(|error| format!("Cannot encode agent recovery: {error}"))?;
+    connection.execute("INSERT INTO agent_recovery_states(agent_id, session_id, record) VALUES (?1, ?2, ?3) ON CONFLICT(agent_id) DO UPDATE SET session_id=excluded.session_id, record=excluded.record", params![agent.0, session.0, json]).map_err(sql_error)?;
+    Ok(())
+}
+
+fn migrate_agent_recovery_ownership(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct LegacyRecovery {
+        turn_recovery: Option<TurnRecovery>,
+        queued_messages: Vec<protocol::QueuedMessageEntry>,
+        #[serde(default)]
+        restoration: Option<SessionRestoreState>,
+        #[serde(default)]
+        parent_agent_id: Option<protocol::AgentId>,
+    }
+    let original = read_raw_records(transaction, &[])?;
+    let mut sessions = decode_records(&original)?;
+    for record in sessions.values_mut() {
+        if let Some(owner) = &mut record.restore_state
+            && owner.agent_id.is_none()
+        {
+            owner.agent_id = Some(protocol::AgentId(uuid::Uuid::new_v4().to_string()));
+        }
+    }
+    let owners = sessions
+        .values()
+        .filter_map(|record| {
+            record
+                .restore_state
+                .as_ref()
+                .and_then(|owner| owner.agent_id.clone())
+                .map(|agent| (record.id.clone(), agent))
+        })
+        .collect::<HashMap<_, _>>();
+    let parent_for = |record: &SessionRecord| match &record.parent_id {
+        None => AgentRestorationParent::Root,
+        Some(session) => match owners.get(session) {
+            Some(agent) => AgentRestorationParent::Agent(agent.clone()),
+            None => AgentRestorationParent::UnrestoredSession(session.clone()),
+        },
+    };
+    let mut query = transaction
+        .prepare("SELECT agent_id, session_id, record FROM agent_recovery_states")
+        .map_err(sql_error)?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    drop(query);
+    let mut migrated = HashSet::new();
+    for (agent, session, json) in rows {
+        let value: Value = serde_json::from_str(&json)
+            .map_err(|error| format!("Cannot decode legacy recovery: {error}"))?;
+        let selected = owners
+            .get(&SessionId(session.clone()))
+            .is_some_and(|id| id.0 == agent);
+        let legacy: LegacyRecovery = serde_json::from_value(value.clone())
+            .map_err(|error| format!("Cannot decode legacy custody: {error}"))?;
+        let record = sessions
+            .get(&session)
+            .ok_or("Legacy recovery session is missing")?;
+        let parent = if value.get("parent_agent_id").is_some() {
+            match legacy.parent_agent_id {
+                Some(id) => AgentRestorationParent::Agent(id),
+                None => AgentRestorationParent::Root,
+            }
+        } else if selected {
+            parent_for(record)
+        } else {
+            return Err("Legacy recovery parent identity cannot be established".to_owned());
+        };
+        let state = AgentRecoveryState {
+            turn_recovery: legacy.turn_recovery,
+            queued_messages: legacy.queued_messages,
+            restoration: if selected {
+                record.restore_state.clone()
+            } else {
+                legacy.restoration
+            },
+            parent,
+        };
+        let agent = protocol::AgentId(agent);
+        write_agent_recovery(transaction, &agent, &record.id, &state)?;
+        migrated.insert(agent);
+    }
+    for record in sessions.values() {
+        if let Some(owner) = &record.restore_state {
+            let agent = owner
+                .agent_id
+                .as_ref()
+                .ok_or("Migrated restoration identity is missing")?;
+            if !migrated.contains(agent) {
+                write_agent_recovery(
+                    transaction,
+                    agent,
+                    &record.id,
+                    &AgentRecoveryState {
+                        turn_recovery: record.turn_recovery,
+                        queued_messages: record.queued_messages.clone(),
+                        restoration: Some(owner.clone()),
+                        parent: parent_for(record),
+                    },
+                )?;
+            }
+        }
+    }
+    write_records(transaction, &original, sessions)?;
+    Ok(())
+}
+
+fn agent_close_recorded(
+    connection: &Connection,
+    agent: &protocol::AgentId,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_close_intents WHERE agent_id=?1)",
+            [&agent.0],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 fn read_reservation(
@@ -2052,6 +2679,9 @@ pub mod commit_hooks {
     enum Target {
         AnyCommit,
         RestorationWithdrawal(SessionId),
+        TaskUsageArchive,
+        RecoveryBinding(SessionId),
+        AgentCloseIntent(protocol::AgentId),
     }
     struct PendingHook {
         target: Target,
@@ -2064,6 +2694,22 @@ pub mod commit_hooks {
     impl InstalledHook {
         pub fn install(path: PathBuf, hook: Hook) -> Self {
             Self::install_target(path, Target::AnyCommit, hook)
+        }
+
+        pub fn install_task_usage_archive(path: PathBuf, hook: Hook) -> Self {
+            Self::install_target(path, Target::TaskUsageArchive, hook)
+        }
+
+        pub fn install_agent_close_intent(
+            path: PathBuf,
+            agent: protocol::AgentId,
+            hook: Hook,
+        ) -> Self {
+            Self::install_target(path, Target::AgentCloseIntent(agent), hook)
+        }
+
+        pub fn install_recovery_binding(path: PathBuf, session: SessionId, hook: Hook) -> Self {
+            Self::install_target(path, Target::RecoveryBinding(session), hook)
         }
 
         pub fn install_restoration_withdrawal(
@@ -2098,11 +2744,39 @@ pub mod commit_hooks {
     }
 
     pub(super) fn run(path: &Path, withdrawn: &[SessionId]) -> Result<(), String> {
+        run_at(path, withdrawn, false, None, &[])
+    }
+
+    pub(super) fn archive(path: &Path) -> Result<(), String> {
+        run_at(path, &[], true, None, &[])
+    }
+
+    pub(super) fn recovery_binding(path: &Path, session: &SessionId) -> Result<(), String> {
+        run_at(path, &[], false, Some(session), &[])
+    }
+
+    pub(super) fn agent_close_intent(
+        path: &Path,
+        agents: &[protocol::AgentId],
+    ) -> Result<(), String> {
+        run_at(path, &[], false, None, agents)
+    }
+
+    fn run_at(
+        path: &Path,
+        withdrawn: &[SessionId],
+        archive: bool,
+        binding: Option<&SessionId>,
+        closing: &[protocol::AgentId],
+    ) -> Result<(), String> {
         let hook = {
             let mut hooks = HOOKS.get_or_init(Mutex::default).lock().unwrap();
             let matches = hooks.get(path).is_some_and(|hook| match &hook.target {
                 Target::AnyCommit => true,
                 Target::RestorationWithdrawal(session) => withdrawn.contains(session),
+                Target::TaskUsageArchive => archive,
+                Target::RecoveryBinding(session) => binding == Some(session),
+                Target::AgentCloseIntent(agent) => closing.contains(agent),
             });
             if matches { hooks.remove(path) } else { None }
         };
@@ -2110,6 +2784,9 @@ pub mod commit_hooks {
             let boundary = match hook.target {
                 Target::AnyCommit => "any-commit",
                 Target::RestorationWithdrawal(_) => "restoration-withdrawal",
+                Target::TaskUsageArchive => "task-usage-archive",
+                Target::RecoveryBinding(_) => "agent-recovery-binding",
+                Target::AgentCloseIntent(_) => "agent-close-intent",
             };
             eprintln!("Session commit injection diagnostic: boundary={boundary}");
             (hook.callback)()

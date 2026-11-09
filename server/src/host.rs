@@ -942,6 +942,11 @@ pub(crate) struct HostState {
     spawn_publication_claims: HashMap<AgentId, SpawnOperationTerminalClaim>,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
     task_usage_resets: Vec<protocol::TaskUsageReset>,
+    close_admission_sealed: bool,
+    closing_agents: HashMap<AgentId, AgentHandle>,
+    closing_cleanup: HashMap<AgentId, AgentCloseCleanup>,
+    agent_close_completions: HashMap<AgentId, CancellationToken>,
+    agent_close_failures: HashMap<AgentId, protocol::CommandErrorPayload>,
     closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     // Registry ownership survives failed mandatory cleanup; reconnects replay the failure.
     unclaimed_agent_cleanup_failures: HashMap<AgentId, protocol::CommandErrorPayload>,
@@ -1023,6 +1028,8 @@ pub(crate) struct HostState {
     swarm_startup_test_gates: crate::agent::SwarmStartupTestGates,
     #[cfg(feature = "test-support")]
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    project_close_wait_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     agent_publication_start_test_gate: Option<state_owner::StartTestGate>,
     #[cfg(feature = "test-support")]
@@ -1188,6 +1195,7 @@ pub struct HostHandle {
 }
 
 struct RestartShutdown {
+    close_tasks: tokio_util::task::TaskTracker,
     // Runtime handles stay outside HostState so a stuck host operation cannot
     // prevent the shutdown deadline from killing its owned processes.
     agents: StdMutex<Vec<AgentHandle>>,
@@ -1205,6 +1213,7 @@ struct RestartShutdown {
 impl Default for RestartShutdown {
     fn default() -> Self {
         Self {
+            close_tasks: tokio_util::task::TaskTracker::new(),
             agents: StdMutex::new(Vec::new()),
             control: std::sync::OnceLock::new(),
             swarm_registry: None,
@@ -1687,6 +1696,17 @@ impl AgentVisibilityRegistry {
             entry.fanout_covered.remove(host_stream);
         }
     }
+}
+
+#[derive(Clone)]
+struct AgentCloseCleanup {
+    agent_id: AgentId,
+    initial_session: Option<SessionId>,
+    parent: Option<AgentId>,
+    remove_annotations: bool,
+    annotations: Option<Arc<AgentsViewPreferencesHandle>>,
+    teams: TeamRegistryHandle,
+    swarms: SwarmRegistryHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2503,9 +2523,14 @@ impl HostHandle {
         let agent_id = agent_id.clone();
         let handle = self
             .state
-            .with(move |state| state.registry.agent_handle(&agent_id))
+            .with(move |state| {
+                state
+                    .registry
+                    .agent_handle(&agent_id)
+                    .or_else(|| state.closing_agents.get(&agent_id).cloned())
+            })
             .await
-            .expect("registered agent for termination observation");
+            .expect("owned agent for termination observation");
         handle.wait_termination_for_test().await;
     }
 
@@ -3095,6 +3120,15 @@ impl HostHandle {
                 .with(move |state| state.restore_marker_withdraw_test_gate = Some(gate))
                 .await
         };
+        gate
+    }
+
+    pub async fn install_project_close_wait_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let shared = gate.shared();
+        self.state
+            .with(move |state| state.project_close_wait_test_gate = Some(shared))
+            .await;
         gate
     }
 
@@ -4144,7 +4178,7 @@ impl HostHandle {
                         return Vec::new();
                     }
                 }
-                let cleanup_replay_failed = state.unclaimed_agent_cleanup_failures.values().any(|failure| {
+                let cleanup_replay_failed = state.unclaimed_agent_cleanup_failures.values().chain(state.agent_close_failures.values()).any(|failure| {
                     let payload = serde_json::to_value(failure).expect("CommandError payload serializes");
                     bootstrap_stream.send_value(FrameKind::CommandError, payload).is_err()
                 });
@@ -4523,6 +4557,11 @@ impl HostHandle {
             }
             let host = self.clone();
             tokio::spawn(async move {
+                host.state.with(|_| ()).await;
+                host.restart.close_tasks.close();
+                host.restart.close_tasks.wait().await;
+                host.shutdown_spawn_operations().await;
+                host.restart.close_tasks.wait().await;
                 let handles = host
                     .restart
                     .agents
@@ -4545,6 +4584,13 @@ impl HostHandle {
                     }
                 };
                 let graceful = async {
+                    if host
+                        .state
+                        .with(|state| !state.agent_close_failures.is_empty())
+                        .await
+                    {
+                        return Err("Cannot restart after failed closed-agent finalization; final accounting remains owned".to_owned());
+                    }
                     tychat.bridge.shutdown().await;
                     futures_util::future::join_all(
                         handles.iter().map(|handle| handle.prepare_restart()),
@@ -4564,12 +4610,35 @@ impl HostHandle {
                             wait_for_spawn_operation_test_gate_inner(&gate).await;
                         }
                     }
+                    host.state
+                        .with(|state| state.close_admission_sealed = true)
+                        .await;
+                    host.restart.close_tasks.wait().await;
+                    if host
+                        .state
+                        .with(|state| !state.agent_close_failures.is_empty())
+                        .await
+                    {
+                        return Err(
+                            "Cannot restart after failed closed-agent finalization".to_owned()
+                        );
+                    }
                     let snapshots = futures_util::future::join_all(
                         handles.iter().map(|handle| handle.stop_for_restart()),
                     )
                     .await;
                     tracing::info!(target: "server::restart_accounting", diagnostic_run = %accounting_diagnostic_run().simple(), phase = ?AccountingDiagnosticPhase::AgentStopsSettled, agents = snapshots.len(), missing_checkpoints = snapshots.iter().filter(|snapshot| snapshot.is_err()).count());
                     host.shutdown_spawn_operations().await;
+                    host.restart.close_tasks.wait().await;
+                    if host
+                        .state
+                        .with(|state| !state.agent_close_failures.is_empty())
+                        .await
+                    {
+                        return Err(
+                            "Cannot restart after failed closed-agent finalization".to_owned()
+                        );
+                    }
                     for snapshot in snapshots {
                         let mut snapshot = snapshot?;
                         #[cfg(feature = "test-support")]
@@ -4621,6 +4690,11 @@ impl HostHandle {
                     Ok::<(), String>(())
                 };
                 let result = graceful.await;
+                if result.is_err() {
+                    host.state
+                        .with(|state| state.close_admission_sealed = false)
+                        .await;
+                }
                 control.expire_await_requests();
                 if result.is_ok() {
                     for handle in &handles {
@@ -4681,6 +4755,11 @@ impl HostHandle {
                 .await
                 .map_err(|_| "Host restart completion channel closed".to_owned())?;
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_restart_started_for_test(&self) {
+        self.restart.stopped.cancelled().await;
     }
 
     pub async fn shutdown_spawn_operations(&self) {
@@ -7225,8 +7304,15 @@ let custom_agents = &state.custom_agent_store;
         // marker the resumed card still needs.
         let inflight_resume = match request.resume_session_id.as_ref() {
             Some(session_id) => Some(
-                self.claim_inflight_resume(session_id, request.restoration.is_some())
-                    .await?,
+                self.claim_inflight_resume(
+                    session_id,
+                    request.restoration.is_some(),
+                    request
+                        .restoration
+                        .as_ref()
+                        .and_then(|admission| admission.agent_id.clone()),
+                )
+                .await?,
             ),
             None => None,
         };
@@ -7425,9 +7511,23 @@ self.state.with_async_gated_reply(move |state| Box::pin(async move {
             if let Some(project) = &execution_project {
                 crate::workbench::validate_execution(project)?;
             }
+            let resumed_identity = if request.restoration.is_none() && request.startup_failure.is_none() {
+                match request.resume_session_id.as_ref() {
+                    Some(session) => {
+                        let session = session.clone();
+                        let saved = state.session_store.read(move |store| {
+                            let record = store.get_result(&session)?.ok_or("Resumed session is missing")?;
+                            Ok(record.restore_state.and_then(|owner| owner.agent_id))
+                        }).await.map_err(|error| AppError::internal("spawn_agent", anyhow!(error)))?;
+                        saved.filter(|id| state.registry.agent_handle(id).is_none())
+                    }
+                    None => None,
+                }
+            } else { None };
             let spawned = tyde_process_env::launch::project_scope_sync(execution_project, || {
                 state.registry.spawn(
                     request,
+                    resumed_identity,
                     &agent_control_mcp,
                     crate::agent::AgentActorRuntimeResources {
                         tychat,
@@ -8030,8 +8130,15 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         // marker the resumed card still needs.
         let inflight_resume = match request.resume_session_id.as_ref() {
             Some(session_id) => Some(
-                self.claim_inflight_resume(session_id, request.restoration.is_some())
-                    .await?,
+                self.claim_inflight_resume(
+                    session_id,
+                    request.restoration.is_some(),
+                    request
+                        .restoration
+                        .as_ref()
+                        .and_then(|admission| admission.agent_id.clone()),
+                )
+                .await?,
             ),
             None => None,
         };
@@ -8109,6 +8216,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                                 || {
                                     state.registry.spawn(
                                         request,
+                                        None,
                                         &agent_control_mcp,
                                         crate::agent::AgentActorRuntimeResources {
                                             tychat,
@@ -8865,6 +8973,68 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         Ok(())
     }
 
+    async fn await_project_close_settlement(&self, project_id: &ProjectId) -> AppResult<()> {
+        let project = self.project_catalog.get(project_id).ok_or_else(|| {
+            AppError::not_found(
+                "project_cleanup",
+                "Project context is missing before close settlement",
+            )
+        })?;
+        let workbench_roots = match project.source {
+            ProjectSource::GitWorkbench { roots, .. } => roots
+                .into_iter()
+                .map(|root| root.worktree_root)
+                .collect::<Vec<_>>(),
+            ProjectSource::Standalone { .. } => Vec::new(),
+        };
+        let id = project_id.clone();
+        let closing = self
+            .state
+            .with(move |state| {
+                state
+                    .agent_close_completions
+                    .keys()
+                    .chain(state.closing_agents.keys())
+                    .filter(|agent| {
+                        state
+                            .registry
+                            .agent_handle(agent)
+                            .or_else(|| state.closing_agents.get(*agent).cloned())
+                            .is_some_and(|handle| {
+                                let start = handle.snapshot();
+                                start.project_id.as_ref() == Some(&id)
+                                    || (start.project_id.is_none()
+                                        && start.workspace_roots.iter().any(|workspace| {
+                                            workbench_roots.iter().any(|root| {
+                                                Path::new(workspace).starts_with(&root.0)
+                                            })
+                                        }))
+                            })
+                    })
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            })
+            .await;
+        if !closing.is_empty() {
+            #[cfg(feature = "test-support")]
+            {
+                let gate = self
+                    .state
+                    .with(|state| state.project_close_wait_test_gate.clone())
+                    .await;
+                if let Some(gate) = gate {
+                    wait_for_spawn_operation_test_gate_inner(&gate).await;
+                }
+            }
+            for agent in closing {
+                self.await_agent_close_settlement(&agent)
+                    .await
+                    .map_err(|error| AppError::internal("project_cleanup", anyhow!(error)))?;
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_project_delete(
         &self,
         project_id: &ProjectId,
@@ -8872,6 +9042,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
     ) -> AppResult<()> {
         const OPERATION: &str = "project_cleanup";
         let started = std::time::Instant::now();
+        self.await_project_close_settlement(project_id).await?;
         self.stop_project_services(project_id).await?;
         let (sessions, annotations, teams, reviews, workflows) = {
             {
@@ -8984,6 +9155,8 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     })
                     .await;
             }
+            // A close may start while live actors are being detached.
+            self.await_project_close_settlement(project_id).await?;
             sessions
                 .detach_project(project_id)
                 .await
@@ -9079,6 +9252,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         for agent_id in agents {
             self.close_agent(&agent_id).await?;
         }
+        self.await_project_close_settlement(&payload.id).await?;
         for terminal in terminals {
             terminal.close().await;
             terminal.wait_for_exit().await;
@@ -10619,8 +10793,74 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn await_agent_close_settlement_for_test(
+        &self,
+        agent: &AgentId,
+    ) -> Result<(), String> {
+        self.await_agent_close_settlement(agent).await
+    }
+
+    pub(super) async fn await_agent_close_settlement(&self, agent: &AgentId) -> Result<(), String> {
+        loop {
+            let id = agent.clone();
+            let pending = self
+                .state
+                .with(move |state| {
+                    if let Some(token) = state
+                        .agent_close_completions
+                        .get(&id)
+                        .filter(|token| !token.is_cancelled())
+                    {
+                        return Ok(Some(token.clone()));
+                    }
+                    if let Some(failure) = state.agent_close_failures.get(&id) {
+                        return Err(failure.message.clone());
+                    }
+                    Ok(None)
+                })
+                .await?;
+            match pending {
+                Some(complete) => complete.cancelled().await,
+                None => return Ok(()),
+            }
+        }
+    }
+
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> AppResult<()> {
         const OPERATION: &str = "delete_session";
+        let session = session_id.clone();
+        let closing = self
+            .state
+            .with(move |state| {
+                state
+                    .agent_close_completions
+                    .keys()
+                    .filter(|id| {
+                        state
+                            .registry
+                            .agent_handle(id)
+                            .or_else(|| state.closing_agents.get(id).cloned())
+                            .is_some_and(|handle| {
+                                handle.snapshot().session_id.as_ref() == Some(&session)
+                            })
+                            || state.pending_agent_sessions.get(*id) == Some(&session)
+                            || state
+                                .closing_cleanup
+                                .get(*id)
+                                .and_then(|cleanup| cleanup.initial_session.as_ref())
+                                == Some(&session)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        for agent in closing {
+            self.await_agent_close_settlement(&agent)
+                .await
+                .map_err(|error| AppError::conflict(OPERATION, error))?;
+        }
+
         let (session_store, annotations_store, deletion_guard) = {
             {
                 let session_id = session_id.clone();
@@ -10649,7 +10889,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                     "This session already has an in-flight ownership change",
                 )));
             }
-            if state.registry.agent_ids().iter().any(|id| {
+            if state.closing_agents.iter().any(|(id, handle)| handle.snapshot().session_id.as_ref() == Some(&session_id) || state.closing_cleanup.get(id).and_then(|cleanup| cleanup.initial_session.as_ref()) == Some(&session_id)) || state.registry.agent_ids().iter().any(|id| {
                 state.registry.agent_handle(id).is_some_and(|handle| {
                     handle.snapshot().session_id.as_ref() == Some(&session_id)
                 })
@@ -13342,6 +13582,10 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue(state
     }
 
     async fn cleanup_unclaimed_agent(&self, agent_id: AgentId) -> AppResult<()> {
+        if self.restart.stopped.is_cancelled() {
+            tracing::info!(target: "server::agent_close", "startup cleanup handed to restart owner");
+            return Ok(());
+        }
         let result = self
             .close_agent_with_publication(
                 &agent_id,
@@ -13352,6 +13596,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue(state
             .await;
         let result = match result {
             Ok(true) => Ok(()),
+            Ok(false) if self.restart.stopped.is_cancelled() => Ok(()),
             Ok(false) => {
                 let id = agent_id.clone();
                 if self
@@ -13412,6 +13657,39 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue(state
     }
 
     #[cfg(feature = "test-support")]
+    pub async fn install_close_return_test_gate(
+        &self,
+        agent: &AgentId,
+    ) -> Result<InstalledSpawnOperationTestGate, String> {
+        let gate = new_spawn_operation_test_gate();
+        let id = agent.clone();
+        let handle = self
+            .state
+            .with(move |state| state.registry.agent_handle(&id))
+            .await
+            .ok_or("Close return gate requires a registered actor")?;
+        handle.install_close_return_gate(gate.shared())?;
+        Ok(gate)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn abort_owned_agent_for_test(&self, agent: &AgentId) -> Result<(), String> {
+        let id = agent.clone();
+        let handle = self
+            .state
+            .with(move |state| {
+                state
+                    .registry
+                    .agent_handle(&id)
+                    .or_else(|| state.closing_agents.get(&id).cloned())
+            })
+            .await
+            .ok_or("Abort requires an owned actor")?;
+        handle.kill_for_restart();
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
     pub async fn wait_for_agent_startup_for_test(&self, agent_id: &AgentId) -> Result<(), String> {
         let id = agent_id.clone();
         let handle = self
@@ -13466,7 +13744,12 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue(state
         let mut closed = false;
         for close_id in close_ids {
             closed |= self
-                .close_agent_with_host_visibility(&close_id, true)
+                .close_agent_with_publication(
+                    &close_id,
+                    true,
+                    None,
+                    AgentCloseIntent::UnclaimedCreation,
+                )
                 .await?;
         }
         Ok(closed)
@@ -13493,18 +13776,94 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue(state
         completed_compaction: Option<(Stream, AgentCompactNotifyPayload)>,
         intent: AgentCloseIntent,
     ) -> AppResult<bool> {
+        let host = self.clone();
+        let agent = agent_id.clone();
+        let (reply, result) = oneshot::channel();
+        self.state
+            .with(move |state| {
+                if intent == AgentCloseIntent::User && state.close_admission_sealed {
+                    return Err(AppError::conflict("close_agent", "The host is stopping"));
+                }
+                let tasks = host.restart.close_tasks.clone();
+                tasks.spawn(async move {
+                    let outcome = host
+                        .admit_agent_close(
+                            &agent,
+                            recorded_visibility_only,
+                            completed_compaction,
+                            intent,
+                        )
+                        .await;
+                    let _ = reply.send(outcome);
+                });
+                Ok::<_, AppError>(())
+            })
+            .await?;
+        result.await.map_err(|_| {
+            AppError::internal(
+                "close_agent",
+                anyhow!("Close owner stopped before admission"),
+            )
+        })?
+    }
+
+    async fn admit_agent_close(
+        &self,
+        agent_id: &AgentId,
+        recorded_visibility_only: bool,
+        completed_compaction: Option<(Stream, AgentCompactNotifyPayload)>,
+        intent: AgentCloseIntent,
+    ) -> AppResult<bool> {
+        let retry_id = agent_id.clone();
+        let retry = self
+            .state
+            .with(move |state| {
+                if !state.agent_close_failures.contains_key(&retry_id)
+                    || state
+                        .agent_close_completions
+                        .get(&retry_id)
+                        .is_some_and(|token| !token.is_cancelled())
+                {
+                    return None;
+                }
+                let handle = state.closing_agents.get(&retry_id)?.clone();
+                let cleanup = state.closing_cleanup.get(&retry_id)?.clone();
+                let complete = CancellationToken::new();
+                state
+                    .agent_close_completions
+                    .insert(retry_id, complete.clone());
+                Some((
+                    handle,
+                    cleanup,
+                    state.session_store.clone(),
+                    state.backend_storage.clone(),
+                    complete.drop_guard(),
+                ))
+            })
+            .await;
+        if let Some((handle, cleanup, store, storage, completion)) = retry {
+            let host = self.clone();
+            self.restart.close_tasks.spawn(async move {
+                handle.retry_close_recovery().await;
+                host.settle_closed_agent(handle, store, storage, cleanup)
+                    .await;
+                drop(completion);
+            });
+            return Ok(true);
+        }
         let (
             close_targets,
             session_store,
             closing_sessions_by_agent,
             backend_storage,
             close_preparations,
+            close_completions,
         ) = {
             {
                 let agent_id = agent_id.to_owned();
                 match self.state.with(move |state| {
 let agent_id = &agent_id;
-
+            state.agent_close_completions.retain(|_, token| !token.is_cancelled());
             let close_targets = state.registry.agent_subtree_post_order(agent_id);
             if close_targets.is_empty() {
                 return Ok(std::ops::ControlFlow::Break(Ok(false)));
@@ -13517,6 +13876,11 @@ let agent_id = &agent_id;
                 return Ok(std::ops::ControlFlow::Break(Ok(false)));
             }
             let close_preparations = close_targets.iter().map(|(_, handle)| handle.prepare_close().ok_or_else(|| AppError::conflict("close_agent", "A descendant is already closing; finish that close before closing this subtree"))).collect::<AppResult<Vec<_>>>()?;
+            let close_completions = close_targets.iter().map(|(id, _)| {
+                let complete = CancellationToken::new();
+                state.agent_close_completions.insert(id.clone(), complete.clone());
+                complete.drop_guard()
+            }).collect::<Vec<_>>();
             let closing_sessions_by_agent = close_targets
                 .iter()
                 .filter_map(|(agent_id, handle)| {
@@ -13536,155 +13900,74 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                 closing_sessions_by_agent,
                 state.backend_storage.clone(),
                 close_preparations,
+                close_completions,
             )))
 
 }).await? { std::ops::ControlFlow::Break(result) => return result, std::ops::ControlFlow::Continue(value) => value }
             }
         };
-        let reviews = {
-            self.state
-                .with(move |state| state.review_registry.clone())
-                .await
-        };
-        for (id, _) in &close_targets {
-            if let Err(error) = reviews.reviewer_closed(id.clone()) {
-                tracing::warn!(%error, "failed to record reviewer closure");
-            }
-        }
+        let close_ids = close_targets
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
         let closing_session_ids = closing_sessions_by_agent
             .values()
             .cloned()
             .collect::<HashSet<_>>();
-        let close_ids = close_targets
-            .iter()
-            .map(|(agent_id, _)| agent_id.clone())
-            .collect::<Vec<_>>();
-        if intent == AgentCloseIntent::User {
-            self.withdraw_unowned_restoration_markers(
-                &closing_session_ids,
-                &session_store,
-                "closing subtree",
-            )
-            .await?;
-        }
-        for (_, agent_handle) in &close_targets {
-            agent_handle.begin_closing();
-        }
-        if intent == AgentCloseIntent::UnclaimedCreation {
-            // There is no caller left to retain a running agent on a storage error.
-            for (_, agent_handle) in &close_targets {
-                let acknowledged = agent_handle.close().await;
-                tracing::debug!(acknowledged, "unclaimed actor stop command settled");
-            }
-            self.withdraw_unowned_restoration_markers(
-                &closing_session_ids,
-                &session_store,
-                "unclaimed creation",
-            )
-            .await?;
-        }
-        let mut closed_usage_snapshots = Vec::new();
-        for (_, agent_handle) in &close_targets {
-            // Recovery I/O belongs to its own actor, not the suspended startup
-            // future. Wait for teardown instead of announcing a timed-out close.
-            if intent == AgentCloseIntent::User {
-                let acknowledged = agent_handle.close().await;
-                tracing::debug!(acknowledged, "agent close command settled");
-            }
-            let mut snapshot = agent_handle
-                .final_usage_snapshot()
-                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
-            if snapshot.start.parent_agent_id.is_none() {
-                let owner = snapshot
-                    .start
-                    .project_id
-                    .as_ref()
-                    .map(|id| {
-                        let project = self.project_catalog.get(id).ok_or_else(|| {
-                            AppError::internal(
-                                "close_agent",
-                                anyhow!("board card references a missing project"),
-                            )
-                        })?;
-                        Ok::<_, AppError>(
-                            project.parent_project_id().cloned().unwrap_or(project.id),
-                        )
-                    })
-                    .transpose()?;
-                self.state
-                    .with(|state| state.board.clone())
-                    .await
-                    .settle_card(snapshot.start.clone(), owner)
-                    .await
-                    .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
-            }
-            snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
-            if let Some(session_id) = snapshot.start.session_id.as_ref() {
-                let session = session_id.clone();
-                let storage = backend_storage.clone();
-                let resumable = session_store
-                    .read(move |store| {
-                        Ok(store
-                            .get_result(&session)?
-                            .is_some_and(|record| session_record_is_resumable(&record, &storage)))
-                    })
-                    .await
-                    .map_err(|error| {
-                        AppError::internal(
-                            "close_agent",
-                            anyhow!("Cannot read saved task context: {error}"),
-                        )
-                    })?;
-                if resumable {
-                    snapshot.navigation = protocol::TaskUsageNavigation::SavedSession {
-                        session_id: session_id.clone(),
-                    };
-                }
-            }
-            session_store
-                .save_task_usage_snapshot(snapshot.clone())
-                .await
-                .map_err(|error| {
-                    AppError::internal(
-                        "close_agent",
-                        anyhow!("Cannot save settled task accounting: {error}"),
-                    )
-                })?;
-            closed_usage_snapshots.push(snapshot);
-        }
+        #[cfg(feature = "test-support")]
         {
-            {
-                self.state
-                    .with(move |state| {
-                        for snapshot in closed_usage_snapshots {
-                            if let Some(session) = &snapshot.start.session_id {
-                                state.closed_agent_usage_snapshots.retain(|_, saved| {
-                                    saved.start.session_id.as_ref() != Some(session)
-                                });
-                            }
-                            state
-                                .closed_agent_usage_snapshots
-                                .insert(snapshot.start.agent_id.clone(), snapshot);
-                        }
-                    })
-                    .await
+            let gate = self
+                .state
+                .with(|state| state.restore_marker_withdraw_test_gate.clone())
+                .await;
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
         }
-        for (target_agent_id, agent_handle) in &close_targets {
-            let mut settled_session_ids = closing_sessions_by_agent
-                .get(target_agent_id)
-                .cloned()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            settled_session_ids.extend(agent_handle.snapshot().session_id);
-            self.withdraw_unowned_restoration_markers(
-                &settled_session_ids,
-                &session_store,
-                "settled close",
-            )
-            .await?;
+        let ids = close_ids.clone();
+        let sessions = closing_session_ids.clone();
+        let survivors = self
+            .state
+            .with(|state| {
+                let mut owners =
+                    HashMap::<SessionId, Vec<crate::store::session::SessionRestoreState>>::new();
+                for id in state.registry.agent_ids() {
+                    if let Some(handle) = state.registry.agent_handle(&id) {
+                        let start = handle.snapshot();
+                        if let Some(session) = start.session_id {
+                            owners.entry(session).or_default().push(
+                                crate::store::session::SessionRestoreState {
+                                    agent_id: Some(start.agent_id),
+                                    origin: start.origin,
+                                    workflow: start.workflow,
+                                },
+                            );
+                        }
+                    }
+                }
+                owners
+            })
+            .await;
+        if let Err(error) = session_store
+            .call(move |store| store.record_agent_close(&ids, &sessions, &survivors))
+            .await
+        {
+            if intent == AgentCloseIntent::UnclaimedCreation {
+                futures_util::future::join_all(
+                    close_targets.iter().map(|(_, handle)| handle.close()),
+                )
+                .await;
+            }
+            return Err(AppError::internal(
+                "close_agent",
+                anyhow!("Cannot clear closed task restoration markers (close intent): {error}"),
+            ));
         }
-        let mut cleanup_events = Vec::new();
+        for (_, handle) in &close_targets {
+            handle.begin_closing();
+        }
+        tracing::info!(target: "server::agent_close", agents = close_targets.len(), "durable close intent committed");
+        let mut cleanup_targets = Vec::new();
         for closed_agent_id in &close_ids {
             let (parent, remove_annotations, annotations, teams, swarms) = {
                 {
@@ -13716,44 +13999,20 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                         .await
                 }
             };
-            let session = closing_sessions_by_agent.get(closed_agent_id).cloned();
-            let member = close_targets
-                .iter()
-                .find(|(id, _)| id == closed_agent_id)
-                .is_some_and(|(_, handle)| handle.snapshot().swarm_membership.is_some());
-            let swarm_events = if member {
-                swarms
-                    .status(
-                        closed_agent_id.clone(),
-                        AgentControlStatus::Idle,
-                        session,
-                        true,
-                        None,
-                    )
-                    .await
-                    .map_err(|error| AppError::internal("close_agent", anyhow!(error.message)))?
-            } else {
-                Vec::new()
-            };
-            if remove_annotations && let Some(store) = annotations {
-                let agent = closed_agent_id.clone();
-                store
-                    .call(move |store| {
-                        store.remove_transient_agent(HostFilterId(LOCAL_HOST_ID.to_owned()), agent)
-                    })
-                    .await
-                    .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
-            }
-            let team_events = teams
-                .clear_binding_by_agent(closed_agent_id.clone())
-                .await
-                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
-            cleanup_events.push((closed_agent_id.clone(), parent, swarm_events, team_events));
+            cleanup_targets.push(AgentCloseCleanup {
+                agent_id: closed_agent_id.clone(),
+                initial_session: closing_sessions_by_agent.get(closed_agent_id).cloned(),
+                parent,
+                remove_annotations,
+                annotations,
+                teams,
+                swarms,
+            });
         }
-        self.fan_out_session_lists().await?;
         for preparation in close_preparations {
             preparation.commit();
         }
+        let publication_targets = cleanup_targets.clone();
         let parents = {
             {
                 self.state
@@ -13763,7 +14022,9 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                             send_agent_compact_notify(&stream, completed);
                         }
                         let mut dead_paths = Vec::new();
-                        for (closed_agent_id, parent, swarm_events, team_events) in cleanup_events {
+                        for target in &publication_targets {
+                            let closed_agent_id = target.agent_id.clone();
+                            let parent = target.parent.clone();
                             let visible = recorded_visibility_only.then(|| {
                                 state
                                     .agent_visibility
@@ -13786,7 +14047,16 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                                     dead_paths.push(path.clone());
                                 }
                             }
-                            let removed = state.registry.remove_agent(&closed_agent_id).is_some();
+                            let removed = state
+                                .registry
+                                .remove_agent(&closed_agent_id)
+                                .map(|handle| {
+                                    state.closing_agents.insert(closed_agent_id.clone(), handle);
+                                    state
+                                        .closing_cleanup
+                                        .insert(closed_agent_id.clone(), target.clone());
+                                })
+                                .is_some();
                             tracing::debug!(
                                 removed,
                                 registry_agent_count = state.registry.agent_ids().len(),
@@ -13807,8 +14077,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                                 forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
                                 subscriber.last_task_token_usages.clear();
                             }
-                            swarms::fan_out_swarm_events_locked(state, swarm_events);
-                            fan_out_team_registry_events(state, team_events);
                             if let Some(parent) = parent {
                                 parents.push(parent);
                             }
@@ -13823,24 +14091,226 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                     .await?
             }
         };
+        let host = self.clone();
+        self.restart.close_tasks.spawn(async move {
+            futures_util::future::join_all(
+                close_targets
+                    .into_iter()
+                    .zip(cleanup_targets)
+                    .zip(close_completions)
+                    .map(|(((_, handle), cleanup), completion)| {
+                        let host = host.clone();
+                        let store = session_store.clone();
+                        let storage = backend_storage.clone();
+                        async move {
+                            host.settle_closed_agent(handle, store, storage, cleanup)
+                                .await;
+                            drop(completion);
+                        }
+                    }),
+            )
+            .await;
+        });
+        for parent in parents {
+            self.publish_agent_background_work(&parent).await;
+        }
+        Ok(true)
+    }
+
+    async fn settle_closed_agent(
+        &self,
+        handle: AgentHandle,
+        store: Arc<SessionStoreHandle>,
+        storage: crate::backend::BackendStorage,
+        cleanup: AgentCloseCleanup,
+    ) {
+        let id = cleanup.agent_id.clone();
+        if let Err(error) = self
+            .finish_closed_agent(handle, store, storage, cleanup)
+            .await
+        {
+            tracing::error!(target: "server::agent_close", "owned agent teardown failed");
+            self.state
+                .with(move |state| {
+                    let failure = error.to_payload(new_instance_stream(&id), FrameKind::CloseAgent);
+                    state.agent_close_completions.remove(&id);
+                    state
+                        .agent_close_failures
+                        .insert(id.clone(), failure.clone());
+                    state.host_streams.retain(|_, subscriber| {
+                        let payload =
+                            serde_json::to_value(&failure).expect("serialize close error");
+                        emit_or_queue_host_frame(subscriber, FrameKind::CommandError, payload)
+                            .is_ok()
+                    });
+                })
+                .await;
+        }
+    }
+
+    async fn finish_closed_agent(
+        &self,
+        handle: AgentHandle,
+        store: Arc<SessionStoreHandle>,
+        storage: crate::backend::BackendStorage,
+        cleanup: AgentCloseCleanup,
+    ) -> AppResult<()> {
+        let id = cleanup.agent_id.clone();
+        let acknowledged = handle.close().await;
+        tracing::info!(target: "server::agent_close", acknowledged, "actor close acknowledged");
+        if let Err(error) = handle.wait_for_termination().await {
+            let message = match handle.final_usage_snapshot() {
+                Ok(_) => error,
+                Err(checkpoint) => format!("{error}; {checkpoint}"),
+            };
+            return Err(AppError::internal("close_agent", anyhow!(message)));
+        }
+        handle
+            .close_persistence_result()
+            .await
+            .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+        let mut snapshot = handle
+            .final_usage_snapshot()
+            .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+        if snapshot.start.parent_agent_id.is_none() {
+            let owner = snapshot
+                .start
+                .project_id
+                .as_ref()
+                .map(|id| {
+                    let project = self.project_catalog.get(id).ok_or_else(|| {
+                        AppError::internal(
+                            "close_agent",
+                            anyhow!("board card references a missing project"),
+                        )
+                    })?;
+                    Ok::<_, AppError>(project.parent_project_id().cloned().unwrap_or(project.id))
+                })
+                .transpose()?;
+            let published_owner = owner.clone();
+            self.state
+                .with(|state| state.board.clone())
+                .await
+                .settle_card(snapshot.start.clone(), owner)
+                .await
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+            if let Some(project_id) = published_owner {
+                self.board_command(
+                    protocol::BoardCommandPayload::Read(protocol::BoardReadPayload { project_id }),
+                    None,
+                )
+                .await
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error.message)))?;
+            }
+        }
+        snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
+        if let Some(session) = snapshot.start.session_id.clone() {
+            let resumable = store
+                .read(move |store| {
+                    Ok(store
+                        .get_result(&session)?
+                        .is_some_and(|record| session_record_is_resumable(&record, &storage)))
+                })
+                .await
+                .map_err(|error| {
+                    AppError::internal(
+                        "close_agent",
+                        anyhow!("Cannot read saved task context: {error}"),
+                    )
+                })?;
+            if resumable {
+                snapshot.navigation = protocol::TaskUsageNavigation::SavedSession {
+                    session_id: snapshot.start.session_id.clone().expect("snapshot session"),
+                };
+            }
+        }
+        store
+            .save_task_usage_snapshot(snapshot.clone())
+            .await
+            .map_err(|error| {
+                AppError::internal(
+                    "close_agent",
+                    anyhow!("Cannot save settled task accounting: {error}"),
+                )
+            })?;
+        let sessions = cleanup
+            .initial_session
+            .clone()
+            .into_iter()
+            .chain(handle.snapshot().session_id)
+            .collect::<HashSet<_>>();
+        self.withdraw_unowned_restoration_markers(&sessions, &store, "settled close")
+            .await?;
+        let swarm_events = if handle.snapshot().swarm_membership.is_some() {
+            cleanup
+                .swarms
+                .status(
+                    id.clone(),
+                    AgentControlStatus::Idle,
+                    snapshot.start.session_id.clone(),
+                    true,
+                    None,
+                )
+                .await
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error.message)))?
+        } else {
+            Vec::new()
+        };
+        if cleanup.remove_annotations
+            && let Some(annotations) = cleanup.annotations
+        {
+            let agent = id.clone();
+            annotations
+                .call(move |store| {
+                    store.remove_transient_agent(HostFilterId(LOCAL_HOST_ID.to_owned()), agent)
+                })
+                .await
+                .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+        }
+        let reviews = self.state.with(|state| state.review_registry.clone()).await;
+        reviews
+            .reviewer_closed(id.clone())
+            .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+        let team_events = cleanup
+            .teams
+            .clear_binding_by_agent(id.clone())
+            .await
+            .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+        self.fan_out_session_lists().await?;
+        let closed_id = id.clone();
+        self.state
+            .with(move |state| {
+                if let Some(session) = &snapshot.start.session_id {
+                    state
+                        .closed_agent_usage_snapshots
+                        .retain(|_, saved| saved.start.session_id.as_ref() != Some(session));
+                }
+                state
+                    .closed_agent_usage_snapshots
+                    .insert(closed_id.clone(), snapshot);
+                state.closing_agents.remove(&closed_id);
+                state.closing_cleanup.remove(&closed_id);
+                state.agent_close_failures.remove(&closed_id);
+                state.agent_close_completions.remove(&closed_id);
+                swarms::fan_out_swarm_events_locked(state, swarm_events);
+                fan_out_team_registry_events(state, team_events);
+                fan_out_current_agents_view_preferences(state);
+                for subscriber in state.host_streams.values_mut() {
+                    subscriber.last_task_token_usages.clear();
+                }
+            })
+            .await;
         self.restart
             .agents
             .lock()
             .expect("restart handles mutex poisoned")
-            .retain(|handle| !close_ids.contains(&handle.snapshot().agent_id));
-        for parent in parents {
-            self.publish_agent_background_work(&parent).await;
+            .retain(|handle| handle.snapshot().agent_id != id);
+        if handle.snapshot().swarm_membership.is_some() {
+            self.schedule_swarm_dispatch().await;
         }
-        {
-            {
-                self.state
-                    .with(move |state| {
-                        fan_out_current_agents_view_preferences(state);
-                    })
-                    .await
-            }
-        }
-        Ok(true)
+        self.fan_out_task_token_usages().await;
+        tracing::info!(target: "server::agent_close", "owned agent teardown completed");
+        Ok(())
     }
 
     pub(crate) async fn agent_status_snapshot(
@@ -14218,46 +14688,59 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         &self,
         session_id: &SessionId,
         require_restore_intent: bool,
+        restoring_agent: Option<AgentId>,
     ) -> AppResult<InflightResumeClaim> {
         let (ownership, store) = loop {
             let session_id = session_id.clone();
-            let outcome = self
-                .state
-                .with(move |state| {
-                    if state
-                        .deleting_sessions
-                        .get(&session_id)
-                        .is_some_and(|claim| !claim.is_cancelled())
-                    {
-                        return Err(AppError::conflict(
-                            "spawn_agent",
-                            "This session is being deleted",
-                        ));
-                    }
-                    if let Some(active) = state
-                        .withdrawing_sessions
-                        .get(&session_id)
-                        .filter(|claim| !claim.is_cancelled())
-                        .cloned()
-                    {
-                        return Ok(std::ops::ControlFlow::Break(active));
-                    }
-                    state.resuming_sessions.retain(|_, claims| {
-                        claims.retain(|claim| !claim.is_cancelled());
-                        !claims.is_empty()
-                    });
-                    let claim = CancellationToken::new();
-                    state
-                        .resuming_sessions
-                        .entry(session_id.clone())
-                        .or_default()
-                        .push(claim.clone());
-                    Ok::<_, AppError>(std::ops::ControlFlow::Continue((
-                        claim.drop_guard(),
-                        Arc::clone(&state.session_store),
-                    )))
-                })
-                .await?;
+            let outcome =
+                self.state
+                    .with(move |state| {
+                        if state
+                            .deleting_sessions
+                            .get(&session_id)
+                            .is_some_and(|claim| !claim.is_cancelled())
+                        {
+                            return Err(AppError::conflict(
+                                "spawn_agent",
+                                "This session is being deleted",
+                            ));
+                        }
+                        state.agent_close_completions.retain(|_, token| !token.is_cancelled());
+                        if let Some(active) = state.agent_close_completions.iter().find_map(|(id, token)| {
+                            let handle = state.registry.agent_handle(id).or_else(|| state.closing_agents.get(id).cloned())?;
+                            (handle.snapshot().session_id.as_ref() == Some(&session_id) || state.pending_agent_sessions.get(id) == Some(&session_id) || state.closing_cleanup.get(id).and_then(|cleanup| cleanup.initial_session.as_ref()) == Some(&session_id)).then(|| token.clone())
+                        }) {
+                            return Ok(std::ops::ControlFlow::Break(active));
+                        }
+                        if let Some((id, _)) = state.closing_agents.iter().find(|(id, handle)| handle.snapshot().session_id.as_ref() == Some(&session_id) || state.closing_cleanup.get(*id).and_then(|cleanup| cleanup.initial_session.as_ref()) == Some(&session_id))
+                            && state.agent_close_failures.contains_key(id)
+                        {
+                            return Err(AppError::conflict("spawn_agent", "This session's closed-agent finalization failed; accounting remains owned"));
+                        }
+                        if let Some(active) = state
+                            .withdrawing_sessions
+                            .get(&session_id)
+                            .filter(|claim| !claim.is_cancelled())
+                            .cloned()
+                        {
+                            return Ok(std::ops::ControlFlow::Break(active));
+                        }
+                        state.resuming_sessions.retain(|_, claims| {
+                            claims.retain(|claim| !claim.is_cancelled());
+                            !claims.is_empty()
+                        });
+                        let claim = CancellationToken::new();
+                        state
+                            .resuming_sessions
+                            .entry(session_id.clone())
+                            .or_default()
+                            .push(claim.clone());
+                        Ok::<_, AppError>(std::ops::ControlFlow::Continue((
+                            claim.drop_guard(),
+                            Arc::clone(&state.session_store),
+                        )))
+                    })
+                    .await?;
             match outcome {
                 std::ops::ControlFlow::Continue(ownership) => break ownership,
                 std::ops::ControlFlow::Break(active) => active.cancelled().await,
@@ -14266,11 +14749,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         if require_restore_intent {
             let id = session_id.clone();
             let wanted = store
-                .read(move |store| {
-                    Ok(store
-                        .get_result(&id)?
-                        .is_some_and(|record| record.restore_state.is_some()))
-                })
+                .read(move |store| store.agent_restoration_wanted(&id, restoring_agent.as_ref()))
                 .await
                 .map_err(|error| AppError::internal("spawn_agent", anyhow!(error)))?;
             if !wanted {
@@ -16304,6 +16783,10 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
         expected_session_id: Option<&SessionId>,
         visibility: &SpawnVisibility,
     ) {
+        if self.restart.stopped.is_cancelled() {
+            tracing::info!(target: "server::agent_close", "unpublished session cleanup handed to restart owner");
+            return;
+        }
         let removed_pending_session_id = {
             {
                 let agent_id = agent_id.clone();
@@ -20445,6 +20928,11 @@ fn spawn_host_inner(
         agent_activity_summaries: HashMap::new(),
         task_usage_resets,
         closed_agent_usage_snapshots,
+        close_admission_sealed: false,
+        closing_agents: HashMap::new(),
+        closing_cleanup: HashMap::new(),
+        agent_close_completions: HashMap::new(),
+        agent_close_failures: HashMap::new(),
         unclaimed_agent_cleanup_failures: HashMap::new(),
         #[cfg(feature = "test-support")]
         activity_summary_generation_test_gate: None,
@@ -20535,6 +21023,8 @@ fn spawn_host_inner(
         swarm_startup_test_gates: Default::default(),
         #[cfg(feature = "test-support")]
         restore_marker_withdraw_test_gate: None,
+        #[cfg(feature = "test-support")]
+        project_close_wait_test_gate: None,
         #[cfg(feature = "test-support")]
         agent_publication_start_test_gate: None,
         #[cfg(feature = "test-support")]
@@ -20977,10 +21467,14 @@ impl HostHandle {
                     .await
             }
         };
-        let mut records = session_store
-            .list()
+        let snapshot = session_store
+            .read(|store| store.restoration_snapshot())
             .await
-            .map_err(|error| format!("failed to load open agent sessions: {error}"))?
+            .map_err(|error| format!("failed to load open agent restoration custody: {error}"))?;
+        let saved_parents = snapshot.parents;
+        let work_owners = snapshot.work_owners;
+        let mut records = snapshot
+            .records
             .into_iter()
             .filter(|record| {
                 record
@@ -21064,18 +21558,12 @@ impl HostHandle {
             })
             .collect::<HashMap<_, _>>();
 
-        let restore_session_ids = records
-            .iter()
-            .map(|record| record.id.clone())
-            .collect::<HashSet<_>>();
-        let mut restored_agent_ids = HashMap::<SessionId, AgentId>::new();
+        let mut replacement_owners = HashMap::<AgentId, AgentId>::new();
 
         let mut admissions =
-            Vec::<(SessionId, Arc<crate::agent::registry::RestorationAdmission>)>::new();
-        let mut admission_by_session =
-            HashMap::<SessionId, Arc<crate::agent::registry::RestorationAdmission>>::new();
-        let mut children_by_session =
-            HashMap::<SessionId, Vec<Arc<crate::agent::registry::RestorationAdmission>>>::new();
+            Vec::<(AgentId, Arc<crate::agent::registry::RestorationAdmission>)>::new();
+        let mut children_by_agent =
+            HashMap::<AgentId, Vec<Arc<crate::agent::registry::RestorationAdmission>>>::new();
         let mut failures = Vec::<protocol::AgentRestorationFailure>::new();
         while !records.is_empty() {
             if self.restart.stopped.is_cancelled() {
@@ -21085,10 +21573,26 @@ impl HostHandle {
             // afterwards, each parent only once its children continue, so no
             // parent can find a child idle and replace it.
             let index = match records.iter().position(|record| {
-                record
-                    .parent_id
+                let owner = record
+                    .restore_state
                     .as_ref()
-                    .is_none_or(|parent_id| !records.iter().any(|pending| &pending.id == parent_id))
+                    .and_then(|restore| restore.agent_id.as_ref());
+                match owner.and_then(|id| saved_parents.get(id)) {
+                    Some(crate::store::session::AgentRestorationParent::Agent(parent)) => {
+                        !records.iter().any(|pending| {
+                            pending
+                                .restore_state
+                                .as_ref()
+                                .and_then(|restore| restore.agent_id.as_ref())
+                                == Some(parent)
+                        })
+                    }
+                    Some(
+                        crate::store::session::AgentRestorationParent::Root
+                        | crate::store::session::AgentRestorationParent::UnrestoredSession(_),
+                    )
+                    | None => true,
+                }
             }) {
                 Some(index) => index,
                 None => {
@@ -21126,7 +21630,27 @@ impl HostHandle {
             // can complete and withdraw the intent.
             let admitted = self.session_resume_admission(&record.id).await;
 
-            if let Some(agent_id) = self.live_agent_for_session(&record.id).await {
+            let existing = if restore_state
+                .agent_id
+                .as_ref()
+                .is_some_and(|id| work_owners.contains(id))
+            {
+                match restore_state.agent_id.as_ref() {
+                    Some(id) if self.agent_status_snapshot(id).await.is_some() => Some(id.clone()),
+                    _ => None,
+                }
+            } else {
+                self.live_agent_for_session(&record.id)
+                    .await
+                    .filter(|owner| !admissions.iter().any(|(id, _)| id == owner))
+            };
+            if let Some(agent_id) = existing {
+                if let Some(saved) = restore_state.agent_id.as_ref()
+                    && saved != &agent_id
+                {
+                    replacement_owners.insert(saved.clone(), agent_id.clone());
+                }
+
                 // Skipping the spawn does not make this session stop being a
                 // parent; without recording the owner a restored child loses
                 // its binding and comes back as a root card.
@@ -21135,7 +21659,6 @@ impl HostHandle {
                     agent_id = %agent_id,
                     "restoration reused the agent already bound to this session"
                 );
-                restored_agent_ids.insert(record.id.clone(), agent_id);
                 continue;
             }
 
@@ -21143,10 +21666,27 @@ impl HostHandle {
             // completed while this claim was contended has already withdrawn
             // the marker, and reconstructing the card anyway would reopen an
             // agent the user explicitly closed.
-            let still_marked = session_store
-                .get(&record.id)
+            let saved_session = record.id.clone();
+            let saved_agent = restore_state.agent_id.clone();
+            let still_marked = match session_store
+                .read(move |store| {
+                    store.agent_restoration_wanted(&saved_session, saved_agent.as_ref())
+                })
                 .await
-                .is_some_and(|current| current.restore_state.is_some());
+            {
+                Ok(wanted) => wanted,
+                Err(error) => {
+                    failures.push(protocol::AgentRestorationFailure {
+                        agent: restored_session_ref(&record),
+                        reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                            message: format!("Cannot read restoration custody: {error}"),
+                        },
+                        retry: protocol::AgentRestorationRetry::NextLaunch,
+                        skipped: Vec::new(),
+                    });
+                    continue;
+                }
+            };
             if !still_marked {
                 tracing::info!(
                     session_id = %record.id,
@@ -21159,37 +21699,53 @@ impl HostHandle {
             // reconstruct. Resuming it here would give it a new identity
             // outside the child-first admission order, so its subtree keeps
             // its restoration intent for the next launch instead.
-            let parent_agent_id = match record.parent_id.as_ref() {
-                Some(parent_session_id) => {
-                    let parent_agent_id = match restored_agent_ids.get(parent_session_id) {
-                        Some(agent_id) => Some(agent_id.clone()),
-                        None => self.live_agent_for_session(parent_session_id).await,
-                    };
-                    if parent_agent_id.is_none() {
-                        tracing::error!(
-                            session_id = %record.id,
-                            parent_session_id = %parent_session_id,
-                            parent_in_snapshot = restore_session_ids.contains(parent_session_id),
-                            "not restoring an open agent whose saved parent was not restored"
-                        );
+            let Some(parent_custody) = restore_state
+                .agent_id
+                .as_ref()
+                .and_then(|owner| saved_parents.get(owner))
+            else {
+                failures.push(protocol::AgentRestorationFailure {
+                    agent: restored_session_ref(&record),
+                    reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                        message: "Restoration identity or parent custody is missing".to_owned(),
+                    },
+                    retry: protocol::AgentRestorationRetry::NextLaunch,
+                    skipped: Vec::new(),
+                });
+                continue;
+            };
+            let parent_agent_id = match parent_custody {
+                crate::store::session::AgentRestorationParent::Root => None,
+                crate::store::session::AgentRestorationParent::Agent(parent) => {
+                    let parent = replacement_owners
+                        .get(parent)
+                        .cloned()
+                        .unwrap_or_else(|| parent.clone());
+                    if self.agent_status_snapshot(&parent).await.is_none() {
                         record_restoration_skip(
                             &mut failures,
-                            |failed| failed_session_is(failed, Some(parent_session_id)),
+                            |failed| failed_agent_is(failed, &parent),
                             restored_session_ref(&record),
                         );
                         continue;
                     }
-                    parent_agent_id
+                    Some(parent)
                 }
-                None => None,
+                crate::store::session::AgentRestorationParent::UnrestoredSession(session) => {
+                    record_restoration_skip(
+                        &mut failures,
+                        |failed| failed_session_is(failed, Some(session)),
+                        restored_session_ref(&record),
+                    );
+                    continue;
+                }
             };
             let team_context = team_contexts.get(&record.id).cloned();
             // Only a restored parent waits on this agent's startup; any other
             // agent may start as late as its backend needs.
-            let parent_waits = record
-                .parent_id
+            let parent_waits = parent_agent_id
                 .as_ref()
-                .is_some_and(|parent| admission_by_session.contains_key(parent));
+                .is_some_and(|parent| admissions.iter().any(|(id, _)| id == parent));
             let restoration = crate::agent::registry::RestorationAdmission::new(
                 restore_state.agent_id.clone(),
                 parent_waits.then_some(restored_agent_startup_timeout),
@@ -21200,7 +21756,7 @@ impl HostHandle {
                         launch_context: protocol::AgentLaunchContext::Standard,
                         name: None,
                         custom_agent_id: record.custom_agent_id.clone(),
-                        parent_agent_id,
+                        parent_agent_id: parent_agent_id.clone(),
                         project_id: record.project_id.clone(),
                         params: SpawnAgentParams::Resume {
                             session_id: record.id.clone(),
@@ -21220,18 +21776,16 @@ impl HostHandle {
 
             match restored {
                 Ok(agent_id) => {
-                    if let Some(parent_session_id) = record.parent_id.as_ref()
-                        && let Some(parent) = admission_by_session.get(parent_session_id)
+                    if let Some(parent_id) = parent_agent_id.as_ref()
+                        && let Some((_, parent)) = admissions.iter().find(|(id, _)| id == parent_id)
                     {
                         parent.record_restored_child(agent_id.clone());
-                        children_by_session
-                            .entry(parent_session_id.clone())
+                        children_by_agent
+                            .entry(parent_id.clone())
                             .or_default()
                             .push(restoration.clone());
                     }
-                    admission_by_session.insert(record.id.clone(), restoration.clone());
-                    admissions.push((record.id.clone(), restoration));
-                    restored_agent_ids.insert(record.id.clone(), agent_id.clone());
+                    admissions.push((agent_id.clone(), restoration));
                     if let Some(team_context) = team_context {
                         self.bind_restored_team_member(team_context, agent_id, record.id)
                             .await;
@@ -21255,6 +21809,22 @@ impl HostHandle {
                 }
             }
         }
+        // Each restored agent activates on its own once its restored children
+        // settle, so subtrees recover child-first and independently: a held
+        // subtree never delays an unrelated one.
+        for (agent_id, admission) in admissions {
+            let children = children_by_agent.remove(&agent_id).unwrap_or_default();
+            let stopped = self.restart.stopped.clone();
+            tokio::spawn(async move {
+                for child in children {
+                    tokio::select! {
+                        _ = stopped.cancelled() => return,
+                        _ = child.wait_until_settled() => {}
+                    }
+                }
+                admission.activate();
+            });
+        }
         self.restore_startup_reservations(&session_store, &mut failures)
             .await?;
         if !failures.is_empty() {
@@ -21269,22 +21839,6 @@ impl HostHandle {
                     })
                     .await
             }
-        }
-        // Each restored agent activates on its own once its restored children
-        // settle, so subtrees recover child-first and independently: a held
-        // subtree never delays an unrelated one.
-        for (session_id, admission) in admissions {
-            let children = children_by_session.remove(&session_id).unwrap_or_default();
-            let stopped = self.restart.stopped.clone();
-            tokio::spawn(async move {
-                for child in children {
-                    tokio::select! {
-                        _ = stopped.cancelled() => return,
-                        _ = child.wait_until_settled() => {}
-                    }
-                }
-                admission.activate();
-            });
         }
         Ok(())
     }
@@ -24668,13 +25222,17 @@ fn task_token_usage_sources_for_state(
         .agent_ids()
         .into_iter()
         .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
+        .chain(state.closing_agents.values().cloned())
         .collect::<Vec<_>>();
     (
         handles,
         state
             .closed_agent_usage_snapshots
             .values()
-            .filter(|snapshot| !live_agent_ids.contains(&snapshot.start.agent_id))
+            .filter(|snapshot| {
+                !live_agent_ids.contains(&snapshot.start.agent_id)
+                    && !state.closing_agents.contains_key(&snapshot.start.agent_id)
+            })
             .cloned()
             .collect(),
         live_agent_ids,
@@ -24696,6 +25254,11 @@ async fn task_token_usage_snapshots_from_handles(
 
 async fn read_agent_usage_snapshot_or_unavailable(handle: &AgentHandle) -> AgentUsageSnapshot {
     let start = handle.snapshot();
+    if handle.is_closing() {
+        return handle
+            .published_final_usage()
+            .unwrap_or_else(|| unavailable_agent_usage_snapshot(start));
+    }
     handle
         .read_usage_snapshot()
         .await

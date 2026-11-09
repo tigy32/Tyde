@@ -221,7 +221,6 @@ struct TerminalFailureContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
-    session_store: &'a Arc<SessionStoreHandle>,
     compaction: Option<TerminalCompactionFailureContext<'a>>,
 }
 
@@ -1021,6 +1020,8 @@ pub(crate) struct AgentHandle {
     processes: crate::backend::subprocess::ProcessOwner,
     actor_abort: tokio::task::AbortHandle,
     diagnostics: ActorDiagnostics,
+    #[cfg(feature = "test-support")]
+    close_return_test_gate: Arc<std::sync::OnceLock<Arc<crate::host::SpawnOperationTestGateInner>>>,
     actor_status: registry::AgentStatusHandle,
     startup_completion: watch::Receiver<Option<Result<SessionId, StartupFailure>>>,
     initial_usage_generation: u64,
@@ -3045,13 +3046,45 @@ impl AgentHandle {
     }
 
     #[cfg(feature = "test-support")]
-    pub(crate) async fn wait_termination_for_test(&self) {
+    pub(crate) fn install_close_return_gate(
+        &self,
+        gate: Arc<crate::host::SpawnOperationTestGateInner>,
+    ) -> Result<(), String> {
+        self.close_return_test_gate
+            .set(gate)
+            .map_err(|_| "Close return gate is already installed".to_owned())
+    }
+
+    async fn wait_actor_termination(&self) -> Result<ActorTermination, String> {
         self.diagnostics
             .termination
             .clone()
             .wait_for(|termination| *termination != ActorTermination::Running)
             .await
-            .expect("actor termination diagnostic publisher");
+            .map(|termination| *termination)
+            .map_err(|_| "Actor termination owner stopped without completion".to_owned())
+    }
+
+    pub(crate) async fn wait_for_termination(&self) -> Result<(), String> {
+        match self.wait_actor_termination().await? {
+            ActorTermination::Returned => Ok(()),
+            ActorTermination::Dropped => {
+                Err("Agent teardown was cancelled after close admission".to_owned())
+            }
+            ActorTermination::Unwinding => {
+                Err("Agent teardown panicked after close admission".to_owned())
+            }
+            ActorTermination::Running => {
+                Err("Actor termination observation was inconsistent".to_owned())
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_termination_for_test(&self) {
+        self.wait_actor_termination()
+            .await
+            .expect("actor termination observation");
     }
 
     pub fn actor_finished(&self) -> bool {
@@ -3063,6 +3096,21 @@ impl AgentHandle {
             phase = ?AccountingDiagnosticPhase::CancellationRequested, checkpoint_present = self.final_usage.borrow().is_some());
         self.processes.kill_all();
         self.actor_abort.abort();
+    }
+
+    pub(crate) async fn retry_close_recovery(&self) {
+        self.actor_status.withdraw_recovery().await;
+    }
+
+    pub(crate) async fn close_persistence_result(&self) -> Result<(), String> {
+        match self.actor_status.snapshot().await.close_recovery_error {
+            Some(error) => Err(format!("Cannot persist agent recovery: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn published_final_usage(&self) -> Option<AgentUsageSnapshot> {
+        self.final_usage.borrow().clone()
     }
 
     pub(crate) fn final_usage_snapshot(&self) -> Result<AgentUsageSnapshot, String> {
@@ -3080,6 +3128,8 @@ impl AgentHandle {
     }
 
     pub async fn close(&self) -> bool {
+        let started = std::time::Instant::now();
+        tracing::info!(target: "server::agent_close", accounting_actor = self.diagnostics.slot, "actor close requested");
         self.begin_closing();
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -3089,7 +3139,9 @@ impl AgentHandle {
         {
             return false;
         }
-        reply_rx.await.is_ok()
+        let acknowledged = reply_rx.await.is_ok();
+        tracing::info!(target: "server::agent_close", accounting_actor = self.diagnostics.slot, elapsed_ms = started.elapsed().as_millis(), acknowledged, runtime = ?tokio::runtime::Handle::current().runtime_flavor(), "actor close reply received");
+        acknowledged
     }
 
     #[cfg(feature = "test-support")]
@@ -4333,6 +4385,10 @@ pub(crate) fn spawn_agent_actor(
     let (final_usage_tx, final_usage) = watch::channel(None);
     let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
     let accounting_actor = diagnostics.slot;
+    #[cfg(feature = "test-support")]
+    let close_return_test_gate = Arc::new(std::sync::OnceLock::new());
+    #[cfg(feature = "test-support")]
+    let actor_close_return_test_gate = Arc::clone(&close_return_test_gate);
     let actor_tx = tx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
@@ -4449,20 +4505,35 @@ pub(crate) fn spawn_agent_actor(
                 resolved_spawn_config,
             },
         );
-        let resume_recovery = match resume_session_id.as_ref() {
-            Some(session_id) => session_store
-                .get(session_id)
-                .await
-                .and_then(|record| record.turn_recovery),
-            None => None,
-        };
+        let mut resume_recovery = None;
         let mut startup_failure = startup_failure;
         let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
-            session_store
-                .get(session_id)
+            match status_handle
+                .bind_recovery(
+                    Arc::clone(&session_store),
+                    session_id.clone(),
+                    (startup_failure.is_none()
+                        && session_resumability_config.is_rebuilt_by_resume())
+                    .then(|| SessionRestoreState {
+                        agent_id: Some(current_start.agent_id.clone()),
+                        origin: current_start.origin,
+                        workflow: current_start.workflow.clone(),
+                    }),
+                    current_start.parent_agent_id.clone(),
+                )
                 .await
-                .map(|record| record.queued_messages)
-                .unwrap_or_default()
+            {
+                Ok(state) => {
+                    resume_recovery = state.turn_recovery;
+                    state.queued_messages
+                }
+                Err(error) => {
+                    startup_failure = Some(AgentStartupFailure::internal(format!(
+                        "Cannot bind durable agent recovery: {error}"
+                    )));
+                    Vec::new()
+                }
+            }
         } else if let (None, Some(first_input)) = (startup_failure.as_ref(), initial_input.as_ref())
         {
             let reservation = startup_reservation(
@@ -4504,9 +4575,6 @@ pub(crate) fn spawn_agent_actor(
             }
         }
         if let Some(session_id) = resume_session_id.as_ref() {
-            status_handle
-                .bind_recovery(Arc::clone(&session_store), session_id.clone())
-                .await;
             replay_state.journal = Some(transcript_store.open_session(session_id));
             replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         }
@@ -4757,9 +4825,9 @@ pub(crate) fn spawn_agent_actor(
                 } else {
                     validate_startup_mcp_configuration(&spawn_config.startup_mcp_servers).await
                 };
-                eprintln!(
-                    "TYDE MCP CONFIG VALIDATION agent={} result={:?}",
-                    agent_id, mcp_config_validation
+                tracing::debug!(
+                    valid = mcp_config_validation.is_ok(),
+                    "MCP configuration validated"
                 );
                 let startup_result: Result<
                     (
@@ -4915,6 +4983,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             let _ = session_binding_tx
                                 .send(Err("host stopped during startup".to_owned()));
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(
                                 &accepting_input_task,
                                 &status_handle,
@@ -4926,6 +4995,7 @@ pub(crate) fn spawn_agent_actor(
                                 },
                             )
                             .await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -5262,7 +5332,6 @@ pub(crate) fn spawn_agent_actor(
                         replay_state: &mut replay_state,
                         subscribers: &mut subscribers,
                         queue: &mut queue,
-                        session_store: &session_store,
                         compaction: None,
                     },
                     &payload,
@@ -5388,18 +5457,29 @@ pub(crate) fn spawn_agent_actor(
         if is_resume {
             pending_resume_attaches.append(&mut pending_startup_attaches);
         }
-        let restore_state = match persist_agent_session(
-            &session_store,
-            &actor_session_id,
-            parent_session_id,
-            &current_start,
-            &current_session_settings,
-            &session_resumability_config,
-            &mut pending_alias,
-        )
-        .await
-        {
-            Ok(restore_state) => restore_state,
+        let persistence = async {
+            let restore_state = persist_agent_session(
+                &session_store,
+                &actor_session_id,
+                parent_session_id,
+                &current_start,
+                &current_session_settings,
+                &session_resumability_config,
+                &mut pending_alias,
+            )
+            .await?;
+            status_handle
+                .promote_reservation(
+                    Arc::clone(&session_store),
+                    actor_session_id.clone(),
+                    restore_state,
+                    current_start.parent_agent_id.clone(),
+                )
+                .await
+        }
+        .await;
+        match persistence {
+            Ok(()) => (),
             Err(err) => {
                 if let Some(backend) = backend.take() {
                     backend.shutdown().await;
@@ -5498,16 +5578,6 @@ pub(crate) fn spawn_agent_actor(
                 () = crate::host::wait_for_spawn_operation_test_gate_inner(gate) => {},
             }
         }
-        // A fresh spawn's first prompt went to the provider during startup,
-        // before its session existed, recorded on its startup reservation;
-        // the session takes that over atomically now that it exists.
-        status_handle
-            .promote_reservation(
-                Arc::clone(&session_store),
-                actor_session_id.clone(),
-                restore_state,
-            )
-            .await;
         if !is_resume {
             event_log
                 .timing
@@ -5791,7 +5861,6 @@ pub(crate) fn spawn_agent_actor(
             &mut event_log,
             &mut subscribers,
             &queue,
-            &session_store,
             &status_handle,
         )
         .await;
@@ -6331,7 +6400,6 @@ pub(crate) fn spawn_agent_actor(
                             &mut event_log,
                             &mut subscribers,
                             &queue,
-                            &session_store,
                             &status_handle,
                         )
                         .await;
@@ -6375,7 +6443,6 @@ pub(crate) fn spawn_agent_actor(
                             &mut event_log,
                             &mut subscribers,
                             &current_start.agent_id,
-                            &session_store,
                             &status_handle,
                             &review_registry,
                             false,
@@ -6824,7 +6891,9 @@ pub(crate) fn spawn_agent_actor(
                                 "agent closed",
                             )
                             .await;
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                     }
@@ -7270,7 +7339,6 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     queue: &mut queue,
-                                    session_store: &session_store,
                                     compaction: Some(TerminalCompactionFailureContext {
                                         flight: &mut context_compaction,
                                         session_store: &session_store,
@@ -7338,7 +7406,9 @@ pub(crate) fn spawn_agent_actor(
                                 "agent closed",
                             )
                             .await;
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                             tool_publication.close();
@@ -7375,7 +7445,6 @@ pub(crate) fn spawn_agent_actor(
                                 replay_state: &mut replay_state,
                                 subscribers: &mut subscribers,
                                 queue: &mut queue,
-                                session_store: &session_store,
                                 compaction: Some(TerminalCompactionFailureContext {
                                     flight: &mut context_compaction,
                                     session_store: &session_store,
@@ -7658,7 +7727,6 @@ pub(crate) fn spawn_agent_actor(
                                                 event_log: &mut event_log,
                                                 subscribers: &mut subscribers,
                                                 agent_id: &current_start.agent_id,
-                                                session_store: &session_store,
                                                 status_handle: &status_handle,
                                                 review_registry: &review_registry,
                                                 },
@@ -7699,7 +7767,6 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
-                                                    session_store: &session_store,
                                                     compaction: Some(
                                                         TerminalCompactionFailureContext {
                                                             flight: &mut context_compaction,
@@ -7854,7 +7921,6 @@ pub(crate) fn spawn_agent_actor(
                                             replay_state: &mut replay_state,
                                             subscribers: &mut subscribers,
                                             queue: &mut queue,
-                                            session_store: &session_store,
                                             compaction: Some(TerminalCompactionFailureContext {
                                                 flight: &mut context_compaction,
                                                 session_store: &session_store,
@@ -8558,7 +8624,9 @@ pub(crate) fn spawn_agent_actor(
                             "agent closed",
                         )
                         .await;
+                        let close_actor = event_log.accounting_actor;
                         finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                        tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                         return;
                     }
 
@@ -8674,9 +8742,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut event_log,
                             &mut subscribers,
                             &queue,
-                            &session_store,
-                            &status_handle,
-                        )
+                            &status_handle,)
                         .await;
                         in_turn = true;
                         idle_transition_armed = false;
@@ -8704,9 +8770,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &queue,
-                                    &session_store,
-                                    &status_handle,
-                                )
+                                    &status_handle,)
                                 .await;
                             }
                             SendOutcome::Closed => {
@@ -8748,7 +8812,6 @@ pub(crate) fn spawn_agent_actor(
                                         replay_state: &mut replay_state,
                                         subscribers: &mut subscribers,
                                         queue: &mut queue,
-                                        session_store: &session_store,
                                         compaction: Some(TerminalCompactionFailureContext {
                                             flight: &mut context_compaction,
                                             session_store: &session_store,
@@ -9225,9 +9288,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
+                                        &status_handle,)
                                     .await;
                                 }
                                 if let Some(reply) = delivery_ack.take() {
@@ -9622,9 +9683,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &queue,
-                                                &session_store,
-                                                &status_handle,
-                                            ).await;
+                                                &status_handle,).await;
                                         }
                                         if let Some(reply) = delivery_ack.take() {
                                             // Queued behind the open turn counts
@@ -9726,9 +9785,7 @@ pub(crate) fn spawn_agent_actor(
                                                         &mut event_log,
                                                         &mut subscribers,
                                                         &queue,
-                                                        &session_store,
-                                                        &status_handle,
-                                                    )
+                                                        &status_handle,)
                                                     .await;
                                                     if let Some(reply) = delivery_ack.take() {
                                                         // A Busy hand-back is a
@@ -9813,7 +9870,6 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
-                                                    session_store: &session_store,
                                                     compaction: Some(TerminalCompactionFailureContext {
                                                         flight: &mut context_compaction,
                                                         session_store: &session_store,
@@ -9997,9 +10053,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut event_log,
                                             &mut subscribers,
                                             &queue,
-                                            &session_store,
-                                            &status_handle,
-                                        )
+                                            &status_handle,)
                                         .await;
                                         if let Some(reply) = delivery_ack.take() {
                                             if reply.is_control() && in_turn { mark_agent_work_pending(&status_handle).await; }
@@ -10145,9 +10199,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &queue,
-                                                &session_store,
-                                                &status_handle,
-                                            ).await;
+                                                &status_handle,).await;
                                         }
                                         if let Some(reply) = delivery_ack.take() {
                                             if reply.is_control() && in_turn { mark_agent_turn_active(&status_handle).await; }
@@ -10216,9 +10268,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
+                                        &status_handle,)
                                     .await;
                                 }
                                 AgentInput::CancelQueuedMessage(payload) => {
@@ -10245,9 +10295,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
+                                        &status_handle,)
                                     .await;
                                 }
                                 AgentInput::SendQueuedMessageNow(payload) => {
@@ -10298,9 +10346,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
+                                        &status_handle,)
                                     .await;
 
                                     if usage_paused { continue; }
@@ -10375,9 +10421,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut subscribers,
                                         &queue,
-                                        &session_store,
-                                        &status_handle,
-                                    )
+                                        &status_handle,)
                                     .await;
                                     in_turn = true;
                                     idle_transition_armed = false;
@@ -10401,9 +10445,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &queue,
-                                                &session_store,
-                                                &status_handle,
-                                            )
+                                                &status_handle,)
                                             .await;
                                         }
                                         SendOutcome::Closed => {
@@ -10445,7 +10487,6 @@ pub(crate) fn spawn_agent_actor(
                                                     replay_state: &mut replay_state,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
-                                                    session_store: &session_store,
                                                     compaction: Some(TerminalCompactionFailureContext {
                                                         flight: &mut context_compaction,
                                                         session_store: &session_store,
@@ -11259,11 +11300,9 @@ pub(crate) fn spawn_agent_actor(
                                 &mut event_log,
                                 &mut subscribers,
                                 &current_start.agent_id,
-                                &session_store,
                                 &status_handle,
                                 &review_registry,
-                                usage_paused || !held_controls.is_empty(),
-                            )
+                                usage_paused || !held_controls.is_empty(),)
                             .await;
                             if dispatch == QueuedMessageDispatchOutcome::Closed {
                                 terminalize_closed_queue_dispatch(
@@ -11456,11 +11495,9 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &current_start.agent_id,
-                                    &session_store,
                                     &status_handle,
                                     &review_registry,
-                                    usage_paused || !held_controls.is_empty(),
-                                )
+                                    usage_paused || !held_controls.is_empty(),)
                                 .await;
                                 if dispatch == QueuedMessageDispatchOutcome::Closed {
                                     terminalize_closed_queue_dispatch(
@@ -11980,7 +12017,7 @@ pub(crate) fn spawn_agent_actor(
                                 queue.retain(|entry| entry.origin != Some(MessageOrigin::Supervisor));
                                 if queue.len() != queue_len {
                                     update_queued_messages_snapshot(&canonical_stream, &mut event_log, &mut subscribers,
-                                        &queue, &session_store, &status_handle).await;
+                                        &queue, &status_handle,).await;
                                 }
                                 if !in_turn || context_compaction.is_some() || active_compaction.is_some() {
                                     let _ = reply.send(InterruptOutcome::Interrupted);
@@ -12132,7 +12169,6 @@ pub(crate) fn spawn_agent_actor(
                                     replay_state: &mut replay_state,
                                     subscribers: &mut subscribers,
                                     queue: &mut queue,
-                                    session_store: &session_store,
                                     compaction: Some(TerminalCompactionFailureContext {
                                         flight: &mut context_compaction,
                                         session_store: &session_store,
@@ -12191,7 +12227,9 @@ pub(crate) fn spawn_agent_actor(
                                 UNKNOWN_TOOL_OUTCOME_MESSAGE,
                             )
                             .await;
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -12251,9 +12289,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut event_log,
                                     &mut subscribers,
                                     &queue,
-                                    &session_store,
-                                    &status_handle,
-                                )
+                                    &status_handle,)
                                 .await;
                             }
                             let waiting_for_user_response = !pending_tool_response_ids.is_empty();
@@ -12280,7 +12316,9 @@ pub(crate) fn spawn_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
+                                let close_actor = event_log.accounting_actor;
                                 finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                                tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                                 return;
                             }
                             // Closing a busy agent has to end its turn, not
@@ -12358,7 +12396,9 @@ pub(crate) fn spawn_agent_actor(
                         "agent closed",
                     )
                     .await;
+                    let close_actor = event_log.accounting_actor;
                     finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                    tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                     return;
                 }
             }
@@ -12370,7 +12410,16 @@ pub(crate) fn spawn_agent_actor(
     );
     let actor = Box::pin(actor);
     let actor_task = crate::backend::subprocess::spawn(async move {
-        actor_processes.scope(actor).await;
+        let mut scoped = Box::pin(actor_processes.scope(actor));
+        scoped.as_mut().await;
+        tracing::info!(target: "server::agent_close", accounting_actor, runtime = ?tokio::runtime::Handle::current().runtime_flavor(), "actor await returned after body-local cleanup");
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = actor_close_return_test_gate.get() {
+            crate::host::wait_for_spawn_operation_test_gate_inner(gate).await;
+        }
+        let drop_started = std::time::Instant::now();
+        drop(scoped);
+        tracing::info!(target: "server::agent_close", accounting_actor, elapsed_ms = drop_started.elapsed().as_millis(), "completed actor future frame dropped");
         termination_guard.returned();
     });
 
@@ -12379,6 +12428,8 @@ pub(crate) fn spawn_agent_actor(
             processes,
             actor_abort: actor_task.abort_handle(),
             diagnostics,
+            #[cfg(feature = "test-support")]
+            close_return_test_gate,
             actor_status,
             startup_completion,
             initial_usage_generation,
@@ -12475,15 +12526,24 @@ pub(crate) fn spawn_relay_agent_actor(
     let (final_usage_tx, final_usage) = watch::channel(None);
     let (diagnostics, mut termination_guard) = ActorDiagnostics::new(final_usage.clone());
     let accounting_actor = diagnostics.slot;
+    #[cfg(feature = "test-support")]
+    let close_return_test_gate = Arc::new(std::sync::OnceLock::new());
+    #[cfg(feature = "test-support")]
+    let actor_close_return_test_gate = Arc::clone(&close_return_test_gate);
     let live_archive_start = start_rx.clone();
 
     let processes = crate::backend::subprocess::ProcessOwner::default();
     let actor_processes = processes.clone();
     let actor_status = status_handle.clone();
-    let (_, startup_completion) = watch::channel(Some(Ok(session_id.clone())));
+    let (startup_tx, startup_completion) = watch::channel(None);
     let actor = async move {
-        status_handle
-            .bind_recovery(Arc::clone(&session_store), session_id.clone())
+        let recovery = status_handle
+            .bind_recovery(
+                Arc::clone(&session_store),
+                session_id.clone(),
+                None,
+                start.parent_agent_id.clone(),
+            )
             .await;
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log = AgentEventLog {
@@ -12522,6 +12582,56 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut close_deadline: Option<tokio::time::Instant> = None;
+        if let Err(error) = recovery {
+            startup_tx.send_replace(Some(Err(StartupFailure::SessionPersistenceFailed)));
+            let message = format!("Cannot bind durable native recovery: {error}");
+            status_handle
+                .update(|status| {
+                    status.terminated = true;
+                    status.last_error = Some(message.clone());
+                })
+                .await;
+            append_event(
+                &canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                FrameKind::AgentStart,
+                &current_start,
+            )
+            .await;
+            append_event(
+                &canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                FrameKind::AgentError,
+                &AgentErrorPayload {
+                    agent_id: current_start.agent_id.clone(),
+                    code: AgentErrorCode::Internal,
+                    fatal: true,
+                    message,
+                },
+            )
+            .await;
+            park_relay_terminal_agent(
+                &session_store,
+                &transcript_store,
+                &session_id,
+                &mut pending_alias,
+                &mut current_start,
+                &start_tx,
+                &mut event_log,
+                &replay_state,
+                &mut latest_output,
+                &mut subscribers,
+                &mut rx,
+                &accepting_input_task,
+                &status_handle,
+                &canonical_stream,
+            )
+            .await;
+            return;
+        }
+        startup_tx.send_replace(Some(Ok(session_id.clone())));
         event_log
             .timing
             .restore(&session_store, &session_id, &status_handle)
@@ -12698,7 +12808,9 @@ pub(crate) fn spawn_relay_agent_actor(
                                 "agent closed",
                             )
                             .await;
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                         if status_handle.snapshot().await.is_active() {
@@ -12913,7 +13025,9 @@ pub(crate) fn spawn_relay_agent_actor(
                             "agent closed",
                         )
                         .await;
+                        let close_actor = event_log.accounting_actor;
                         finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                        tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                         return;
                     }
                 }
@@ -13135,7 +13249,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::StopForRestart { reply } => {
                             status_handle.prepare_restart().await;
+                            let close_actor = event_log.accounting_actor;
                             finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::StopForRestart, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                            tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -13168,7 +13284,9 @@ pub(crate) fn spawn_relay_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
+                                let close_actor = event_log.accounting_actor;
                                 finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                                tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                                 return;
                             }
                             // A relay mirrors a backend-native child and owns no
@@ -13257,7 +13375,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         "agent closed",
                     )
                     .await;
+                    let close_actor = event_log.accounting_actor;
                     finish_actor_close(&accepting_input_task, &status_handle, Some(reply), ActorFinish::Close, ActorUsageFinalization { start: &current_start, event_log: &mut event_log }).await;
+                    tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                     return;
                 }
             }
@@ -13269,7 +13389,16 @@ pub(crate) fn spawn_relay_agent_actor(
     );
     let actor = Box::pin(actor);
     let actor_task = crate::backend::subprocess::spawn(async move {
-        actor_processes.scope(actor).await;
+        let mut scoped = Box::pin(actor_processes.scope(actor));
+        scoped.as_mut().await;
+        tracing::info!(target: "server::agent_close", accounting_actor, runtime = ?tokio::runtime::Handle::current().runtime_flavor(), "actor await returned after body-local cleanup");
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = actor_close_return_test_gate.get() {
+            crate::host::wait_for_spawn_operation_test_gate_inner(gate).await;
+        }
+        let drop_started = std::time::Instant::now();
+        drop(scoped);
+        tracing::info!(target: "server::agent_close", accounting_actor, elapsed_ms = drop_started.elapsed().as_millis(), "completed actor future frame dropped");
         termination_guard.returned();
     });
 
@@ -13277,6 +13406,8 @@ pub(crate) fn spawn_relay_agent_actor(
         processes,
         actor_abort: actor_task.abort_handle(),
         diagnostics,
+        #[cfg(feature = "test-support")]
+        close_return_test_gate,
         actor_status,
         startup_completion,
         initial_usage_generation: 1,
@@ -13533,6 +13664,8 @@ async fn finish_actor_close(
     finish: ActorFinish,
     usage: ActorUsageFinalization<'_>,
 ) {
+    let phase_started = std::time::Instant::now();
+    tracing::info!(target: "server::agent_close", accounting_actor = usage.event_log.accounting_actor, log_records = usage.event_log.len(), runtime = ?tokio::runtime::Handle::current().runtime_flavor(), "finalization entered");
     // A clean stop is durable before close, so a later reopen reports the
     // gap as not running rather than unobserved.
     if let Some((store, session)) = usage.event_log.timing_context.clone() {
@@ -13540,6 +13673,7 @@ async fn finish_actor_close(
         usage.event_log.timing.stop();
         usage.event_log.timing.persist(&store, &session).await;
     }
+    tracing::info!(target: "server::agent_close", accounting_actor = usage.event_log.accounting_actor, elapsed_ms = phase_started.elapsed().as_millis(), "timing persisted");
     publish_final_usage(usage.start, usage.event_log);
     accepting_input.store(false, Ordering::SeqCst);
     match finish {
@@ -13547,6 +13681,7 @@ async fn finish_actor_close(
         ActorFinish::Close => status_handle.withdraw_recovery().await,
         ActorFinish::StopForRestart => {}
     }
+    tracing::info!(target: "server::agent_close", accounting_actor = usage.event_log.accounting_actor, elapsed_ms = phase_started.elapsed().as_millis(), "recovery withdrawn");
     status_handle
         .update(|s| {
             s.terminated = true;
@@ -13557,8 +13692,10 @@ async fn finish_actor_close(
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
         .await;
+    tracing::info!(target: "server::agent_close", accounting_actor = usage.event_log.accounting_actor, elapsed_ms = phase_started.elapsed().as_millis(), "status terminated");
     if let Some(reply) = reply {
-        let _ = reply.send(());
+        let acknowledged = reply.send(()).is_ok();
+        tracing::info!(target: "server::agent_close", accounting_actor = usage.event_log.accounting_actor, elapsed_ms = phase_started.elapsed().as_millis(), acknowledged, runtime = ?tokio::runtime::Handle::current().runtime_flavor(), "actor close reply sent");
     }
 }
 
@@ -14146,7 +14283,6 @@ async fn enter_terminal_failure(
         context.event_log,
         context.subscribers,
         context.queue,
-        context.session_store,
         context.status_handle,
     )
     .await;
@@ -14557,11 +14693,13 @@ async fn park_terminal_agent(
                 );
             }
             AgentCommand::Close { reply } => {
+                publish_final_usage(current_start, event_log);
                 status_handle.withdraw_recovery().await;
                 let _ = reply.send(());
                 break;
             }
             AgentCommand::StopForRestart { reply } => {
+                publish_final_usage(current_start, event_log);
                 let _ = reply.send(());
                 break;
             }
@@ -14860,6 +14998,7 @@ async fn park_relay_terminal_agent(
                 );
             }
             AgentCommand::Close { reply } => {
+                let close_actor = event_log.accounting_actor;
                 finish_actor_close(
                     accepting_input,
                     status_handle,
@@ -14871,9 +15010,11 @@ async fn park_relay_terminal_agent(
                     },
                 )
                 .await;
+                tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                 break;
             }
             AgentCommand::StopForRestart { reply } => {
+                let close_actor = event_log.accounting_actor;
                 finish_actor_close(
                     accepting_input,
                     status_handle,
@@ -14885,6 +15026,7 @@ async fn park_relay_terminal_agent(
                     },
                 )
                 .await;
+                tracing::info!(target: "server::agent_close", accounting_actor = close_actor, "actor close body returning");
                 break;
             }
             AgentCommand::Compact { reply, .. } => {
@@ -16794,7 +16936,6 @@ async fn send_initial_follow_up_or_park(
             context.event_log,
             context.subscribers,
             context.queue,
-            context.session_store,
             context.status_handle,
         )
         .await;
@@ -16883,7 +17024,6 @@ async fn send_initial_follow_up_or_park(
                     context.event_log,
                     context.subscribers,
                     context.queue,
-                    context.session_store,
                     context.status_handle,
                 )
                 .await;
@@ -16913,7 +17053,6 @@ async fn send_initial_follow_up_or_park(
             replay_state: context.replay_state,
             subscribers: context.subscribers,
             queue: context.queue,
-            session_store: context.session_store,
             compaction: None,
         },
         &payload,
@@ -16981,7 +17120,6 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
             replay_state: context.replay_state,
             subscribers: context.subscribers,
             queue: context.queue,
-            session_store: context.session_store,
             compaction: context.current_session_id.map(|session_id| {
                 TerminalCompactionFailureContext {
                     flight: context.context_compaction,
@@ -17864,24 +18002,27 @@ async fn update_queued_messages_snapshot(
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     queue: &VecDeque<SequencedQueuedMessage>,
-    session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
 ) {
-    if let Some(session_id) = event_log.iter().find_map(|event| {
-        (event.kind == FrameKind::AgentStart)
-            .then(|| event.parse_payload::<AgentStartPayload>().ok())
-            .flatten()
-            .and_then(|start| start.session_id)
-    }) {
-        let messages = queue.iter().map(|queued| queued.entry.clone()).collect();
-        let persist_id = session_id.clone();
-        if let Err(error) = run_session_store_io(session_store, move |store| {
-            store.update(&persist_id, |record| record.queued_messages = messages)
-        })
-        .await
-        {
-            tracing::error!(%session_id, %error, "failed to persist queued messages");
-        }
+    let messages = queue.iter().map(|queued| queued.entry.clone()).collect();
+    if let Err(error) = status_handle.persist_queued_messages(messages).await {
+        let message = format!("Cannot persist queued messages: {error}");
+        status_handle
+            .update(|status| status.last_error = Some(message.clone()))
+            .await;
+        append_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            FrameKind::AgentError,
+            &AgentErrorPayload {
+                agent_id: status_handle.agent_id().clone(),
+                code: AgentErrorCode::Internal,
+                fatal: false,
+                message,
+            },
+        )
+        .await;
     }
     publish_queued_messages_snapshot(
         canonical_stream,
@@ -18121,7 +18262,6 @@ async fn release_context_compaction_barrier(
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
-    session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
     review_registry: &ReviewRegistryHandle,
     dispatch_withheld: bool,
@@ -18138,7 +18278,6 @@ async fn release_context_compaction_barrier(
         event_log,
         subscribers,
         agent_id,
-        session_store,
         status_handle,
         review_registry,
     })
@@ -18164,7 +18303,6 @@ struct QueuedMessageDispatchContext<'a> {
     event_log: &'a mut AgentEventLog,
     subscribers: &'a mut Vec<Stream>,
     agent_id: &'a AgentId,
-    session_store: &'a Arc<SessionStoreHandle>,
     status_handle: &'a registry::AgentStatusHandle,
     review_registry: &'a ReviewRegistryHandle,
 }
@@ -18195,7 +18333,6 @@ async fn dispatch_queued_message(
         context.event_log,
         context.subscribers,
         context.queue,
-        context.session_store,
         context.status_handle,
     )
     .await;
@@ -18232,7 +18369,6 @@ async fn dispatch_queued_message(
                 context.event_log,
                 context.subscribers,
                 context.queue,
-                context.session_store,
                 context.status_handle,
             )
             .await;

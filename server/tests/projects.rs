@@ -1240,6 +1240,89 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         ProjectFileViewState::Ready { entries, .. }
             if entries.iter().any(|entry| entry.path.relative_path == "README.md")
     ));
+    let shutdown = server::backend::mock::MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "project deletion close owner",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::text("ready"))
+                .with_shutdown_gate(&shutdown),
+        )
+        .await;
+    let spawn = protocol::SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
+        name: Some("project deletion close owner".to_owned()),
+        custom_agent_id: None,
+        parent_agent_id: None,
+        project_id: Some(project.id.clone()),
+        params: protocol::SpawnAgentParams::New {
+            workspace_roots: vec![repo.path().to_string_lossy().into_owned()],
+            prompt: "ready".to_owned(),
+            images: None,
+            backend_kind: protocol::BackendKind::Claude,
+            launch_profile_id: None,
+            cost_hint: None,
+            access_mode: Default::default(),
+            session_settings: None,
+        },
+    };
+    let (agent, start) = fixture.spawn_with(spawn.clone()).await;
+    fixture.finish_turn(&agent).await;
+    drop(reservation);
+    let failed_reservation = fixture
+        .reserve_next_mock_spawn_failure(
+            "failed detached project card",
+            "forced project card startup failure",
+        )
+        .await;
+    let mut failed_launch = spawn;
+    failed_launch.name = Some("failed detached project card".to_owned());
+    fixture
+        .client
+        .spawn_agent(failed_launch)
+        .await
+        .expect("spawn failed project card");
+    let failed: protocol::NewAgentPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "failed project card descriptor",
+        |frame| frame.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload()
+    .expect("failed project descriptor");
+    let terminal: protocol::AgentBootstrapPayload = next_frame_matching_on(
+        &mut fixture.client,
+        "failed project card terminal bootstrap",
+        |frame| frame.stream == failed.instance_stream && frame.kind == FrameKind::AgentBootstrap,
+    )
+    .await
+    .parse_payload()
+    .expect("failed project bootstrap");
+    assert!(
+        terminal.events.iter().any(|event| matches!(event,
+            protocol::AgentBootstrapEvent::AgentError(error) if error.fatal
+        )),
+        "project card is terminal before its project is deleted"
+    );
+    drop(failed_reservation);
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close project root");
+    shutdown.wait_until_entered().await;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "project actor removed before teardown",
+        |frame| {
+            frame.kind == FrameKind::AgentClosed
+                && frame
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == start.agent_id)
+        },
+    )
+    .await;
+    let host = fixture.host_for_test();
+    let waiting = host.install_project_close_wait_test_gate().await;
     fixture
         .client
         .project_delete(ProjectDeletePayload {
@@ -1247,19 +1330,116 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         })
         .await
         .expect("project_delete failed");
-
-    match expect_project_notify(&mut fixture.client, "project delete").await {
-        ProjectNotifyPayload::Delete { project: deleted } => assert_eq!(deleted, project),
-        other => panic!("expected delete project notification, got {other:?}"),
+    tokio::select! {
+        _ = waiting.wait_until_entered() => {}
+        event = next_frame_matching_on(&mut fixture.client, "deletion cannot overtake owned close", |frame| {
+            frame.kind == FrameKind::CommandError || (frame.kind == FrameKind::ProjectNotify
+                && matches!(frame.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project: deleted }) if deleted.id == project.id))
+        }) => panic!("project deletion overtook held close settlement: {}", event.kind),
     }
+    let (_, held) = fixture.connect_with_bootstrap().await;
+    assert!(
+        held.projects.iter().any(|entry| entry.id == project.id),
+        "project context survives owned close"
+    );
+    assert!(
+        !held
+            .agents
+            .iter()
+            .any(|entry| entry.agent_id == start.agent_id),
+        "close removal remains immediate"
+    );
+    drop(waiting);
+    shutdown.release_one();
 
-    next_frame_matching_on(&mut fixture.client, "project deletion committed", |event| {
-        event.kind == FrameKind::ProjectOperation
-            && event.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
-                matches!(operation.mutation, protocol::ProjectMutation::Delete(ref payload) if payload.id == project.id)
-                    && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
-            })
-    }).await;
+    // File-view pushes can precede Delete; catalog notification and operation
+    // completion are independent events, not a next-frame response contract.
+    let mut deleted = false;
+    let mut committed = false;
+    while !deleted || !committed {
+        let frame =
+            fixture::next_logical_frame_on(&mut fixture.client, "project deletion settlement")
+                .await;
+        match frame.kind {
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload =
+                    frame.parse_payload().expect("typed deletion error");
+                panic!("project deletion rejected with code {:?}", error.code);
+            }
+            FrameKind::ProjectFileViewState => {
+                let update: ProjectFileViewStatePayload =
+                    frame.parse_payload().expect("typed interleaved file view");
+                let state = match update.state {
+                    ProjectFileViewState::Closed => "closed",
+                    ProjectFileViewState::Loading => "loading",
+                    ProjectFileViewState::DirectoryMissing => "directory_missing",
+                    ProjectFileViewState::Ready { .. } => "ready",
+                    ProjectFileViewState::Unavailable { .. } => "unavailable",
+                };
+                eprintln!("Project deletion wait: interleaved_file_view={state}");
+            }
+            FrameKind::ProjectNotify => {
+                let update: ProjectNotifyPayload =
+                    frame.parse_payload().expect("typed project notification");
+                if let ProjectNotifyPayload::Delete { project: removed } = update
+                    && removed.id == project.id
+                {
+                    assert_eq!(removed, project);
+                    deleted = true;
+                }
+            }
+            FrameKind::ProjectOperation => {
+                let operation: protocol::ProjectOperationPayload =
+                    frame.parse_payload().expect("typed project operation");
+                if matches!(operation.mutation, protocol::ProjectMutation::Delete(ref payload) if payload.id == project.id)
+                {
+                    assert!(
+                        !matches!(
+                            operation.state,
+                            protocol::ProjectOperationState::Failed { .. }
+                        ),
+                        "project deletion operation failed"
+                    );
+                    committed |= matches!(
+                        operation.state,
+                        protocol::ProjectOperationState::Committed { .. }
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    host.await_agent_close_settlement_for_test(&start.agent_id)
+        .await
+        .expect("project deletion preserves successful close finalization");
+    let (_, detached) = fixture.connect_with_bootstrap().await;
+    assert!(
+        detached
+            .agents
+            .iter()
+            .any(|card| card.agent_id == failed.agent_id && card.project_id.is_none()),
+        "deleting the project detaches its still-visible failed card"
+    );
+    fixture
+        .client
+        .close_agent(&failed.instance_stream)
+        .await
+        .expect("dismiss detached failed card");
+    next_frame_matching_on(
+        &mut fixture.client,
+        "failed detached card removed",
+        |frame| {
+            frame.kind == FrameKind::AgentClosed
+                && frame
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| closed.agent_id == failed.agent_id)
+        },
+    )
+    .await;
+    host.await_agent_close_settlement_for_test(&failed.agent_id)
+        .await
+        .expect("terminal checkpoint uses the detached project metadata");
+    fixture.restart_host().await;
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(
         bootstrap.projects.is_empty(),

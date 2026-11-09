@@ -875,6 +875,142 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         usage.total.usage.total_tokens, parent_usage,
         "closing one card cannot certify shared historical attribution"
     );
+    let mut additional = Vec::new();
+    for name in ["shared concurrent close one", "shared concurrent close two"] {
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some(name.to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: Some(parent.new_agent.agent_id.clone()),
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .expect("open another shared-session card");
+        let card = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "additional shared card",
+            |frame| frame.kind == FrameKind::NewAgent,
+        )
+        .await;
+        let card: NewAgentPayload = card.parse_payload().expect("shared card descriptor");
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &card.instance_stream,
+            "additional shared card ready",
+        )
+        .await;
+        additional.push(card);
+    }
+    let (mut concurrent, concurrent_bootstrap) = fixture.connect_with_bootstrap().await;
+    let concurrent_stream = concurrent_bootstrap
+        .agents
+        .iter()
+        .find(|owner| owner.agent_id == additional[1].agent_id)
+        .expect("concurrent connection advertises shared owner")
+        .instance_stream
+        .clone();
+    fixture::next_frame_matching_on(
+        &mut concurrent,
+        "concurrent shared owner attached",
+        |frame| frame.kind == FrameKind::AgentBootstrap && frame.stream == concurrent_stream,
+    )
+    .await;
+    let gate = fixture
+        .host_for_test()
+        .install_restore_marker_withdraw_test_gate()
+        .await;
+    fixture
+        .client
+        .close_agent(&additional[0].instance_stream)
+        .await
+        .expect("first concurrent shared close");
+    gate.wait_until_entered().await;
+    concurrent
+        .close_agent(&concurrent_stream)
+        .await
+        .expect("second concurrent shared close");
+    gate.wait_until_entered().await;
+    gate.release_one();
+    gate.release_one();
+    let mut removed = std::collections::HashSet::new();
+    while removed.len() < 2 {
+        let frame = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "concurrent shared close removal",
+            |frame| frame.kind == FrameKind::AgentClosed,
+        )
+        .await;
+        let closed: protocol::AgentClosedPayload =
+            frame.parse_payload().expect("closed shared card");
+        if additional
+            .iter()
+            .any(|card| card.agent_id == closed.agent_id)
+        {
+            removed.insert(closed.agent_id);
+        }
+    }
+    drop(gate);
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("shared active close".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent.new_agent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("open the active shared-session card");
+    let active =
+        fixture::next_frame_matching_on(&mut fixture.client, "active shared card", |frame| {
+            frame.kind == FrameKind::NewAgent
+        })
+        .await;
+    let active: NewAgentPayload = active.parse_payload().expect("active shared descriptor");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &active.instance_stream,
+        "active shared card ready",
+    )
+    .await;
+    let closing_turn = server::backend::mock::MockGateHandle::new();
+    fixture
+        .mock_by_id(&active.agent_id)
+        .await
+        .enqueue(MockTurn::text_after_gate(
+            "closed shared turn",
+            &closing_turn,
+        ))
+        .await;
+    fixture
+        .client
+        .send_message(&active.instance_stream, "close this shared turn".to_owned())
+        .await
+        .expect("start shared card turn");
+    closing_turn.wait_until_entered().await;
+    fixture
+        .client
+        .close_agent(&active.instance_stream)
+        .await
+        .expect("close active shared card");
+    fixture::next_frame_matching_on(&mut fixture.client, "active shared card removal", |frame| {
+        frame.kind == FrameKind::AgentClosed
+            && frame
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|closed| closed.agent_id == active.agent_id)
+    })
+    .await;
+    closing_turn.release_one();
     let task_usage_snapshot = fixture.task_usage_snapshot().await;
     let parent_session = task_usage_snapshot
         .iter()
@@ -882,7 +1018,7 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
         .and_then(|usage| usage.root_session_id.clone())
         .expect("parent session");
     let bootstrap = fixture.restart_host().await;
-    let (restored_by_session, _) = collect_restart_replay(
+    let (restored_by_session, restored_bootstraps) = collect_restart_replay(
         &mut fixture,
         &bootstrap,
         &[session.clone(), parent_session.clone()],
@@ -890,6 +1026,19 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
     .await;
     restored_by_session.get(&session).expect(
         "the card still open must be restored; closing its sibling must not withdraw the session",
+    );
+    let survivor = &restored_bootstraps[&restored_by_session[&session].instance_stream];
+    assert_eq!(
+        survivor.activity,
+        protocol::AgentActivity::Idle,
+        "closing a shared card cannot continue its turn on the idle survivor"
+    );
+    assert!(
+        !survivor.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::RestartRecovery { .. })
+        )),
+        "the idle survivor has no interrupted work to continue"
     );
     let restored_parent = &restored_by_session[&parent_session];
     let task_usage_snapshot = fixture.task_usage_snapshot().await;
@@ -952,6 +1101,263 @@ async fn closing_one_card_does_not_strand_another_on_the_same_session() {
             reason: protocol::TaskTokenUsageUnavailableReason::SharedSessionAccounting
         }
     ));
+    let survivor = restored_by_session[&session].clone();
+    let held = server::backend::mock::MockGateHandle::new();
+    fixture
+        .mock_by_id(&survivor.agent_id)
+        .await
+        .enqueue(MockTurn::text_after_gate("held shared work", &held))
+        .await;
+    fixture
+        .client
+        .send_message(&survivor.instance_stream, "hold shared work".to_owned())
+        .await
+        .expect("start survivor work");
+    held.wait_until_entered().await;
+    fixture
+        .client
+        .send_message(&survivor.instance_stream, "queued shared work".to_owned())
+        .await
+        .expect("queue survivor work");
+    fixture::next_frame_matching_on(&mut fixture.client, "shared work durable queue", |frame| {
+        frame.kind == FrameKind::QueuedMessages
+            && frame.stream == survivor.instance_stream
+            && frame
+                .parse_payload::<protocol::QueuedMessagesPayload>()
+                .is_ok_and(|queue| !queue.messages.is_empty())
+    })
+    .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("idle beside shared custody".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("open idle card beside accepted work");
+    let idle =
+        fixture::next_frame_matching_on(&mut fixture.client, "idle shared descriptor", |frame| {
+            frame.kind == FrameKind::NewAgent
+        })
+        .await;
+    let idle: NewAgentPayload = idle.parse_payload().expect("idle shared descriptor");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &idle.instance_stream,
+        "idle shared startup",
+    )
+    .await;
+    let bootstrap = fixture.restart_host().await;
+    held.release_one();
+    let mut owners = bootstrap
+        .agents
+        .into_iter()
+        .filter(|agent| agent.agent_id == survivor.agent_id || agent.agent_id == idle.agent_id)
+        .map(|agent| (agent.agent_id.clone(), agent))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut bootstraps = std::collections::HashMap::new();
+    let mut completed = Vec::new();
+    while owners.len() != 2
+        || owners
+            .values()
+            .any(|owner| !bootstraps.contains_key(&owner.instance_stream))
+    {
+        let frame = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "restored shared custody",
+            |frame| {
+                matches!(
+                    frame.kind,
+                    FrameKind::NewAgent | FrameKind::AgentBootstrap | FrameKind::ChatEvent
+                )
+            },
+        )
+        .await;
+        match frame.kind {
+            FrameKind::NewAgent => {
+                let owner: NewAgentPayload =
+                    frame.parse_payload().expect("restored custody descriptor");
+                if owner.agent_id == survivor.agent_id || owner.agent_id == idle.agent_id {
+                    owners.insert(owner.agent_id.clone(), owner);
+                }
+            }
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload =
+                    frame.parse_payload().expect("restored custody bootstrap");
+                for event in &bootstrap.events {
+                    if let protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) =
+                        event
+                    {
+                        completed.push((frame.stream.clone(), end.message.content.clone()));
+                    }
+                }
+                bootstraps.insert(frame.stream, bootstrap);
+            }
+            FrameKind::ChatEvent => {
+                if let ChatEvent::StreamEnd(end) =
+                    frame.parse_payload().expect("restored shared response")
+                {
+                    completed.push((frame.stream, end.message.content));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        bootstraps[&owners[&idle.agent_id].instance_stream].activity,
+        protocol::AgentActivity::Idle,
+        "the idle sibling must not inherit another card's recovery"
+    );
+    let stream = &owners[&survivor.agent_id].instance_stream;
+    if !completed.iter().any(|(response_stream, content)| {
+        response_stream == stream
+            && content.contains("mock backend response to: queued shared work")
+    }) {
+        fixture::next_frame_matching_on(&mut fixture.client, "queued custody completes after restart", |frame| frame.stream == *stream && frame.kind == FrameKind::ChatEvent && frame.parse_payload::<ChatEvent>().is_ok_and(|event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content.contains("mock backend response to: queued shared work")))).await;
+    }
+    let child_gate = server::backend::mock::MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "required idle parent child",
+            MockScript::one(MockTurn::text_after_gate(
+                "child before restart",
+                &child_gate,
+            )),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("required idle parent child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(survivor.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/required-parent-child".to_owned()],
+                prompt: "child before restart".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn active child of the idle shared owner");
+    let child: NewAgentPayload = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "required child descriptor",
+        |frame| frame.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload()
+    .expect("child descriptor");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "required child startup",
+    )
+    .await;
+    child_gate.wait_until_entered().await;
+    drop(reservation);
+    let mut child_stream = child.instance_stream.clone();
+    for all_idle in [false, true] {
+        if all_idle {
+            let bootstrap: AgentBootstrapPayload = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "restored child bootstrap before all-idle restart",
+                |frame| frame.kind == FrameKind::AgentBootstrap && frame.stream == child_stream,
+            )
+            .await
+            .parse_payload()
+            .expect("restored child bootstrap");
+            if bootstrap.activity != protocol::AgentActivity::Idle {
+                fixture::next_logical_frame_matching_on(
+                    &mut fixture.client,
+                    "restored child settles before all-idle restart",
+                    |frame| {
+                        frame.stream == child_stream
+                            && frame.kind == FrameKind::ChatEvent
+                            && frame.parse_payload::<ChatEvent>().is_ok_and(|event| {
+                                matches!(event, ChatEvent::TypingStatusChanged(false))
+                            })
+                    },
+                )
+                .await;
+            }
+        }
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("selected idle shared owner".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .expect("select another idle session owner");
+        let selected: NewAgentPayload = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "selected idle descriptor",
+            |frame| frame.kind == FrameKind::NewAgent,
+        )
+        .await
+        .parse_payload()
+        .expect("selected descriptor");
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &selected.instance_stream,
+            "selected idle ready",
+        )
+        .await;
+        let bootstrap = fixture.restart_host().await;
+        if !all_idle {
+            child_gate.release_one();
+        }
+        let expected = [&survivor.agent_id, &child.agent_id, &selected.agent_id];
+        let mut restored = bootstrap
+            .agents
+            .into_iter()
+            .filter(|owner| expected.contains(&&owner.agent_id))
+            .map(|owner| (owner.agent_id.clone(), owner))
+            .collect::<std::collections::HashMap<_, _>>();
+        while restored.len() != expected.len() {
+            let frame = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "required ancestor restoration",
+                |frame| frame.kind == FrameKind::NewAgent,
+            )
+            .await;
+            let owner: NewAgentPayload =
+                frame.parse_payload().expect("restored ancestor descriptor");
+            if expected.contains(&&owner.agent_id) {
+                restored.insert(owner.agent_id.clone(), owner);
+            }
+        }
+        assert!(
+            restored[&child.agent_id].parent_agent_id.as_ref() == Some(&survivor.agent_id),
+            "every open child must retain its exact idle parent, not the selected sibling"
+        );
+        assert!(
+            restored.contains_key(&selected.agent_id),
+            "selected idle sibling remains independently restorable"
+        );
+        child_stream = restored[&child.agent_id].instance_stream.clone();
+    }
 }
 
 /// A close decides which of its sessions no other card owns, then writes that
@@ -1020,6 +1426,57 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
     // close would not even be dispatched until the close it is racing had
     // finished. Two clients on one host is the ordinary case this race comes
     // from.
+    let binding_failure =
+        server::store::session::commit_hooks::InstalledHook::install_recovery_binding(
+            SessionStore::database_path(&fixture.session_store_path()),
+            session.clone(),
+            Box::new(|| Err("injected durable recovery binding failure".to_owned())),
+        );
+    let mut failed_client = fixture.connect().await;
+    failed_client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("failed recovery binding".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("request resume with a failed durable binding");
+    let failed =
+        fixture::next_frame_matching_on(&mut failed_client, "failed binding descriptor", |frame| {
+            frame.kind == FrameKind::NewAgent
+        })
+        .await;
+    let failed: NewAgentPayload = failed.parse_payload().expect("failed binding descriptor");
+    let failed_bootstrap = expect_raw_event_on_stream(
+        &mut failed_client,
+        &failed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "failed binding bootstrap",
+    )
+    .await;
+    let failed_bootstrap: AgentBootstrapPayload = failed_bootstrap
+        .parse_payload()
+        .expect("failed binding bootstrap payload");
+    assert_eq!(
+        failed_bootstrap.status,
+        protocol::AgentControlStatus::Failed
+    );
+    assert!(failed_bootstrap.events.iter().any(|event| matches!(event, protocol::AgentBootstrapEvent::AgentError(error) if error.fatal && error.code == protocol::AgentErrorCode::Internal && error.message.contains("Cannot bind durable agent recovery"))), "a required binding failure must remain a fatal startup error");
+    drop(binding_failure);
+    failed_client
+        .close_agent(&failed.instance_stream)
+        .await
+        .expect("dismiss failed durable startup");
+    fixture::next_frame_matching_on(&mut failed_client, "failed binding closes", |frame| {
+        frame.kind == FrameKind::AgentClosed
+    })
+    .await;
     drop(reservation);
     let mut resumer = fixture.connect().await;
 

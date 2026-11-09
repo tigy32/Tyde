@@ -6397,12 +6397,11 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
             && before_teardown_describe.swarm == history
     );
     let (mut retry_client, _) = scenario.fixture.connect_with_bootstrap().await;
-    let occupied_before_teardown = scenario.fixture.agent_ids().await;
     finish_gate.release_one();
     scenario
         .wait_mock_turn(
             &retirement_teardown_gate,
-            "actual retirement native teardown held before registry removal",
+            "actual retirement native teardown held after authoritative removal",
         )
         .await;
     // The authenticated survivor observes the canonical retiring state while
@@ -6411,6 +6410,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         tool_value(&(call_tool(&retained_caller, "tyde_swarm_describe", json!({}))).await);
     assert!(teardown_describe.member_id == retained.spec.id);
     let teardown_state = teardown_describe.swarm;
+    let (_, teardown_bootstrap) = scenario.fixture.connect_with_bootstrap().await;
     assert_eq!(teardown_state.lifecycle, SwarmLifecycle::Transitioning);
     assert!(
         teardown_state
@@ -6421,7 +6421,7 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
                 && member.runtime_status == Some(AgentControlStatus::Idle)
                 && member.agent_id == retiring.agent_id
                 && member.session_id == retiring.session_id),
-        "entered native shutdown is still an occupied Retiring binding until actual host registry teardown"
+        "entered native shutdown keeps the Retiring binding until owned teardown settles"
     );
     assert!(
         teardown_state
@@ -6431,12 +6431,25 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
                 && member.state == SwarmMemberState::Proposed
                 && member.agent_id.is_none()
                 && member.session_id.is_none())
-            && scenario.fixture.agent_ids().await == occupied_before_teardown,
-        "the reviewed replacement must remain unbound while native retirement teardown is held"
+            && teardown_bootstrap.agents.len() == 1
+            && teardown_bootstrap.agents[0].agent_id
+                == *retained.agent_id.as_ref().expect("surviving member agent"),
+        "only the survivor remains visible while the retiring binding still occupies native capacity"
     );
+    fixture::next_frame_matching_on(
+        &mut retry_client,
+        "retiring agent removed while native shutdown is held",
+        |frame| {
+            frame.kind == FrameKind::AgentClosed
+                && frame
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|closed| Some(closed.agent_id) == retiring.agent_id)
+        },
+    )
+    .await;
     // Retry cleanup used to classify a closing handle as terminated and call
     // registry.status directly, publishing Retired before returning Conflict.
-    // Both entry points must reject without bypassing actual registry removal.
+    // Both entry points must reject without bypassing owned native teardown.
     for (phase, command) in [
         (
             "RetryMember during held retirement teardown",
@@ -6491,10 +6504,13 @@ async fn reviewed_capacity_changes_count_retiring_slots_and_never_redirect_retir
         assert!(
             after_retry_describe.member_id == retained.spec.id
                 && after_retry_describe.swarm == teardown_state,
-            "rejected retry must preserve the exact Retiring binding, session, pending replacement, causal rounds and delivery dispositions until actual registry removal"
+            "rejected retry must preserve the exact Retiring binding, session, pending replacement, causal rounds and delivery dispositions until owned native teardown settles"
         );
+        let (_, retry_bootstrap) = scenario.fixture.connect_with_bootstrap().await;
         assert!(
-            scenario.fixture.agent_ids().await == occupied_before_teardown,
+            retry_bootstrap.agents.len() == 1
+                && retry_bootstrap.agents[0].agent_id
+                    == *retained.agent_id.as_ref().expect("surviving member agent"),
             "rejected retry cannot release the occupied retirement slot or admit the reviewed replacement before teardown completes"
         );
         assert_eq!(request_count(&retiring_control.requests().await), 2);
