@@ -1403,6 +1403,7 @@ fn folder_toggle(
     label: String,
     display_label: String,
     folder_count: FolderCount,
+    open_project: Option<Callback<()>>,
 ) -> impl IntoView {
     let count = folder_count.rows();
     let toggle_key = key.clone();
@@ -1414,12 +1415,16 @@ fn folder_toggle(
         )
     });
     let described_by = count_id.clone();
+    let split = open_project.is_some();
+    let name = display_label.clone();
     view! {
+        <div class="agent-folder-heading">
         <button
             type="button"
             class="agent-folder-toggle"
-            aria-label=label.clone()
-            aria-describedby=described_by
+            class:agent-project-disclosure=split
+            aria-label=if split { format!("Toggle {label}") } else { label.clone() }
+            aria-describedby=described_by.clone()
             title=label.clone()
             aria-expanded=move || expanded.get().to_string()
             on:keydown=move |ev: web_sys::KeyboardEvent| ev.stop_propagation()
@@ -1439,12 +1444,21 @@ fn folder_toggle(
             }
         >
             {disclosure_chevron(move || expanded.get())}
-            <span class="agent-folder-label">{display_label}</span>
-            {(count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{format!("({count})")}</span> })}
+            {(!split).then(|| view! { <span class="agent-folder-label">{display_label}</span> })}
+            {(!split && count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{format!("({count})")}</span> })}
             {count_id.map(|id| view! {
                 <span id=id hidden>{folder_count.spoken()}</span>
             })}
         </button>
+        {open_project.map(|open| view! {
+            <button type="button" class="agent-project-open" title=label.clone() aria-label=label aria-describedby=described_by
+                on:keydown=move |ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); open.run(()); }>
+                <span class="agent-folder-label">{name}</span>
+                {(count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{format!("({count})")}</span> })}
+            </button>
+        })}
+        </div>
     }
 }
 
@@ -2364,7 +2378,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 view! {
                                                                     {
                                                                         let (group_name, member_count) = header.get();
-                                                                        folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name, member_count)
+                                                                        folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name, member_count, None)
                                                                     }
                                                                 }.into_any()
                                                             }
@@ -2408,6 +2422,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                 let editor = state.project_editor;
                                 let header_key = folder_key.clone();
                                 let no_project_host = no_project_host.clone();
+                                let page_state = state.clone();
                                 view! {
                                     <section class="agent-sidebar-project-section" data-project-key=project_key>
                                         <div class="agent-sidebar-project-header">
@@ -2416,7 +2431,10 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 let heading = if target.is_some() { format!("Project: {label}") } else { label.clone() };
                                                 let edit_name = format!("Edit project {label}");
                                                 view! {
-                                                    {folder_toggle(collapsed_folders, header_key.clone(), heading, label.clone(), member_count)}
+                                                    {folder_toggle(collapsed_folders, header_key.clone(), heading, label.clone(), member_count, target.clone().map(|target| {
+                                                        let state = page_state.clone();
+                                                        Callback::new(move |()| crate::components::project_page::open_project_page(&state, target.clone()))
+                                                    }))}
                                                     {match target {
                                                         Some(target) => view! {
                                                             <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
@@ -2630,7 +2648,7 @@ fn project_members(
                             let edit_label = format!("Edit project {label}");
                             let target = target.clone();
                             view! {
-                                {folder_toggle(collapsed, header_key.clone(), format!("Workbench: {label}"), label.clone(), count)}
+                                {folder_toggle(collapsed, header_key.clone(), format!("Workbench: {label}"), label.clone(), count, None)}
                                 <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
                                     on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
                                 <ProjectNewAgent destination=LaunchDestination::Project(target) name=format!("New agent in {label}") launch=launch />
@@ -6186,7 +6204,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(workbench_checkbox.checked());
         container
-            .query_selector("[aria-label='Project: Beta Project']")
+            .query_selector("[aria-label='Toggle Project: Beta Project']")
             .unwrap()
             .unwrap()
             .dyn_into::<HtmlElement>()
@@ -9466,13 +9484,13 @@ mod wasm_tests {
                 .contains("Parent Alpha Agent")
         );
         assert!(container.text_content().unwrap().contains("Beta Agent"));
-        toggle("Project: Alpha Project").click();
+        toggle("Toggle Project: Alpha Project").click();
         toggle("Review Group").click();
         for _ in 0..4 {
             next_tick().await;
         }
         assert_eq!(
-            toggle("Project: Alpha Project")
+            toggle("Toggle Project: Alpha Project")
                 .get_attribute("aria-expanded")
                 .as_deref(),
             Some("false")
@@ -9502,7 +9520,7 @@ mod wasm_tests {
             next_tick().await;
         }
         assert_eq!(
-            toggle("Project: Alpha Project")
+            toggle("Toggle Project: Alpha Project")
                 .get_attribute("aria-expanded")
                 .as_deref(),
             Some("false")
@@ -9514,7 +9532,7 @@ mod wasm_tests {
                 .contains("Parent Alpha Agent")
         );
         assert!(
-            toggle("Project: Alpha Project")
+            toggle("Toggle Project: Alpha Project")
                 .get_bounding_client_rect()
                 .height()
                 > 0.0,
@@ -9540,7 +9558,7 @@ mod wasm_tests {
             next_tick().await;
         }
         assert_eq!(
-            toggle("Project: Alpha Project")
+            toggle("Toggle Project: Alpha Project")
                 .get_attribute("aria-expanded")
                 .as_deref(),
             Some("false")
@@ -9552,7 +9570,7 @@ mod wasm_tests {
             Some("false")
         );
         assert!(!container.text_content().unwrap().contains("Beta Agent"));
-        toggle("Project: Alpha Project").click();
+        toggle("Toggle Project: Alpha Project").click();
         toggle("Renamed Review").click();
         for _ in 0..4 {
             next_tick().await;
@@ -12932,6 +12950,180 @@ mod wasm_tests {
     }
 
     /// Clicking an agent that belongs to a different project than the active one
+    /// switches the active project to the agent's project FIRST, then opens its
+    /// chat tab — so the tab lands in the agent's project center zone instead of
+    /// the previously-active project's.
+    #[wasm_bindgen_test]
+    async fn project_header_navigates_separately_from_folder_disclosures() {
+        use crate::components::center_zone::CenterZone;
+        use crate::sidebar_layout::SidebarTab;
+
+        install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let host = "agents-header-project-page";
+        let state = make_app_state(host);
+        state
+            .configured_hosts
+            .set(vec![configured_host(host, "Header Host")]);
+        let mut workbench = project_info(host, "header-workbench", "Header workbench", 1);
+        workbench.project.source = ProjectSource::GitWorkbench {
+            environment: Default::default(),
+            parent_project_id: ProjectId("header-project".into()),
+            branch: protocol::GitBranchName("fix/header-navigation".into()),
+            roots: vec![protocol::WorkbenchRoot {
+                parent_root: ProjectRootPath("/tmp/header-project".into()),
+                worktree_root: ProjectRootPath("/tmp/header-workbench".into()),
+            }],
+        };
+        state.projects.set(vec![
+            project_info(host, "header-project", "Header project", 0),
+            workbench,
+        ]);
+        for (id, name, project) in [
+            ("header-member", "Project conversation", "header-project"),
+            (
+                "header-worker",
+                "Workbench conversation",
+                "header-workbench",
+            ),
+        ] {
+            push_agent_with_scope(&state, host, id, name, true, Some(project), None);
+        }
+        state.apply_agents_view_snapshot(
+            "local",
+            sidebar_snapshot(AgentsSidebarPreferences {
+                show_workbenches: true,
+                project_visibility: AgentsSidebarProjectVisibility::AllProjects,
+                ..Default::default()
+            }),
+        );
+        state.activate_sidebar_tab(SidebarTab::Agents);
+        let sidebar_before = state.sidebar_layout.get_untracked();
+        CenterWorkspaceWidth::forget_measurement();
+        let mounted = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <AgentsPanel />
+                <CenterZone />
+            }
+        });
+        next_tick().await;
+        let click = |selector: &str| {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+        };
+        let has_page = || {
+            container
+                .query_selector("[role='tab'][aria-label='Header project']")
+                .unwrap()
+                .is_some()
+        };
+        let has_member = |id: &str| {
+            container
+                .query_selector(&format!(".agents-panel [data-agent-id='{id}']"))
+                .unwrap()
+                .is_some()
+        };
+
+        click("button[aria-label='Project: Header project']");
+        next_tick().await;
+        assert!(has_page(), "The project name opens its page tab");
+        let branch = container
+            .query_selector(".pp-branch-primary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            branch.text_content().as_deref(),
+            Some("fix/header-navigation")
+        );
+        let window = web_sys::window().unwrap();
+        let font = |element: &web_sys::Element| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("font-family")
+                .unwrap()
+        };
+        assert_eq!(
+            font(&branch),
+            font(&container.query_selector(".pp-page").unwrap().unwrap()),
+            "Workbench branch names use the surrounding UI font"
+        );
+        let root_name = container
+            .query_selector(".pp-row-main:not(.pp-branch-primary)")
+            .unwrap()
+            .unwrap();
+        for property in ["font-size", "line-height"] {
+            let value = |element: &web_sys::Element| {
+                window
+                    .get_computed_style(element)
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value(property)
+                    .unwrap()
+            };
+            assert_eq!(
+                value(&branch),
+                value(&root_name),
+                "Workbench branch names match neighboring root names"
+            );
+        }
+        assert!(
+            has_member("header-member"),
+            "Navigation leaves project members visible"
+        );
+        assert!(
+            has_member("header-worker"),
+            "Navigation leaves workbench members visible"
+        );
+        assert_eq!(
+            state.sidebar_layout.get_untracked(),
+            sidebar_before,
+            "Project navigation preserves the visible Agents sidebar"
+        );
+        let page = state
+            .center_zone
+            .with_untracked(|center| center.active_tab_id())
+            .unwrap();
+        state.close_tab(page);
+        next_tick().await;
+        assert!(!has_page());
+        click("button[aria-label='Toggle Project: Header project']");
+        next_tick().await;
+        assert!(
+            !has_member("header-member"),
+            "The project chevron hides members"
+        );
+        assert!(!has_member("header-worker"));
+        assert!(!has_page(), "The project chevron never opens a page");
+        click("button[aria-label='Toggle Project: Header project']");
+        next_tick().await;
+        assert!(has_member("header-worker"));
+        click("button[aria-label='Workbench: Header workbench']");
+        next_tick().await;
+        assert!(has_member("header-member"));
+        assert!(
+            !has_member("header-worker"),
+            "Workbench names remain accordions"
+        );
+        assert!(!has_page());
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Header workbench']")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Regression: clicking an agent whose project differs from the active project
     /// switches the active project to the agent's project FIRST, then opens its
     /// chat tab — so the tab lands in the agent's project center zone instead of
     /// the previously-active project's.
