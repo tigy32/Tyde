@@ -2217,6 +2217,12 @@ fn claude_token_usage(value: Value) -> Option<TokenUsage> {
         .ok()
 }
 
+fn claude_declared_tool_name(name: &str) -> &str {
+    name.strip_prefix("mcp__")
+        .and_then(|qualified| qualified.split_once("__"))
+        .map_or(name, |(_server, tool)| tool)
+}
+
 fn claude_tool_use_data(value: Value, default_content_offset: u32) -> Option<ToolUseData> {
     let tool_call_id = value
         .get("tool_call_id")
@@ -2227,13 +2233,13 @@ fn claude_tool_use_data(value: Value, default_content_offset: u32) -> Option<Too
     if tool_call_id.is_empty() {
         return None;
     }
-    let name = value.get("name").and_then(Value::as_str)?.trim().to_owned();
+    let name = value.get("name").and_then(Value::as_str)?.trim();
     if name.is_empty() {
         return None;
     }
     Some(ToolUseData {
         tool_call_id,
-        name,
+        name: claude_declared_tool_name(name).to_owned(),
         arguments: value.get("arguments").cloned().unwrap_or(Value::Null),
         content_offset: value
             .get("content_offset")
@@ -9321,7 +9327,7 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
     stream.message_id = sa_message_id;
     for tool in &stream.summary.tool_calls {
         stream.seen_tool_call_ids.insert(tool.id.clone());
-        stream.last_tool_name = Some(tool.name.clone());
+        stream.last_tool_name = Some(claude_declared_tool_name(&tool.name).to_owned());
     }
     maybe_emit_subagent_progress(stream);
     flush_subagent_progress(stream);
@@ -12013,7 +12019,7 @@ fn declare_open_response_tool_calls(
         .iter()
         .map(|tool_call| ToolUseData {
             tool_call_id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
+            name: claude_declared_tool_name(&tool_call.name).to_owned(),
             arguments: tool_call.arguments.clone(),
             content_offset: Some(content_offset),
         })

@@ -2563,7 +2563,7 @@ async fn claude_review_configuration<B: Backend>(host: &mut Harness<B>) {
                 .iter()
                 .find(|completion| completion.tool_call_id == request.tool_call_id)
                 .expect("terminal outcome for this attempt");
-            if name == "mcp__tyde-review-feedback__propose_review_comment" {
+            if name == "propose_review_comment" {
                 feedback_calls += 1;
                 assert!(
                     matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
