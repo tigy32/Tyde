@@ -266,17 +266,22 @@ keep one compact chat-local header, with latency at its action edge rather than
 inside its title. There is no second native horizontal action row.
 The client keeps the compact chat-local title and full-height untitled Agents
 hierarchy, but transfers Back, sidebar, menu and healthy latency to UIKit.
-`NativeChatDock` uses the navigation item's system Back action, leading groups
-and system overflow, not a bottom toolbar or manually positioned rail. UIKit
-places those controls below system status and above tabs on Duo's vertical
-axis and manages safe areas and overflow as the device resizes. The compact
-custom latency item explicitly permits vertical placement with `axisBehavior`.
+`NativeChatDock` uses the navigation item's leading groups and system overflow,
+not a bottom toolbar or manually positioned rail. UIKit places those controls
+below system status and above tabs on Duo's vertical axis and manages safe
+areas and overflow as the device resizes. The order is latency, Back, sidebar,
+then overflow, so the status dot reads as part of system status. UIKit always
+places the system Back item first, so the dock hides it and owns one Back
+leading item that sends the same typed intent. The compact custom latency item
+explicitly permits vertical placement with `axisBehavior`; a reserved slot
+holds its position while the host is disconnected, so Back never moves.
 It is a status readout, not a control, so it hides the shared glass background
 and stacks its status dot above the value inside the 40pt slot. The shared
 `NativeLatencyText` keeps the value to at most three digits plus a unit, also
 for the root header; the accessible description retains exact milliseconds.
-While a modal is open, the shared dock omits Back, leading groups and overflow;
-disabling the legacy navigation bar cannot exclude the separate shared bar.
+While a modal is open, the shared dock omits Back, sidebar and overflow and
+keeps latency in place; disabling the legacy navigation bar cannot exclude the
+separate shared bar.
 Closing the modal restores those controls from the same typed presentation.
 
 The additive optional `chat_dock_owner`, `chat_connected_status` and

@@ -78,27 +78,18 @@ final class NativeConnectionDockView: UILabel {
         attributedText = display
         isHidden = false
     }
+
+    /// Holds the readout's row, empty, using the same metrics as a live readout.
+    func reserveSlot() {
+        render(nil)
+        isHidden = false
+        isAccessibilityElement = false
+    }
 }
 
 @available(iOS 27.1, *)
 @MainActor
 enum NativeChatDock {
-    private static func reservedActionSlot() -> UIBarButtonItemGroup {
-        let space = UIView(frame: CGRect(x: 0, y: 0, width: 40, height: 40))
-        space.isUserInteractionEnabled = false
-        space.accessibilityElementsHidden = true
-        space.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            space.widthAnchor.constraint(equalToConstant: 40),
-            space.heightAnchor.constraint(equalToConstant: 40)
-        ])
-        let item = UIBarButtonItem(customView: space)
-        item.isEnabled = false
-        item.axisBehavior = .verticalPreferred
-        item.hidesSharedBackground = true
-        return UIBarButtonItemGroup(barButtonItems: [item], representativeItem: nil)
-    }
-
     static func owner(for traits: UITraitCollection) -> NativeChatDockOwner {
         traits.verticalBarEdge == .unspecified ? .client : .shell
     }
@@ -121,18 +112,32 @@ enum NativeChatDock {
         content.navigationItem.leftBarButtonItems = []
         content.navigationItem.rightBarButtonItems = []
         content.navigationItem.trailingItemGroups = []
-        content.navigationItem.hidesBackButton = modal
-        content.navigationItem.leftItemsSupplementBackButton = !modal
-        // Duo's shared bar is outside navigationBar's interaction/accessibility exclusion.
-        content.navigationItem.backAction = modal ? nil : UIAction(title: dock.back_label,
-            image: UIImage(systemName: "chevron.backward")) { _ in send(.back) }
+        // UIKit always places the system Back first, so the dock owns Back to lead with health.
+        content.navigationItem.hidesBackButton = true
+        content.navigationItem.leftItemsSupplementBackButton = false
+        content.navigationItem.backAction = nil
         var groups: [UIBarButtonItemGroup] = []
-        // Removing a preceding action would move health into its row in Duo's shared bar.
-        if modal { groups.append(reservedActionSlot()) }
-        if dock.sidebar_available {
-            if modal {
-                groups.append(reservedActionSlot())
-            } else {
+        let health = NativeConnectionDockView(frame: .zero)
+        if let status = dock.connection_status {
+            health.render(status)
+            content.connectedStatusView = health
+        } else {
+            // Without health, Back would rise into its row in Duo's shared bar.
+            health.reserveSlot()
+        }
+        // Leave the item enabled: disabling it greys the label, including its status dot.
+        let healthItem = UIBarButtonItem(customView: health)
+        healthItem.axisBehavior = .verticalPreferred
+        healthItem.hidesSharedBackground = true
+        groups.append(UIBarButtonItemGroup(barButtonItems: [healthItem], representativeItem: nil))
+        if !modal {
+            let back = UIBarButtonItem(title: dock.back_label, image: UIImage(systemName: "chevron.backward"),
+                primaryAction: UIAction(title: dock.back_label) { _ in send(.back) })
+            back.accessibilityLabel = dock.back_label
+            // Back keeps its own glass; adjacent leading items would otherwise merge into one capsule.
+            back.sharesBackground = false
+            groups.append(UIBarButtonItemGroup(barButtonItems: [back], representativeItem: nil))
+            if dock.sidebar_available {
                 let title = dock.sidebar_open ? "Hide Agents" : "Show Agents"
                 let sidebar = UIBarButtonItem(title: title, image: UIImage(systemName: "sidebar.left"),
                     primaryAction: UIAction(title: title) { _ in send(.toggle_sidebar) })
@@ -140,16 +145,6 @@ enum NativeChatDock {
                 sidebar.accessibilityIdentifier = "native-toggle-agents"
                 groups.append(UIBarButtonItemGroup(barButtonItems: [sidebar], representativeItem: nil))
             }
-        }
-        if let status = dock.connection_status {
-            let health = NativeConnectionDockView(frame: .zero)
-            health.render(status)
-            // Leave the item enabled: disabling it greys the label, including its status dot.
-            let item = UIBarButtonItem(customView: health)
-            item.axisBehavior = .verticalPreferred
-            item.hidesSharedBackground = true
-            groups.append(UIBarButtonItemGroup(barButtonItems: [item], representativeItem: nil))
-            content.connectedStatusView = health
         }
         // Leading navigation groups enter Duo's shared bar below status and above tabs.
         // A bottom toolbar would put these controls beside the tab group instead.
