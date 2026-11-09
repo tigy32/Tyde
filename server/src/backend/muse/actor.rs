@@ -1233,7 +1233,7 @@ impl Actor {
                     };
                     declarations.push(ToolUseData {
                         tool_call_id: call.call_id.clone(),
-                        name: call.name.clone(),
+                        name: tools::declared_name(&call.name).to_owned(),
                         arguments: args.clone(),
                         content_offset: None,
                     });
@@ -1649,17 +1649,13 @@ impl Actor {
                             .tool_calls
                             .checked_add(1)
                             .ok_or("Muse native child tool count exceeded its domain")?;
-                        child.last_tool_name = Some(
-                            child
-                                .actor
-                                .tools
-                                .get(&request.tool_call_id)
-                                .ok_or(
-                                    "Muse native child tool card omitted its provider declaration",
-                                )?
-                                .name
-                                .clone(),
-                        );
+                        let name = &child
+                            .actor
+                            .tools
+                            .get(&request.tool_call_id)
+                            .ok_or("Muse native child tool card omitted its provider declaration")?
+                            .name;
+                        child.last_tool_name = Some(tools::declared_name(name).to_owned());
                     }
                     changed = true;
                 }

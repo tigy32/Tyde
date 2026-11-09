@@ -163,6 +163,12 @@ pub(super) fn mcp_selector_reference(name: &str) -> bool {
         .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
 }
 
+pub(super) fn declared_name(name: &str) -> &str {
+    name.strip_prefix("mcp__")
+        .and_then(|qualified| qualified.split_once("__"))
+        .map_or(name, |(_server, tool)| tool)
+}
+
 pub(super) fn question_only_policy(policy: &protocol::ToolPolicy) -> bool {
     match policy {
         protocol::ToolPolicy::Unrestricted => true,
