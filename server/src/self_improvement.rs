@@ -805,8 +805,11 @@ impl ConfigActor {
                 SteeringScope::Host => None,
                 SteeringScope::Project(id) => Some(id),
             };
-            let guidance =
-                crate::agent::customization::resolve_steering_body(&self.steering, project_id)?;
+            let guidance = crate::agent::customization::resolve_steering_body(
+                &self.steering,
+                project_id,
+                None,
+            )?;
             let prompt = learning_analysis_prompt(
                 &scope,
                 &batch.inputs,

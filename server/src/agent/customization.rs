@@ -146,6 +146,7 @@ pub(crate) struct ResolveSpawnConfigRequest<'a> {
     pub built_in_mcp_servers: &'a [StartupMcpServer],
     pub custom_agent_store: &'a CustomAgentStore,
     pub mcp_server_store: &'a McpServerStore,
+    pub board_sections: &'a Result<HashMap<ProjectId, String>, String>,
     pub steering_store: &'a SteeringStore,
     pub skill_store: &'a SkillStore,
 }
@@ -163,7 +164,11 @@ pub(crate) fn resolve_spawn_config(
         .iter()
         .map(startup_mcp_server_to_protocol)
         .collect();
-    resolved.steering_body = resolve_steering_body(request.steering_store, request.project_id)?;
+    resolved.steering_body = resolve_steering_body(
+        request.steering_store,
+        request.project_id,
+        Some(request.board_sections.as_ref().map_err(Clone::clone)?),
+    )?;
     resolved.skill_delivery = crate::backend::skill_delivery(request.backend_kind);
     match &request.customization {
         SpawnCustomization::User(custom_agent_id) => {
@@ -406,6 +411,7 @@ fn resolve_skill(skill_store: &SkillStore, skill_id: &SkillId) -> Result<Resolve
 pub(crate) fn resolve_steering_body(
     steering_store: &SteeringStore,
     project_id: Option<&ProjectId>,
+    board_sections: Option<&HashMap<ProjectId, String>>,
 ) -> Result<String, String> {
     let mut entries = steering_store
         .list()?
@@ -420,9 +426,16 @@ pub(crate) fn resolve_steering_body(
             .cmp(&right.title)
             .then(left.id.0.cmp(&right.id.0))
     });
-    Ok(entries
+    let mut body = entries
         .into_iter()
         .map(|entry| entry.content)
         .collect::<Vec<_>>()
-        .join("\n\n"))
+        .join("\n\n");
+    if let Some(section) = project_id.and_then(|id| board_sections?.get(id)) {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(section);
+    }
+    Ok(body)
 }

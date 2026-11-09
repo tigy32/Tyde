@@ -679,6 +679,9 @@ impl ProtocolValidator {
                     "AgentsViewPreferencesNotify",
                 )
             }
+            FrameKind::BoardCommand => parse_host_payload::<crate::BoardCommandPayload>(self, envelope, "BoardCommand"),
+            FrameKind::BoardState => parse_host_payload::<crate::BoardStatePayload>(self, envelope, "BoardState"),
+            FrameKind::BoardError => parse_host_payload::<crate::BoardErrorPayload>(self, envelope, "BoardError"),
             FrameKind::DotsCommand => parse_host_payload::<crate::DotsCommandPayload>(self, envelope, "DotsCommand"),
             FrameKind::DotsState => parse_host_payload::<crate::DotsStatePayload>(self, envelope, "DotsState"),
             FrameKind::TychatCommand => parse_host_payload::<crate::TychatCommandPayload>(self, envelope, "TychatCommand"),

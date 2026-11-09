@@ -150,6 +150,8 @@ pub(crate) enum TaskAccountingSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) board_card_id: Option<protocol::BoardCardId>,
     #[serde(default)]
     pub task_usage_generation_floor: u64,
     #[serde(default)]
@@ -400,6 +402,7 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    board_card_id: None,
                     task_usage_generation_floor: 0,
                     task_usage_accounting: None,
                     task_accounting_source: None,
@@ -921,50 +924,6 @@ impl SessionStore {
         self.cas(&[session_id], |records| {
             let changed = records.remove(&session_id.0).is_some();
             Ok(((), changed))
-        })
-    }
-
-    pub fn mark_compacted(
-        &self,
-        old_session_id: &SessionId,
-        new_session_id: &SessionId,
-        summary_preview: String,
-    ) -> Result<(), String> {
-        if old_session_id == new_session_id {
-            return Err(format!(
-                "cannot compact session {old_session_id} into itself"
-            ));
-        }
-        self.read_modify_write(&[old_session_id, new_session_id], |records| {
-            if !records.contains_key(&old_session_id.0) {
-                return Err(format!(
-                    "cannot compact missing old session {old_session_id}"
-                ));
-            }
-            if !records.contains_key(&new_session_id.0) {
-                return Err(format!(
-                    "cannot compact into missing new session {new_session_id}"
-                ));
-            }
-
-            let now = now_ms();
-            let old_record = records
-                .get_mut(&old_session_id.0)
-                .expect("old session existence checked before compaction mark");
-            old_record.resumable = false;
-            old_record.compacted_to_session_id = Some(new_session_id.clone());
-            old_record.compacted_at_ms = Some(now);
-            old_record.compaction_summary_preview = Some(summary_preview.clone());
-            old_record.updated_at_ms = now;
-
-            let new_record = records
-                .get_mut(&new_session_id.0)
-                .expect("new session existence checked before compaction mark");
-            new_record.compacted_from_session_id = Some(old_session_id.clone());
-            new_record.compacted_at_ms = Some(now);
-            new_record.compaction_summary_preview = Some(summary_preview.clone());
-            new_record.updated_at_ms = now;
-            Ok(())
         })
     }
 
@@ -1744,20 +1703,6 @@ impl SessionStoreHandle {
         self.call(move |store| store.delete(&session_id)).await
     }
 
-    pub async fn mark_compacted(
-        &self,
-        old_session_id: &SessionId,
-        new_session_id: &SessionId,
-        summary_preview: String,
-    ) -> Result<(), String> {
-        let old_session_id = old_session_id.clone();
-        let new_session_id = new_session_id.clone();
-        self.call(move |store| {
-            store.mark_compacted(&old_session_id, &new_session_id, summary_preview)
-        })
-        .await
-    }
-
     pub async fn compacted_successor_chain(
         &self,
         session_id: &SessionId,
@@ -2170,4 +2115,37 @@ pub mod commit_hooks {
             (hook.callback)()
         })
     }
+}
+
+pub(crate) fn mark_compacted_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    old: &SessionId,
+    new: &SessionId,
+    summary: String,
+    card_id: protocol::BoardCardId,
+) -> Result<(), String> {
+    if old == new {
+        return Err("cannot compact a session into itself".into());
+    }
+    let original = read_raw_records(transaction, &[old, new])?;
+    let mut records = decode_records(&original)?;
+    let now = now_ms();
+    let old_record = records
+        .get_mut(&old.0)
+        .ok_or("cannot compact missing old session")?;
+    old_record.resumable = false;
+    old_record.compacted_to_session_id = Some(new.clone());
+    old_record.compacted_at_ms = Some(now);
+    old_record.compaction_summary_preview = Some(summary.clone());
+    old_record.updated_at_ms = now;
+    let new_record = records
+        .get_mut(&new.0)
+        .ok_or("cannot compact into missing new session")?;
+    new_record.board_card_id = Some(card_id);
+    new_record.compacted_from_session_id = Some(old.clone());
+    new_record.compacted_at_ms = Some(now);
+    new_record.compaction_summary_preview = Some(summary);
+    new_record.updated_at_ms = now;
+    write_records(transaction, &original, records)?;
+    Ok(())
 }

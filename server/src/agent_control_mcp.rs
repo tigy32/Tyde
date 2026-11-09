@@ -392,10 +392,12 @@ pub(crate) enum AgentControlDiscoveryScope {
 pub(crate) type AgentControlDiscoveryCatalog = HashMap<AgentId, AgentControlDiscoveryEntry>;
 
 /// The authoritative published state `tools/list` reads. Discovery never
-/// waits on the host state owner, another actor or disk; invocation still
+/// waits on the host state owner; board discovery reads its storage leaf, and invocation still
 /// re-checks live authority.
 #[derive(Clone)]
 pub(crate) struct AgentControlDiscovery {
+    board: crate::board::BoardHandle,
+    projects: Arc<crate::host::ProjectCatalogHandle>,
     agents: tokio::sync::watch::Receiver<AgentControlDiscoveryCatalog>,
     settings: tokio::sync::watch::Receiver<settings_model::HostSettings>,
 }
@@ -440,10 +442,56 @@ impl DiscoveryFailure {
 
 impl AgentControlDiscovery {
     pub(crate) fn new(
+        board: crate::board::BoardHandle,
+        projects: Arc<crate::host::ProjectCatalogHandle>,
         agents: tokio::sync::watch::Receiver<AgentControlDiscoveryCatalog>,
         settings: tokio::sync::watch::Receiver<settings_model::HostSettings>,
     ) -> Self {
-        Self { agents, settings }
+        Self {
+            board,
+            projects,
+            agents,
+            settings,
+        }
+    }
+
+    async fn board_tools(&self, caller: Option<&AgentId>) -> Result<Vec<&'static str>, String> {
+        let Some(caller) = caller else {
+            return Ok(vec![]);
+        };
+        let start = {
+            let agents = self.agents.borrow();
+            let entry = agents.get(caller).ok_or("board caller is not registered")?;
+            entry.start.borrow().clone()
+        };
+        if start.parent_agent_id.is_some() {
+            return Ok(vec![]);
+        }
+        let Some(project_id) = start.project_id else {
+            return Ok(vec![]);
+        };
+        let project = self
+            .projects
+            .get(&project_id)
+            .ok_or("board project not found")?;
+        let project_id = project.parent_project_id().cloned().unwrap_or(project.id);
+        let board = self
+            .board
+            .apply(
+                protocol::BoardCommandPayload::Read(protocol::BoardReadPayload { project_id }),
+                vec![],
+                protocol::BoardActor::User,
+            )
+            .await
+            .map_err(|error| error.message)?;
+        let mut names = vec![];
+        if board.customized {
+            names.extend(["tyde_board_read", "tyde_board_move"]);
+        }
+        if start.tyde_permissions != protocol::AgentTydePermissions::Agent {
+            names.push("tyde_board_lanes");
+        }
+        Ok(names)
     }
 
     fn tiers_enabled(&self) -> Result<bool, DiscoveryFailure> {
@@ -1224,6 +1272,13 @@ async fn require_authenticated_caller(
 ) -> Result<AgentId, String> {
     let caller = authenticated_caller_from_parts(&server.credentials, parts)?
         .ok_or_else(|| format!("{tool_name} requires an agent-control bearer credential"))?;
+    if matches!(
+        tool_name,
+        "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes"
+    ) && !server.host.board_tool_allowed(&caller, tool_name).await?
+    {
+        return Err("board tool is not enabled for this caller".into());
+    }
     if server.host.agent_handle(&caller).await.is_none() {
         return Err("authenticated agent-control caller is not active".to_owned());
     }
@@ -1897,6 +1952,153 @@ impl TydeAgentControlMcpServer {
                 review_page(items, input.offset, input.limit)
             }
             Err(e) => Ok(err_text(e)),
+        }
+    }
+
+    #[tool(description = "Read this project's board, lanes and card move history.")]
+    async fn tyde_board_read(
+        &self,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let caller = require_authenticated_caller(self, &parts, "tyde_board_read").await?;
+            let project_id = self
+                .host
+                .board_caller_project(&caller)
+                .await?
+                .ok_or("caller has no top-level project card")?;
+            let board = self
+                .host
+                .board_command(
+                    protocol::BoardCommandPayload::Read(protocol::BoardReadPayload { project_id }),
+                    Some(&caller),
+                )
+                .await
+                .map_err(|error| error.message)?;
+            let own_card_id = board
+                .cards
+                .iter()
+                .find(|card| card.agent_id == caller)
+                .ok_or("caller card is no longer on this board")?
+                .id
+                .clone();
+            Ok::<_, String>(protocol::BoardToolReadResult { own_card_id, board })
+        }
+        .await;
+        match result {
+            Ok(board) => ok_json(board),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Move your own card to a lane by name or nest it under a parent card. A lane destination un-nests. Only Orchestrator and Root may specify card_id. Sends no message."
+    )]
+    async fn tyde_board_move(
+        &self,
+        Parameters(input): Parameters<protocol::BoardToolMoveInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let caller = require_authenticated_caller(self, &parts, "tyde_board_move").await?;
+            let project_id = self
+                .host
+                .board_caller_project(&caller)
+                .await?
+                .ok_or("caller has no top-level project card")?;
+            if input.card_id.is_some()
+                && self.host.tyde_permissions_for_caller(Some(&caller)).await?
+                    == protocol::AgentTydePermissions::Agent
+            {
+                return Err("only Orchestrator and Root may pass card_id".into());
+            }
+            let board = self
+                .host
+                .board_command(
+                    protocol::BoardCommandPayload::Read(protocol::BoardReadPayload {
+                        project_id: project_id.clone(),
+                    }),
+                    Some(&caller),
+                )
+                .await
+                .map_err(|error| error.message)?;
+            let card = match input.card_id {
+                Some(id) => board.cards.iter().find(|card| card.id == id),
+                None => board.cards.iter().find(|card| card.agent_id == caller),
+            }
+            .ok_or("card not found")?;
+            self.host
+                .board_command(
+                    protocol::BoardCommandPayload::Move(protocol::BoardMovePayload {
+                        project_id,
+                        card_id: card.id.clone(),
+                        destination: input.destination,
+                        note: input.note,
+                        position: None,
+                        expected_version: card.version,
+                    }),
+                    Some(&caller),
+                )
+                .await
+                .map_err(|error| error.message)
+        }
+        .await;
+        match result {
+            Ok(board) => ok_json(board),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Read or replace this project's ordered lanes. Lane IDs are stable across renames. Requires Orchestrator or Root; editing enables the board tools."
+    )]
+    async fn tyde_board_lanes(
+        &self,
+        Parameters(input): Parameters<protocol::BoardToolLanesInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let caller = require_authenticated_caller(self, &parts, "tyde_board_lanes").await?;
+            if self.host.tyde_permissions_for_caller(Some(&caller)).await?
+                == protocol::AgentTydePermissions::Agent
+            {
+                return Err("only Orchestrator and Root may edit lanes".into());
+            }
+            let project_id = self
+                .host
+                .board_caller_project(&caller)
+                .await?
+                .ok_or("caller has no top-level project card")?;
+            let board = self
+                .host
+                .board_command(
+                    protocol::BoardCommandPayload::Read(protocol::BoardReadPayload {
+                        project_id: project_id.clone(),
+                    }),
+                    None,
+                )
+                .await
+                .map_err(|error| error.message)?;
+            match input.lanes {
+                None => Ok(board),
+                Some(lanes) => self
+                    .host
+                    .board_command(
+                        protocol::BoardCommandPayload::Lanes(protocol::BoardLanesPayload {
+                            project_id,
+                            lanes,
+                            expected_version: board.version,
+                        }),
+                        Some(&caller),
+                    )
+                    .await
+                    .map_err(|error| error.message),
+            }
+        }
+        .await;
+        match result {
+            Ok(board) => ok_json(board),
+            Err(error) => Ok(err_text(error)),
         }
     }
 
@@ -2825,6 +3027,17 @@ impl ServerHandler for TydeAgentControlMcpServer {
             }
         };
         let mut tools = self.tool_router.list_all();
+        let board_tools = self
+            .discovery
+            .board_tools(caller.as_ref())
+            .await
+            .map_err(|error| McpError::internal_error(error, None))?;
+        tools.retain(|tool| {
+            !matches!(
+                tool.name.as_ref(),
+                "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes"
+            ) || board_tools.contains(&tool.name.as_ref())
+        });
         if let Some(discovered) = &discovered {
             match discovered.scope {
                 AgentControlDiscoveryScope::Ordinary => tools.retain(|tool| {

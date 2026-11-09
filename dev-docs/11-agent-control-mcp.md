@@ -867,3 +867,28 @@ independently; existing manual UI moves still require an idle standalone agent.
 The server derives authoritative roots from the selected project. Supplied roots must
 match; missing/removing projects, mismatches, and a request with neither a
 project nor roots fail before agent registration.
+
+### Board tools (protocol 98)
+
+`tyde_board_read`, `tyde_board_move`, and `tyde_board_lanes` on agent-control
+call the same `BoardCommandPayload` handler as the host UI stream. The bearer
+credential identifies the caller's own top-level card and canonical parent
+project. There is no `tyde_board_nest` tool: move's destination is a lane name
+or a parent `BoardCardId`; a lane destination also un-nests.
+
+Before the first actual lane edit, Agent sees no board tools and Orchestrator
+and Root see only `tyde_board_lanes`. After editing, Agent sees read and move;
+Orchestrator and Root see all three. Invocation rechecks these rules, project
+ownership and the current role. Agent cannot pass `card_id`, even its own;
+privileged roles may specify any card on their project board. Unknown lane
+errors list the project's lane names. A move sends no agent messages.
+
+Lane reads omit the optional `lanes` input; replacements include it. Move input
+is `BoardToolMoveInput` (destination, optional note, optional card_id). Tool
+schemas are generated from protocol types. UI moves must supply their observed
+card version; MCP moves read the current card and submit the same versioned
+command, so concurrent edits still reject rather than overwrite.
+
+`tyde_board_read` returns `BoardToolReadResult`: the typed board snapshot plus
+`own_card_id`, resolved from the bearer identity. Agents do not guess which
+card is theirs from names or history.

@@ -1029,6 +1029,7 @@ try {
     await page.locator('textarea,input,#scan-video').evaluateAll(nodes=>nodes.forEach(node=>node.style.visibility='hidden'));
     await page.screenshot({path:resolvePath(evidence,'boundary-failure-redacted.png')});
     const state=await page.evaluate(()=>({loaderError:document.getElementById('error-message')?.textContent,
+      loaderDetail:document.getElementById('error-detail')?.textContent?.replace(/https?:\/\/[^\s)]+/g,'<url>').replace(/[A-Za-z0-9_-]{24,}/g,'<opaque>').slice(0,500),
       secure:window.isSecureContext,worker:!!navigator.serviceWorker?.controller,client:window.__tydeLoader?.bootVersion()}));
     await writeFile(resolvePath(evidence,'boundary-failure.json'),JSON.stringify({stage,...state},null,2)+'\n');
   }

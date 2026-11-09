@@ -9834,6 +9834,29 @@ async fn wakes_are_short_pings_steered_into_running_turns_beside_standing_swarm_
     let (opening, live) = scenario
         .open_request(&starting.id, "Opening request body text")
         .await;
+    let (mut board_viewer, _) = scenario.fixture.connect_with_bootstrap().await;
+    fixture::send_host_payload(
+        &mut board_viewer,
+        FrameKind::BoardCommand,
+        &protocol::BoardCommandPayload::Read(protocol::BoardReadPayload {
+            project_id: scenario.project.id.clone(),
+        }),
+    )
+    .await;
+    let board: protocol::BoardStatePayload =
+        fixture::next_frame_matching_on(&mut board_viewer, "swarm project board", |frame| {
+            frame.kind == FrameKind::BoardState
+        })
+        .await
+        .parse_payload()
+        .expect("typed board state");
+    for member in &live.members {
+        let agent_id = member.agent_id.as_ref().expect("live member agent");
+        assert!(
+            board.cards.iter().all(|card| card.agent_id != *agent_id),
+            "swarm members are not board cards"
+        );
+    }
     let mocks = controls(&scenario, &live).await;
     for (member, control) in live.members.iter().zip(&mocks) {
         let steering = server::backend::mock::session_builtin_steering(

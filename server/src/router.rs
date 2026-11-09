@@ -136,6 +136,28 @@ pub(crate) async fn route_client_envelope(
                 let payload: SetAgentGroupsPayload = parse_payload(&envelope, "set_agent_groups")?;
                 host.set_agent_groups(payload).await?;
             }
+            FrameKind::BoardCommand => {
+                let payload: protocol::BoardCommandPayload =
+                    parse_payload(&envelope, "board_command")?;
+                host.subscribe_board(
+                    host_output_stream.path().clone(),
+                    crate::board::command_project(&payload).clone(),
+                )
+                .await
+                .map_err(|error| crate::error::AppError::invalid("board_command", error))?;
+                if let Err(error) = host.board_command(payload, None).await {
+                    host_output_stream
+                        .send_value(
+                            FrameKind::BoardError,
+                            serde_json::to_value(error).map_err(|error| {
+                                crate::error::AppError::invalid("board_error", error.to_string())
+                            })?,
+                        )
+                        .map_err(|_| {
+                            crate::error::AppError::invalid("board_error", "host stream closed")
+                        })?;
+                }
+            }
             FrameKind::DotsCommand => {
                 let payload: protocol::DotsCommandPayload =
                     parse_payload(&envelope, "dots_command")?;

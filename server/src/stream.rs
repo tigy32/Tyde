@@ -1165,6 +1165,9 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::VoiceTranscript
         | FrameKind::VoiceState
         | FrameKind::VoiceOutput
+        | FrameKind::BoardCommand
+        | FrameKind::BoardState
+        | FrameKind::BoardError
         | FrameKind::DotsCommand
         | FrameKind::DotsState
         | FrameKind::TychatCommand

@@ -279,3 +279,13 @@ pub use types::{
     ProjectCatalogRecord, ProjectMutation, ProjectOperationPayload, ProjectOperationStage,
     ProjectOperationState, ProjectOperationWarning,
 };
+
+pub use types::{
+    BoardActor, BoardCard, BoardCardId, BoardCommandPayload, BoardDestination, BoardErrorCode,
+    BoardErrorPayload, BoardLane, BoardLaneId, BoardLanesPayload, BoardLocation, BoardMove,
+    BoardMovePayload, BoardReadPayload, BoardStatePayload, BoardToolLanesInput, BoardToolMoveInput,
+};
+
+pub use types::{BoardCardNavigation, BoardNavigationTarget};
+
+pub use types::BoardToolReadResult;

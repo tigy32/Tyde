@@ -786,7 +786,6 @@ struct AgentCompaction {
     old_session_id: SessionId,
     access_mode: protocol::BackendAccessMode,
     old_record: SessionRecord,
-    session_store: Arc<SessionStoreHandle>,
     team_registry: TeamRegistryHandle,
     stream: Stream,
     summary_rx: oneshot::Receiver<Result<CompactionSummary, String>>,
@@ -896,6 +895,8 @@ pub(crate) struct HostState {
     workbench_support: protocol::WorkbenchSupport,
     tychat: crate::tychat::TychatService,
     dots: crate::dots::DotsHandle,
+    board: crate::board::BoardHandle,
+    board_subscriptions: HashMap<StreamPath, HashSet<ProjectId>>,
     #[cfg(feature = "test-support")]
     tychat_bridge_disabled: bool,
     pub swarm_registry: SwarmRegistryHandle,
@@ -4381,6 +4382,12 @@ impl HostHandle {
             handle.remove_subscriber(path.clone()).await;
         }
 
+        let board_path = path.clone();
+        self.state
+            .with(move |state| {
+                state.board_subscriptions.remove(&board_path);
+            })
+            .await;
         review_registry.unsubscribe_all(path.clone()).await;
 
         for terminal in terminals {
@@ -5420,7 +5427,6 @@ impl HostHandle {
             old_session_id,
             access_mode,
             old_record,
-            session_store,
             team_registry,
             stream,
             summary_rx,
@@ -5435,7 +5441,6 @@ impl HostHandle {
             old_session_id,
             access_mode,
             old_record,
-            session_store,
             team_registry,
             stream,
             summary_rx,
@@ -5649,8 +5654,17 @@ impl HostHandle {
             }
         }
 
-        if let Err(error) = session_store
-            .mark_compacted(&old_session_id, &new_session_id, summary_preview.clone())
+        if let Err(error) = self
+            .state
+            .with(|state| state.board.clone())
+            .await
+            .rotate(
+                agent_id.clone(),
+                new_agent_id.clone(),
+                old_session_id.clone(),
+                new_session_id.clone(),
+                summary_preview.clone(),
+            )
             .await
         {
             if let Some(context) = team_context.as_ref() {
@@ -6116,6 +6130,7 @@ impl HostHandle {
                         let steering_store = steering_store.clone();
                         let project_id = project_id.clone();
                         let workspace_roots = workspace_roots.clone();
+                        let board_sections = self.board_lane_sections().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6133,6 +6148,7 @@ impl HostHandle {
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
+                                    board_sections: &board_sections,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => {
@@ -6430,6 +6446,7 @@ impl HostHandle {
                             let project_id = project_id.clone();
                             let startup_mcp_servers = startup_mcp_servers.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
+                            let board_sections = self.board_lane_sections().await;
                             self.state.with(move |state| {
 let stored_custom_agent_id = &stored_custom_agent_id;
 let custom_agents = &state.custom_agent_store;
@@ -6447,6 +6464,7 @@ let custom_agents = &state.custom_agent_store;
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
                                 steering_store: &steering,
+                                    board_sections: &board_sections,
                                 skill_store: skills,
                             })
                             .unwrap_or_else(|err| {
@@ -6471,6 +6489,7 @@ let custom_agents = &state.custom_agent_store;
                             let project_id = project_id.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
                             let startup_mcp_servers = startup_mcp_servers.clone();
+                            let board_sections = self.board_lane_sections().await;
                             self.state
                                 .with(move |state| {
                                     let stored_custom_agent_id = &stored_custom_agent_id;
@@ -6489,6 +6508,7 @@ let custom_agents = &state.custom_agent_store;
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
                                         steering_store: &steering,
+                                        board_sections: &board_sections,
                                         skill_store: skills,
                                     }) {
                                         Ok(resolved) => (
@@ -6513,6 +6533,7 @@ let custom_agents = &state.custom_agent_store;
                         let steering_store = steering_store.clone();
                         let record = record.clone();
                         let project_id = project_id.clone();
+                        let board_sections = self.board_lane_sections().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6528,6 +6549,7 @@ let custom_agents = &state.custom_agent_store;
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
+                                    board_sections: &board_sections,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => (None, resolved, None, None),
@@ -6767,6 +6789,7 @@ let custom_agents = &state.custom_agent_store;
                             let workspace_roots = workspace_roots.clone();
                             let startup_mcp_servers = startup_mcp_servers.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
+                            let board_sections = self.board_lane_sections().await;
                             self.state.with(move |state| {
 let stored_custom_agent_id = &stored_custom_agent_id;
 let custom_agents = &state.custom_agent_store;
@@ -6784,6 +6807,7 @@ let custom_agents = &state.custom_agent_store;
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
                                 steering_store: &steering,
+                                    board_sections: &board_sections,
                                 skill_store: skills,
                             })
                             .unwrap_or_else(|err| {
@@ -6808,6 +6832,7 @@ let custom_agents = &state.custom_agent_store;
                             let workspace_roots = workspace_roots.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
                             let startup_mcp_servers = startup_mcp_servers.clone();
+                            let board_sections = self.board_lane_sections().await;
                             self.state
                                 .with(move |state| {
                                     let stored_custom_agent_id = &stored_custom_agent_id;
@@ -6826,6 +6851,7 @@ let custom_agents = &state.custom_agent_store;
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
                                         steering_store: &steering,
+                                        board_sections: &board_sections,
                                         skill_store: skills,
                                     }) {
                                         Ok(resolved) => (
@@ -6851,6 +6877,7 @@ let custom_agents = &state.custom_agent_store;
                     {
                         let project_id = project_id.clone();
                         let workspace_roots = workspace_roots.clone();
+                        let board_sections = self.board_lane_sections().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6866,6 +6893,7 @@ let custom_agents = &state.custom_agent_store;
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
+                                    board_sections: &board_sections,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => (None, resolved, None, None),
@@ -9154,8 +9182,12 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 host.project_catalog.published(stream);
             }
             for change in changes {
+                if let ProjectNotifyPayload::Delete { project } = &change {
+                    for projects in state.board_subscriptions.values_mut() { projects.remove(&project.id); }
+                }
                 fan_out_project_notify(state, change);
             }
+            state.registry.notify_usage_changed();
             if matches!(
                 mutation,
                 protocol::ProjectMutation::Rename(_)
@@ -13562,6 +13594,30 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
             let mut snapshot = agent_handle
                 .final_usage_snapshot()
                 .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+            if snapshot.start.parent_agent_id.is_none() {
+                let owner = snapshot
+                    .start
+                    .project_id
+                    .as_ref()
+                    .map(|id| {
+                        let project = self.project_catalog.get(id).ok_or_else(|| {
+                            AppError::internal(
+                                "close_agent",
+                                anyhow!("board card references a missing project"),
+                            )
+                        })?;
+                        Ok::<_, AppError>(
+                            project.parent_project_id().cloned().unwrap_or(project.id),
+                        )
+                    })
+                    .transpose()?;
+                self.state
+                    .with(|state| state.board.clone())
+                    .await
+                    .settle_card(snapshot.start.clone(), owner)
+                    .await
+                    .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
+            }
             snapshot.navigation = protocol::TaskUsageNavigation::Unavailable;
             if let Some(session_id) = snapshot.start.session_id.as_ref() {
                 let session = session_id.clone();
@@ -15494,6 +15550,7 @@ let project_id = &project_id;
                 let definition = definition.clone();
                 let project_id = project_id.clone();
                 let workspace_roots = workspace_roots.clone();
+                let board_sections = self.board_lane_sections().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -15509,6 +15566,7 @@ let project_id = &project_id;
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
+                            board_sections: &board_sections,
                             skill_store: skills,
                         })
                     })
@@ -18424,6 +18482,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                 let project_roots = project_roots.clone();
                 let project_id = project_id.clone();
                 let custom_agent_id = custom_agent_id.clone();
+                let board_sections = self.board_lane_sections().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -18439,6 +18498,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
+                            board_sections: &board_sections,
                             skill_store: skills,
                         })
                         .map_err(|error| {
@@ -19074,6 +19134,7 @@ self.state.with(move |state| {
             {
                 let project_id = request.review.project_id.clone();
                 let roots = roots.clone();
+                let board_sections = self.board_lane_sections().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -19092,6 +19153,7 @@ self.state.with(move |state| {
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
+                            board_sections: &board_sections,
                             skill_store: skills,
                         })
                     })
@@ -20146,8 +20208,10 @@ fn spawn_host_inner(
     let backend_storage =
         crate::backend::BackendStorage::new(runtime_config.backend_storage_roots.clone())?;
 
+    let board_path = SessionStore::database_path(&paths.session);
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
+    let board = crate::board::BoardHandle::start(board_path)?;
     let project_store = ProjectStore::load(paths.project)?;
     let initial_projects = project_store.list()?;
     let workflow_catalog = WorkflowCatalog::discover(&initial_projects);
@@ -20324,13 +20388,19 @@ fn spawn_host_inner(
     let (settings_apply_tx, settings_apply_rx) = mpsc::unbounded_channel();
     let registry = AgentRegistry::new();
     let agent_control_discovery = crate::agent_control_mcp::AgentControlDiscovery::new(
+        board.clone(),
+        project_store.clone(),
         registry.subscribe_agent_control_discovery(),
         settings_store.subscribe_committed(),
     );
+    let board_changes = registry.subscribe_status_changes();
+    let board_agents = registry.subscribe_agent_control_discovery();
     let agent_status_transitions = registry.subscribe_status_transitions();
     let agent_turn_state_transitions = registry.subscribe_status_transitions();
     let (state, state_actor) = StateOwner::new(HostState {
         workbench_support,
+        board,
+        board_subscriptions: HashMap::new(),
         dots,
         #[cfg(feature = "test-support")]
         tychat_bridge_disabled: runtime_config.tychat_bridge_disabled,
@@ -20519,6 +20589,11 @@ fn spawn_host_inner(
     };
 
     state_actor.start()?;
+    board_host::start_live_updates(
+        WeakHostHandle::downgrade(&host),
+        board_changes,
+        board_agents,
+    )?;
     debug_host_binding.bind_host(&host)?;
     project_catalog_actor.start(WeakHostHandle::downgrade(&host))?;
     spawn_settings_apply_actor(WeakHostHandle::downgrade(&host), settings_apply_rx);
@@ -27916,3 +27991,6 @@ fn spawn_learning_projection(
             });
     }
 }
+
+#[path = "board_host.rs"]
+mod board_host;

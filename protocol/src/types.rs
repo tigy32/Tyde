@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 97;
+pub const PROTOCOL_VERSION: u32 = 98;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1269,6 +1269,9 @@ pub enum FrameKind {
     BackendConfigSnapshots,
     BackendCapacity,
     LaunchProfileCatalogNotify,
+    BoardCommand,
+    BoardState,
+    BoardError,
     DotsCommand,
     DotsState,
     TychatCommand,
@@ -1500,6 +1503,9 @@ impl fmt::Display for FrameKind {
             Self::BackendConfigSnapshots => f.write_str("backend_config_snapshots"),
             Self::BackendCapacity => f.write_str("backend_capacity"),
             Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
+            Self::BoardCommand => f.write_str("board_command"),
+            Self::BoardState => f.write_str("board_state"),
+            Self::BoardError => f.write_str("board_error"),
             Self::DotsCommand => f.write_str("dots_command"),
             Self::DotsState => f.write_str("dots_state"),
             Self::TychatCommand => f.write_str("tychat_command"),
@@ -11620,4 +11626,153 @@ pub struct DotsHostRegistrationPayload {
     pub host_id: String,
     pub host_key: String,
     pub pairing_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct BoardLaneId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct BoardCardId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BoardLane {
+    pub id: BoardLaneId,
+    pub name: String,
+    pub position: u64,
+    pub instructions: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardDestination {
+    Lane { name: String },
+    Parent { card_id: BoardCardId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardLocation {
+    Lane {
+        project_id: ProjectId,
+        lane_id: BoardLaneId,
+    },
+    Parent {
+        card_id: BoardCardId,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardActor {
+    User,
+    ProjectChange,
+    Agent { agent_id: AgentId },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardMove {
+    pub seq: u64,
+    pub from: BoardLocation,
+    pub to: BoardLocation,
+    pub actor: BoardActor,
+    pub note: Option<String>,
+    pub at: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardCard {
+    pub retained: bool,
+    pub id: BoardCardId,
+    pub agent_id: AgentId,
+    pub session_id: Option<SessionId>,
+    pub title: String,
+    pub location: BoardLocation,
+    pub position: u64,
+    pub version: u64,
+    pub history: Vec<BoardMove>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardStatePayload {
+    pub navigation: Vec<BoardCardNavigation>,
+    pub live_agents: Vec<AgentStartPayload>,
+    pub project_id: ProjectId,
+    pub version: u64,
+    pub customized: bool,
+    pub lanes: Vec<BoardLane>,
+    pub cards: Vec<BoardCard>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BoardReadPayload {
+    pub project_id: ProjectId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BoardMovePayload {
+    pub project_id: ProjectId,
+    pub card_id: BoardCardId,
+    pub destination: BoardDestination,
+    pub note: Option<String>,
+    pub position: Option<u64>,
+    pub expected_version: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BoardLanesPayload {
+    pub project_id: ProjectId,
+    pub lanes: Vec<BoardLane>,
+    pub expected_version: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardCommandPayload {
+    Read(BoardReadPayload),
+    Move(BoardMovePayload),
+    Lanes(BoardLanesPayload),
+    Remove {
+        project_id: ProjectId,
+        card_id: BoardCardId,
+        expected_version: u64,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardErrorCode {
+    NotFound,
+    InvalidInput,
+    StaleVersion,
+    Forbidden,
+    Storage,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardErrorPayload {
+    pub project_id: ProjectId,
+    pub code: BoardErrorCode,
+    pub message: String,
+}
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BoardToolMoveInput {
+    pub destination: BoardDestination,
+    pub note: Option<String>,
+    pub card_id: Option<BoardCardId>,
+}
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BoardToolLanesInput {
+    pub lanes: Option<Vec<BoardLane>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardNavigationTarget {
+    Live {
+        agent_id: AgentId,
+    },
+    Saved {
+        session_id: SessionId,
+        backend_kind: BackendKind,
+        project_id: Option<ProjectId>,
+    },
+    Unavailable,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardCardNavigation {
+    pub card_id: BoardCardId,
+    pub target: BoardNavigationTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardToolReadResult {
+    pub own_card_id: BoardCardId,
+    pub board: BoardStatePayload,
 }

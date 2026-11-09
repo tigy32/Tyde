@@ -510,3 +510,73 @@ diagnostics. The flows retain pointer-hit, layout, catalog-authority, and
 admitted-versus-committed assertions. Early stale assertions left a modal mounted;
 subsequent hit-test failures explicitly identified that browser overlay covering
 otherwise unrelated controls. Those geometry assertions were not changed.
+
+## Project board lanes (protocol 98)
+
+`protocol/src/types.rs` defines the board model. Send `FrameKind::BoardCommand`
+on the host stream with `BoardCommandPayload` (`client::Connection::board_command`
+provides the typed client send path):
+
+- `Read(BoardReadPayload)` subscribes the connection to the board and emits its
+  current `BoardStatePayload` as `FrameKind::BoardState`.
+- `Lanes(BoardLanesPayload)` replaces the ordered lanes using the board's lane
+  `version` as `expected_version`. Preserve each `BoardLaneId` across renames;
+  new lanes require a new ID. Names are nonblank and case-insensitively unique;
+  IDs and positions are unique. At least one lane is required.
+- `Move(BoardMovePayload)` uses the card's `version` as `expected_version`.
+  `BoardDestination::Lane { name }` moves or un-nests; `Parent { card_id }`
+  nests one level deep. `position` and `note` are optional.
+- `Remove` removes a closed, retained card and releases its children into its
+  lane. Close a live agent with the existing close-agent command first.
+
+Every successful command and subsequent live-agent change emits a complete
+`BoardStatePayload` to board subscribers. Mutations commit and publish in the
+host actor's order. `BoardErrorPayload` (`FrameKind::BoardError`) reports typed
+`StaleVersion`, `InvalidInput`, `NotFound`, `Forbidden`, or `Storage` failures;
+rejected commands do not mutate state. A stale move is not silently retried. A live subscription storage failure emits
+`BoardError` and terminates that project's subscription; stale state is not
+presented as a successful read.
+
+Boards belong to standalone parent projects. Workbench IDs canonicalize to the
+parent board. Only top-level agents are cards; swarm members are not. The server supplies default
+locations and complete card projections; clients must not reconstruct them.
+`live_agents` carries current agent metadata, never persisted board state.
+`navigation` explicitly distinguishes live chats, saved sessions and unavailable
+chats, including cards whose workbench and session were removed.
+
+`server/src/board.rs` is a single leaf actor with an owned SQLite connection to
+`sessions.sqlite3`: `board_lanes`, `board_versions`, `board_cards`, `board_moves`.
+Default lanes (Active, Done) are synthesized only when none have been stored.
+Ordinary chats and reads create no board rows. A first move or nesting retains
+the involved cards; rows contain identity, placement, title and history, never
+live agent activity. Closing untouched agents removes them from the projection;
+retained cards outlive closing and workbench/session deletion. Compaction rotates
+the card's agent/session binding, not its stable `BoardCardId`, placement or
+history. An untouched replacement keeps its logical card ID in the existing
+session metadata without creating a card row. Session compaction metadata and
+board rebinding commit in the board leaf's single SQLite transaction; failure
+uses the existing replacement cleanup and reservation-release path. Resuming a
+retained saved session rebinds its existing card. Closing and rotation use the
+explicit saved-session identity even when no board viewers are subscribed;
+closing also settles canonical project ownership. Explicit project reassignment
+transfers that same card, releases nesting, and records the first-lane move with
+`BoardActor::ProjectChange`. Lane removal relocates retained cards to the new first lane and records
+that move. Untouched cards always appear in the current first lane.
+
+Lane text is resolved only in `resolve_steering_body` in
+`server/src/agent/customization.rs`, via fresh actor reads before spawn
+customization. The parent section is also supplied for its workbenches:
+
+```text
+Lanes. Call tyde_board_read to see which one you're in.
+
+In Progress: Keep work scoped.
+```
+
+Only lanes with nonblank instructions contribute. Without any text the existing
+steering is byte-identical. Edits affect future spawn configurations, not running
+agents. Moves have no steering, messaging, lifecycle or backend side effects.
+
+Lane locations carry both `project_id` and `lane_id`, including immutable move
+history. This keeps prior ownership explicit after cross-project reassignment;
+a project's default lane IDs are not a global namespace.

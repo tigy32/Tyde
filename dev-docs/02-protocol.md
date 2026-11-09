@@ -690,3 +690,13 @@ The conformance scenario `real_slash_commands` runs against every backend: the
 advertised set must be well-formed, a read-only command from it must run to a
 visible reply without any model request, and a slash-prefixed non-command must
 still reach the model as text.
+
+### Protocol 98: Project boards
+
+Adds host-stream `board_command`, `board_state`, and `board_error` frames, typed
+by `BoardCommandPayload`, `BoardStatePayload`, and `BoardErrorPayload` in
+`protocol/src/types.rs`. Boards use stable lane/card IDs, explicit locations,
+versioned moves and full-state broadcasts. See `06-projects.md` for commands,
+subscription semantics and storage, and `11-agent-control-mcp.md` for tool
+permissions. All clients must negotiate protocol 98; older clients are rejected
+by the existing exact-version handshake.

@@ -723,6 +723,14 @@ impl Connection {
             .await
     }
 
+    pub async fn board_command(
+        &mut self,
+        payload: protocol::BoardCommandPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::BoardCommand, &payload)
+            .await
+    }
+
     pub async fn project_create(
         &mut self,
         payload: ProjectCreatePayload,
@@ -1729,6 +1737,14 @@ impl Connection {
                 }
                 FrameKind::HeartbeatAck => {
                     let _: protocol::HeartbeatPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::BoardState => {
+                    let _: protocol::BoardStatePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::BoardError => {
+                    let _: protocol::BoardErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::ProjectOperation => {
