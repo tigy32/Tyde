@@ -374,15 +374,17 @@ pub(crate) fn ChatConnectionStatus() -> impl IntoView {
 /// end-to-end round-trip measurement; states needing attention expand to a
 /// larger action pill.
 #[component]
-pub fn ConnectionBanner() -> impl IntoView {
+pub fn ConnectionBanner(#[prop(optional)] inline: bool) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let status_state = state.clone();
     let command_error_state = state.clone();
     let bundle_state = state.clone();
 
     view! {
-        <div class="connection-banner" data-mobile-test="connection-banner"
-            hidden=move || (crate::native::is_native() && state.mobile_shell_error.get().is_some())
+        <div class=if inline { "connection-banner board-connection" } else { "connection-banner" } data-mobile-test="connection-banner"
+            hidden=move || (!inline && state.active_tab.get() == crate::state::MobileTab::Agents
+                && !state.viewing_chat.get()
+                && state.board_project.get().is_some_and(|target| Some(target.local_host_id) == state.active_local_host_id.get())) || (crate::native::is_native() && state.mobile_shell_error.get().is_some())
                 || ((chat_owns_connection_status(&state) || crate::native::root_status_owned(&state))
                     && (matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
                         || (chat_owns_connection_status(&state) && connection_pending(&state.active_host_connection_status())))

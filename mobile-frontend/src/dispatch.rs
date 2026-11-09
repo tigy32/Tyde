@@ -871,6 +871,60 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 );
             }
         },
+        FrameKind::BoardState => match envelope.parse_payload::<protocol::BoardStatePayload>() {
+            Ok(board) => {
+                let key = (host.clone(), board.project_id.clone());
+                state.board_errors.update(|errors| {
+                    if errors
+                        .get(&key)
+                        .is_some_and(|error| error.code == protocol::BoardErrorCode::Storage)
+                    {
+                        errors.remove(&key);
+                    }
+                });
+                state.boards.update(|boards| {
+                    boards.insert(key, board);
+                });
+            }
+            Err(error) => report_protocol_error(
+                state,
+                host,
+                bridge::ConnectionInvalidation::ProtocolViolation {
+                    message: format!("Invalid board state: {error}"),
+                },
+            ),
+        },
+        FrameKind::BoardError => match envelope.parse_payload::<protocol::BoardErrorPayload>() {
+            Ok(error) => {
+                let key = (host.clone(), error.project_id.clone());
+                if error.code == protocol::BoardErrorCode::Storage {
+                    state.boards.update(|boards| {
+                        boards.remove(&key);
+                    });
+                }
+                state.board_errors.update(|errors| {
+                    if errors
+                        .get(&key)
+                        .is_some_and(|existing| existing.code == protocol::BoardErrorCode::Storage)
+                        && error.code != protocol::BoardErrorCode::Storage
+                    {
+                        log::warn!(
+                            "Board command rejected while storage is unavailable: code={:?}",
+                            error.code
+                        );
+                    } else {
+                        errors.insert(key, error);
+                    }
+                });
+            }
+            Err(error) => report_protocol_error(
+                state,
+                host,
+                bridge::ConnectionInvalidation::ProtocolViolation {
+                    message: format!("Invalid board error: {error}"),
+                },
+            ),
+        },
         FrameKind::ProjectNotify => {
             if let Ok(payload) = envelope.parse_payload::<ProjectNotifyPayload>() {
                 match payload {
@@ -892,6 +946,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     }
                     ProjectNotifyPayload::Delete { project } => {
                         let pid = project.id.clone();
+                        state.boards.update(|boards| {
+                            boards.remove(&(host.clone(), pid.clone()));
+                        });
+                        state.board_errors.update(|errors| {
+                            errors.remove(&(host.clone(), pid.clone()));
+                        });
+                        state.board_project.update(|target| {
+                            if target.as_ref().is_some_and(|target| {
+                                &target.local_host_id == host && target.project_id == pid
+                            }) {
+                                *target = None;
+                            }
+                        });
                         state.projects.update(|projects| {
                             projects.retain(|e| !(e.local_host_id == *host && e.project.id == pid));
                         });
@@ -3232,6 +3299,12 @@ fn apply_host_bootstrap(
         });
     }
 
+    state
+        .boards
+        .update(|boards| boards.retain(|(owner, _), _| owner != host));
+    state
+        .board_errors
+        .update(|errors| errors.retain(|(owner, _), _| owner != host));
     let session_page = payload.session_list;
     let bootstrap_session_count = payload.sessions.len();
     log::info!(

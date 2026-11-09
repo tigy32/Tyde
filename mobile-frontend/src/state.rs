@@ -1078,6 +1078,9 @@ pub struct AppState {
     // Projects
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
+    pub board_project: RwSignal<Option<ActiveProjectRef>>,
+    pub boards: RwSignal<HashMap<(LocalHostId, ProjectId), protocol::BoardStatePayload>>,
+    pub board_errors: RwSignal<HashMap<(LocalHostId, ProjectId), protocol::BoardErrorPayload>>,
     /// Whether the new-chat project sheet is up. Mobile has no project rail to
     /// carry a persistent scope, so the choice is made per chat, at the one
     /// moment it decides anything: the agent about to be spawned.
@@ -1459,6 +1462,9 @@ impl AppState {
 
             projects: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
+            board_project: RwSignal::new(None),
+            boards: RwSignal::new(HashMap::new()),
+            board_errors: RwSignal::new(HashMap::new()),
             project_picker_open: RwSignal::new(false),
             git_status: RwSignal::new(HashMap::new()),
             project_file_contents: RwSignal::new(HashMap::new()),
@@ -2283,6 +2289,10 @@ impl AppState {
     /// forgotten (the user removed the pairing) or fully disconnects in a way
     /// that should clear cached snapshots.
     pub fn clear_host_runtime(&self, host: &LocalHostId) {
+        self.boards
+            .update(|boards| boards.retain(|(owner, _), _| owner != host));
+        self.board_errors
+            .update(|errors| errors.retain(|(owner, _), _| owner != host));
         self.host_releases.update(|m| {
             m.remove(host);
         });

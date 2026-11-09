@@ -14,6 +14,7 @@ mod onboarding_view;
 mod paired_hosts_picker;
 mod pairing_flow;
 pub mod pending_submissions;
+mod project_board;
 mod project_picker;
 mod session_settings;
 mod sessions_view;

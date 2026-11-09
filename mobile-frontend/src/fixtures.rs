@@ -414,6 +414,11 @@ pub fn seed_state(state: &AppState) {
     });
 
     match name.as_str() {
+        "board" => {
+            seed_board(state, &host);
+            state.active_tab.set(MobileTab::Agents);
+            state.viewing_chat.set(false);
+        }
         "new-chat" => {
             state.active_agent.set(None);
             state.show_chat();
@@ -570,4 +575,216 @@ pub fn install_recovery(state: &AppState) {
         .expect("remove fixture commit boundary");
         drop(commit.take());
     });
+}
+
+fn seed_board(state: &AppState, host: &LocalHostId) {
+    use protocol::{
+        BoardActor, BoardCard, BoardCardId, BoardCardNavigation, BoardLane, BoardLaneId,
+        BoardLocation, BoardMove, BoardNavigationTarget, BoardStatePayload,
+    };
+    let project_id = ProjectId("fixture-tyde".into());
+    state.agents.update(|agents| {
+        let child = &mut agents[1];
+        child.project_id = Some(project_id.clone());
+        child.name = "Keyboard navigation".into();
+        child.session_id = Some(SessionId("fixture-child-session".into()));
+    });
+    state.agent_turn_active.update(|active| {
+        active.insert(
+            crate::state::AgentRef {
+                local_host_id: host.clone(),
+                agent_id: AgentId("fixture-agent".into()),
+            },
+            true,
+        );
+    });
+    state.agent_awaiting_user.update(|active| {
+        active.insert(crate::state::AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("fixture-agent-tychat".into()),
+        });
+    });
+    let workbench = ProjectId("fixture-board-workbench".into());
+    state.projects.update(|projects| {
+        projects.push(ProjectInfo {
+            local_host_id: host.clone(),
+            project: Project {
+                id: workbench.clone(),
+                name: "Release workbench".into(),
+                sort_order: 2,
+                source: ProjectSource::GitWorkbench {
+                    parent_project_id: project_id.clone(),
+                    branch: protocol::GitBranchName("release-notes".into()),
+                    roots: vec![protocol::WorkbenchRoot {
+                        parent_root: ProjectRootPath("/Users/mike/Tyggs/Tyde".into()),
+                        worktree_root: ProjectRootPath(
+                            "/Users/mike/Tyggs/Tyde--release-notes".into(),
+                        ),
+                    }],
+                    environment: Default::default(),
+                },
+            },
+        })
+    });
+    state.sessions.update(|sessions| {
+        sessions.push(crate::state::SessionInfo {
+            local_host_id: host.clone(),
+            summary: protocol::SessionSummary {
+                id: SessionId("fixture-workbench-archive".into()),
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                workspace_roots: vec!["/Users/mike/Tyggs/Tyde--release-notes".into()],
+                project_id: Some(workbench),
+                alias: Some("Document release notes".into()),
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                message_count: 1,
+                token_count: None,
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: None,
+            },
+        })
+    });
+    let project = state.projects.with_untracked(|projects| {
+        projects
+            .iter()
+            .find(|info| info.project.id == project_id)
+            .expect("board fixture project")
+            .project
+            .clone()
+    });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_BOARD_PROJECT__".into(),
+        &JsValue::from_str(&serde_json::to_string(&project).expect("typed project fixture")),
+    )
+    .expect("project fixture export");
+    let lane = |name: &str| BoardLocation::Lane {
+        project_id: project_id.clone(),
+        lane_id: BoardLaneId(name.into()),
+    };
+    let cards = vec![
+        BoardCard {
+            id: BoardCardId("board-mira".into()),
+            agent_id: AgentId("fixture-agent".into()),
+            session_id: Some(SessionId("fixture-session".into())),
+            retained: true,
+            title: "Mira".into(),
+            location: lane("active"),
+            position: 0,
+            version: 3,
+            history: vec![],
+        },
+        BoardCard {
+            id: BoardCardId("board-keyboard".into()),
+            agent_id: AgentId("fixture-agent-tychat".into()),
+            session_id: Some(SessionId("fixture-child-session".into())),
+            retained: true,
+            title: "Keyboard navigation".into(),
+            location: BoardLocation::Parent {
+                card_id: BoardCardId("board-mira".into()),
+            },
+            position: 1,
+            version: 2,
+            history: vec![],
+        },
+        BoardCard {
+            id: BoardCardId("board-release".into()),
+            agent_id: AgentId("archived-agent".into()),
+            session_id: Some(SessionId("fixture-workbench-archive".into())),
+            retained: true,
+            title: "Document release notes".into(),
+            location: lane("done"),
+            position: 2,
+            version: 1,
+            history: vec![BoardMove {
+                seq: 0,
+                from: lane("active"),
+                to: lane("done"),
+                actor: BoardActor::User,
+                note: None,
+                at: 1,
+            }],
+        },
+        BoardCard {
+            id: BoardCardId("board-removed".into()),
+            agent_id: AgentId("removed-agent".into()),
+            session_id: None,
+            retained: true,
+            title: "Removed workbench".into(),
+            location: lane("done"),
+            position: 3,
+            version: 1,
+            history: vec![],
+        },
+    ];
+    let board = BoardStatePayload {
+        project_id: project_id.clone(),
+        version: 1,
+        customized: true,
+        live_agents: vec![],
+        lanes: vec![
+            BoardLane {
+                id: BoardLaneId("active".into()),
+                name: "Active".into(),
+                position: 0,
+                instructions: None,
+            },
+            BoardLane {
+                id: BoardLaneId("done".into()),
+                name: "Done".into(),
+                position: 1,
+                instructions: None,
+            },
+        ],
+        navigation: vec![
+            BoardCardNavigation {
+                card_id: cards[0].id.clone(),
+                target: BoardNavigationTarget::Live {
+                    agent_id: cards[0].agent_id.clone(),
+                },
+            },
+            BoardCardNavigation {
+                card_id: cards[1].id.clone(),
+                target: BoardNavigationTarget::Live {
+                    agent_id: cards[1].agent_id.clone(),
+                },
+            },
+            BoardCardNavigation {
+                card_id: cards[2].id.clone(),
+                target: BoardNavigationTarget::Saved {
+                    session_id: cards[2].session_id.clone().expect("fixture session"),
+                    backend_kind: BackendKind::Codex,
+                    project_id: Some(project_id.clone()),
+                },
+            },
+            BoardCardNavigation {
+                card_id: cards[3].id.clone(),
+                target: BoardNavigationTarget::Unavailable,
+            },
+        ],
+        cards,
+    };
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_BOARD_STATE__".into(),
+        &JsValue::from_str(&serde_json::to_string(&board).expect("typed board fixture")),
+    )
+    .expect("board fixture export");
+    crate::dispatch::dispatch_envelope(
+        state,
+        host,
+        protocol::Envelope::from_payload(
+            StreamPath("/host/fixture".into()),
+            protocol::FrameKind::BoardState,
+            0,
+            &board,
+        )
+        .expect("board fixture event"),
+    );
 }

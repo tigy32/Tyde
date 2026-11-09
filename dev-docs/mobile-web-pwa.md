@@ -798,3 +798,32 @@ size during a width change at scale 2. This follows the vendored runtime's
 documented pinch-zoom freeze contract, introduced in `01099962`; it was not
 changed or assigned as the customer's cause. Native Safari/PWA transitions
 and Root's visual acceptance remain separate requirements.
+
+## Project boards (protocol 98)
+
+Agents → Projects opens a single-column board. Each lane includes its nested
+cards in the count. Cards use explicit board navigation targets to open a live
+chat, resume a saved session, or disable chat navigation when unavailable.
+The Move sheet sends lane or parent destinations and the card version captured
+when opened. Un-nest sends the parent's lane. BoardState events alone change
+placement; move errors remain visible until dismissed. Storage errors retire
+the snapshot and remain explicit until a new server snapshot arrives. There is
+no retry.
+Lane editing and instructions remain desktop/tool-only.
+
+Opening the page subscribes with BoardCommand::Read on the selected host;
+reconnection subscribes again after HostBootstrap. Users who never open it send
+no board commands. State and errors are host/project-scoped and cleared with
+that host's runtime. Live labels use existing server-driven agent state. The page header includes
+connection and bundle notices in measured layout, never over card actions.
+Saved-session navigation leaves project binding to the server. Project deletion
+retires the open board; HostBootstrap clears snapshots before resubscribing.
+The move sheet keeps its note input mounted while destinations update.
+
+No bundle version or protocol copy is maintained here. The canonical
+`tools/build-mobile-web-bundle.sh` builds the current release's mobile assets
+and generates an integrity manifest from `protocol/src/types.rs` (98), retaining
+the normal matching-host loader path. `./dev.sh check` builds and exercises this
+matching bundle; its browser stage also builds the debug-only fixture bundle.
+The project-board WebKit phone flow runs in that existing stage and retains
+`test-results/board-mobile-phone.png` and `board-mobile-move.png`.

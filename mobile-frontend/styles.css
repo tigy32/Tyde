@@ -5679,6 +5679,9 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 [data-native-host] .native-workspace:not(.native-pairing) .view-header:has(> .view-title:only-child),
 [data-native-host] .agents-view > .shell-header > .view-header { display: none; }
 [data-native-host] .sessions-view .view-header { display: none; }
+[data-native-host] .native-workspace:not(.native-pairing) .mobile-project-page .view-header > .view-title { display: block; }
+.native-agents-tools:not([hidden]) { display: flex; align-items: center; gap: var(--space-2); }
+.native-agents-tools input { flex: 1; min-width: 0; }
 [data-native-host] .native-split { grid-template-columns: minmax(calc(280px + 1px), 32%) minmax(0, 1fr); }
 [data-native-host] .native-split > .native-agents-pane {
     border-inline-end: 1px solid var(--border-default);
@@ -6018,3 +6021,35 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
     transform: translateX(calc(var(--native-back-progress, 0) * 100%));
 }
 [data-native-host] .native-chat-pane { position: relative; isolation: isolate; }
+
+/* Project boards use the same single-column rhythm as the agent list. */
+.board-header-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mobile-project-page .view-header { gap: 8px; }
+.mobile-project-page .view-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board-lanes { gap: 24px; }
+.board-lane { min-width: 0; }
+.board-lane-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 16px; margin: 0 0 12px; }
+.board-count { color: var(--text-secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
+.board-card-group { border: 1px solid var(--border-default); border-radius: 14px; overflow: hidden; background: var(--bg-surface); margin-bottom: 10px; }
+.board-card { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 4px 6px 4px 12px; }
+.board-card-chat { flex: 1; min-width: 0; text-align: left; padding: 10px 0; background: none; border: 0; color: inherit; min-height: 64px; display: grid; gap: 6px; }
+.board-card-chat:disabled { opacity: 1; color: var(--text-secondary); }
+.board-card-title { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.board-card-status { color: var(--text-secondary); font-size: 12px; }
+.board-card-status[data-status="Thinking"] { color: var(--accent-primary); }
+.board-card-status[data-status="Needs your answer"], .board-card-status[data-status="Failed"] { color: var(--accent-warning); }
+.board-card-move { min-width: 54px; min-height: 44px; padding: 8px; border: 0; border-radius: 8px; background: none; color: var(--accent-primary); font-size: 13px; }
+.board-card-move:active, .board-card-chat:active { background: var(--bg-hover); }
+.board-card button:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: -2px; }
+.board-children { margin: 0 10px 10px 20px; border-radius: 10px; background: var(--bg-base); }
+.board-children .board-card + .board-card { border-top: 1px solid var(--border-default); }
+.board-empty { margin: 0; padding: 12px 0; font-size: 14px; color: var(--text-secondary); }
+.board-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--accent-error); overflow-wrap: anywhere; }
+.board-move-sheet h2 { font-size: 18px; min-width: 0; overflow-wrap: anywhere; }
+.board-move-sheet h3 { font-size: 13px; color: var(--text-secondary); margin: 16px 0 4px; }
+.board-note { display: grid; gap: 8px; font-size: 14px; margin: 12px 0; }
+.board-note textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 64px; background: var(--bg-base); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 8px; padding: 10px; font: inherit; }
+.board-lane + .board-lane { margin-top: 24px; }
+.board-connection { position: static; align-items: stretch; margin-top: 8px; }
+.board-connection .connection-banner-inner { max-width: none; }
+.board-connection .connection-banner-inner.connected { align-self: flex-end; }

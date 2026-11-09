@@ -1107,3 +1107,17 @@ async fn finish_native_auth_reconnect(
             }));
     }
 }
+
+pub async fn board_command(
+    state: &AppState,
+    host: &LocalHostId,
+    command: &protocol::BoardCommandPayload,
+) -> Result<(), String> {
+    let stream = state
+        .host_stream_untracked(host)
+        .ok_or("Host is not connected")?;
+    send_frame(host, stream, protocol::FrameKind::BoardCommand, command)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
