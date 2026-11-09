@@ -5,8 +5,8 @@
 use leptos::prelude::*;
 
 use protocol::{
-    Swarm, SwarmBoard, SwarmCommandPayload, SwarmDraft, SwarmDraftId, SwarmId, SwarmMemberState,
-    TeamId,
+    Swarm, SwarmBoard, SwarmCommandPayload, SwarmConstraints, SwarmDraft, SwarmDraftId, SwarmId,
+    SwarmMemberState, TeamId,
 };
 
 use crate::components::swarm_dialogs::SwarmDraftDialog;
@@ -16,7 +16,9 @@ use crate::components::swarm_view::{
     open_swarm_tab, project_name, send_swarm_command, swarm_error_presentation,
 };
 use crate::components::teams_panel::TeamsPanel;
-use crate::state::{AppState, SwarmErrorEntry, TabContent};
+use crate::state::{
+    ActiveProjectRef, AppState, ProjectInfo, SwarmErrorEntry, TabContent, agent_ui_project_id,
+};
 
 /// Which draft dialog is open. A new swarm's draft id is minted when the
 /// dialog opens, so the draft the host creates for it is known exactly.
@@ -34,11 +36,66 @@ impl DraftDialogTarget {
     }
 }
 
+/// Whether a swarm's or draft's project is `filter`, or one of its workbenches.
+fn constraints_in_project(
+    projects: &[ProjectInfo],
+    constraints: &SwarmConstraints,
+    filter: &ActiveProjectRef,
+) -> bool {
+    agent_ui_project_id(projects, &filter.host_id, Some(&constraints.project_id))
+        == Some(&filter.project_id)
+}
+
+/// The number of rows the Swarms panel shows when filtered to `filter`.
+pub(crate) fn project_swarm_count(state: &AppState, filter: &ActiveProjectRef) -> usize {
+    state.projects.with(|projects| {
+        let swarms = state.swarms.with(|map| {
+            map.get(&filter.host_id).map_or(0, |swarms| {
+                swarms
+                    .values()
+                    .filter(|swarm| constraints_in_project(projects, &swarm.constraints, filter))
+                    .count()
+            })
+        });
+        let drafts = state.swarm_drafts.with(|map| {
+            map.get(&filter.host_id).map_or(0, |drafts| {
+                drafts
+                    .values()
+                    .filter(|draft| constraints_in_project(projects, &draft.constraints, filter))
+                    .count()
+            })
+        });
+        swarms + drafts
+    })
+}
+
 #[component]
 pub fn SwarmsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let context_state = state.clone();
-    let swarm_host = Memo::new(move |_| context_state.chat_context_host_id());
+    let project_filter = state.swarm_project_filter;
+    on_cleanup(move || project_filter.set(None));
+    let swarm_host = Memo::new(move |_| match project_filter.get() {
+        Some(filter) => Some(filter.host_id),
+        None => context_state.chat_context_host_id(),
+    });
+    let filter_state = state.clone();
+    let projects_for_filter = state.projects;
+    Effect::new(move |_| {
+        let active = filter_state.active_project.get();
+        if project_filter.with(|filter| filter.is_some() && *filter != active) {
+            project_filter.set(None);
+        }
+    });
+    let filter_project_name = Memo::new(move |_| {
+        let filter = project_filter.get()?;
+        projects_for_filter.with(|projects| {
+            projects
+                .iter()
+                .find(|info| info.host_id == filter.host_id && info.project.id == filter.project_id)
+                .map(|info| info.project.name.clone())
+        })
+    });
     let settings_host = state.selected_host_id;
     let swarms_signal = state.swarms;
     let drafts_signal = state.swarm_drafts;
@@ -79,6 +136,13 @@ pub fn SwarmsPanel() -> impl IntoView {
                 .get(&host_id)
                 .map(|m| m.values().collect())
                 .unwrap_or_default();
+            if let Some(filter) = project_filter.get() {
+                projects_for_filter.with(|projects| {
+                    swarms.retain(|swarm| {
+                        constraints_in_project(projects, &swarm.constraints, &filter)
+                    });
+                });
+            }
             swarms.sort_by(|a, b| {
                 a.name
                     .to_lowercase()
@@ -100,6 +164,13 @@ pub fn SwarmsPanel() -> impl IntoView {
                 .get(&host_id)
                 .map(|m| m.values().cloned().collect())
                 .unwrap_or_default();
+            if let Some(filter) = project_filter.get() {
+                projects_for_filter.with(|projects| {
+                    drafts.retain(|draft| {
+                        constraints_in_project(projects, &draft.constraints, &filter)
+                    });
+                });
+            }
             drafts.sort_by(|a, b| {
                 a.name
                     .to_lowercase()
@@ -156,6 +227,9 @@ pub fn SwarmsPanel() -> impl IntoView {
     view! {
         <div class="panel swarms-panel">
             <div class="panel-filters swarms-panel-toolbar">
+                {move || filter_project_name.get().map(|name| view! {
+                    <crate::components::project_page::ProjectFilterChip name=name on_clear=Callback::new(move |_| project_filter.set(None)) />
+                })}
                 <button
                     class="swarm-btn swarm-btn-primary"
                     disabled=move || swarm_host.get().is_none()
@@ -248,7 +322,7 @@ pub fn SwarmsPanel() -> impl IntoView {
                     </section>
                 </Show>
 
-                <Show when=move || { legacy_team_count.get() > 0 }>
+                <Show when=move || { legacy_team_count.get() > 0 && project_filter.with(Option::is_none) }>
                     <details class="swarms-legacy">
                         <summary class="swarms-section-title">
                             {move || format!("Legacy teams ({})", legacy_team_count.get())}

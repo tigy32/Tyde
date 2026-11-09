@@ -876,6 +876,7 @@ enum TabRenderKey {
     Comments(String, ProjectId),
     Workflow(ActiveAgentRef, ToolCallId),
     Swarm(String, SwarmId),
+    Project(String, ProjectId),
     Missing,
 }
 
@@ -927,6 +928,10 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                 Some(TabContent::Swarm { host_id, swarm_id }) => {
                     TabRenderKey::Swarm(host_id.clone(), swarm_id.clone())
                 }
+                Some(TabContent::Project {
+                    host_id,
+                    project_id,
+                }) => TabRenderKey::Project(host_id.clone(), project_id.clone()),
                 None => TabRenderKey::Missing,
             }
         })
@@ -1010,6 +1015,9 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                     }
                     TabRenderKey::Workflow(agent_ref, tool_call_id) => {
                         view! { <WorkflowView agent_ref=agent_ref tool_call_id=tool_call_id /> }.into_any()
+                    }
+                    TabRenderKey::Project(host_id, project_id) => {
+                        view! { <crate::components::project_page::ProjectPage host_id=host_id project_id=project_id /> }.into_any()
                     }
                     TabRenderKey::Swarm(host_id, swarm_id) => {
                         let visible: Signal<bool> = Signal::derive(is_active);

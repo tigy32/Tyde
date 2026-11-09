@@ -553,6 +553,22 @@ struct RootTree {
     status: ProjectRootStatus,
 }
 
+/// Remove a root from a project once the user confirms.
+pub(crate) fn confirm_and_remove_root(
+    state: AppState,
+    host_id: String,
+    project_id: protocol::ProjectId,
+    root: protocol::ProjectRootPath,
+) {
+    spawn_local(async move {
+        let message = format!("Remove root \"{}\" from this project?", root.0);
+        if !crate::bridge::confirm_dialog("Remove root", &message).await {
+            return;
+        }
+        delete_project_root(&state, host_id, project_id, root);
+    });
+}
+
 fn render_root_section(
     root_tree: RootTree,
     filter: &str,
@@ -586,17 +602,12 @@ fn render_root_section(
         let root_for_remove = root.clone();
         let on_remove = move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
-            let state = expect_context::<AppState>();
-            let host_id = host_id.clone();
-            let project_id = project_id.clone();
-            let root_for_remove = root_for_remove.clone();
-            spawn_local(async move {
-                let message = format!("Remove root \"{}\" from this project?", root_for_remove.0);
-                if !crate::bridge::confirm_dialog("Remove root", &message).await {
-                    return;
-                }
-                delete_project_root(&state, host_id, project_id, root_for_remove);
-            });
+            confirm_and_remove_root(
+                expect_context::<AppState>(),
+                host_id.clone(),
+                project_id.clone(),
+                root_for_remove.clone(),
+            );
         };
         view! {
             <Show when=move || can_manage.get()>

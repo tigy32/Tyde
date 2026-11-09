@@ -1978,7 +1978,12 @@ mod wasm_tests {
                 (1, 1),
                 "Inactive readable views keep their bodies"
             );
-            element(&container, "[title='Ownership A']").click();
+            // A top-level rail row now opens the project page; this guards
+            // restoring the saved view, which is the non-rail switch path.
+            state.switch_active_project(Some(ActiveProjectRef {
+                host_id: "ownership-host".into(),
+                project_id: ProjectId("A".into()),
+            }));
             tick().await;
             assert!(
                 container

@@ -1302,6 +1302,12 @@ pub enum TabContent {
         host_id: String,
         swarm_id: SwarmId,
     },
+    /// A project's page: its agents and everything else about it. Bound to
+    /// the explicit `(host, project)` pair the rail row named.
+    Project {
+        host_id: String,
+        project_id: ProjectId,
+    },
 }
 
 impl TabContent {
@@ -3507,6 +3513,9 @@ fn close_host_runtime_tabs_in_cz(
             TabContent::File { key } => key.host_id == host_id,
             TabContent::Swarm {
                 host_id: tab_host, ..
+            }
+            | TabContent::Project {
+                host_id: tab_host, ..
             } => tab_host == host_id,
             TabContent::Home | TabContent::AgentMonitor => false,
         })
@@ -4107,6 +4116,10 @@ pub struct AppState {
     pub project_view_memory: RwSignal<HashMap<ActiveProjectRef, ProjectViewMemory>>,
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
+    /// Limits the Steering settings tab to one project while set.
+    pub steering_project_filter: RwSignal<Option<ActiveProjectRef>>,
+    /// Limits the Swarms dock panel to one project while set.
+    pub swarm_project_filter: RwSignal<Option<ActiveProjectRef>>,
     pub self_improvement_open_after_write:
         RwSignal<Option<(String, protocol::SettingsWriteId, protocol::SteeringScope)>>,
     pub self_improvement_settings_scope_request:
@@ -4637,6 +4650,8 @@ impl AppState {
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
+            steering_project_filter: RwSignal::new(None),
+            swarm_project_filter: RwSignal::new(None),
             self_improvement_open_after_write: RwSignal::new(None),
             self_improvement_settings_scope_request: RwSignal::new(None),
             self_improvement_scope_request: RwSignal::new(None),
@@ -6972,6 +6987,35 @@ impl AppState {
         // against is the settled one — `active_agent` derives from the center
         // zone, which the match above has just replaced.
         self.drop_draft_bound_to_another_host();
+    }
+
+    /// Keep open project-page tabs named after their project, in the active
+    /// center zone and in every remembered project's.
+    pub fn retitle_project_tabs(&self, host: &str, project: &ProjectId, name: &str) {
+        let retitle = |cz: &mut CenterZoneState| {
+            let mut changed = false;
+            cz.for_each_tab_mut(|_, tab| {
+                if tab.label != name
+                    && matches!(&tab.content, TabContent::Project { host_id, project_id }
+                        if host_id == host && project_id == project)
+                {
+                    tab.label = name.to_owned();
+                    changed = true;
+                }
+            });
+            changed
+        };
+        self.center_zone.maybe_update(retitle);
+        self.project_view_memory.maybe_update(|map| {
+            let mut changed = false;
+            for cz in map
+                .values_mut()
+                .filter_map(|memory| memory.center_zone.as_mut())
+            {
+                changed |= retitle(cz);
+            }
+            changed
+        });
     }
 
     pub fn forget_project_view_memory(&self, project: &ActiveProjectRef) {

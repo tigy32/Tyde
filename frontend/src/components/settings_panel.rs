@@ -9834,11 +9834,38 @@ impl SteeringForm {
     }
 }
 
+pub(crate) fn steering_in_project(item: &Steering, project: &ProjectId) -> bool {
+    matches!(&item.scope, SteeringScope::Project(id) if id == project)
+}
+
 #[component]
-fn SteeringTab() -> impl IntoView {
+pub(crate) fn SteeringTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let form: RwSignal<Option<SteeringForm>> = RwSignal::new(None);
     let pending_delete: RwSignal<Option<PendingSteeringDelete>> = RwSignal::new(None);
+    let project_filter = state.steering_project_filter;
+    on_cleanup(move || project_filter.set(None));
+    let selected_host = state.selected_host_id;
+    Effect::new(move |_| {
+        let host = selected_host.get();
+        if project_filter.with(|filter| {
+            filter
+                .as_ref()
+                .is_some_and(|filter| Some(&filter.host_id) != host.as_ref())
+        }) {
+            project_filter.set(None);
+        }
+    });
+    let filter_state = state.clone();
+    let filter_project_name = Memo::new(move |_| {
+        let filter = project_filter.get()?;
+        filter_state.projects.with(|projects| {
+            projects
+                .iter()
+                .find(|info| info.host_id == filter.host_id && info.project.id == filter.project_id)
+                .map(|info| info.project.name.clone())
+        })
+    });
 
     let state_for_rows = state.clone();
     let rows = Memo::new(move |_| {
@@ -9852,6 +9879,9 @@ fn SteeringTab() -> impl IntoView {
             .cloned()
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
+        if let Some(filter) = project_filter.get() {
+            items.retain(|item| steering_in_project(item, &filter.project_id));
+        }
         items.sort_by(|a, b| a.title.cmp(&b.title));
         items
     });
@@ -9884,6 +9914,9 @@ fn SteeringTab() -> impl IntoView {
     view! {
             <div class="settings-panel-header">
                 <h2 class="settings-panel-title">"Steering"</h2>
+                {move || filter_project_name.get().map(|name| view! {
+                    <crate::components::project_page::ProjectFilterChip name=name on_clear=Callback::new(move |_| project_filter.set(None)) />
+                })}
                 <button
                     class="settings-btn settings-btn-primary"
                     disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
@@ -9904,7 +9937,12 @@ fn SteeringTab() -> impl IntoView {
                     {move || {
                         let list = rows.get();
                         if list.is_empty() {
-                            view! { <div class="panel-empty">"No steering on this host."</div> }.into_any()
+                            let message = if project_filter.get().is_some() {
+                                "No steering on this project."
+                            } else {
+                                "No steering on this host."
+                            };
+                            view! { <div class="panel-empty">{message}</div> }.into_any()
                         } else {
                             view! {
                                 <>

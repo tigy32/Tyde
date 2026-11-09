@@ -45,10 +45,10 @@ struct RailContextMenu {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkbenchCreatePrompt {
-    host_id: String,
-    parent_project_id: protocol::ProjectId,
-    parent_name: String,
+pub(crate) struct WorkbenchCreatePrompt {
+    pub(crate) host_id: String,
+    pub(crate) parent_project_id: protocol::ProjectId,
+    pub(crate) parent_name: String,
 }
 
 type EditingKey = (String, protocol::ProjectId);
@@ -406,11 +406,17 @@ fn ProjectRow(
     let state_for_click = state.clone();
     let host_id_for_click = host_id.clone();
     let project_id_for_click = project_id.clone();
+    let is_workbench_for_click = is_workbench_signal.clone();
     let on_click = move |_| {
-        state_for_click.switch_active_project(Some(ActiveProjectRef {
+        let project = ActiveProjectRef {
             host_id: host_id_for_click.clone(),
             project_id: project_id_for_click.clone(),
-        }));
+        };
+        if is_workbench_for_click() {
+            state_for_click.switch_active_project(Some(project));
+        } else {
+            crate::components::project_page::open_project_page(&state_for_click, project);
+        }
     };
 
     let host_id_for_drag = host_id.clone();
@@ -754,7 +760,7 @@ fn RailContextMenuView(
     }
 }
 
-fn failed_workbench_removal(
+pub(crate) fn failed_workbench_removal(
     state: &AppState,
     host_id: &str,
     workbench_id: &protocol::ProjectId,
@@ -794,6 +800,76 @@ fn failed_workbench_removal(
         failed.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
         failed.into_iter().next()
     })
+}
+
+/// Delete a project once the user confirms.
+pub(crate) fn request_delete_project(
+    state: AppState,
+    host_id: String,
+    project_id: protocol::ProjectId,
+) {
+    let project_name = project_display_name(&state, &host_id, &project_id);
+    spawn_local(async move {
+        let message = format!(
+            "Delete project \"{project_name}\"? Sessions and history will be preserved without this project."
+        );
+        if !crate::bridge::confirm_dialog("Delete project", &message).await {
+            return;
+        }
+        delete_project(&state, host_id, project_id);
+    });
+}
+
+/// Remove a workbench once the user confirms, or reopen the recovery prompt
+/// when an earlier removal failed.
+pub(crate) fn request_remove_workbench(
+    state: AppState,
+    host_id: String,
+    workbench_id: protocol::ProjectId,
+) {
+    let workbench_name = project_display_name(&state, &host_id, &workbench_id);
+    if let Some((operation_stream, message)) =
+        failed_workbench_removal(&state, &host_id, &workbench_id)
+    {
+        state
+            .workbench_remove_prompt
+            .set(Some(WorkbenchRemovePrompt {
+                host_id,
+                operation_stream,
+                project_id: workbench_id,
+                project_name: workbench_name,
+                message,
+            }));
+        return;
+    }
+    spawn_local(async move {
+        let message = format!(
+            "Remove workbench '{workbench_name}'? This will remove its git worktree and all associated agents, terminals, sessions, steering, team references, reviews, and workflow runs."
+        );
+        if !crate::bridge::confirm_dialog("Remove workbench", &message).await {
+            return;
+        }
+        remove_workbench(&state, host_id, workbench_id, false);
+    });
+}
+
+fn project_display_name(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+) -> String {
+    state
+        .projects
+        .get_untracked()
+        .into_iter()
+        .find_map(|info| {
+            if info.host_id == host_id && &info.project.id == project_id {
+                Some(info.project.name)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 #[component]
@@ -909,27 +985,7 @@ fn ProjectContextMenuItems(
         let project_id = project_id_for_delete.clone();
         let state = expect_context::<AppState>();
         context_menu.set(None);
-        let project_name = state
-            .projects
-            .get_untracked()
-            .into_iter()
-            .find_map(|info| {
-                if info.host_id == host_id && info.project.id == project_id {
-                    Some(info.project.name)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-        spawn_local(async move {
-            let message = format!(
-                "Delete project \"{project_name}\"? Sessions and history will be preserved without this project."
-            );
-            if !crate::bridge::confirm_dialog("Delete project", &message).await {
-                return;
-            }
-            delete_project(&state, host_id, project_id);
-        });
+        request_delete_project(state, host_id, project_id);
     };
 
     let host_id_for_remove_wb = project.host_id.clone();
@@ -939,41 +995,7 @@ fn ProjectContextMenuItems(
         let workbench_id = project_id_for_remove_wb.clone();
         let state = expect_context::<AppState>();
         context_menu.set(None);
-        let workbench_name = state
-            .projects
-            .get_untracked()
-            .into_iter()
-            .find_map(|info| {
-                if info.host_id == host_id && info.project.id == workbench_id {
-                    Some(info.project.name)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-        if let Some((operation_stream, message)) =
-            failed_workbench_removal(&state, &host_id, &workbench_id)
-        {
-            state
-                .workbench_remove_prompt
-                .set(Some(WorkbenchRemovePrompt {
-                    host_id,
-                    operation_stream,
-                    project_id: workbench_id,
-                    project_name: workbench_name,
-                    message,
-                }));
-            return;
-        }
-        spawn_local(async move {
-            let message = format!(
-                "Remove workbench '{workbench_name}'? This will remove its git worktree and all associated agents, terminals, sessions, steering, team references, reviews, and workflow runs."
-            );
-            if !crate::bridge::confirm_dialog("Remove workbench", &message).await {
-                return;
-            }
-            remove_workbench(&state, host_id, workbench_id, false);
-        });
+        request_remove_workbench(state, host_id, workbench_id);
     };
 
     view! {
@@ -1014,7 +1036,7 @@ fn ProjectContextMenuItems(
 }
 
 #[component]
-fn WorkbenchCreateModal(
+pub(crate) fn WorkbenchCreateModal(
     prompt: WorkbenchCreatePrompt,
     workbench_prompt: RwSignal<Option<WorkbenchCreatePrompt>>,
 ) -> impl IntoView {

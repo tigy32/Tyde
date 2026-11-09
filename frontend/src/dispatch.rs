@@ -1876,6 +1876,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
+                state.retitle_project_tabs(host_id, &project.id, &project.name);
                 state.projects.update(|projects| {
                     if let Some(existing) = projects
                         .iter_mut()
