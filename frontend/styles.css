@@ -18344,18 +18344,40 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .pp-btn { height: 32px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 6px; font: inherit; font-weight: 500; cursor: pointer; }
 .pp-btn-icon { width: 32px; padding: 0; color: var(--text-secondary); background: var(--surface-1); box-shadow: inset 0 0 0 1px var(--border-primary); }
 .pp-btn-icon:hover { color: var(--text-primary); background: var(--surface-2); }
+.pp-btn:disabled { opacity: .5; cursor: default; }
+.pp-btn-plain { color: var(--text-primary); background: var(--surface-3); box-shadow: inset 0 0 0 1px var(--border-secondary); }
+.pp-btn-plain:hover:not(:disabled) { box-shadow: inset 0 0 0 1px var(--text-tertiary); }
 .pp-btn-primary { color: var(--text-on-accent); background: var(--accent-primary); }
 .pp-btn-primary:hover { background: var(--accent-hover); }
 .pp-body { flex: 1; min-height: 0; display: flex; }
 .pp-board { flex: 1; min-width: 0; padding: 16px; overflow: auto; }
-.pp-lanes { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(240px, calc((100% - 48px) / 4)); column-gap: 16px; align-items: start; }
-.pp-lane { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.pp-lanes { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(240px, calc((100% - 48px) / 4)); column-gap: 16px; align-items: stretch; min-height: 100%; }
+.pp-lane { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: -4px; padding: 4px; border-radius: 6px; }
+.pp-lane-drop { background: var(--surface-1); box-shadow: inset 0 0 0 1px var(--border-secondary); }
 .pp-lane-head { height: 24px; display: flex; align-items: center; gap: 6px; }
-.pp-lane-name { font-weight: 500; color: var(--text-primary); white-space: nowrap; }
+.pp-lane-name { min-width: 0; font-weight: 500; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pp-lane-head .pp-count { flex: none; }
 .pp-count { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
-.pp-card { display: flex; flex-direction: column; gap: 2px; min-width: 0; width: 100%; padding: 8px 12px; border: 0; border-radius: 4px; font: inherit; text-align: left; background: var(--surface-1); box-shadow: inset 0 0 0 1px var(--border-primary); cursor: pointer; }
+.pp-card-slot { position: relative; min-width: 0; }
+.pp-card { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 8px 12px; border-radius: 4px; background: var(--surface-1); box-shadow: inset 0 0 0 1px var(--border-primary); cursor: pointer; outline: none; }
 .pp-card:hover { background: var(--surface-2); }
-.pp-card-title { font-weight: 500; color: var(--text-primary); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.pp-card-nested { background: var(--surface-2); }
+.pp-card-nested:hover { background: var(--surface-3); }
+.pp-card-archived { cursor: default; }
+.pp-card-archived:hover { background: var(--surface-1); }
+.pp-card-nested.pp-card-archived:hover { background: var(--surface-2); }
+.pp-card-drop { box-shadow: inset 0 0 0 1px var(--accent-primary); }
+.pp-card-dragging { opacity: .5; }
+.pp-card-title { font-weight: 500; color: var(--text-primary); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; padding-right: 16px; border-radius: 2px; outline: none; }
+.pp-card-title:focus-visible { box-shadow: 0 0 0 1px var(--accent-primary); }
+.pp-card-more { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 4px; color: var(--text-secondary); background: var(--surface-3); cursor: pointer; opacity: 0; }
+.pp-card-more:hover { color: var(--text-primary); }
+.pp-card-slot:hover > .pp-card-more, .pp-card-slot:focus-within > .pp-card-more { opacity: 1; }
+.pp-subcards { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.pp-note { font-size: 12px; line-height: 16px; color: var(--text-primary); margin-top: 2px; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.pp-history { list-style: none; margin: 6px 0 0; padding: 0; max-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; font-size: 12px; line-height: 16px; color: var(--text-secondary); }
+.pp-history-row { display: flex; justify-content: space-between; gap: 8px; }
+.pp-history-place { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pp-card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; line-height: 16px; color: var(--text-secondary); }
 .pp-state { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
 .pp-state .pp-ic { margin-left: -2px; }
@@ -18383,5 +18405,25 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .pp-row:hover, .pp-row:focus-within { background: var(--surface-2); }
 .pp-row:hover .pp-row-act, .pp-row:focus-within .pp-row-act { display: flex; }
 .pp-row-swap:hover .pp-row-meta, .pp-row-swap:focus-within .pp-row-meta { display: none; }
+.pp-scrim { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0, 0, 0, .62); }
+.pp-dialog { width: 640px; max-width: 100%; max-height: 100%; display: flex; flex-direction: column; padding: 16px; border-radius: 8px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border-primary), 0 8px 32px rgba(0, 0, 0, .5); outline: none; }
+.pp-dialog-title { flex: none; margin-bottom: 12px; font-size: 16px; font-weight: 500; color: var(--text-bright); }
+.pp-lane-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.pp-lane-edit { flex: none; padding: 4px 0 8px; display: grid; row-gap: 4px; grid-template-columns: 20px minmax(0, 1fr) 24px; align-items: center; }
+.pp-lane-handle { grid-column: 1; display: flex; align-items: center; color: var(--text-tertiary); cursor: grab; border-radius: 2px; outline: none; }
+.pp-lane-handle:hover { color: var(--text-secondary); }
+.pp-lane-handle:focus-visible { box-shadow: 0 0 0 1px var(--accent-primary); }
+.pp-field { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 0; border-radius: 4px; box-shadow: inset 0 0 0 1px var(--border-primary); outline: none; }
+.pp-field:focus { box-shadow: inset 0 0 0 1px var(--accent-primary); }
+.pp-lane-name-field { grid-column: 2; margin-left: 4px; height: 32px; padding: 0 8px; }
+.pp-lane-remove { grid-column: 3; justify-self: end; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 4px; color: var(--text-tertiary); background: none; cursor: pointer; }
+.pp-lane-remove:hover { color: var(--text-primary); background: var(--surface-3); }
+.pp-lane-instructions { grid-column: 2; margin-left: 4px; display: block; min-height: 32px; padding: 6px 8px; color: var(--text-secondary); resize: none; overflow: hidden; }
+.pp-lane-instructions::placeholder { color: var(--text-tertiary); }
+.pp-lane-add { flex: none; align-self: flex-start; margin: 4px 0 8px 24px; padding: 0 0 0 8px; display: inline-flex; align-items: center; gap: 6px; border: 0; font: inherit; color: var(--text-secondary); background: none; cursor: pointer; }
+.pp-lane-add:hover { color: var(--text-primary); }
+.pp-dialog-error { flex: none; margin-top: 8px; color: var(--error); font-size: 12px; line-height: 16px; }
+.pp-dialog-foot { flex: none; display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+@media (hover: none) { .pp-card-more { opacity: 1; } }
 .pp-filter-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 160px; height: 24px; padding: 0 4px 0 8px; border: 0; border-radius: 4px; font: inherit; font-size: 12px; color: var(--text-primary); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border-primary); cursor: pointer; }
 .pp-filter-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

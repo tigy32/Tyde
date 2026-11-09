@@ -3531,6 +3531,17 @@ fn close_host_runtime_tabs_in_cz(
     removed
 }
 
+/// A submitted Lanes edit awaiting the server. Cleared when `BoardState`
+/// carries exactly these lanes; `error` holds a rejection for the open dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardLanesSave {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub expected_version: u64,
+    pub lanes: Vec<protocol::BoardLane>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
     pub host_id: String,
@@ -4264,6 +4275,9 @@ pub struct AppState {
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
     pub skills: RwSignal<HashMap<String, HashMap<SkillId, Skill>>>,
     pub workflow_summaries: RwSignal<HashMap<String, Vec<WorkflowSummary>>>,
+    /// Latest server board per (host, canonical project). Replaced whole by each `BoardState`.
+    pub boards: RwSignal<HashMap<(String, ProjectId), protocol::BoardStatePayload>>,
+    pub board_lanes_save: RwSignal<Option<BoardLanesSave>>,
     pub workflow_diagnostics: RwSignal<HashMap<String, Vec<WorkflowDiagnostic>>>,
     pub workflow_runs: RwSignal<HashMap<String, HashMap<WorkflowRunId, WorkflowRunSnapshot>>>,
     /// Server-sent workflow catalog directories (global + per project root),
@@ -4712,6 +4726,8 @@ impl AppState {
             steering: RwSignal::new(HashMap::new()),
             skills: RwSignal::new(HashMap::new()),
             workflow_summaries: RwSignal::new(HashMap::new()),
+            boards: RwSignal::new(HashMap::new()),
+            board_lanes_save: RwSignal::new(None),
             workflow_diagnostics: RwSignal::new(HashMap::new()),
             workflow_runs: RwSignal::new(HashMap::new()),
             workflow_locations: RwSignal::new(HashMap::new()),
@@ -5395,6 +5411,17 @@ impl AppState {
     pub fn chat_context_host_settings_untracked(&self) -> Option<HostSettings> {
         let host_id = self.chat_context_host_id_untracked()?;
         self.host_settings_untracked(&host_id)
+    }
+
+    /// A board subscription lives on one connection, so its state ends with it.
+    fn clear_host_boards(&self, host_id: &str) {
+        self.boards
+            .update(|boards| boards.retain(|(host, _), _| host != host_id));
+        self.board_lanes_save.update(|save| {
+            if let Some(save) = save.as_mut().filter(|save| save.host_id == host_id) {
+                save.error = Some("Host disconnected".to_owned());
+            }
+        });
     }
 
     pub fn host_stream_untracked(&self, host_id: &str) -> Option<StreamPath> {
@@ -7136,6 +7163,7 @@ impl AppState {
         self.host_streams.update(|streams| {
             streams.remove(host_id);
         });
+        self.clear_host_boards(host_id);
         crate::send::clear_host_seqs(host_id);
         crate::dispatch::reset_inbound_state_for_host(host_id);
         self.session_list_pages
@@ -7446,6 +7474,7 @@ impl AppState {
         self.host_streams.update(|streams| {
             streams.remove(host_id);
         });
+        self.clear_host_boards(host_id);
         // Drop per-host validator state on both directions. Otherwise a
         // reconnect keeps stale seq/protocol stream state, but the server
         // builds fresh validators per connection and replays bootstraps from

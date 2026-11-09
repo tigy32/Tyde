@@ -1395,6 +1395,26 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::BoardState => match envelope.parse_payload::<protocol::BoardStatePayload>() {
+            Ok(payload) => apply_board_state(state, host_id, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse BoardState payload: {error}"),
+            ),
+        },
+        FrameKind::BoardError => match envelope.parse_payload::<protocol::BoardErrorPayload>() {
+            Ok(payload) => apply_board_error(state, host_id, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse BoardError payload: {error}"),
+            ),
+        },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
             Ok(payload) => {
                 log::info!(
@@ -3350,6 +3370,42 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
+    }
+}
+
+fn apply_board_state(state: &AppState, host_id: &str, payload: protocol::BoardStatePayload) {
+    state.board_lanes_save.update(|save| {
+        if save.as_ref().is_some_and(|save| {
+            save.host_id == host_id
+                && save.project_id == payload.project_id
+                && payload.version > save.expected_version
+                && payload.lanes == save.lanes
+        }) {
+            *save = None;
+        }
+    });
+    state.boards.update(|boards| {
+        boards.insert((host_id.to_owned(), payload.project_id.clone()), payload);
+    });
+}
+
+/// A rejection belongs to the Lanes dialog while it has an edit in flight, and
+/// to the app-wide notice otherwise: moves have no surface of their own.
+fn apply_board_error(state: &AppState, host_id: &str, payload: protocol::BoardErrorPayload) {
+    let mut for_dialog = false;
+    state.board_lanes_save.update(|save| {
+        if let Some(save) = save.as_mut().filter(|save| {
+            save.host_id == host_id && save.project_id == payload.project_id && save.error.is_none()
+        }) {
+            save.error = Some(payload.message.clone());
+            for_dialog = true;
+        }
+    });
+    if !for_dialog {
+        crate::components::header::report_user_error(format!(
+            "Board update failed: {}",
+            payload.message
+        ));
     }
 }
 

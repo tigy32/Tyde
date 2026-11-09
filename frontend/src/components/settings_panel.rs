@@ -12440,6 +12440,8 @@ mod wasm_tests {
         document.head().unwrap().append_child(&style).unwrap();
         let calls = install_settings_send_stub();
         let state = AppState::new();
+        crate::notices::clear_scope(&crate::notices::NoticeScope::Settings(None));
+        crate::notices::clear_host("host-lp");
         install_launch_profile_host(&state, Vec::new());
         crate::dispatch::prime_host_with_bootstrap_for_tests(&state, "host-lp", |bootstrap| {
             bootstrap.settings.chatgpt_dots_enabled = true;
@@ -12893,7 +12895,8 @@ mod wasm_tests {
             copy_error.text_content().unwrap_or_default().contains(
                 "Could not copy the server URL. Copy it manually before opening ChatGPT."
             ),
-            "Open ChatGPT must explain when its required URL copy fails"
+            "Open ChatGPT must explain when its required URL copy fails; first alert: {:?}",
+            copy_error.text_content()
         );
         let opens_after_copy_failure = calls
             .iter()
@@ -15135,6 +15138,8 @@ mod wasm_tests {
         state.streaming_text.update(|streams| {
             streams.insert(protocol::AgentId("private-id-marker".to_owned()), stream);
         });
+        crate::notices::clear_scope(&crate::notices::NoticeScope::Settings(None));
+        crate::notices::clear_host("host-general");
         install_general_host_settings(&state, true, false, None);
         let mut schema = settings_model::host_settings_schema().clone();
         schema
@@ -15266,7 +15271,13 @@ mod wasm_tests {
                 .unwrap()
                 .text_content()
                 .unwrap()
-                .contains("Stall capture action failed")
+                .contains("Stall capture action failed"),
+            "first alert: {:?}",
+            container
+                .query_selector("[role=alert]")
+                .unwrap()
+                .unwrap()
+                .text_content()
         );
         assert_eq!(
             calls
