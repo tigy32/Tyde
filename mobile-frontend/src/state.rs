@@ -990,6 +990,7 @@ pub struct NativeChatDestination {
     pub local_host_id: LocalHostId,
     pub stream: StreamPath,
     pub tab: MobileTab,
+    pub root_tab: MobileTab,
     pub draft_id: uuid::Uuid,
     pub source_agent: Option<ActiveAgentRef>,
     pub created_agent: Option<AgentId>,
@@ -1055,6 +1056,7 @@ pub struct AppState {
     // Tab navigation within the per-host workspace
     pub active_tab: RwSignal<MobileTab>,
     pub viewing_chat: RwSignal<bool>,
+    pub chat_root_tab: RwSignal<MobileTab>,
     pub chat_origin_tab: RwSignal<MobileTab>,
     pub chat_back_stack: RwSignal<Vec<ActiveAgentRef>>,
     pub chat_draft_id: RwSignal<uuid::Uuid>,
@@ -1334,8 +1336,28 @@ impl AppState {
     fn enter_chat(&self, parents: Vec<ActiveAgentRef>) {
         self.native_chat_destination.set(None);
         self.chat_back_stack.set(parents);
+        let root_tab = self.chat_root_for_entry();
+        self.chat_root_tab.set(root_tab);
+        if root_tab == MobileTab::Home && self.active_tab.get_untracked() == MobileTab::Home {
+            self.active_tab.set(MobileTab::Agents);
+        }
         self.chat_origin_tab.set(self.active_tab.get_untracked());
         self.viewing_chat.set(true);
+    }
+
+    pub(crate) fn chat_root_for_entry(&self) -> MobileTab {
+        if crate::native::chat_visible(self) {
+            return self.chat_root_tab.get_untracked();
+        }
+        if self.active_tab.get_untracked() == MobileTab::Home
+            && self.board_project.get_untracked().is_some_and(|target| {
+                Some(target.local_host_id) == self.active_local_host_id.get_untracked()
+            })
+        {
+            MobileTab::Home
+        } else {
+            MobileTab::Agents
+        }
     }
 
     pub fn back_destination(&self) -> Option<BackDestination> {
@@ -1358,7 +1380,7 @@ impl AppState {
     fn chat_back_destination(&self) -> BackDestination {
         self.chat_back_stack.with(|parents| match parents.last() {
             Some(parent) => BackDestination::Chat(Some(parent.clone())),
-            None => BackDestination::Root(MobileTab::Agents),
+            None => BackDestination::Root(self.chat_root_tab.get()),
         })
     }
 
@@ -1372,9 +1394,9 @@ impl AppState {
                     parents.pop();
                 });
                 self.active_agent.set(parent);
-            } else {
-                self.active_tab.set(MobileTab::Agents);
-                self.chat_origin_tab.set(MobileTab::Agents);
+            } else if let BackDestination::Root(tab) = destination {
+                self.active_tab.set(tab);
+                self.chat_origin_tab.set(tab);
                 self.viewing_chat.set(false);
             }
         });
@@ -1403,7 +1425,10 @@ impl AppState {
                             .unwrap_or_else(|| "Back to parent chat".into())
                     })
                 })
-                .unwrap_or_else(|| "Back to Agents".into())
+                .unwrap_or_else(|| match self.chat_root_tab.get() {
+                    MobileTab::Home => "Back to board".into(),
+                    _ => "Back to Agents".into(),
+                })
         })
     }
 
@@ -1442,6 +1467,7 @@ impl AppState {
 
             active_tab: RwSignal::new(MobileTab::Home),
             viewing_chat: RwSignal::new(false),
+            chat_root_tab: RwSignal::new(MobileTab::Agents),
             chat_origin_tab: RwSignal::new(MobileTab::Home),
             chat_back_stack: RwSignal::new(Vec::new()),
             chat_draft_id: RwSignal::new(uuid::Uuid::new_v4()),

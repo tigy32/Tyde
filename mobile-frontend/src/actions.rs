@@ -33,6 +33,7 @@ pub async fn spawn_chat(
                     local_host_id: host.clone(),
                     stream: stream.clone(),
                     tab: state.active_tab.get_untracked(),
+                    root_tab: state.chat_root_for_entry(),
                     draft_id: draft.map_or_else(
                         || state.chat_draft_id.get_untracked(),
                         |draft| draft.draft_id,

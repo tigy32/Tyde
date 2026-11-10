@@ -360,8 +360,7 @@ test('project board moves and nests only through typed server state on a phone',
   await page.waitForFunction(() => window.__TYDE_FIXTURE_READY__ === true);
   const commands = () => page.evaluate(() => (window.__TYDE_FIXTURE_SENT_LINES__ ?? []).map(JSON.parse).filter(e => e.kind === 'board_command').map(e => e.payload));
   expect(await commands()).toEqual([]);
-  await page.getByRole('button',{name:'Projects',exact:true}).click();
-  await page.getByRole('dialog',{name:'Projects',exact:true}).getByRole('button',{name:'Tyde',exact:true}).click();
+  await page.getByRole('region',{name:'Projects',exact:true}).getByRole('button',{name:'Tyde',exact:true}).click();
   const board = page.locator('[data-mobile-test=project-board]');
   await expect(board).toBeVisible();
   await page.waitForFunction(() => (window.__TYDE_FIXTURE_SENT_LINES__ ?? []).some(line => JSON.parse(line).kind === 'board_command'));
@@ -442,7 +441,7 @@ test('project board moves and nests only through typed server state on a phone',
   await expect(active.getByRole('button',{name:'Keyboard review Thinking',exact:true})).toBeVisible();
   await active.getByRole('button',{name:'Mira Thinking',exact:true}).click();
   await expect(page.locator('[data-mobile-test=chat-view]')).toBeVisible();
-  await page.getByRole('button',{name:'Back to Agents',exact:true}).click();
+  await page.getByRole('button',{name:'Back to board',exact:true}).click();
   await expect(board).toBeVisible();
   await done.getByRole('button',{name:'Document release notes Closed',exact:true}).click();
   await page.waitForFunction(() => window.__TYDE_FIXTURE_SENT_LINES__.map(JSON.parse).some(e => e.kind === 'spawn_agent'));
@@ -469,8 +468,7 @@ test('project board moves and nests only through typed server state on a phone',
   const project = await page.evaluate(() => JSON.parse(window.__TYDE_FIXTURE_BOARD_PROJECT__));
   await emit('project_notify',{kind:'delete',project});
   await expect(board).toHaveCount(0);
-  await page.getByRole('button',{name:'Projects',exact:true}).click();
-  await expect(page.getByRole('dialog',{name:'Projects',exact:true}).getByRole('button',{name:'Tyde',exact:true})).toHaveCount(0);
-  await expect(page.getByRole('dialog',{name:'Projects',exact:true}).getByRole('button',{name:'Tychat',exact:true})).toBeVisible();
+  await expect(page.getByRole('region',{name:'Projects',exact:true}).getByRole('button',{name:'Tyde',exact:true})).toHaveCount(0);
+  await expect(page.getByRole('region',{name:'Projects',exact:true}).getByRole('button',{name:'Tychat',exact:true})).toBeVisible();
 
 });

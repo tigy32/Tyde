@@ -6,54 +6,7 @@ use protocol::{
 use wasm_bindgen_futures::spawn_local;
 
 use super::ui::{Button, ButtonSize, ButtonVariant, Spinner};
-use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AgentRef, AppState, LocalHostId, sort_project_infos,
-};
-
-#[component]
-pub fn ProjectDirectory(open: RwSignal<bool>) -> impl IntoView {
-    let state = StoredValue::new(use_context::<AppState>().unwrap());
-    crate::native::track_modal(open);
-    let focus: NodeRef<leptos::html::Div> = NodeRef::new();
-    Effect::new(move |_| {
-        if open.get()
-            && let Some(element) = focus.get()
-        {
-            let _ = element.focus();
-        }
-    });
-    view! {
-        <Show when=move || open.get()>
-            <div class="project-sheet-backdrop" role="dialog" aria-modal="true" aria-label="Projects" tabindex="-1" node_ref=focus
-                on:keydown=move |event| { if event.key() == "Escape" { open.set(false); } }
-                on:click=move |_| open.set(false)>
-                <div class="project-sheet" on:click=|event| event.stop_propagation()>
-                    <div class="board-header-actions"><h2>"Projects"</h2>
-                        <Button label="Close" variant=ButtonVariant::Ghost on_click=Callback::new(move |_| open.set(false)) />
-                    </div>
-                    <div class="project-sheet-list">
-                    {move || {
-                        let state = state.get_value();
-                        let host = state.active_local_host_id.get();
-                        let mut projects = state.projects.get().into_iter().filter(|info|
-                            Some(info.local_host_id.clone()) == host && info.project.parent_project_id().is_none()
-                        ).collect::<Vec<_>>();
-                        sort_project_infos(&mut projects);
-                        if projects.is_empty() { return view! { <p>"No projects"</p> }.into_any(); }
-                        projects.into_iter().map(|info| {
-                            let state = state.clone();
-                            view! { <button class="project-sheet-row" on:click=move |_| {
-                                state.board_project.set(Some(ActiveProjectRef { local_host_id: info.local_host_id.clone(), project_id: info.project.id.clone() }));
-                                open.set(false);
-                            }>{info.project.name}</button> }
-                        }).collect_view().into_any()
-                    }}
-                    </div>
-                </div>
-            </div>
-        </Show>
-    }
-}
+use crate::state::{ActiveAgentRef, ActiveProjectRef, AgentRef, AppState, LocalHostId};
 
 fn send(
     state: AppState,
@@ -177,13 +130,13 @@ pub fn ProjectBoard(target: ActiveProjectRef) -> impl IntoView {
                     <Button label="New agent" variant=ButtonVariant::Primary size=ButtonSize::Compact on_click=new_chat />
                 </header>
                 <super::ConnectionBanner inline=true />
-            </div>
-            <div class="view-body"><div class="shell-flow board-lanes">
                 {move || error_text().map(|message| view! {
                     <div class="board-error" role="alert"><span>{message}</span>
                         <Show when=can_dismiss><Button label="Dismiss" variant=ButtonVariant::Ghost on_click=dismiss /></Show>
                     </div>
                 })}
+            </div>
+            <div class="view-body"><div class="shell-flow board-lanes">
                 {move || match board.get() {
                     None if storage_failed.get() => ().into_any(),
                     None => view! { <Spinner aria_label="Loading board".to_owned() /> }.into_any(),

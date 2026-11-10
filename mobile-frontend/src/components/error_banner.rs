@@ -204,8 +204,7 @@ mod wasm_tests {
                 native.style().set_property("width", &format!("{width}px")).unwrap();
                 next_tick().await;
                 check(visible("[role='alert']") == 1, "Native mismatch must have one visible error, not three parallel diagnostic paragraphs")?;
-                check(native.query_selector("[data-mobile-test='home-connection-pill']").unwrap().is_none()
-                    && native.query_selector("[data-mobile-test='home-stat-host']").unwrap().is_none(),
+                check(native.query_selector("[data-mobile-test='home-connection-pill']").unwrap().is_none(),
                     "Native Home keeps one honest dot/status rather than repeated pill and connection card")?;
                 check(native.query_selector(".home-hero-status-label").unwrap().unwrap().text_content().as_deref() == Some("Update required"),
                     "Reducing duplicate notices must preserve the actual typed update-required status")?;
@@ -339,10 +338,10 @@ mod wasm_tests {
                 .unwrap()
                 .is_some()
                 && browser
-                    .query_selector("[data-mobile-test='home-stat-host']")
+                    .query_selector("[data-mobile-test='home-hero-status']")
                     .unwrap()
                     .is_some(),
-            "Browser Home layout remains unchanged"
+            "Browser Home retains its connection pill and host status"
         );
         drop(browser_handle);
         browser.remove();

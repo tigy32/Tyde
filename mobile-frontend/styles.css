@@ -3767,15 +3767,7 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    padding: var(--space-5) var(--space-4) var(--space-3);
-}
-
-.home-hero-greeting {
-    font-size: var(--text-sm);
-    color: var(--text-secondary);
-    margin: 0;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    padding: 0;
 }
 
 .home-hero-host {
@@ -3790,47 +3782,11 @@ input, textarea, select {
     word-break: break-word;
 }
 
-.home-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
-}
-
-.home-stat-card {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-}
-
-.home-stat-value {
-    font-size: var(--text-2xl);
-    font-weight: var(--weight-bold);
-    color: var(--text-primary);
-    line-height: var(--line-tight);
-    font-variant-numeric: tabular-nums;
-}
-
-.home-stat-label {
-    font-size: var(--text-sm);
-    color: var(--text-secondary);
-    margin: 0;
-}
-
-.home-quick-actions {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3) var(--space-4);
-}
-
-.home-quick-actions-title {
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-tertiary);
-    margin: var(--space-2) 0 var(--space-1);
-}
+.home-layout { display: grid; gap: var(--space-6); padding: var(--space-5) var(--space-4); }
+.home-primary { display: flex; flex-direction: column; gap: var(--space-5); min-width: 0; }
+.home-recents { min-width: 0; }
+.home-view .section-heading { padding: 0; margin-bottom: var(--space-2); }
+.home-view .agent-list { padding: 0; margin: 0; gap: var(--space-2); }
 
 .list-row {
     display: flex;
@@ -5566,34 +5522,9 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
         margin: 0;
     }
 
-    .home-view > .shell-flow:has(> .agent-list) {
-        display: grid;
+    .home-layout:has(> .home-recents) {
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        column-gap: var(--space-4);
-    }
-
-    .home-view .home-hero,
-    .home-view .home-grid {
-        grid-column: 1 / -1;
-    }
-
-    .home-grid {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .home-view .home-quick-actions {
-        grid-column: 1;
-        grid-row: 3 / 5;
-    }
-
-    .home-view .section-heading {
-        grid-column: 2;
-        grid-row: 3;
-    }
-
-    .home-view .agent-list {
-        grid-column: 2;
-        grid-row: 4;
+        align-items: start;
     }
 }
 
@@ -5908,11 +5839,6 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 
 /* Moving Home's existing identity/status into native chrome removes only its header row. */
 [data-native-host] .home-hero[hidden] { display: none; }
-@container tws (min-width: 640px) {
-    [data-native-host] .home-view:has(.home-hero[hidden]) .home-quick-actions { grid-row: 2 / 4; }
-    [data-native-host] .home-view:has(.home-hero[hidden]) .section-heading { grid-row: 2; }
-    [data-native-host] .home-view:has(.home-hero[hidden]) .agent-list { grid-row: 3; }
-}
 
 [data-native-host] .chat-context-bar {
     inset: auto;
@@ -5978,10 +5904,17 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 }
 
 /* The one WebKit scene stays attached while UIKit transitions its chrome. */
-[data-native-host] .native-workspace:not(.native-split) { position: relative; isolation: isolate; }
-[data-native-host] .native-workspace:not(.native-split) > .native-pane {
+[data-native-host] .native-workspace { position: relative; isolation: isolate; }
+[data-native-host] .native-workspace:not(.native-split) > .native-pane,
+[data-native-host] .native-workspace > [data-native-back-destination] {
     position: absolute;
     inset: 0;
+    background: var(--bg-base);
+}
+[data-native-host] .native-split > .native-agents-pane,
+[data-native-host] .native-split > .native-chat-pane {
+    position: relative;
+    z-index: 1;
     background: var(--bg-base);
 }
 [data-native-host] .native-back-target {
@@ -6022,11 +5955,13 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 }
 [data-native-host] .native-chat-pane { position: relative; isolation: isolate; }
 
-/* Project boards use the same single-column rhythm as the agent list. */
 .board-header-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mobile-project-page { display: flex; flex-direction: column; }
+.mobile-project-page > .shell-header { align-self: stretch; position: static; flex-shrink: 0; padding-block: var(--space-3); }
+.mobile-project-page > .view-body { min-height: 0; }
 .mobile-project-page .view-header { gap: 8px; }
 .mobile-project-page .view-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.board-lanes { gap: 24px; }
+.mobile-project-page .board-lanes { gap: 24px; padding: 16px 16px max(16px, var(--tws-clear-bottom, 16px)); }
 .board-lane { min-width: 0; }
 .board-lane-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 16px; margin: 0 0 12px; }
 .board-count { color: var(--text-secondary); font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -6053,3 +5988,15 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 .board-connection { position: static; align-items: stretch; margin-top: 8px; }
 .board-connection .connection-banner-inner { max-width: none; }
 .board-connection .connection-banner-inner.connected { align-self: flex-end; }
+
+.home-view[hidden] { display: none; }
+.home-project-list { display: grid; gap: var(--space-2); }
+.home-project-row { min-height: 60px; padding: var(--space-4); border: 1px solid var(--border-default); border-radius: var(--radius-lg); background: var(--bg-surface); color: var(--text-primary); text-align: left; font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.home-project-row:active { background: var(--bg-hover); }
+.home-project-row:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+@container tws (min-width: 640px) {
+    .mobile-project-page > .view-body { display: flex; overflow: hidden; }
+    .mobile-project-page .board-lanes { display: flex; flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; align-items: stretch; max-width: none; }
+    .board-lane { flex: 0 0 320px; overflow-y: auto; }
+    .board-lane + .board-lane { margin-top: 0; }
+}

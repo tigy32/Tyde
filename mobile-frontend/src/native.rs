@@ -506,8 +506,17 @@ pub fn open_created_chat(state: &AppState) {
             local_host_id: target.local_host_id,
             agent_id,
         }));
+        let chat_tab = if target.root_tab == MobileTab::Home && target.tab == MobileTab::Home {
+            if state.active_tab.get_untracked() == target.tab {
+                state.active_tab.set(MobileTab::Agents);
+            }
+            MobileTab::Agents
+        } else {
+            target.tab
+        };
         state.chat_back_stack.set(Vec::new());
-        state.chat_origin_tab.set(target.tab);
+        state.chat_root_tab.set(target.root_tab);
+        state.chat_origin_tab.set(chat_tab);
         state.viewing_chat.set(true);
     });
 }
@@ -552,6 +561,7 @@ pub fn open_host(state: &AppState, local_host_id: LocalHostId) {
             state.native_chat_destination.set(None);
         }
         if changed {
+            state.board_project.set(None);
             state.chat_draft_id.set(uuid::Uuid::new_v4());
             state.set_chat_input(String::new());
             state.draft_backend_override.set(None);

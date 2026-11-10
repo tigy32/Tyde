@@ -1418,6 +1418,312 @@ mod wasm_tests {
         container.dyn_into::<HtmlElement>().unwrap()
     }
 
+    #[wasm_bindgen_test]
+    async fn home_projects_board_uses_full_width_and_returns_from_chat() {
+        use crate::state::{ActiveProjectRef, ProjectInfo};
+        use protocol::*;
+        crate::components::test_styles::ensure_styles_loaded();
+        let window = web_sys::window().unwrap();
+        js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &js_sys::Object::new()).unwrap();
+        let container = make_container();
+        container.set_class_name("mobile-app");
+        container.set_attribute("data-native-host", "").unwrap();
+        container.style().set_css_text("width:1180px;height:820px;position:relative;container-type:inline-size;container-name:tws");
+        let host = LocalHostId("home-projects-wide-regression-20261109".into());
+        let project_id = ProjectId("full-width-board".into());
+        let state = AppState::new();
+        state.app_mode.set(AppMode::Workspace);
+        state.active_local_host_id.set(Some(host.clone()));
+        state
+            .native_layout
+            .set(mobile_shell_types::native::NativeLayout::RegularLandscape);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
+        });
+        state.projects.set(vec![ProjectInfo {
+            local_host_id: host.clone(),
+            project: Project {
+                id: project_id.clone(),
+                name: "Mobile navigation and workspace polish".into(),
+                sort_order: 0,
+                source: ProjectSource::Standalone { roots: vec![] },
+            },
+        }]);
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &host,
+            Envelope::from_payload(
+                StreamPath("/host/projects".into()),
+                FrameKind::NewAgent,
+                0,
+                &fixture_user_agent("board-agent", "board-session"),
+            )
+            .unwrap(),
+        );
+        let card = BoardCard {
+            id: BoardCardId("readable-card".into()),
+            agent_id: AgentId("board-agent".into()),
+            session_id: None,
+            retained: true,
+            title: "Keep project boards readable on iPad and Duo landscape".into(),
+            location: BoardLocation::Lane {
+                project_id: project_id.clone(),
+                lane_id: BoardLaneId("active".into()),
+            },
+            position: 0,
+            version: 1,
+            history: vec![],
+        };
+        state.boards.update(|boards| {
+            boards.insert(
+                (host.clone(), project_id.clone()),
+                BoardStatePayload {
+                    project_id: project_id.clone(),
+                    version: 1,
+                    customized: true,
+                    live_agents: vec![],
+                    lanes: ["active", "review", "done"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(position, name)| BoardLane {
+                            id: BoardLaneId(name.into()),
+                            name: name.into(),
+                            position: position as u64,
+                            instructions: None,
+                        })
+                        .collect(),
+                    navigation: vec![BoardCardNavigation {
+                        card_id: card.id.clone(),
+                        target: BoardNavigationTarget::Live {
+                            agent_id: card.agent_id.clone(),
+                        },
+                    }],
+                    cards: vec![card],
+                },
+            );
+        });
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <NativeWorkspace /> }
+        });
+        next_tick().await;
+        let find = |selector: &str| container.query_selector(selector).unwrap().unwrap();
+        assert!(
+            find(".home-projects")
+                .text_content()
+                .unwrap()
+                .contains("Mobile navigation")
+        );
+        for width in [390, 640, 834, 1180] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            let hero = find(".home-hero").get_bounding_client_rect();
+            let project = find(".home-project-row").get_bounding_client_rect();
+            let new_chat = find("[data-mobile-test='home-new-chat']").get_bounding_client_rect();
+            let recents = find(".home-recents").get_bounding_client_rect();
+            let heading = find(".home-recents .section-heading").get_bounding_client_rect();
+            let first_agent =
+                find("[data-mobile-test='home-recent-agent-row']").get_bounding_client_rect();
+            assert!((hero.left() - project.left()).abs() < 1.0);
+            assert!(
+                (new_chat.left() - project.left()).abs() < 1.0
+                    && (new_chat.right() - project.right()).abs() < 1.0
+            );
+            assert!(
+                (first_agent.top() - heading.bottom() - 8.0).abs() < 1.0,
+                "The first recent agent sits directly below its heading"
+            );
+            if width >= 640 {
+                assert!((recents.top() - hero.top()).abs() < 1.0);
+                assert!((recents.width() - project.width()).abs() < 1.0);
+                assert!(recents.left() > project.right());
+                let home = find("[data-mobile-test='home-view']").get_bounding_client_rect();
+                assert!(
+                    ((project.left() - home.left()) - (home.right() - recents.right())).abs() < 1.0,
+                    "The two columns fill Home symmetrically"
+                );
+            } else {
+                assert!(recents.top() >= new_chat.bottom());
+                assert!(
+                    (recents.left() - project.left()).abs() < 1.0
+                        && (recents.right() - project.right()).abs() < 1.0
+                );
+            }
+            assert!(container.query_selector("[data-mobile-test='home-stats'], [data-mobile-test='home-view-agents'], [data-mobile-test='home-view-sessions']").unwrap().is_none());
+        }
+
+        find(".home-project-row")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        let board = find("[data-mobile-test='project-board']");
+        assert_eq!(state.active_tab.get_untracked(), MobileTab::Home);
+        assert!(!crate::native::sidebar_available(&state));
+        let title = find(".mobile-project-page .view-title");
+        assert_eq!(
+            title.text_content().as_deref(),
+            Some("Mobile navigation and workspace polish")
+        );
+        assert!(
+            title.get_bounding_client_rect().width() > 0.0
+                && title.get_bounding_client_rect().height() > 0.0
+        );
+        assert!(
+            (board.get_bounding_client_rect().width()
+                - find(".native-workspace").get_bounding_client_rect().width())
+            .abs()
+                < 1.0
+        );
+        let lanes = board.query_selector_all(".board-lane").unwrap();
+        let first: web_sys::Element = lanes.item(0).unwrap().unchecked_into();
+        let second: web_sys::Element = lanes.item(1).unwrap().unchecked_into();
+        assert!(
+            second.get_bounding_client_rect().left() >= first.get_bounding_client_rect().right()
+        );
+        assert!(
+            first.get_bounding_client_rect().top()
+                >= find(".mobile-project-page .view-header")
+                    .get_bounding_client_rect()
+                    .bottom()
+        );
+        find(".board-card-chat")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(crate::native::sidebar_available(&state));
+        let sidebar = find(".native-agents-pane").get_bounding_client_rect();
+        let chat = find(".native-chat-pane").get_bounding_client_rect();
+        assert!(sidebar.width() >= 280.0 && chat.width() > sidebar.width());
+        assert!(sidebar.right() <= chat.left() && (sidebar.top() - chat.top()).abs() < 1.0);
+        assert!(
+            (chat.height()
+                - find(".native-workspace")
+                    .get_bounding_client_rect()
+                    .height())
+            .abs()
+                < 1.0
+        );
+        assert_eq!(
+            state.back_destination(),
+            Some(crate::state::BackDestination::Root(MobileTab::Home))
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                host.clone(),
+                ConnectionStatus::Error("Temporary connection failure".into()),
+            );
+        });
+        state.active_tab.set(MobileTab::Home);
+        next_tick().await;
+        assert!(state.viewing_chat.get_untracked() && !crate::native::chat_visible(&state));
+        let notices = container
+            .query_selector_all("[data-mobile-test='connection-banner']")
+            .unwrap();
+        let visible_notices = (0..notices.length())
+            .filter(|index| {
+                notices
+                    .item(*index)
+                    .unwrap()
+                    .unchecked_into::<web_sys::Element>()
+                    .get_bounding_client_rect()
+                    .height()
+                    > 0.0
+            })
+            .count();
+        assert_eq!(
+            visible_notices, 1,
+            "The retained Home board owns the only visible connection notice"
+        );
+        state.active_tab.set(MobileTab::Agents);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Disconnected);
+        });
+        state.back_from_chat();
+        next_tick().await;
+        assert!(
+            find("[data-mobile-test='project-board']")
+                .get_bounding_client_rect()
+                .width()
+                > 1100.0
+        );
+        find(".board-card-move")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(
+            find("[role='dialog']")
+                .text_content()
+                .unwrap()
+                .contains("Move Keep project")
+        );
+        let cancel = find("[role='dialog'] button").unchecked_into::<HtmlElement>();
+        cancel.click();
+        next_tick().await;
+        container.style().set_property("width", "390px").unwrap();
+        next_tick().await;
+        assert!(
+            second.get_bounding_client_rect().top() >= first.get_bounding_client_rect().bottom()
+        );
+        assert!(
+            first.get_bounding_client_rect().top()
+                >= find(".mobile-project-page .view-header")
+                    .get_bounding_client_rect()
+                    .bottom()
+        );
+        find(".mobile-project-page .view-header button")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(state.board_project.get_untracked().is_none());
+        assert!(
+            find(".home-project-row")
+                .get_bounding_client_rect()
+                .height()
+                >= 44.0
+        );
+        state.active_tab.set(MobileTab::Agents);
+        next_tick().await;
+        assert!(
+            !find("[data-mobile-test='agents-view']")
+                .text_content()
+                .unwrap()
+                .contains("Projects")
+        );
+        state.active_tab.set(MobileTab::Home);
+        next_tick().await;
+        find(".home-project-row")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        let buttons = find(".mobile-project-page .view-header")
+            .query_selector_all("button")
+            .unwrap();
+        buttons
+            .item(1)
+            .unwrap()
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert_eq!(
+            state.active_project.get_untracked(),
+            Some(ActiveProjectRef {
+                local_host_id: host,
+                project_id
+            })
+        );
+        assert_eq!(
+            state.back_destination(),
+            Some(crate::state::BackDestination::Root(MobileTab::Home))
+        );
+        drop(handle);
+        container.remove();
+        js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
+    }
+
     #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/bridge/loader-test.js")]
     extern "C" {
         #[wasm_bindgen(js_name = install)]
@@ -2092,9 +2398,11 @@ mod wasm_tests {
                     && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
                     "Home and Agents roots project healthy latency into native chrome without a second status band")?;
                 if destination == NativeIntent::Home {
+                    // No host bootstrap has landed: the old .home-grid selector matched the loading placeholder.
                     check(root.title == "Native host" && find(".home-hero")?.get_bounding_client_rect().height() == 0.0
-                        && find(".home-grid")?.get_bounding_client_rect().height() > 0.0,
-                        "Home transfers its existing host heading/status to the compact toolbar without changing dashboard content")?;
+                        && state.host_snapshot_pending()
+                        && find("[data-mobile-test='home-loading']")?.get_bounding_client_rect().height() > 0.0,
+                        "Home transfers host status to native chrome while its bootstrap placeholder stays visible")?;
                 }
             }
             navigate(NativeIntent::Home)?;
@@ -2554,15 +2862,14 @@ mod wasm_tests {
                 "Cancel returns the actual outgoing surface and preserves exact draft selection")?;
             back_progress(mobile_shell_types::native::NativeBackPhase::Progress, 1000)?;
             next_tick().await;
-            // The native host heading intentionally hides .home-hero; measure an actual visible summary card.
-            let home_card = home.query_selector(".home-grid > :first-child").unwrap().ok_or("Missing live Home card")?;
-            check(home_card.get_bounding_client_rect().height() > 0.0,
-                "The destination summary card must actually be rendered")?;
-            let before_commit = home_card.get_bounding_client_rect();
+            let home_loading = home.query_selector("[data-mobile-test='home-loading']").unwrap().ok_or("Missing Home bootstrap placeholder")?;
+            check(state.host_snapshot_pending() && home_loading.get_bounding_client_rect().height() > 0.0,
+                "The unbootstrapped destination must render its actual loading content")?;
+            let before_commit = home_loading.get_bounding_client_rect();
             back_progress(mobile_shell_types::native::NativeBackPhase::Complete, 1000)?;
             next_tick().await;
-            check((home_card.get_bounding_client_rect().top() - before_commit.top()).abs() < 0.5,
-                "Hosts reveals the actual Home card with destination-owned clearance before commit")?;
+            check((home_loading.get_bounding_client_rect().top() - before_commit.top()).abs() < 0.5,
+                "Hosts reveals actual Home loading content with destination-owned clearance before commit")?;
             navigate(NativeIntent::Hosts)?;
             next_tick().await;
             find("[data-mobile-test='paired-host-open']")?.dyn_into::<HtmlElement>().unwrap().click();
@@ -3224,6 +3531,8 @@ mod wasm_tests {
                     &serde_json::from_value::<protocol::AgentStartPayload>(serde_json::to_value(&background).unwrap()).unwrap()).unwrap());
             check(state.native_chat_destination.get_untracked().as_ref().map(|target| &target.stream) == Some(&resume_creation.stream), "A superseded fork's publication cannot consume the later Resume destination")?;
             check(resume_creation.stream != failed_creation.stream, "Distinct requests cannot share a terminal stream")?;
+            navigate(NativeIntent::Settings)?;
+            next_tick().await;
             let published: protocol::AgentStartPayload = serde_json::from_value(serde_json::to_value(&resumed).unwrap()).unwrap();
             dispatch_envelope(&state, &host_id,
                 protocol::Envelope::from_payload(resume_creation.stream, FrameKind::AgentStart, 0, &published).unwrap());
@@ -3231,6 +3540,11 @@ mod wasm_tests {
             check(state.active_agent.get_untracked().as_ref().map(|active| &active.agent_id) == Some(&current.agent_id), "A publication receipt must wait for this subscriber's typed descriptor")?;
             dispatch_envelope(&state, &host_id,
                 protocol::Envelope::from_payload(host_stream.clone(), FrameKind::NewAgent, 5, &resumed).unwrap());
+            next_tick().await;
+            check(projected()?.tab == mobile_shell_types::native::NativeTab::Settings
+                && projected()?.route == mobile_shell_types::native::NativeRoute::Root,
+                "A delayed resume keeps Settings visible rather than taking it over")?;
+            navigate(NativeIntent::Sessions)?;
             next_tick().await;
             let resumed_projection = projected()?;
             check(resumed_projection.tab == mobile_shell_types::native::NativeTab::Sessions &&
@@ -4096,6 +4410,7 @@ mod wasm_tests {
                             "/host/previous/spawn/00000000-0000-0000-0000-000000000001".into(),
                         ),
                         tab: MobileTab::Sessions,
+                        root_tab: MobileTab::Agents,
                         draft_id: state.chat_draft_id.get_untracked(),
                         source_agent: state.active_agent.get_untracked(),
                         created_agent: None,
@@ -5933,13 +6248,13 @@ mod wasm_tests {
         state.active_tab.set(MobileTab::Home);
         render_shell(&frame).await;
         wasm_bindgen_test::console_log!(
-            "Dashboard stale-focus fixture: loading={} stat_present={}",
+            "Dashboard stale-focus fixture: loading={} heading_present={}",
             container
                 .query_selector("[data-mobile-test='home-loading']")
                 .unwrap()
                 .is_some(),
             container
-                .query_selector("[data-mobile-test='home-stat-agents']")
+                .query_selector(".home-hero-host")
                 .unwrap()
                 .is_some()
         );
@@ -5948,24 +6263,24 @@ mod wasm_tests {
                 .call1(&wasm_bindgen::JsValue::NULL, &frame_window)
                 .unwrap(),
         );
-        let stat = container
-            .query_selector("[data-mobile-test='home-stat-agents']")
+        let heading = container
+            .query_selector(".home-hero-host")
             .unwrap()
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap();
-        assert!(stat.text_content().unwrap().contains("Active agents"));
-        stat.focus().unwrap();
+        assert!(heading.get_bounding_client_rect().height() > 0.0);
+        heading.focus().unwrap();
         render_shell(&frame).await;
         assert!(
             !frame_document
                 .active_element()
-                .is_some_and(|active| active.is_same_node(Some(&stat))),
-            "a non-interactive card must not acquire input ownership"
+                .is_some_and(|active| active.is_same_node(Some(&heading))),
+            "a non-interactive heading must not acquire input ownership"
         );
         assert!(
             (shell.get_bounding_client_rect().height() - 852.0).abs() <= 1.0,
-            "non-interactive cards must not reclaim a stale contraction"
+            "non-interactive headings must not reclaim a stale contraction"
         );
         assert!(!shell.has_attribute("data-tws-keyboard"));
         let nav = container

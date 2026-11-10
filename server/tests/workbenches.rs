@@ -2712,7 +2712,9 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
             !failed,
             "cross-project child remains controllable by its parent"
         );
-        let turn = fixture::finish_turn_on(&mut fixture.client, &child.instance_stream).await;
+        // The launch client's buffered bootstrap can still contain an earlier turn.
+        // This observer consumed its bootstrap before moving and now sees only live reports.
+        let turn = fixture::finish_turn_on(&mut observer, observer_child).await;
         let reported = turn
             .chat_events()
             .into_iter()

@@ -2,47 +2,15 @@ use crate::components::ui::{
     Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Skeleton, StatusDot,
     StatusTone,
 };
-use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, MobileTab};
+use crate::state::{
+    ActiveAgentRef, ActiveProjectRef, AgentInfo, AppState, ConnectionStatus, MobileTab,
+    sort_project_infos,
+};
 use leptos::prelude::*;
 
-/// Dashboard surface — the user's first impression once a host is
-/// connected. Renders a compact hero, a 2×2 stat card grid, quick
-/// actions, and an Active Agents list. When the host is disconnected
-/// or no host is selected the surface degrades gracefully via
-/// `EmptyState`-style messaging without losing the global affordances
-/// (Pair another host).
 #[component]
 pub fn HomeView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
-
-    // Phase C HIGH 5: every projection filters by `active_local_host_id`.
-    // If no host is selected, counts are zero — Home never aggregates
-    // across paired hosts.
-    let s_agents = state.clone();
-    let active_agent_count = move || {
-        let Some(active) = s_agents.active_local_host_id.get() else {
-            return 0;
-        };
-        s_agents
-            .agents
-            .get()
-            .iter()
-            .filter(|a| a.local_host_id == active && a.started && a.fatal_error.is_none())
-            .count()
-    };
-
-    let s_sessions = state.clone();
-    let session_count = move || {
-        let Some(active) = s_sessions.active_local_host_id.get() else {
-            return 0;
-        };
-        s_sessions
-            .sessions
-            .get()
-            .iter()
-            .filter(|s| s.local_host_id == active)
-            .count()
-    };
 
     let s_host_label = state.clone();
     let host_label = move || -> String {
@@ -58,10 +26,6 @@ pub fn HomeView() -> impl IntoView {
             .unwrap_or_else(|| "Tyde".to_owned())
     };
 
-    // Project the active host's connection state into a small tuple
-    // used by the pill, dot, and the "Connection" stat card. A `Memo`
-    // is `Copy`, so we can hand it to multiple closures without
-    // worrying about consuming it.
     let s_status = state.clone();
     let connection_tone: Memo<(StatusTone, &'static str, PillTone, &'static str)> =
         Memo::new(move |_| match s_status.active_host_connection_status() {
@@ -111,14 +75,6 @@ pub fn HomeView() -> impl IntoView {
 
     let on_new_chat = crate::components::new_chat_callback(&state);
 
-    let s_nav_agents = state.clone();
-    let on_view_agents = Callback::new(move |_: ()| {
-        s_nav_agents.active_tab.set(MobileTab::Agents);
-    });
-    let s_nav_sessions = state.clone();
-    let on_view_sessions = Callback::new(move |_: ()| {
-        s_nav_sessions.active_tab.set(MobileTab::Sessions);
-    });
     let native_heading_state = state.clone();
     let s_recent = state.clone();
     let recent_agents = move || -> Vec<AgentInfo> {
@@ -146,12 +102,23 @@ pub fn HomeView() -> impl IntoView {
     let s_loading = state.clone();
     let initial_loading = move || s_loading.host_snapshot_pending();
 
+    let board_state = state.clone();
+    let project_state = state.clone();
+    let showing_board = Memo::new(move |_| {
+        board_state.board_project.get().filter(|target| {
+            Some(target.local_host_id.clone()) == board_state.active_local_host_id.get()
+        })
+    });
     view! {
-        <div class="view home-view" data-mobile-test="home-view">
+        <Show when=move || showing_board.get().is_some()>
+            {move || showing_board.get().map(|target| view! { <super::project_board::ProjectBoard target=target /> })}
+        </Show>
+        <div hidden=move || showing_board.get().is_some() inert=move || showing_board.get().is_some().then_some("") class="view home-view" data-mobile-test="home-view">
             <div class="shell-flow">
+                <div class="home-layout">
+                <div class="home-primary">
                 <header class="home-hero" hidden=move || crate::native::root_status_owned(&native_heading_state)
                     && native_heading_state.active_host_label().is_some()>
-                    <Show when=|| !crate::native::is_native()><p class="home-hero-greeting">"Welcome back"</p></Show>
                     <h1 class="home-hero-host">
                         {move || {
                             let (_, _, pill_tone, pill_label) = connection_tone.get();
@@ -181,6 +148,30 @@ pub fn HomeView() -> impl IntoView {
                 </header>
 
                 {move || {
+                    let state = project_state.clone();
+                    let host = state.active_local_host_id.get();
+                    let mut projects = state.projects.get().into_iter().filter(|info|
+                        Some(info.local_host_id.clone()) == host && info.project.parent_project_id().is_none()
+                    ).collect::<Vec<_>>();
+                    sort_project_infos(&mut projects);
+                    (!projects.is_empty()).then(|| view! {
+                        <section class="home-projects" aria-label="Projects">
+                            <div class="section-heading">"Projects"</div>
+                            <div class="home-project-list">
+                                {projects.into_iter().map(|info| {
+                                    let state = state.clone();
+                                    view! { <button class="home-project-row" on:click=move |_| {
+                                        state.active_tab.set(MobileTab::Home);
+                                        state.board_project.set(Some(ActiveProjectRef {
+                                            local_host_id: info.local_host_id.clone(), project_id: info.project.id.clone()
+                                        }));
+                                    }>{info.project.name}</button> }
+                                }).collect_view()}
+                            </div>
+                        </section>
+                    })
+                }}
+                {move || {
                     if !has_active_host() {
                         view! {
                             <EmptyState
@@ -192,46 +183,14 @@ pub fn HomeView() -> impl IntoView {
                         }
                         .into_any()
                     } else if initial_loading() {
-                        // Server hasn't pushed HostSettings yet — show a
-                        // skeleton so the dashboard doesn't pop in.
                         view! {
-                            <div class="home-grid" data-mobile-test="home-loading">
-                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
+                            <div class="home-loading" data-mobile-test="home-loading">
+                                <Skeleton width="100%".to_string() height="52px".to_string() rounded=false />
                             </div>
                         }.into_any()
                     } else {
                         view! {
-                            <div class="home-grid" data-mobile-test="home-stats">
-                                <Card data_mobile_test="home-stat-agents" dense=true>
-                                    <div class="home-stat-card">
-                                        <div class="home-stat-value">{active_agent_count}</div>
-                                        <p class="home-stat-label">"Active agents"</p>
-                                    </div>
-                                </Card>
-                                <Card data_mobile_test="home-stat-sessions" dense=true>
-                                    <div class="home-stat-card">
-                                        <div class="home-stat-value">{session_count}</div>
-                                        <p class="home-stat-label">"Sessions"</p>
-                                    </div>
-                                </Card>
-                                <Show when=|| !crate::native::is_native()>                                <Card data_mobile_test="home-stat-host" dense=true>
-                                    <div class="home-stat-card">
-                                        <div class="home-stat-value" style="font-size: var(--text-lg);">
-                                            {move || {
-                                                let (_, label, _, _) = connection_tone.get();
-                                                label.to_string()
-                                            }}
-                                        </div>
-                                        <p class="home-stat-label">"Connection"</p>
-                                    </div>
-                                </Card></Show>
-                            </div>
-
-                            <div class="home-quick-actions">
-                                <Show when=|| !crate::native::is_native()><p class="home-quick-actions-title">"Quick actions"</p></Show>
+                            <div class="home-new-chat">
                                 <Button
                                     label="New chat"
                                     variant=ButtonVariant::Primary
@@ -240,28 +199,13 @@ pub fn HomeView() -> impl IntoView {
                                     data_mobile_test="home-new-chat"
                                     on_click=on_new_chat
                                 />
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2);">
-                                    <Button
-                                        label="Agents"
-                                        variant=ButtonVariant::Secondary
-                                        full_width=true
-                                        data_mobile_test="home-view-agents"
-                                        on_click=on_view_agents
-                                    />
-                                    <Button
-                                        label="Sessions"
-                                        variant=ButtonVariant::Secondary
-                                        full_width=true
-                                        data_mobile_test="home-view-sessions"
-                                        on_click=on_view_sessions
-                                    />
-                                </div>
                             </div>
                         }
                         .into_any()
                     }
                 }}
 
+                </div>
                 {move || {
                     let agents = recent_agents();
                     if agents.is_empty() || !has_active_host() {
@@ -269,6 +213,7 @@ pub fn HomeView() -> impl IntoView {
                     } else {
                         let s = state.clone();
                         Some(view! {
+                            <section class="home-recents" aria-label="Active agents">
                             <div class="section-heading">
                                 <span>"Active agents"</span>
                                 <span class="section-heading-trailing">
@@ -318,9 +263,11 @@ pub fn HomeView() -> impl IntoView {
                                     }
                                 }).collect::<Vec<_>>()}
                             </div>
+                            </section>
                         })
                     }
                 }}
+                </div>
             </div>
         </div>
     }
@@ -379,7 +326,7 @@ mod wasm_tests {
     /// reflects only the active host, and flipping `active_local_host_id`
     /// re-projects without remount.
     #[wasm_bindgen_test]
-    async fn home_view_counts_and_recent_list_are_scoped_to_active_host() {
+    async fn home_projects_and_recent_agents_are_scoped_to_active_host() {
         let host_a = LocalHostId("host-a".to_owned());
         let host_b = LocalHostId("host-b".to_owned());
 
@@ -391,6 +338,23 @@ mod wasm_tests {
         let host_b_for_mount = host_b.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.projects.set(
+                [
+                    (&host_a_for_mount, "Alpha project"),
+                    (&host_b_for_mount, "Bravo project"),
+                ]
+                .into_iter()
+                .map(|(host, name)| crate::state::ProjectInfo {
+                    local_host_id: host.clone(),
+                    project: protocol::Project {
+                        id: protocol::ProjectId(name.into()),
+                        name: name.into(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone { roots: vec![] },
+                    },
+                })
+                .collect(),
+            );
             state.agents.set(vec![
                 fixture_agent(&host_a_for_mount, "a-1", "Agent Alpha"),
                 fixture_agent(&host_a_for_mount, "a-2", "Agent Bravo"),
@@ -410,16 +374,18 @@ mod wasm_tests {
         next_tick().await;
 
         let text = container.text_content().unwrap_or_default();
-        assert!(
+        assert_eq!(
             container
-                .query_selector("[data-mobile-test='home-stat-projects'], [data-mobile-test='home-view-projects']")
+                .query_selector("[data-mobile-test='home-active-count']")
                 .unwrap()
-                .is_none(),
-            "mobile home must not expose project, file, Git, diff, or review entry points"
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("2")
         );
         assert!(
-            !text.contains("Projects"),
-            "mobile home must remain agent-chat focused: {text}"
+            text.contains("Alpha project") && !text.contains("Bravo project"),
+            "Home lists only the active host's projects"
         );
         assert!(
             text.contains("Agent Alpha") && text.contains("Agent Bravo"),
@@ -430,11 +396,33 @@ mod wasm_tests {
             "host-b agent must not leak into host-a's home view: {text}"
         );
 
-        // Switch active host to host-b — list flips.
+        // Switch active host to host-b — both lists flip.
         let state = state_handle.borrow().as_ref().unwrap().clone();
         state.active_local_host_id.set(Some(host_b.clone()));
         next_tick().await;
         let text = container.text_content().unwrap_or_default();
+        assert_eq!(
+            container
+                .query_selector("[data-mobile-test='home-active-count']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            text.contains("Bravo project") && !text.contains("Alpha project"),
+            "Home projects re-project when switching hosts"
+        );
+        state.projects.set(vec![]);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".home-projects")
+                .unwrap()
+                .is_none(),
+            "Empty projects render nothing"
+        );
         assert!(
             text.contains("Agent Charlie"),
             "host-b agent should appear after switching: {text}"

@@ -112,27 +112,12 @@ pub fn AgentsView() -> impl IntoView {
     });
 
     let on_new_chat = crate::components::new_chat_callback(&state);
-    let projects_open = RwSignal::new(false);
-    let board_state = state.clone();
-    let showing_board = Memo::new(move |_| {
-        board_state.board_project.get().is_some_and(|target| {
-            Some(target.local_host_id) == board_state.active_local_host_id.get()
-        })
-    });
-    let project_state = state.clone();
-
     view! {
-        <super::project_board::ProjectDirectory open=projects_open />
-        {move || project_state.board_project.get().filter(|target| Some(target.local_host_id.clone()) == project_state.active_local_host_id.get())
-            .map(|target| view! { <super::project_board::ProjectBoard target=target /> })}
-        <div class="view agents-view" data-mobile-test="agents-view" hidden=move || showing_board.get() inert=move || showing_board.get().then_some("")>
+        <div class="view agents-view" data-mobile-test="agents-view">
             <div class="shell-header tws-header">
             <header class="view-header">
                 <h1 class="view-title">{move || if segment.get() == AgentsSegment::Swarms { "Swarms" } else { "Agents" }}</h1>
                 <Show when=move || segment.get() == AgentsSegment::Agents>
-                <div class="board-header-actions">
-                <Button label="Projects" variant=ButtonVariant::Ghost size=ButtonSize::Compact
-                    on_click=Callback::new(move |_| projects_open.set(true)) />
                 <Button
                     label="New chat"
                     variant=ButtonVariant::Primary
@@ -140,7 +125,6 @@ pub fn AgentsView() -> impl IntoView {
                     data_mobile_test="agents-new-chat"
                     on_click=on_new_chat
                 />
-                </div>
                 </Show>
             </header>
             {crate::native::is_native().then(|| view! {
@@ -149,8 +133,6 @@ pub fn AgentsView() -> impl IntoView {
                         autocapitalize="none" autocomplete="off" spellcheck="false"
                         data-mobile-test="agents-search" prop:value=move || search.get()
                         on:input=move |event| search.set(event_target_value(&event)) />
-                    <Button label="Projects" variant=ButtonVariant::Ghost size=ButtonSize::Compact
-                        on_click=Callback::new(move |_| projects_open.set(true)) />
                 </div>
             })}
             <Show when=move || has_swarms.get()>
@@ -973,75 +955,27 @@ mod wasm_tests {
         agent
     }
 
-    /// The native shell hides the Agents header and every view title, so the
-    /// board needs its own way in and must keep its project name.
     #[wasm_bindgen_test]
-    async fn native_shell_reaches_a_titled_project_board() {
-        let window = web_sys::window().unwrap();
-        js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &js_sys::Object::new()).unwrap();
-        crate::components::test_styles::ensure_styles_loaded();
-        let document = window.document().unwrap();
-        let app = make_container();
-        app.set_attribute("data-native-host", "").unwrap();
-        let workspace = document.create_element("div").unwrap();
-        workspace.set_class_name("native-workspace");
-        app.append_child(&workspace).unwrap();
-        let workspace: HtmlElement = workspace.dyn_into().unwrap();
-
-        let host = LocalHostId("host-native-board".to_owned());
-        let target = crate::state::ActiveProjectRef {
-            local_host_id: host.clone(),
-            project_id: protocol::ProjectId("native-project".to_owned()),
-        };
-        let state = AppState::new();
-        state.active_local_host_id.set(Some(host.clone()));
-        state.projects.set(vec![crate::state::ProjectInfo {
-            local_host_id: host,
-            project: protocol::Project {
-                id: target.project_id.clone(),
-                name: "Native project".to_owned(),
-                sort_order: 0,
-                source: protocol::ProjectSource::Standalone {
-                    roots: vec![protocol::ProjectRootPath("/native".to_owned())],
-                },
-            },
-        }]);
-        let mounted_state = state.clone();
-        let _handle = mount_to(workspace, move || {
-            provide_context(mounted_state);
+    async fn agents_has_no_projects_navigation() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(AppState::new());
             view! { <AgentsView /> }
         });
         next_tick().await;
-
-        let rendered =
-            |element: &web_sys::Element| element.unchecked_ref::<HtmlElement>().offset_width() > 0;
-        let buttons = app.query_selector_all("button").unwrap();
-        let projects: Vec<HtmlElement> = (0..buttons.length())
-            .map(|index| buttons.item(index).unwrap().unchecked_into::<HtmlElement>())
-            .filter(|button| button.text_content().unwrap_or_default().trim() == "Projects")
-            .filter(|button| rendered(button))
-            .collect();
-        assert_eq!(projects.len(), 1, "native must render one Projects entry");
-        projects[0].click();
-        next_tick().await;
-        assert!(
-            app.query_selector("[role='dialog'][aria-label='Projects']")
-                .unwrap()
-                .is_some(),
-            "the native Projects entry opens the directory"
-        );
-
-        state.board_project.set(Some(target));
-        next_tick().await;
-        let title = app
-            .query_selector("[data-mobile-test='project-board'] .view-title")
-            .unwrap()
-            .expect("the board renders its title");
-        assert_eq!(title.text_content().unwrap(), "Native project");
-        assert!(rendered(&title), "the native board keeps its project name");
-
-        js_sys::Reflect::delete_property(&window, &"__tydeNativeHost".into()).unwrap();
-        app.remove();
+        let buttons = container.query_selector_all("button").unwrap();
+        for index in 0..buttons.length() {
+            assert_ne!(
+                buttons
+                    .item(index)
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default()
+                    .trim(),
+                "Projects"
+            );
+        }
+        container.remove();
     }
 
     /// A BTW fork is a stand-alone top-level chat, so none of the sub-agent

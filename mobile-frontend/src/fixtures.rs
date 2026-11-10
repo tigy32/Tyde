@@ -416,7 +416,7 @@ pub fn seed_state(state: &AppState) {
     match name.as_str() {
         "board" => {
             seed_board(state, &host);
-            state.active_tab.set(MobileTab::Agents);
+            state.active_tab.set(MobileTab::Home);
             state.viewing_chat.set(false);
         }
         "new-chat" => {

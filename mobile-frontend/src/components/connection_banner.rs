@@ -382,8 +382,8 @@ pub fn ConnectionBanner(#[prop(optional)] inline: bool) -> impl IntoView {
 
     view! {
         <div class=if inline { "connection-banner board-connection" } else { "connection-banner" } data-mobile-test="connection-banner"
-            hidden=move || (!inline && state.active_tab.get() == crate::state::MobileTab::Agents
-                && !state.viewing_chat.get()
+            hidden=move || (!inline && state.active_tab.get() == crate::state::MobileTab::Home
+                && (if crate::native::is_native() { !crate::native::chat_visible(&state) } else { !state.viewing_chat.get() })
                 && state.board_project.get().is_some_and(|target| Some(target.local_host_id) == state.active_local_host_id.get())) || (crate::native::is_native() && state.mobile_shell_error.get().is_some())
                 || ((chat_owns_connection_status(&state) || crate::native::root_status_owned(&state))
                     && (matches!(state.active_host_connection_status(), ConnectionStatus::Connected)
