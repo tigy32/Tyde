@@ -19085,7 +19085,7 @@ mod wasm_tests {
         let page_width = container
             .query_selector(".settings-page")
             .unwrap()
-            .expect("the capped settings page must render")
+            .expect("the settings page must render")
             .get_bounding_client_rect()
             .width();
         let content_style = web_sys::window()
@@ -19105,9 +19105,44 @@ mod wasm_tests {
             - padding("padding-left")
             - padding("padding-right");
         assert!(
-            page_width + 1.0 < content_box_width,
-            "a wide window must cap the page, not stretch it across the overlay"
+            (page_width - content_box_width).abs() <= 1.0,
+            "the page must flex to its pane: page {page_width}, pane {content_box_width}"
         );
+        let overlay_box = |selector: &str| {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .expect("settings overlay geometry target must render")
+                .get_bounding_client_rect()
+        };
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 4000px; height: 900px;",
+            )
+            .unwrap();
+        let window = overlay_box(".settings-root");
+        let wide_layout = overlay_box(".settings-layout");
+        assert!(
+            wide_layout.width() + 1.0 < window.width(),
+            "a very wide window must cap Settings, not stretch rows across it"
+        );
+        assert!(
+            ((wide_layout.left() - window.left()) - (window.right() - wide_layout.right())).abs()
+                <= 1.0,
+            "a capped Settings must sit centered in the window"
+        );
+        let nav_right = overlay_box(".settings-nav").right();
+        assert!(
+            (overlay_box(".settings-content").left() - nav_right).abs() <= 1.0,
+            "the page must stay beside its navigation when centered"
+        );
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 1600px; height: 900px;",
+            )
+            .unwrap();
         let columns = container
             .query_selector_all(".review-configuration-columns > section")
             .unwrap();

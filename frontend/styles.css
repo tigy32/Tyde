@@ -18216,15 +18216,14 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 }
 /* Settings section rails change layout only; theme typography remains inherited. */
 .settings-overlay .settings-root { padding: 24px 32px; }
-.settings-overlay .settings-layout { gap: 0; }
+.settings-overlay .settings-layout { gap: 0; max-width: 112rem; margin-inline: auto; }
 .settings-overlay .settings-nav { width: 16rem; padding-right: 20px; border-right: 1px solid var(--border-primary); }
 .settings-overlay .settings-search-wrap { position: sticky; top: 0; z-index: 2; padding-bottom: 12px; background: var(--surface-1); }
 .settings-overlay .settings-nav-group-title { text-transform: none; letter-spacing: normal; color: var(--text-primary); }
 .settings-overlay .settings-nav-group + .settings-nav-group { margin-top: 20px; }
 .settings-overlay .settings-nav-item { white-space: normal; overflow-wrap: anywhere; }
-.settings-overlay .settings-content { padding: 0 16px 24px 32px; }
-.settings-overlay .settings-page { max-width: 64rem; }
-.settings-overlay .settings-scope-bar { float: right; max-width: 50%; margin: 0 28px 12px 16px; padding: 0; border: 0; background: none; justify-content: flex-end; }
+.settings-overlay .settings-content { padding: 0 28px 24px 32px; }
+.settings-overlay .settings-scope-bar { float: right; max-width: 50%; margin: 0 0 12px 16px; padding: 0; border: 0; background: none; justify-content: flex-end; }
 .settings-overlay .settings-section-body > .settings-scope-bar { float: none; max-width: none; margin: 0 0 8px; justify-content: flex-start; }
 .settings-overlay .settings-panel-header { flex-wrap: wrap; align-items: flex-start; }
 .settings-overlay .settings-panel-intro { max-width: 70ch; margin-bottom: 28px; }
