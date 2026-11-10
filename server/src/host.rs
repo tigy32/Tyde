@@ -1705,7 +1705,6 @@ struct AgentCloseCleanup {
     parent: Option<AgentId>,
     remove_annotations: bool,
     annotations: Option<Arc<AgentsViewPreferencesHandle>>,
-    teams: TeamRegistryHandle,
     swarms: SwarmRegistryHandle,
 }
 
@@ -13924,6 +13923,37 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                 wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
         }
+        // Team members are unbound and the change published before the
+        // durable close commits, so a message sent after AgentClosed never
+        // resolves a binding to an agent the registry no longer holds.
+        let teams = self.state.with(|state| state.team_registry.clone()).await;
+        let mut team_events = Vec::with_capacity(close_ids.len());
+        let mut unbind_error = None;
+        for closed_agent_id in &close_ids {
+            match teams.clear_binding_by_agent(closed_agent_id.clone()).await {
+                Ok(events) => team_events.push(events),
+                Err(error) => {
+                    unbind_error = Some(error);
+                    break;
+                }
+            }
+        }
+        self.state
+            .with(move |state| {
+                for events in team_events {
+                    fan_out_team_registry_events(state, events);
+                }
+            })
+            .await;
+        if let Some(error) = unbind_error {
+            if intent == AgentCloseIntent::UnclaimedCreation {
+                futures_util::future::join_all(
+                    close_targets.iter().map(|(_, handle)| handle.close()),
+                )
+                .await;
+            }
+            return Err(AppError::internal("close_agent", anyhow!(error)));
+        }
         let ids = close_ids.clone();
         let sessions = closing_session_ids.clone();
         let survivors = self
@@ -13969,7 +13999,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         tracing::info!(target: "server::agent_close", agents = close_targets.len(), "durable close intent committed");
         let mut cleanup_targets = Vec::new();
         for closed_agent_id in &close_ids {
-            let (parent, remove_annotations, annotations, teams, swarms) = {
+            let (parent, remove_annotations, annotations, swarms) = {
                 {
                     let closed_agent_id = closed_agent_id.to_owned();
                     self.state
@@ -13992,7 +14022,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                                 state.registry.parent_agent_id(closed_agent_id),
                                 remove_annotations,
                                 state.agents_view_preferences_store.clone(),
-                                state.team_registry.clone(),
                                 state.swarm_registry.clone(),
                             )
                         })
@@ -14005,7 +14034,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                 parent,
                 remove_annotations,
                 annotations,
-                teams,
                 swarms,
             });
         }
@@ -14271,11 +14299,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
         reviews
             .reviewer_closed(id.clone())
             .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
-        let team_events = cleanup
-            .teams
-            .clear_binding_by_agent(id.clone())
-            .await
-            .map_err(|error| AppError::internal("close_agent", anyhow!(error)))?;
         self.fan_out_session_lists().await?;
         let closed_id = id.clone();
         self.state
@@ -14293,7 +14316,6 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((
                 state.agent_close_failures.remove(&closed_id);
                 state.agent_close_completions.remove(&closed_id);
                 swarms::fan_out_swarm_events_locked(state, swarm_events);
-                fan_out_team_registry_events(state, team_events);
                 fan_out_current_agents_view_preferences(state);
                 for subscriber in state.host_streams.values_mut() {
                     subscriber.last_task_token_usages.clear();

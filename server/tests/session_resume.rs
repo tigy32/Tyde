@@ -1477,6 +1477,13 @@ async fn a_resume_racing_a_close_keeps_its_session_restorable() {
         frame.kind == FrameKind::AgentClosed
     })
     .await;
+    // AgentClosed precedes teardown; a teardown still running would enter
+    // the withdrawal gate below and spend a permit meant for the race.
+    fixture
+        .host_for_test()
+        .await_agent_close_settlement_for_test(&failed.agent_id)
+        .await
+        .expect("failed binding teardown settles");
     drop(reservation);
     let mut resumer = fixture.connect().await;
 

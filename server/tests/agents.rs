@@ -4546,15 +4546,13 @@ async fn task_token_usage_rolls_up_updates_and_retains_closed_descendants() {
             entry.agent_id
         );
     }
-    let closed_task_usages = fixture.task_usage_snapshot().await;
-    assert_eq!(
-        closed_task_usages
-            .iter()
-            .find(|usage| usage.root_agent_id == restored_agent.agent_id)
-            .expect("closed mixed rollup")
-            .total,
-        mixed.total
-    );
+    expect_task_token_usage_matching(
+        &mut replay_client,
+        &restored_agent.agent_id,
+        "closed mixed children settle their final accounting",
+        |usage| usage.total == mixed.total,
+    )
+    .await;
     let session = mixed.root_session_id.clone().expect("mixed root session");
     let restarted = fixture.relaunch_host_after_kill().await;
     let restored = fixture

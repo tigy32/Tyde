@@ -2913,6 +2913,8 @@ kbd {
     position: absolute;
     inset: 0;
     overflow-y: auto;
+    /* ChatView anchors rows itself; WebKit has no native anchoring. */
+    overflow-anchor: none;
     padding: 8px 8px 24px 8px;
     display: flex;
     flex-direction: column;
