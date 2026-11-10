@@ -199,7 +199,7 @@ No account, Service, IAM, deployment, host/device update or restart is authorize
 The Lander alone owns landing/check/push and publisher steps; this bookkeeping
 executor performs no Apple API, archive, upload or native QA operations.
 
-## Current private preview build 9 preparation
+## Historical private preview build 9 preparation
 
 Release tracks build 9; Debug remains build 1. The GET-only ASC catalog check
 at `2026-11-07T13:55:01.717180+00:00` found builds 2–8 VALID/COMPLETE,
@@ -240,6 +240,28 @@ unchanged entitlements and export compliance before any approved upload.
 A native archive does not publish the host-selected full client. No Git beta,
 account/IAM/team/tester/agreement change, deployment, host/device update or
 restart is authorized. Preserve credentials, tools, simulators and pairings.
+
+## Current private preview build 10 preparation
+
+Release tracks build 10; Debug remains build 1. The GET-only ASC catalog check
+at `2026-11-10T00:19:00Z` found builds 2–9 VALID/COMPLETE, old build 1
+AWAITING_UPLOAD, and no build 10 record or reservation. Private Preview (A) has
+builds 2–9 and is not an all-builds group. This does not reserve 10; recheck
+allocation before upload and stop if taken.
+
+Source base `c4820096` adds the Duo dock latency readout (`62843567`) and
+status-first order (`08b85895`) since build 9. Those Swift changes reach users
+only in a new shell binary. This commit changes only Release build metadata and
+preparation provenance.
+
+Distribution follows the build 9 archive, export and verification contract from
+the exact landed source, using whatever marketing version that source
+generates. The certificate and profile are the existing local ones.
+`/v1/builds` works, but `/v1/profiles` and `/v1/certificates` returned 403 for
+this team during the Apple account upgrade, so Apple may refuse signing or
+upload. A refusal for an account, team, agreement or membership reason stops
+the attempt with the verified IPA kept for retry; it does not justify another
+team, key, bundle ID or certificate.
 
 ## Adaptive Agents hierarchy
 
