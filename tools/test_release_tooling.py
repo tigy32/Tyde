@@ -290,7 +290,8 @@ class TransportProtocolVersionTests(unittest.TestCase):
             (paths[2], "BytesMut::from(&[1][..])", "BytesMut::from(&[2][..])"),
             (signaling, "MobileSdpKind::Answer,", "MobileSdpKind::Offer,"),
             (signaling, "Duration::from_secs(60)", "Duration::from_secs(61)"),
-            (signaling, "Duration::from_secs(15)", "Duration::from_secs(16)"),
+            # Held phone POSTs have no exchange timeout; guard socket keepalive instead.
+            (signaling, "Duration::from_secs(25)", "Duration::from_secs(26)"),
             (signaling, "now.saturating_add(60_000)", "now.saturating_add(30_000)"),
             (signaling, "        progress(next);", "        publish(next);"),
             (library, 'Self::AwaitHostAnswer => "The host did not answer.",',

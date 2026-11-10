@@ -12,7 +12,7 @@ tyde-dev-driver = { path = "../dev-driver" }
 tyde-agent-adapter = { path = "../agent-adapter" }
 tyde-process-env = { path = "../process-env" }
 futures-util = "0.3"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64.workspace = true
 paste = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }

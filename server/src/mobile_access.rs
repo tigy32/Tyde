@@ -3586,22 +3586,15 @@ impl MobileAccessActor {
         let registration_id = Uuid::new_v4();
         let task = tokio::spawn(async move {
             let endpoint = format!("/pairings/{}/bootstrap", managed.pairing_id);
-            let mut generation = None;
-            loop {
-                let result = service
-                    .register_bootstrap(&endpoint, None, Some(&managed), &descriptor, generation)
-                    .await;
-                if let Ok(next) = result {
-                    generation = Some(next);
-                } else {
-                    let _ = tx.send(MobileAccessCommand::BootstrapRegistrationFailed {
-                        device_id,
-                        registration_id,
-                    });
-                    return;
-                }
-                // Product lease renewal, not test synchronization or a retry of a failed write.
-                sleep(Duration::from_secs(60)).await;
+            if let Err(error) = service
+                .register_bootstrap(&endpoint, None, Some(&managed), &descriptor, None)
+                .await
+            {
+                tracing::warn!(code = ?error.code, "paired bootstrap registration failed");
+                let _ = tx.send(MobileAccessCommand::BootstrapRegistrationFailed {
+                    device_id,
+                    registration_id,
+                });
             }
         });
         self.bootstrap_tasks
@@ -3830,8 +3823,9 @@ fn spawn_device_accept_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = ACCEPT_RECONNECT_INITIAL;
+        let mut credentials = None;
         loop {
-            match connect_mobile_device_stream(&managed_service, &record).await {
+            match connect_mobile_device_stream(&managed_service, &record, &mut credentials).await {
                 Ok(stream) => {
                     let _ = tx.send(MobileAccessCommand::DeviceTransportConnected {
                         device_id: record.device_id.clone(),
@@ -3840,6 +3834,7 @@ fn spawn_device_accept_task(
                     return;
                 }
                 Err(error) => {
+                    tracing::debug!(code = ?error.code, "mobile signaling accept failed; applying reconnect policy");
                     let terminal = terminal_device_accept_error(error.code);
                     let _ = tx.send(MobileAccessCommand::DeviceAcceptFailed {
                         device_id: record.device_id.clone(),
@@ -4071,11 +4066,25 @@ fn managed_handoff_from_poll_response(
 async fn connect_mobile_device_stream(
     managed_service: &ManagedMobileServiceClient,
     record: &MobilePairingRecord,
+    credentials: &mut Option<protocol::MobileRtcCredentials>,
 ) -> Result<BoxedMobileTransport, MobileTaskError> {
-    let credentials = managed_service
-        .mint_host_rtc_credentials(record)
-        .await
-        .map_err(MobileTaskError::managed_service)?;
+    let now = now_ms().map_err(MobileTaskError::transport)?;
+    if credentials
+        .as_ref()
+        .is_none_or(|current| current.expires_at_ms <= now.saturating_add(60_000))
+    {
+        *credentials = Some(
+            managed_service
+                .mint_host_rtc_credentials(record)
+                .await
+                .map_err(MobileTaskError::managed_service)?,
+        );
+        tracing::debug!("host RTC credentials minted for signaling listener");
+    }
+    let credentials = credentials
+        .as_ref()
+        .ok_or_else(|| MobileTaskError::transport("missing host RTC credentials"))?
+        .clone();
     rtc_transport::connect(credentials, record.psk.as_bytes(), |_| {})
         .await
         .map(|stream| Box::new(stream) as BoxedMobileTransport)

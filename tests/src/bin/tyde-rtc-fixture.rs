@@ -76,8 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let unanswered_url = format!("http://{address}/unanswered/signal");
     let unanswered_ice = relay.browser_ice.clone();
-    let poll_started = Arc::new(tokio::sync::Notify::new());
-    let observed_poll = poll_started.clone();
+    let publish_started = Arc::new(tokio::sync::Notify::new());
+    let observed_publish = publish_started.clone();
     let app = Router::new()
         .route(
             "/unanswered/pairings/{pairing}/webrtc",
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/unanswered/signal",
             post(move |Json(command): Json<protocol::MobileSignalCommand>| {
-                let started = poll_started.clone();
+                let started = publish_started.clone();
                 async move {
                     match command {
                         protocol::MobileSignalCommand::Publish { description } => {
@@ -124,21 +124,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &[53; 32],
                             )
                             .unwrap();
-                        }
-                        protocol::MobileSignalCommand::Poll { session_id } => {
-                            assert!(session_id.is_some());
                             started.notify_one();
                         }
                     }
-                    Json(protocol::MobileSignalEvent::Waiting)
+                    std::future::pending::<Json<protocol::MobileSignalEvent>>().await
                 }
             })
             .options(|| async { StatusCode::NO_CONTENT }),
         )
         .route(
-            "/unanswered/poll-started",
+            "/unanswered/publish-started",
             get(move || {
-                let started = observed_poll.clone();
+                let started = observed_publish.clone();
                 async move {
                     started.notified().await;
                     StatusCode::NO_CONTENT
@@ -167,10 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(offer).options(|| async { StatusCode::NO_CONTENT }),
         )
         .with_state(relay.clone())
-        .merge(tests::rtc_reconnect::router(
-            relay.clone(),
-            format!("http://{address}"),
-        ))
+        .merge(tests::rtc_reconnect::router(relay.clone()))
         .layer(axum::middleware::map_response(
             |headers: HeaderMap, mut response: Response| async move {
                 response.headers_mut().insert(

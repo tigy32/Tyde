@@ -1787,7 +1787,7 @@ mod wasm_tests {
     }
 
     const VALID_MINT_RESPONSE: &str = r#"{
-        "protocol_version":1,"pairing_id":"pair_01J","role":"mobile",
+        "protocol_version":2,"pairing_id":"pair_01J","role":"mobile",
         "signaling_url":"https://tycode.dev/api/tyde/mobile/v1/webrtc/signal",
         "signaling_token":"signed-grant", "expires_at_ms":4102444800000,
         "ice_servers":[{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],

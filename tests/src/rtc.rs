@@ -277,3 +277,242 @@ pub async fn connect(
     eprintln!("TURN flow: channels open");
     (mobile, host)
 }
+
+#[derive(Clone)]
+pub struct PushSignaling {
+    commands: tokio::sync::mpsc::UnboundedSender<SignalRequest>,
+    state: tokio::sync::watch::Receiver<(u64, bool)>,
+    pub url: String,
+}
+
+enum SignalRequest {
+    Register(
+        tokio::sync::mpsc::UnboundedSender<HostRequest>,
+        tokio::sync::oneshot::Sender<u64>,
+    ),
+    Unregister(u64),
+    Offer(
+        protocol::MobileRtcDescription,
+        tokio::sync::oneshot::Sender<protocol::MobileSignalEvent>,
+    ),
+    Disconnect(tokio::sync::oneshot::Sender<()>),
+}
+
+enum HostRequest {
+    Offer(
+        protocol::MobileRtcDescription,
+        tokio::sync::oneshot::Sender<protocol::MobileSignalEvent>,
+    ),
+    Close,
+}
+
+impl PushSignaling {
+    pub fn router(base_url: &str) -> (Self, axum::Router) {
+        use axum::routing::get;
+        use tokio::sync::{mpsc, watch};
+        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (state_tx, state) = watch::channel((0, false));
+        tokio::spawn(async move {
+            let mut generation = 0;
+            let mut host: Option<mpsc::UnboundedSender<HostRequest>> = None;
+            while let Some(request) = requests.recv().await {
+                match request {
+                    SignalRequest::Register(next, reply) => {
+                        if let Some(old) = host.replace(next) {
+                            let _ = old.send(HostRequest::Close);
+                        }
+                        generation += 1;
+                        state_tx.send_replace((generation, true));
+                        let _ = reply.send(generation);
+                    }
+                    SignalRequest::Unregister(id) if id == generation => {
+                        host = None;
+                        state_tx.send_replace((generation, false));
+                    }
+                    SignalRequest::Unregister(_) => {}
+                    SignalRequest::Offer(description, reply) => match host.as_ref() {
+                        Some(host) => {
+                            if let Err(error) = host.send(HostRequest::Offer(description, reply)) {
+                                let HostRequest::Offer(_, reply) = error.0 else {
+                                    unreachable!()
+                                };
+                                let _ = reply.send(offline());
+                            }
+                        }
+                        None => {
+                            let _ = reply.send(offline());
+                        }
+                    },
+                    SignalRequest::Disconnect(reply) => {
+                        if let Some(host) = host.take() {
+                            let _ = host.send(HostRequest::Close);
+                        }
+                        state_tx.send_replace((generation, false));
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        let fixture = Self {
+            commands,
+            state,
+            url: format!("{base_url}/push-signal"),
+        };
+        let router = axum::Router::new()
+            .route(
+                "/push-signal",
+                get(push_host)
+                    .post(push_mobile)
+                    .options(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .with_state(fixture.clone())
+            .layer(axum::middleware::map_response(
+                |mut response: axum::response::Response| async move {
+                    use axum::http::{HeaderValue, header};
+                    response.headers_mut().insert(
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        HeaderValue::from_static("*"),
+                    );
+                    response.headers_mut().insert(
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        HeaderValue::from_static("content-type, authorization"),
+                    );
+                    response.headers_mut().insert(
+                        header::ACCESS_CONTROL_ALLOW_METHODS,
+                        HeaderValue::from_static("GET, POST, OPTIONS"),
+                    );
+                    response
+                },
+            ));
+        (fixture, router)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.state.borrow().0
+    }
+
+    pub async fn host_connected_after(&self, previous: u64) {
+        self.state
+            .clone()
+            .wait_for(|(generation, connected)| *generation > previous && *connected)
+            .await
+            .expect("signaling actor");
+    }
+
+    pub async fn disconnect(&self) {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(SignalRequest::Disconnect(reply))
+            .expect("signaling actor");
+        result.await.expect("signaling disconnect");
+    }
+
+    pub fn credentials(
+        &self,
+        role: protocol::MobilePeerRole,
+        ice: protocol::MobileIceServer,
+    ) -> protocol::MobileRtcCredentials {
+        protocol::MobileRtcCredentials {
+            protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
+            pairing_id: protocol::MobilePairingId("push-fixture".into()),
+            role,
+            signaling_url: protocol::MobileSignalingUrl(self.url.clone()),
+            signaling_token: "local-test-only".into(),
+            ice_servers: vec![ice],
+            expires_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis() as u64
+                + 3_600_000,
+        }
+    }
+}
+
+fn offline() -> protocol::MobileSignalEvent {
+    protocol::MobileSignalEvent::Failed {
+        message: "host offline".into(),
+    }
+}
+
+fn authorize(headers: &axum::http::HeaderMap) {
+    assert!(
+        headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer local-test-only"),
+        "signaling requires bearer authorization"
+    );
+}
+
+async fn push_mobile(
+    axum::extract::State(fixture): axum::extract::State<PushSignaling>,
+    headers: axum::http::HeaderMap,
+    axum::Json(command): axum::Json<protocol::MobileSignalCommand>,
+) -> axum::Json<protocol::MobileSignalEvent> {
+    authorize(&headers);
+    let protocol::MobileSignalCommand::Publish { description } = command;
+    assert_eq!(description.kind, MobileSdpKind::Offer);
+    let (reply, result) = tokio::sync::oneshot::channel();
+    fixture
+        .commands
+        .send(SignalRequest::Offer(description, reply))
+        .expect("signaling actor");
+    axum::Json(
+        result
+            .await
+            .expect("held POST must receive an explicit outcome"),
+    )
+}
+
+async fn push_host(
+    axum::extract::State(fixture): axum::extract::State<PushSignaling>,
+    headers: axum::http::HeaderMap,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    authorize(&headers);
+    upgrade.on_upgrade(move |socket| push_socket(fixture, socket))
+}
+
+async fn push_socket(fixture: PushSignaling, mut socket: axum::extract::ws::WebSocket) {
+    use axum::extract::ws::Message;
+    use protocol::{MobileSignalCommand, MobileSignalEvent};
+    let (host, mut offers) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, result) = tokio::sync::oneshot::channel();
+    fixture
+        .commands
+        .send(SignalRequest::Register(host, reply))
+        .expect("signaling actor");
+    let generation = result.await.expect("host registration");
+    let mut pending = None;
+    loop {
+        tokio::select! {
+            request = offers.recv() => match request {
+                Some(HostRequest::Offer(description, reply)) => {
+                    assert!(pending.is_none(), "one pending room per pairing");
+                    pending = Some(reply);
+                    let event = MobileSignalEvent::Description { description };
+                    if socket.send(Message::Text(serde_json::to_string(&event).expect("offer event").into())).await.is_err() { break; }
+                }
+                Some(HostRequest::Close) | None => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            },
+            frame = socket.recv() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    let MobileSignalCommand::Publish { description } = serde_json::from_str(&text).expect("typed host answer");
+                    assert_eq!(description.kind, MobileSdpKind::Answer);
+                    let reply = pending.take().expect("answer requires pending phone POST");
+                    let _ = reply.send(MobileSignalEvent::Description { description });
+                    if socket.send(Message::Text(serde_json::to_string(&MobileSignalEvent::Waiting).expect("answer ack").into())).await.is_err() { break; }
+                }
+                Some(Ok(Message::Ping(bytes))) => { if socket.send(Message::Pong(bytes)).await.is_err() { break; } }
+                Some(Ok(Message::Pong(_))) => {}
+                _ => break,
+            }
+        }
+    }
+    if let Some(reply) = pending {
+        let _ = reply.send(offline());
+    }
+    let _ = fixture.commands.send(SignalRequest::Unregister(generation));
+}

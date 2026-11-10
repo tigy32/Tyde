@@ -2084,7 +2084,7 @@ mod wasm_tests {
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
                 http.call3(
                     &wasm_bindgen::JsValue::NULL,
-                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &format!("{endpoint}/unanswered/publish-started").into(),
                     &"GET".into(), &"".into(),
                 ).unwrap(),
             )).await.unwrap();
@@ -2096,7 +2096,7 @@ mod wasm_tests {
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
                 http.call3(
                     &wasm_bindgen::JsValue::NULL,
-                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &format!("{endpoint}/unanswered/publish-started").into(),
                     &"GET".into(), &"".into(),
                 ).unwrap(),
             )).await.unwrap();
@@ -2108,7 +2108,7 @@ mod wasm_tests {
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
                 http.call3(
                     &wasm_bindgen::JsValue::NULL,
-                    &format!("{endpoint}/unanswered/poll-started").into(),
+                    &format!("{endpoint}/unanswered/publish-started").into(),
                     &"GET".into(),
                     &"".into(),
                 )

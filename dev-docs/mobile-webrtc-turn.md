@@ -16,22 +16,31 @@ callback bodies without a transport version increase.
 ## Connection establishment
 
 1. Pairing keeps its durable host/device secrets and the QR-shared pairing key.
-   New managed QR offers advertise WebRTC transport version 1. Existing stored
+   New managed QR offers advertise WebRTC transport version 2. Existing stored
    managed identities can connect after both applications and the service update.
 2. Each reconnect signs `POST /pairings/{id}/webrtc` with its role's pairing
    secret. Mobile also needs its current Tyggs Pass session cookie. The service
    checks pairing status and issues fresh Cloudflare credentials and a scoped
-   signaling grant. Neither grant is cached or written to device storage.
-3. The mobile peer gathers a relay offer, signs the complete SDP with the pairing
-   key, and publishes it to `/webrtc/signal`. The host polls this authenticated
-   HTTPS endpoint while waiting for a phone. It verifies the offer, gathers its
-   relay answer, signs it, and publishes the answer. Mobile verifies the answer
-   before applying it. The session ID and description kind are included in each
-   HMAC, binding the DTLS fingerprints to this pairing and negotiation.
-4. Signaling retains one short-lived session per pairing in DSQL. A host claims
-   each offer once; roles, session IDs, expiration and pairing revocation are
-   checked on every exchange. HTTP polling uses the existing Lambda deployment;
-   it carries connection setup only. Active data connections need no polling.
+   signaling grant. The host accept task retains its credentials across socket
+   reconnects, renewing only within 60 seconds of expiry. They are never persisted.
+3. Host opens the credentials' `signaling_url` as a WebSocket (HTTPS becomes
+   WSS), with `Authorization: Bearer <signaling_token>` on the GET upgrade.
+   While idle it sends only WebSocket protocol pings every 25 seconds, not JSON
+   heartbeat requests. A new socket replaces the pairing's previous socket.
+   A close or transport error reaches the existing jittered accept-task backoff.
+   The host allocates no TURN peer until an offer arrives.
+4. Mobile POSTs `MobileSignalCommand::Publish { description: offer }` with the
+   same bearer authorization. The service holds that request until the host
+   answers, returning `MobileSignalEvent::Description { description: answer }`,
+   or `Failed { message }` when offline or the 60-second room expires. There is
+   no 15-second HTTP exchange timeout on this held request; the existing
+   60-second mobile negotiation bound still applies. Host receives the offer as
+   a JSON text `Description` event, verifies its pairing-key HMAC, creates and
+   signs the answer, then sends JSON text `Publish { description: answer }`.
+   The socket returns `Waiting` only as the answer acknowledgement, or `Failed`.
+   An acknowledgement while awaiting a description is a protocol error. There
+   is no Poll command, polling loop, or transport fallback. SDP signatures still
+   bind session ID, kind, and the complete SDP (including DTLS fingerprints).
 5. The data channel adapter bounds chunks and receive queues. A write flush waits
    for the peer to enqueue every chunk, and backpressure propagates to the sender.
    Normal connection heartbeat and disconnect handling remain in the Tyde layer.
@@ -64,7 +73,7 @@ real browser recovery flow, a 50 ms wait then slept until an unrelated 2-second
 or 15-second deadline fired. Heartbeat, retry, signaling and frame-reassembly
 timers all use the replacement; native timing remains on Tokio.
 
-Mobile service requests have a 15-second deadline covering both response headers
+Non-signaling mobile service requests have a 15-second deadline covering both response headers
 and the complete response body. Cancelling or timing out a request aborts its
 browser fetch. The complete managed credential-and-negotiation attempt is bounded
 by the existing 60-second connection deadline. Returning after a background pause
@@ -306,3 +315,43 @@ retry and the unknown-versus-revoked distinction are unchanged. Original capture
 remain preserved outside the workbench. The existing DOM dismissal flow also
 requires heading clearance, readable cause text and aligned recovery controls
 at phone widths; it does not depend on elapsed-time thresholds.
+
+## Idle requests and compatibility (transport 2)
+
+`spawn_device_accept_task` previously minted credentials on every failed
+`connect_mobile_device_stream` attempt. Socket reconnect now reuses the task's
+current 8-hour credentials; the transport's existing expiry deadline wakes an
+idle listener for renewal. A successful connection starts a new accept task
+and therefore obtains a new connection's credentials.
+
+`/pairings/{id}/bootstrap` is a different API, not RTC credential minting.
+`spawn_bootstrap_registration` previously performed a generation GET followed
+by a registration POST, then gratuitously repeated the POST every 60 seconds.
+The service's paired Resolve operation re-attests the stored descriptor with a
+fresh 120-second response lease; registration does not expire. Register once
+per descriptor/runtime instead. Descriptor changes still replace registration,
+and failed registration remains an explicit error. The reported approximately
+36-second GET cadence is not produced by that 60-second timer in this source;
+new listeners and registration failures could repeat the initial GET. Local
+content-free diagnostics now identify registration, credential minting, and
+socket reconnect failures separately; production cadence was not measured.
+
+The `tycode.dev/tyde` loader reads the published manifest and selects the exact
+host client release. Native bootstrap compares the descriptor's application
+protocol, transport protocol, artifact hash and native ABI to that manifest
+before loading it (`web/loader/native-bootstrap.js`, `loader.js`). The desktop
+also rejects a published descriptor with a different transport version. Both
+RTC peers reject credential protocol versions other than 2 before connecting;
+credential mint requests explicitly advertise version 2. A v1 grant must not
+be returned to a v2 request: these clients reject it rather than polling.
+
+Deploy the matching service contract and publish a new immutable desktop/mobile
+release whose manifest advertises transport 2. Do not overwrite an old version's
+mobile bundle. Existing pairings keep their secrets; no re-pairing is required,
+but each desktop needs its matching client bundle. Until that bundle is
+published, a new desktop fails publication compatibility explicitly. The service
+may preserve an isolated v1 legacy path during rollout. A v1 host must select
+its published v1 mobile bundle through the bootstrap descriptor, not cause a
+v2 client to downgrade transport or accept v1 credentials. Unsupported versions
+and role/transport mismatches must fail explicitly. This source change does not
+itself publish the mobile bundle or cut a release.

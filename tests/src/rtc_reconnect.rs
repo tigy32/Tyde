@@ -11,11 +11,14 @@ use axum::{
 use futures_util::StreamExt;
 use protocol::{
     CustomAgent, CustomAgentId, MOBILE_RTC_PROTOCOL_VERSION, MobileDeviceId, MobilePairingId,
-    MobilePeerRole, MobileRtcCredentials, MobileRtcCredentialsRequest, MobileRtcDescription,
-    MobileSdpKind, MobileSignalCommand, MobileSignalEvent, MobileSignalingUrl, ToolPolicy,
+    MobilePeerRole, MobileRtcCredentialsRequest, ToolPolicy,
 };
-use rtc_transport::{Peer, authenticate_description, verify_description};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
+
+enum ScenarioCommand {
+    Configure(String, String),
+    Read(String, bool, oneshot::Sender<(String, usize)>),
+}
 
 struct Scenario {
     mode: String,
@@ -24,15 +27,13 @@ struct Scenario {
 
 struct Fixture {
     relay: Arc<crate::rtc::RelayFixture>,
-    base_url: String,
-    scenarios: Mutex<HashMap<String, Scenario>>,
-    answers: Mutex<HashMap<String, MobileRtcDescription>>,
+    scenarios: mpsc::UnboundedSender<ScenarioCommand>,
     host: server::HostHandle,
     store: tempfile::TempDir,
     dev_host_addr: Option<std::net::SocketAddr>,
 }
 
-pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router {
+pub fn router(relay: Arc<crate::rtc::RelayFixture>) -> Router {
     let dev_host_addr = std::env::var_os("TYDE_RTC_TEST_DEV_HOST_ADDR").map(|value| {
         let address: std::net::SocketAddr = value
             .to_str()
@@ -62,6 +63,30 @@ pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router 
         store.path().join("settings.json"),
     )
     .expect("reconnect host");
+    let (scenarios, mut commands) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut scenarios = HashMap::<String, Scenario>::new();
+        while let Some(command) = commands.recv().await {
+            match command {
+                ScenarioCommand::Configure(id, mode) => {
+                    scenarios
+                        .entry(id)
+                        .or_insert(Scenario {
+                            mode: String::new(),
+                            requests: 0,
+                        })
+                        .mode = mode;
+                }
+                ScenarioCommand::Read(id, increment, reply) => {
+                    let scenario = scenarios
+                        .get_mut(&id)
+                        .expect("configured reconnect scenario");
+                    scenario.requests += usize::from(increment);
+                    let _ = reply.send((scenario.mode.clone(), scenario.requests));
+                }
+            }
+        }
+    });
     Router::new()
         .route("/reconnect/{id}/control", post(control).options(preflight))
         .route("/reconnect/{id}/requests", get(requests))
@@ -69,12 +94,9 @@ pub fn router(relay: Arc<crate::rtc::RelayFixture>, base_url: String) -> Router 
             "/reconnect/{id}/pairings/{pairing}/webrtc",
             post(credentials).options(preflight),
         )
-        .route("/reconnect/{id}/signal", post(signal).options(preflight))
         .with_state(Arc::new(Fixture {
             relay,
-            base_url,
-            scenarios: Mutex::new(HashMap::new()),
-            answers: Mutex::new(HashMap::new()),
+            scenarios,
             host,
             store,
             dev_host_addr,
@@ -90,25 +112,20 @@ async fn control(
     Path(id): Path<String>,
     mode: String,
 ) -> StatusCode {
-    let mut scenarios = fixture.scenarios.lock().await;
-    scenarios
-        .entry(id)
-        .or_insert(Scenario {
-            mode: String::new(),
-            requests: 0,
-        })
-        .mode = mode;
+    fixture
+        .scenarios
+        .send(ScenarioCommand::Configure(id, mode))
+        .expect("scenario actor");
     StatusCode::NO_CONTENT
 }
 
 async fn requests(State(fixture): State<Arc<Fixture>>, Path(id): Path<String>) -> Json<usize> {
-    let count = fixture
+    let (reply, result) = oneshot::channel();
+    fixture
         .scenarios
-        .lock()
-        .await
-        .get(&id)
-        .expect("scenario")
-        .requests;
+        .send(ScenarioCommand::Read(id, false, reply))
+        .expect("scenario actor");
+    let (_, count) = result.await.expect("scenario count");
     eprintln!(
         "reconnect fixture: observed count={count} time={:?}",
         SystemTime::now()
@@ -123,14 +140,12 @@ async fn credentials(
 ) -> Response {
     assert_eq!(request.protocol_version, MOBILE_RTC_PROTOCOL_VERSION);
     assert_eq!(request.role, MobilePeerRole::Mobile);
-    let (mode, count) = {
-        let mut scenarios = fixture.scenarios.lock().await;
-        let scenario = scenarios
-            .get_mut(&id)
-            .expect("configured reconnect scenario");
-        scenario.requests += 1;
-        (scenario.mode.clone(), scenario.requests)
-    };
+    let (reply, result) = oneshot::channel();
+    fixture
+        .scenarios
+        .send(ScenarioCommand::Read(id.clone(), true, reply))
+        .expect("scenario actor");
+    let (mode, count) = result.await.expect("scenario credentials");
     eprintln!(
         "reconnect fixture: credential request mode={mode} count={count} time={:?}",
         SystemTime::now()
@@ -149,57 +164,37 @@ async fn credentials(
             }})),
         )
             .into_response(),
-        "ready" => Json(MobileRtcCredentials {
-            protocol_version: MOBILE_RTC_PROTOCOL_VERSION,
-            pairing_id: MobilePairingId(pairing),
-            role: MobilePeerRole::Mobile,
-            signaling_url: MobileSignalingUrl(format!(
-                "{}/reconnect/{id}/signal",
-                fixture.base_url
-            )),
-            signaling_token: "local-test-only".to_owned(),
-            ice_servers: vec![fixture.relay.browser_ice.clone()],
-            expires_at_ms: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("clock")
-                .as_millis() as u64
-                + 3_600_000,
-        })
-        .into_response(),
-        _ => panic!("unexpected reconnect fixture mode"),
-    }
-}
-
-async fn signal(
-    State(fixture): State<Arc<Fixture>>,
-    Json(command): Json<MobileSignalCommand>,
-) -> Json<MobileSignalEvent> {
-    match command {
-        MobileSignalCommand::Publish { description } => {
-            let session = description.session_id.clone();
-            verify_description(&description, &session, MobileSdpKind::Offer, &[53; 32])
-                .expect("authenticated reconnect offer");
-            let mut peer = Peer::with_tls_roots(
-                std::slice::from_ref(&fixture.relay.tls_ice),
-                fixture.relay.roots.clone(),
-            )
-            .await
-            .expect("native reconnect peer");
-            let sdp = peer
-                .answer(description.sdp)
+        "ready" => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("native reconnect answer");
-            let answer =
-                authenticate_description(session.clone(), MobileSdpKind::Answer, sdp, &[53; 32])
-                    .expect("signed reconnect answer");
-            fixture.answers.lock().await.insert(session.0, answer);
+                .expect("push listener");
+            let base = format!("http://{}", listener.local_addr().expect("push address"));
+            let (signal, router) = crate::rtc::PushSignaling::router(&base);
+            let service = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("push service");
+            });
+            let host_credentials =
+                signal.credentials(MobilePeerRole::Host, fixture.relay.tls_ice.clone());
+            let roots = fixture.relay.roots.clone();
+            let mut mobile_credentials =
+                signal.credentials(MobilePeerRole::Mobile, fixture.relay.browser_ice.clone());
+            mobile_credentials.pairing_id = MobilePairingId(pairing);
+            let connected = signal.clone();
             tokio::spawn(async move {
-                assert!(
-                    fixture.store.path().exists(),
-                    "disposable store remains alive"
-                );
                 let flow = async {
-                    let stream = peer.into_stream().await.map_err(std::io::Error::other)?;
+                    let stream = rtc_transport::connect_with_tls_roots(
+                        host_credentials,
+                        &[53; 32],
+                        |_| {},
+                        roots,
+                    )
+                    .await
+                    .map_err(std::io::Error::other)?;
+                    service.abort();
+                    assert!(
+                        fixture.store.path().exists(),
+                        "disposable store remains alive"
+                    );
                     if let Some(address) = fixture.dev_host_addr {
                         let mut stream = stream;
                         let mut host = tokio::net::TcpStream::connect(address).await?;
@@ -212,7 +207,7 @@ async fn signal(
                     server::run_mobile_connection(
                         connection,
                         fixture.host.clone(),
-                        MobileDeviceId("rtc-reconnect".to_owned()),
+                        MobileDeviceId("rtc-reconnect".into()),
                     )
                     .await
                     .map_err(std::io::Error::other)
@@ -221,16 +216,9 @@ async fn signal(
                     eprintln!("reconnect fixture: host connection ended: {error}");
                 }
             });
-            Json(MobileSignalEvent::Waiting)
+            connected.host_connected_after(0).await;
+            Json(mobile_credentials).into_response()
         }
-        MobileSignalCommand::Poll { session_id } => {
-            let session = session_id.expect("mobile polls its session");
-            Json(match fixture.answers.lock().await.get(session.as_str()) {
-                Some(description) => MobileSignalEvent::Description {
-                    description: description.clone(),
-                },
-                None => MobileSignalEvent::Waiting,
-            })
-        }
+        _ => panic!("unexpected reconnect fixture mode"),
     }
 }

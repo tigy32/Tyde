@@ -8,12 +8,37 @@ use crate::{
     ConnectStage, Error, Peer, RtcStream, authenticate_description, failure, verify_description,
 };
 
-use tyde_time::{sleep, timeout};
+use tyde_time::timeout;
 
 pub async fn connect(
     credentials: MobileRtcCredentials,
     pairing_key: &[u8; 32],
+    progress: impl FnMut(ConnectStage),
+) -> Result<RtcStream, Error> {
+    connect_with(credentials, pairing_key, progress, |servers| async move {
+        Peer::new(&servers).await
+    })
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn connect_with_tls_roots(
+    credentials: MobileRtcCredentials,
+    pairing_key: &[u8; 32],
+    progress: impl FnMut(ConnectStage),
+    roots: tokio_rustls::rustls::RootCertStore,
+) -> Result<RtcStream, Error> {
+    connect_with(credentials, pairing_key, progress, |servers| async move {
+        Peer::with_tls_roots(&servers, roots).await
+    })
+    .await
+}
+
+async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
+    credentials: MobileRtcCredentials,
+    pairing_key: &[u8; 32],
     mut progress: impl FnMut(ConnectStage),
+    new_peer: impl FnOnce(Vec<protocol::MobileIceServer>) -> F,
 ) -> Result<RtcStream, Error> {
     if credentials.protocol_version != MOBILE_RTC_PROTOCOL_VERSION {
         return Err(failure(
@@ -74,24 +99,26 @@ pub async fn connect(
         stage = next;
         progress(next);
     };
-    advance(ConnectStage::RelayAllocation);
-    let mut peer = Peer::new(&signal.credentials.ice_servers).await?;
     let negotiation = async {
-        match signal.credentials.role {
+        let peer = match signal.credentials.role {
             MobilePeerRole::Mobile => {
+                advance(ConnectStage::RelayAllocation);
+                let mut peer = new_peer(signal.credentials.ice_servers.clone()).await?;
                 let session_id = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
                 let offer = peer.offer().await?;
                 advance(ConnectStage::PublishOffer);
-                signal
-                    .publish(authenticate_description(
-                        session_id.clone(),
-                        MobileSdpKind::Offer,
-                        offer,
-                        pairing_key,
-                    )?)
-                    .await?;
                 advance(ConnectStage::AwaitHostAnswer);
-                let description = signal.wait(Some(session_id.clone())).await?;
+                let description = signal
+                    .exchange(MobileSignalCommand::Publish {
+                        description: authenticate_description(
+                            session_id.clone(),
+                            MobileSdpKind::Offer,
+                            offer,
+                            pairing_key,
+                        )?,
+                    })
+                    .await?;
+                let description = require_description(description)?;
                 verify_description(
                     &description,
                     &session_id,
@@ -99,16 +126,19 @@ pub async fn connect(
                     pairing_key,
                 )?;
                 peer.set_answer(description.sdp).await?;
+                peer
             }
             MobilePeerRole::Host => {
                 advance(ConnectStage::AwaitMobileOffer);
-                let description = signal.wait(None).await?;
+                let mut socket = HostSocket::open(&signal.credentials).await?;
+                let description = require_description(socket.receive().await?)?;
                 let session_id = description.session_id.clone();
                 verify_description(&description, &session_id, MobileSdpKind::Offer, pairing_key)?;
                 advance(ConnectStage::CreateAnswer);
+                let mut peer = new_peer(signal.credentials.ice_servers.clone()).await?;
                 let answer = peer.answer(description.sdp).await?;
                 advance(ConnectStage::PublishAnswer);
-                signal
+                socket
                     .publish(authenticate_description(
                         session_id,
                         MobileSdpKind::Answer,
@@ -116,8 +146,9 @@ pub async fn connect(
                         pairing_key,
                     )?)
                     .await?;
+                peer
             }
-        }
+        };
         advance(ConnectStage::OpenChannel);
         peer.into_stream_for(remaining()?).await
     };
@@ -137,69 +168,157 @@ struct Signaling {
 
 impl Signaling {
     async fn exchange(&self, command: MobileSignalCommand) -> Result<MobileSignalEvent, Error> {
-        timeout(Duration::from_secs(15), async {
-            let response = self
-                .client
-                .post(self.credentials.signaling_url.as_str())
-                .bearer_auth(&self.credentials.signaling_token)
-                .json(&command)
-                .send()
-                .await
-                .map_err(|error| failure("signaling request", error))?;
-            if !response.status().is_success() {
-                return Err(failure(
-                    "signaling",
-                    format!("service refused request (HTTP {})", response.status()),
-                ));
-            }
-            if response
-                .content_length()
-                .is_some_and(|length| length > 32 * 1024)
-            {
-                return Err(failure("signaling", "response exceeds 32 KiB"));
-            }
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| failure("signaling response", error))?;
-            if body.len() > 32 * 1024 {
-                return Err(failure("signaling", "response exceeds 32 KiB"));
-            }
-            serde_json::from_slice(&body).map_err(|error| failure("signaling response", error))
-        })
-        .await
-        .map_err(|_| failure("signaling request", "timed out"))?
+        let response = self
+            .client
+            .post(self.credentials.signaling_url.as_str())
+            .bearer_auth(&self.credentials.signaling_token)
+            .json(&command)
+            .send()
+            .await
+            .map_err(|error| failure("signaling request", error))?;
+        if !response.status().is_success() {
+            return Err(failure(
+                "signaling",
+                format!("service refused request (HTTP {})", response.status()),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > 32 * 1024)
+        {
+            return Err(failure("signaling", "response exceeds 32 KiB"));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| failure("signaling response", error))?;
+        if body.len() > 32 * 1024 {
+            return Err(failure("signaling", "response exceeds 32 KiB"));
+        }
+        serde_json::from_slice(&body).map_err(|error| failure("signaling response", error))
+    }
+}
+
+fn require_description(event: MobileSignalEvent) -> Result<protocol::MobileRtcDescription, Error> {
+    match event {
+        MobileSignalEvent::Description { description } => Ok(description),
+        MobileSignalEvent::Failed { message } => Err(failure("signaling", message)),
+        MobileSignalEvent::Waiting => Err(failure(
+            "signaling",
+            "unexpected acknowledgement while awaiting description",
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct HostSocket {
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ping: tokio::time::Interval,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl HostSocket {
+    async fn open(credentials: &MobileRtcCredentials) -> Result<Self, Error> {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+        let mut url = url::Url::parse(credentials.signaling_url.as_str())
+            .map_err(|error| failure("signaling URL", error))?;
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        url.set_scheme(scheme)
+            .map_err(|_| failure("signaling URL", "invalid WebSocket scheme"))?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| failure("signaling socket", error))?;
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", credentials.signaling_token))
+                .map_err(|_| failure("signaling authorization", "invalid token header"))?,
+        );
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(32 * 1024))
+            .max_frame_size(Some(32 * 1024));
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true)
+            .await
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => failure(
+                    "signaling socket",
+                    format!("service refused WebSocket upgrade (HTTP {}); check service compatibility and credentials", response.status()),
+                ),
+                _ => failure("signaling socket", "WebSocket upgrade failed"),
+            })?;
+        // Protocol pings do not invoke the service's billed application handler.
+        const PING_INTERVAL: Duration = Duration::from_secs(25);
+        let mut ping =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::debug!("host signaling socket connected");
+        Ok(Self { socket, ping })
     }
 
-    async fn publish(
-        &self,
-        description: protocol::types::MobileRtcDescription,
-    ) -> Result<(), Error> {
-        match self
-            .exchange(MobileSignalCommand::Publish { description })
-            .await?
-        {
+    async fn receive(&mut self) -> Result<MobileSignalEvent, Error> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            tokio::select! {
+                _ = self.ping.tick() => self.socket.send(Message::Ping(Vec::new().into())).await
+                    .map_err(|_| failure("signaling socket", "ping failed"))?,
+                frame = self.socket.next() => match frame {
+                    Some(Ok(Message::Text(text))) => return serde_json::from_str(&text)
+                        .map_err(|error| failure("signaling socket response", error)),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        self.socket.flush().await.map_err(|_| failure("signaling socket", "control frame flush failed"))?;
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Err(failure("signaling socket", "connection closed")),
+                    Some(Err(_)) => return Err(failure("signaling socket", "connection failed")),
+                    Some(Ok(_)) => return Err(failure("signaling socket", "expected JSON text frame")),
+                }
+            }
+        }
+    }
+
+    async fn publish(&mut self, description: protocol::MobileRtcDescription) -> Result<(), Error> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let text = serde_json::to_string(&MobileSignalCommand::Publish { description })
+            .map_err(|error| failure("signaling answer", error))?;
+        self.socket
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|_| failure("signaling socket", "answer send failed"))?;
+        match self.receive().await? {
             MobileSignalEvent::Waiting => Ok(()),
             MobileSignalEvent::Failed { message } => Err(failure("signaling", message)),
-            _ => Err(failure("signaling", "unexpected publish response")),
+            MobileSignalEvent::Description { .. } => Err(failure(
+                "signaling",
+                "unexpected description while awaiting answer acknowledgement",
+            )),
         }
     }
+}
 
-    async fn wait(
-        &self,
-        session_id: Option<MobileRtcSessionId>,
-    ) -> Result<protocol::types::MobileRtcDescription, Error> {
-        loop {
-            match self
-                .exchange(MobileSignalCommand::Poll {
-                    session_id: session_id.clone(),
-                })
-                .await?
-            {
-                MobileSignalEvent::Waiting => sleep(Duration::from_secs(1)).await,
-                MobileSignalEvent::Description { description } => return Ok(description),
-                MobileSignalEvent::Failed { message } => return Err(failure("signaling", message)),
-            }
-        }
+#[cfg(target_arch = "wasm32")]
+struct HostSocket;
+
+#[cfg(target_arch = "wasm32")]
+impl HostSocket {
+    async fn open(_: &MobileRtcCredentials) -> Result<Self, Error> {
+        Err(failure(
+            "configuration",
+            "browser cannot act as a signaling host",
+        ))
+    }
+    async fn receive(&mut self) -> Result<MobileSignalEvent, Error> {
+        Err(failure(
+            "configuration",
+            "browser cannot act as a signaling host",
+        ))
+    }
+    async fn publish(&mut self, _: protocol::MobileRtcDescription) -> Result<(), Error> {
+        Err(failure(
+            "configuration",
+            "browser cannot act as a signaling host",
+        ))
     }
 }

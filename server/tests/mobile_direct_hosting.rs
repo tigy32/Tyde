@@ -2333,3 +2333,154 @@ async fn managed_revocation_retains_credentials_until_authority_confirms() {
     http.abort();
     let _ = http.await;
 }
+
+#[tokio::test]
+async fn managed_idle_listener_reuses_credentials_after_socket_close() {
+    use axum::{
+        Json, Router,
+        extract::{State, WebSocketUpgrade},
+        routing::{get, post},
+    };
+    use protocol::{MobilePeerRole, MobileRtcCredentialsRequest};
+    use server::store::mobile_pairings::{
+        ManagedMobilePairingCredential, MobilePairingRecord, MobilePairings, MobilePairingsStore,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    #[derive(Clone)]
+    struct Signaling {
+        url: String,
+        mints: Arc<AtomicUsize>,
+        sockets: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+    async fn mint(
+        State(state): State<Signaling>,
+        headers: axum::http::HeaderMap,
+        Json(request): Json<MobileRtcCredentialsRequest>,
+    ) -> Json<protocol::MobileRtcCredentials> {
+        assert!(headers.contains_key("x-tycode-pairing-auth"));
+        assert_eq!(request.role, MobilePeerRole::Host);
+        assert_eq!(
+            request.protocol_version,
+            protocol::MOBILE_RTC_PROTOCOL_VERSION
+        );
+        state.mints.fetch_add(1, Ordering::SeqCst);
+        Json(protocol::MobileRtcCredentials {
+            protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
+            pairing_id: protocol::MobilePairingId("idle-pairing".into()),
+            role: MobilePeerRole::Host,
+            signaling_url: protocol::MobileSignalingUrl(state.url),
+            signaling_token: "local-idle-token".into(),
+            ice_servers: vec![protocol::MobileIceServer {
+                urls: vec![protocol::MobileTurnUrl(
+                    "turns:localhost:443?transport=tcp".into(),
+                )],
+                username: "local".into(),
+                credential: "local".into(),
+            }],
+            expires_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 8 * 3_600_000,
+        })
+    }
+    async fn socket(
+        State(state): State<Signaling>,
+        headers: axum::http::HeaderMap,
+        upgrade: WebSocketUpgrade,
+    ) -> axum::response::Response {
+        assert!(
+            headers
+                .get("authorization")
+                .is_some_and(|value| value == "Bearer local-idle-token")
+        );
+        upgrade.on_upgrade(move |mut socket| async move {
+            let (close, closed) = oneshot::channel();
+            state.sockets.send(close).unwrap();
+            closed.await.unwrap();
+            let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+        })
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (sockets, mut connected) = mpsc::unbounded_channel();
+    let mints = Arc::new(AtomicUsize::new(0));
+    let state = Signaling {
+        url: format!("{endpoint}/signal"),
+        mints: mints.clone(),
+        sockets,
+    };
+    let service = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/pairings/idle-pairing/webrtc", post(mint))
+                .route("/signal", get(socket))
+                .with_state(state),
+        )
+        .await
+        .unwrap();
+    });
+    let store = tempfile::tempdir().unwrap();
+    let psk = mobile_pairing::PreSharedKey::random();
+    let fingerprint = server::store::mobile_pairings::key_fingerprint(&psk);
+    let mut pairings = MobilePairings::empty();
+    pairings.devices.push(MobilePairingRecord {
+        device_id: protocol::MobileDeviceId("idle-device".into()),
+        psk,
+        label: "Idle phone".into(),
+        created_at_ms: 1,
+        last_seen_at_ms: None,
+        state: protocol::MobileDeviceState::Paired,
+        key_fingerprint: fingerprint,
+        push: None,
+        managed: Some(ManagedMobilePairingCredential {
+            pairing_id: "idle-pairing".into(),
+            host_pairing_secret: uuid::Uuid::new_v4().to_string(),
+        }),
+    });
+    MobilePairingsStore::load(store.path().join("mobile_pairings.json"))
+        .unwrap()
+        .save(&pairings)
+        .unwrap();
+    let mut fixture = Fixture::new_at_existing_store_with_runtime_config(
+        store.path().into(),
+        server::HostRuntimeConfig {
+            mobile_managed_service_base_url: Some(endpoint),
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .client
+        .replace_setting("/enable_mobile_connections", true, false)
+        .await
+        .unwrap();
+    let first = connected.recv().await.expect("initial host WebSocket");
+    assert_eq!(mints.load(Ordering::SeqCst), 1);
+    first.send(()).unwrap();
+    let second = connected.recv().await.expect("host reconnects after close");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        1,
+        "socket reconnect must not mint unexpired credentials"
+    );
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert_eq!(
+        bootstrap.mobile_access.paired_devices.len(),
+        1,
+        "listener failure must retain the pairing"
+    );
+    fixture
+        .client
+        .replace_setting("/enable_mobile_connections", false, true)
+        .await
+        .unwrap();
+    second.send(()).unwrap();
+    service.abort();
+}

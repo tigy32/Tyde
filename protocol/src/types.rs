@@ -55,7 +55,7 @@ pub mod mobile_rtc {
     rtc_identifier!(MobileSignalingUrl);
     rtc_identifier!(MobileTurnUrl);
 
-    pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 1;
+    pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 2;
     pub const MOBILE_RTC_CHANNEL_LABEL: &str = "tyde.v1";
     pub const MOBILE_RTC_CHANNEL_ID: u16 = 0;
 
@@ -136,12 +136,7 @@ pub mod mobile_rtc {
     #[derive(Clone, Serialize, Deserialize, JsonSchema)]
     #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
     pub enum MobileSignalCommand {
-        Poll {
-            session_id: Option<MobileRtcSessionId>,
-        },
-        Publish {
-            description: MobileRtcDescription,
-        },
+        Publish { description: MobileRtcDescription },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
