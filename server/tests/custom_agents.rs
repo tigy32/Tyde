@@ -2079,7 +2079,7 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
         text.contains(&format!(
             "[builtin_steering: {}]",
             // The mock's startup summary renders newlines as literal \n.
-            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
+            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. Use tyde_request_permissions to ask the human for a different Tyde permission mode when needed. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )),
         "spawn config lost the agent-control steering: {text}"
     );

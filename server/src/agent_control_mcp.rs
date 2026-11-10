@@ -79,7 +79,7 @@ pub(crate) async fn current_permissions_response(
     Ok(json!({"tyde_permissions": role, "guidance": tyde_permissions_guidance(role)}))
 }
 
-pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.";
+pub(crate) const TYDE_PERMISSIONS_INSTRUCTIONS: &str = "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. Use tyde_request_permissions to ask the human for a different Tyde permission mode when needed. This guidance does not grant operating-system privileges or waive confirmations.";
 
 fn agent_control_tool_allowed(
     capabilities: &protocol::types::AgentControlMcpCapabilities,
@@ -1639,8 +1639,89 @@ pub(crate) fn text_page(text: &str, offset: usize, limit: usize) -> serde_json::
         "next_offset": (end < total).then_some(end) })
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RequestPermissionsInput {
+    /// Permission mode to request from the human.
+    access: protocol::AgentTydePermissions,
+    /// Why this task needs the different permission mode.
+    reason: String,
+}
+
 #[tool_router]
 impl TydeAgentControlMcpServer {
+    #[tool(
+        description = "Ask the human to change your Tyde permission mode. Shows a pinned approval tray and waits for their decision, with no automatic grant. The chosen mode lasts until the human changes it. Request only what this task needs; do not repeat a denied request. This does not grant OS privileges or change backend execution mode."
+    )]
+    async fn tyde_request_permissions(
+        &self,
+        Parameters(input): Parameters<RequestPermissionsInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let _active_request = ActiveAwaitRequestGuard::new(Arc::clone(&self.active_await_requests));
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_request_permissions").await {
+                Ok(caller) => caller,
+                Err(error) => return Ok(err_text(error)),
+            };
+        let Some(agent) = self.host.agent_handle(&caller).await else {
+            return Ok(err_text("Agent is no longer live"));
+        };
+        let access = input.access;
+        let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
+            Arc::clone(&self.await_request_cancellations),
+            caller.clone(),
+        );
+        let id = Uuid::new_v4();
+        let request = agent.request_tyde_permissions(protocol::AgentTydePermissionRequest {
+            id,
+            access,
+            reason: input.reason,
+        });
+        let reporter = AwaitProgressReporter::from_context(&context);
+        tracing::info!(
+            has_progress_token = reporter.is_some(),
+            "Permission request human-decision wait started"
+        );
+        let mut progress_tick = tokio::time::interval(AWAIT_TOOL_PROGRESS_INTERVAL);
+        progress_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut progress = 0.0;
+        tokio::pin!(request);
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = self.await_expiration.cancelled() => break Err("Host stopped while awaiting permission decision".to_owned()),
+                _ = host_cancellation.cancelled() => break Err("Permission request cancelled".to_owned()),
+                _ = context.ct.cancelled() => break Err("Permission request cancelled".to_owned()),
+                result = &mut request => break result,
+                _ = progress_tick.tick(), if reporter.is_some() => {
+                    if let Some(reporter) = &reporter {
+                        progress += 1.0;
+                        if let Err(error) = reporter.peer.notify_progress(ProgressNotificationParam {
+                            progress_token: reporter.progress_token.clone(), progress, total: None,
+                            message: Some("Waiting for the human permission-mode decision".to_owned()),
+                        }).await {
+                            break Err(format!("Cannot report pending permission decision: {error}"));
+                        }
+                    }
+                }
+            }
+        };
+        if result.is_err() {
+            agent
+                .cancel_tyde_permission_request(id)
+                .await
+                .map_err(|error| McpError::internal_error(error, None))?;
+        }
+        match result {
+            Ok(()) => match current_permissions_response(&self.host, Some(&caller)).await {
+                Ok(value) => ok_json(value),
+                Err(error) => Ok(err_text(error)),
+            },
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
     #[tool(
         description = "Read your own current human-assigned Tyde permissions and role guidance before using Tyde controls. Does not read or change host configuration or another agent's permissions.",
         annotations(
@@ -2942,7 +3023,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_review on the await server to run configured advisory reviewers and return completion/counts in one call. Use ID-scoped list/read/edit/resolve tools on this server; full audit history is bounded and on demand. Completion is not approval. Review results never arrive as injected messages. Read your current Tyde permissions with tyde_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
             }
             AgentControlMcpSurface::Await => {
-                "Long-running tools without local work timers: tyde_await_agents waits for direct children; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."
+                "Long-running tools without local work timers: tyde_request_permissions waits for a human permission-mode decision; tyde_await_agents waits for direct children; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."
             }
         };
         ServerInfo {
@@ -3049,11 +3130,15 @@ impl ServerHandler for TydeAgentControlMcpServer {
             }
         }
         tools.retain(|tool| match self.surface {
-            AgentControlMcpSurface::Control => {
-                !matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
-            }
+            AgentControlMcpSurface::Control => !matches!(
+                tool.name.as_ref(),
+                "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+            ),
             AgentControlMcpSurface::Await => {
-                matches!(tool.name.as_ref(), "tyde_await_agents" | "tyde_review")
+                matches!(
+                    tool.name.as_ref(),
+                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+                )
             }
         });
         if !tiers_enabled {
@@ -3201,11 +3286,11 @@ impl ServerHandler for TydeAgentControlMcpServer {
             let allowed = match self.surface {
                 AgentControlMcpSurface::Control => !matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_review"
+                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
                 ),
                 AgentControlMcpSurface::Await => matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_review"
+                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
                 ),
             };
             if !allowed {

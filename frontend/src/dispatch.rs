@@ -278,6 +278,7 @@ pub fn prime_agent_stream_for_tests(
             error: None,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -1466,6 +1467,28 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse agent move result: {error}"),
+                ),
+            }
+        }
+        FrameKind::AgentTydePermissionRequestChanged => {
+            match envelope.parse_payload::<protocol::AgentTydePermissionRequestChangedPayload>() {
+                Ok(payload) => state.pending_permission_requests.update(|map| {
+                    let key = (host_id.to_owned(), payload.agent_id);
+                    match payload.request {
+                        Some(request) => {
+                            map.insert(key, request);
+                        }
+                        None => {
+                            map.remove(&key);
+                        }
+                    }
+                }),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse permission request: {error}"),
                 ),
             }
         }
@@ -5317,6 +5340,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.pending_user_questions.update(|map| {
         map.remove(&agent_id);
     });
+    state.pending_permission_requests.update(|map| {
+        map.remove(&(host_id.to_owned(), agent_id.clone()));
+    });
     state.completed_tool_results.update(|map| {
         map.retain(|(id, _), _| id != &agent_id);
     });
@@ -7642,8 +7668,23 @@ fn apply_agent_bootstrap(
     state.pending_user_questions.update(|map| {
         map.remove(&agent_id);
     });
+    state.pending_permission_requests.update(|map| {
+        map.remove(&(host_id.to_owned(), agent_id.clone()));
+    });
     state.completed_tool_results.update(|map| {
         map.retain(|(id, _), _| id != &agent_id);
+    });
+
+    state.pending_permission_requests.update(|map| {
+        let key = (host_id.to_owned(), agent_id.clone());
+        match payload.pending_permission_request {
+            Some(request) => {
+                map.insert(key, request);
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
     });
 
     for event in payload.events {

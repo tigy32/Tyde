@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 98;
+pub const PROTOCOL_VERSION: u32 = 99;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1087,6 +1087,7 @@ pub enum FrameKind {
     SendQueuedMessageNow,
     SetAgentName,
     SetAgentTydePermissions,
+    DenyAgentTydePermissionRequest,
     AgentCompact,
     ResetTaskUsage,
     Interrupt,
@@ -1212,6 +1213,7 @@ pub enum FrameKind {
     AgentStart,
     AgentRenamed,
     AgentTydePermissionsChanged,
+    AgentTydePermissionRequestChanged,
     AgentCompactNotify,
     ContextCompactionNotify,
     ContextCompactionCapability,
@@ -1322,6 +1324,9 @@ impl fmt::Display for FrameKind {
             Self::CancelBackgroundTask => f.write_str("cancel_background_task"),
             Self::SendQueuedMessageNow => f.write_str("send_queued_message_now"),
             Self::SetAgentName => f.write_str("set_agent_name"),
+            Self::DenyAgentTydePermissionRequest => {
+                f.write_str("deny_agent_tyde_permission_request")
+            }
             Self::SetAgentTydePermissions => f.write_str("set_agent_tyde_permissions"),
             Self::AgentCompact => f.write_str("agent_compact"),
             Self::ResetTaskUsage => f.write_str("reset_task_usage"),
@@ -1442,6 +1447,9 @@ impl fmt::Display for FrameKind {
             Self::TaskTokenUsage => f.write_str("task_token_usage"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
+            Self::AgentTydePermissionRequestChanged => {
+                f.write_str("agent_tyde_permission_request_changed")
+            }
             Self::AgentTydePermissionsChanged => f.write_str("agent_tyde_permissions_changed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
             Self::ContextCompactionNotify => f.write_str("context_compaction_notify"),
@@ -2452,6 +2460,8 @@ pub struct AgentBootstrapPayload {
     /// retained across transcript tail truncation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_user_questions: Vec<ToolRequest>,
+    #[serde(default)]
+    pub pending_permission_request: Option<AgentTydePermissionRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4675,7 +4685,7 @@ pub struct AgentMoveResultPayload {
     pub result: Result<AgentStartPayload, String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTydePermissions {
     #[default]
@@ -4699,6 +4709,24 @@ impl AgentTydePermissions {
             Self::Root => "Control any agent + anything in Tyde",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTydePermissionRequest {
+    pub id: uuid::Uuid,
+    pub access: AgentTydePermissions,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTydePermissionRequestChangedPayload {
+    pub agent_id: AgentId,
+    pub request: Option<AgentTydePermissionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DenyAgentTydePermissionRequestPayload {
+    pub id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

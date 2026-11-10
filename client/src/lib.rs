@@ -1229,6 +1229,27 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn deny_agent_tyde_permission_request(
+        &mut self,
+        stream: &StreamPath,
+        id: uuid::Uuid,
+    ) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("permission decision on unknown agent stream");
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::DenyAgentTydePermissionRequest,
+            seq,
+            &protocol::DenyAgentTydePermissionRequestPayload { id },
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn set_agent_tyde_permissions(
         &mut self,
         stream: &StreamPath,
@@ -1767,6 +1788,10 @@ impl Connection {
                     let _: protocol::types::AgentMoveResultPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::AgentTydePermissionRequestChanged => {
+                    let _: protocol::AgentTydePermissionRequestChangedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::AgentTydePermissionsChanged => {
                     let _: protocol::AgentTydePermissionsChangedPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1843,6 +1868,10 @@ impl Connection {
                         "AgentError on stream {} before NewAgent",
                         envelope.stream
                     );
+                }
+                FrameKind::AgentTydePermissionRequestChanged => {
+                    let _: protocol::AgentTydePermissionRequestChangedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::AgentTydePermissionsChanged => {
                     let payload: protocol::AgentTydePermissionsChangedPayload =

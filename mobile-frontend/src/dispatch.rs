@@ -4021,6 +4021,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Idle,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
             .expect("synthetic AgentBootstrap");
@@ -4998,6 +4999,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Idle,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         };
         dispatch_envelope(
             &state,
@@ -5841,6 +5843,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Idle,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         };
         dispatch_envelope(
             &state,

@@ -2404,6 +2404,7 @@ mod wasm_tests {
                 }))], latest_output: Default::default(), activity: protocol::AgentActivity::Idle,
                 last_turn_cancelled: false,
                 pending_user_questions: Vec::new(),
+            pending_permission_request: None,
             },
         ).unwrap());
         settle_autoscroll().await;
@@ -5442,6 +5443,7 @@ mod wasm_tests {
                     activity: protocol::AgentActivity::Idle,
                     last_turn_cancelled: false,
                     pending_user_questions: Vec::new(),
+                    pending_permission_request: None,
                 },
             )
             .unwrap(),

@@ -1044,6 +1044,8 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::CancelBackgroundTask
         | FrameKind::SendQueuedMessageNow
         | FrameKind::SetAgentName
+        | FrameKind::DenyAgentTydePermissionRequest
+        | FrameKind::AgentTydePermissionRequestChanged
         | FrameKind::SetAgentTydePermissions
         | FrameKind::AgentCompact
         | FrameKind::ResetTaskUsage

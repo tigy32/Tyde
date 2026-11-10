@@ -1408,6 +1408,36 @@ impl ProtocolValidator {
                     )
                 })?;
             }
+            FrameKind::DenyAgentTydePermissionRequest => {
+                let _: crate::DenyAgentTydePermissionRequestPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("Invalid permission denial: {error}"),
+                        )
+                    })?;
+            }
+            FrameKind::AgentTydePermissionRequestChanged => {
+                let payload: crate::AgentTydePermissionRequestChangedPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("Invalid permission request: {error}"),
+                        )
+                    })?;
+                if !state.saw_agent_start || payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        "Permission request targets a different agent".to_owned(),
+                    ));
+                }
+            }
             FrameKind::SetAgentTydePermissions => {
                 let _: crate::SetAgentTydePermissionsPayload =
                     envelope.parse_payload().map_err(|error| {

@@ -883,6 +883,23 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await;
             }
+            FrameKind::DenyAgentTydePermissionRequest => {
+                let agent_id = parse_agent_id(&envelope.stream)?;
+                let payload: protocol::DenyAgentTydePermissionRequestPayload =
+                    parse_payload(&envelope, "deny_agent_tyde_permission_request")?;
+                let agent = host.agent_handle(&agent_id).await.ok_or_else(|| {
+                    AppError::invalid(
+                        "deny_agent_tyde_permission_request",
+                        "Agent is no longer live",
+                    )
+                })?;
+                agent
+                    .deny_tyde_permission_request(payload.id)
+                    .await
+                    .map_err(|error| {
+                        AppError::invalid("deny_agent_tyde_permission_request", error)
+                    })?;
+            }
             FrameKind::SetAgentTydePermissions => {
                 let agent_id = parse_agent_id(&envelope.stream)?;
                 let payload: protocol::SetAgentTydePermissionsPayload =

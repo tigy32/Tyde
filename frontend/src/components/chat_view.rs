@@ -1013,7 +1013,7 @@ pub fn ChatView(
                         view! { <span class=badge_class>{label}</span> }
                     })}
                     <Show when=move || owns_composer.get()>
-                        <ToolOutputModeToggle />
+                        <ToolOutputModeToggle agent_ref=agent_ref />
                     </Show>
                     <ReviewChangesButton agent_ref=agent_ref />
                     <AgentTydePermissionsMenu agent_ref=agent_ref />
@@ -1918,12 +1918,26 @@ fn AgentTydePermissionsMenu(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl I
         // Read the lazy memo so it subscribes to pane identity changes.
         target.with(|_| open.set(false));
     });
+    let requested_menu = state.agent_header_menu;
+    let toggle = NodeRef::<leptos::html::Button>::new();
+    Effect::new(move |_| {
+        if let Some((target, crate::state::AgentHeaderMenu::Permissions)) = requested_menu.get()
+            && Some(target) == agent_ref.get()
+        {
+            open.set(true);
+            requested_menu.set(None);
+            if let Some(button) = toggle.get() {
+                let _ = button.focus();
+            }
+        }
+    });
+    let pending = state.pending_permission_requests;
     view! {
         <Show when=move || agent.get().is_some_and(|agent| agent.origin != protocol::AgentOrigin::BackendNative)>
             <div class="chat-tyde-permissions" on:keydown=move |event: web_sys::KeyboardEvent| {
                 if event.key() == "Escape" { open.set(false); event.stop_propagation(); }
             }>
-                <button type="button" class="chat-tyde-permissions-toggle" aria-label="Tyde permissions"
+                <button type="button" class="chat-tyde-permissions-toggle" node_ref=toggle aria-label="Tyde permissions"
                     aria-haspopup="menu" aria-expanded=move || open.get().to_string()
                     title=move || format!("Tyde permissions: {}", permissions.get().label())
                     disabled=move || agent.get().is_none_or(|agent| !agent.started || agent.fatal_error.is_some())
@@ -1949,7 +1963,7 @@ fn AgentTydePermissionsMenu(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl I
                                         });
                                     }>
                                     <TydePermissionsIcon permissions=Signal::derive(move || access) />
-                                    <span class="tyde-permissions-copy"><span>{access.label()}</span><small>{access.control_description()}</small></span>
+                                    <span class="tyde-permissions-copy"><span>{access.label()}{move || agent_ref.get().and_then(|target| pending.with(|map| map.get(&(target.host_id, target.agent_id)).map(|request| request.access == access))).filter(|requested| *requested).map(|_| view! { <span class="permission-requested-label">"Requested"</span> })}</span><small>{access.control_description()}</small></span>
                                     <span class="tyde-permissions-check" aria-hidden="true">{move || if permissions.get() == access { "✓" } else { "" }}</span>
                                 </button>
                             }).collect_view()}
@@ -1960,42 +1974,47 @@ fn AgentTydePermissionsMenu(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl I
     }
 }
 
-/// Cycle button for the global tool-output verbosity setting. Lives on the
+/// Menu for the global tool-output verbosity setting. Lives on the
 /// chat header next to the backend badge. Reads and writes
 /// `state.tool_output_mode` directly (frontend-local, persisted to
 /// localStorage); never goes through the protocol.
 #[component]
-fn ToolOutputModeToggle() -> impl IntoView {
+fn ToolOutputModeToggle(
+    #[prop(optional)] agent_ref: Option<Signal<Option<ActiveAgentRef>>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let mode = state.tool_output_mode;
-
-    let label = move || match mode.get() {
-        ToolOutputMode::Summary => "\u{2298}",
-        ToolOutputMode::Compact => "\u{25d0}",
-        ToolOutputMode::Full => "\u{25c9}",
-    };
-    let title = move || match mode.get() {
-        ToolOutputMode::Summary => "Tool output: summary (click to switch to compact)",
-        ToolOutputMode::Compact => "Tool output: compact (click to switch to full)",
-        ToolOutputMode::Full => "Tool output: full (click to switch to summary)",
-    };
-
-    let on_click = move |_| {
-        let next = match mode.get_untracked() {
-            ToolOutputMode::Summary => ToolOutputMode::Compact,
-            ToolOutputMode::Compact => ToolOutputMode::Full,
-            ToolOutputMode::Full => ToolOutputMode::Summary,
-        };
-        mode.set(next);
-        persist_tool_output_mode(next);
-    };
-
+    let open = RwSignal::new(false);
+    let requested_menu = state.agent_header_menu;
+    Effect::new(move |_| {
+        if let Some((target, crate::state::AgentHeaderMenu::ToolOutput)) = requested_menu.get()
+            && agent_ref.is_some_and(|agent| agent.get() == Some(target))
+        {
+            open.set(true);
+            requested_menu.set(None);
+        }
+    });
     view! {
-        <button
-            class="tool-output-mode-toggle"
-            title=title
-            on:click=on_click
-        >{label}</button>
+        <div class="chat-tyde-permissions chat-tool-output" on:keydown=move |event: web_sys::KeyboardEvent| {
+            if event.key() == "Escape" { open.set(false); event.stop_propagation(); }
+        }>
+            <button class="tool-output-mode-toggle" title="Tool output" aria-label="Tool output" aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string() on:click=move |_| open.update(|value| *value = !*value)>
+                {move || match mode.get() { ToolOutputMode::Summary => "⊘", ToolOutputMode::Compact => "◐", ToolOutputMode::Full => "◉" }}
+            </button>
+            <Show when=move || open.get()>
+                <button type="button" class="tyde-permissions-dismiss" aria-label="Close tool output" tabindex="-1" on:click=move |_| open.set(false) />
+                <div class="tyde-permissions-menu" role="menu" aria-label="Tool output">
+                    <div class="tyde-permissions-heading">"Tool output"</div>
+                    {[ToolOutputMode::Summary, ToolOutputMode::Compact, ToolOutputMode::Full].into_iter().map(|value| view! {
+                        <button type="button" role="menuitemradio" aria-checked=move || (mode.get() == value).to_string()
+                            on:click=move |_| { mode.set(value); persist_tool_output_mode(value); open.set(false); }>
+                            {match value { ToolOutputMode::Summary => "Summary", ToolOutputMode::Compact => "Compact", ToolOutputMode::Full => "Full" }}
+                        </button>
+                    }).collect_view()}
+                </div>
+            </Show>
+        </div>
     }
 }
 
@@ -6018,7 +6037,10 @@ mod wasm_tests {
             mounted.borrow_mut().replace(state.clone());
             provide_context(state);
             let target = Memo::new(move |_| selected.get());
-            view! { <AgentTydePermissionsMenu agent_ref=target.into() /> }
+            view! {
+                <AgentTydePermissionsMenu agent_ref=target.into() />
+                <crate::components::inflight_tray::InflightTray agent_ref=target.into() />
+            }
         });
         next_tick().await;
         let state = slot.borrow_mut().take().unwrap();
@@ -6070,11 +6092,66 @@ mod wasm_tests {
             "Tyde permissions: Root",
             "Saved host descriptors render their non-default role before live updates"
         );
-        button.click();
+        let pending = protocol::AgentTydePermissionRequest {
+            id: "6da864b7-343b-470b-a448-76daf50d9a90".parse().unwrap(),
+            access: protocol::AgentTydePermissions::Orchestrator,
+            reason: "Contact a peer reviewer".to_owned(),
+        };
+        state.pending_permission_requests.update(|map| {
+            map.insert(
+                ("role-host-a".to_owned(), AgentId("same-agent".to_owned())),
+                pending,
+            );
+        });
+        next_tick().await;
+        let tray = container
+            .query_selector("[aria-label='Permission request']")
+            .unwrap()
+            .expect("a permission request is pinned above the composer");
+        assert!(
+            tray.text_content()
+                .unwrap()
+                .contains("Contact a peer reviewer")
+        );
+        assert!(!tray.text_content().unwrap().contains("Allow once"));
+        let buttons = tray.query_selector_all("button").unwrap();
+        buttons
+            .item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
         next_tick().await;
         assert_eq!(
-            choice("Root").get_attribute("aria-checked").unwrap(),
-            "true"
+            button.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        assert!(
+            choice("Tyde Orchestrator")
+                .text_content()
+                .unwrap()
+                .contains("Requested")
+        );
+        assert_eq!(
+            choice("Tyde Orchestrator")
+                .get_attribute("aria-checked")
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            choice("Root").get_attribute("aria-checked").as_deref(),
+            Some("true"),
+            "Reviewing a request must not change the current role"
+        );
+        state.pending_permission_requests.update(|map| {
+            map.clear();
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[aria-label='Permission request']")
+                .unwrap()
+                .is_none()
         );
         let reload = |access| {
             crate::dispatch::prime_agent_stream_for_tests(
@@ -6778,6 +6855,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Idle,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         }
     }
 
@@ -6801,6 +6879,7 @@ mod wasm_tests {
             activity: protocol::AgentActivity::Idle,
             last_turn_cancelled: false,
             pending_user_questions: Vec::new(),
+            pending_permission_request: None,
         }
     }
 

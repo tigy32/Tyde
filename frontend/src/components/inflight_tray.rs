@@ -657,6 +657,14 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
     })
     .into();
+    let permission_state = state.clone();
+    let permission_request = Memo::new(move |_| {
+        let agent = agent_ref.get()?;
+        permission_state
+            .pending_permission_requests
+            .with(|map| map.get(&(agent.host_id, agent.agent_id)).cloned())
+    });
+    let has_permission_request = move || permission_request.get().is_some();
     let has_questions = move || !pending_questions.with(|questions| questions.is_empty());
     let question_open = RwSignal::new(false);
     let active_question_call_id = RwSignal::new(None::<String>);
@@ -795,12 +803,12 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
     };
 
     view! {
-        <Show when=move || (has_work() || has_questions()) && is_ink()>
+        <Show when=move || (has_work() || has_questions() || has_permission_request()) && is_ink()>
             <div class="ink-activity" data-testid="ink-activity">
                 <div
                     class="ink-activity-drawer"
                     class:expanded=move || has_work() && ink_open.get() && (!has_questions() || question_open.get())
-                    class:question-open=move || has_questions() && question_open.get()
+                    class:question-open=move || has_permission_request() || (has_questions() && question_open.get())
                     on:keydown=move |event: leptos::ev::KeyboardEvent| {
                         if event.key() == "Escape"
                             && (ink_open.get_untracked()
@@ -812,6 +820,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                         }
                     }
                 >
+                    <PermissionRequestSection agent_ref=agent_ref request=permission_request />
                     <Show when=move || has_questions() && question_open.get()>
                         <PinnedQuestionSection
                             agent_ref=agent_ref
@@ -820,7 +829,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             on_collapse=collapse_ink_question
                         />
                     </Show>
-                    <Show when=move || has_work() || !question_open.get()>
+                    <Show when=move || has_work() || (has_questions() && !question_open.get())>
                         <button
                             type="button"
                             class="ink-activity-tab"
@@ -935,12 +944,13 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                 </div>
             </div>
         </Show>
-        <Show when=move || (has_work() || has_questions()) && !is_ink()>
+        <Show when=move || (has_work() || has_questions() || has_permission_request()) && !is_ink()>
             <div
                 class="inflight-tray"
-                class:question-open=move || has_questions() && question_open.get()
+                class:question-open=move || has_permission_request() || (has_questions() && question_open.get())
                 class:activity-open=move || has_work() && expanded.get() && (!has_questions() || question_open.get())
             >
+                <PermissionRequestSection agent_ref=agent_ref request=permission_request />
                 <Show when=move || has_questions() && question_open.get()>
                     <PinnedQuestionSection
                         agent_ref=agent_ref
@@ -949,7 +959,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                         on_collapse=collapse_current_question
                     />
                 </Show>
-                <Show when=move || has_work() || !question_open.get()>
+                <Show when=move || has_work() || (has_questions() && !question_open.get())>
                     <button type="button" class="inflight-tray-header" on:click=on_toggle
                         aria-expanded=move || {
                             (has_work() && expanded.get()
@@ -1022,6 +1032,48 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                 </Show>
             </div>
         </Show>
+    }
+}
+
+#[component]
+fn PermissionRequestSection(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    request: Memo<Option<protocol::AgentTydePermissionRequest>>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let menus = state.agent_header_menu;
+    let agents = state.agents;
+    view! {
+        {move || request.get().map(|pending| {
+            let id = pending.id;
+            view! {
+                <section class="pinned-question-section permission-request-section" aria-label="Permission request">
+                    <div class="pinned-question-bar"><span class="pinned-question-dot"></span><span class="pinned-question-title">"Change agent permissions?"</span></div>
+                    <div class="pinned-question-body">
+                        <strong>{move || agent_ref.get().and_then(|target| agents.with(|agents| agents.iter().find(|agent| agent.host_id == target.host_id && agent.agent_id == target.agent_id).map(|agent| agent.tyde_permissions.label())))}" → "{pending.access.label()}</strong>
+                        <p>{pending.reason}</p>
+                        <p class="permission-request-scope">{pending.access.control_description()}</p>
+                        <div class="permission-request-actions">
+                            <button type="button" class="permission-request-deny" on:click=move |_| {
+                                if let Some(target) = agent_ref.get_untracked()
+                                    && let Some(agent) = agents.with_untracked(|agents| agents.iter().find(|agent| agent.host_id == target.host_id && agent.agent_id == target.agent_id).cloned()) {
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        if let Err(error) = crate::send::send_frame(&target.host_id, agent.instance_stream,
+                                            protocol::FrameKind::DenyAgentTydePermissionRequest,
+                                            &protocol::DenyAgentTydePermissionRequestPayload { id }).await {
+                                            crate::notices::report_agent_error(&target, &error);
+                                        }
+                                    });
+                                }
+                            }>"Deny"</button>
+                            <button type="button" class="ask-question-submit" on:click=move |_| {
+                                if let Some(target) = agent_ref.get_untracked() { menus.set(Some((target, crate::state::AgentHeaderMenu::Permissions))); }
+                            }>"Review permissions"</button>
+                        </div>
+                    </div>
+                </section>
+            }
+        })}
     }
 }
 

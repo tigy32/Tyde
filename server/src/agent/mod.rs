@@ -510,6 +510,15 @@ enum AgentCommand {
         handoff: protocol::AgentHandoff,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    RequestTydePermissions {
+        request: protocol::AgentTydePermissionRequest,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    DenyTydePermissionRequest {
+        id: uuid::Uuid,
+        cancelled: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     SetTydePermissions {
         access: protocol::AgentTydePermissions,
         reply: oneshot::Sender<Result<(), String>>,
@@ -840,6 +849,12 @@ struct PreparedContextFallback {
     metrics: CompactionMetrics,
 }
 
+struct PendingPermissionDecision {
+    request: protocol::AgentTydePermissionRequest,
+    agent_id: AgentId,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Default)]
 struct AgentReplayState {
     journal: Option<Arc<SessionJournal>>,
@@ -867,6 +882,7 @@ struct AgentReplayState {
     active_tool_progress: HashMap<String, protocol::ToolProgressData>,
     active_background_progress: HashMap<String, protocol::ToolProgressData>,
     pending_user_questions: Vec<protocol::ToolRequest>,
+    pending_permission_request: Option<PendingPermissionDecision>,
 }
 
 impl AgentReplayState {
@@ -2403,6 +2419,48 @@ impl AgentHandle {
                 AgentDeliveryFailure::Rejected(DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned())
             })?;
         Ok(AgentDeliveryReceipt(receipt))
+    }
+
+    pub(crate) async fn request_tyde_permissions(
+        &self,
+        request: protocol::AgentTydePermissionRequest,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::RequestTydePermissions { request, reply })
+            .map_err(|_| "Agent is no longer running".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Agent closed before the permission request was resolved".to_owned())?
+    }
+
+    pub(crate) async fn deny_tyde_permission_request(&self, id: uuid::Uuid) -> Result<(), String> {
+        self.resolve_tyde_permission_request(id, false).await
+    }
+
+    pub(crate) async fn cancel_tyde_permission_request(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<(), String> {
+        self.resolve_tyde_permission_request(id, true).await
+    }
+
+    async fn resolve_tyde_permission_request(
+        &self,
+        id: uuid::Uuid,
+        cancelled: bool,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(AgentCommand::DenyTydePermissionRequest {
+                id,
+                cancelled,
+                reply,
+            })
+            .map_err(|_| "Agent is no longer running".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Agent did not acknowledge the permission decision".to_owned())?
     }
 
     pub(crate) async fn set_tyde_permissions(
@@ -4975,7 +5033,9 @@ pub(crate) fn spawn_agent_actor(
                                 "Wait until the agent is ready before moving it".to_owned(),
                             ));
                         }
-                        AgentCommand::SetTydePermissions { reply, .. } => {
+                        AgentCommand::SetTydePermissions { reply, .. }
+                        | AgentCommand::RequestTydePermissions { reply, .. }
+                        | AgentCommand::DenyTydePermissionRequest { reply, .. } => {
                             let _ = reply.send(Err("Wait until the agent has started before changing its Tyde permissions".to_owned()));
                         }
                         AgentCommand::RecordHandoff { reply, .. } => {
@@ -11693,6 +11753,32 @@ pub(crate) fn spawn_agent_actor(
                                     });
                                     }
                         }
+                        AgentCommand::RequestTydePermissions { request, reply } => {
+                            if !matches!(lifecycle, ActorLifecycle::Running) {
+                                let _ = reply.send(Err("Agent is not running".to_owned()));
+                            } else if request.reason.trim().is_empty() || request.reason.len() > 2000 {
+                                let _ = reply.send(Err("Provide a reason of 1–2000 bytes".to_owned()));
+                            } else if replay_state.pending_permission_request.is_some() {
+                                let _ = reply.send(Err("A permission request is already awaiting the user".to_owned()));
+                            } else if request.access == current_start.tyde_permissions {
+                                let _ = reply.send(Err("The agent already has that permission mode".to_owned()));
+                            } else {
+                                replay_state.pending_permission_request = Some(PendingPermissionDecision { request, agent_id: current_start.agent_id.clone(), reply });
+                                broadcast_permission_request(&mut subscribers, &current_start.agent_id, &replay_state).await;
+                                tracing::info!("Agent permission request awaits human decision");
+                            }
+                        }
+                        AgentCommand::DenyTydePermissionRequest { id, cancelled, reply } => {
+                            if replay_state.pending_permission_request.as_ref().is_none_or(|pending| pending.request.id != id) {
+                                let _ = reply.send(if cancelled { Ok(()) } else { Err("Permission request is no longer pending".to_owned()) });
+                            } else {
+                                if let Some(pending) = replay_state.pending_permission_request.take() {
+                                    broadcast_permission_request(&mut subscribers, &current_start.agent_id, &replay_state).await;
+                                    let _ = pending.reply.send(Err(if cancelled { "Permission request cancelled" } else { "The user denied the permission mode change" }.to_owned()));
+                                }
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
                         AgentCommand::SetTydePermissions { access, reply } => {
                             let result = if !matches!(lifecycle, ActorLifecycle::Running) {
                                 Err("Agent is not running".to_owned())
@@ -11705,6 +11791,10 @@ pub(crate) fn spawn_agent_actor(
                                     session_store: &session_store,
                                 }, access).await
                             };
+                            if result.is_ok() && let Some(pending) = replay_state.pending_permission_request.take() {
+                                broadcast_permission_request(&mut subscribers, &current_start.agent_id, &replay_state).await;
+                                let _ = pending.reply.send(Ok(()));
+                            }
                             let _ = reply.send(result);
                         }
                         AgentCommand::RecordHandoff { handoff, reply } => {
@@ -12933,7 +13023,9 @@ pub(crate) fn spawn_relay_agent_actor(
             AgentCommand::RecordHandoff { reply, .. } => {
                 let _ = reply.send(Err("Handoff source is not running".to_owned()));
             }
-            AgentCommand::SetTydePermissions { reply, .. } => {
+            AgentCommand::SetTydePermissions { reply, .. }
+            | AgentCommand::RequestTydePermissions { reply, .. }
+            | AgentCommand::DenyTydePermissionRequest { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot change its Tyde permissions in its current state".to_owned()));
             }
             AgentCommand::SetName {
@@ -13526,6 +13618,25 @@ fn project_input_sender(event: &mut ChatEvent) {
     {
         message.sender = sender;
     }
+}
+
+async fn broadcast_permission_request(
+    subscribers: &mut Vec<Stream>,
+    agent_id: &AgentId,
+    replay_state: &AgentReplayState,
+) {
+    broadcast_live_event(
+        subscribers,
+        FrameKind::AgentTydePermissionRequestChanged,
+        &protocol::AgentTydePermissionRequestChangedPayload {
+            agent_id: agent_id.clone(),
+            request: replay_state
+                .pending_permission_request
+                .as_ref()
+                .map(|pending| pending.request.clone()),
+        },
+    )
+    .await;
 }
 
 struct AgentTydePermissionsContext<'a> {
@@ -14189,6 +14300,13 @@ async fn terminalize_live_activity(
     let pending_tool_response_ids = &mut context.pending_tool_response_ids;
     let active_agent_await_ids = &mut context.active_agent_await_ids;
 
+    if let Some(pending) = replay_state.pending_permission_request.take() {
+        let _ = pending.reply.send(Err(
+            "Agent stopped before the permission decision".to_owned()
+        ));
+        broadcast_permission_request(subscribers, &pending.agent_id, replay_state).await;
+        tracing::info!(access = ?pending.request.access, "Stopped pending permission request");
+    }
     let open_tools = open_tool_call_ids.drain().collect::<Vec<_>>();
     for tool_call_id in open_tools {
         pending_tool_response_ids.remove(&tool_call_id);
@@ -14310,7 +14428,9 @@ async fn park_terminal_agent(
             AgentCommand::RecordHandoff { reply, .. } => {
                 let _ = reply.send(Err("Handoff source is not running".to_owned()));
             }
-            AgentCommand::SetTydePermissions { reply, .. } => {
+            AgentCommand::SetTydePermissions { reply, .. }
+            | AgentCommand::RequestTydePermissions { reply, .. }
+            | AgentCommand::DenyTydePermissionRequest { reply, .. } => {
                 let _ = reply.send(Err(
                     "This agent cannot change its Tyde permissions in its current state".to_owned(),
                 ));
@@ -14635,7 +14755,9 @@ async fn park_relay_terminal_agent(
             AgentCommand::RecordHandoff { reply, .. } => {
                 let _ = reply.send(Err("Handoff source is not running".to_owned()));
             }
-            AgentCommand::SetTydePermissions { reply, .. } => {
+            AgentCommand::SetTydePermissions { reply, .. }
+            | AgentCommand::RequestTydePermissions { reply, .. }
+            | AgentCommand::DenyTydePermissionRequest { reply, .. } => {
                 let _ = reply.send(Err(
                     "This agent cannot change its Tyde permissions in its current state".to_owned(),
                 ));
@@ -18784,6 +18906,14 @@ fn attach_subscriber_with_latest_output(
         error: status.last_error.clone(),
         last_turn_cancelled: replay_state.operation_cancelled,
         pending_user_questions,
+        pending_permission_request: if status.terminated {
+            None
+        } else {
+            replay_state
+                .pending_permission_request
+                .as_ref()
+                .map(|pending| pending.request.clone())
+        },
     })
     .expect("failed to serialize AgentBootstrap payload");
     if stream.send_bootstrap(payload).is_err() {

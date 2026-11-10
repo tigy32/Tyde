@@ -2848,6 +2848,8 @@ fn agent_card(
 ) -> AnyView {
     #[cfg(all(test, target_arch = "wasm32"))]
     wasm_tests::trace_sidebar_stack("agent card", std::ptr::addr_of!(state) as usize);
+    let header_menu_agent = agent.clone();
+    let header_menu_state = state.clone();
     let moving_project = RwSignal::new(false);
     let move_project_agent = agent.clone();
     let move_project_state = state.clone();
@@ -3399,6 +3401,18 @@ fn agent_card(
                 <MoveAgentProjectDialog state=move_project_state.clone() agent=move_project_agent.clone() open=moving_project />
             </Show>
             <CardContextMenu menu=card_menu label="Agent actions" anchor=card_anchor>
+                {[ ("Tool output…", crate::state::AgentHeaderMenu::ToolOutput), ("Change permissions…", crate::state::AgentHeaderMenu::Permissions) ].into_iter().map(|(label, menu)| {
+                    let state = header_menu_state.clone();
+                    let agent = header_menu_agent.clone();
+                    let unavailable = agent.origin == protocol::AgentOrigin::BackendNative && menu == crate::state::AgentHeaderMenu::Permissions;
+                    view! { <button type="button" class="context-menu-item" role="menuitem" disabled=unavailable
+                        on:click=move |_| {
+                            card_menu.set(None);
+                            open_agent_chat(&state, &agent);
+                            state.agent_header_menu.set(Some((ActiveAgentRef { host_id: agent.host_id.clone(), agent_id: agent.agent_id.clone() }, menu.clone())));
+                        }>{label}</button> }
+                }).collect_view()}
+
                 <button
                     type="button"
                     class="context-menu-item"
@@ -4585,12 +4599,16 @@ mod wasm_tests {
             .collect();
         assert_eq!(
             labels.len(),
-            6,
+            8,
             "the actions menu offers every row action: {labels:?}"
         );
         assert_eq!(
-            [labels[0], labels[1], labels[2], labels[3], labels[5]],
             [
+                labels[0], labels[1], labels[2], labels[3], labels[4], labels[5], labels[7]
+            ],
+            [
+                "Tool output…",
+                "Change permissions…",
                 "Rename agent",
                 "Pin chat",
                 "Move to group",
@@ -4599,10 +4617,10 @@ mod wasm_tests {
             ],
         );
         assert!(
-            labels[4].starts_with("Compact context — unavailable:")
-                && from_button[4].1.as_deref() == Some("true"),
+            labels[6].starts_with("Compact context — unavailable:")
+                && from_button[6].1.as_deref() == Some("true"),
             "unavailable compaction stays visible and says why: {:?}",
-            from_button[4]
+            from_button[6]
         );
         dispatch_key(&menu.clone().dyn_into::<HtmlElement>().unwrap(), "Escape");
         next_tick().await;
@@ -5059,6 +5077,7 @@ mod wasm_tests {
             error: None,
             last_turn_cancelled: false,
             pending_user_questions: vec![],
+            pending_permission_request: None,
         };
         crate::dispatch::apply_agent_bootstrap_for_test(
             &state,

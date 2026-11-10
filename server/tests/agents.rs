@@ -9220,6 +9220,147 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     assert!(replay.events.iter().any(|event| matches!(event,
         AgentBootstrapEvent::AgentStart(start) if start.tyde_permissions == protocol::AgentTydePermissions::Agent)));
     eprintln!("Role credential flow: observer attached");
+    for approve in [false, true] {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bearer = child_caller.authorization.strip_prefix("Bearer ").unwrap();
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(child_caller.await_url.clone())
+                .auth_header(bearer),
+        );
+        let permission_service = ProgressRecorder { tx: progress_tx }
+            .serve(transport)
+            .await
+            .unwrap();
+        let progress_token = ProgressToken(NumberOrString::String(
+            format!("permission-decision-{approve}").into(),
+        ));
+        let handle = permission_service
+            .send_request_with_option(
+                ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams {
+                    meta: None,
+                    name: "tyde_request_permissions".into(),
+                    arguments: json!({"access":"orchestrator", "reason":"Contact a peer reviewer"})
+                        .as_object()
+                        .cloned(),
+                    task: None,
+                })),
+                PeerRequestOptions {
+                    timeout: None,
+                    meta: Some(Meta::with_progress_token(progress_token.clone())),
+                },
+            )
+            .await
+            .unwrap();
+        let response = handle.await_response();
+        tokio::pin!(response);
+        let pending = fixture::next_frame_matching_on(
+            &mut role_client,
+            "permission request published",
+            |env| {
+                env.stream == role_stream
+                    && env.kind == FrameKind::AgentTydePermissionRequestChanged
+            },
+        )
+        .await
+        .parse_payload::<protocol::AgentTydePermissionRequestChangedPayload>()
+        .unwrap();
+        let pending = pending.request.expect("human decision is pending");
+        let progress = tokio::select! {
+            progress = progress_rx.recv() => progress.expect("permission wait progress remains connected"),
+            _ = &mut response => panic!("Permission request completed before the human decision"),
+        };
+        assert_eq!(progress.progress_token, progress_token);
+        assert!(
+            progress
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("permission-mode decision")),
+            "Human-decision waits emit provider keepalive progress"
+        );
+
+        assert_eq!(pending.access, protocol::AgentTydePermissions::Orchestrator);
+        let current = mcp_success_json(
+            &mcp_tool_call_as(&child_caller, false, "tyde_get_permissions", json!({})).await,
+        );
+        assert_eq!(
+            current["tyde_permissions"], "agent",
+            "Requesting never grants a role"
+        );
+        let (mut reconnect, snapshot) = fixture.connect_with_bootstrap().await;
+        let stream = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == child_a)
+            .unwrap()
+            .instance_stream
+            .clone();
+        let replay = expect_raw_agent_bootstrap_on_stream(
+            &mut reconnect,
+            &stream,
+            "pending request reconnect",
+        )
+        .await;
+        assert!(
+            replay.pending_permission_request.as_ref() == Some(&pending),
+            "Reconnect restores the actionable request independently of transcript history"
+        );
+        if approve {
+            role_client
+                .set_agent_tyde_permissions(&role_stream, pending.access)
+                .await
+                .unwrap();
+        } else {
+            role_client
+                .deny_agent_tyde_permission_request(&role_stream, pending.id)
+                .await
+                .unwrap();
+        }
+        let settled = fixture::next_frame_matching_on(
+            &mut role_client,
+            "permission request retired",
+            |env| {
+                env.stream == role_stream
+                    && env.kind == FrameKind::AgentTydePermissionRequestChanged
+            },
+        )
+        .await
+        .parse_payload::<protocol::AgentTydePermissionRequestChangedPayload>()
+        .unwrap();
+        assert!(settled.request.is_none());
+        let ServerResult::CallToolResult(result) = (&mut response).await.unwrap() else {
+            panic!("Expected permission tool result");
+        };
+        let result = json!({"result":result});
+        assert_eq!(mcp_result_is_error(&result), !approve);
+        let current = mcp_success_json(
+            &mcp_tool_call_as(&child_caller, false, "tyde_get_permissions", json!({})).await,
+        );
+        assert_eq!(
+            current["tyde_permissions"],
+            if approve { "orchestrator" } else { "agent" }
+        );
+        permission_service.cancel().await.unwrap();
+    }
+    // Return to Agent so the pre-existing role-change flow still observes both transitions.
+    role_client
+        .set_agent_tyde_permissions(&role_stream, protocol::AgentTydePermissions::Agent)
+        .await
+        .unwrap();
+    fixture::next_frame_matching_on(&mut role_client, "reset human-selected role", |env| {
+        env.stream == role_stream
+            && env.kind == FrameKind::AgentTydePermissionsChanged
+            && env
+                .parse_payload::<protocol::AgentTydePermissionsChangedPayload>()
+                .is_ok_and(|payload| {
+                    eprintln!(
+                        "Role credential flow: observed permission mode {:?}",
+                        payload.access
+                    );
+                    payload.access == protocol::AgentTydePermissions::Agent
+                })
+    })
+    .await;
+
     for access in [
         protocol::AgentTydePermissions::Orchestrator,
         protocol::AgentTydePermissions::Root,
@@ -9230,7 +9371,17 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             .unwrap();
         eprintln!("Role credential flow: waiting for promoted state");
         fixture::next_frame_matching_on(&mut role_client, "promoted child role", |env| {
-            env.stream == role_stream && env.kind == FrameKind::AgentTydePermissionsChanged
+            env.stream == role_stream
+                && env.kind == FrameKind::AgentTydePermissionsChanged
+                && env
+                    .parse_payload::<protocol::AgentTydePermissionsChangedPayload>()
+                    .is_ok_and(|payload| {
+                        eprintln!(
+                            "Role credential flow: observed permission mode {:?}",
+                            payload.access
+                        );
+                        payload.access == access
+                    })
         })
         .await;
         let permissions = mcp_success_json(
@@ -9306,7 +9457,17 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
         .await
         .unwrap();
     fixture::next_frame_matching_on(&mut role_client, "child demoted", |env| {
-        env.stream == role_stream && env.kind == FrameKind::AgentTydePermissionsChanged
+        env.stream == role_stream
+            && env.kind == FrameKind::AgentTydePermissionsChanged
+            && env
+                .parse_payload::<protocol::AgentTydePermissionsChangedPayload>()
+                .is_ok_and(|payload| {
+                    eprintln!(
+                        "Role credential flow: observed permission mode {:?}",
+                        payload.access
+                    );
+                    payload.access == protocol::AgentTydePermissions::Agent
+                })
     })
     .await;
     let denied = mcp_tool_call_as(
@@ -9580,7 +9741,14 @@ async fn agent_control_discovery_answers_while_host_state_is_held() {
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
     await_names.sort_unstable();
-    assert_eq!(await_names, ["tyde_await_agents", "tyde_review"]);
+    assert_eq!(
+        await_names,
+        [
+            "tyde_await_agents",
+            "tyde_request_permissions",
+            "tyde_review"
+        ]
+    );
     assert!(
         control.iter().any(|tool| tool["name"] == "tyde_spawn_agent"
             && tool["inputSchema"]["properties"].get("global").is_some()),
@@ -13976,7 +14144,7 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
              [steering: {}] [builtin_steering: {}] mock backend response to: {prompt}",
             fixture.bootstrap.steering[0].content.replace('\n', "\\n"),
             // The mock's startup summary renders newlines as literal \n.
-            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
+            format!("{}\n\n{}", server::backend::AGENT_CONTROL_SPAWN_STEERING, "Tyde permissions are assigned by the human, independent of who created an agent or its parent. Before controlling Tyde, read current permissions using the attached server's self-query (tyde_get_permissions on agent-control; tyde_config_get_permissions on config) and obey its current role guidance. Ordinary agents work on their own task and children, not sideways build/commit coordination. Role changes are metadata, not steering entries or permission to interrupt anyone. Use tyde_request_permissions to ask the human for a different Tyde permission mode when needed. This guidance does not grant operating-system privileges or waive confirmations.").replace('\n', "\\n")
         )
     };
     let expected = [

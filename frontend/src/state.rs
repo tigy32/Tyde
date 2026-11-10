@@ -3767,6 +3767,12 @@ impl Default for SessionsPanelFilters {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AgentHeaderMenu {
+    Permissions,
+    ToolOutput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ActiveAgentRef {
     pub host_id: String,
     pub agent_id: AgentId,
@@ -3992,6 +3998,9 @@ pub struct AppState {
     /// `AgentBootstrapPayload::pending_user_questions`, and retired only on
     /// `ChatEvent::ToolExecutionCompleted` or terminal agent teardown. Never
     /// populated from paged `SessionHistory`.
+    pub pending_permission_requests:
+        RwSignal<HashMap<(String, AgentId), protocol::AgentTydePermissionRequest>>,
+    pub agent_header_menu: RwSignal<Option<(ActiveAgentRef, AgentHeaderMenu)>>,
     pub pending_user_questions: RwSignal<HashMap<AgentId, Vec<protocol::ToolRequest>>>,
     /// Completed tool execution outcomes indexed by `(agent_id, tool_call_id)`
     /// so historical tool requests paged in via `SessionHistory` after their
@@ -4610,6 +4619,8 @@ impl AppState {
             agent_activity_stats: RwSignal::new(HashMap::new()),
             task_token_usage: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
+            pending_permission_requests: RwSignal::new(HashMap::new()),
+            agent_header_menu: RwSignal::new(None),
             pending_user_questions: RwSignal::new(HashMap::new()),
             completed_tool_results: RwSignal::new(HashMap::new()),
             user_question_drafts: Arc::new(Mutex::new(HashMap::new())),
