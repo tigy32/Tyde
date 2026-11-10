@@ -4133,8 +4133,6 @@ pub struct AppState {
     pub swarm_project_filter: RwSignal<Option<ActiveProjectRef>>,
     pub self_improvement_open_after_write:
         RwSignal<Option<(String, protocol::SettingsWriteId, protocol::SteeringScope)>>,
-    pub self_improvement_settings_scope_request:
-        RwSignal<Option<(String, protocol::SteeringScope)>>,
     pub self_improvement_scope_request: RwSignal<Option<(String, protocol::SteeringScope)>>,
     /// When set, the settings panel jumps to the tab with this label (e.g.
     /// "Backends") the next time it renders. Used to deep-link from onboarding
@@ -4667,7 +4665,6 @@ impl AppState {
             steering_project_filter: RwSignal::new(None),
             swarm_project_filter: RwSignal::new(None),
             self_improvement_open_after_write: RwSignal::new(None),
-            self_improvement_settings_scope_request: RwSignal::new(None),
             self_improvement_scope_request: RwSignal::new(None),
             settings_tab_request: RwSignal::new(None),
             help_tour_step: RwSignal::new(None),

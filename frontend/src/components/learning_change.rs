@@ -494,9 +494,8 @@ pub fn SelfImprovementSidebar() -> impl IntoView {
                 <h2>"Self-improvement"</h2>
                 <button class="learning-link" aria-label="Self-improvement settings" title="Self-improvement settings" on:click=move |_| {
                     let state = store.get_value();
-                    if let Some((host, scope)) = selection.get_untracked() {
-                        state.selected_host_id.set(Some(host.clone()));
-                        state.self_improvement_settings_scope_request.set(Some((host, scope)));
+                    if let Some((host, _)) = selection.get_untracked() {
+                        state.selected_host_id.set(Some(host));
                     }
                     state.settings_tab_request.set(Some("Self-improvement"));
                     state.settings_open.set(true);

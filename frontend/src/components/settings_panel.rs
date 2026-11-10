@@ -9423,23 +9423,7 @@ fn SelfImprovementTab() -> impl IntoView {
     let scope = RwSignal::new(None::<SteeringScope>);
     Effect::new(move |_| {
         let state = store.get_value();
-        let host = state.selected_host_id.get();
-        scope.set(
-            state
-                .active_project
-                .get()
-                .filter(|project| Some(&project.host_id) == host.as_ref())
-                .map(|project| SteeringScope::Project(project.project_id)),
-        );
-    });
-    Effect::new(move |_| {
-        let state = store.get_value();
-        if let Some((host, requested_scope)) = state.self_improvement_settings_scope_request.get()
-            && state.selected_host_id.get() == Some(host)
-        {
-            scope.set(Some(requested_scope));
-            state.self_improvement_settings_scope_request.set(None);
-        }
+        scope.set(state.selected_host_id.get().map(|_| SteeringScope::Host));
     });
     let config = Memo::new(move |_| {
         let settings = store.get_value().selected_host_settings()?;
@@ -23961,11 +23945,12 @@ mod wasm_tests {
         root.set_attribute("style", "width: 1000px; height: 800px")
             .unwrap();
         let mounted = state.clone();
+        let show_settings = RwSignal::new(true);
         let handle = mount_to(root.clone(), move || {
             provide_context(mounted.clone());
             view! {
                 <div id="learning-header"><crate::components::header::Header /></div>
-                <div id="learning-settings"><SelfImprovementTab /></div>
+                <div id="learning-settings"><Show when=move || show_settings.get()><SelfImprovementTab /></Show></div>
                 <div id="learning-dock"><crate::components::dock_zone::DockZone position=crate::state::SidebarSide::Right /></div>
                 <div id="learning-sidebar" style="width:320px; height:500px"><crate::components::learning_change::SelfImprovementSidebar /></div>
                 <div id="learning-chat"><crate::components::chat_view::ChatView tab_id=crate::state::TabId(987654321)
@@ -23996,25 +23981,53 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<web_sys::HtmlButtonElement>()
             .unwrap();
+        assert_eq!(select.value(), "host", "New Chat defaults to host-wide");
+        assert!(!open.disabled());
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.into(),
+                project_id: ProjectId("learning-project".into()),
+            }));
+        next_tick().await;
         assert_eq!(
             select.value(),
-            "",
-            "New Chat without a project requires an explicit Settings scope"
+            "host",
+            "Project navigation must not change scope"
         );
-        assert!(
-            open.disabled(),
-            "A missing scope must not expose an enabled no-op"
-        );
-        open.click();
+        sidebar
+            .query_selector("button[aria-label='Self-improvement settings']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
         next_tick().await;
-        assert!(!state.sidebar_layout.get_untracked().current().right.visible);
-        select.set_value("host");
-        dispatch_event_from_js(select.unchecked_ref(), "change", None);
-        next_tick().await;
-        assert!(
-            !open.disabled(),
-            "Choosing the existing host scope makes Open suggestions actionable"
+        assert!(state.settings_open.get_untracked());
+        assert_eq!(
+            select.value(),
+            "host",
+            "Sidebar settings default to host-wide"
         );
+        show_settings.set(false);
+        next_tick().await;
+        show_settings.set(true);
+        next_tick().await;
+        let select = surface("#learning-settings select[aria-label='Self-improvement scope']")
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "host",
+            "Reopening with a project defaults to host-wide"
+        );
+        state.active_project.set(None);
+        next_tick().await;
+        let open = find_button_by_text(&settings, "Open suggestions")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlButtonElement>()
+            .unwrap();
+        assert!(!open.disabled());
         let enabled = surface("input[aria-label='Enable self-improvement']")
             .dyn_into::<HtmlInputElement>()
             .unwrap();
