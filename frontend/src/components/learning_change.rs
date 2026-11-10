@@ -384,7 +384,20 @@ pub fn PendingBadge() -> impl IntoView {
                                     SteeringScope::Project(id) => {
                                         project.as_ref().is_some_and(|project| {
                                             Some(&project.host_id) == host.as_ref()
-                                                && &project.project_id == id
+                                                && state.projects.with(|projects| {
+                                                    projects.iter().any(|entry| {
+                                                        entry.host_id == project.host_id
+                                                            && entry.project.id
+                                                                == project.project_id
+                                                            && match entry
+                                                                .project
+                                                                .parent_project_id()
+                                                            {
+                                                                Some(parent) => parent == id,
+                                                                None => &entry.project.id == id,
+                                                            }
+                                                    })
+                                                })
                                         })
                                     }
                                 }
@@ -402,18 +415,31 @@ pub fn SelfImprovementSidebar() -> impl IntoView {
     let store = StoredValue::new(state.clone());
     let selection = RwSignal::new(None::<(String, SteeringScope)>);
     let history = RwSignal::new(false);
-    Effect::new(move |_| {
+    let navigation_scope = Memo::new(move |_| {
         let state = store.get_value();
         let host = state.chat_context_host_id();
         let project = state.active_project.get();
-        selection.set(host.map(|host| {
+        host.and_then(|host| {
             let scope = match project.filter(|project| project.host_id == host) {
-                Some(project) => SteeringScope::Project(project.project_id),
+                Some(active) => state.projects.with(|projects| {
+                    projects
+                        .iter()
+                        .find(|entry| {
+                            entry.host_id == host && entry.project.id == active.project_id
+                        })
+                        .map(|entry| {
+                            SteeringScope::Project(match entry.project.parent_project_id() {
+                                Some(parent) => parent.clone(),
+                                None => entry.project.id.clone(),
+                            })
+                        })
+                })?,
                 None => SteeringScope::Host,
             };
-            (host, scope)
-        }));
+            Some((host, scope))
+        })
     });
+    Effect::new(move |_| selection.set(navigation_scope.get()));
     Effect::new(move |_| {
         let state = store.get_value();
         if let Some(request) = state.self_improvement_scope_request.get() {
@@ -517,7 +543,7 @@ pub fn SelfImprovementSidebar() -> impl IntoView {
                         }
                     }>
                     <option value="">"All projects (host-wide)"</option>
-                    {move || store.get_value().projects.get().into_iter().filter(|project| selection.get().is_some_and(|(host, _)| host == project.host_id)).map(|project| view! { <option value=project.project.id.0>{project.project.name}</option> }).collect_view()}
+                    {move || store.get_value().projects.get().into_iter().filter(|project| selection.get().is_some_and(|(host, _)| host == project.host_id) && !project.project.is_workbench()).map(|project| view! { <option value=project.project.id.0>{project.project.name}</option> }).collect_view()}
                 </select>
             </div>
             <div class="learning-sidebar-tabs" role="tablist" aria-label="Suggestions">

@@ -1,5 +1,8 @@
 mod fixture;
-use fixture::{Fixture, TestAgent, expect_settings_write_applied, next_frame_matching_on};
+use fixture::{
+    Fixture, TestAgent, expect_settings_write_applied, expect_settings_write_result,
+    next_frame_matching_on,
+};
 use protocol::*;
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
@@ -206,25 +209,26 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
     let analyzer_gate = MockGateHandle::new();
     fixture
         .host_for_test()
-        .set_learning_script_for_test(
-            MockScript::one(MockTurn::gated_text_for_input(
-                response(vec![
-                    operation(
-                        None,
-                        steering("Keep changes focused and explain the user-visible result."),
-                        "human-one",
-                    ),
-                    operation(
-                        None,
-                        aspect("Check that navigation preserves drafts and scroll position."),
-                        "human-one",
-                    ),
-                ]),
-                format!("\n{}\n", edited_guidance.content),
-                &analyzer_gate,
-            ))
-            .then(MockTurn::text(response(Vec::new()))),
-        )
+        .set_learning_script_for_test(MockScript::one(MockTurn::gated_text_for_input(
+            response(vec![
+                operation(
+                    None,
+                    steering("Keep changes focused and explain the user-visible result."),
+                    "human-one",
+                ),
+                operation(
+                    None,
+                    aspect("Check that navigation preserves drafts and scroll position."),
+                    "human-one",
+                ),
+            ]),
+            format!("\n{}\n", edited_guidance.content),
+            &analyzer_gate,
+        )))
+        .expect("install fresh analyzer batch");
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(Vec::new()))))
         .expect("install analyzer at backend boundary");
     save(
         &mut fixture,
@@ -486,7 +490,26 @@ async fn busy_human_inputs_suggest_apply_automatic_edit_and_conflicting_undo() {
         })
         .await;
     let before_restart = fixture.connect_with_bootstrap().await.1.self_improvement;
-    let restored = fixture.restart_host().await;
+    let journal_path = fixture
+        .session_store_path()
+        .with_file_name("self-improvement.json");
+    let restored = fixture.restart_host_with_runtime_config(|_| {
+        let mut journal: serde_json::Value = serde_json::from_slice(&std::fs::read(&journal_path).expect("read legacy journal")).expect("decode legacy journal");
+        journal["jobs"][0]["state"]["status"] = serde_json::json!({
+            "kind": "failed",
+            "reason": "Analyzer context reached its bounded input budget; disable and re-enable to start a new context"
+        });
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).expect("encode legacy budget status")).expect("seed legacy budget status");
+    }).await;
+    assert!(
+        restored
+            .self_improvement
+            .scopes
+            .iter()
+            .any(|scope| scope.scope == SteeringScope::Host
+                && matches!(scope.status, LearningStatus::Ready)),
+        "Retired context limits must not leave learning permanently failed after upgrade"
+    );
     assert_eq!(
         restored.self_improvement.changes, before_restart.changes,
         "Restart must retain the same audit identities and applied revisions, not apply them twice"
@@ -801,15 +824,22 @@ async fn journal_failure_and_replay_preserve_author_once_and_accounting_failure_
     let analyzer_gate = MockGateHandle::new();
     fixture
         .host_for_test()
-        .set_learning_script_for_test(
-            MockScript::one(MockTurn::gated_text(response(Vec::new()), &analyzer_gate))
-                .then(MockTurn::text(response(vec![operation(
-                    None,
-                    steering("Keep future changes focused."),
-                    "projection-failure",
-                )])))
-                .then(MockTurn::text(response(Vec::new()))),
-        )
+        .set_learning_script_for_test(MockScript::one(MockTurn::gated_text(
+            response(Vec::new()),
+            &analyzer_gate,
+        )))
+        .expect("install fresh analyzer batch");
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(vec![operation(
+            None,
+            steering("Keep future changes focused."),
+            "projection-failure",
+        )]))))
+        .expect("install fresh analyzer batch");
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(Vec::new()))))
         .expect("install analyzer");
     save(
         &mut fixture,
@@ -1049,6 +1079,28 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     ])
     .await;
     let root = tempfile::tempdir().expect("project directory");
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "Initial",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .expect("prepare real repository")
+                .success()
+        );
+    }
     fixture
         .client
         .project_create(ProjectCreatePayload {
@@ -1067,6 +1119,21 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     let ProjectNotifyPayload::Upsert { project } = project else {
         panic!("expected created project");
     };
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: project.id.clone(),
+            branch: GitBranchName("learning-feedback".into()),
+            name: "Feedback workbench".into(),
+        })
+        .await
+        .expect("create feedback workbench");
+    let workbench = next_frame_matching_on(&mut fixture.client, "feedback workbench created", |frame| {
+        frame.kind == FrameKind::ProjectNotify && matches!(frame.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Upsert { project: child }) if child.parent_project_id() == Some(&project.id))
+    }).await.parse_payload::<ProjectNotifyPayload>().expect("workbench notify");
+    let ProjectNotifyPayload::Upsert { project: workbench } = workbench else {
+        unreachable!()
+    };
     let reservation = fixture
         .reserve_next_mock_launch("Scoped author", MockScript::new().with_unbounded_echo())
         .await;
@@ -1076,9 +1143,13 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
             name: Some("Scoped author".into()),
             custom_agent_id: None,
             parent_agent_id: None,
-            project_id: Some(project.id.clone()),
+            project_id: Some(workbench.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: vec![root.path().to_string_lossy().into_owned()],
+                workspace_roots: workbench
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect(),
                 prompt: "One-off initial task".into(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -1108,6 +1179,25 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         )
         .expect("install no-op analyzer");
     let suggest = config(LearningMode::Suggest);
+    let rejected = fixture
+        .client
+        .replace_setting(
+            "/self_improvement/projects",
+            std::collections::BTreeMap::from([(workbench.id.clone(), suggest.clone())]),
+            std::collections::BTreeMap::<ProjectId, LearningConfig>::new(),
+        )
+        .await
+        .expect("request workbench learning configuration");
+    let rejected = expect_settings_write_result(
+        &mut fixture.client,
+        &rejected,
+        "reject workbench learning scope",
+    )
+    .await;
+    assert!(
+        !rejected.applied,
+        "Workbenches cannot own learning configuration"
+    );
     let write = fixture
         .client
         .replace_setting(
@@ -1194,25 +1284,29 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     };
     fixture
         .host_for_test()
-        .set_learning_script_for_test(
-            MockScript::one(MockTurn::text(response(vec![operation(
-                None,
-                generated.clone(),
-                "project-durable",
-            )])))
-            .then(MockTurn::text(response(vec![operation(
-                Some(revised.clone()),
-                scoped_rule("Replace the human text."),
-                "project-protected",
-            )])))
-            .then(MockTurn::text(response(vec![operation(
-                Some(LearningRule::Steering {
-                    steering: outside.clone(),
-                }),
-                escape,
-                "project-escape",
-            )]))),
-        )
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(vec![operation(
+            None,
+            generated.clone(),
+            "project-durable",
+        )]))))
+        .expect("install fresh analyzer batch");
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(vec![operation(
+            Some(revised.clone()),
+            scoped_rule("Replace the human text."),
+            "project-protected",
+        )]))))
+        .expect("install fresh analyzer batch");
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(vec![operation(
+            Some(LearningRule::Steering {
+                steering: outside.clone(),
+            }),
+            escape,
+            "project-escape",
+        )]))))
         .expect("install replacement context");
     human(
         &mut fixture,
@@ -1748,4 +1842,15 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         steering.contains(&outside),
         "A project analyzer must not edit a rule outside its scope"
     );
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+            force: true,
+        })
+        .await
+        .expect("remove feedback workbench");
+    next_frame_matching_on(&mut fixture.client, "feedback workbench removed", |frame| {
+        frame.kind == FrameKind::ProjectNotify && matches!(frame.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == workbench.id)
+    }).await;
 }

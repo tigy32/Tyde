@@ -285,7 +285,11 @@ preservation. It creates no model conversations.
 ## Self-improvement suggestion dock
 
 Settings is the only place that enables/disables learning, selects its scope,
-mode and analyzer. Suggestions live in the normal Self-improvement dock tab,
+mode and analyzer. Project scopes refer only to standalone projects;
+workbench feedback is attributed to its explicit parent project. Each queued
+analysis batch starts a fresh tool-free analyzer and shuts it down after the
+result, before the next batch starts. No analyzer conversation is reused.
+Suggestions live in the normal Self-improvement dock tab,
 not Settings or a chat tray. Its host and rule scope are explicit. The dock uses
 the existing client layout for placement, resizing and visibility; its pending
 badge never changes visibility or focus. Only this client's successful,

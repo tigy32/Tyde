@@ -9620,7 +9620,7 @@ fn SelfImprovementTab() -> impl IntoView {
                             let state = store.get_value();
                             let host = state.selected_host_id.get();
                             state.projects.get().into_iter()
-                                .filter(|project| Some(&project.host_id) == host.as_ref())
+                                .filter(|project| Some(&project.host_id) == host.as_ref() && !project.project.is_workbench())
                                 .map(|project| view! { <option value=project.project.id.0>{format!("Project · {}", project.project.name)}</option> })
                                 .collect_view()
                         }}
@@ -23976,6 +23976,31 @@ mod wasm_tests {
         state
             .configured_hosts
             .set(vec![settings_host(host, "Sidebar host")]);
+        state.projects.set(vec![
+            crate::state::ProjectInfo {
+                host_id: host.into(),
+                project: protocol::Project {
+                    id: ProjectId("learning-project".into()),
+                    name: "Learning project".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone { roots: vec![] },
+                },
+            },
+            crate::state::ProjectInfo {
+                host_id: host.into(),
+                project: protocol::Project {
+                    id: ProjectId("learning-workbench".into()),
+                    name: "Learning workbench".into(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::GitWorkbench {
+                        parent_project_id: ProjectId("learning-project".into()),
+                        branch: protocol::GitBranchName("feedback".into()),
+                        roots: vec![],
+                        environment: Default::default(),
+                    },
+                },
+            },
+        ]);
         let root = make_container();
         root.set_attribute("style", "width: 1000px; height: 800px")
             .unwrap();
@@ -24017,12 +24042,24 @@ mod wasm_tests {
             .dyn_into::<web_sys::HtmlButtonElement>()
             .unwrap();
         assert_eq!(select.value(), "host", "New Chat defaults to host-wide");
+        for selector in [
+            "#learning-settings select[aria-label='Self-improvement scope']",
+            "#learning-sidebar select[aria-label='Suggestions scope']",
+        ] {
+            let options = surface(selector).text_content().unwrap();
+            assert!(options.contains("Learning project"));
+            assert!(
+                !options.contains("Learning workbench"),
+                "Only top-level projects are learning scopes"
+            );
+        }
+
         assert!(!open.disabled());
         state
             .active_project
             .set(Some(crate::state::ActiveProjectRef {
                 host_id: host.into(),
-                project_id: ProjectId("learning-project".into()),
+                project_id: ProjectId("learning-workbench".into()),
             }));
         next_tick().await;
         assert_eq!(
@@ -24030,6 +24067,15 @@ mod wasm_tests {
             "host",
             "Project navigation must not change scope"
         );
+        assert_eq!(
+            surface("#learning-sidebar select[aria-label='Suggestions scope']")
+                .dyn_into::<HtmlSelectElement>()
+                .unwrap()
+                .value(),
+            "learning-project",
+            "Workbench navigation selects its parent learning scope"
+        );
+
         sidebar
             .query_selector("button[aria-label='Self-improvement settings']")
             .unwrap()

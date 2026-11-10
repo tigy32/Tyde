@@ -19687,25 +19687,6 @@ impl LearningHelper {
         })
     }
 
-    pub(crate) async fn send(&self, prompt: String) -> Result<(), String> {
-        match self
-            .backend
-            .send_with_outcome(AgentInput::SendMessage(SendMessagePayload {
-                message: prompt,
-                images: None,
-                origin: Some(MessageOrigin::System),
-                tool_response: None,
-            }))
-            .await
-        {
-            crate::backend::SendOutcome::Accepted => Ok(()),
-            crate::backend::SendOutcome::Busy(_) => {
-                Err("Analyzer refused a serialized batch as busy".into())
-            }
-            crate::backend::SendOutcome::Closed => Err("Analyzer context closed".into()),
-        }
-    }
-
     pub(crate) async fn collect(
         &mut self,
         cancelled: &tokio_util::sync::CancellationToken,

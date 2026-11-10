@@ -20383,6 +20383,7 @@ fn spawn_host_inner(
         Arc::clone(&settings_store),
         Arc::clone(&steering_store),
         use_mock_backend,
+        project_store.clone(),
         stopped.clone(),
     )?;
     let (settings_apply_tx, settings_apply_rx) = mpsc::unbounded_channel();

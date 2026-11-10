@@ -67,7 +67,6 @@ enum Command {
 struct Worker {
     scope: SteeringScope,
     config: LearningConfig,
-    tx: mpsc::UnboundedSender<(LearningChangeId, String)>,
     cancel: CancellationToken,
 }
 struct ConfigActor {
@@ -79,7 +78,8 @@ struct ConfigActor {
     tx: mpsc::UnboundedSender<Command>,
     workers: Vec<Worker>,
     use_mock: bool,
-    mock_script: Option<crate::backend::mock::MockScript>,
+    mock_scripts: std::collections::VecDeque<crate::backend::mock::MockScript>,
+    projects: Arc<crate::host::ProjectCatalogHandle>,
     error: Option<String>,
     seen: watch::Sender<Arc<std::collections::HashSet<HumanInputId>>>,
     settings_in_flight: bool,
@@ -91,6 +91,7 @@ impl ConfigHandle {
         settings: Arc<HostSettingsStore>,
         steering: Arc<SteeringStore>,
         use_mock: bool,
+        projects: Arc<crate::host::ProjectCatalogHandle>,
         stopped: CancellationToken,
     ) -> Result<Self, String> {
         let path = settings.learning_journal_path();
@@ -114,7 +115,8 @@ impl ConfigHandle {
             tx: tx.clone(),
             workers: Vec::new(),
             use_mock,
-            mock_script: None,
+            mock_scripts: std::collections::VecDeque::new(),
+            projects,
             error: None,
             seen,
             settings_in_flight: false,
@@ -388,7 +390,7 @@ impl ConfigActor {
                     let _ = reply.send(result);
                 }
                 #[cfg(feature = "test-support")]
-                Command::MockScript(script) => self.mock_script = Some(script),
+                Command::MockScript(script) => self.mock_scripts.push_back(script),
             }
             if let Err(reason) = self.schedule() {
                 for job in &mut self.journal.jobs {
@@ -668,6 +670,19 @@ impl ConfigActor {
         if self.settings.get()? != before {
             return Err("Settings changed concurrently; no values were overwritten".into());
         }
+        for (id, config) in &after.self_improvement.projects {
+            if before.self_improvement.projects.get(id) != Some(config) {
+                let project = self
+                    .projects
+                    .get(id)
+                    .ok_or("Self-improvement project is unavailable")?;
+                if project.is_workbench() {
+                    return Err(
+                        "Self-improvement must be configured on the top-level project".into(),
+                    );
+                }
+            }
+        }
         for (id, aspect) in &before.review.aspects {
             if after.review.aspects.get(id) != Some(aspect)
                 || before.review.aspect_scopes.get(id) != after.review.aspect_scopes.get(id)
@@ -685,12 +700,22 @@ impl ConfigActor {
         self.refresh()?;
         Ok(committed)
     }
-    fn accept(&mut self, input: AcceptedHumanInput) -> Result<bool, String> {
+    fn accept(&mut self, mut input: AcceptedHumanInput) -> Result<bool, String> {
         if input.id.0.is_empty() || input.id.0.len() > 200 {
             return Err("Invalid human input identity".into());
         }
         if self.journal.seen.contains(&input.id) {
             return Ok(false);
+        }
+        if let Some(id) = &input.project_id {
+            let project = self
+                .projects
+                .get(id)
+                .ok_or("Learning input project is unavailable")?;
+            input.project_id = Some(match project.parent_project_id() {
+                Some(parent) => parent.clone(),
+                None => project.id,
+            });
         }
         let mut next = self.journal.clone();
         next.seen.insert(input.id.clone());
@@ -772,9 +797,7 @@ impl ConfigActor {
             }
             let scope = self.journal.jobs[index].state.scope.clone();
             let config = self.config(&scope)?;
-            if self.workers.iter().any(|worker| {
-                worker.scope == scope && (worker.cancel.is_cancelled() || worker.config != config)
-            }) {
+            if self.workers.iter().any(|worker| worker.scope == scope) {
                 continue;
             }
             if !matches!(configuration_status(&config), LearningStatus::Ready) {
@@ -821,96 +844,50 @@ impl ConfigActor {
             self.journal.jobs[index].active = Some(batch.clone());
             self.journal.jobs[index].state.status = LearningStatus::Running;
             self.save()?;
-            if let Some(worker) = self.workers.iter().find(|worker| worker.scope == scope) {
-                worker
-                    .tx
-                    .send((batch.id.clone(), prompt))
-                    .map_err(|_| "Analyzer worker stopped")?;
-            } else {
-                let (tx, mut rx) = mpsc::unbounded_channel::<(LearningChangeId, String)>();
-                let cancel = CancellationToken::new();
-                let stop = cancel.clone();
-                let use_mock = self.use_mock;
-                let analyzer = config.analyzer.clone().ok_or("Choose an analyzer model")?;
-                let script = self
-                    .mock_script
-                    .take()
-                    .map(Box::new)
-                    .map(crate::backend::mock::MockLaunch::Script);
-                // A worker is one reusable native tool-free context. Results
-                // use a separate channel; it never calls back into an actor
-                // while holding a request to that actor.
-                let results = self.tx.clone();
-                let worker_scope = scope.clone();
-                let initial_batch = batch.id.clone();
-                let first_prompt = prompt;
-                tokio::spawn(async move {
-                    let mut context_bytes = first_prompt.len();
-                    let helper = crate::agent::LearningHelper::start(
-                        &analyzer,
-                        first_prompt,
-                        use_mock,
-                        script,
-                    )
-                    .await;
-                    match helper {
-                        Ok(mut helper) => {
-                            let mut current_batch = initial_batch;
-                            let mut completed_batches = 0;
-                            loop {
-                                let (result, usage) = helper.collect(&stop).await;
-                                completed_batches += 1;
-                                let failed = result.is_err();
-                                if results
-                                    .send(Command::Finished {
-                                        scope: worker_scope.clone(),
-                                        batch_id: current_batch,
-                                        result,
-                                        usage,
-                                    })
-                                    .is_err()
-                                    || failed
-                                {
-                                    break;
-                                }
-                                let next = tokio::select! { _ = stop.cancelled() => break, next = rx.recv() => match next { Some(next) => next, None => break } };
-                                // Every queued prompt carries the server batch identity,
-                                // not an identity inferred from model output.
-                                current_batch = next.0;
-                                context_bytes += next.1.len();
-                                if completed_batches >= 64 || context_bytes > 262144 {
-                                    let _ = results.send(Command::Finished { scope: worker_scope.clone(), batch_id: current_batch, result: Err("Analyzer context reached its bounded input budget; disable and re-enable to start a new context".into()), usage: TaskTokenUsageScope::Unavailable { reason: TaskTokenUsageUnavailableReason::BackendDidNotReport } });
-                                    break;
-                                }
-                                if helper.send(next.1).await.is_err() {
-                                    let _ = results.send(Command::Finished { scope: worker_scope.clone(), batch_id: current_batch, result: Err("Analyzer rejected the next batch".into()), usage: TaskTokenUsageScope::Unavailable { reason: TaskTokenUsageUnavailableReason::BackendDidNotReport } });
-                                    break;
-                                }
-                            }
-                            helper.shutdown().await;
-                        }
-                        Err(reason) => {
-                            let _ = results.send(Command::Finished {
-                                scope: worker_scope.clone(),
-                                batch_id: initial_batch,
-                                result: Err(reason),
-                                usage: TaskTokenUsageScope::Unavailable {
-                                    reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
-                                },
-                            });
-                        }
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let use_mock = self.use_mock;
+            let analyzer = config.analyzer.clone().ok_or("Choose an analyzer model")?;
+            let script = self
+                .mock_scripts
+                .pop_front()
+                .map(Box::new)
+                .map(crate::backend::mock::MockLaunch::Script);
+            let results = self.tx.clone();
+            let worker_scope = scope.clone();
+            tokio::spawn(async move {
+                match crate::agent::LearningHelper::start(&analyzer, prompt, use_mock, script).await
+                {
+                    Ok(mut helper) => {
+                        let (result, usage) = helper.collect(&stop).await;
+                        let _ = results.send(Command::Finished {
+                            scope: worker_scope.clone(),
+                            batch_id: batch.id,
+                            result,
+                            usage,
+                        });
+                        helper.shutdown().await;
                     }
-                    let _ = results.send(Command::WorkerStopped {
-                        scope: worker_scope,
-                    });
+                    Err(reason) => {
+                        let _ = results.send(Command::Finished {
+                            scope: worker_scope.clone(),
+                            batch_id: batch.id,
+                            result: Err(reason),
+                            usage: TaskTokenUsageScope::Unavailable {
+                                reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
+                            },
+                        });
+                    }
+                }
+                let _ = results.send(Command::WorkerStopped {
+                    scope: worker_scope,
                 });
-                self.workers.push(Worker {
-                    scope,
-                    config,
-                    tx,
-                    cancel,
-                });
-            }
+            });
+            self.workers.push(Worker {
+                scope,
+                config,
+                cancel,
+            });
         }
         Ok(())
     }
@@ -1418,6 +1395,10 @@ impl ConfigActor {
     }
     fn recover(&mut self) -> Result<(), String> {
         for job in &mut self.journal.jobs {
+            if matches!(&job.state.status, LearningStatus::Failed { reason } if reason == "Analyzer context reached its bounded input budget; disable and re-enable to start a new context")
+            {
+                job.state.status = LearningStatus::Ready;
+            }
             if let Some(batch) = job.active.take() {
                 if let Some(analyzer) = batch.config.analyzer {
                     self.journal.usage.push(LearningUsage {
