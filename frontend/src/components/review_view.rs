@@ -4937,7 +4937,7 @@ pub(crate) fn ReviewDialog(
                                 p.assignments.into_iter().map(|assignment| {
                                     let aspects = assignment.aspects.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
                                     let actual_source = crate::components::settings_panel::review_source_label(&protocol::ReviewReviewerTarget::Explicit { backend_kind: assignment.backend_kind, session_settings: assignment.session_settings });
-                                    let source = if assignment.target == protocol::ReviewReviewerTarget::ForkCurrentAgent { format!("Fork current agent · {actual_source}") } else { actual_source };
+                                    let source = if assignment.fork_from_session_id.is_some() { format!("Fork current agent · {actual_source}") } else if assignment.target == protocol::ReviewReviewerTarget::ForkCurrentAgent { format!("Fresh reviewer · {actual_source}") } else { actual_source };
                                     view! { <div class="review-preview-row"><span>{if aspects.is_empty() { "General review".to_owned() } else { aspects }}</span><span>{source}</span></div> }
                                 }).collect_view().into_any()
                             }

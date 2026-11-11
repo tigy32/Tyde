@@ -19223,16 +19223,12 @@ self.state.with(move |state| {
 }).await
 }};
                         let inherited_failure = record.session_settings.as_ref().and_then(|values| session_settings_startup_failure(record.backend_kind, schema.as_ref(), values, "inherited reviewer"));
-                        if !crate::backend::capabilities_for_backend_kind(record.backend_kind).contains(tyde_agent_adapter::BackendCapability::ForkSession) {
-                            ReviewForkCapability::Unsupported { reason: format!("{}. Use Inline or an explicitly selected team backend/model.", crate::backend::backend_fork_unsupported_message(record.backend_kind)) }
-                        } else if !crate::backend::capabilities_for_backend_kind(record.backend_kind).contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly) {
-                            ReviewForkCapability::Unsupported { reason: format!("{0:?} supports native forks, but does not support enforced read-only reviewers. Use Inline or a supported explicit team source.", record.backend_kind) }
-                        } else if !session_record_is_resumable(&record, &storage) {
-                            ReviewForkCapability::Unsupported { reason: "The author's native session is not resumable. Use Inline or an explicit team reviewer.".to_owned() }
-                        } else if inherited_failure.is_some() {
-                            ReviewForkCapability::Unsupported { reason: "The author’s inherited model/settings are no longer supported by this backend’s current schema. Update the author’s settings or use Inline; reviewer forks never substitute defaults.".to_owned() }
-                        } else {
+                        if inherited_failure.is_some() {
+                            ReviewForkCapability::Unsupported { reason: "The author’s inherited model/settings are no longer supported by this backend’s current schema. Update the author’s settings or use Inline; reviewers never substitute defaults.".to_owned() }
+                        } else if crate::backend::capabilities_for_backend_kind(record.backend_kind).contains(tyde_agent_adapter::BackendCapability::ForkSession) && session_record_is_resumable(&record, &storage) {
                             ReviewForkCapability::Supported { session_id: record.id, backend_kind: record.backend_kind, session_settings: record.session_settings.unwrap_or_default() }
+                        } else {
+                            ReviewForkCapability::Fresh { backend_kind: record.backend_kind, session_settings: record.session_settings.unwrap_or_default() }
                         }
                     }
                 }
@@ -19314,7 +19310,11 @@ self.state.with(move |state| {
             ReviewMode::SingleReviewer => Ok(vec![(
                 protocol::ReviewReviewerConfig {
                     id: protocol::ReviewReviewerId("author-fork".to_owned()),
-                    name: "Fork current agent".to_owned(),
+                    name: match fork_capability {
+                        ReviewForkCapability::Fresh { .. } => "Fresh reviewer",
+                        _ => "Fork current agent",
+                    }
+                    .to_owned(),
                     target: ReviewReviewerTarget::ForkCurrentAgent,
                 },
                 aspects.clone(),
@@ -19341,6 +19341,7 @@ self.state.with(move |state| {
                     let resolved = match &reviewer.target {
                         ReviewReviewerTarget::ForkCurrentAgent => match &fork_capability {
                             ReviewForkCapability::Supported { session_id, backend_kind, session_settings } => Ok((*backend_kind, session_settings.clone(), Some(session_id.clone()))),
+                            ReviewForkCapability::Fresh { backend_kind, session_settings } => Ok((*backend_kind, session_settings.clone(), None)),
                             ReviewForkCapability::Unsupported { reason } => Err(reason.clone()),
                         },
                         ReviewReviewerTarget::Default => settings.default_backend.map(|kind| (kind, Default::default(), None)).ok_or_else(|| "Choose a host default backend or configure an explicit reviewer source".to_owned()),
@@ -19787,7 +19788,7 @@ self.state.with(move |state| {
                     from_session_id: session.clone(),
                     prompt,
                     images: None,
-                    access_mode: Some(protocol::BackendAccessMode::EnforcedReadOnly),
+                    access_mode: Some(reviewer_spawn_config.access_mode),
                 },
                 None => SpawnAgentParams::New {
                     workspace_roots: roots,
@@ -19796,7 +19797,7 @@ self.state.with(move |state| {
                     backend_kind,
                     launch_profile_id: None,
                     cost_hint: request.cost_hint,
-                    access_mode: protocol::BackendAccessMode::EnforcedReadOnly,
+                    access_mode: reviewer_spawn_config.access_mode,
                     session_settings: Some(config.session_settings.clone()),
                 },
             },

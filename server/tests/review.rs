@@ -6422,75 +6422,62 @@ async fn review_modes_share_persisted_aspects_and_exact_source_assignments() {
     )
     .await;
     assert!(failed);
-    let (unsupported, _) = spawn_review_author(
+    // A backend without native fork (Grok, like Antigravity) gets a previewed
+    // fresh reviewer on the author's backend instead of an unavailable review.
+    let (unforkable, _) = spawn_review_author(
         &mut client,
         &project,
-        "Unsupported fork author",
+        "Unforkable author",
         true,
         BackendKind::Grok,
     )
     .await;
-    let unsupported_caller = fixture.agent_control_caller(&unsupported.agent_id).await;
+    let unforkable_caller = fixture.agent_control_caller(&unforkable.agent_id).await;
     let (failed, value) = review_mcp_call(
-        &unsupported_caller.url,
-        Some(&unsupported_caller.authorization),
+        &unforkable_caller.url,
+        Some(&unforkable_caller.authorization),
         "tyde_preview_review",
         json!({"mode": "single_reviewer"}),
     )
     .await;
     assert!(!failed);
-    let unsupported_plan: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
+    let fresh_plan: protocol::ReviewPlan = serde_json::from_value(value).unwrap();
     assert!(matches!(
-        unsupported_plan.fork_capability,
-        protocol::ReviewForkCapability::Unsupported { .. }
+        fresh_plan.fork_capability,
+        protocol::ReviewForkCapability::Fresh {
+            backend_kind: BackendKind::Grok,
+            ..
+        }
     ));
-    assert!(
-        unsupported_plan
-            .unavailable_reason
-            .as_deref()
-            .unwrap()
-            .contains("Inline")
-    );
-    assert!(unsupported_plan.assignments.is_empty());
-    let before = subscribe_review(&mut client, &review.id)
-        .await
-        .ai_reviewer
-        .rounds
-        .len();
-    client
-        .review_action(
-            &review.id,
-            ReviewActionPayload::StartAiReview {
-                mode: Some(unsupported_plan.mode),
-                author_agent_id: Some(unsupported.agent_id),
-                expected_plan: Some(Box::new(unsupported_plan)),
-                backend_kind: None,
-                cost_hint: None,
-                instructions: None,
-                scope: ReviewAiScope::WorkingTree,
-            },
-        )
-        .await
-        .unwrap();
-    next_frame_matching_on(
-        &mut client,
-        "Unsupported fork fails before spawning",
-        |env| {
-            env.kind == FrameKind::ReviewEvent
-                && matches!(
-                    env.parse_payload::<ReviewEventPayload>(),
-                    Ok(ReviewEventPayload::Error { .. })
-                )
-        },
+    assert_eq!(fresh_plan.unavailable_reason, None);
+    assert_eq!(fresh_plan.assignments.len(), 1);
+    assert_eq!(fresh_plan.assignments[0].backend_kind, BackendKind::Grok);
+    assert_eq!(fresh_plan.assignments[0].fork_from_session_id, None);
+    let (failed, result) = review_mcp_call(
+        &unforkable_caller.await_url,
+        Some(&unforkable_caller.authorization),
+        "tyde_review",
+        json!({"request_id": "unforkable-fresh", "mode": "single_reviewer"}),
     )
     .await;
+    assert!(!failed, "unforkable author review must launch: {result}");
+    assert_eq!(result["status"], "completed");
+    let fresh_reviewer = expect_new_agent(&mut client, "fresh reviewer").await;
+    assert_eq!(fresh_reviewer.name, "Review: Fresh reviewer");
+    assert_eq!(fresh_reviewer.backend_kind, BackendKind::Grok);
     assert_eq!(
-        subscribe_review(&mut client, &review.id)
-            .await
-            .ai_reviewer
-            .rounds
-            .len(),
-        before
+        fresh_reviewer.parent_agent_id.as_ref(),
+        Some(&unforkable.agent_id)
+    );
+    let fresh_response =
+        reviewer_assignment_before_idle(&mut client, &fresh_reviewer.instance_stream).await;
+    assert!(
+        fresh_response.contains("[access_mode: ReadOnly]"),
+        "fresh Grok reviewer must be advisory read-only: {fresh_response}"
+    );
+    assert!(
+        !fresh_response.contains("[excluded_tool_categories:"),
+        "Grok cannot exclude tool categories: {fresh_response}"
     );
 
     let (catalog_author, _) = spawn_review_author(

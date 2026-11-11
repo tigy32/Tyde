@@ -2743,7 +2743,7 @@ pub(super) fn ReviewConfigurationFields(
     let mode_help = view! {
         <dl class="review-mode-help" aria-label="Review mode descriptions">
             <div><dt>"Inline"</dt><dd>"The authoring agent reviews its own work. No separate reviewers or Review-panel findings."</dd></div>
-            <div><dt>"Single reviewer"</dt><dd>"One reviewer inherits the authoring agent’s context, backend and model to check all selected aspects. Requires native forks and enforced read-only support."</dd></div>
+            <div><dt>"Single reviewer"</dt><dd>"One reviewer on the authoring agent’s backend and model checks all selected aspects, forking its context when the backend supports it."</dd></div>
             <div><dt>"Review team"</dt><dd>"Reviewers use your configured sources and team layout to cover the selected aspects."</dd></div>
         </dl>
     }.into_any();
@@ -2825,7 +2825,7 @@ pub(super) fn ReviewConfigurationFields(
                                 }
                                 view! { <div class="review-settings-row review-source-row">
                                     <div class="review-settings-row-copy"><strong>{reviewer.name}</strong><small>{move || {
-                                        if summary_target == protocol::ReviewReviewerTarget::ForkCurrentAgent && let Some(p) = plan.and_then(|p| p.get()) && let protocol::ReviewForkCapability::Supported { backend_kind, session_settings, .. } = p.fork_capability {
+                                        if summary_target == protocol::ReviewReviewerTarget::ForkCurrentAgent && let Some(p) = plan.and_then(|p| p.get()) && let protocol::ReviewForkCapability::Supported { backend_kind, session_settings, .. } | protocol::ReviewForkCapability::Fresh { backend_kind, session_settings } = p.fork_capability {
                                             return review_source_label(&protocol::ReviewReviewerTarget::Explicit { backend_kind, session_settings });
                                         }
                                         review_source_label(&summary_target)
@@ -23633,11 +23633,9 @@ mod wasm_tests {
             .unwrap();
         let help_text = mode_help.text_content().unwrap();
         assert!(help_text.contains("The authoring agent reviews its own work"));
-        assert!(
-            help_text
-                .contains("One reviewer inherits the authoring agent’s context, backend and model")
-        );
-        assert!(help_text.contains("Requires native forks and enforced read-only support"));
+        assert!(help_text.contains(
+            "One reviewer on the authoring agent’s backend and model checks all selected aspects, forking its context when the backend supports it."
+        ));
         assert!(help_text.contains("Reviewers use your configured sources and team layout"));
         let mode_disclosure: HtmlElement = container
             .query_selector("details summary")

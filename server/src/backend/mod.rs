@@ -2224,6 +2224,13 @@ pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
     with_backend_type!(kind, |B| B::capabilities(), removed => BackendCapabilities::default())
 }
 
+pub(crate) fn can_exclude_tool_category(
+    kind: BackendKind,
+    category: protocol::ToolCategory,
+) -> bool {
+    with_backend_type!(kind, |B| B::validate_tool_categories(&[category]).is_ok(), removed => false)
+}
+
 pub(crate) fn supports_running_redirect(kind: BackendKind) -> bool {
     let capabilities = capabilities_for_backend_kind(kind);
     capabilities.contains(BackendCapability::MidTurnSteering)

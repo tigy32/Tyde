@@ -445,8 +445,11 @@ stable IDs, enabled state and prior finding/execution snapshots.
   explicitly selected author in the UI). It creates no reviewers, execution
   records or panel findings. The author may fix issues and decide to proceed;
   this is not completion certification.
-- **Single reviewer** makes one native author-context fork, inheriting its
-  backend/model, covering all selected aspects. No separate model picker.
+- **Single reviewer** runs one reviewer on the author's backend/model covering
+  all selected aspects. It is a native author-context fork when the backend
+  declares `ForkSession` and the author's session is resumable; otherwise it is
+  a fresh reviewer with the same backend/settings and no author context
+  (`ReviewForkCapability::Fresh`). No separate model picker.
 - **Review team** uses stable source entries under `/review/team/reviewers`.
   A source is `fork_current_agent` or an explicit backend/session-settings
   target. Preserved host-default selections remain editable. `per_aspect`
@@ -466,16 +469,19 @@ assignment selection and lifecycle. UI state only projects typed events.
 Settings tools expose `review_default_mode` and `review_team`; aspects remain
 managed by the existing list/upsert/delete tools and storage.
 
-Forks use `Backend::fork`, never transcript copying or fresh-provider
-substitution. Codex calls native `thread/fork` and Claude uses `--resume` with
+Forks use `Backend::fork`, never transcript copying. A non-forkable author
+gets an explicit, previewed `Fresh` reviewer, never a silent substitution.
+Reviewers run `EnforcedReadOnly` (and exclude agent delegation) where the
+backend declares it; other backends review under `ReadOnly` with the read-only
+reviewer system prompt as advisory guidance. Codex calls native `thread/fork` and Claude uses `--resume` with
 `--fork-session`; both provide separate provider identities. Primary API
 sources: [Codex fork protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)
 and [Claude CLI reference](https://code.claude.com/docs/en/cli-reference).
-Muse exposes native `session/fork` in its adapter but currently rejects
-`EnforcedReadOnly`, so protected review forks are explicitly unavailable.
-Other adapters without `ForkSession` are also explicitly unsupported. Installed
-provider incompatibility remains a typed startup failure, never a clean
-review or a fresh-spawn fallback. Forks consume tokens. The scoped
+Antigravity cannot fork headlessly (agy 1.5.6 refuses `/fork` in print and
+stream-json modes, and its ACP server advertises no `session/fork`), so its
+authors get `Fresh` reviewers. Muse forks natively under advisory read-only.
+Installed provider incompatibility remains a typed startup failure, never a
+clean review. Forks consume tokens. The scoped
 `real_review_context_forks` conformance case verifies inherited model context,
 selected model, independent sibling identity, and author/sibling isolation
 against every backend declaring ForkSession, ResumeSession, SessionSettings

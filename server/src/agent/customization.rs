@@ -177,8 +177,24 @@ pub(crate) fn resolve_spawn_config(
         SpawnCustomization::Reviewer { instructions } => {
             resolved.instructions = Some(instructions.clone());
             resolved.tool_policy = crate::review::reviewer::reviewer_tool_policy();
-            resolved.access_mode = BackendAccessMode::EnforcedReadOnly;
-            resolved.excluded_tool_categories = vec![protocol::ToolCategory::AgentDelegation];
+            // Backends that cannot enforce read-only access or delegation
+            // exclusion review under the advisory read-only system prompt.
+            resolved.access_mode =
+                if crate::backend::capabilities_for_backend_kind(request.backend_kind)
+                    .contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly)
+                {
+                    BackendAccessMode::EnforcedReadOnly
+                } else {
+                    BackendAccessMode::ReadOnly
+                };
+            resolved.excluded_tool_categories = if crate::backend::can_exclude_tool_category(
+                request.backend_kind,
+                protocol::ToolCategory::AgentDelegation,
+            ) {
+                vec![protocol::ToolCategory::AgentDelegation]
+            } else {
+                Vec::new()
+            };
         }
     }
     resolved.builtin_steering = crate::backend::builtin_steering_for_tools(

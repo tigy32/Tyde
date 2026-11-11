@@ -8109,6 +8109,12 @@ pub enum ReviewForkCapability {
         backend_kind: BackendKind,
         session_settings: SessionSettingsValues,
     },
+    /// The author cannot be forked; a fresh reviewer runs on this
+    /// backend/settings instead, without the author's context.
+    Fresh {
+        backend_kind: BackendKind,
+        session_settings: SessionSettingsValues,
+    },
     Unsupported {
         reason: String,
     },
