@@ -13,8 +13,10 @@ use protocol::{
     AgentControlStatus, AgentId, AgentOrigin, ProjectId, Swarm, SwarmId, SwarmLifecycle,
     SwarmMemberState,
 };
+use wasm_bindgen::JsCast;
 
 const STORAGE_HIDE_SUB_AGENTS: &str = "tyde-mobile-agents-hide-sub-agents";
+const STORAGE_SHOW_WORKBENCHES: &str = "tyde-mobile-agents-show-workbenches";
 const BOOL_TRUE: &str = "true";
 const BOOL_FALSE: &str = "false";
 
@@ -40,36 +42,33 @@ fn bool_from_str(value: &str) -> Option<bool> {
     }
 }
 
-fn persist_hide_sub_agents(hidden: bool) {
+fn persist_bool_pref(key: &str, value: bool) {
     if let Some(storage) = local_storage() {
-        let _ = storage.set_item(STORAGE_HIDE_SUB_AGENTS, bool_to_str(hidden));
+        let _ = storage.set_item(key, bool_to_str(value));
     }
 }
 
-fn restore_hide_sub_agents() -> bool {
-    let default = true;
+fn restore_bool_pref(key: &str, default: bool) -> bool {
     let Some(storage) = local_storage() else {
         return default;
     };
-    match storage.get_item(STORAGE_HIDE_SUB_AGENTS) {
+    match storage.get_item(key) {
         Ok(Some(raw)) => match bool_from_str(&raw) {
             Some(value) => value,
             None => {
                 log::warn!(
-                    "unrecognized agents hide-sub-agents preference in localStorage: {raw:?}; resetting to default"
+                    "unrecognized agents preference {key} in localStorage: {raw:?}; resetting to default"
                 );
-                persist_hide_sub_agents(default);
+                persist_bool_pref(key, default);
                 default
             }
         },
         Ok(None) => {
-            persist_hide_sub_agents(default);
+            persist_bool_pref(key, default);
             default
         }
         Err(error) => {
-            log::warn!(
-                "failed to read agents hide-sub-agents preference from localStorage: {error:?}"
-            );
+            log::warn!("failed to read agents preference {key} from localStorage: {error:?}");
             default
         }
     }
@@ -87,7 +86,8 @@ fn restore_hide_sub_agents() -> bool {
 pub fn AgentsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let segment: RwSignal<AgentsSegment> = RwSignal::new(AgentsSegment::Agents);
-    let hide_sub_agents = RwSignal::new(restore_hide_sub_agents());
+    let hide_sub_agents = RwSignal::new(restore_bool_pref(STORAGE_HIDE_SUB_AGENTS, true));
+    let show_workbenches = RwSignal::new(restore_bool_pref(STORAGE_SHOW_WORKBENCHES, false));
     let search = RwSignal::new(String::new());
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
     let selected_swarm = RwSignal::new(None::<(LocalHostId, SwarmId)>);
@@ -125,6 +125,7 @@ pub fn AgentsView() -> impl IntoView {
                     data_mobile_test="agents-new-chat"
                     on_click=on_new_chat
                 />
+                {(!crate::native::is_native()).then(|| view! { <AgentFilters hide_sub_agents show_workbenches /> })}
                 </Show>
             </header>
             {crate::native::is_native().then(|| view! {
@@ -133,6 +134,7 @@ pub fn AgentsView() -> impl IntoView {
                         autocapitalize="none" autocomplete="off" spellcheck="false"
                         data-mobile-test="agents-search" prop:value=move || search.get()
                         on:input=move |event| search.set(event_target_value(&event)) />
+                    <AgentFilters hide_sub_agents show_workbenches />
                 </div>
             })}
             <Show when=move || has_swarms.get()>
@@ -176,7 +178,7 @@ pub fn AgentsView() -> impl IntoView {
                     }
                     view! {
                         <AgentRestorationNotice />
-                        {render_agents_body(&state, hide_sub_agents, collapsed_parents, open_swarm, search)}
+                        {render_agents_body(&state, hide_sub_agents, show_workbenches, collapsed_parents, open_swarm, search)}
                         <Show when=move || !has_swarms.get()>
                             <LegacyTeams />
                         </Show>
@@ -185,6 +187,79 @@ pub fn AgentsView() -> impl IntoView {
                 }}
                 </div>
             </div>
+        </div>
+    }
+}
+
+#[component]
+fn AgentFilters(
+    hide_sub_agents: RwSignal<bool>,
+    show_workbenches: RwSignal<bool>,
+) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let menu: NodeRef<leptos::html::Div> = NodeRef::new();
+    let outside_press = window_event_listener(leptos::ev::pointerdown, move |event| {
+        if !open.get_untracked() {
+            return;
+        }
+        let inside = menu.get_untracked().is_some_and(|menu| {
+            event
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                .is_some_and(|target| menu.contains(Some(&target)))
+        });
+        if !inside {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || outside_press.remove());
+    let toggle_sub_agents = move |_| {
+        hide_sub_agents.update(|hidden| {
+            *hidden = !*hidden;
+            persist_bool_pref(STORAGE_HIDE_SUB_AGENTS, *hidden);
+        });
+    };
+    let toggle_workbenches = move |_| {
+        show_workbenches.update(|shown| {
+            *shown = !*shown;
+            persist_bool_pref(STORAGE_SHOW_WORKBENCHES, *shown);
+        });
+    };
+    view! {
+        <div class="agents-filter-menu" node_ref=menu data-mobile-test="agents-filter-menu">
+            <button
+                type="button"
+                class="agents-filter-toggle"
+                aria-label="Filters"
+                aria-haspopup="true"
+                aria-expanded=move || open.get().to_string()
+                data-mobile-test="agents-filter-toggle"
+                on:click=move |_| open.update(|open| *open = !*open)
+            >
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M4 7h16M7 12h10M10 17h4" />
+                </svg>
+            </button>
+            <Show when=move || open.get()>
+                <div class="agents-filter-popover" role="group" aria-label="Agent filters"
+                    data-mobile-test="agents-filter-popover">
+                    <label class="agents-filter-option">
+                        <span>"Sub-agents"</span>
+                        <input type="checkbox" aria-label="Show sub-agents"
+                            data-mobile-test="agents-filter-sub-agents"
+                            prop:checked=move || !hide_sub_agents.get()
+                            on:change=toggle_sub_agents />
+                    </label>
+                    <label class="agents-filter-option">
+                        <span>"Workbenches"</span>
+                        <input type="checkbox" aria-label="Show workbenches"
+                            data-mobile-test="agents-filter-workbenches"
+                            prop:checked=move || show_workbenches.get()
+                            on:change=toggle_workbenches />
+                    </label>
+                </div>
+            </Show>
         </div>
     }
 }
@@ -336,24 +411,49 @@ struct ProjectSection {
 /// A project id an agent carries that the project list does not know about
 /// still gets a section, keyed by the raw id: dropping those agents on the
 /// floor would hide running work.
+///
+/// Unless `show_workbenches` is set, work in a workbench is filed under the
+/// project the workbench was cut from.
 fn project_sections(
     agents: Vec<AgentInfo>,
     swarms: Vec<Swarm>,
     projects: &[ProjectInfo],
+    show_workbenches: bool,
 ) -> Vec<ProjectSection> {
     let labels: HashMap<ProjectId, String> = projects
         .iter()
         .map(|info| (info.project.id.clone(), info.project.name.clone()))
         .collect();
+    let parents: HashMap<&ProjectId, &ProjectId> = projects
+        .iter()
+        .filter_map(|info| Some((&info.project.id, info.project.parent_project_id()?)))
+        .collect();
+    let section_key = |id: &ProjectId| -> ProjectId {
+        if show_workbenches {
+            return id.clone();
+        }
+        let mut current = id;
+        for _ in 0..=parents.len() {
+            match parents.get(current) {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current.clone()
+    };
 
     let mut order: Vec<Option<ProjectId>> = projects
         .iter()
+        .filter(|info| show_workbenches || info.project.parent_project_id().is_none())
         .map(|info| Some(info.project.id.clone()))
         .collect();
     let swarm_projects = swarms
         .iter()
-        .map(|swarm| Some(swarm.constraints.project_id.clone()));
-    for key in swarm_projects.chain(agents.iter().map(|agent| agent.project_id.clone())) {
+        .map(|swarm| Some(section_key(&swarm.constraints.project_id)));
+    let agent_projects = agents
+        .iter()
+        .map(|agent| agent.project_id.as_ref().map(section_key));
+    for key in swarm_projects.chain(agent_projects) {
         if key.is_some() && !order.contains(&key) {
             order.push(key);
         }
@@ -364,14 +464,14 @@ fn project_sections(
     let mut by_project: HashMap<Option<ProjectId>, Vec<AgentInfo>> = HashMap::new();
     for agent in agents {
         by_project
-            .entry(agent.project_id.clone())
+            .entry(agent.project_id.as_ref().map(section_key))
             .or_default()
             .push(agent);
     }
     let mut swarms_by_project: HashMap<Option<ProjectId>, Vec<Swarm>> = HashMap::new();
     for swarm in swarms {
         swarms_by_project
-            .entry(Some(swarm.constraints.project_id.clone()))
+            .entry(Some(section_key(&swarm.constraints.project_id)))
             .or_default()
             .push(swarm);
     }
@@ -400,6 +500,7 @@ fn project_sections(
 fn render_agents_body(
     state: &AppState,
     hide_sub_agents: RwSignal<bool>,
+    show_workbenches: RwSignal<bool>,
     collapsed_parents: RwSignal<HashSet<AgentId>>,
     open_swarm: Callback<(LocalHostId, SwarmId)>,
     search: RwSignal<String>,
@@ -463,10 +564,6 @@ fn render_agents_body(
                         }.into_any();
                     }
 
-                    let sub_agent_count = agents
-                        .iter()
-                        .filter(|agent| agent.parent_agent_id.is_some())
-                        .count();
                     let visible_agents: Vec<_> = if hide_sub_agents.get() {
                         agents
                             .into_iter()
@@ -488,7 +585,7 @@ fn render_agents_body(
                             projects
                         })
                         .unwrap_or_default();
-                    let mut sections = project_sections(visible_agents, swarms, &projects);
+                    let mut sections = project_sections(visible_agents, swarms, &projects, show_workbenches.get());
                     let query = search.get().trim().to_lowercase();
                     if !query.is_empty() {
                         for section in &mut sections {
@@ -509,34 +606,6 @@ fn render_agents_body(
 
                     view! {
                         <div>
-                            {if sub_agent_count == 0 {
-                                view! { <div></div> }.into_any()
-                            } else {
-                                let toggle_hide = move |_| {
-                                    hide_sub_agents.update(|hidden| {
-                                        *hidden = !*hidden;
-                                        persist_hide_sub_agents(*hidden);
-                                    });
-                                };
-                                view! {
-                                    <div class="agents-list-controls" data-mobile-test="agents-list-controls">
-                                        <span class="agents-subagent-count">
-                                            {format!("{sub_agent_count} sub-agent{}", if sub_agent_count == 1 { "" } else { "s" })}
-                                        </span>
-                                        <button
-                                            type="button"
-                                            class="agents-filter-toggle"
-                                            class:active=move || hide_sub_agents.get()
-                                            aria-pressed=move || hide_sub_agents.get().to_string()
-                                            data-mobile-test="agents-hide-subagents"
-                                            on:click=toggle_hide
-                                        >
-                                            <span class="agents-filter-icon" aria-hidden="true">"☷"</span>
-                                            <span class="agents-filter-label">{move || if hide_sub_agents.get() { "Show sub-agents" } else { "Hide sub-agents" }}</span>
-                                        </button>
-                                    </div>
-                                }.into_any()
-                            }}
                             <div class="agent-list" data-mobile-test="agents-list">
                                 {sections.into_iter().map(|section| {
                                     let agent_count = section.swarms.len()
@@ -1411,8 +1480,27 @@ mod wasm_tests {
         );
     }
 
-    /// Sub-agents are hidden by default, but the mobile list exposes a
-    /// direct Show sub-agents control and persists the user's selection.
+    fn open_filters(container: &HtmlElement) {
+        let toggle: HtmlElement = container
+            .query_selector("[data-mobile-test='agents-filter-toggle']")
+            .unwrap()
+            .expect("filter menu button")
+            .dyn_into()
+            .unwrap();
+        toggle.click();
+    }
+
+    fn filter_checkbox(container: &HtmlElement, test_id: &str) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(&format!("[data-mobile-test='{test_id}']"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{test_id} checkbox in the open filter menu"))
+            .dyn_into()
+            .unwrap()
+    }
+
+    /// Sub-agents are hidden by default; the filter menu shows them and the
+    /// selection persists.
     #[wasm_bindgen_test]
     async fn agents_hide_subagents_toggle_shows_child_rows_and_persists() {
         clear_hide_sub_agents_pref();
@@ -1436,17 +1524,22 @@ mod wasm_tests {
             "child should be hidden by default: {initial_text}"
         );
         assert!(
-            initial_text.contains("Show sub-agents"),
-            "default toggle should offer to show sub-agents: {initial_text}"
+            !initial_text.contains("sub-agent"),
+            "the list carries no sub-agent count label: {initial_text}"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='agents-filter-popover']")
+                .unwrap()
+                .is_none(),
+            "filter options stay closed until the menu is opened"
         );
 
-        let toggle: HtmlElement = container
-            .query_selector("[data-mobile-test='agents-hide-subagents']")
-            .unwrap()
-            .expect("show sub-agents toggle")
-            .dyn_into()
-            .unwrap();
-        toggle.click();
+        open_filters(&container);
+        next_tick().await;
+        let sub_agents = filter_checkbox(&container, "agents-filter-sub-agents");
+        assert!(!sub_agents.checked(), "Sub-agents starts unchecked");
+        sub_agents.click();
         next_tick().await;
 
         let shown_text = container.text_content().unwrap_or_default();
@@ -1454,9 +1547,34 @@ mod wasm_tests {
             shown_text.contains("Parent agent") && shown_text.contains("Child agent"),
             "showing sub-agents should reveal the child row: {shown_text}"
         );
+        assert!(sub_agents.checked(), "Sub-agents reads as shown");
         assert!(
-            shown_text.contains("Hide sub-agents"),
-            "inactive toggle should offer to hide sub-agents again: {shown_text}"
+            container
+                .query_selector("[data-mobile-test='agents-filter-popover']")
+                .unwrap()
+                .is_some(),
+            "toggling an option keeps the menu open"
+        );
+
+        let outside = web_sys::PointerEvent::new_with_event_init_dict("pointerdown", &{
+            let init = web_sys::PointerEventInit::new();
+            init.set_bubbles(true);
+            init
+        })
+        .unwrap();
+        container
+            .query_selector("[data-mobile-test='agents-list']")
+            .unwrap()
+            .expect("agent list")
+            .dispatch_event(&outside)
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='agents-filter-popover']")
+                .unwrap()
+                .is_none(),
+            "pressing outside the menu closes it"
         );
         assert_eq!(
             test_storage()
@@ -1491,9 +1609,11 @@ mod wasm_tests {
             text.contains("Parent agent") && text.contains("Child agent"),
             "persisted show-sub-agents selection should be restored: {text}"
         );
+        open_filters(&container);
+        next_tick().await;
         assert!(
-            text.contains("Hide sub-agents"),
-            "restored selection should offer to hide sub-agents: {text}"
+            filter_checkbox(&container, "agents-filter-sub-agents").checked(),
+            "restored selection reads as shown in the filter menu"
         );
     }
 
@@ -1565,6 +1685,9 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn agents_are_filed_under_the_project_they_run_in() {
         set_hide_sub_agents_pref(false);
+        test_storage()
+            .remove_item(STORAGE_SHOW_WORKBENCHES)
+            .expect("clear workbench preference");
         let host = LocalHostId("host-1".to_owned());
         let container = make_container();
         let mount_host = host.clone();
@@ -1579,6 +1702,20 @@ mod wasm_tests {
                         name: "Tyde".to_owned(),
                         sort_order: 0,
                         source: protocol::ProjectSource::Standalone { roots: Vec::new() },
+                    },
+                },
+                ProjectInfo {
+                    local_host_id: mount_host.clone(),
+                    project: protocol::Project {
+                        id: ProjectId("tyde-wb".to_owned()),
+                        name: "Tyde workbench".to_owned(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::GitWorkbench {
+                            environment: Default::default(),
+                            parent_project_id: ProjectId("tyde".to_owned()),
+                            branch: protocol::GitBranchName("wb".to_owned()),
+                            roots: Vec::new(),
+                        },
                     },
                 },
                 ProjectInfo {
@@ -1601,10 +1738,12 @@ mod wasm_tests {
             let mut stranger = fixture(&mount_host, "stranger", "Unknown project agent", None);
             stranger.project_id = Some(ProjectId("not-in-the-list".to_owned()));
             let loose = fixture(&mount_host, "loose", "Unscoped agent", None);
+            let mut benched = fixture(&mount_host, "benched", "Workbench agent", None);
+            benched.project_id = Some(ProjectId("tyde-wb".to_owned()));
 
             state
                 .agents
-                .set(vec![loose, stranger, child, parent, scoped]);
+                .set(vec![loose, stranger, child, benched, parent, scoped]);
             provide_context(state);
             view! { <AgentsView /> }
         });
@@ -1628,8 +1767,8 @@ mod wasm_tests {
             "one heading per project the host is running agents in: {heading_names:?}"
         );
         assert!(
-            heading_names[0].contains("Tyde") && heading_names[0].contains('2'),
-            "sections follow the project list's order, and count the agents in them: {heading_names:?}"
+            heading_names[0].contains("Tyde") && heading_names[0].contains('3'),
+            "sections follow the project list's order, count the agents in them, and fold workbench work into its project by default: {heading_names:?}"
         );
         assert!(
             heading_names[1].contains("Tychat"),
@@ -1653,6 +1792,7 @@ mod wasm_tests {
             "Tyde child",
             "Unknown project agent",
             "Unscoped agent",
+            "Workbench agent",
         ] {
             assert!(text.contains(name), "{name} must still be listed: {text}");
         }
@@ -1667,15 +1807,58 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(
             tyde_groups.length(),
-            1,
+            2,
             "the sub-agent stays nested under its parent inside the section"
         );
 
+        open_filters(&container);
+        next_tick().await;
+        let workbenches = filter_checkbox(&container, "agents-filter-workbenches");
+        assert!(!workbenches.checked(), "Workbenches starts unchecked");
+        workbenches.click();
+        next_tick().await;
+        let headings = container
+            .query_selector_all("[data-mobile-test='agent-project-heading']")
+            .unwrap();
+        let heading_names: Vec<String> = (0..headings.length())
+            .map(|index| {
+                headings
+                    .item(index)
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            heading_names.len(),
+            5,
+            "showing workbenches gives the workbench its own section: {heading_names:?}"
+        );
+        assert!(
+            heading_names[0].contains("Tyde") && heading_names[0].contains('2'),
+            "the parent project keeps only its own agents: {heading_names:?}"
+        );
+        assert!(
+            heading_names[1].contains("Tyde workbench") && heading_names[1].contains('1'),
+            "the workbench section follows the project list's order: {heading_names:?}"
+        );
+        assert_eq!(
+            test_storage()
+                .get_item(STORAGE_SHOW_WORKBENCHES)
+                .expect("read stored preference")
+                .as_deref(),
+            Some(BOOL_TRUE),
+            "showing workbenches must persist the selection"
+        );
+
         clear_hide_sub_agents_pref();
+        test_storage()
+            .remove_item(STORAGE_SHOW_WORKBENCHES)
+            .expect("clear workbench preference");
     }
     /// Swarm members (and agents they own) are replaced in the Agents list by
     /// one summary row per swarm, filed under the swarm's project. Project
-    /// counts and the sub-agent toggle only reflect rendered rows, the row's
+    /// counts only reflect rendered rows, the row's
     /// status follows member runtime status and the swarm lifecycle, and
     /// tapping it opens that swarm.
     #[wasm_bindgen_test]
