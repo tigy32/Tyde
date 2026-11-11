@@ -346,6 +346,13 @@ fn ReviewCard() -> impl IntoView {
         );
     };
 
+    let send_state = state.clone();
+    let send_target = Memo::new(move |_| {
+        let (host, review_id) = target.get()?;
+        let project = send_state.active_project.get()?;
+        (project.host_id == host).then_some((host, review_id, project.project_id))
+    });
+
     view! {
         <Show when=move || visible.get()>
             <div class="gp-review-card" data-test="gp-review-card">
@@ -389,6 +396,14 @@ fn ReviewCard() -> impl IntoView {
                         "Open review"
                     </button>
                 </div>
+                {move || send_target.get().map(|(host_id, review_id, project_id)| view! {
+                    <crate::components::review_view::ReviewSendControl
+                        host_id
+                        review_id
+                        project_id
+                        compact=true
+                    />
+                })}
             </div>
         </Show>
     }
@@ -4553,10 +4568,33 @@ mod wasm_tests {
     async fn draft_keeps_git_compact_and_opens_full_review_controls() {
         ensure_styles_loaded();
         let container = make_container();
-        stub_recording_bridge();
+        record_bridge();
         container.style().set_property("width", "320px").unwrap();
         let mounted = mount_git_panel(container.clone(), true);
         let state = mounted.borrow().clone().unwrap();
+        state.agents.update(|agents| {
+            agents.push(crate::state::AgentInfo {
+                tyde_permissions: Default::default(),
+                host_id: "h1".to_owned(),
+                agent_id: AgentId("implementer".to_owned()),
+                name: "Implementer".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Codex,
+                workspace_roots: vec![],
+                project_id: Some(ProjectId("proj-1".to_owned())),
+                parent_agent_id: None,
+                team_member_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                workflow: None,
+                created_at_ms: 1,
+                instance_stream: StreamPath("s".to_owned()),
+                started: true,
+                fatal_error: None,
+                activity_summary: Default::default(),
+                review_recipient: true,
+            });
+        });
         let finding_body = "Long review finding with actionable source context. ".repeat(80);
         state.reviews.update(|reviews| {
             let review = reviews.get_mut(&ReviewId("rev-1".to_owned())).unwrap();
@@ -4641,6 +4679,23 @@ mod wasm_tests {
                 .contains(&finding_body),
             "Detailed findings belong in the main review tab, never the Git sidebar"
         );
+        let select: web_sys::HtmlSelectElement =
+            query(&container, "[data-test=review-submit-target]")
+                .expect("The Git review card offers a recipient without opening the review")
+                .dyn_into()
+                .unwrap();
+        assert_eq!(select.value(), "existing:implementer");
+        let send = query(&container, "[data-test=review-send-btn]").expect("Git card Send");
+        assert!(!send.has_attribute("disabled"));
+        click(&send);
+        next_tick().await;
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("/review/rev-1")
+                && sent.contains("submit")
+                && sent.contains("implementer"),
+            "Send must submit the workspace review to the preselected agent; sent: {sent}"
+        );
         let open = query(&container, "[data-test=gp-review-open]").expect("Open review button");
         assert_eq!(open.text_content().as_deref(), Some("Open review"));
         click(&open);
@@ -4711,9 +4766,9 @@ mod wasm_tests {
         assert!(
             query(&main, "[data-test=review-run-ai]").is_some()
                 && query(&main, "[data-test=review-submit-target]").is_some()
-                && query(&main, ".review-submit-btn").is_some()
+                && query(&main, "[data-test=review-send-btn]").is_some()
                 && query(&main, "[data-test=review-clear-btn]").is_some(),
-            "The main review surface retains the AI reviewer, submit, and clear controls"
+            "The main review surface retains the AI reviewer, send, and clear controls"
         );
         assert!(
             query(&container, "[data-test=review-run-ai]").is_none(),

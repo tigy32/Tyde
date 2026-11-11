@@ -5,8 +5,8 @@
 //! (`ReviewableDiffView` in `diff_view.rs`). There is one active workspace
 //! review per project spanning every root plus exact committed-range drafts;
 //! each per-root diff tab renders its own slice.
-//! Review actions and round history live in the main comments surface.
-//! The Git panel only shows a compact review status and navigation row.
+//! Send, secondary review actions and round history live in the main
+//! comments surface. The Git panel shows a compact status row plus Send.
 //!
 //! Reactivity rules (`dev-docs/01-philosophy.md`):
 //! * No optimistic UI: action buttons disable on click and re-enable when
@@ -99,10 +99,9 @@ fn format_elapsed(start_ms: u64) -> String {
     }
 }
 
-/// Action sidebar for a Draft review: live counts, the AI-reviewer form,
-/// the submit-target picker (with full gating), and Clear. Public to the
-/// crate so the main review surface can reuse submit-target gating. Reviews
-/// are always-on, so there is no Cancel/discard-review affordance here.
+/// Secondary actions for a Draft review: the AI-reviewer form and Clear.
+/// Sending lives in [`ReviewSendControl`]. Reviews are always-on, so there
+/// is no Cancel/discard-review affordance here.
 ///
 /// `can_run_ai` is an optional extra gate on the AI reviewer: when supplied
 /// and `false`, "Run AI reviewer" is disabled (e.g. the workspace has no
@@ -110,7 +109,6 @@ fn format_elapsed(start_ms: u64) -> String {
 /// (`None`) ⇒ no extra gate, the historical behavior.
 #[component]
 pub(crate) fn ReviewSidebar(
-    review: Review,
     host_id: String,
     review_id: protocol::ReviewId,
     is_draft: Memo<bool>,
@@ -157,83 +155,12 @@ pub(crate) fn ReviewSidebar(
             .unwrap_or(0)
     });
 
-    // Submit gate: status is Draft, comments not empty, AI not running,
-    // and no submit echo currently pending.
     let review_id_for_pending = review_id.clone();
     let pending_state = state.clone();
     let action_pending = move || {
         pending_state
             .review_action_pending
             .with(|map| map.get(&review_id_for_pending).copied().unwrap_or_default())
-    };
-
-    // ── Submit target picker. The user must choose an explicit
-    // destination for the feedback bundle: an existing same-project agent
-    // or a freshly spawned one. `None` ⇒ nothing chosen yet (Submit is
-    // gated off until a target is picked). The protocol `ReviewSubmitTarget`
-    // shape is still settling, so its construction is isolated in
-    // `parse_submit_target` — this signal only ever holds the result.
-    let submit_target: RwSignal<Option<protocol::ReviewSubmitTarget>> = RwSignal::new(None);
-    // Optional instructions for a freshly-spawned target agent. Only
-    // meaningful when the picked target is `NewAgent`; folded into the
-    // target at submit time (see `on_submit`).
-    let submit_new_instructions: RwSignal<String> = RwSignal::new(String::new());
-    let submit_new_instructions_for_submit = submit_new_instructions;
-
-    // Project whose live agents are the deliverable submit targets. The
-    // review's own origin is deliberately NOT a fallback: project-scoped
-    // reviews carry a synthetic origin that is not a live agent. Target
-    // resolution lives in the module-level `live_same_project_candidates` /
-    // `effective_submit_target` helpers (kept as fns, not closures, so the
-    // captures stay `Send` for Leptos).
-    let target_project = review.project_id.clone();
-
-    // Returns either an empty string (button enabled) or a short reason
-    // string suitable for binding to `title` so hovering a disabled
-    // button explains why.
-    let submit_reason = {
-        let action_pending = action_pending.clone();
-        let live = live_for_ai;
-        let reason_state = state.clone();
-        let reason_host = host_id.clone();
-        let reason_project = target_project.clone();
-        move || -> &'static str {
-            if !is_draft.get() {
-                return "Review is no longer Draft";
-            }
-            let ai_running = live
-                .get()
-                .map(|r| matches!(r.ai_reviewer.status, ReviewAiReviewerStatus::Running))
-                .unwrap_or(false);
-            if ai_running {
-                return "Wait for the AI reviewer to finish";
-            }
-            if user_comment_count.get() == 0 {
-                if pending_suggestion_count.get() > 0 {
-                    return "Accept or reject the AI suggestions first, or add a comment";
-                }
-                return "Add at least one comment first";
-            }
-            if effective_submit_target(
-                &reason_state,
-                &reason_host,
-                &reason_project,
-                submit_target,
-                true,
-            )
-            .is_none()
-            {
-                return "Choose which agent receives the review";
-            }
-            if action_pending().submit {
-                return "Submit in progress\u{2026}";
-            }
-            ""
-        }
-    };
-    let submit_disabled = {
-        let submit_reason = submit_reason.clone();
-        move || !submit_reason().is_empty()
     };
 
     let cost_pick: RwSignal<Option<protocol::SpawnCostHint>> = RwSignal::new(None);
@@ -245,108 +172,6 @@ pub(crate) fn ReviewSidebar(
             .host_settings_by_host
             .with(|m| m.contains_key(&settings_host))
     });
-
-    let host_for_submit = host_id.clone();
-    let review_for_submit = review_id.clone();
-    let state_for_submit = state.clone();
-    let submit_project = target_project.clone();
-    let user_count_for_submit = user_comment_count;
-    let pending_count_for_submit = pending_suggestion_count;
-    let live_for_submit = live_for_ai;
-    let on_submit = move |_| {
-        let host = host_for_submit.clone();
-        let rid = review_for_submit.clone();
-        // Effective deliverable target: explicit picker choice, else a
-        // single auto-selected live candidate. No origin fallback — a
-        // project-scoped review's synthetic origin is not deliverable.
-        let Some(mut submit_target_value) = effective_submit_target(
-            &state_for_submit,
-            &host,
-            &submit_project,
-            submit_target,
-            false,
-        ) else {
-            log::warn!("review.submit.click review={rid} skipped=no_deliverable_target");
-            return;
-        };
-        // Fold the optional instructions into a NewAgent target.
-        if let protocol::ReviewSubmitTarget::NewAgent { instructions, .. } =
-            &mut submit_target_value
-        {
-            let text = submit_new_instructions_for_submit.get_untracked();
-            let trimmed = text.trim();
-            *instructions = (!trimmed.is_empty()).then(|| trimmed.to_owned());
-        }
-        let gate_before = state_for_submit
-            .review_action_pending
-            .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
-        let status = live_for_submit
-            .get_untracked()
-            .map(|r| format!("{:?}", std::mem::discriminant(&r.status)))
-            .unwrap_or_else(|| "none".to_owned());
-        let ai_status = live_for_submit
-            .get_untracked()
-            .map(|r| match r.ai_reviewer.status {
-                ReviewAiReviewerStatus::Idle => "idle",
-                ReviewAiReviewerStatus::Running => "running",
-                ReviewAiReviewerStatus::Completed => "completed",
-                ReviewAiReviewerStatus::Failed => "failed",
-            })
-            .unwrap_or("unknown");
-        let mut claimed = false;
-        state_for_submit.review_action_pending.update(|map| {
-            let gate = map.entry(rid.clone()).or_default();
-            if !gate.submit {
-                gate.submit = true;
-                claimed = true;
-            }
-        });
-        log::info!(
-            "review.submit.click review={} claimed={} gate_before_submit={} comments={} pending_suggestions={} ai_status={} status_disc={} {}",
-            rid,
-            claimed,
-            gate_before.submit,
-            user_count_for_submit.get_untracked(),
-            pending_count_for_submit.get_untracked(),
-            ai_status,
-            status,
-            conn_diag(&state_for_submit, &host)
-        );
-        if !claimed {
-            return;
-        }
-        let target_state = state_for_submit.clone();
-        let target_rid = rid.clone();
-        spawn_local(async move {
-            match send_review_action_inner(
-                &host,
-                target_rid.clone(),
-                ReviewActionPayload::Submit {
-                    target: submit_target_value.clone(),
-                },
-            )
-            .await
-            {
-                Ok(()) => {
-                    log::info!("review.submit.send_ok review={target_rid}");
-                }
-                Err(e) => {
-                    log::error!("review.submit.send_err review={target_rid} error={e}");
-                    target_state.review_action_pending.update(|map| {
-                        if let Some(gate) = map.get_mut(&target_rid) {
-                            gate.submit = false;
-                            if gate.is_idle() {
-                                map.remove(&target_rid);
-                            }
-                        }
-                    });
-                    log::info!(
-                        "review.submit.local_gate_clear review={target_rid} reason=send_err"
-                    );
-                }
-            }
-        });
-    };
 
     // ── Clear: drop all comments + AI suggestions (and reset the AI
     // reviewer) without delivering anything. Distinct from Cancel, which
@@ -552,32 +377,6 @@ pub(crate) fn ReviewSidebar(
                 }
             }
         });
-    };
-
-    let target_backends_state = state.clone();
-    let host_for_target_backends = host_id.clone();
-    let target_backends = move || -> Vec<BackendKind> {
-        target_backends_state
-            .host_settings_by_host
-            .with(|map| {
-                map.get(&host_for_target_backends)
-                    .map(|s| s.enabled_backends.clone())
-            })
-            .unwrap_or_default()
-    };
-
-    // Live same-project candidate agents for the picker's "Existing agents"
-    // group (plain closure so its captures stay `Send`).
-    let candidate_state = state.clone();
-    let host_for_candidates = host_id.clone();
-    let candidate_project = target_project.clone();
-    let candidate_agents = move || -> Vec<(protocol::AgentId, String)> {
-        live_same_project_candidates(
-            &candidate_state,
-            &host_for_candidates,
-            &candidate_project,
-            true,
-        )
     };
 
     let ai_status_kind = {
@@ -891,81 +690,7 @@ pub(crate) fn ReviewSidebar(
             </div>
 
             <div class="review-sidebar-section">
-                <label class="review-submit-target-label" for="review-submit-target">
-                    "Send feedback to"
-                </label>
-                <select
-                    id="review-submit-target"
-                    class="review-submit-target-select"
-                    data-test="review-submit-target"
-                    disabled=move || !is_draft.get()
-                    on:change=move |ev| {
-                        let val = event_target_value(&ev);
-                        submit_target.set(parse_submit_target(&val));
-                    }
-                >
-                    <option value="">"Auto (single same-project agent)"</option>
-                    {move || {
-                        let agents = candidate_agents();
-                        (!agents.is_empty()).then(|| view! {
-                            <optgroup label="Existing agents">
-                                {agents.into_iter().map(|(id, name)| {
-                                    view! {
-                                        <option value={format!("existing:{}", id.0)}>{name}</option>
-                                    }
-                                }).collect::<Vec<_>>()}
-                            </optgroup>
-                        })
-                    }}
-                    {move || {
-                        let kinds = target_backends();
-                        (!kinds.is_empty()).then(|| view! {
-                            <optgroup label="Spawn new agent">
-                                {kinds.into_iter().map(|kind| {
-                                    let label = backend_kind_label(kind);
-                                    view! {
-                                        <option value={format!("new:{label}")}>
-                                            {format!("New {label} agent")}
-                                        </option>
-                                    }
-                                }).collect::<Vec<_>>()}
-                            </optgroup>
-                        })
-                    }}
-                </select>
-                {move || {
-                    // Optional instructions only apply when spawning a new
-                    // agent — show the field only for a NewAgent selection.
-                    let is_new_agent = matches!(
-                        submit_target.get(),
-                        Some(protocol::ReviewSubmitTarget::NewAgent { .. })
-                    );
-                    is_new_agent.then(|| {
-                        let instructions_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
-                        autosize_textarea(instructions_ref, submit_new_instructions);
-                        view! {
-                            <textarea
-                                node_ref=instructions_ref
-                                class="review-submit-instructions"
-                                data-test="review-submit-instructions"
-                                placeholder="Optional instructions for the new agent\u{2026}"
-                                prop:value=move || submit_new_instructions.get()
-                                on:input=move |ev| {
-                                    submit_new_instructions.set(event_target_value(&ev))
-                                }
-                            />
-                        }
-                    })
-                }}
                 <div class="review-action-row">
-                    <button
-                        class="review-btn primary review-submit-btn"
-                        disabled=submit_disabled
-                        title=submit_reason
-                        on:click=on_submit
-                    >
-                        "Submit review"
-                    </button>
                     <button
                         class="review-btn review-clear-btn"
                         data-test="review-clear-btn"
@@ -978,6 +703,254 @@ pub(crate) fn ReviewSidebar(
                 </div>
             </div>
         </div>
+    }
+}
+
+/// Agent picker plus Send for a Draft review's feedback bundle. The picker
+/// always shows a concrete destination: the user's explicit choice while it
+/// stays deliverable, otherwise [`best_guess_recipient`]. `compact` drops the
+/// new-agent instructions field so the control fits the Git sidebar card.
+#[component]
+pub(crate) fn ReviewSendControl(
+    host_id: String,
+    review_id: ReviewId,
+    project_id: ProjectId,
+    #[prop(optional)] compact: bool,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let picked: RwSignal<Option<protocol::ReviewSubmitTarget>> = RwSignal::new(None);
+    let new_instructions: RwSignal<String> = RwSignal::new(String::new());
+
+    let live_state = state.clone();
+    let live_id = review_id.clone();
+    let live: Memo<Option<Review>> =
+        Memo::new(move |_| live_state.reviews.with(|map| map.get(&live_id).cloned()));
+
+    let candidates_state = state.clone();
+    let candidates_host = host_id.clone();
+    let candidates_project = project_id.clone();
+    let candidates: Memo<Vec<RecipientCandidate>> = Memo::new(move |_| {
+        candidates_state
+            .agents
+            .with(|agents| review_recipients(agents, &candidates_host, &candidates_project))
+    });
+    let focus_state = state.clone();
+    let focus_host = host_id.clone();
+    let focused = Memo::new(move |_| {
+        focus_state
+            .active_agent
+            .get()
+            .filter(|active| active.host_id == focus_host)
+            .map(|active| active.agent_id)
+    });
+    let target: Memo<Option<protocol::ReviewSubmitTarget>> = Memo::new(move |_| {
+        candidates.with(|candidates| match picked.get() {
+            Some(protocol::ReviewSubmitTarget::ExistingAgent { agent_id })
+                if candidates.iter().any(|c| c.agent_id == agent_id) =>
+            {
+                Some(protocol::ReviewSubmitTarget::ExistingAgent { agent_id })
+            }
+            Some(new @ protocol::ReviewSubmitTarget::NewAgent { .. }) => Some(new),
+            _ => best_guess_recipient(candidates, focused.get().as_ref())
+                .map(|agent_id| protocol::ReviewSubmitTarget::ExistingAgent { agent_id }),
+        })
+    });
+    let target_value = Memo::new(move |_| target.get().map(|t| submit_target_value(&t)));
+
+    let backends_state = state.clone();
+    let backends_host = host_id.clone();
+    let backends = Memo::new(move |_| {
+        backends_state
+            .host_settings_by_host
+            .with(|map| map.get(&backends_host).map(|s| s.enabled_backends.clone()))
+            .unwrap_or_default()
+    });
+
+    let pending_state = state.clone();
+    let pending_id = review_id.clone();
+    let submit_pending = Memo::new(move |_| {
+        pending_state
+            .review_action_pending
+            .with(|map| map.get(&pending_id).is_some_and(|gate| gate.submit))
+    });
+
+    let reason = Memo::new(move |_| -> &'static str {
+        let Some(review) = live.get() else {
+            return "Review is loading";
+        };
+        if !matches!(review.status, ReviewStatus::Draft) {
+            return "Review is no longer Draft";
+        }
+        if matches!(review.ai_reviewer.status, ReviewAiReviewerStatus::Running) {
+            return "Wait for the AI reviewer to finish";
+        }
+        if review.comments.is_empty() {
+            let pending = review
+                .suggestions
+                .iter()
+                .any(|s| matches!(s.state, ReviewSuggestionState::Pending));
+            return if pending {
+                "Accept or reject the AI suggestions first, or add a comment"
+            } else {
+                "Add at least one comment first"
+            };
+        }
+        if target.get().is_none() {
+            return "No agent can receive this review";
+        }
+        if submit_pending.get() {
+            return "Sending\u{2026}";
+        }
+        ""
+    });
+    let is_draft = Memo::new(move |_| {
+        live.with(|r| {
+            r.as_ref()
+                .is_some_and(|r| matches!(r.status, ReviewStatus::Draft))
+        })
+    });
+
+    let send_state = state.clone();
+    let send_host = host_id.clone();
+    let send_id = review_id.clone();
+    let on_send = move |_| {
+        if !reason.get_untracked().is_empty() {
+            return;
+        }
+        let Some(mut target_value) = target.get_untracked() else {
+            return;
+        };
+        if let protocol::ReviewSubmitTarget::NewAgent { instructions, .. } = &mut target_value {
+            let text = new_instructions.get_untracked();
+            let trimmed = text.trim();
+            *instructions = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
+        let rid = send_id.clone();
+        let mut claimed = false;
+        send_state.review_action_pending.update(|map| {
+            let gate = map.entry(rid.clone()).or_default();
+            if !gate.submit {
+                gate.submit = true;
+                claimed = true;
+            }
+        });
+        let host = send_host.clone();
+        log::info!(
+            "review.submit.click review={rid} claimed={claimed} target={} {}",
+            submit_target_value(&target_value),
+            conn_diag(&send_state, &host)
+        );
+        if !claimed {
+            return;
+        }
+        let target_state = send_state.clone();
+        spawn_local(async move {
+            match send_review_action_inner(
+                &host,
+                rid.clone(),
+                ReviewActionPayload::Submit {
+                    target: target_value,
+                },
+            )
+            .await
+            {
+                Ok(()) => log::info!("review.submit.send_ok review={rid}"),
+                Err(e) => {
+                    log::error!("review.submit.send_err review={rid} error={e}");
+                    target_state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(&rid) {
+                            gate.submit = false;
+                            if gate.is_idle() {
+                                map.remove(&rid);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    };
+
+    view! {
+        <div class="review-send" data-test="review-send">
+            <div class="review-send-row">
+                <select
+                    class="review-send-target"
+                    data-test="review-submit-target"
+                    aria-label="Send feedback to"
+                    disabled=move || !is_draft.get()
+                    on:change=move |ev| picked.set(parse_submit_target(&event_target_value(&ev)))
+                >
+                    {move || {
+                        let selected = target_value.get();
+                        let is_selected = |value: &str| selected.as_deref() == Some(value);
+                        let agents = candidates.get();
+                        let kinds = backends.get();
+                        let none = selected.is_none().then(|| view! {
+                            <option value="" selected=true>"Choose agent"</option>
+                        });
+                        let existing = agents.into_iter().map(|candidate| {
+                            let name = candidate.name;
+                            let value = format!("existing:{}", candidate.agent_id.0);
+                            let selected = is_selected(&value);
+                            view! { <option value=value selected=selected>{name}</option> }
+                        }).collect::<Vec<_>>();
+                        let new = (!kinds.is_empty()).then(|| view! {
+                            <optgroup label="New agent">
+                                {kinds.into_iter().map(|kind| {
+                                    let label = backend_kind_label(kind);
+                                    let value = format!("new:{label}");
+                                    let selected = is_selected(&value);
+                                    view! {
+                                        <option value=value selected=selected>
+                                            {format!("New {label} agent")}
+                                        </option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </optgroup>
+                        });
+                        view! { {none} {existing} {new} }
+                    }}
+                </select>
+                <button
+                    class="review-btn primary review-submit-btn"
+                    data-test="review-send-btn"
+                    disabled=move || !reason.get().is_empty()
+                    title=move || reason.get()
+                    on:click=on_send
+                >
+                    {move || if submit_pending.get() { "Sending\u{2026}" } else { "Send" }}
+                </button>
+            </div>
+            {move || {
+                let is_new = !compact
+                    && matches!(target.get(), Some(protocol::ReviewSubmitTarget::NewAgent { .. }));
+                is_new.then(|| {
+                    let instructions_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+                    autosize_textarea(instructions_ref, new_instructions);
+                    view! {
+                        <textarea
+                            node_ref=instructions_ref
+                            class="review-submit-instructions"
+                            data-test="review-submit-instructions"
+                            placeholder="Instructions for the new agent (optional)"
+                            prop:value=move || new_instructions.get()
+                            on:input=move |ev| new_instructions.set(event_target_value(&ev))
+                        />
+                    }
+                })
+            }}
+        </div>
+    }
+}
+
+fn submit_target_value(target: &protocol::ReviewSubmitTarget) -> String {
+    match target {
+        protocol::ReviewSubmitTarget::ExistingAgent { agent_id } => {
+            format!("existing:{}", agent_id.0)
+        }
+        protocol::ReviewSubmitTarget::NewAgent { backend_kind, .. } => {
+            format!("new:{}", backend_kind_label(*backend_kind))
+        }
     }
 }
 
@@ -1017,84 +990,76 @@ fn parse_submit_target(value: &str) -> Option<protocol::ReviewSubmitTarget> {
     }
 }
 
+/// A deliverable review recipient: its id, display name, and creation time.
+#[derive(Clone, PartialEq)]
+struct RecipientCandidate {
+    agent_id: protocol::AgentId,
+    name: String,
+    created_at_ms: u64,
+}
+
 /// Live same-project agents on `host_id` for `project_id` — the deliverable
 /// review submit targets. "Live" excludes agents with a fatal error
 /// (terminated); the server-owned `review_recipient` flag admits only agents
-/// the server accepts feedback for, so the picker and auto-target never offer
-/// reviewers or team, swarm, workflow, or provider-native sub-agents. The review's own
+/// the server accepts feedback for, so the picker never offers reviewers or
+/// team, swarm, workflow, or provider-native sub-agents. The review's own
 /// origin is intentionally never consulted: project-scoped reviews use a
-/// synthetic, non-deliverable origin. The `tracked` flag selects reactive vs
-/// untracked signal reads so the same logic serves both the reactive submit
-/// gate and the click handler.
-fn live_same_project_candidates(
-    state: &AppState,
+/// synthetic, non-deliverable origin.
+fn review_recipients(
+    agents: &[AgentInfo],
     host_id: &str,
-    project_id: &protocol::ProjectId,
-    tracked: bool,
-) -> Vec<(protocol::AgentId, String)> {
-    let collect = |agents: &Vec<AgentInfo>| -> Vec<(protocol::AgentId, String)> {
-        agents
-            .iter()
-            .filter(|a| {
-                a.host_id == host_id
-                    && a.project_id.as_ref() == Some(project_id)
-                    && a.fatal_error.is_none()
-                    && a.review_recipient
-            })
-            .map(|a| {
-                let name = if a.name.is_empty() {
-                    let short: String = a.agent_id.0.chars().take(8).collect();
-                    format!("agent {short}")
-                } else {
-                    a.name.clone()
-                };
-                (a.agent_id.clone(), name)
-            })
-            .collect()
-    };
-    if tracked {
-        state.agents.with(collect)
-    } else {
-        state.agents.with_untracked(collect)
-    }
+    project_id: &ProjectId,
+) -> Vec<RecipientCandidate> {
+    agents
+        .iter()
+        .filter(|a| {
+            a.host_id == host_id
+                && a.project_id.as_ref() == Some(project_id)
+                && a.fatal_error.is_none()
+                && a.review_recipient
+        })
+        .map(|a| RecipientCandidate {
+            agent_id: a.agent_id.clone(),
+            name: if a.name.is_empty() {
+                let short: String = a.agent_id.0.chars().take(8).collect();
+                format!("agent {short}")
+            } else {
+                a.name.clone()
+            },
+            created_at_ms: a.created_at_ms,
+        })
+        .collect()
 }
 
-/// The deliverable submit target: an explicit picker choice if present,
-/// else the sole live same-project candidate when exactly one exists.
-/// `None` ⇒ no deliverable target (Submit is gated off; the user must pick).
-fn effective_submit_target(
-    state: &AppState,
-    host_id: &str,
-    project_id: &protocol::ProjectId,
-    submit_target: RwSignal<Option<protocol::ReviewSubmitTarget>>,
-    tracked: bool,
-) -> Option<protocol::ReviewSubmitTarget> {
-    let explicit = if tracked {
-        submit_target.get()
-    } else {
-        submit_target.get_untracked()
-    };
-    if explicit.is_some() {
-        return explicit;
-    }
-    let candidates = live_same_project_candidates(state, host_id, project_id, tracked);
-    if let [(agent_id, _)] = candidates.as_slice() {
-        return Some(protocol::ReviewSubmitTarget::ExistingAgent {
-            agent_id: agent_id.clone(),
-        });
-    }
-    None
+/// The recipient a review most plausibly belongs to: the focused chat when it
+/// can receive the review, otherwise the newest eligible agent (an
+/// implementer a coordinator spawned last wins over the coordinator).
+fn best_guess_recipient(
+    candidates: &[RecipientCandidate],
+    focused: Option<&protocol::AgentId>,
+) -> Option<protocol::AgentId> {
+    focused
+        .filter(|id| candidates.iter().any(|c| c.agent_id == **id))
+        .cloned()
+        .or_else(|| {
+            candidates
+                .iter()
+                .max_by_key(|c| c.created_at_ms)
+                .map(|c| c.agent_id.clone())
+        })
 }
 
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
     match s {
-        // "ACP" is the label this backend carried for one release; still parsed
-        // so a persisted review reviewer string keeps resolving.
-        "Kiro" | "ACP" => Some(BackendKind::Kiro),
+        "Tycode" => Some(BackendKind::Tycode),
+        "Kiro" => Some(BackendKind::Kiro),
         "Claude" => Some(BackendKind::Claude),
         "Codex" => Some(BackendKind::Codex),
         "Antigravity" => Some(BackendKind::Antigravity),
         "Hermes" => Some(BackendKind::Hermes),
+        "Grok" => Some(BackendKind::Grok),
+        "OpenCode" => Some(BackendKind::Opencode),
+        "Muse" => Some(BackendKind::Muse),
         _ => None,
     }
 }
@@ -1972,7 +1937,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                 .is_some_and(|roots| roots.iter().any(root_has_reviewable_changes))
         })
     });
-    let actions_state = state.clone();
+    let send_pid = project_id.clone();
     let rounds_state = state.clone();
     let review_with_rounds = Memo::new(move |_| {
         let (_, id) = draft.get()?;
@@ -1992,6 +1957,12 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
         <div class="review-comments-surface" data-test="review-comments-surface">
             <div class="review-comments-toolbar">
                 <span class="review-comments-title">"Review comments"</span>
+                {
+                    let send_project = send_pid.clone();
+                    move || controls_target.get().map(|(host, id)| view! {
+                        <ReviewSendControl host_id=host review_id=id project_id=send_project.clone() />
+                    })
+                }
                 {move || groups.get().first().and_then(|(_, entries)| entries.first().cloned()).map(|entry| {
                     let state = toolbar_state.clone();
                     let host = toolbar_host.clone();
@@ -2010,14 +1981,11 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     }
                 })}
             </div>
-            {move || controls_target.get().and_then(|(host, id)| {
-                let review = actions_state.reviews.with_untracked(|reviews| reviews.get(&id).cloned())?;
-                Some(view! {
-                    <details class="review-actions">
-                        <summary data-test="review-actions-toggle">"Review actions"</summary>
-                        <ReviewSidebar review host_id=host review_id=id is_draft can_run_ai />
-                    </details>
-                })
+            {move || controls_target.get().map(|(host, id)| view! {
+                <details class="review-actions">
+                    <summary data-test="review-actions-toggle">"More actions"</summary>
+                    <ReviewSidebar host_id=host review_id=id is_draft can_run_ai />
+                </details>
             })}
             <Show when=move || review_with_rounds.get().is_some()>
                 <details class="review-history">
@@ -2799,7 +2767,6 @@ pub(crate) mod wasm_tests {
             });
             view! {
                 <ReviewSidebar
-                    review=review.clone()
                     host_id=host_id.clone()
                     review_id=review.id.clone()
                     is_draft=is_draft
@@ -2809,150 +2776,102 @@ pub(crate) mod wasm_tests {
         Mounted::new(handle, state_holder)
     }
 
-    /// Submit gating: disabled with zero comments, stays disabled with a
-    /// comment but no deliverable target, enables with a comment and exactly
-    /// one live same-project agent, and disables again once the review
-    /// leaves Draft.
+    fn mount_send_control(
+        container: HtmlElement,
+        review: Review,
+    ) -> Mounted<std::rc::Rc<std::cell::RefCell<Option<AppState>>>> {
+        let state_holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_holder_for_mount = state_holder.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            state.reviews.update(|map| {
+                map.insert(review.id.clone(), review.clone());
+            });
+            *state_holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ReviewSendControl
+                    host_id="h1".to_owned()
+                    review_id=review.id.clone()
+                    project_id=review.project_id.clone()
+                />
+            }
+        });
+        Mounted::new(handle, state_holder)
+    }
+
+    fn selected_target(container: &HtmlElement) -> String {
+        let select: web_sys::HtmlSelectElement = container
+            .query_selector("[data-test=\"review-submit-target\"]")
+            .unwrap()
+            .expect("send target picker rendered")
+            .dyn_into()
+            .unwrap();
+        select.value()
+    }
+
+    fn send_button(container: &HtmlElement) -> web_sys::Element {
+        container
+            .query_selector("[data-test=\"review-send-btn\"]")
+            .unwrap()
+            .expect("send button rendered")
+    }
+
+    /// The send control always shows a concrete destination and gates Send
+    /// on deliverable feedback. Only server-eligible same-project agents are
+    /// offered (no name inference); with several, the newest is the best
+    /// guess, the focused chat beats it, and an explicit pick beats both.
     #[wasm_bindgen_test]
-    async fn submit_button_disabled_until_draft_with_comments() {
+    async fn send_control_picks_best_guess_recipient_and_gates_send() {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review();
         let review_id = review.id.clone();
-        let state_holder = mount_sidebar(container.clone(), review);
-
+        let state_holder = mount_send_control(container.clone(), review);
         next_tick().await;
-        next_tick().await;
-
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            submit.has_attribute("disabled"),
-            "submit must be disabled with zero comments"
-        );
-
-        // Add a comment — necessary but NOT sufficient: with no live
-        // same-project agent there is no deliverable target, so submit
-        // stays disabled.
         let state = state_holder.borrow().clone().unwrap();
+
+        let send = send_button(&container);
+        assert_eq!(send.text_content().as_deref(), Some("Send"));
+        assert!(
+            send.has_attribute("disabled"),
+            "no comments, nothing to send"
+        );
+        assert_eq!(
+            send.get_attribute("title").as_deref(),
+            Some("Add at least one comment first")
+        );
+
         state.reviews.update(|map| {
-            if let Some(r) = map.get_mut(&review_id) {
-                r.comments.push(comment_at_line(2, "fix this"));
-            }
+            map.get_mut(&review_id)
+                .unwrap()
+                .comments
+                .push(comment_at_line(2, "fix this"));
         });
         next_tick().await;
-
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            submit.has_attribute("disabled"),
-            "submit must stay disabled with a comment but no deliverable target"
+        assert!(send.has_attribute("disabled"));
+        assert_eq!(
+            send.get_attribute("title").as_deref(),
+            Some("No agent can receive this review")
         );
+        assert_eq!(selected_target(&container), "");
 
-        // Seed exactly one live same-project agent — it auto-selects as the
-        // target, so submit now enables.
         state.agents.update(|agents| {
-            agents.push(make_agent("Only Candidate", "a-only", Some("proj-1")));
+            agents.push(make_agent("Agent", "a-top", Some("proj-1")));
         });
         next_tick().await;
-
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            !submit.has_attribute("disabled"),
-            "submit must enable with a comment and exactly one live same-project agent"
+        assert_eq!(
+            selected_target(&container),
+            "existing:a-top",
+            "a sole eligible agent is preselected, even one named \"Agent\""
         );
+        assert!(!send.has_attribute("disabled"));
 
-        // Flip the review to Submitted — submit must disable again.
-        state.reviews.update(|map| {
-            if let Some(r) = map.get_mut(&review_id) {
-                r.status = ReviewStatus::Submitted {
-                    submitted_at_ms: 999,
-                };
-            }
-        });
-        next_tick().await;
-
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            submit.has_attribute("disabled"),
-            "submit must disable when status leaves Draft"
-        );
-    }
-
-    /// The submit-target picker offers only same-project agents as
-    /// explicit destinations — an agent belonging to a different project
-    /// must never appear, since feedback can only route within the
-    /// review's own project.
-    #[wasm_bindgen_test]
-    async fn submit_target_picker_lists_only_same_project_agents() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review(); // project_id = "proj-1", host = "h1"
-        let state_holder = mount_sidebar(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        // Seed one same-project agent and one from a different project.
-        let state = state_holder.borrow().clone().unwrap();
         state.agents.update(|agents| {
-            agents.push(make_agent("Backend Codex", "a-same", Some("proj-1")));
-            agents.push(make_agent("Other Project", "a-other", Some("proj-2")));
-        });
-        next_tick().await;
-
-        let select = container
-            .query_selector("[data-test=\"review-submit-target\"]")
-            .unwrap()
-            .expect("submit target picker rendered");
-        let text = select.text_content().unwrap_or_default();
-        assert!(
-            text.contains("Auto (single same-project agent)"),
-            "default auto-target option missing; got: {text}"
-        );
-        assert!(
-            text.contains("Backend Codex"),
-            "same-project agent must be offered as a target; got: {text}"
-        );
-        assert!(
-            !text.contains("Other Project"),
-            "an agent from a different project must not be offered; got: {text}"
-        );
-    }
-
-    /// The picker offers exactly the agents the server marks as
-    /// `review_recipient`, including an agent-control implementer child, and
-    /// hides read-only reviewers and native/workflow sub-agents. With two
-    /// eligible agents Auto has no single target, so Submit stays disabled
-    /// until the user explicitly picks the implementer.
-    ///
-    /// This replaces an assertion that every agent-control child is hidden:
-    /// the server delivers review feedback to a live same-project
-    /// agent-control implementer, so hiding it left the user agent as the
-    /// sole Auto target and misrouted the feedback.
-    #[wasm_bindgen_test]
-    async fn submit_target_picker_offers_server_eligible_agents() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review(); // project_id = "proj-1", host = "h1"
-        let review_id = review.id.clone();
-        let state_holder = mount_sidebar(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let state = state_holder.borrow().clone().unwrap();
-        state.reviews.update(|map| {
-            if let Some(r) = map.get_mut(&review_id) {
-                r.comments.push(comment_at_line(2, "fix this"));
-            }
-        });
-        state.agents.update(|agents| {
-            agents.push(make_agent("Top Level", "a-top", Some("proj-1")));
             agents.push(AgentInfo {
                 review_recipient: true,
+                created_at_ms: 20,
                 ..make_sub_agent(
                     "Implementer Child",
                     "a-implementer",
@@ -2960,118 +2879,100 @@ pub(crate) mod wasm_tests {
                     "a-top",
                 )
             });
-            agents.push(make_sub_agent(
-                "AI Review",
-                "a-reviewer",
-                AgentOrigin::AgentControl,
-                "a-top",
-            ));
-            agents.push(make_sub_agent(
-                "Agent",
-                "a-native",
-                AgentOrigin::BackendNative,
-                "a-top",
-            ));
-            agents.push(make_sub_agent(
-                "Agent2 Stats Wiring Implementer",
-                "a-workflow",
-                AgentOrigin::Workflow,
-                "a-top",
-            ));
+            agents.push(AgentInfo {
+                created_at_ms: 30,
+                ..make_agent("Other Project", "a-other", Some("proj-2"))
+            });
+            for (name, id, origin) in [
+                ("AI Review", "a-reviewer", AgentOrigin::AgentControl),
+                ("Agent", "a-native", AgentOrigin::BackendNative),
+                ("Stats Wiring", "a-workflow", AgentOrigin::Workflow),
+            ] {
+                agents.push(AgentInfo {
+                    created_at_ms: 40,
+                    ..make_sub_agent(name, id, origin, "a-top")
+                });
+            }
         });
         next_tick().await;
-
-        let select: web_sys::HtmlSelectElement = container
+        let select = container
             .query_selector("[data-test=\"review-submit-target\"]")
             .unwrap()
-            .expect("submit target picker rendered")
-            .dyn_into()
             .unwrap();
-        for offered in ["a-top", "a-implementer"] {
-            assert!(
-                select
-                    .query_selector(&format!("option[value=\"existing:{offered}\"]"))
-                    .unwrap()
-                    .is_some(),
-                "eligible agent {offered} must be offered as a review target"
-            );
-        }
-        for hidden in ["a-reviewer", "a-native", "a-workflow"] {
+        for hidden in ["a-other", "a-reviewer", "a-native", "a-workflow"] {
             assert!(
                 select
                     .query_selector(&format!("option[value=\"existing:{hidden}\"]"))
                     .unwrap()
                     .is_none(),
-                "ineligible agent {hidden} must not appear in the reviewer picker"
+                "ineligible agent {hidden} must not be offered"
             );
         }
-
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            submit.has_attribute("disabled"),
-            "Auto must not pick a target when two agents are eligible"
-        );
         assert_eq!(
-            submit.get_attribute("title").as_deref(),
-            Some("Choose which agent receives the review")
+            selected_target(&container),
+            "existing:a-implementer",
+            "the newest eligible agent is the best guess"
+        );
+        assert!(!send.has_attribute("disabled"));
+
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: "h1".to_owned(),
+                agent_id: AgentId("a-top".to_owned()),
+            }),
+            "Agent".to_owned(),
+            true,
+        );
+        next_tick().await;
+        assert_eq!(
+            selected_target(&container),
+            "existing:a-top",
+            "the focused chat wins when it can receive the review"
         );
 
+        let select: web_sys::HtmlSelectElement = select.dyn_into().unwrap();
         select.set_value("existing:a-implementer");
         select
             .dispatch_event(&web_sys::Event::new("change").unwrap())
             .unwrap();
         next_tick().await;
-        let submit =
-            find_button_by_text(&container, "Submit review").expect("submit button rendered");
-        assert!(
-            !submit.has_attribute("disabled"),
-            "an explicitly selected implementer must enable Submit"
-        );
-    }
+        assert_eq!(selected_target(&container), "existing:a-implementer");
 
-    /// The filter is driven by the server's typed eligibility, never the
-    /// display name: a top-level user agent literally named "Agent" is kept,
-    /// while an ineligible sub-agent with a friendly name is still dropped.
-    #[wasm_bindgen_test]
-    async fn submit_target_picker_keeps_user_agent_named_agent() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review();
-        let state_holder = mount_sidebar(container.clone(), review);
-
+        // Every offered new-agent option must stay selected, never silently
+        // falling back to the best-guess existing agent.
+        let all_kinds = vec![
+            BackendKind::Tycode,
+            BackendKind::Kiro,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+            BackendKind::Hermes,
+            BackendKind::Grok,
+            BackendKind::Opencode,
+            BackendKind::Muse,
+        ];
+        seed_host_settings(&state, None, all_kinds.clone());
         next_tick().await;
-        next_tick().await;
+        for kind in all_kinds {
+            let value = format!("new:{}", backend_kind_label(kind));
+            select.set_value(&value);
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_eq!(selected_target(&container), value);
+            assert!(!send.has_attribute("disabled"), "{value} must be sendable");
+        }
 
-        let state = state_holder.borrow().clone().unwrap();
-        state.agents.update(|agents| {
-            agents.push(make_agent("Agent", "a-user-named-agent", Some("proj-1")));
-            agents.push(make_sub_agent(
-                "Helpful Reviewer",
-                "a-child",
-                AgentOrigin::AgentControl,
-                "a-user-named-agent",
-            ));
+        state.reviews.update(|map| {
+            map.get_mut(&review_id).unwrap().status = ReviewStatus::Submitted {
+                submitted_at_ms: 999,
+            };
         });
         next_tick().await;
-
-        let select = container
-            .query_selector("[data-test=\"review-submit-target\"]")
-            .unwrap()
-            .expect("submit target picker rendered");
         assert!(
-            select
-                .query_selector("option[value=\"existing:a-user-named-agent\"]")
-                .unwrap()
-                .is_some(),
-            "a top-level user agent named \"Agent\" must be kept — no name inference"
-        );
-        assert!(
-            select
-                .query_selector("option[value=\"existing:a-child\"]")
-                .unwrap()
-                .is_none(),
-            "a sub-agent must be dropped even with a friendly display name"
+            send.has_attribute("disabled"),
+            "send must disable when the review leaves Draft"
         );
     }
 
@@ -3575,9 +3476,9 @@ pub(crate) mod wasm_tests {
         );
     }
 
-    // Review actions now live here instead of expanding the Git sidebar.
-    // Keep feedback uncluttered until the user opens actions, without losing
-    // either the controls or navigation to the exact commented source.
+    // Sending feedback is the primary action, so it stays visible above the
+    // comments; secondary actions stay collapsed without losing navigation
+    // to the exact commented source.
     #[wasm_bindgen_test]
     async fn comments_surface_opens_the_staged_comment_source() {
         ensure_styles_loaded();
@@ -3589,8 +3490,15 @@ pub(crate) mod wasm_tests {
         let holder = mount_comments_surface(container.clone(), review, false);
 
         next_tick().await;
-        // inner_text reports the label's production text-transform: uppercase.
-        for label in ["Run AI reviewer", "SEND FEEDBACK TO", "Clear comments"] {
+        let send = container
+            .query_selector("[data-test=review-send-btn]")
+            .unwrap()
+            .expect("Send renders without opening any disclosure");
+        assert!(
+            send.get_bounding_client_rect().height() > 0.0,
+            "Send must be visible above the comments"
+        );
+        for label in ["Run AI reviewer", "Clear comments"] {
             assert!(
                 !container.inner_text().contains(label),
                 "{label} stays collapsed while reading feedback"
@@ -3604,7 +3512,7 @@ pub(crate) mod wasm_tests {
             .unwrap()
             .click();
         next_tick().await;
-        for label in ["Run AI reviewer", "SEND FEEDBACK TO", "Clear comments"] {
+        for label in ["Run AI reviewer", "Clear comments"] {
             assert!(
                 container.inner_text().contains(label),
                 "Opening actions reveals {label}"

@@ -13560,7 +13560,7 @@ pre.tool-error-pre {
 
 .review-backend-select,
 .review-cost-select,
-.review-submit-target-select {
+.review-send-target {
     appearance: none;
     -webkit-appearance: none;
     width: 100%;
@@ -13584,24 +13584,15 @@ pre.tool-error-pre {
 
 .review-backend-select:hover:not(:disabled),
 .review-cost-select:hover:not(:disabled),
-.review-submit-target-select:hover:not(:disabled) {
+.review-send-target:hover:not(:disabled) {
     border-color: var(--border-secondary);
 }
 
 .review-backend-select:focus,
 .review-cost-select:focus,
-.review-submit-target-select:focus {
+.review-send-target:focus {
     outline: none;
     border-color: var(--accent-primary);
-}
-
-.review-submit-target-label {
-    display: block;
-    font-size: 0.692rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-tertiary);
 }
 
 .review-submit-instructions {
@@ -14098,6 +14089,42 @@ pre.tool-error-pre {
 .review-history .review-rounds {
     margin: 0;
     padding: 0 var(--space-3) var(--space-3);
+}
+
+.review-send {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-width: 0;
+}
+
+.review-send-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+select.review-send-target {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    padding: 3px 28px 3px var(--space-2);
+    font-size: 0.8rem;
+}
+
+.review-send-row .review-submit-btn {
+    flex: 0 0 auto;
+}
+
+.review-comments-toolbar .review-send {
+    margin-left: auto;
+    width: min(360px, 50%);
+}
+
+.gp-review-card .review-btn {
+    padding: 2px var(--space-3);
+    font-size: 0.769rem;
 }
 
 .review-comments-title {
