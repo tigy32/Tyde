@@ -281,6 +281,22 @@ def _tyde_invalid_arguments_result(agent, messages, ref, parse_error):
 
 _tyde_tool_executor._append_invalid_arguments_result = _tyde_invalid_arguments_result
 
+_tyde_original_publish_sequential_result = _tyde_tool_executor._publish_sequential_result
+_tyde_tool_cancelled_result = _tyde_tool_executor._ToolCancelledResult
+_tyde_cancelled_tool_completion = threading.local()
+
+def _tyde_publish_sequential_result(agent, messages, ref, managed, *args, **kwargs):
+    # Hermes types the result it synthesizes for an interrupt-abandoned call,
+    # but tool.complete carries only its text. Publish that typed outcome.
+    cancelled = isinstance(managed.result, _tyde_tool_cancelled_result)
+    _tyde_cancelled_tool_completion.call_id = ref.call_id if cancelled else None
+    try:
+        return _tyde_original_publish_sequential_result(agent, messages, ref, managed, *args, **kwargs)
+    finally:
+        _tyde_cancelled_tool_completion.call_id = None
+
+_tyde_tool_executor._publish_sequential_result = _tyde_publish_sequential_result
+
 
 def _tyde_make_agent(*args, **kwargs):
     agent = _tyde_original_make_agent(*args, **kwargs)
@@ -423,6 +439,20 @@ def _tyde_make_agent(*args, **kwargs):
     return agent
 
 def _tyde_emit(event_type, session_id, payload=None):
+    if event_type == "tool.complete" and isinstance(payload, dict):
+        cancelled = (getattr(_tyde_cancelled_tool_completion, "call_id", None) is not None
+                     and payload.get("tool_id") == _tyde_cancelled_tool_completion.call_id)
+        with _tyde_message_condition:
+            control = _tyde_turn_controls.get(session_id)
+            cancel_requested = control is not None and control.cancel_requested and not control.settled
+        if cancelled or cancel_requested:
+            payload = dict(payload)
+            payload["_tyde_cancelled"] = cancelled
+            payload["_tyde_cancel_requested"] = cancel_requested
+            print(
+                f"TYDE HERMES TOOL COMPLETE native_cancelled={cancelled} cancel_requested={cancel_requested}",
+                file=sys.stderr, flush=True,
+            )
     if event_type == "message.delta":
         session = _tyde_gateway_server._sessions.get(session_id)
         agent = session.get("agent") if session is not None else None
@@ -1450,6 +1480,9 @@ struct HermesEventMapper {
     last_turn_generation: Option<u64>,
     retired_cancelled_generation: Option<u64>,
     interrupted_turn_generations: VecDeque<u64>,
+    /// A user interrupt may abort the open response; closing the session must
+    /// publish what the user watched stream instead.
+    closing: bool,
     session_info_emitted: bool,
     approval_counter: u64,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
@@ -3275,6 +3308,7 @@ impl HermesSessionActor {
                                 eprintln!(
                                     "TYDE HERMES SHUTDOWN settling active provider turn before session close"
                                 );
+                                self.mapper.closing = true;
                                 let _ = self.handle_interrupt().await;
                             }
                             self.stop_owned_background_work().await;
@@ -6398,7 +6432,7 @@ impl HermesEventMapper {
         }
         match status.as_str() {
             "interrupted" => {
-                if self.closed_response.is_some() {
+                if self.closed_response.is_some() || self.closing_publishes_open_response() {
                     events.extend(self.finish_stream_events(
                         stream_final_text,
                         final_reasoning.clone(),
@@ -6808,13 +6842,22 @@ impl HermesEventMapper {
             .or_else(|| payload.get("summary").cloned())
             .unwrap_or(Value::Null);
         let provider_error = hermes_tool_error(&payload, &result);
+        let native_cancelled =
+            payload.get("_tyde_cancelled").and_then(Value::as_bool) == Some(true);
+        // The tool ended after Tyde asked Hermes to stop its turn; a failure
+        // here is the stop Hermes delivered, such as its exit-130 kill.
+        let cancel_requested = payload
+            .get("_tyde_cancel_requested")
+            .and_then(Value::as_bool)
+            == Some(true);
         let normalized_mcp = tool_name
             .starts_with("mcp_tyde_")
             .then(|| normalize_mcp_call_tool_result(&payload));
-        let success = normalized_mcp
-            .as_ref()
-            .map(|normalized| normalized.success && provider_error.is_none())
-            .unwrap_or_else(|| provider_error.is_none());
+        let success = !native_cancelled
+            && normalized_mcp
+                .as_ref()
+                .map(|normalized| normalized.success && provider_error.is_none())
+                .unwrap_or_else(|| provider_error.is_none());
         let error = normalized_mcp
             .as_ref()
             .and_then(|normalized| normalized.error.clone())
@@ -6834,7 +6877,14 @@ impl HermesEventMapper {
             }));
         }
         self.opaque_progress_tools.remove(&completion_tool_call_id);
-        let outcome = if success {
+        let outcome = if native_cancelled {
+            ToolExecutionOutcome::Cancelled {
+                message: result
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| result.to_string()),
+            }
+        } else if success {
             let tool_result = normalized_mcp
                 .map(|normalized| {
                     serde_json::from_value(normalized.tool_result.clone()).unwrap_or(
@@ -6850,10 +6900,12 @@ impl HermesEventMapper {
             ToolExecutionOutcome::Succeeded {
                 result: tool_result,
             }
-        } else if error.as_ref().is_some_and(|error| {
-            let error = error.to_ascii_lowercase();
-            error.contains("cancel") || error.contains("interrupt")
-        }) {
+        } else if cancel_requested
+            || error.as_ref().is_some_and(|error| {
+                let error = error.to_ascii_lowercase();
+                error.contains("cancel") || error.contains("interrupt")
+            })
+        {
             ToolExecutionOutcome::Cancelled {
                 message: error
                     .clone()
@@ -7474,8 +7526,18 @@ impl HermesEventMapper {
         }
     }
 
+    fn closing_publishes_open_response(&self) -> bool {
+        self.closing
+            && self.closed_response.is_none()
+            && self.current_message_id.is_some()
+            && (!self.current_text.trim().is_empty() || !self.current_reasoning.trim().is_empty())
+    }
+
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
+        if self.closing_publishes_open_response() {
+            events.extend(self.finish_stream_events(None, None, None, None, None));
+        }
         self.retired_cancelled_generation =
             self.current_turn_generation.or(self.last_turn_generation);
         if let Some(generation) = self.current_turn_generation.or(self.last_turn_generation)

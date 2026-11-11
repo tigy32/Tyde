@@ -935,6 +935,7 @@ impl<B: Backend> Harness<B> {
                     survivors, 0,
                     "the session moved while its process still ran"
                 );
+                Ok(())
             },
             Box::pin(std::future::ready(Ok(()))),
             tokio::sync::watch::channel(BackendRestartCancel::None).1,
@@ -980,6 +981,7 @@ impl<B: Backend> Harness<B> {
             |(backend, events): (B, EventStream)| async move {
                 shut_down_until_exited(backend.shutdown(), events).await;
                 stopped_tx.send_replace(true);
+                Ok(())
             },
             Box::pin(async move {
                 commit_cancel
@@ -1589,24 +1591,28 @@ impl<B: Backend> Harness<B> {
     }
 
     pub async fn next_chat(&mut self, deadline: tokio::time::Instant) -> Option<ChatEvent> {
+        tokio::time::timeout_at(deadline, self.next_chat_unbounded())
+            .await
+            .ok()
+    }
+
+    pub async fn next_chat_unbounded(&mut self) -> ChatEvent {
         let events = self
             .events
             .as_mut()
             .expect("backend event stream must be open");
         loop {
-            match tokio::time::timeout_at(deadline, events.recv_backend()).await {
-                Ok(Some(BackendEvent::Chat(event))) => {
+            match events.recv_backend().await {
+                Some(BackendEvent::Chat(event)) => {
                     let kind = serde_json::to_value(&event).expect("serialize event kind");
                     eprintln!("{} event={}", self.test_name, kind["kind"]);
-                    return Some(event);
+                    return event;
                 }
-                Ok(Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_))) => {
-                }
-                Ok(Some(BackendEvent::ResumeReplayComplete(_))) => {
+                Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_)) => {}
+                Some(BackendEvent::ResumeReplayComplete(_)) => {
                     panic!("unexpected resume boundary in live events")
                 }
-                Ok(None) => panic!("{}: backend closed its event stream", self.test_name),
-                Err(_) => return None,
+                None => panic!("{}: backend closed its event stream", self.test_name),
             }
         }
     }
@@ -1824,39 +1830,7 @@ pub async fn interrupt_turn<B: Backend>(
     prompt: &str,
     trigger: InterruptTrigger,
 ) -> Interrupted {
-    send_prompt(host, agent, prompt).await;
-    let mut turn = host.turn(prompt);
-    let mut streamed = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
-    loop {
-        let event = host
-            .next_chat(deadline)
-            .await
-            .expect("interrupt trigger timed out");
-        let fire = match (&event, &trigger) {
-            (ChatEvent::StreamDelta(delta), InterruptTrigger::AfterStreamedChars(wanted)) => {
-                streamed += delta.text.chars().count();
-                streamed >= *wanted
-            }
-            // Grok can read its bundled skill before launching the command.
-            // Cancelling that read never exercises foreground process cancellation.
-            (ChatEvent::ToolRequest(request), InterruptTrigger::AfterCommandRequest) => {
-                matches!(request.tool_type, ToolRequestType::RunCommand { .. })
-            }
-            (ChatEvent::StreamEnd(end), InterruptTrigger::ResponseContaining(marker)) => {
-                end.message.content.contains(marker)
-            }
-            (ChatEvent::TypingStatusChanged(false), _) => panic!(
-                "{}: turn went idle before the interrupt trigger ({streamed} characters streamed)",
-                turn.label()
-            ),
-            _ => false,
-        };
-        turn.events.push(event);
-        if fire {
-            break;
-        }
-    }
+    let mut turn = run_until_trigger(host, agent, prompt, &trigger).await;
     if matches!(trigger, InterruptTrigger::AfterCommandRequest) {
         tokio::time::sleep(TOOL_STARTUP_GRACE).await;
     }
@@ -1887,6 +1861,58 @@ pub async fn interrupt_turn<B: Backend>(
         after_completed_response,
         settled_in,
     }
+}
+
+/// Runs `prompt` until `trigger`, then closes the session through
+/// `Backend::shutdown`. The turn holds everything the backend emitted for it,
+/// including what it emitted while closing.
+pub async fn shutdown_turn<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    trigger: InterruptTrigger,
+) -> Turn {
+    let mut turn = run_until_trigger(host, agent, prompt, &trigger).await;
+    turn.events.extend(host.shutdown().await);
+    turn
+}
+
+async fn run_until_trigger<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    trigger: &InterruptTrigger,
+) -> Turn {
+    send_prompt(host, agent, prompt).await;
+    let mut turn = host.turn(prompt);
+    let mut streamed = 0;
+    loop {
+        let event = host.next_chat_unbounded().await;
+        let fire = match (&event, trigger) {
+            (ChatEvent::StreamDelta(delta), InterruptTrigger::AfterStreamedChars(wanted)) => {
+                streamed += delta.text.chars().count();
+                streamed >= *wanted
+            }
+            // Grok can read its bundled skill before launching the command.
+            // Cancelling that read never exercises foreground process cancellation.
+            (ChatEvent::ToolRequest(request), InterruptTrigger::AfterCommandRequest) => {
+                matches!(request.tool_type, ToolRequestType::RunCommand { .. })
+            }
+            (ChatEvent::StreamEnd(end), InterruptTrigger::ResponseContaining(marker)) => {
+                end.message.content.contains(marker)
+            }
+            (ChatEvent::TypingStatusChanged(false), _) => panic!(
+                "{}: turn went idle before the interrupt trigger ({streamed} characters streamed)",
+                turn.label()
+            ),
+            _ => false,
+        };
+        turn.events.push(event);
+        if fire {
+            break;
+        }
+    }
+    turn
 }
 
 /// Runs `prompt` as a turn and, once its shell command is running, hands the

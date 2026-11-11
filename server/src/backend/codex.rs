@@ -2517,7 +2517,11 @@ impl CodexSession {
         Ok(())
     }
 
+    /// Closes the turn before tearing the provider down, so the terminal
+    /// events a deliberate close owes the stream cannot race the transport's
+    /// own exit report.
     pub async fn shutdown(self) {
+        self.inner.emitter.close("Codex session closed");
         self.inner.terminate_background_terminals().await;
         self.inner.drain_background_commands().await;
         self.inner.complete_all_codex_subagents().await;
@@ -23205,6 +23209,12 @@ impl CodexBackend {
             }
 
             session.shutdown().await;
+            while let Some(raw) = raw_events.recv().await {
+                if !forward_codex_backend_stream_event(raw, &events_tx, &mut normalization_failures)
+                {
+                    break;
+                }
+            }
         });
 
         let session_id = match ready_rx.await {
@@ -24606,6 +24616,12 @@ impl Backend for CodexBackend {
             }
 
             session.shutdown().await;
+            while let Some(raw) = raw_events.recv().await {
+                if !forward_codex_backend_stream_event(raw, &events_tx, &mut normalization_failures)
+                {
+                    break;
+                }
+            }
         });
 
         Ok((
@@ -24894,6 +24910,12 @@ impl Backend for CodexBackend {
             }
 
             session.shutdown().await;
+            while let Some(raw) = raw_events.recv().await {
+                if !forward_codex_backend_stream_event(raw, &events_tx, &mut normalization_failures)
+                {
+                    break;
+                }
+            }
         });
 
         let child_session_id = match ready_rx.await {

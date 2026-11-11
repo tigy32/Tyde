@@ -521,7 +521,28 @@ impl Actor {
             compaction::BackendCompactionFailureKind::TransportClosed,
             "Muse event transport closed during compaction",
         );
+        self.close("Muse session closed");
         self.connection.shutdown();
+    }
+
+    /// A closed session still owes the stream its partial response and the
+    /// end of any turn it was in.
+    fn close(&mut self, message: &str) {
+        if self.response.is_some()
+            && let Err(error) = self.finish_response()
+        {
+            tracing::error!(
+                message = error,
+                "Muse failed to settle its partial response"
+            );
+        }
+        self.emitter.close(message);
+        if let Err(error) = self.flush() {
+            tracing::error!(
+                message = error,
+                "Muse close could not reach its event consumer"
+            );
+        }
     }
 
     async fn notification(&mut self, method: &str, params: Value) -> Result<(), String> {

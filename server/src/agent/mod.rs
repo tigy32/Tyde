@@ -28,11 +28,12 @@ use uuid::Uuid;
 use crate::backend::mock::MockBackend;
 use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendExecutionTarget, BackendRestartCancel,
-    BackendRestartCommit, BackendRestartOutcome, BackendRestartRequest, BackendSession,
-    BackendSessionRelocation, BackendSpawnConfig, BackendStartupError, EventStream, RunningBackend,
-    SendOutcome, SteerOutcome, apply_session_settings_update, resolve_backend_session_settings,
-    restart_agent_backend, validate_runtime_session_settings_update,
-    validate_session_settings_values, validate_startup_mcp_configuration, with_backend_type,
+    BackendRestartCommit, BackendRestartDrain, BackendRestartOutcome, BackendRestartRequest,
+    BackendRestartSourceEvent, BackendSession, BackendSessionRelocation, BackendSpawnConfig,
+    BackendStartupError, EventStream, RunningBackend, SendOutcome, SteerOutcome,
+    apply_session_settings_update, resolve_backend_session_settings, restart_agent_backend,
+    validate_runtime_session_settings_update, validate_session_settings_values,
+    validate_startup_mcp_configuration, with_backend_type,
 };
 use crate::host::{
     HostCapacityTx, HostSessionSummaryCountEvent, HostSessionSummaryCountTx,
@@ -1173,6 +1174,9 @@ struct AgentProjectMoves {
     /// The turn that scheduled a restart has ended, but the UI still shows it
     /// working so the restart does not read as an idle agent.
     idle_withheld: bool,
+    restart_boundary_reached: bool,
+    restart_source: Option<mpsc::UnboundedReceiver<BackendRestartSourceEvent>>,
+    restart_source_drained: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 impl AgentProjectMoves {
@@ -1192,6 +1196,9 @@ impl AgentProjectMoves {
         self.scheduled = None;
         self.entry_pending = None;
         self.entry_execution = None;
+        self.restart_source = None;
+        self.restart_source_drained = None;
+        self.restart_boundary_reached = false;
     }
 }
 
@@ -1294,6 +1301,8 @@ struct AgentProjectMoveRequest<'a> {
     destination: Option<protocol::Project>,
     roots: Vec<String>,
     restart_cancel: watch::Receiver<BackendRestartCancel>,
+    restart_source: &'a mut Option<mpsc::UnboundedReceiver<BackendRestartSourceEvent>>,
+    restart_source_drained: &'a mut Option<oneshot::Sender<Result<(), String>>>,
 }
 
 fn rejected_project_move_stage(failure: ProjectMoveFailure) -> ProjectMoveStage {
@@ -1320,14 +1329,15 @@ fn begin_project_move_stage(request: AgentProjectMoveRequest<'_>) -> ProjectMove
             "Agent has no saved conversation to move".to_owned(),
         ));
     };
-    if request.native_registrations.load(Ordering::SeqCst) > 0 || !request.events.is_drained() {
+    if request.native_registrations.load(Ordering::SeqCst) > 0 {
         return rejected_project_move_stage(ProjectMoveFailure::Busy);
     }
     let running = request.backend.take().expect("running actor has backend");
-    let running_events = std::mem::replace(
-        request.events,
-        EventStream::new_backend(mpsc::unbounded_channel().1),
-    );
+    let running_events = request.events.take_for_restart();
+    let (source_tx, source_rx) = mpsc::unbounded_channel();
+    let (drained, source_drained) = oneshot::channel();
+    *request.restart_source = Some(source_rx);
+    *request.restart_source_drained = Some(drained);
     let native_session_id = running.session_id();
     let session_store = Arc::clone(request.session_store);
     let project_id = request.project_id;
@@ -1355,6 +1365,10 @@ fn begin_project_move_stage(request: AgentProjectMoveRequest<'_>) -> ProjectMove
             },
         },
         running: (running, running_events),
+        drain: BackendRestartDrain {
+            events: source_tx,
+            drained: source_drained,
+        },
         commit,
         cancel: request.restart_cancel,
     })))
@@ -6014,20 +6028,31 @@ pub(crate) fn spawn_agent_actor(
                         })
                 }));
             }
+            let project_entry_quiescent = !in_turn
+                && !backend_typing
+                && pending_tool_response_ids.is_empty()
+                && open_tool_call_ids.is_empty()
+                && !status_handle.snapshot().await.has_background_work;
+            if project_entry_quiescent
+                && project_moves
+                    .scheduled
+                    .as_ref()
+                    .is_some_and(|movement| movement.restarts_backend)
+            {
+                // Native goals may start another turn before the catalog grants
+                // entry. The accepted boundary still owns the stop/reopen.
+                project_moves.restart_boundary_reached = true;
+            }
             let project_entry_ready = project_moves.pending.is_none()
                 && project_moves.scheduled.is_some()
                 && actor_native_registrations.load(Ordering::SeqCst) == 0
                 && !project_move_waiting_for_backend
                 && matches!(lifecycle, ActorLifecycle::Running)
-                && !in_turn
-                && !backend_typing
+                && (project_entry_quiescent || project_moves.restart_boundary_reached)
                 && !compaction_blocked
                 && active_compaction.is_none()
                 && context_compaction.is_none()
-                && !resume_replay_gate_pending
-                && pending_tool_response_ids.is_empty()
-                && open_tool_call_ids.is_empty()
-                && !status_handle.snapshot().await.has_background_work;
+                && !resume_replay_gate_pending;
             if project_moves.scheduled.is_some()
                 && tracing::enabled!(target: "tyde_project_entry_diagnostic", tracing::Level::INFO)
             {
@@ -6046,6 +6071,7 @@ pub(crate) fn spawn_agent_actor(
             if project_moves.scheduled.is_none() {
                 project_moves.entry_pending = None;
                 project_moves.entry_execution = None;
+                project_moves.restart_boundary_reached = false;
             }
             if project_entry_ready
                 && project_moves.entry_pending.is_none()
@@ -6061,9 +6087,6 @@ pub(crate) fn spawn_agent_actor(
                     Ok(pending) => project_moves.entry_pending = Some(pending),
                     Err(error) => project_moves.entry_execution = Some(Err(error)),
                 }
-            }
-            if !project_entry_ready {
-                project_moves.entry_execution = None;
             }
             if project_entry_ready && let Some(mut execution) = project_moves.entry_execution.take()
             {
@@ -6097,6 +6120,8 @@ pub(crate) fn spawn_agent_actor(
                             destination,
                             roots: roots.clone(),
                             restart_cancel: restart_cancel_requests,
+                            restart_source: &mut project_moves.restart_source,
+                            restart_source_drained: &mut project_moves.restart_source_drained,
                         });
                         (roots, stage)
                     }
@@ -6668,6 +6693,8 @@ pub(crate) fn spawn_agent_actor(
                         let result = match result {
                             ProjectMoveStageResult::Plain(result) => result,
                             ProjectMoveStageResult::Restart(outcome) => {
+                                project_moves.restart_source = None;
+                                project_moves.restart_source_drained = None;
                                 let (binding, result) = match *outcome {
                                     BackendRestartOutcome::Refused { backend: (running, running_events), error } => {
                                         backend = Some(running);
@@ -7243,14 +7270,60 @@ pub(crate) fn spawn_agent_actor(
                     }
                 maybe_event = async {
                     if let Some(result) = &resume_replay_boundary {
-                        Some(match deferred_resume_events.pop_front() {
+                        Some(BackendRestartSourceEvent::Event(Box::new(match deferred_resume_events.pop_front() {
                             Some(event) => event,
                             None => BackendEvent::ResumeReplayComplete(result.clone()),
-                        })
+                        })))
+                    } else if let Some(source) = project_moves.restart_source.as_mut() {
+                        source.recv().await
                     } else {
-                        events.recv_backend().await
+                        events.recv_backend().await.map(|event| BackendRestartSourceEvent::Event(Box::new(event)))
                     }
-                }, if !backend_restart_in_flight => {
+                }, if !backend_restart_in_flight || project_moves.restart_source.is_some() => {
+                    let maybe_event = match maybe_event {
+                        Some(BackendRestartSourceEvent::Event(event)) => Some(*event),
+                        Some(BackendRestartSourceEvent::Stopped) => {
+                            Box::pin(async {
+                                if let Some(pending) = replay_state.pending_permission_request.take() {
+                                    let _ = pending.reply.send(Err("Backend stopped for project entry".to_owned()));
+                                    broadcast_permission_request(&mut subscribers, &pending.agent_id, &replay_state).await;
+                                }
+                                // A stopped backend owns ending its turn, response
+                                // and tools; one that did not is lost, not patched.
+                                let settled = if in_turn || backend_typing || !open_tool_call_ids.is_empty() {
+                                    tracing::error!(
+                                        agent_id = %current_start.agent_id,
+                                        in_turn,
+                                        backend_typing,
+                                        open_tools = open_tool_call_ids.len(),
+                                        "Backend stopped for project entry without settling its turn"
+                                    );
+                                    Err("Backend stopped without settling its turn".to_owned())
+                                } else {
+                                    active_agent_await_ids.clear();
+                                    status_handle.persist_recovery(None).await;
+                                    status_handle.update(|status| {
+                                        status.pending_user_response = None;
+                                        status.blocked_on_user_response = false;
+                                    }).await;
+                                    Ok(())
+                                };
+                                project_moves.restart_source = None;
+                                if let Some(drained) = project_moves.restart_source_drained.take() {
+                                    let _ = drained.send(settled);
+                                }
+                            }).await;
+                            continue;
+                        }
+                        None if project_moves.restart_source.is_some() => {
+                            // Preflight refused before stopping the source. Its
+                            // original stream returns with the restart result.
+                            project_moves.restart_source = None;
+                            project_moves.restart_source_drained = None;
+                            continue;
+                        }
+                        None => None,
+                    };
                         project_readiness_epoch = project_readiness_epoch.wrapping_add(1);
                     project_move_waiting_for_backend = false;
                     let Some(event) = maybe_event else {
@@ -8217,7 +8290,8 @@ pub(crate) fn spawn_agent_actor(
                     // authoritative clock lives here and not in the scheduler.
                     last_backend_event_at = Some(Instant::now());
                     let mut real_idle_transition = false;
-                    let mut withhold_idle = false;
+                    let mut withhold_idle = backend_restart_in_flight
+                        && matches!(event, ChatEvent::TypingStatusChanged(false));
                     snapshot_viewed_image(
                         &mut event,
                         &open_tool_requests,
@@ -8330,9 +8404,11 @@ pub(crate) fn spawn_agent_actor(
                                 completed_by_idle = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
-                                withhold_idle = project_moves.scheduled.as_ref()
+                                withhold_idle = backend_restart_in_flight || project_moves.scheduled.as_ref()
                                     .is_some_and(|movement| movement.restarts_backend);
-                                project_moves.idle_withheld = withhold_idle;
+                                if !backend_restart_in_flight {
+                                    project_moves.idle_withheld = withhold_idle;
+                                }
                             } else if in_turn {
                                 tracing::warn!(
                                     agent_id = %current_start.agent_id,
@@ -8388,7 +8464,7 @@ pub(crate) fn spawn_agent_actor(
                             status_handle.update(|s| {
                                 // Clearing a blocking wait exposes the last
                                 // backend activity, not newly started work.
-                                if s.blocked_on_user_response {
+                                if s.blocked_on_user_response && !backend_restart_in_flight {
                                     s.is_thinking = backend_typing;
                                     s.turn_completed = !backend_typing;
                                 }
@@ -8550,7 +8626,9 @@ pub(crate) fn spawn_agent_actor(
                             tychat.fail(error).await;
                         }
                     }
-                    if real_idle_transition {
+                    // A restart publishes the destination capability after its
+                    // replay settles; the source backend is owned by shutdown.
+                    if real_idle_transition && !backend_restart_in_flight {
                         let session_id = current_session_id
                             .as_ref()
                             .expect("live agent must have session_id");
@@ -8631,6 +8709,7 @@ pub(crate) fn spawn_agent_actor(
                     }
 
                     if matches!(lifecycle, ActorLifecycle::Running)
+                        && !backend_restart_in_flight
                         && context_compaction.is_some()
                     {
                         try_dispatch_context_compaction(
@@ -8696,6 +8775,7 @@ pub(crate) fn spawn_agent_actor(
                             && initial_follow_up.is_none()
                             && pending_tool_response_ids.is_empty()
                             && open_tool_call_ids.is_empty()))
+                        && !backend_restart_in_flight
                         && held_controls.is_empty()
                         && tychat_handoff.is_none()
                         && !resume_replay_gate_pending
@@ -11781,6 +11861,8 @@ pub(crate) fn spawn_agent_actor(
                                         destination,
                                         roots: roots.clone(),
                                         restart_cancel: restart_cancel_requests,
+                                        restart_source: &mut project_moves.restart_source,
+                                        restart_source_drained: &mut project_moves.restart_source_drained,
                                     });
                                     project_moves.pending = Some(PendingAgentProjectMove {
                                         project_id, roots, stage, origin: ProjectMoveOrigin::Immediate { reply },
@@ -12404,7 +12486,7 @@ pub(crate) fn spawn_agent_actor(
             }
         }
     };
-    tracing::debug!(
+    tracing::info!(target: "tyde_project_entry_diagnostic",
         actor_future_bytes = std::mem::size_of_val(&actor),
         "heap-owning agent state before process scope and runtime submission"
     );
@@ -14117,6 +14199,24 @@ async fn retire_cancelled_user_interactions(
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
 ) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(retire_cancelled_user_interactions_unboxed(
+        tools,
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+    ))
+    .await
+}
+
+async fn retire_cancelled_user_interactions_unboxed(
+    tools: CancelledUserInteractions<'_>,
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+) {
     for tool_call_id in std::mem::take(tools.pending_tool_response_ids) {
         if !tools.open_tool_call_ids.remove(&tool_call_id)
             || tools.completed_tool_call_ids.contains(&tool_call_id)
@@ -14207,7 +14307,12 @@ fn complete_compaction(
     )
 }
 
-async fn enter_terminal_failure(
+async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &AgentErrorPayload) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(enter_terminal_failure_unboxed(context, payload)).await
+}
+
+async fn enter_terminal_failure_unboxed(
     mut context: TerminalFailureContext<'_>,
     payload: &AgentErrorPayload,
 ) {
@@ -14358,6 +14463,11 @@ struct LiveActivityTerminalContext<'a> {
 /// user, exactly as the restored agent would, before it retires the remaining
 /// tools as having an unknown outcome.
 async fn expire_pending_user_interactions(context: &mut LiveActivityTerminalContext<'_>) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(expire_pending_user_interactions_unboxed(context)).await
+}
+
+async fn expire_pending_user_interactions_unboxed(context: &mut LiveActivityTerminalContext<'_>) {
     let pending = context
         .pending_tool_response_ids
         .drain()
@@ -14378,6 +14488,28 @@ async fn expire_pending_user_interactions(context: &mut LiveActivityTerminalCont
 }
 
 async fn terminalize_open_tool(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    replay_state: &mut AgentReplayState,
+    subscribers: &mut Vec<Stream>,
+    tool_call_id: String,
+    status: LiveActivityTerminalStatus,
+    message: &str,
+) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(terminalize_open_tool_unboxed(
+        canonical_stream,
+        event_log,
+        replay_state,
+        subscribers,
+        tool_call_id,
+        status,
+        message,
+    ))
+    .await
+}
+
+async fn terminalize_open_tool_unboxed(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
     replay_state: &mut AgentReplayState,
@@ -14423,6 +14555,15 @@ async fn terminalize_open_tool(
 }
 
 async fn terminalize_live_activity(
+    context: LiveActivityTerminalContext<'_>,
+    status: LiveActivityTerminalStatus,
+    message: &str,
+) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(terminalize_live_activity_unboxed(context, status, message)).await
+}
+
+async fn terminalize_live_activity_unboxed(
     mut context: LiveActivityTerminalContext<'_>,
     status: LiveActivityTerminalStatus,
     message: &str,
@@ -15707,6 +15848,31 @@ async fn close_untracked_background_card(
     open_tool_requests: &mut HashMap<String, protocol::ToolRequest>,
     tool_call_id: &str,
 ) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(close_untracked_background_card_unboxed(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        completed_tool_call_ids,
+        open_tool_call_ids,
+        open_tool_requests,
+        tool_call_id,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn close_untracked_background_card_unboxed(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    completed_tool_call_ids: &mut HashSet<String>,
+    open_tool_call_ids: &mut HashSet<String>,
+    open_tool_requests: &mut HashMap<String, protocol::ToolRequest>,
+    tool_call_id: &str,
+) {
     if !replay_state
         .active_background_progress
         .contains_key(tool_call_id)
@@ -15780,6 +15946,14 @@ fn request_backend_restart_cancel(movement: &PendingAgentProjectMove, command: &
 }
 
 async fn publish_backend_restart_typing(context: BackendRestartTypingContext<'_>, typing: bool) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(publish_backend_restart_typing_unboxed(context, typing)).await
+}
+
+async fn publish_backend_restart_typing_unboxed(
+    context: BackendRestartTypingContext<'_>,
+    typing: bool,
+) {
     append_chat_event(
         context.canonical_stream,
         context.event_log,
@@ -15799,6 +15973,24 @@ async fn publish_backend_restart_typing(context: BackendRestartTypingContext<'_>
 }
 
 async fn append_chat_event(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    event: &ChatEvent,
+) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(append_chat_event_unboxed(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        event,
+    ))
+    .await
+}
+
+async fn append_chat_event_unboxed(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
@@ -15919,6 +16111,28 @@ async fn append_backend_chat_event(
     events: &EventStream,
     event: &ChatEvent,
 ) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(append_backend_chat_event_unboxed(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        backend_kind,
+        events,
+        event,
+    ))
+    .await
+}
+
+async fn append_backend_chat_event_unboxed(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    backend_kind: BackendKind,
+    events: &EventStream,
+    event: &ChatEvent,
+) {
     let _ = append_chat_event_with_transcript_metadata(
         canonical_stream,
         event_log,
@@ -15931,6 +16145,26 @@ async fn append_backend_chat_event(
 }
 
 async fn append_chat_event_with_transcript_metadata(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    transcript_metadata: Option<(BackendKind, &EventStream)>,
+    event: &ChatEvent,
+) -> Result<(), String> {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(append_chat_event_with_transcript_metadata_unboxed(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        transcript_metadata,
+        event,
+    ))
+    .await
+}
+
+async fn append_chat_event_with_transcript_metadata_unboxed(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,
@@ -16867,6 +17101,14 @@ async fn send_initial_follow_up_or_park(
     input: SendMessagePayload,
     context: InitialFollowUpContext<'_>,
 ) -> InitialFollowUpDispatch {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(send_initial_follow_up_or_park_unboxed(input, context)).await
+}
+
+async fn send_initial_follow_up_or_park_unboxed(
+    input: SendMessagePayload,
+    context: InitialFollowUpContext<'_>,
+) -> InitialFollowUpDispatch {
     let host_restart = input.origin == Some(MessageOrigin::HostRestart);
     let admission = context
         .status_handle
@@ -17091,6 +17333,11 @@ async fn send_initial_follow_up_or_park(
 }
 
 async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext<'_>) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(terminalize_closed_queue_dispatch_unboxed(context)).await
+}
+
+async fn terminalize_closed_queue_dispatch_unboxed(context: QueueDispatchTerminalContext<'_>) {
     let payload = AgentErrorPayload {
         agent_id: context.current_start.agent_id.clone(),
         code: AgentErrorCode::BackendFailed,
@@ -17261,6 +17508,24 @@ fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {
 }
 
 async fn publish_resumed_agent_idle(
+    status_handle: &registry::AgentStatusHandle,
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(publish_resumed_agent_idle_unboxed(
+        status_handle,
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+    ))
+    .await
+}
+
+async fn publish_resumed_agent_idle_unboxed(
     status_handle: &registry::AgentStatusHandle,
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
@@ -18110,6 +18375,37 @@ struct ContextCompactionTerminalRecord {
 
 #[allow(clippy::too_many_arguments)]
 async fn record_context_compaction_terminal(
+    flight: CompactionFlight,
+    terminal: ContextCompactionTerminalRecord,
+    session_store: &Arc<SessionStoreHandle>,
+    session_id: &SessionId,
+    start: &AgentStartPayload,
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    replay_state: &mut AgentReplayState,
+    subscribers: &mut Vec<Stream>,
+    activity_stats: &mut AgentActivityStatsTracker,
+    activity_event_seq: Option<&mut u64>,
+) {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(record_context_compaction_terminal_unboxed(
+        flight,
+        terminal,
+        session_store,
+        session_id,
+        start,
+        canonical_stream,
+        event_log,
+        replay_state,
+        subscribers,
+        activity_stats,
+        activity_event_seq,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_context_compaction_terminal_unboxed(
     mut flight: CompactionFlight,
     terminal: ContextCompactionTerminalRecord,
     session_store: &Arc<SessionStoreHandle>,
@@ -18776,6 +19072,24 @@ async fn upsert_context_compaction_capability(
 }
 
 async fn append_compaction_marker_once(
+    canonical_stream: &str,
+    event_log: &mut AgentEventLog,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    marker: &ContextCompactionTimelineEvent,
+) -> Option<u64> {
+    // Keeps this future out of callers' poll frames, chiefly the agent actor's.
+    Box::pin(append_compaction_marker_once_unboxed(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        marker,
+    ))
+    .await
+}
+
+async fn append_compaction_marker_once_unboxed(
     canonical_stream: &str,
     event_log: &mut AgentEventLog,
     subscribers: &mut Vec<Stream>,

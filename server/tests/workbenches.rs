@@ -3253,6 +3253,278 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_continuation_cannot_revoke_a_workbench_restart_boundary() {
+    use server::backend::mock::MockResumeLaunch;
+    for finishes_while_stopping in [false, true] {
+        let repo = init_git_repo("entry-native-continuation");
+        let mut fixture =
+            Fixture::new_with_mock_backend_for_enabled_backends(vec![BackendKind::Codex]).await;
+        fixture
+            .host_for_test()
+            .set_session_schema_ready_for_test(BackendKind::Codex)
+            .await;
+        let write = fixture
+            .client
+            .replace_setting(
+                "/workbenches/engine",
+                protocol::WorkbenchEngine::Bubblewrap,
+                protocol::WorkbenchEngine::Native,
+            )
+            .await
+            .unwrap();
+        let applied = next_frame_matching_on(&mut fixture.client, "select restart engine", |env| {
+            env.kind == FrameKind::SettingsWriteResult
+                && env
+                    .parse_payload::<protocol::SettingsWriteResultPayload>()
+                    .unwrap()
+                    .write_id
+                    == write
+        })
+        .await
+        .parse_payload::<protocol::SettingsWriteResultPayload>()
+        .unwrap();
+        assert!(applied.applied, "Bubblewrap engine must be selected");
+        let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+        let initial = MockGateHandle::new();
+        let provider = MockGateHandle::new();
+        let shutdown = MockGateHandle::new();
+        let source_finished = MockGateHandle::new();
+        let destination = MockGateHandle::new();
+        let goal = protocol::NativeGoal {
+            objective: "Finish in the assigned workbench".to_owned(),
+            status: protocol::GoalStatus::Active,
+            token_budget: None,
+            tokens_used: None,
+            time_used_seconds: None,
+        };
+        let reservation = fixture
+            .reserve_next_mock_launch(
+                "Native entry",
+                MockScript::one(
+                    MockTurn::entry_then_provider_turn(
+                        &initial,
+                        &provider,
+                        finishes_while_stopping.then_some(&source_finished),
+                    )
+                    .starting_with_goal(goal.clone()),
+                )
+                .with_shutdown_gate(&shutdown)
+                .with_resume_launch(MockResumeLaunch::Script(MockScript::one(
+                    MockTurn::gated_launch_binding(&destination),
+                ))),
+            )
+            .await;
+        let (agent, start) = fixture
+            .spawn_with(SpawnAgentPayload {
+                launch_context: protocol::AgentLaunchContext::Standard,
+                name: Some("Native entry".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: Some(parent.id.clone()),
+                params: SpawnAgentParams::New {
+                    workspace_roots: project_roots(&parent),
+                    prompt: "Enter the workbench".to_owned(),
+                    images: None,
+                    backend_kind: BackendKind::Codex,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: BackendAccessMode::Unrestricted,
+                    session_settings: None,
+                },
+            })
+            .await;
+        drop(reservation);
+        initial.wait_until_entered().await;
+        let grant = fixture
+            .host_for_test()
+            .install_project_entry_grant_test_gate(start.agent_id.clone());
+        let (failed, created) = call_agent_control(
+            &fixture,
+            &start.agent_id,
+            "tyde_create_workbench",
+            json!({
+                "parent_project_id": parent.id, "branch": "feature/goal-entry", "action": "enter"
+            }),
+        )
+        .await;
+        assert!(!failed, "self entry must schedule");
+        let created: Value = serde_json::from_str(&created).expect("created workbench");
+        let workbench = ProjectId(created["project_id"].as_str().unwrap().to_owned());
+        assert_eq!(created["entry_scheduled"], true);
+        initial.release_one();
+        grant.wait_until_entered().await;
+        provider.wait_until_entered().await;
+        fixture
+            .next_chat_event_matching(&agent, "provider began before grant", |event| {
+                matches!(event, protocol::ChatEvent::StreamDelta(delta) if delta.text == "Source goal continuation")
+            })
+            .await;
+        grant.release_one();
+        shutdown.wait_until_entered().await;
+        let (_, before) = fixture.connect_with_bootstrap().await;
+        let source = before
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap();
+        assert_eq!(source.project_id, Some(parent.id.clone()));
+        assert!(source.session_id == start.session_id);
+        provider.release_one();
+        if finishes_while_stopping {
+            source_finished.wait_until_entered().await;
+            source_finished.release_one();
+        }
+        shutdown.release_one();
+        let source_end = fixture
+            .next_chat_event_matching(&agent, "source response settled before entry", |event| {
+                matches!(event, protocol::ChatEvent::StreamEnd(end) if end.message.content == "Source goal continuation")
+            })
+            .await;
+        let protocol::ChatEvent::StreamEnd(source_end) = source_end else {
+            unreachable!()
+        };
+        assert!(
+            source_end
+                .message
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.text == "Source continuation reasoning")
+        );
+        let declared: Vec<_> = source_end
+            .message
+            .tool_calls
+            .iter()
+            .map(|tool| tool.tool_call_id.as_str())
+            .collect();
+        if finishes_while_stopping {
+            assert!(declared.is_empty());
+        } else {
+            assert_eq!(declared, ["source-command"]);
+            let completed = fixture
+                .next_chat_event_matching(&agent, "backend cancels its open tool", |event| {
+                    matches!(event, protocol::ChatEvent::ToolExecutionCompleted(done) if done.tool_call_id == "source-command")
+                })
+                .await;
+            assert!(matches!(
+                completed,
+                protocol::ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                    outcome: protocol::ToolExecutionOutcome::Cancelled { message },
+                    ..
+                }) if message == "mock backend session closed"
+            ));
+        }
+        let moved = expect_kind(
+            &mut fixture.client,
+            FrameKind::AgentProjectChanged,
+            "native goal entry",
+        )
+        .await
+        .parse_payload::<AgentStartPayload>()
+        .unwrap();
+        assert_eq!(moved.project_id, Some(workbench.clone()));
+        assert!(moved.session_id == start.session_id);
+        assert_eq!(moved.tyde_permissions, start.tyde_permissions);
+        destination.wait_until_entered().await;
+        destination.release_one();
+        let turn = fixture.finish_turn(&agent).await;
+        assert!(
+            turn.chat_events().iter().any(|event| matches!(event,
+                protocol::ChatEvent::StreamEnd(end) if end.message.content.contains("project=")
+            )),
+            "same session must continue in its destination"
+        );
+        let (mut replay_client, after) = fixture.connect_with_bootstrap().await;
+        let replay_stream = &after
+            .agents
+            .iter()
+            .find(|entry| entry.agent_id == start.agent_id)
+            .unwrap()
+            .instance_stream;
+        let replay = next_frame_matching_on(
+            &mut replay_client,
+            "source response survives reattach",
+            |env| env.kind == FrameKind::AgentBootstrap && &env.stream == replay_stream,
+        )
+        .await
+        .parse_payload::<protocol::AgentBootstrapPayload>()
+        .unwrap();
+        let source_responses: Vec<_> =
+            replay
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::StreamEnd(
+                        end,
+                    )) if end.message.content == "Source goal continuation" => Some(&end.message),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            source_responses.len(),
+            1,
+            "source response must replay exactly once"
+        );
+        assert!(
+            source_responses[0]
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.text == "Source continuation reasoning")
+        );
+        let cancellations: Vec<_> = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                protocol::AgentBootstrapEvent::ChatEvent(
+                    protocol::ChatEvent::OperationCancelled(cancelled),
+                ) => Some(cancelled.message.as_str()),
+                _ => None,
+            })
+            .collect();
+        let tool_outcomes: Vec<_> = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                protocol::AgentBootstrapEvent::ChatEvent(
+                    protocol::ChatEvent::ToolExecutionCompleted(done),
+                ) if done.tool_call_id == "source-command" => Some(&done.outcome),
+                _ => None,
+            })
+            .collect();
+        if finishes_while_stopping {
+            assert!(cancellations.is_empty(), "{cancellations:?}");
+            assert!(tool_outcomes.is_empty());
+        } else {
+            assert_eq!(cancellations, ["mock backend session closed"]);
+            assert_eq!(
+                tool_outcomes,
+                [&protocol::ToolExecutionOutcome::Cancelled {
+                    message: "mock backend session closed".to_owned()
+                }]
+            );
+        }
+        let saved = after
+            .sessions
+            .iter()
+            .find(|session| Some(&session.id) == start.session_id.as_ref())
+            .unwrap();
+        assert_eq!(saved.project_id, Some(workbench.clone()));
+        assert_eq!(saved.workspace_roots, moved.workspace_roots);
+        fixture.client.close_agent(&agent.stream).await.unwrap();
+        expect_kind(&mut fixture.client, FrameKind::AgentClosed, "entry cleanup").await;
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: workbench,
+                force: false,
+            })
+            .await
+            .unwrap();
+        expect_project_notify(&mut fixture.client, "workbench cleanup").await;
+    }
+}
+
 #[tokio::test]
 async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() {
     let repo = init_git_repo("self-entry");

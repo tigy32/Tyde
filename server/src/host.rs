@@ -3155,6 +3155,15 @@ impl HostHandle {
         gate
     }
 
+    pub fn install_project_entry_grant_test_gate(
+        &self,
+        agent_id: AgentId,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        lifecycle::install_entry_grant_test_gate(agent_id, gate.shared());
+        gate
+    }
+
     pub fn install_project_move_delivery_test_gate(
         &self,
         name: &str,

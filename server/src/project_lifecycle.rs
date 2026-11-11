@@ -76,6 +76,31 @@ pub(crate) struct ProjectEntryRequest {
     pub(crate) reply: oneshot::Sender<Result<ProjectEntryExecution, String>>,
 }
 
+#[cfg(feature = "test-support")]
+type EntryGrantTestGates = std::sync::Mutex<
+    std::collections::HashMap<AgentId, Arc<crate::host::SpawnOperationTestGateInner>>,
+>;
+
+#[cfg(feature = "test-support")]
+fn entry_grant_test_gates() -> &'static EntryGrantTestGates {
+    static GATES: std::sync::OnceLock<EntryGrantTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_entry_grant_test_gate(
+    agent_id: AgentId,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    assert!(
+        entry_grant_test_gates()
+            .lock()
+            .expect("entry grant test gates")
+            .insert(agent_id, gate)
+            .is_none()
+    );
+}
+
 pub(crate) async fn run_entry(
     host: HostHandle,
     catalog: Arc<ProjectCatalogHandle>,
@@ -133,6 +158,16 @@ pub(crate) async fn run_entry(
             return;
         }
     };
+    #[cfg(feature = "test-support")]
+    {
+        let gate = entry_grant_test_gates()
+            .lock()
+            .expect("entry grant test gates")
+            .remove(&agent_id);
+        if let Some(gate) = gate {
+            crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+        }
+    }
     let (completion, completed) = oneshot::channel();
     if reply
         .send(Ok(ProjectEntryExecution {

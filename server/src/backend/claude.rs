@@ -17522,6 +17522,13 @@ impl Backend for ClaudeBackend {
             }
 
             session.shutdown().await;
+            while let Some(raw) = raw_events.recv().await {
+                if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None)
+                    .await
+                {
+                    break;
+                }
+            }
         });
 
         Ok((

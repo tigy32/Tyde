@@ -242,6 +242,7 @@ impl MockActor {
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
+                        self.events_tx.close("mock backend session closed");
                         return;
                     };
                     let alive = match command {

@@ -5411,6 +5411,143 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+/// Tyde closes a running session to move it, for example into a workbench,
+/// and reopens the same conversation elsewhere. The closing backend settles
+/// its own turn: what it already said is kept under its own identity, with
+/// every tool it declared, rather than lost or rebuilt by the server.
+async fn real_shutdown_settles_active_turn<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mid_answer = shutdown_turn(
+        host,
+        &agent,
+        &long_answer_prompt(),
+        InterruptTrigger::AfterStreamedChars(MID_ANSWER_CHARS),
+    )
+    .await;
+    assert_shutdown_settled_turn(&mid_answer);
+    let published = mid_answer
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end.message.content.trim()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: closing mid-answer published no response; the streamed text was dropped",
+                mid_answer.label()
+            )
+        });
+    let streamed = mid_answer.streamed_text();
+    let before_close: String = streamed.chars().take(MID_ANSWER_CHARS).collect();
+    assert!(
+        published.starts_with(before_close.trim()) && streamed.trim().starts_with(published),
+        "{}: closing mid-answer published {} characters, which are not the {} streamed, \
+         starting with the {MID_ANSWER_CHARS} streamed before the close",
+        mid_answer.label(),
+        published.chars().count(),
+        streamed.chars().count()
+    );
+
+    let proof = host.workspace().join(INTERRUPT_PROOF_FILE);
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mid_tool = shutdown_turn(
+        host,
+        &agent,
+        &format!(
+            "This is a shutdown-cancellation test: the harness will close this session and cancel \
+             the command as soon as its request opens. Run this exact shell command in the \
+             foreground; its event wait must stay blocked until cancellation. Do not run it in \
+             the background: python3 -c \"import threading; threading.Event().wait(); \
+             open('{}', 'w').write('proof')\"\nIf it completes, reply with exactly {RAN_MARKER} and nothing else.",
+            proof.display()
+        ),
+        InterruptTrigger::AfterCommandRequest,
+    )
+    .await;
+    assert_shutdown_settled_turn(&mid_tool);
+    let command = mid_tool
+        .tool_requests()
+        .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
+        .last()
+        .expect("the trigger saw a command request");
+    let outcome = mid_tool
+        .tool_completions()
+        .find(|completion| completion.tool_call_id == command.tool_call_id)
+        .map(|completion| &completion.outcome);
+    assert!(
+        matches!(outcome, Some(ToolExecutionOutcome::Cancelled { .. })),
+        "{}: the command running when the session closed completed as {outcome:?}",
+        mid_tool.label()
+    );
+}
+
+/// A closed turn ends exactly as an interrupted one does, except that its
+/// open response is published rather than aborted: the session is being moved,
+/// and its conversation continues.
+fn assert_shutdown_settled_turn(turn: &Turn) {
+    assert_no_error_message(&turn.label(), turn.events());
+    assert_no_unknown_backend_event(turn);
+    assert_no_empty_response(turn);
+    assert_every_request_was_declared(turn);
+    assert_every_request_completed_exactly_once(turn);
+    assert_no_completion_without_request(turn);
+    let mut open = false;
+    for event in turn.events() {
+        match event {
+            ChatEvent::StreamStart(_) => {
+                assert!(
+                    !open,
+                    "{}: StreamStart while a response was open",
+                    turn.label()
+                );
+                open = true;
+            }
+            ChatEvent::StreamEnd(_) => {
+                assert!(open, "{}: StreamEnd without a response", turn.label());
+                open = false;
+            }
+            ChatEvent::OperationCancelled(_) => assert!(
+                !open,
+                "{}: the closing session cancelled its open response instead of publishing \
+                 it, so the answer the user watched stream disappears",
+                turn.label()
+            ),
+            _ => {}
+        }
+    }
+    assert!(
+        !open,
+        "{}: the session closed with its response still open",
+        turn.label()
+    );
+    let cancellations = event_positions(turn, |event| {
+        matches!(event, ChatEvent::OperationCancelled(_))
+    });
+    let [cancelled_at] = cancellations.as_slice() else {
+        panic!(
+            "{}: closing a running turn produced {} OperationCancelled event(s), expected 1",
+            turn.label(),
+            cancellations.len()
+        );
+    };
+    let trailing: Vec<String> = turn.events()[cancelled_at + 1..]
+        .iter()
+        .map(describe_event)
+        .collect();
+    assert_eq!(
+        trailing,
+        ["TypingStatusChanged(false)"],
+        "{}: a closed turn must go idle exactly once, right after its cancellation",
+        turn.label()
+    );
+}
+
 async fn real_input_origins<B: Backend>(host: &mut Harness<B>) {
     let origin = protocol::MessageOrigin::Agent {
         agent_id: Some(AgentId("conformance-parent".to_owned())),
@@ -11065,6 +11202,7 @@ conformance2_scenario!(
     ]
 );
 conformance2_scenario!(real_interruption, [BackendCapability::Interrupt]);
+conformance2_scenario!(real_shutdown_settles_active_turn, []);
 conformance2_scenario!(
     real_running_command_survives_response_retry,
     [BackendCapability::YieldsRunningCommands]

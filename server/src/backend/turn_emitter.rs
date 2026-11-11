@@ -836,6 +836,23 @@ impl TurnEmitterState {
         idle_caller: &'static std::panic::Location<'static>,
     ) -> String {
         let opened_at = open.opened_at;
+        match self.publish_open_response(open) {
+            None => format!(
+                "typing ended at {idle_caller} before the response opened at {opened_at} reached \
+                 StreamEnd, discarding the empty shell"
+            ),
+            Some((content_len, reasoning_len, declared_len)) => format!(
+                "typing ended at {idle_caller} before the response opened at {opened_at} reached \
+                 StreamEnd, publishing {content_len} characters of content, {reasoning_len} of \
+                 reasoning and {declared_len} declared tool calls as-is"
+            ),
+        }
+    }
+
+    /// Ends an interrupted response under the identity it streamed with,
+    /// carrying its content, reasoning and declared tools. Returns the
+    /// published volume, or `None` when only an empty shell was dropped.
+    fn publish_open_response(&mut self, open: OpenResponse) -> Option<(usize, usize, usize)> {
         let owner = open.message_id.clone();
         let declared = self
             .declared_tools
@@ -846,20 +863,13 @@ impl TurnEmitterState {
         let content_len = open.content.chars().count();
         let reasoning_len = open.reasoning.chars().count();
         if content_len == 0 && reasoning_len == 0 && declared.is_empty() {
-            return format!(
-                "typing ended at {idle_caller} before the response opened at {opened_at} reached \
-                 StreamEnd, discarding the empty shell"
-            );
+            return None;
         }
         let mut message = self.build_stream_end_message(StreamEndPayload::default(), open);
         message.tool_calls = self.sanitize_tool_declarations(owner, content_len as u64, declared);
         let declared_len = message.tool_calls.len();
         self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-        format!(
-            "typing ended at {idle_caller} before the response opened at {opened_at} reached \
-             StreamEnd, publishing {content_len} characters of content, {reasoning_len} of \
-             reasoning and {declared_len} declared tool calls as-is"
-        )
+        Some((content_len, reasoning_len, declared_len))
     }
 
     fn discard_open_response(&mut self, response: &ResponseHandle) {
@@ -1302,12 +1312,10 @@ impl TurnEmitterState {
                 .open_tool_requests
                 .values()
                 .any(|request| request.execution_mode == ToolExecutionMode::Foreground);
-        if let Some(response) = self
-            .current_response
-            .as_ref()
-            .map(|response| response.handle.clone())
-        {
-            self.discard_open_response(&response);
+        // A closed session's partial response is still the provider's output:
+        // publish it under its own identity before cancelling its tools.
+        if let Some(open) = self.current_response.take() {
+            self.publish_open_response(open);
         }
         self.complete_pending_tools_as_cancelled(message);
         let background = self

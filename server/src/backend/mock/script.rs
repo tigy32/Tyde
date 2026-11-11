@@ -676,6 +676,64 @@ impl MockTurn {
         Self::done(steps)
     }
 
+    pub fn entry_then_provider_turn(
+        initial: &MockGateHandle,
+        provider: &MockGateHandle,
+        finished: Option<&MockGateHandle>,
+    ) -> Self {
+        let mut steps = text_steps(
+            "Before entry".to_owned(),
+            TextShape {
+                gate: Some(initial.gate()),
+                ..TextShape::default()
+            },
+        );
+        steps.extend([
+            MockStep::emit(emit::typing(true)),
+            MockStep::emit(emit::stream_start(
+                "mock",
+                Some(super::MOCK_MODEL.to_owned()),
+            )),
+            MockStep::emit(BackendEvent::Chat(
+                protocol::ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
+                    text: "Source continuation reasoning".to_owned(),
+                }),
+            )),
+            MockStep::emit(emit::stream_delta("Source goal continuation".to_owned())),
+        ]);
+        if finished.is_none() {
+            steps.push(MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: "source-command".to_owned(),
+                tool_name: "run_command".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: "cargo build".to_owned(),
+                    working_directory: "/tmp/mock".to_owned(),
+                },
+            })));
+        }
+        steps.push(MockStep::Gate(provider.gate()));
+        if let Some(finished) = finished {
+            let mut message = emit::mock_assistant_message(
+                Some(ChatMessageId(Uuid::new_v4().to_string())),
+                "Source goal continuation".to_owned(),
+            );
+            message.reasoning = Some(protocol::ReasoningData {
+                text: "Source continuation reasoning".to_owned(),
+                tokens: None,
+                signature: None,
+                blob: None,
+            });
+            steps.extend([
+                MockStep::emit(emit::stream_end(message)),
+                MockStep::emit(emit::typing(false)),
+                MockStep::Gate(finished.gate()),
+            ]);
+            Self::done(steps)
+        } else {
+            Self::held(steps, true)
+        }
+    }
+
     pub fn gated_held_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         let mut steps = held_steps(text.into());
         steps.push(MockStep::Gate(gate.gate()));

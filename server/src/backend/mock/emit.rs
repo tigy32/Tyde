@@ -33,12 +33,31 @@ use super::{MOCK_MODEL, now_ms};
 pub(super) struct MockEventSender {
     tx: mpsc::UnboundedSender<BackendEvent>,
     active_turn: Arc<AtomicBool>,
+    open_work: Arc<std::sync::Mutex<MockOpenWork>>,
 }
 
 #[derive(Clone)]
 pub(super) struct WeakMockEventSender {
     tx: mpsc::WeakUnboundedSender<BackendEvent>,
     active_turn: Arc<AtomicBool>,
+    open_work: Arc<std::sync::Mutex<MockOpenWork>>,
+}
+
+/// What the scripted stream has opened and not yet ended, so an orderly
+/// shutdown can settle it the way the real backends' turn emitter does.
+#[derive(Default)]
+struct MockOpenWork {
+    response: Option<MockOpenResponse>,
+    tools: Vec<String>,
+}
+
+struct MockOpenResponse {
+    message_id: ChatMessageId,
+    agent: String,
+    model: Option<String>,
+    content: String,
+    reasoning: String,
+    declarations: Vec<protocol::ToolUseData>,
 }
 
 impl MockEventSender {
@@ -46,6 +65,7 @@ impl MockEventSender {
         Self {
             tx,
             active_turn: Arc::new(AtomicBool::new(false)),
+            open_work: Arc::default(),
         }
     }
 
@@ -53,14 +73,110 @@ impl MockEventSender {
         WeakMockEventSender {
             tx: self.tx.downgrade(),
             active_turn: Arc::clone(&self.active_turn),
+            open_work: Arc::clone(&self.open_work),
         }
     }
 
     pub(super) fn send_event(&self, event: BackendEvent) -> bool {
-        if let BackendEvent::Chat(ChatEvent::TypingStatusChanged(active)) = &event {
-            self.active_turn.store(*active, Ordering::SeqCst);
+        if let BackendEvent::Chat(chat) = &event {
+            self.track_open_work(chat);
         }
         self.tx.send(event).is_ok()
+    }
+
+    fn track_open_work(&self, event: &ChatEvent) {
+        let mut open = self
+            .open_work
+            .lock()
+            .expect("mock open work mutex poisoned");
+        match event {
+            ChatEvent::TypingStatusChanged(active) => {
+                self.active_turn.store(*active, Ordering::SeqCst);
+            }
+            ChatEvent::StreamStart(start) => {
+                open.response = Some(MockOpenResponse {
+                    message_id: ChatMessageId(Uuid::new_v4().to_string()),
+                    agent: start.agent.clone(),
+                    model: start.model.clone(),
+                    content: String::new(),
+                    reasoning: String::new(),
+                    declarations: Vec::new(),
+                });
+            }
+            ChatEvent::StreamDelta(delta) => {
+                if let Some(response) = open.response.as_mut() {
+                    response.content.push_str(&delta.text);
+                }
+            }
+            ChatEvent::StreamReasoningDelta(delta) => {
+                if let Some(response) = open.response.as_mut() {
+                    response.reasoning.push_str(&delta.text);
+                }
+            }
+            ChatEvent::StreamEnd(_) => open.response = None,
+            ChatEvent::OperationCancelled(_) => *open = MockOpenWork::default(),
+            ChatEvent::ToolRequest(request) => {
+                if let Some(response) = open.response.as_mut() {
+                    response.declarations.push(protocol::ToolUseData {
+                        tool_call_id: request.tool_call_id.clone(),
+                        name: request.tool_name.clone(),
+                        arguments: json!({}),
+                        content_offset: Some(response.content.chars().count() as u32),
+                    });
+                }
+                open.tools.push(request.tool_call_id.clone());
+            }
+            ChatEvent::ToolExecutionCompleted(completed) => {
+                open.tools.retain(|id| id != &completed.tool_call_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// The backend contract for a deliberate close: publish the partial
+    /// response under its own identity, cancel its open tools, and end the
+    /// turn it was in.
+    pub(super) fn close(&self, message: &str) {
+        let (response, tools) = {
+            let mut open = self
+                .open_work
+                .lock()
+                .expect("mock open work mutex poisoned");
+            (open.response.take(), std::mem::take(&mut open.tools))
+        };
+        let active = self.is_active() || response.is_some() || !tools.is_empty();
+        if let Some(response) = response
+            && !(response.content.is_empty()
+                && response.reasoning.is_empty()
+                && response.declarations.is_empty())
+        {
+            self.send_event(stream_end(ChatMessage {
+                sender: MessageSender::Assistant {
+                    agent: response.agent,
+                },
+                reasoning: (!response.reasoning.is_empty()).then_some(protocol::ReasoningData {
+                    text: response.reasoning,
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                model_info: response.model.map(|model| ModelInfo { model }),
+                tool_calls: response.declarations,
+                ..mock_assistant_message(Some(response.message_id), response.content)
+            }));
+        }
+        for tool_call_id in tools {
+            self.send_event(tool_completed(ToolExecutionCompletedData {
+                tool_call_id,
+                outcome: ToolExecutionOutcome::Cancelled {
+                    message: message.to_owned(),
+                },
+            }));
+        }
+        if active {
+            self.send_event(cancelled(message.to_owned()));
+            self.send_event(typing(false));
+        }
     }
 
     pub(super) fn send_compaction(&self, event: BackendCompactionEvent) -> bool {
@@ -77,6 +193,7 @@ impl WeakMockEventSender {
         Some(MockEventSender {
             tx: self.tx.upgrade()?,
             active_turn: Arc::clone(&self.active_turn),
+            open_work: Arc::clone(&self.open_work),
         })
     }
 }

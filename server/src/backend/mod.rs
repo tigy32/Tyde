@@ -810,16 +810,10 @@ impl EventStream {
         }
     }
 
-    /// Whether every event the backend has already emitted was delivered. A
-    /// restart abandons this stream, so anything still in it would be lost.
-    pub(crate) fn is_drained(&self) -> bool {
-        self.buffered.is_empty()
-            && self.pending_delta.is_none()
-            && match &self.rx {
-                EventStreamReceiver::Chat(rx) => rx.is_empty(),
-                EventStreamReceiver::Backend(rx) => rx.is_empty(),
-                EventStreamReceiver::Adapter(rx) => rx.is_empty(),
-            }
+    pub(crate) fn take_for_restart(&mut self) -> Self {
+        let mut replacement = Self::new_backend(mpsc::unbounded_channel().1);
+        replacement.transcript_metadata_projector = self.transcript_metadata_projector.clone();
+        std::mem::replace(self, replacement)
     }
 
     fn prepend(&mut self, events: Vec<BackendEvent>) {
@@ -2382,7 +2376,7 @@ pub async fn restart_backend_session<B, R, Stop>(
 ) -> BackendRestartOutcome<B, R>
 where
     B: Backend,
-    Stop: std::future::Future<Output = ()>,
+    Stop: std::future::Future<Output = Result<(), String>>,
 {
     for target in [&relocation.source, &relocation.destination] {
         if let Err(error) = target
@@ -2404,7 +2398,9 @@ where
             error: PROJECT_ENTRY_CANCELLED.to_owned(),
         };
     }
-    stop(running).await;
+    if let Err(error) = stop(running).await {
+        return BackendRestartOutcome::Lost(error);
+    }
     let mut relocated = false;
     let error = match B::relocate_stopped_session(&session_id, &relocation).await {
         Err(error) => error,
@@ -2486,6 +2482,7 @@ async fn restart_erased_backend_session<B: Backend>(
     spawn: BackendSpawnConfig,
     relocation: BackendSessionRelocation,
     running: RunningBackend,
+    drain: BackendRestartDrain,
     commit: BackendRestartCommit,
     cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
 ) -> BackendRestartOutcome<handle::BackendHandle, RunningBackend> {
@@ -2494,7 +2491,24 @@ async fn restart_erased_backend_session<B: Backend>(
         spawn,
         relocation,
         running,
-        |(backend, events): RunningBackend| shut_down_until_exited(backend.shutdown(), events),
+        |(backend, mut events): RunningBackend| async move {
+            backend.shutdown().await;
+            while let Some(event) = events.recv_backend().await {
+                drain
+                    .events
+                    .send(BackendRestartSourceEvent::Event(Box::new(event)))
+                    .map_err(|_| {
+                        "Project entry owner stopped while draining the source".to_owned()
+                    })?;
+            }
+            drain
+                .events
+                .send(BackendRestartSourceEvent::Stopped)
+                .map_err(|_| "Project entry owner stopped before source settlement".to_owned())?;
+            drain.drained.await.map_err(|_| {
+                "Project entry owner stopped before acknowledging source settlement".to_owned()
+            })?
+        },
         commit,
         cancel,
     )
@@ -2515,6 +2529,18 @@ async fn restart_erased_backend_session<B: Backend>(
     }
 }
 
+pub(crate) enum BackendRestartSourceEvent {
+    Event(Box<BackendEvent>),
+    Stopped,
+}
+
+pub(crate) struct BackendRestartDrain {
+    pub events: mpsc::UnboundedSender<BackendRestartSourceEvent>,
+    /// The owner's verdict once the stopped source's stream is consumed: a
+    /// source that did not settle its turn fails the restart.
+    pub drained: tokio::sync::oneshot::Receiver<Result<(), String>>,
+}
+
 pub(crate) struct BackendRestartRequest {
     pub kind: BackendKind,
     pub use_mock_backend: bool,
@@ -2522,6 +2548,7 @@ pub(crate) struct BackendRestartRequest {
     pub spawn: BackendSpawnConfig,
     pub relocation: BackendSessionRelocation,
     pub running: RunningBackend,
+    pub drain: BackendRestartDrain,
     pub commit: BackendRestartCommit,
     pub cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
 }
@@ -2536,17 +2563,18 @@ pub(crate) async fn restart_agent_backend(
         spawn,
         relocation,
         running,
+        drain,
         commit,
         cancel,
     } = request;
     if use_mock_backend {
         return restart_erased_backend_session::<mock::MockBackend>(
-            session_id, spawn, relocation, running, commit, cancel,
+            session_id, spawn, relocation, running, drain, commit, cancel,
         )
         .await;
     }
     with_backend_type!(kind, |B| restart_erased_backend_session::<B>(
-        session_id, spawn, relocation, running, commit, cancel
+        session_id, spawn, relocation, running, drain, commit, cancel
     )
     .await, removed => BackendRestartOutcome::Refused {
         backend: running,
