@@ -2234,12 +2234,36 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
     let (_, bootstrap) = fixture.connect_with_bootstrap().await;
     let committed = bootstrap.projects.into_iter().find(|project| matches!(&project.source, ProjectSource::GitWorkbench { branch, .. } if branch.0 == "workflow-publication-error")).expect("durably committed workbench must remain authoritative");
     fixture.relaunch_host_after_kill().await;
-    let replay = next_frame_matching_on(&mut fixture.client, "durable creation warning replay", |env| {
-        env.kind == FrameKind::ProjectOperation && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
-            matches!(operation.mutation, protocol::ProjectMutation::CreateWorkbench(ref payload) if payload.branch.0 == "workflow-publication-error")
-                && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
-        })
-    }).await.parse_payload::<protocol::ProjectOperationPayload>().unwrap();
+    // Restored agents hold their project family until every one of them is
+    // reconstructed. None starts before that, and an agent stream opens only
+    // once its agent has started, so the first one marks the family free for
+    // the removal below.
+    let mut replay = None;
+    let mut restored = false;
+    while replay.is_none() || !restored {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .unwrap()
+            .expect("relaunch replay and restored agents");
+        match env.kind {
+            FrameKind::ProjectOperation => {
+                let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+                if matches!(operation.mutation, protocol::ProjectMutation::CreateWorkbench(ref payload) if payload.branch.0 == "workflow-publication-error")
+                    && matches!(
+                        operation.state,
+                        protocol::ProjectOperationState::Committed { .. }
+                    )
+                {
+                    replay = Some(operation);
+                }
+            }
+            FrameKind::AgentBootstrap => restored = true,
+            _ => {}
+        }
+    }
+    let replay = replay.expect("durable creation warning replay");
     assert!(
         matches!(replay.state, protocol::ProjectOperationState::Committed { warnings } if warnings.iter().any(|warning| warning.stage == protocol::ProjectOperationStage::Workflow)),
         "restart must retain the actual settled creation warning, not replay clean success"
@@ -2290,6 +2314,11 @@ async fn agent_control_creates_lists_and_spawns_workbenches() {
             }
             FrameKind::CommandError => {
                 let error: CommandErrorPayload = env.parse_payload().unwrap();
+                assert!(
+                    !matches!(error.code, protocol::CommandErrorCode::Conflict),
+                    "removal was refused: {}",
+                    error.message
+                );
                 reported |= error.message.contains("Catalog committed")
                     && matches!(error.context, Some(protocol::CommandErrorContext::ProjectMutationCommitted { mutation: protocol::ProjectMutation::RemoveWorkbench(payload), warnings }) if payload.id == committed.id && warnings.iter().any(|warning| warning.stage == protocol::ProjectOperationStage::Workflow));
             }

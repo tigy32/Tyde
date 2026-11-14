@@ -116,9 +116,6 @@ fn cancel_highlight_task(active_task_id: &Arc<Mutex<Option<u64>>>) {
 fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
     TabScrollState {
         scroll_top: el.scroll_top(),
-        scroll_height: el.scroll_height(),
-        client_height: el.client_height(),
-        user_scrolled_up: true,
     }
 }
 

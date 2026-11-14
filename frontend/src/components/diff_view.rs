@@ -234,9 +234,6 @@ fn measured_code_line_height(element: &web_sys::Element) -> Result<f64, String> 
 fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
     TabScrollState {
         scroll_top: el.scroll_top(),
-        scroll_height: el.scroll_height(),
-        client_height: el.client_height(),
-        user_scrolled_up: true,
     }
 }
 
@@ -7945,9 +7942,6 @@ mod wasm_tests {
                             TabId(90_001),
                             TabScrollState {
                                 scroll_top: if total_lines == 20 { 0 } else { 39_800 },
-                                scroll_height: 40_000,
-                                client_height: 600,
-                                user_scrolled_up: true,
                             },
                         );
                         state.diff_view_mode.set(mode);

@@ -2963,14 +2963,14 @@ kbd {
 }
 
 /* ===== Chat Cards (full-width, like legacy) ===== */
+/* Opacity only: a card that slid into place would be measured mid-slide
+   when the chat holds a reading position against it. */
 @keyframes card-enter {
     from {
         opacity: 0;
-        transform: translateY(4px);
     }
     to {
         opacity: 1;
-        transform: translateY(0);
     }
 }
 

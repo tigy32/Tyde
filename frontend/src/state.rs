@@ -1221,9 +1221,6 @@ pub struct TabId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabScrollState {
     pub scroll_top: i32,
-    pub scroll_height: i32,
-    pub client_height: i32,
-    pub user_scrolled_up: bool,
 }
 
 /// Where a scrolled-up reader is in a chat transcript: `row`'s top edge sits

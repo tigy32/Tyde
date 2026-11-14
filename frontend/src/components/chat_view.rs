@@ -40,6 +40,10 @@ const TRIM_BEYOND_PX: f64 = 9000.0;
 const KEEP_ABOVE_PX: f64 = 5000.0;
 const BOTTOM_EPSILON_PX: f64 = 1.5;
 const JUMP_BUTTON_DISTANCE_PX: f64 = 80.0;
+/// A scroll gesture is over once this many animation frames pass without
+/// input; trackpad momentum delivers a wheel event every frame until then.
+const GESTURE_QUIET_FRAMES: u8 = 6;
+const GESTURE_EVENTS: [&str; 2] = ["wheel", "touchmove"];
 
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
 
@@ -451,15 +455,23 @@ pub fn ChatView(
     let transcript_ref = NodeRef::<leptos::html::Div>::new();
     let rows_ref = NodeRef::<leptos::html::Div>::new();
     let show_scroll_btn = RwSignal::new(saved_position.is_some());
-    let scroll_offset = StoredValue::new(0.0);
+    let scroll_offset = StoredValue::new(0.0_f64);
     // A reading position to put back: after a remount, or after a hidden tab
     // regains layout. It names a row, so it survives the transcript growing
     // in the meantime, which a distance from the bottom would not.
     let pending_restore: StoredValue<Option<ChatReadingPosition>> =
         StoredValue::new(saved_position);
     let laid_out = StoredValue::new(false);
-    let anchor: StoredValue<Option<(web_sys::Element, ChatReadingPosition)>, LocalStorage> =
-        StoredValue::new_local(None);
+    // What a scrolled-up reader is looking at: the elements crossing the top
+    // edge of the viewport, from the row inward, each with the distance of
+    // its top edge below the viewport's. Content is replaced under a reader
+    // (a streaming reply re-renders its text, and is itself replaced when it
+    // completes), so the position is held against the innermost of them
+    // still in the document.
+    let anchor: StoredValue<ReadingAnchor, LocalStorage> =
+        StoredValue::new_local(ReadingAnchor::default());
+    // Animation frames left before a scroll gesture counts as over.
+    let gesture_frames = StoredValue::new(0_u8);
 
     let reveal_from = RwSignal::new(
         saved_position.map_or(RevealFrom::Tail, |position| RevealFrom::Row(position.row)),
@@ -489,9 +501,11 @@ pub fn ChatView(
         if scroller.client_height() == 0 {
             if laid_out.get_value() {
                 laid_out.set_value(false);
-                pending_restore
-                    .set_value(anchor.with_value(|anchor| anchor.as_ref().map(|anchor| anchor.1)));
-                anchor.set_value(None);
+                pending_restore.set_value(
+                    chat_reading_position
+                        .with_untracked(|positions| positions.get(&tab_id).copied()),
+                );
+                anchor.set_value(ReadingAnchor::default());
             }
             return;
         }
@@ -501,6 +515,7 @@ pub fn ChatView(
         };
         let viewport_top = scroller.get_bounding_client_rect().top();
         let start = first_mounted.get_untracked();
+        let mut held = None;
         if let Some(position) = pending_restore.get_value() {
             let row = rows_el
                 .query_selector(&format!("[data-row-id=\"{}\"]", position.row.0))
@@ -534,47 +549,82 @@ pub fn ChatView(
                 }
             }
         } else if top < -BOTTOM_EPSILON_PX {
-            let drift = anchor.with_value(|anchor| {
-                let (row, position) = anchor.as_ref()?;
-                row.is_connected().then(|| {
-                    let expected = f64::from(position.offset) - (top - previous);
-                    row.get_bounding_client_rect().top() - viewport_top - expected
-                })
+            // The engine clamps the offset when the transcript becomes
+            // shorter than the reader's distance from its end. That is not
+            // the reader scrolling.
+            let range = f64::from(scroller.scroll_height() - scroller.client_height());
+            let scrolled = if previous < -range - 1.0 {
+                Some(top + range).filter(|past| past.abs() >= 1.0)
+            } else {
+                Some(top - previous)
+            }
+            .unwrap_or(0.0);
+            held = anchor.with_value(|anchor| {
+                anchor
+                    .chain
+                    .iter()
+                    .rev()
+                    .find(|(element, _)| {
+                        element.is_connected() && element.get_client_rects().length() > 0
+                    })
+                    .cloned()
+                    .or_else(|| same_text_in_successor(anchor, &rows_el.children()))
+                    .map(|(element, offset)| (element, offset - scrolled))
             });
-            if let Some(drift) = drift.filter(|drift| drift.abs() >= 1.0) {
-                let Some(corrected) = write_scroll_top(&scroller, top + drift) else {
-                    return;
-                };
-                top = corrected;
+            if let Some((element, expected)) = held.clone() {
+                let drift = || element.get_bounding_client_rect().top() - viewport_top - expected;
+                let moved = drift();
+                if gesture_frames.get_value() > 0 {
+                    // The offset belongs to the gesture while it lasts.
+                    // WebKit's momentum does not survive a write, so the
+                    // reader's position is taken afresh instead.
+                    held = None;
+                } else if moved.abs() >= 1.0 {
+                    let Some(corrected) = write_scroll_top(&scroller, top + moved) else {
+                        return;
+                    };
+                    top = corrected;
+                    // A position the scroll range no longer reaches is not
+                    // held against later layout.
+                    if drift().abs() >= 1.0 {
+                        held = None;
+                    }
+                }
             }
         }
         scroll_offset.set_value(top);
         let children = rows_el.children();
         // A streaming row is replaced when its reply completes, so it can
-        // name neither the reading position nor the start of the mounted
-        // range; the nearest row above it stands in.
+        // name neither the saved reading position nor the start of the
+        // mounted range; the nearest row above it stands in.
         let streaming_row = untrack(|| {
             active_agent_id().and_then(|id| {
                 streaming_text.with(|streams| streams.get(&id).map(|stream| stream.row_id))
             })
         });
-        let reading = (top < -BOTTOM_EPSILON_PX)
+        let straddling = (top < -BOTTOM_EPSILON_PX)
             .then(|| first_row_ending_below(&children, viewport_top))
-            .flatten()
-            .and_then(|index| {
-                (0..=index).rev().find_map(|index| {
-                    let row = children.item(index)?;
-                    let id = ChatRowId(row.get_attribute("data-row-id")?.parse().ok()?);
-                    if Some(id) == streaming_row || row.get_client_rects().length() == 0 {
-                        return None;
-                    }
-                    let offset =
-                        (row.get_bounding_client_rect().top() - viewport_top).round() as i32;
-                    Some((row, ChatReadingPosition { row: id, offset }))
+            .flatten();
+        let position = straddling.and_then(|index| {
+            (0..=index).rev().find_map(|index| {
+                let row = children.item(index)?;
+                let id = ChatRowId(row.get_attribute("data-row-id")?.parse().ok()?);
+                if Some(id) == streaming_row || row.get_client_rects().length() == 0 {
+                    return None;
+                }
+                let offset = (row.get_bounding_client_rect().top() - viewport_top).round() as i32;
+                Some(ChatReadingPosition { row: id, offset })
+            })
+        });
+        anchor.set_value(
+            straddling
+                .and_then(|index| Some((index, children.item(index)?)))
+                .map(|(index, row)| ReadingAnchor {
+                    chain: reading_chain(row, viewport_top, held.as_ref()),
+                    rows_after: children.length() - 1 - index,
                 })
-            });
-        let position = reading.as_ref().map(|reading| reading.1);
-        anchor.set_value(reading);
+                .unwrap_or_default(),
+        );
         let show = top < -JUMP_BUTTON_DISTANCE_PX;
         if show_scroll_btn.get_untracked() != show {
             show_scroll_btn.set(show);
@@ -592,18 +642,18 @@ pub fn ChatView(
             });
         }
 
+        let rows = untrack(row_handles);
+        let is_streaming = |index: usize| {
+            rows.get(index)
+                .is_some_and(|row| Some(row.id) == streaming_row)
+        };
         let mount_from = |mut index: usize| {
-            let rows = untrack(row_handles);
-            while index > 0
-                && rows
-                    .get(index)
-                    .is_some_and(|row| Some(row.id) == streaming_row)
-            {
+            while index > 0 && is_streaming(index) {
                 index -= 1;
             }
             match rows.get(index) {
-                Some(row) if index > 0 => reveal_from.set(RevealFrom::Row(row.id)),
-                Some(_) => reveal_from.set(RevealFrom::All),
+                Some(_) if is_streaming(index) => reveal_from.set(RevealFrom::All),
+                Some(row) => reveal_from.set(RevealFrom::Row(row.id)),
                 None => {}
             }
         };
@@ -611,10 +661,11 @@ pub fn ChatView(
         // would unmount rows from under a reader, and a named row that left
         // the transcript falls back to that window. Once laid out, the
         // mounted range starts at a present row and only reveal and trim
-        // move it.
+        // move it. Rows loaded above that row later are revealed like any
+        // others, so only a streaming first row leaves the range open.
         let named = match reveal_from.get_untracked() {
             RevealFrom::Tail => false,
-            RevealFrom::All => true,
+            RevealFrom::All => rows.is_empty() || is_streaming(0),
             RevealFrom::Row(id) => children
                 .item(0)
                 .and_then(|row| row.get_attribute("data-row-id"))
@@ -648,14 +699,46 @@ pub fn ChatView(
         }
     };
 
+    // A tab keeps this view when its agent changes. The new transcript opens
+    // at its newest message, with nothing carried over from the old one.
+    Effect::new(move |shown: Option<Option<protocol::AgentId>>| {
+        let agent = active_agent_id();
+        if shown.is_some_and(|shown| shown != agent) {
+            pending_restore.set_value(None);
+            anchor.set_value(ReadingAnchor::default());
+            reveal_from.set(RevealFrom::Tail);
+            if let Some(scroller) = scroll_ref.get_untracked() {
+                scroller.set_scroll_top(0);
+            }
+        }
+        agent
+    });
+
     // Multiple `ChatView`s can be mounted at once (LRU hot set) and one chat
-    // can be mounted many times, so the listener and observer belong to this
+    // can be mounted many times, so the listeners and observer belong to this
     // instance and are released on cleanup.
     struct ScrollWiring {
         scroller: web_sys::HtmlElement,
+        transcript: web_sys::HtmlElement,
         on_scroll: Closure<dyn Fn()>,
+        on_gesture: Closure<dyn Fn()>,
         observer: web_sys::ResizeObserver,
         _on_resize: Closure<dyn FnMut(JsValue, JsValue)>,
+    }
+    impl ScrollWiring {
+        fn release(self) {
+            self.observer.disconnect();
+            let _ = self.scroller.remove_event_listener_with_callback(
+                "scroll",
+                self.on_scroll.as_ref().unchecked_ref(),
+            );
+            for event in GESTURE_EVENTS {
+                let _ = self.scroller.remove_event_listener_with_callback(
+                    event,
+                    self.on_gesture.as_ref().unchecked_ref(),
+                );
+            }
+        }
     }
     let wiring: StoredValue<Option<ScrollWiring>, LocalStorage> = StoredValue::new_local(None);
     let registration =
@@ -664,15 +747,48 @@ pub fn ChatView(
         let (Some(scroller), Some(transcript)) = (scroll_ref.get(), transcript_ref.get()) else {
             return;
         };
-        if wiring.with_value(Option::is_some) {
+        let scroller: web_sys::HtmlElement = scroller.into();
+        let transcript: web_sys::HtmlElement = transcript.into();
+        // The scroller is built anew each time the tab gains an agent.
+        let mut bound = false;
+        wiring.update_value(|wiring| {
+            bound = wiring.as_ref().is_some_and(|wiring| {
+                wiring.scroller == scroller && wiring.transcript == transcript
+            });
+            if !bound && let Some(stale) = wiring.take() {
+                stale.release();
+            }
+        });
+        if bound {
             return;
         }
         let on_scroll = Closure::<dyn Fn()>::new(reconcile);
-        if scroller
+        let on_gesture = Closure::<dyn Fn()>::new(move || {
+            let Some(frames) = gesture_frames.try_get_value() else {
+                return;
+            };
+            gesture_frames.set_value(GESTURE_QUIET_FRAMES);
+            if frames == 0 {
+                count_down_gesture(gesture_frames);
+            }
+        });
+        // Passive, so the listener never delays the scroll it reports.
+        let passive = web_sys::AddEventListenerOptions::new();
+        passive.set_passive(true);
+        let listening = scroller
             .add_event_listener_with_callback("scroll", on_scroll.as_ref().unchecked_ref())
-            .is_err()
-        {
-            log::error!("chat scroller rejected its scroll listener");
+            .is_ok()
+            && GESTURE_EVENTS.iter().all(|event| {
+                scroller
+                    .add_event_listener_with_callback_and_add_event_listener_options(
+                        event,
+                        on_gesture.as_ref().unchecked_ref(),
+                        &passive,
+                    )
+                    .is_ok()
+            });
+        if !listening {
+            log::error!("chat scroller rejected its listeners");
             return;
         }
         // ResizeObserver delivers after layout and before paint, so a
@@ -686,8 +802,10 @@ pub fn ChatView(
         observer.observe(&scroller);
         observer.observe(&transcript);
         wiring.set_value(Some(ScrollWiring {
-            scroller: scroller.unchecked_into(),
+            scroller,
+            transcript,
             on_scroll,
+            on_gesture,
             observer,
             _on_resize: on_resize,
         }));
@@ -704,11 +822,7 @@ pub fn ChatView(
     on_cleanup(move || {
         wiring.update_value(|wiring| {
             if let Some(wiring) = wiring.take() {
-                wiring.observer.disconnect();
-                let _ = wiring.scroller.remove_event_listener_with_callback(
-                    "scroll",
-                    wiring.on_scroll.as_ref().unchecked_ref(),
-                );
+                wiring.release();
             }
         });
     });
@@ -969,6 +1083,97 @@ fn first_row_ending_below(rows: &web_sys::HtmlCollection, y: f64) -> Option<u32>
         }
     }
     rendered_from(low, rows.length()).map(|(index, _)| index)
+}
+
+/// Where the reader is: the elements crossing the top edge of the viewport
+/// from the row inward, and how many rows follow that row.
+#[derive(Default)]
+struct ReadingAnchor {
+    chain: Vec<(web_sys::Element, f64)>,
+    rows_after: u32,
+}
+
+/// The elements crossing the viewport's top edge at `y`, from `row` inward,
+/// each with the distance of its top edge below `y`. `held` keeps the
+/// distance it already has instead of a fresh measurement, so a position
+/// corrected many times cannot creep by the rounding of each correction.
+fn reading_chain(
+    row: web_sys::Element,
+    y: f64,
+    held: Option<&(web_sys::Element, f64)>,
+) -> Vec<(web_sys::Element, f64)> {
+    let mut chain = Vec::new();
+    let mut next = Some(row);
+    while let Some(element) = next {
+        let children = element.children();
+        next = first_row_ending_below(&children, y)
+            .and_then(|index| children.item(index))
+            .filter(|child| {
+                let rect = child.get_bounding_client_rect();
+                rect.top() <= y && rect.bottom() > y && moves_with_content(child)
+            });
+        let offset = match held {
+            Some((kept, offset)) if *kept == element => *offset,
+            _ => element.get_bounding_client_rect().top() - y,
+        };
+        chain.push((element, offset));
+    }
+    chain
+}
+
+/// A reply that completes is rendered anew in a row of its own, leaving
+/// none of the elements the reader was on in the document. The element at
+/// the same place among those showing the same text in that row takes over.
+fn same_text_in_successor(
+    anchor: &ReadingAnchor,
+    rows: &web_sys::HtmlCollection,
+) -> Option<(web_sys::Element, f64)> {
+    let (replaced, _) = anchor.chain.first()?;
+    if replaced.is_connected() {
+        return None;
+    }
+    let (lost, offset) = anchor.chain.last()?;
+    let text = lost.text_content().filter(|text| !text.trim().is_empty())?;
+    let successor = rows.item(rows.length().checked_sub(anchor.rows_after + 1)?)?;
+    let alike = |row: &web_sys::Element| {
+        let found = row.query_selector_all(&lost.tag_name()).ok()?;
+        Some(
+            (0..found.length())
+                .filter_map(|index| found.item(index)?.dyn_into::<web_sys::Element>().ok())
+                .filter(|element| element.text_content().as_deref() == Some(text.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (before, mut after) = (alike(replaced)?, alike(&successor)?);
+    let place = match before.iter().position(|element| element == lost) {
+        Some(place) if before.len() == after.len() => place,
+        // A re-render since the position was taken already replaced it.
+        None if after.len() == 1 => 0,
+        _ => return None,
+    };
+    let element = after.swap_remove(place);
+    (element.get_client_rects().length() > 0).then_some((element, *offset))
+}
+
+/// Sticky and out-of-flow boxes do not move with the text around them.
+fn moves_with_content(element: &web_sys::Element) -> bool {
+    web_sys::window()
+        .and_then(|window| window.get_computed_style(element).ok().flatten())
+        .and_then(|style| style.get_property_value("position").ok())
+        .is_some_and(|position| position == "static" || position == "relative")
+}
+
+fn count_down_gesture(frames: StoredValue<u8>) {
+    request_animation_frame(move || {
+        let Some(left) = frames.try_get_value() else {
+            return;
+        };
+        let left = left.saturating_sub(1);
+        frames.set_value(left);
+        if left > 0 {
+            count_down_gesture(frames);
+        }
+    });
 }
 
 #[component]
@@ -5733,6 +5938,31 @@ mod wasm_tests {
             15,
             "every message of a transcript this short is on screen or one scroll away"
         );
+
+        // Earlier history loaded on demand arrives above the first message.
+        // It mounts as the reader approaches it, like any other old rows.
+        let newest = message_rows(&container).last().unwrap().clone();
+        let newest_top = newest.get_bounding_client_rect().top();
+        transcript.state.prepend_chat_rows(
+            &transcript.agent_id,
+            (0..200)
+                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("short msg earlier {i}"))))
+                .collect(),
+        );
+        while message_rows(&container).len() == 15 {
+            next_tick().await;
+        }
+        let mounted = message_rows(&container).len();
+        assert!(
+            mounted < 215,
+            "loading 200 earlier messages mounted {mounted} rows at once"
+        );
+        settle_scroll(&container, &scroller).await;
+        let moved = newest.get_bounding_client_rect().top() - newest_top;
+        assert!(
+            first.is_connected() && moved.abs() <= 1.0,
+            "loading earlier messages moved the newest one by {moved}px"
+        );
     }
 
     /// Older rows mount as the reader approaches them and are dropped again
@@ -5884,6 +6114,364 @@ mod wasm_tests {
             moved.abs() <= 1.0,
             "growth inside a straddling row moved its visible text by {moved}px"
         );
+    }
+
+    /// Waits for `text` to be rendered, then for the scroller to settle.
+    async fn settle_showing(container: &HtmlElement, scroller: &HtmlElement, text: &str) {
+        while !container.text_content().unwrap_or_default().contains(text) {
+            next_animation_frame().await;
+        }
+        settle_scroll(container, scroller).await;
+    }
+
+    fn jump_button_shown(container: &HtmlElement) -> bool {
+        container
+            .query_selector(".scroll-to-bottom-btn")
+            .unwrap()
+            .is_some()
+    }
+
+    /// A reader partway down a streaming reply. Its thinking growing above
+    /// them, the reply growing below them, and the reply completing (which
+    /// folds the thinking away) all leave the paragraph they are on in place.
+    #[wasm_bindgen_test]
+    async fn reading_inside_a_streaming_reply_survives_its_growth_and_completion() {
+        let transcript = mount_scrolled_transcript(TabId(10_019), "agent-mid-reply", 8, |i| {
+            format!("earlier msg {i}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        let host_id = format!("host-{}", transcript.agent_id.0);
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(
+                &transcript.state,
+                &host_id,
+                &transcript.agent_id,
+                event,
+            );
+        };
+        let paragraphs = |range: std::ops::Range<usize>| {
+            range
+                .map(|_| "the same reply paragraph\n\n")
+                .collect::<String>()
+        };
+        let thoughts = |range: std::ops::Range<usize>| {
+            range
+                .map(|i| format!("thought {i} end\n"))
+                .collect::<String>()
+        };
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "Agent".to_owned(),
+            model: None,
+        }));
+        dispatch(ChatEvent::StreamReasoningDelta(
+            protocol::StreamTextDeltaData {
+                text: thoughts(0..10),
+            },
+        ));
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: paragraphs(0..120),
+        }));
+        let reply_paragraphs = || {
+            let nodes = container.query_selector_all(".chat-messages p").unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+                .filter(|paragraph| {
+                    paragraph.text_content().as_deref() == Some("the same reply paragraph")
+                })
+                .collect::<Vec<_>>()
+        };
+        while reply_paragraphs().len() < 120 {
+            next_animation_frame().await;
+        }
+        transcript.scroll_up(1_500).await;
+
+        // Every paragraph of the reply reads the same, so only its place
+        // among them tells the one being read from the others. The top edge
+        // of the viewport is put a few pixels into it.
+        let viewport_top = scroller.get_bounding_client_rect().top();
+        let reading = reply_paragraphs()
+            .iter()
+            .position(|paragraph| paragraph.get_bounding_client_rect().top() >= viewport_top)
+            .expect("a paragraph is on screen");
+        assert!(
+            (1..119).contains(&reading),
+            "precondition: the reader is partway down the streaming reply"
+        );
+        let paragraph = || reply_paragraphs().swap_remove(reading);
+        let offset = || paragraph().get_bounding_client_rect().top() - viewport_top;
+        scroller.set_scroll_top(scroller.scroll_top() + offset().round() as i32 + 4);
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            offset() < 0.0 && paragraph().get_bounding_client_rect().bottom() > viewport_top,
+            "precondition: the paragraph being read crosses the top of the viewport"
+        );
+        let reply_height = || {
+            paragraph()
+                .closest("[data-row-id]")
+                .unwrap()
+                .expect("the paragraph sits in a transcript row")
+                .get_bounding_client_rect()
+                .height()
+        };
+        let offset_before = offset();
+        let mut moves = Vec::new();
+
+        dispatch(ChatEvent::StreamReasoningDelta(
+            protocol::StreamTextDeltaData {
+                text: thoughts(10..40),
+            },
+        ));
+        settle_showing(&container, &scroller, "thought 39 end").await;
+        let moved = offset() - offset_before;
+        if moved.abs() > 1.0 {
+            moves.push(format!("thinking growing above moved it {moved}px"));
+        }
+
+        let offset_before = offset();
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: paragraphs(120..160),
+        }));
+        while reply_paragraphs().len() < 160 {
+            next_animation_frame().await;
+        }
+        settle_scroll(&container, &scroller).await;
+        let moved = offset() - offset_before;
+        if moved.abs() > 1.0 {
+            moves.push(format!("the reply growing below moved it {moved}px"));
+        }
+
+        let offset_before = offset();
+        let streaming_height = reply_height();
+        let streaming_paragraph = paragraph();
+        let mut completed = mk_user_msg(&paragraphs(0..160)).message;
+        completed.sender = MessageSender::Assistant {
+            agent: "Agent".to_owned(),
+        };
+        completed.reasoning = Some(protocol::ReasoningData {
+            text: thoughts(0..40),
+            tokens: None,
+            signature: None,
+            blob: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: completed,
+        }));
+        while streaming_paragraph.is_connected() {
+            next_animation_frame().await;
+        }
+        settle_scroll(&container, &scroller).await;
+        let folded = streaming_height - reply_height();
+        assert!(
+            folded > 100.0,
+            "precondition: completing folds the thinking above the reader, {folded}px shorter"
+        );
+        let moved = offset() - offset_before;
+        if moved.abs() > 1.0 {
+            moves.push(format!("the reply completing moved it {moved}px"));
+        }
+
+        assert!(
+            moves.is_empty(),
+            "the paragraph being read must stay put: {moves:?}"
+        );
+    }
+
+    /// The engine clamps the scroll offset when the transcript becomes
+    /// shorter than the reader's distance from its end. That is not the
+    /// reader scrolling, and must not be compensated as if it were.
+    #[wasm_bindgen_test]
+    async fn transcript_shrinking_below_a_reader_near_its_top_keeps_their_place() {
+        let body = "tall row text ".repeat(220);
+        let transcript = mount_scrolled_transcript(TabId(10_020), "agent-clamp", 10, |i| {
+            format!("clamp msg {i} {body}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        settle_scroll(&container, &scroller).await;
+        let rows = message_rows(&container);
+        assert_eq!(rows.len(), 10, "precondition: every row is mounted");
+        let last = rows.last().unwrap().clone();
+        grow(&last, 400);
+        settle_scroll(&container, &scroller).await;
+
+        scroller.set_scroll_top(scroller.client_height() - scroller.scroll_height() + 100);
+        settle_scroll(&container, &scroller).await;
+        let viewport = scroller.get_bounding_client_rect();
+        let visible = first_visible_row(&container, &scroller);
+        let visible_top = visible.get_bounding_client_rect().top();
+        assert!(
+            last.get_bounding_client_rect().top() >= viewport.bottom(),
+            "precondition: the row about to shrink is below the viewport"
+        );
+
+        last.last_element_child()
+            .expect("the growth added earlier")
+            .remove();
+        settle_scroll(&container, &scroller).await;
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
+        assert!(
+            moved.abs() < 1.0,
+            "the transcript shrinking below moved the visible row by {moved}px"
+        );
+    }
+
+    /// Momentum scrolling keeps delivering wheel events after the fingers
+    /// lift. While they arrive the scroll offset belongs to the gesture, and
+    /// holding the reading position resumes once it ends.
+    #[wasm_bindgen_test]
+    async fn transcript_is_not_repositioned_during_a_scroll_gesture() {
+        let transcript = mount_scrolled_transcript(TabId(10_021), "agent-gesture", 80, |i| {
+            format!("gesture msg {i}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        transcript.scroll_up(1_200).await;
+        let visible = first_visible_row(&container, &scroller);
+        let below = message_rows(&container)
+            .into_iter()
+            .rev()
+            .find(|row| {
+                row.get_bounding_client_rect().top() >= scroller.get_bounding_client_rect().bottom()
+            })
+            .expect("rows are mounted below the viewport");
+
+        let offset = scroller.scroll_top();
+        let wheel = web_sys::EventInit::new();
+        wheel.set_bubbles(true);
+        visible
+            .dispatch_event(&web_sys::Event::new_with_event_init_dict("wheel", &wheel).unwrap())
+            .unwrap();
+        grow(&below, 300);
+        settle_scroll(&container, &scroller).await;
+        assert_eq!(
+            scroller.scroll_top(),
+            offset,
+            "the transcript was repositioned under an active scroll gesture"
+        );
+
+        for _ in 0..12 {
+            next_animation_frame().await;
+        }
+        let visible_top = visible.get_bounding_client_rect().top();
+        grow(&below, 300);
+        settle_scroll(&container, &scroller).await;
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
+        assert!(
+            moved.abs() <= 1.0,
+            "growth below the viewport after the gesture moved the visible row by {moved}px"
+        );
+    }
+
+    /// A tab whose agent changes shows the new agent's newest message, and
+    /// its transcript scrolls like any other, whether or not the scroller
+    /// element itself was rebuilt for the change.
+    #[wasm_bindgen_test]
+    async fn switching_the_agent_in_a_tab_starts_at_its_newest_message_and_still_scrolls() {
+        ensure_styles_loaded();
+        let state = AppState::new();
+        let agent = |name: &str| ActiveAgentRef {
+            host_id: "host-switch".to_owned(),
+            agent_id: AgentId(name.to_owned()),
+        };
+        for name in ["agent-switch-a", "agent-switch-b"] {
+            state.chat_rows.update(|rows| {
+                rows.insert(
+                    AgentId(name.to_owned()),
+                    (0..60)
+                        .map(|i| ChatRowHandle::new(mk_user_msg(&format!("{name} msg {i} end"))))
+                        .collect(),
+                );
+            });
+        }
+        let shown = RwSignal::new(Some(agent("agent-switch-a")));
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_022)
+                    agent_ref=Signal::derive(move || shown.get())
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        let scroller_of = |container: &HtmlElement| -> HtmlElement {
+            container
+                .query_selector(".chat-messages")
+                .unwrap()
+                .expect("chat scroller present")
+                .dyn_into()
+                .unwrap()
+        };
+        let scroller = scroller_of(&container);
+        settle_scroll(&container, &scroller).await;
+        scroller.set_scroll_top(-1_000);
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            jump_button_shown(&container),
+            "precondition: the first agent's transcript is scrolled up"
+        );
+
+        async fn newest_shown_and_scrollable(container: &HtmlElement, name: &str, how: &str) {
+            let scroller: HtmlElement = container
+                .query_selector(".chat-messages")
+                .unwrap()
+                .expect("chat scroller present")
+                .dyn_into()
+                .unwrap();
+            settle_showing(container, &scroller, &format!("{name} msg 59 end")).await;
+            let hidden = hidden_below_viewport(container);
+            assert!(
+                hidden.abs() <= 1.0,
+                "{how}: the transcript opened {hidden}px above its newest message"
+            );
+            assert!(
+                !jump_button_shown(container),
+                "{how}: a transcript at its newest message offers no jump button"
+            );
+
+            scroller.set_scroll_top(-500);
+            settle_scroll(container, &scroller).await;
+            assert!(
+                jump_button_shown(container),
+                "{how}: scrolling up offers the jump to bottom"
+            );
+            let visible = first_visible_row(container, &scroller);
+            let visible_top = visible.get_bounding_client_rect().top();
+            let newest = message_rows(container).last().unwrap().clone();
+            grow(&newest, 300);
+            settle_scroll(container, &scroller).await;
+            let moved = visible.get_bounding_client_rect().top() - visible_top;
+            assert!(
+                moved.abs() <= 1.0,
+                "{how}: growth below the viewport moved the visible row by {moved}px"
+            );
+        }
+
+        shown.set(Some(agent("agent-switch-b")));
+        newest_shown_and_scrollable(&container, "agent-switch-b", "switched directly").await;
+
+        shown.set(None);
+        while container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .is_some()
+        {
+            next_animation_frame().await;
+        }
+        shown.set(Some(agent("agent-switch-a")));
+        while container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .is_none()
+        {
+            next_animation_frame().await;
+        }
+        newest_shown_and_scrollable(&container, "agent-switch-a", "switched through no agent")
+            .await;
+
+        drop(handle);
+        container.remove();
+        next_tick().await;
     }
 
     #[wasm_bindgen_test]
