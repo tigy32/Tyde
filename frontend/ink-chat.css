@@ -11,8 +11,11 @@
 }
 
 .chat-view[data-chat-chrome="ink"] .chat-messages {
-    padding: 30px clamp(20px, 4.1%, 48px) 32px;
     scrollbar-gutter: stable;
+}
+
+.chat-view[data-chat-chrome="ink"] .chat-transcript {
+    padding: 30px clamp(20px, 4.1%, 48px) 32px;
 }
 
 .chat-view[data-chat-chrome="ink"] .chat-card {
@@ -22,12 +25,12 @@
 }
 
 .chat-view[data-chat-chrome="ink"] .chat-card + .chat-card,
-.chat-view[data-chat-chrome="ink"] .virt-spacer-bottom ~ .chat-card {
+.chat-view[data-chat-chrome="ink"] .chat-rows ~ .chat-card {
     margin-top: 26px;
 }
 
-/* Ink spaces rows inside the measured row box, so the virtualizer reserves
-   exactly what is drawn; a working stretch's rows sit close together. */
+/* Ink spaces rows inside the row box; a working stretch's rows sit close
+   together. */
 .chat-view[data-chat-chrome="ink"] .virt-row + .virt-row {
     margin-top: 0;
 }
@@ -626,7 +629,7 @@
 }
 
 @media (max-width: 760px) {
-    .chat-view[data-chat-chrome="ink"] .chat-messages {
+    .chat-view[data-chat-chrome="ink"] .chat-transcript {
         padding: 20px 18px 24px;
     }
 
@@ -1731,7 +1734,7 @@
     --ink-activity-indent: 10px;
 }
 
-.chat-view[data-chat-appearance="ink"] .chat-messages {
+.chat-view[data-chat-appearance="ink"] .chat-transcript {
     padding: 20px clamp(18px, 3%, 40px) 24px;
 }
 

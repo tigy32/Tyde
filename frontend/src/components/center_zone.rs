@@ -2723,7 +2723,6 @@ mod wasm_tests {
         assert!(!producers.is_empty() && producers.len() <= 5);
         for producer in [
             "chat_scroll_restore",
-            "chat_auto_scroll",
             "tab_strip_visibility",
             "unattributed",
         ] {

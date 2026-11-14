@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -20,8 +17,9 @@ use crate::components::task_list::TaskListView;
 use crate::perf::{CaptureSpan, ChatProjection};
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ChatNotice, ChatRowContent, ChatRowHandle, ChatRowId,
-    ContextCompactionUiState, PendingHistoryRequest, TabId, TabScrollState, ToolOutputMode,
+    ActiveAgentRef, AgentInfo, AppState, ChatNotice, ChatReadingPosition, ChatRowContent,
+    ChatRowHandle, ChatRowId, ContextCompactionUiState, PendingHistoryRequest, TabId,
+    ToolOutputMode,
 };
 
 use protocol::{
@@ -31,56 +29,19 @@ use protocol::{
     ReviewCreatePayload, ReviewDiffSelection, StreamPath,
 };
 
-/// Default per-row height assumed for rows we haven't measured yet.
-/// Affects initial scrollbar size and pre-measurement window math; once
-/// a row is measured by the per-row `ResizeObserver` the real height
-/// supersedes this. Picked to roughly match a typical text-only chat
-/// card so first-paint geometry is in the right ballpark for short
-/// transcripts.
-const ESTIMATED_ROW_HEIGHT: f64 = 200.0;
-/// Number of rows to render outside the visible viewport in each
-/// direction. A small buffer means scroll-into-view shows a measured row
-/// rather than a default-sized placeholder, hiding the first-frame
-/// height correction from the user.
-const VIRT_OVERSCAN: usize = 5;
-/// CSS gap inserted between adjacent rows by `.virt-row + .virt-row {
-/// margin-top: 6px; }` in styles.css. `ResizeObserver` reports the
-/// row's own border-box height — it doesn't include outside margins —
-/// so the spacer/scroll math has to add this back per non-first row,
-/// otherwise the scrollbar drifts (under-reports total content height
-/// by `ROW_GAP_PX` per unmounted gap on long transcripts). Must stay
-/// in lockstep with the CSS rule. Ink spaces rows with padding inside
-/// the measured row instead, so its gap is zero.
-const ROW_GAP_PX: f64 = 6.0;
+/// Rows mounted before the first layout says how much the viewport needs.
+const INITIAL_TAIL_ROWS: usize = 12;
+const REVEAL_BATCH_ROWS: usize = 12;
+/// Older rows are revealed while less than this much transcript lies above the
+/// viewport, and dropped again once more than `TRIM_BEYOND_PX` does, back down
+/// to `KEEP_ABOVE_PX`.
+const REVEAL_WITHIN_PX: f64 = 2400.0;
+const TRIM_BEYOND_PX: f64 = 9000.0;
+const KEEP_ABOVE_PX: f64 = 5000.0;
+const BOTTOM_EPSILON_PX: f64 = 1.5;
+const JUMP_BUTTON_DISTANCE_PX: f64 = 80.0;
 
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
-
-fn tab_scroll_state_from_element(el: &web_sys::Element, user_scrolled_up: bool) -> TabScrollState {
-    TabScrollState {
-        scroll_top: el.scroll_top(),
-        scroll_height: el.scroll_height(),
-        client_height: el.client_height(),
-        user_scrolled_up,
-    }
-}
-
-fn restore_scroll_top_without_animation(el: &web_sys::HtmlElement, scroll_top: i32) {
-    let style = el.style();
-    let previous = style.get_property_value("scroll-behavior").ok();
-    let _ = style.set_property("scroll-behavior", "auto");
-    el.set_scroll_top(scroll_top);
-    leptos::prelude::set_timeout(
-        move || match previous.as_deref() {
-            Some(value) if !value.is_empty() => {
-                let _ = style.set_property("scroll-behavior", value);
-            }
-            _ => {
-                let _ = style.remove_property("scroll-behavior");
-            }
-        },
-        std::time::Duration::from_millis(0),
-    );
-}
 
 /// Feature-discovery tips shown on empty chat drafts, keyed by tab id so
 /// each new chat surfaces the next one instead of repeating at random.
@@ -160,7 +121,10 @@ pub fn ChatView(
     let pending_state = state.clone();
     let composer_pending_team_member =
         Signal::derive(move || pending_state.tab_pending_team_member(tab_id));
-    let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
+    let chat_reading_position = state.chat_reading_position;
+    let streaming_text = state.streaming_text;
+    let saved_position =
+        chat_reading_position.with_untracked(|positions| positions.get(&tab_id).copied());
 
     let has_agent = move || agent_ref.get().is_some();
 
@@ -476,492 +440,284 @@ pub fn ChatView(
             .unwrap_or(false)
     };
 
+    // `.chat-messages` is a reversed flex column, so the engine measures its
+    // scroll offset from the bottom: 0 at the newest message, negative above
+    // it. Staying at the bottom through growth, and staying put while rows are
+    // added or removed above the viewport, are therefore engine invariants
+    // rather than corrections applied here. WebKit has no scroll anchoring, so
+    // the one case left to this code is content growing below a reader who has
+    // scrolled up.
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
-    let user_scrolled_up =
-        RwSignal::new(initial_scroll_state.is_some_and(|scroll| scroll.user_scrolled_up));
-    let show_scroll_btn =
-        RwSignal::new(initial_scroll_state.is_some_and(|scroll| scroll.user_scrolled_up));
-    let view_mounted = Arc::new(AtomicBool::new(true));
-    let view_mounted_for_cleanup = view_mounted.clone();
-    on_cleanup(move || {
-        view_mounted_for_cleanup.store(false, Ordering::Relaxed);
+    let transcript_ref = NodeRef::<leptos::html::Div>::new();
+    let rows_ref = NodeRef::<leptos::html::Div>::new();
+    let show_scroll_btn = RwSignal::new(saved_position.is_some());
+    let scroll_offset = StoredValue::new(0.0);
+    // A reading position to put back: after a remount, or after a hidden tab
+    // regains layout. It names a row, so it survives the transcript growing
+    // in the meantime, which a distance from the bottom would not.
+    let pending_restore: StoredValue<Option<ChatReadingPosition>> =
+        StoredValue::new(saved_position);
+    let laid_out = StoredValue::new(false);
+    let anchor: StoredValue<Option<(web_sys::Element, ChatReadingPosition)>, LocalStorage> =
+        StoredValue::new_local(None);
+
+    let reveal_from = RwSignal::new(
+        saved_position.map_or(RevealFrom::Tail, |position| RevealFrom::Row(position.row)),
+    );
+    let first_mounted: Memo<usize> = Memo::new(move |_| {
+        let mut span = CaptureSpan::new(ChatProjection::VirtualWindow);
+        let rows = row_handles();
+        span.items(rows.len());
+        let tail = rows.len().saturating_sub(INITIAL_TAIL_ROWS);
+        match reveal_from.get() {
+            RevealFrom::Tail => tail,
+            RevealFrom::All => 0,
+            RevealFrom::Row(id) => rows.iter().position(|row| row.id == id).unwrap_or(tail),
+        }
     });
 
-    // Virtualization plumbing — see `VirtualWindow` and the windowed `<For>`
-    // below. The chat row list is windowed: only rows whose offsets fall
-    // within (scroll_top - overscan, scroll_top + viewport + overscan) are
-    // mounted; rows outside the window are summarised by spacer divs.
-    //
-    // - `scroll_top_sig` and `viewport_height_sig` track the viewport so
-    //   the window-computing Memo can react to scroll and resize.
-    // - `row_heights` maps `ChatRowId` to the row's measured DOM height.
-    //   Rows without an entry use `ESTIMATED_ROW_HEIGHT`. Stored as a
-    //   non-reactive `StoredValue` because it can churn at high frequency
-    //   during streaming and its updates are signalled coarsely via
-    //   `heights_version`.
-    // - `heights_version` is bumped any time `row_heights` mutates by a
-    //   meaningful amount; the windowing Memo subscribes to it.
-    let scroll_top_sig =
-        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
-    let viewport_height_sig = RwSignal::new(800.0_f64);
-    let row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage> =
-        StoredValue::new_local(HashMap::new());
-    let heights_version = RwSignal::new(0u32);
+    let reconcile = move || {
+        let Some(previous) = scroll_offset.try_get_value() else {
+            return;
+        };
+        let (Some(scroller), Some(rows_el)) =
+            (scroll_ref.get_untracked(), rows_ref.get_untracked())
+        else {
+            return;
+        };
+        // Hidden tabs stay mounted under `display: none` and have no layout.
+        if scroller.client_height() == 0 {
+            if laid_out.get_value() {
+                laid_out.set_value(false);
+                pending_restore
+                    .set_value(anchor.with_value(|anchor| anchor.as_ref().map(|anchor| anchor.1)));
+                anchor.set_value(None);
+            }
+            return;
+        }
+        laid_out.set_value(true);
+        let Some(mut top) = read_scroll_top(&scroller) else {
+            return;
+        };
+        let viewport_top = scroller.get_bounding_client_rect().top();
+        let start = first_mounted.get_untracked();
+        if let Some(position) = pending_restore.get_value() {
+            let row = rows_el
+                .query_selector(&format!("[data-row-id=\"{}\"]", position.row.0))
+                .ok()
+                .flatten();
+            if let Some(row) = row {
+                pending_restore.set_value(None);
+                let drift = row.get_bounding_client_rect().top()
+                    - viewport_top
+                    - f64::from(position.offset);
+                if drift.abs() >= 1.0 {
+                    let Some(restored) = write_scroll_top(&scroller, top + drift) else {
+                        return;
+                    };
+                    top = restored;
+                }
+            } else {
+                let rows = untrack(row_handles);
+                match rows.iter().position(|row| row.id == position.row) {
+                    // Mounting the row reconciles again.
+                    Some(index) if index < start => {
+                        reveal_from.set(RevealFrom::Row(position.row));
+                        return;
+                    }
+                    // The row has not rendered yet; its arrival reconciles.
+                    Some(_) => return,
+                    None if rows.is_empty() => return,
+                    // The row left the transcript, so there is no position
+                    // to put back.
+                    None => pending_restore.set_value(None),
+                }
+            }
+        } else if top < -BOTTOM_EPSILON_PX {
+            let drift = anchor.with_value(|anchor| {
+                let (row, position) = anchor.as_ref()?;
+                row.is_connected().then(|| {
+                    let expected = f64::from(position.offset) - (top - previous);
+                    row.get_bounding_client_rect().top() - viewport_top - expected
+                })
+            });
+            if let Some(drift) = drift.filter(|drift| drift.abs() >= 1.0) {
+                let Some(corrected) = write_scroll_top(&scroller, top + drift) else {
+                    return;
+                };
+                top = corrected;
+            }
+        }
+        scroll_offset.set_value(top);
+        let children = rows_el.children();
+        // A streaming row is replaced when its reply completes, so it can
+        // name neither the reading position nor the start of the mounted
+        // range; the nearest row above it stands in.
+        let streaming_row = untrack(|| {
+            active_agent_id().and_then(|id| {
+                streaming_text.with(|streams| streams.get(&id).map(|stream| stream.row_id))
+            })
+        });
+        let reading = (top < -BOTTOM_EPSILON_PX)
+            .then(|| first_row_ending_below(&children, viewport_top))
+            .flatten()
+            .and_then(|index| {
+                (0..=index).rev().find_map(|index| {
+                    let row = children.item(index)?;
+                    let id = ChatRowId(row.get_attribute("data-row-id")?.parse().ok()?);
+                    if Some(id) == streaming_row || row.get_client_rects().length() == 0 {
+                        return None;
+                    }
+                    let offset =
+                        (row.get_bounding_client_rect().top() - viewport_top).round() as i32;
+                    Some((row, ChatReadingPosition { row: id, offset }))
+                })
+            });
+        let position = reading.as_ref().map(|reading| reading.1);
+        anchor.set_value(reading);
+        let show = top < -JUMP_BUTTON_DISTANCE_PX;
+        if show_scroll_btn.get_untracked() != show {
+            show_scroll_btn.set(show);
+        }
+        if chat_reading_position
+            .with_untracked(|positions| positions.get(&tab_id).copied() != position)
+        {
+            chat_reading_position.update(|positions| match position {
+                Some(position) => {
+                    positions.insert(tab_id, position);
+                }
+                None => {
+                    positions.remove(&tab_id);
+                }
+            });
+        }
 
-    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
-    let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
-    let scroll_ref_for_restore = scroll_ref;
-    let state_for_restore = state.clone();
+        let mount_from = |mut index: usize| {
+            let rows = untrack(row_handles);
+            while index > 0
+                && rows
+                    .get(index)
+                    .is_some_and(|row| Some(row.id) == streaming_row)
+            {
+                index -= 1;
+            }
+            match rows.get(index) {
+                Some(row) if index > 0 => reveal_from.set(RevealFrom::Row(row.id)),
+                Some(_) => reveal_from.set(RevealFrom::All),
+                None => {}
+            }
+        };
+        // The tail window slides forward with every arriving row, which
+        // would unmount rows from under a reader, and a named row that left
+        // the transcript falls back to that window. Once laid out, the
+        // mounted range starts at a present row and only reveal and trim
+        // move it.
+        let named = match reveal_from.get_untracked() {
+            RevealFrom::Tail => false,
+            RevealFrom::All => true,
+            RevealFrom::Row(id) => children
+                .item(0)
+                .and_then(|row| row.get_attribute("data-row-id"))
+                .is_some_and(|first| first == id.0.to_string()),
+        };
+        if !named {
+            mount_from(start);
+        }
+        let above = f64::from(scroller.scroll_height() - scroller.client_height()) + top;
+        if above < REVEAL_WITHIN_PX {
+            if start > 0 {
+                mount_from(start.saturating_sub(REVEAL_BATCH_ROWS));
+            }
+        } else if above > TRIM_BEYOND_PX {
+            let Some(keep) = first_row_ending_below(&children, viewport_top - KEEP_ABOVE_PX)
+                .filter(|keep| *keep > 0)
+            else {
+                return;
+            };
+            let Some(id) = children
+                .item(keep)
+                .and_then(|row| row.get_attribute("data-row-id"))
+                .and_then(|id| id.parse().ok())
+                .map(ChatRowId)
+            else {
+                return;
+            };
+            if Some(id) != streaming_row {
+                reveal_from.set(RevealFrom::Row(id));
+            }
+        }
+    };
+
+    // Multiple `ChatView`s can be mounted at once (LRU hot set) and one chat
+    // can be mounted many times, so the listener and observer belong to this
+    // instance and are released on cleanup.
+    struct ScrollWiring {
+        scroller: web_sys::HtmlElement,
+        on_scroll: Closure<dyn Fn()>,
+        observer: web_sys::ResizeObserver,
+        _on_resize: Closure<dyn FnMut(JsValue, JsValue)>,
+    }
+    let wiring: StoredValue<Option<ScrollWiring>, LocalStorage> = StoredValue::new_local(None);
     let registration =
         crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatScrollRestore);
     Effect::new(move |_| {
-        if restored_initial_scroll_for_effect.get() {
-            return;
-        }
-        let Some(el) = scroll_ref_for_restore.get() else {
+        let (Some(scroller), Some(transcript)) = (scroll_ref.get(), transcript_ref.get()) else {
             return;
         };
-        let saved = initial_scroll_state;
-        if saved.is_none() {
+        if wiring.with_value(Option::is_some) {
             return;
         }
-        restored_initial_scroll_for_effect.set(true);
-        let restore_user_scrolled_up = saved.is_some_and(|scroll| scroll.user_scrolled_up);
-        let target_scroll_top = if restore_user_scrolled_up {
-            saved.map(|scroll| scroll.scroll_top).unwrap_or(0)
-        } else {
-            el.scroll_height()
+        let on_scroll = Closure::<dyn Fn()>::new(reconcile);
+        if scroller
+            .add_event_listener_with_callback("scroll", on_scroll.as_ref().unchecked_ref())
+            .is_err()
+        {
+            log::error!("chat scroller rejected its scroll listener");
+            return;
+        }
+        // ResizeObserver delivers after layout and before paint, so a
+        // correction applied from it is never seen.
+        let on_resize =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_: JsValue, _: JsValue| reconcile());
+        let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) else {
+            log::error!("chat scroller could not observe transcript size");
+            return;
         };
-        let html_el: web_sys::HtmlElement = el.clone().unchecked_into();
-        restore_scroll_top_without_animation(&html_el, target_scroll_top);
-        scroll_top_sig.set(html_el.scroll_top() as f64);
-        state_for_restore.save_tab_scroll_state(
-            tab_id,
-            TabScrollState {
-                scroll_top: html_el.scroll_top(),
-                scroll_height: html_el.scroll_height(),
-                client_height: html_el.client_height(),
-                user_scrolled_up: restore_user_scrolled_up,
-            },
-        );
+        observer.observe(&scroller);
+        observer.observe(&transcript);
+        wiring.set_value(Some(ScrollWiring {
+            scroller: scroller.unchecked_into(),
+            on_scroll,
+            observer,
+            _on_resize: on_resize,
+        }));
+        reconcile();
+    });
+    // Rows revealed above the viewport do not always change the transcript's
+    // size (an Ink stretch can be empty), so the reveal loop is driven from
+    // the mounted range itself, after the row list has rendered.
+    Effect::new(move |_| {
+        first_mounted.track();
+        queue_microtask(reconcile);
     });
     drop(registration);
-
-    // Per-instance scroll + user-input listeners. Multiple `ChatView`s
-    // can be mounted simultaneously (LRU hot set), so we can't use
-    // thread-local handles. Closures are parked in a `StoredValue`
-    // and removed on `on_cleanup` — tab LRU eviction can mount/unmount
-    // this ChatView many times for the same chat, and without explicit
-    // cleanup each cycle would leak its handlers.
-    struct ScrollListenerHolder {
-        element: web_sys::HtmlElement,
-        scroll_handler: Closure<dyn Fn()>,
-        input_handler: Closure<dyn Fn()>,
-    }
-    let scroll_listener_slot: StoredValue<Option<ScrollListenerHolder>, LocalStorage> =
-        StoredValue::new_local(None);
-    let view_mounted_for_listeners = view_mounted.clone();
-    // Two listeners, with separate responsibilities:
-    //
-    //   1. The `scroll` listener (always fires, including on
-    //      programmatic `set_scroll_top` calls). It updates
-    //      `scroll_top_sig` — the windowing Memo needs current scroll
-    //      position. Reaching the bottom re-pins; only an upward move
-    //      unpins, which catches scrollbar/page-script scrolls that emit
-    //      no wheel/touch/key events. Rows measured taller than their
-    //      estimate after a jump to the bottom therefore cannot unpin it.
-    //
-    //   2. The user-input listeners (`wheel`, `touchstart`, `keydown`)
-    //      re-pin when a gesture ends near the bottom without moving
-    //      `scrollTop`. They never unpin: momentum wheel events after a
-    //      jump arrive while freshly mounted rows are still settling.
-    let scroll_ref_for_handler = scroll_ref;
-    let state_for_scroll_listener = state.clone();
-    Effect::new(move |_| {
-        let Some(el) = scroll_ref_for_handler.get() else {
-            return;
-        };
-        if scroll_listener_slot.with_value(|s| s.is_some()) {
-            return;
-        }
-        let el_clone = el.clone();
-        let state_for_scroll_handler = state_for_scroll_listener.clone();
-        let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-        let listener_mounted = view_mounted_for_listeners.clone();
-        let scroll_handler = Closure::<dyn Fn()>::new(move || {
-            let scroll_top = el_clone.scroll_top() as f64;
-            let previous_scroll_top = scroll_top_sig.get_untracked();
-            if (previous_scroll_top - scroll_top).abs() >= 1.0 {
-                scroll_top_sig.set(scroll_top);
-                let distance_from_bottom =
-                    el_clone.scroll_height() - el_clone.scroll_top() - el_clone.client_height();
-                // Only an upward scroll leaves the bottom. A downward scroll
-                // that lands short of rows still being measured stays pinned.
-                if distance_from_bottom < 80 {
-                    user_scrolled_up.set(false);
-                } else if scroll_top < previous_scroll_top {
-                    user_scrolled_up.set(true);
-                }
-                show_scroll_btn.set(user_scrolled_up.get_untracked());
-            }
-            if listener_pending.get() {
-                return;
-            }
-            listener_pending.set(true);
-            let pending = listener_pending.clone();
-            let el_for_cb = el_clone.clone();
-            let state_for_cb = state_for_scroll_handler.clone();
-            let mounted = listener_mounted.clone();
-            // `setTimeout(0)` instead of `requestAnimationFrame` — rAF
-            // is paused for hidden Tauri webviews (macOS WKWebView
-            // throttles when the window is occluded). setTimeout
-            // fires regardless of visibility.
-            leptos::prelude::set_timeout(
-                move || {
-                    if !mounted.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    pending.set(false);
-                    let scroll_top = el_for_cb.scroll_top();
-                    scroll_top_sig.set(scroll_top as f64);
-                    let element: web_sys::Element = el_for_cb.clone().unchecked_into();
-                    state_for_cb.save_tab_scroll_state(
-                        tab_id,
-                        tab_scroll_state_from_element(&element, user_scrolled_up.get_untracked()),
-                    );
-                },
-                std::time::Duration::from_millis(0),
-            );
-        });
-        let _ =
-            el.add_event_listener_with_callback("scroll", scroll_handler.as_ref().unchecked_ref());
-
-        // User-input observation. Each user-input event re-evaluates
-        // distance-from-bottom and re-pins near the bottom. The
-        // events themselves don't carry post-scroll geometry — we
-        // schedule a `setTimeout(0)` to read after the browser has
-        // applied the input's scroll effect.
-        let el_for_input = el.clone();
-        let state_for_input_handler = state_for_scroll_listener.clone();
-        let input_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-        let input_mounted = view_mounted_for_listeners.clone();
-        let input_handler = Closure::<dyn Fn()>::new(move || {
-            if input_pending.get() {
-                return;
-            }
-            input_pending.set(true);
-            let pending = input_pending.clone();
-            let el_for_cb = el_for_input.clone();
-            let state_for_cb = state_for_input_handler.clone();
-            let mounted = input_mounted.clone();
-            leptos::prelude::set_timeout(
-                move || {
-                    if !mounted.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    pending.set(false);
-                    let scroll_height = el_for_cb.scroll_height();
-                    let scroll_top = el_for_cb.scroll_top();
-                    let client_height = el_for_cb.client_height();
-                    let distance_from_bottom = scroll_height - scroll_top - client_height;
-                    if distance_from_bottom < 80 {
-                        user_scrolled_up.set(false);
-                        show_scroll_btn.set(false);
-                    }
-                    let element: web_sys::Element = el_for_cb.clone().unchecked_into();
-                    state_for_cb.save_tab_scroll_state(
-                        tab_id,
-                        tab_scroll_state_from_element(&element, user_scrolled_up.get_untracked()),
-                    );
-                },
-                std::time::Duration::from_millis(0),
-            );
-        });
-        for event in &["wheel", "touchstart", "keydown"] {
-            let _ =
-                el.add_event_listener_with_callback(event, input_handler.as_ref().unchecked_ref());
-        }
-
-        let element: web_sys::HtmlElement = el.unchecked_into();
-        scroll_listener_slot.update_value(|s| {
-            *s = Some(ScrollListenerHolder {
-                element,
-                scroll_handler,
-                input_handler,
-            })
-        });
-    });
-    let state_for_scroll_cleanup = state.clone();
     on_cleanup(move || {
-        scroll_listener_slot.update_value(|s| {
-            if let Some(holder) = s.take() {
-                let element: web_sys::Element = holder.element.clone().unchecked_into();
-                state_for_scroll_cleanup.save_tab_scroll_state(
-                    tab_id,
-                    tab_scroll_state_from_element(&element, user_scrolled_up.get_untracked()),
-                );
-                let _ = holder.element.remove_event_listener_with_callback(
+        wiring.update_value(|wiring| {
+            if let Some(wiring) = wiring.take() {
+                wiring.observer.disconnect();
+                let _ = wiring.scroller.remove_event_listener_with_callback(
                     "scroll",
-                    holder.scroll_handler.as_ref().unchecked_ref(),
+                    wiring.on_scroll.as_ref().unchecked_ref(),
                 );
-                for event in &["wheel", "touchstart", "keydown"] {
-                    let _ = holder.element.remove_event_listener_with_callback(
-                        event,
-                        holder.input_handler.as_ref().unchecked_ref(),
-                    );
-                }
-                // Closures drop here.
             }
         });
     });
 
-    // Track viewport height via `ResizeObserver` on the scroll container.
-    // The window-bounds Memo needs the live height, not just whatever
-    // happened to be true at first paint. The observer also fires when
-    // the user resizes the window or toggles dock visibility, both of
-    // which affect what's actually visible.
-    type ViewportObserverSlot = Option<(
-        web_sys::ResizeObserver,
-        Closure<dyn FnMut(JsValue, JsValue)>,
-    )>;
-    let viewport_observer_slot: StoredValue<ViewportObserverSlot, LocalStorage> =
-        StoredValue::new_local(None);
-    let scroll_ref_for_viewport = scroll_ref;
-    let view_mounted_for_viewport = view_mounted.clone();
-    Effect::new(move |_| {
-        let Some(el) = scroll_ref_for_viewport.get() else {
-            return;
-        };
-        if viewport_observer_slot.with_value(|s| s.is_some()) {
-            return;
-        }
-        // Seed the signal eagerly so the first paint gets a real value
-        // rather than the default 800px estimate.
-        viewport_height_sig.set(el.client_height() as f64);
-        let el_clone = el.clone();
-        let viewport_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-        let viewport_mounted = view_mounted_for_viewport.clone();
-        let cb =
-            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
-                if viewport_pending.get() {
-                    return;
-                }
-                viewport_pending.set(true);
-                let pending = viewport_pending.clone();
-                let el_for_cb = el_clone.clone();
-                let mounted = viewport_mounted.clone();
-                leptos::prelude::set_timeout(
-                    move || {
-                        if !mounted.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        pending.set(false);
-                        viewport_height_sig.set(el_for_cb.client_height() as f64);
-                    },
-                    std::time::Duration::from_millis(0),
-                );
-            });
-        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
-            let element: web_sys::Element = el.unchecked_into();
-            observer.observe(&element);
-            viewport_observer_slot.update_value(|s| *s = Some((observer, cb)));
-        }
-    });
-    on_cleanup(move || {
-        viewport_observer_slot.update_value(|s| {
-            if let Some((observer, _cb)) = s.take() {
-                observer.disconnect();
-            }
-        });
-    });
-
-    // Compute the row index window plus top/bottom spacer heights.
-    // Reactive on `chat_rows` (via `row_handles`), scroll position,
-    // viewport height, and `heights_version` (per-row measurements).
-    // Returns indices into the *current* rows Vec.
-    //
-    // Algorithm: walk forward summing per-row heights until we cross
-    // `scroll_top` (first visible) and again until we cross
-    // `scroll_top + viewport` (one past last visible). Apply
-    // `VIRT_OVERSCAN` rows of buffer in each direction so a row at the
-    // edge isn't visibly missing while it's being measured.
-    let visible_window: Memo<VirtualWindow> = Memo::new(move |_| {
-        let mut span = CaptureSpan::new(ChatProjection::VirtualWindow);
-        let _ = heights_version.get();
-        let st = scroll_top_sig.get();
-        let vp = viewport_height_sig.get();
-        let layouts = ink_layouts.get();
-        let row_gap = if layouts.is_some() { 0.0 } else { ROW_GAP_PX };
-        let rows = row_handles();
-        let n = rows.len();
-        span.items(n);
-        if n == 0 {
-            return VirtualWindow::EMPTY;
-        }
-        row_heights.with_value(|map| {
-            // `slot_height` includes the top margin that separates this
-            // row from the previous one, so the running sum matches
-            // what the browser actually lays out. The very first row
-            // gets no leading gap.
-            let slot_height = |idx: usize| -> f64 {
-                if layouts
-                    .as_ref()
-                    .and_then(|layouts| layouts.get(&rows[idx].id))
-                    .is_some_and(|layout| layout.empty)
-                {
-                    return 0.0;
-                }
-                let raw = map
-                    .get(&rows[idx].id)
-                    .copied()
-                    .unwrap_or(ESTIMATED_ROW_HEIGHT);
-                if idx == 0 { raw } else { raw + row_gap }
-            };
-
-            let mut acc = 0.0_f64;
-            let mut first = 0usize;
-            while first < n {
-                let h = slot_height(first);
-                if acc + h > st {
-                    break;
-                }
-                acc += h;
-                first += 1;
-            }
-            let viewport_end = st + vp;
-            let mut last_excl = first;
-            while last_excl < n {
-                if acc >= viewport_end {
-                    break;
-                }
-                acc += slot_height(last_excl);
-                last_excl += 1;
-            }
-            let start = first.saturating_sub(VIRT_OVERSCAN);
-            let end = (last_excl + VIRT_OVERSCAN).min(n);
-            let top_pad: f64 = (0..start).map(slot_height).sum();
-            let bottom_pad: f64 = (end..n).map(slot_height).sum();
-            VirtualWindow {
-                start,
-                end,
-                top_pad,
-                bottom_pad,
-            }
-        })
-    });
-
-    let scroll_anchor = ScrollAnchor {
-        scroller: scroll_ref,
-        user_scrolled_up,
-        scroll_top: scroll_top_sig,
-    };
-
-    // Auto-scroll effect: whenever the message count or streaming text grows,
-    // scroll to bottom (only if the user has scrolled up). Scoped to the
-    // *length* of messages — not the full Vec — so unrelated chat row
-    // updates (e.g. tool_request mutations to existing rows) don't trigger a
-    // scroll.
-    //
-    // Coalesce multiple deltas-per-frame into a single setTimeout. The
-    // previous implementation scheduled one rAF per `text`/`reasoning`
-    // delta — at 50+ deltas/sec while the model streams, all of them
-    // fired in the *same* frame and each ran its own scrollHeight read
-    // (a forced layout) plus a scrollTop write. The pending-flag gate
-    // caps it to at most one scroll per coalesced burst, which still
-    // keeps the bottom pinned.
-    //
-    // Subscribes to `heights_version` so a measurement that grew the last
-    // (visible/streaming) row's height re-pins the bottom. Without that
-    // subscription, sticky-bottom would visibly drift up by the height
-    // delta on every measurement during streaming.
-    //
-    // `user_scrolled_up` is set true only by an upward scroll, so
-    // content growing below the user can't masquerade as user intent
-    // and disable sticky-bottom.
-    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-    let view_mounted_for_auto_scroll = view_mounted.clone();
-    let state_for_auto_scroll = state.clone();
-    let registration = crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatAutoScroll);
-    Effect::new(move |_| {
-        let _len = messages_len.get();
-        let _hv = heights_version.get();
-        let stream = streaming();
-        if let Some(ss) = stream.as_ref() {
-            // Subscribe without cloning the strings. `.get()` on
-            // `ArcRwSignal<String>` cloned the entire accumulated text
-            // into a temporary just to be discarded — `.with` reads
-            // through and tracks the dependency without the alloc.
-            ss.text.with(|_| ());
-            ss.reasoning.with(|_| ());
-        }
-        if user_scrolled_up.get_untracked() {
-            return;
-        }
-        if scroll_pending.get() {
-            return;
-        }
-        // Resolve the NodeRef synchronously — the Effect body runs
-        // inside this component's reactive owner, so the signal is
-        // guaranteed alive here. Capturing the raw `HtmlDivElement`
-        // into the deferred closure means the timer never touches the
-        // reactive graph after the owner is disposed (tab LRU eviction
-        // mid-flight used to panic here).
-        let Some(el) = scroll_ref.get_untracked() else {
-            return;
-        };
-        scroll_pending.set(true);
-        let pending = scroll_pending.clone();
-        let mounted = view_mounted_for_auto_scroll.clone();
-        let state_for_cb = state_for_auto_scroll.clone();
-        // `setTimeout(0)` instead of `requestAnimationFrame`. rAF is
-        // paused for hidden Tauri windows on macOS — a user
-        // backgrounding the app during session restore would leave the
-        // chat stuck wherever it was. setTimeout fires regardless of
-        // window visibility. We still coalesce within a reactive batch
-        // via `scroll_pending`.
-        leptos::prelude::set_timeout(
-            move || {
-                if !mounted.load(Ordering::Relaxed) {
-                    return;
-                }
-                pending.set(false);
-                el.set_scroll_top(el.scroll_height());
-                // Mirror the post-clamp scrollTop into `scroll_top_sig`
-                // immediately. Without this, the windowing Memo only
-                // sees the new scroll position once the `scroll` event
-                // round-trips through the listener — leaving a window
-                // of one or more frames where `scroll_top` is at the
-                // bottom but `visible_window` still has the old
-                // `start = 0`. The user would see the scrollbar at the
-                // end but the rendered rows from index 0, with the
-                // bottom-pad spacer covering the entire visible region.
-                scroll_top_sig.set(el.scroll_top() as f64);
-                let element: web_sys::Element = el.clone().unchecked_into();
-                state_for_cb
-                    .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element, false));
-            },
-            std::time::Duration::from_millis(0),
-        );
-    });
-    drop(registration);
-
-    let tab_scroll_state_for_scroll_to_bottom = state.tab_scroll_state;
     let scroll_to_bottom = move |_| {
-        // Event handler — not a reactive context, so use untracked
-        // read on the NodeRef.
-        if let Some(el) = scroll_ref.get_untracked() {
-            el.set_scroll_top(el.scroll_height());
-            // Same staleness fix as the auto-scroll rAF — keep
-            // `scroll_top_sig` synchronously consistent with the new
-            // scroll position so the windowing Memo recomputes
-            // immediately rather than waiting on the scroll event.
-            scroll_top_sig.set(el.scroll_top() as f64);
-            user_scrolled_up.set(false);
-            show_scroll_btn.set(false);
-            let element: web_sys::Element = el.clone().unchecked_into();
-            tab_scroll_state_for_scroll_to_bottom.update(|scroll| {
-                scroll.insert(tab_id, tab_scroll_state_from_element(&element, false));
-            });
+        if let Some(scroller) = scroll_ref.get_untracked() {
+            pending_restore.set_value(None);
+            scroller.set_scroll_top(0);
+            reconcile();
         }
     };
 
@@ -1044,6 +800,7 @@ pub fn ChatView(
                 </Show>
                 <div class="chat-messages-wrapper">
                     <div class="chat-messages" node_ref=scroll_ref>
+                      <div class="chat-transcript" node_ref=transcript_ref>
                         {move || {
                             if !has_messages()
                                 && streaming().is_none()
@@ -1060,7 +817,7 @@ pub fn ChatView(
                             }
                         }}
 
-                        <Show when=move || prior_history.get().is_some()>
+                        <Show when=move || prior_history.get().is_some() && first_mounted.get() == 0>
                             <div class="chat-history-collapsed">
                                 <button
                                     class="chat-history-load-previous"
@@ -1097,57 +854,32 @@ pub fn ChatView(
                             </div>
                         </Show>
 
-                        // Windowed rows: top spacer + visible rows +
-                        // bottom spacer. The spacers reserve scroll
-                        // geometry for the unrendered rows so the
-                        // scrollbar tracks total estimated height even
-                        // though we only mount what's near the viewport.
-                        // `MeasuredRow` reports each rendered row's
-                        // post-layout height back into `row_heights`,
-                        // which keeps the spacers honest as the user
-                        // scrolls into previously-unmeasured regions.
-                        <div
-                            class="virt-spacer virt-spacer-top"
-                            style=move || {
-                                visible_window
-                                    .with(|w| format!("height: {}px;", w.top_pad))
-                            }
-                        ></div>
-                        <For
-                            each=move || {
-                                let win = visible_window.get();
-                                let rows = row_handles();
-                                let end = win.end.min(rows.len());
-                                let start = win.start.min(end);
-                                rows[start..end].to_vec()
-                            }
-                            key=|row| row.id
-                            let:row
-                        >
-                            <MeasuredRow
-                                agent_ref=agent_ref
-                                row=row
-                                row_heights=row_heights
-                                heights_version=heights_version
-                                ink_layouts=ink_layouts
-                                anchor=scroll_anchor
-                            />
-                        </For>
-                        <div
-                            class="virt-spacer virt-spacer-bottom"
-                            style=move || {
-                                visible_window
-                                    .with(|w| format!("height: {}px;", w.bottom_pad))
-                            }
-                        ></div>
+                        <div class="chat-rows" node_ref=rows_ref>
+                            <For
+                                each=move || {
+                                    let rows = row_handles();
+                                    let start = first_mounted.get().min(rows.len());
+                                    rows[start..].to_vec()
+                                }
+                                key=|row| row.id
+                                let:row
+                            >
+                                <TranscriptRow
+                                    agent_ref=agent_ref
+                                    row=row
+                                    ink_layouts=ink_layouts
+                                />
+                            </For>
+                        </div>
 
-                        // Live compaction state. Outside the windowed list, so
+                        // Live compaction state. Outside the row list, so
                         // it stays visible wherever the user has scrolled and
                         // disappears the moment the operation ends.
                         <ContextCompactionBanner agent_ref=agent_ref />
 
                         <OrchestrationView records=orchestration_records />
 
+                      </div>
                     </div>
 
                     // Scroll-to-bottom button
@@ -1184,105 +916,66 @@ pub fn ChatView(
     }
 }
 
-/// Window descriptor produced by the chat-list virtualizer. `start..end`
-/// is the half-open range of row indices currently mounted; `top_pad`
-/// and `bottom_pad` are the spacer-div heights that reserve scroll
-/// geometry for the unmounted rows above and below. `PartialEq` so the
-/// `Memo` short-circuits when the window doesn't actually change —
-/// avoids triggering downstream re-renders on every signal tick.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VirtualWindow {
-    start: usize,
-    end: usize,
-    top_pad: f64,
-    bottom_pad: f64,
+/// First mounted transcript row. Rows above it stay unrendered until the
+/// reader scrolls near them; everything from it to the newest row is real DOM.
+#[derive(Clone, Copy, PartialEq)]
+enum RevealFrom {
+    Tail,
+    All,
+    Row(ChatRowId),
 }
 
-impl VirtualWindow {
-    const EMPTY: Self = Self {
-        start: 0,
-        end: 0,
-        top_pad: 0.0,
-        bottom_pad: 0.0,
-    };
-}
-
-/// Keeps the reader's place when a row changes height. While pinned to the
-/// bottom the transcript re-pins immediately; while scrolled up, growth
-/// of a row lying wholly above the viewport is absorbed into the scroll
-/// offset. WebKit implements
-/// no CSS scroll anchoring, so a row measured taller than its estimate would
-/// otherwise push the visible transcript downward. The stylesheet disables
-/// native anchoring on `.chat-messages` so every engine uses this one
-/// correction rather than applying two.
-#[derive(Clone, Copy)]
-struct ScrollAnchor {
-    scroller: NodeRef<leptos::html::Div>,
-    user_scrolled_up: RwSignal<bool>,
-    scroll_top: RwSignal<f64>,
-}
-
-impl ScrollAnchor {
-    fn absorb_resize(self, row: &web_sys::DomRect, growth: f64) {
-        if growth == 0.0 {
-            return;
-        }
-        let Some(scroller) = self.scroller.get_untracked() else {
-            return;
-        };
-        let key = JsValue::from_str("scrollTop");
-        let target = if self.user_scrolled_up.get_untracked() {
-            // Only a row that ended above the viewport before resizing shifts
-            // the visible text; a straddling row grows below the reader's eye.
-            if row.bottom() - growth > scroller.get_bounding_client_rect().top() {
-                return;
-            }
-            let Some(current) = js_sys::Reflect::get(&scroller, &key)
-                .ok()
-                .and_then(|value| value.as_f64())
-            else {
-                log::error!("chat scroll anchoring could not read scrollTop");
-                return;
-            };
-            current + growth
-        } else {
-            f64::from(scroller.scroll_height())
-        };
-        if js_sys::Reflect::set(&scroller, &key, &JsValue::from_f64(target)).is_err() {
-            log::error!("chat scroll anchoring could not adjust scrollTop");
-            return;
-        }
-        let Some(adjusted) = js_sys::Reflect::get(&scroller, &key)
-            .ok()
-            .and_then(|value| value.as_f64())
-        else {
-            log::error!("chat scroll anchoring could not read the adjusted scrollTop");
-            return;
-        };
-        self.scroll_top.set(adjusted);
+fn read_scroll_top(scroller: &web_sys::Element) -> Option<f64> {
+    let value = js_sys::Reflect::get(scroller, &JsValue::from_str("scrollTop"))
+        .ok()
+        .and_then(|value| value.as_f64());
+    if value.is_none() {
+        log::error!("chat scroller did not report scrollTop");
     }
+    value
 }
 
-/// Wraps a `ChatMessageView` with a `ResizeObserver` that records the
-/// row's measured DOM height into `row_heights` and bumps
-/// `heights_version` when the height changes meaningfully (>=0.5px).
-/// The bump triggers `visible_window` to recompute, which keeps the
-/// top/bottom spacers honest as the user scrolls into rows that were
-/// previously estimated.
-///
-/// We hold the observer alive in an `Rc<RefCell<Option<...>>>` and
-/// disconnect it on `on_cleanup` so the GC doesn't collect the closure
-/// while the row is still mounted. Per-row observer cost is bounded
-/// because at most `viewport / min_row_height + 2 * VIRT_OVERSCAN` rows
-/// are mounted at any time.
+fn write_scroll_top(scroller: &web_sys::Element, offset: f64) -> Option<f64> {
+    if js_sys::Reflect::set(
+        scroller,
+        &JsValue::from_str("scrollTop"),
+        &JsValue::from_f64(offset),
+    )
+    .is_err()
+    {
+        log::error!("chat scroller rejected a scrollTop write");
+        return None;
+    }
+    read_scroll_top(scroller)
+}
+
+/// Index of the first rendered row whose bottom edge lies below `y`. Rendered
+/// rows are laid out top to bottom; rows without a layout box (Flow hides its
+/// empty ones) report an all-zero rect, so every probe moves to the nearest
+/// rendered row before it is compared.
+fn first_row_ending_below(rows: &web_sys::HtmlCollection, y: f64) -> Option<u32> {
+    let rendered_from = |from: u32, until: u32| {
+        (from..until).find_map(|index| {
+            let row = rows.item(index)?;
+            (row.get_client_rects().length() > 0).then_some((index, row))
+        })
+    };
+    let (mut low, mut high) = (0, rows.length());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match rendered_from(mid, high) {
+            Some((index, row)) if row.get_bounding_client_rect().bottom() <= y => low = index + 1,
+            _ => high = mid,
+        }
+    }
+    rendered_from(low, rows.length()).map(|(index, _)| index)
+}
+
 #[component]
-fn MeasuredRow(
+fn TranscriptRow(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     row: ChatRowHandle,
-    row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage>,
-    heights_version: RwSignal<u32>,
     ink_layouts: Memo<Option<Arc<HashMap<ChatRowId, InkRowLayout>>>>,
-    anchor: ScrollAnchor,
 ) -> impl IntoView {
     let row_id = row.id;
     let ink_layout: Memo<Option<InkRowLayout>> = Memo::new(move |_| {
@@ -1316,84 +1009,9 @@ fn MeasuredRow(
         })
     };
     let ink_layout_signal: Signal<Option<InkRowLayout>> = ink_layout.into();
-    let node_ref: NodeRef<leptos::html::Div> = NodeRef::new();
-    let row_mounted = Arc::new(AtomicBool::new(true));
-
-    // Observer + closure are !Send/!Sync (web_sys handles wrap raw JS
-    // pointers), so we can't capture them in a `Send + Sync` cleanup
-    // closure directly. `StoredValue::new_local` parks them in
-    // thread-local storage and hands back a `Copy` ID handle that *is*
-    // `Send + Sync`. Both the Effect and `on_cleanup` get their own
-    // handle that points at the same slot.
-    type ObserverPair = Option<(
-        web_sys::ResizeObserver,
-        Closure<dyn FnMut(JsValue, JsValue)>,
-    )>;
-    let slot: StoredValue<ObserverPair, LocalStorage> = StoredValue::new_local(None);
-    let row_mounted_for_observer = row_mounted.clone();
-
-    let registration = crate::perf::TaskOrigin::enter(crate::perf::UiTaskProducer::ChatRowMeasure);
-    Effect::new(move |_| {
-        let Some(el) = node_ref.get() else {
-            return;
-        };
-        // Observer already wired? Don't double-wrap.
-        let already = slot.with_value(|s| s.is_some());
-        if already {
-            return;
-        }
-        let element: web_sys::Element = el.clone().unchecked_into();
-        let elem_for_cb = element.clone();
-        let row_mounted_for_cb = row_mounted_for_observer.clone();
-        // Measured synchronously: ResizeObserver delivers after layout and
-        // before paint, so a scroll correction applied here is never seen.
-        let cb =
-            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
-                if !row_mounted_for_cb.load(Ordering::Relaxed) {
-                    return;
-                }
-                let rect = elem_for_cb.get_bounding_client_rect();
-                let h = rect.height();
-                // Inactive tabs in the LRU hot set stay mounted under
-                // `display: none`, where every element measures as 0px.
-                // If we recorded those zeros, switching back to the
-                // hidden tab would compute spacers against rows the
-                // window math thinks have no height — collapsing the
-                // visible window onto rows that are actually below the
-                // viewport. Ignore zero/negative measurements; the next
-                // observer fire after the tab is shown again will
-                // record the real height.
-                if h <= 0.0 || h.is_nan() {
-                    return;
-                }
-                let previous = row_heights.with_value(|map| map.get(&row_id).copied());
-                if previous.is_some_and(|p| (p - h).abs() < 0.5) {
-                    return;
-                }
-                anchor.absorb_resize(&rect, h - previous.unwrap_or(ESTIMATED_ROW_HEIGHT));
-                row_heights.update_value(|map| {
-                    map.insert(row_id, h);
-                });
-                heights_version.update(|v| *v = v.wrapping_add(1));
-            });
-        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
-            observer.observe(&element);
-            slot.update_value(|s| *s = Some((observer, cb)));
-        }
-    });
-    drop(registration);
-
-    on_cleanup(move || {
-        row_mounted.store(false, Ordering::Relaxed);
-        slot.update_value(|s| {
-            if let Some((observer, _cb)) = s.take() {
-                observer.disconnect();
-            }
-        });
-    });
 
     view! {
-        <div class=row_class node_ref=node_ref>
+        <div class=row_class data-row-id=row_id.0.to_string()>
             {match row.content {
                 ChatRowContent::Streaming(streaming) => {
                     view! { <ChatStreamingView agent_ref=agent_ref streaming=streaming ink_layout=ink_layout_signal /> }.into_any()
@@ -2848,13 +2466,28 @@ mod wasm_tests {
         container.remove();
     }
 
+    const ROW_GAP_PX: f64 = 6.0;
+
+    /// How far the end of the transcript lies below the viewport's bottom
+    /// edge: 0 when the newest content is in view.
+    fn hidden_below_viewport(container: &HtmlElement) -> f64 {
+        let edge = |selector: &str| {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect()
+                .bottom()
+        };
+        edge(".chat-transcript") - edge(".chat-messages")
+    }
+
     fn message_rows(container: &HtmlElement) -> Vec<Element> {
-        // Each rendered chat row is wrapped in a `.virt-row` by the
-        // windowed list. The wrapping div is keyed by row id, so its
-        // DOM identity is what survives an append — that's what the
-        // identity assertions below need to look at.
+        // Each rendered chat row is wrapped in a `.virt-row` keyed by row
+        // id, so its DOM identity is what survives an append — that's
+        // what the identity assertions below need to look at.
         let nodes = container
-            .query_selector_all(".chat-messages > .virt-row")
+            .query_selector_all(".chat-messages .virt-row")
             .unwrap();
         (0..nodes.length())
             .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
@@ -4939,7 +4572,11 @@ mod wasm_tests {
         }
         let messages = container.query_selector(".chat-messages").unwrap().unwrap();
         let bounds = messages.get_bounding_client_rect();
-        let style = window.get_computed_style(&messages).unwrap().unwrap();
+        let transcript = container
+            .query_selector(".chat-transcript")
+            .unwrap()
+            .unwrap();
+        let style = window.get_computed_style(&transcript).unwrap().unwrap();
         let inset = |side: &str| {
             style
                 .get_property_value(&format!("padding-{side}"))
@@ -5334,15 +4971,6 @@ mod wasm_tests {
             )
             .unwrap();
         state.bump_tab_lru(tab_id);
-        state.save_tab_scroll_state(
-            tab_id,
-            TabScrollState {
-                scroll_top: 0,
-                scroll_height: 40_000,
-                client_height: 600,
-                user_scrolled_up: true,
-            },
-        );
         let clock = LocalMonitorClock::install();
         clock.reading_step(0.0);
         let container = make_container();
@@ -5367,15 +4995,18 @@ mod wasm_tests {
             "windowing must leave offscreen rows unmounted"
         );
         let first = mounted[0].clone();
-        let spacer: HtmlElement = container
-            .query_selector(".virt-spacer-bottom")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
         assert!(
-            spacer.get_bounding_client_rect().height() > 0.0,
-            "the spacer must reserve geometry for unmounted rows"
+            mounted
+                .last()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default()
+                .contains(&format!("private diagnostic fixture {} ", total_rows - 1)),
+            "the mounted rows end at the newest message"
+        );
+        assert!(
+            hidden_below_viewport(&container).abs() <= 1.0,
+            "a long transcript opens on its newest message"
         );
 
         clock.reading_step(150.0);
@@ -5425,19 +5056,13 @@ mod wasm_tests {
         drop(clock);
         assert_eq!(local["diagnostic"]["event"], "event_loop_gap");
         let producers = local["diagnostic"]["task_producers"].as_array().unwrap();
-        for producer in [
-            "chat_scroll_restore",
-            "chat_auto_scroll",
-            "chat_row_measure",
-        ] {
-            assert!(
-                producers
-                    .iter()
-                    .any(|row| row["producer"] == producer
-                        && row["work"]["polls"].as_u64().unwrap() > 0),
-                "the mounted transcript must retain its actual effect origin: {producer}"
-            );
-        }
+        assert!(
+            producers
+                .iter()
+                .any(|row| row["producer"] == "chat_scroll_restore"
+                    && row["work"]["polls"].as_u64().unwrap() > 0),
+            "the mounted transcript must retain its actual effect origin"
+        );
 
         let task_work = &local["diagnostic"]["task_work"];
         assert!(task_work["polls"].as_u64().unwrap() > 0);
@@ -5664,87 +5289,97 @@ mod wasm_tests {
         assert!(has_load_button, "load-earlier control must be a button");
 
         // Tear the view down inside this test: unmount (runs ChatView's
-        // `on_cleanup`, disconnecting its ResizeObservers and clearing the
-        // `view_mounted` flag), detach the container, and flush a tick so any
-        // `set_timeout` ChatView scheduled fires against the now-unmounted view
-        // instead of leaking into a later test in the shared wasm instance.
+        // `on_cleanup`, disconnecting its ResizeObserver), detach the
+        // container, and flush a tick so nothing ChatView scheduled leaks
+        // into a later test in the shared wasm instance.
         drop(handle);
         container.remove();
         next_tick().await;
     }
 
-    #[wasm_bindgen_test]
-    async fn remount_restores_saved_scroll_position() {
-        ensure_styles_loaded();
-
-        let agent_id = AgentId("agent-scroll".to_owned());
-        let host_id = "host-scroll".to_owned();
-        let tab_id = TabId(10_003);
-        let saved_scroll_top = 1_800;
-
-        let container = make_container();
-        // Rows that measure exactly their estimate isolate restoration from
-        // re-anchoring, which the anchoring tests cover.
-        container.set_id("remount-restore-fixture");
-        let document = web_sys::window().unwrap().document().unwrap();
-        let fixed_rows = document.create_element("style").unwrap();
-        fixed_rows.set_text_content(Some(&format!(
-            "#remount-restore-fixture .virt-row {{ height: {ESTIMATED_ROW_HEIGHT}px; \
-             box-sizing: border-box; overflow: hidden; }}"
-        )));
-        container.append_child(&fixed_rows).unwrap();
-        let agent_id_for_mount = agent_id.clone();
-        let host_id_for_mount = host_id.clone();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            let bound = ActiveAgentRef {
-                host_id: host_id_for_mount.clone(),
-                agent_id: agent_id_for_mount.clone(),
-            };
-            let rows: Vec<ChatRowHandle> = (0..80)
-                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("scroll msg {i}"))))
-                .collect();
-            state.chat_rows.update(|m| {
-                m.insert(agent_id_for_mount.clone(), rows);
-            });
-            state.save_tab_scroll_state(
-                tab_id,
-                TabScrollState {
-                    scroll_top: saved_scroll_top,
-                    scroll_height: 16_000,
-                    client_height: 600,
-                    user_scrolled_up: true,
-                },
-            );
-            provide_context(state);
-            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
-            let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
-        });
-
-        let scroller: HtmlElement = container
-            .query_selector(".chat-messages")
-            .unwrap()
-            .expect("chat scroller present")
-            .dyn_into()
-            .unwrap();
-        settle_scroll(&container, &scroller).await;
-        let restored = scroller.scroll_top();
-        assert_eq!(
-            restored, saved_scroll_top,
-            "remount must restore the saved scrollTop"
-        );
-        let distance_from_bottom =
-            scroller.scroll_height() - scroller.scroll_top() - scroller.client_height();
-        assert!(
-            distance_from_bottom > 500,
-            "restored user-scrolled tab should not auto-scroll back to bottom"
-        );
+    struct ScrolledTranscript {
+        container: HtmlElement,
+        scroller: HtmlElement,
+        state: AppState,
+        tab_id: TabId,
+        agent_id: AgentId,
+        _mounted: Box<dyn std::any::Any>,
     }
 
-    /// WebKit has no CSS scroll anchoring. A row above the viewport that
-    /// grows (including one first measured taller than its estimate) must
-    /// not push the transcript the user is reading downward.
+    impl Drop for ScrolledTranscript {
+        fn drop(&mut self) {
+            self.container.remove();
+        }
+    }
+
+    impl ScrolledTranscript {
+        fn mount(state: AppState, tab_id: TabId, agent_id: AgentId) -> Self {
+            let container = make_container();
+            let bound = ActiveAgentRef {
+                host_id: format!("host-{}", agent_id.0),
+                agent_id: agent_id.clone(),
+            };
+            let mount_state = state.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(mount_state);
+                let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+                let is_active_signal: Signal<bool> = Signal::derive(|| true);
+                view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
+            });
+            let scroller: HtmlElement = container
+                .query_selector(".chat-messages")
+                .unwrap()
+                .expect("chat scroller present")
+                .dyn_into()
+                .unwrap();
+            ScrolledTranscript {
+                container,
+                scroller,
+                state,
+                tab_id,
+                agent_id,
+                _mounted: Box::new(handle),
+            }
+        }
+
+        /// Unmounts the view and mounts it again on the same app state, as
+        /// the tab LRU does when a chat tab is evicted and reopened.
+        fn remount(self) -> Self {
+            let (state, tab_id, agent_id) =
+                (self.state.clone(), self.tab_id, self.agent_id.clone());
+            drop(self);
+            Self::mount(state, tab_id, agent_id)
+        }
+
+        /// Scrolls the settled transcript `px` up from its newest message.
+        async fn scroll_up(&self, px: i32) {
+            settle_scroll(&self.container, &self.scroller).await;
+            self.scroller.set_scroll_top(-px);
+            settle_scroll(&self.container, &self.scroller).await;
+        }
+    }
+
+    /// Mounts a transcript of `count` user messages.
+    fn mount_scrolled_transcript(
+        tab_id: TabId,
+        agent: &str,
+        count: usize,
+        text: impl Fn(usize) -> String,
+    ) -> ScrolledTranscript {
+        ensure_styles_loaded();
+        let agent_id = AgentId(agent.to_owned());
+        let state = AppState::new();
+        state.chat_rows.update(|m| {
+            m.insert(
+                agent_id.clone(),
+                (0..count)
+                    .map(|i| ChatRowHandle::new(mk_user_msg(&text(i))))
+                    .collect(),
+            );
+        });
+        ScrolledTranscript::mount(state, tab_id, agent_id)
+    }
+
     /// Waits until scroll offset, content height and mounted rows stop
     /// changing across a full frame.
     async fn settle_scroll(container: &HtmlElement, scroller: &HtmlElement) {
@@ -5768,55 +5403,177 @@ mod wasm_tests {
         }
     }
 
+    fn first_visible_row(container: &HtmlElement, scroller: &HtmlElement) -> Element {
+        let viewport_top = scroller.get_bounding_client_rect().top();
+        message_rows(container)
+            .into_iter()
+            .find(|row| {
+                let rect = row.get_bounding_client_rect();
+                rect.height() > 0.0 && rect.bottom() > viewport_top + 1.0
+            })
+            .expect("a row is visible")
+    }
+
+    fn grow(row: &Element, px: u32) {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let growth = document.create_element("div").unwrap();
+        growth
+            .set_attribute("style", &format!("height: {px}px"))
+            .unwrap();
+        row.append_child(&growth).unwrap();
+    }
+
+    /// A reader partway through a streaming reply switches tabs. The reply
+    /// completes and more rows arrive than the tail window holds; coming back
+    /// shows the reply where it was.
+    #[wasm_bindgen_test]
+    async fn hidden_tab_returns_the_reader_to_the_reply_they_were_reading() {
+        let body = "tall row text ".repeat(220);
+        let transcript = mount_scrolled_transcript(TabId(10_018), "agent-away", 30, |i| {
+            format!("away msg {i} {body}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        let reply = "reply being read ".repeat(1_500);
+        let mut stream = crate::state::StreamingState::new("Agent".to_owned(), None);
+        stream.after_row = transcript.state.chat_rows.with_untracked(|rows| {
+            rows.get(&transcript.agent_id)
+                .and_then(|rows| rows.last())
+                .map(|row| row.id)
+        });
+        stream.text.set(reply.clone());
+        transcript.state.streaming_text.update(|streams| {
+            streams.insert(transcript.agent_id.clone(), stream);
+        });
+        transcript.scroll_up(300).await;
+        let reply_top = |container: &HtmlElement| {
+            let row = message_rows(container)
+                .into_iter()
+                .find(|row| {
+                    row.text_content()
+                        .unwrap_or_default()
+                        .contains("reply being read")
+                })
+                .expect("the reply is mounted");
+            row.get_bounding_client_rect().top() - scroller.get_bounding_client_rect().top()
+        };
+        assert!(
+            first_visible_row(&container, &scroller)
+                .text_content()
+                .unwrap_or_default()
+                .contains("reply being read"),
+            "precondition: the reader is inside the streaming reply"
+        );
+        let top_before = reply_top(&container);
+        let hidden_before = hidden_below_viewport(&container);
+
+        container.style().set_property("display", "none").unwrap();
+        settle_scroll(&container, &scroller).await;
+        transcript.state.streaming_text.update(|streams| {
+            streams.remove(&transcript.agent_id);
+        });
+        let mut completed = mk_user_msg(&reply);
+        completed.message.sender = MessageSender::Assistant {
+            agent: "Agent".to_owned(),
+        };
+        transcript
+            .state
+            .push_chat_entry(transcript.agent_id.clone(), completed);
+        for i in 0..15 {
+            transcript.state.push_chat_entry(
+                transcript.agent_id.clone(),
+                mk_user_msg(&format!("arrived while away {i} {body}")),
+            );
+        }
+        settle_scroll(&container, &scroller).await;
+        container.style().remove_property("display").unwrap();
+        settle_scroll(&container, &scroller).await;
+
+        let moved = reply_top(&container) - top_before;
+        assert!(
+            moved.abs() <= 1.0,
+            "returning to the tab moved the reply being read by {moved}px"
+        );
+        let hidden = hidden_below_viewport(&container);
+        assert!(
+            hidden > hidden_before + 1_000.0,
+            "the rows that arrived meanwhile lie below the reader, {hidden}px hidden"
+        );
+
+        scroller.set_scroll_top(scroller.scroll_top() - 200);
+        settle_scroll(&container, &scroller).await;
+        let scrolled = reply_top(&container) - top_before;
+        assert!(
+            (scrolled - 200.0).abs() <= 1.0,
+            "the returned transcript still scrolls: the reply moved {scrolled}px for 200px"
+        );
+    }
+
+    /// A scrolled-up reader returns to the same text after the view is
+    /// remounted, even though the transcript grew below them meanwhile.
+    #[wasm_bindgen_test]
+    async fn remount_restores_the_reading_position_after_the_transcript_grew() {
+        let transcript = mount_scrolled_transcript(TabId(10_003), "agent-scroll", 80, |i| {
+            format!("scroll msg {i}")
+        });
+        // Beyond the rows mounted first, so restoring also has to mount the
+        // row the reader was on.
+        transcript.scroll_up(1_800).await;
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        let hidden_before = hidden_below_viewport(&container);
+        assert!(
+            (hidden_before - 1_800.0).abs() <= 1.0,
+            "precondition: the reader is 1800px above the newest message, {hidden_before}px hidden"
+        );
+        let reading = first_visible_row(&container, &scroller);
+        let reading_text = reading.text_content().unwrap_or_default();
+        let reading_offset =
+            reading.get_bounding_client_rect().top() - scroller.get_bounding_client_rect().top();
+
+        for i in 0..6 {
+            transcript.state.push_chat_entry(
+                transcript.agent_id.clone(),
+                mk_user_msg(&format!("scroll msg arrived while away {i}")),
+            );
+        }
+        let transcript = transcript.remount();
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        settle_scroll(&container, &scroller).await;
+
+        let restored = first_visible_row(&container, &scroller);
+        assert_eq!(
+            restored.text_content().unwrap_or_default(),
+            reading_text,
+            "remount returns the reader to the message they were on"
+        );
+        let moved = restored.get_bounding_client_rect().top()
+            - scroller.get_bounding_client_rect().top()
+            - reading_offset;
+        assert!(
+            moved.abs() <= 1.0,
+            "remount moved the message being read by {moved}px"
+        );
+        let hidden = hidden_below_viewport(&container);
+        assert!(
+            hidden > hidden_before + 100.0,
+            "the messages that arrived meanwhile lie below the reader, {hidden}px hidden"
+        );
+        assert!(
+            container
+                .query_selector(".scroll-to-bottom-btn")
+                .unwrap()
+                .is_some(),
+            "a restored scrolled-up transcript offers the jump to bottom"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn jump_to_bottom_lands_on_the_last_row_when_rows_measure_taller() {
-        ensure_styles_loaded();
-
-        let agent_id = AgentId("agent-jump-bottom".to_owned());
-        let host_id = "host-jump-bottom".to_owned();
-        let tab_id = TabId(10_014);
-        let container = make_container();
-        let agent_id_for_mount = agent_id.clone();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            let bound = ActiveAgentRef {
-                host_id: host_id.clone(),
-                agent_id: agent_id_for_mount.clone(),
-            };
-            let body = "tall row text ".repeat(220);
-            let rows: Vec<ChatRowHandle> = (0..60)
-                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("jump msg {i} {body}"))))
-                .collect();
-            state.chat_rows.update(|m| {
-                m.insert(agent_id_for_mount.clone(), rows);
-            });
-            state.save_tab_scroll_state(
-                tab_id,
-                TabScrollState {
-                    scroll_top: 0,
-                    scroll_height: 12_000,
-                    client_height: 600,
-                    user_scrolled_up: true,
-                },
-            );
-            provide_context(state);
-            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
-            let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
+        let body = "tall row text ".repeat(220);
+        let transcript = mount_scrolled_transcript(TabId(10_014), "agent-jump-bottom", 60, |i| {
+            format!("jump msg {i} {body}")
         });
-
-        let scroller: HtmlElement = container
-            .query_selector(".chat-messages")
-            .unwrap()
-            .expect("chat scroller present")
-            .dyn_into()
-            .unwrap();
-        // Emulate WebKit, which ignores `overflow-anchor` entirely.
-        scroller
-            .style()
-            .set_property("overflow-anchor", "none")
-            .unwrap();
-        settle_scroll(&container, &scroller).await;
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        transcript.scroll_up(4_000).await;
 
         let button: HtmlElement = container
             .query_selector(".scroll-to-bottom-btn")
@@ -5831,10 +5588,10 @@ mod wasm_tests {
             .unwrap();
         settle_scroll(&container, &scroller).await;
 
-        let distance = scroller.scroll_height() - scroller.scroll_top() - scroller.client_height();
+        let hidden = hidden_below_viewport(&container);
         assert!(
-            distance <= 1,
-            "jump to bottom stopped {distance}px above the bottom"
+            hidden.abs() <= 1.0,
+            "jump to bottom stopped {hidden}px above the bottom"
         );
         let last = message_rows(&container)
             .last()
@@ -5857,97 +5614,217 @@ mod wasm_tests {
                 .query_selector(".scroll-to-bottom-btn")
                 .unwrap()
                 .is_none(),
-            "the jump button hides once the transcript is pinned"
+            "the jump button hides once the transcript is at the bottom"
         );
     }
 
+    /// The transcript must hold the bottom through layout it did not cause.
+    /// Content above the reader collapsing (a banner or the load-earlier
+    /// control going away) lowers the scroll offset without any user input;
+    /// a reply growing right after must not be mistaken for the reader having
+    /// scrolled up.
     #[wasm_bindgen_test]
-    async fn rows_growing_above_the_viewport_keep_the_reading_position() {
-        ensure_styles_loaded();
-
-        let agent_id = AgentId("agent-scroll-anchor".to_owned());
-        let host_id = "host-scroll-anchor".to_owned();
-        let tab_id = TabId(10_013);
-        let container = make_container();
-        let agent_id_for_mount = agent_id.clone();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            let bound = ActiveAgentRef {
-                host_id: host_id.clone(),
-                agent_id: agent_id_for_mount.clone(),
-            };
-            let rows: Vec<ChatRowHandle> = (0..80)
-                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("anchor msg {i}"))))
-                .collect();
-            state.chat_rows.update(|m| {
-                m.insert(agent_id_for_mount.clone(), rows);
-            });
-            state.save_tab_scroll_state(
-                tab_id,
-                TabScrollState {
-                    scroll_top: 0,
-                    scroll_height: 16_000,
-                    client_height: 600,
-                    user_scrolled_up: true,
-                },
-            );
-            provide_context(state);
-            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
-            let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
+    async fn bottom_survives_content_collapsing_above_while_a_reply_grows() {
+        let transcript = mount_scrolled_transcript(TabId(10_015), "agent-bottom-hold", 40, |i| {
+            format!("hold msg {i}")
         });
-
-        let scroller: HtmlElement = container
-            .query_selector(".chat-messages")
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            scroller.scroll_height() > scroller.client_height(),
+            "precondition: transcript must be scrollable"
+        );
+        let rows = message_rows(&container);
+        let banner = web_sys::window()
             .unwrap()
-            .expect("chat scroller present")
-            .dyn_into()
+            .document()
+            .unwrap()
+            .create_element("div")
             .unwrap();
-        // Emulate WebKit, which ignores `overflow-anchor` entirely.
-        scroller
-            .style()
-            .set_property("overflow-anchor", "none")
-            .unwrap();
+        banner.set_attribute("style", "height: 200px").unwrap();
+        let parent = rows[0].parent_element().unwrap();
+        parent.insert_before(&banner, Some(&rows[0])).unwrap();
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            hidden_below_viewport(&container).abs() <= 1.0,
+            "precondition: the transcript starts at the bottom"
+        );
+
+        let last = rows.last().unwrap().clone();
+        banner.remove();
+        // Lay out between the two changes, as any geometry read would.
+        let _ = scroller.scroll_height();
+        grow(&last, 300);
         settle_scroll(&container, &scroller).await;
 
-        // Fling into rows that have only ever been estimated.
-        scroller.set_scroll_top(2_000);
+        let hidden = hidden_below_viewport(&container);
+        assert!(
+            hidden.abs() <= 1.0,
+            "the transcript left the bottom by {hidden}px without any user scroll"
+        );
+        assert!(
+            container
+                .query_selector(".scroll-to-bottom-btn")
+                .unwrap()
+                .is_none(),
+            "a transcript at the bottom offers no jump button"
+        );
+
+        transcript.state.push_chat_entry(
+            transcript.agent_id.clone(),
+            mk_user_msg("hold msg appended"),
+        );
         settle_scroll(&container, &scroller).await;
+        let newest = message_rows(&container).last().unwrap().clone();
+        assert!(
+            newest
+                .text_content()
+                .unwrap_or_default()
+                .contains("hold msg appended")
+        );
+        assert!(
+            newest.get_bounding_client_rect().bottom()
+                <= scroller.get_bounding_client_rect().bottom() + 1.0,
+            "a new message arrives in view while the transcript is at the bottom"
+        );
+    }
+
+    /// A transcript shorter than the viewport reads from the top, and its
+    /// messages stay where they are as it grows past the first screen.
+    #[wasm_bindgen_test]
+    async fn short_transcript_starts_at_the_top_and_grows_in_place() {
+        let transcript = mount_scrolled_transcript(TabId(10_017), "agent-short", 3, |i| {
+            format!("short msg {i}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        settle_scroll(&container, &scroller).await;
+        let first = message_rows(&container)[0].clone();
+        let first_top = first.get_bounding_client_rect().top();
+        let gap = first_top - scroller.get_bounding_client_rect().top();
+        assert!(
+            (0.0..=40.0).contains(&gap),
+            "the first message sits at the top of the pane, {gap}px down"
+        );
+        assert!(
+            scroller.scroll_height() <= scroller.client_height(),
+            "precondition: the transcript is shorter than the viewport"
+        );
+
+        for i in 0..12 {
+            transcript.state.push_chat_entry(
+                transcript.agent_id.clone(),
+                mk_user_msg(&format!("short msg later {i}")),
+            );
+            settle_scroll(&container, &scroller).await;
+            assert!(
+                first.is_connected(),
+                "the first message was rebuilt when message {i} arrived"
+            );
+            if scroller.scroll_height() <= scroller.client_height() {
+                let moved = first.get_bounding_client_rect().top() - first_top;
+                assert!(
+                    moved.abs() <= 1.0,
+                    "a new message moved the first one by {moved}px"
+                );
+            }
+        }
+        assert_eq!(
+            message_rows(&container).len(),
+            15,
+            "every message of a transcript this short is on screen or one scroll away"
+        );
+    }
+
+    /// Older rows mount as the reader approaches them and are dropped again
+    /// once far behind. Neither may move what the reader is looking at.
+    #[wasm_bindgen_test]
+    async fn older_rows_appear_without_moving_the_reader() {
+        let total = 200;
+        let body = "reveal row text ".repeat(40);
+        let transcript = mount_scrolled_transcript(TabId(10_016), "agent-reveal", total, |i| {
+            format!("reveal msg {i} {body}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        settle_scroll(&container, &scroller).await;
+        let is_first = |row: &Element| {
+            row.text_content()
+                .unwrap_or_default()
+                .contains("reveal msg 0 ")
+        };
+        let mounted_at_bottom = message_rows(&container).len();
+        assert!(
+            mounted_at_bottom < total && !message_rows(&container).iter().any(is_first),
+            "a long transcript does not mount its oldest rows up front"
+        );
+
+        while !message_rows(&container).iter().any(is_first) {
+            let mounted = message_rows(&container).len();
+            // Jump to the top of what is mounted, without waiting for layout.
+            scroller.set_scroll_top(scroller.client_height() - scroller.scroll_height());
+            let visible = first_visible_row(&container, &scroller);
+            let visible_top = visible.get_bounding_client_rect().top();
+            settle_scroll(&container, &scroller).await;
+            assert!(
+                message_rows(&container).len() > mounted
+                    || message_rows(&container).iter().any(is_first),
+                "reaching the top of the mounted rows reveals older ones"
+            );
+            let moved = visible.get_bounding_client_rect().top() - visible_top;
+            assert!(
+                visible.is_connected() && moved.abs() <= 1.0,
+                "revealing older rows moved the visible row by {moved}px"
+            );
+        }
+        let oldest = message_rows(&container)[0].clone();
+        scroller.set_scroll_top(scroller.client_height() - scroller.scroll_height());
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            (oldest.get_bounding_client_rect().top() - scroller.get_bounding_client_rect().top())
+                .abs()
+                <= 9.0,
+            "the oldest message is reachable at the top of the transcript"
+        );
+
+        scroller.set_scroll_top(0);
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            hidden_below_viewport(&container).abs() <= 1.0,
+            "returning to the bottom lands on the newest message"
+        );
+        assert!(
+            message_rows(&container).len() < total,
+            "rows far above the reader are dropped again"
+        );
+    }
+
+    /// WebKit has no CSS scroll anchoring. Content changing height anywhere
+    /// in the transcript must not move the text a scrolled-up reader is on.
+    #[wasm_bindgen_test]
+    async fn rows_changing_height_keep_the_reading_position() {
+        let transcript = mount_scrolled_transcript(TabId(10_013), "agent-scroll-anchor", 80, |i| {
+            format!("anchor msg {i}")
+        });
+        let (container, scroller) = (transcript.container.clone(), transcript.scroller.clone());
+        transcript.scroll_up(1_200).await;
 
         let viewport_top = scroller.get_bounding_client_rect().top();
-        let rows = message_rows(&container);
-        let visible = rows
-            .iter()
-            .find(|row| row.get_bounding_client_rect().bottom() > viewport_top + 1.0)
-            .expect("a row is visible")
-            .clone();
-        let above = rows
-            .iter()
+        let visible = first_visible_row(&container, &scroller);
+        let above = message_rows(&container)
+            .into_iter()
             .rev()
             .find(|row| row.get_bounding_client_rect().bottom() <= viewport_top)
-            .expect("overscan keeps rows mounted above the viewport")
-            .clone();
+            .expect("rows are mounted above the viewport");
         let visible_text = visible.text_content().unwrap_or_default();
         let visible_top = visible.get_bounding_client_rect().top();
-        let scroll_before = scroller.scroll_top();
 
-        let document = web_sys::window().unwrap().document().unwrap();
-        let growth = document.create_element("div").unwrap();
-        growth.set_attribute("style", "height: 300px").unwrap();
-        above.append_child(&growth).unwrap();
+        grow(&above, 300);
         settle_scroll(&container, &scroller).await;
-
         assert!(visible.is_connected(), "the visible row stays mounted");
         assert_eq!(visible.text_content().unwrap_or_default(), visible_text);
         let moved = visible.get_bounding_client_rect().top() - visible_top;
         assert!(
             moved.abs() <= 1.0,
             "growth above the viewport moved the visible row by {moved}px"
-        );
-        let absorbed = scroller.scroll_top() - scroll_before;
-        assert!(
-            (299..=301).contains(&absorbed),
-            "the scroll offset must absorb the 300px growth above the viewport, moved {absorbed}px"
         );
 
         let below = message_rows(&container)
@@ -5956,20 +5833,34 @@ mod wasm_tests {
             .find(|row| {
                 row.get_bounding_client_rect().top() >= scroller.get_bounding_client_rect().bottom()
             })
-            .expect("overscan keeps rows mounted below the viewport");
-        let scroll_before = scroller.scroll_top();
-        let growth = document.create_element("div").unwrap();
-        growth.set_attribute("style", "height: 300px").unwrap();
-        below.append_child(&growth).unwrap();
+            .expect("rows are mounted below the viewport");
+        grow(&below, 300);
         settle_scroll(&container, &scroller).await;
-        assert_eq!(
-            scroller.scroll_top(),
-            scroll_before,
-            "growth below the viewport leaves the reading position alone"
-        );
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
         assert!(
-            (visible.get_bounding_client_rect().top() - visible_top).abs() <= 1.0,
-            "growth below the viewport must not move the visible row"
+            moved.abs() <= 1.0,
+            "growth below the viewport moved the visible row by {moved}px"
+        );
+
+        // Flow hides its empty rows. Rows without a layout box anywhere in
+        // the list must not confuse which row the reader is on.
+        for (index, row) in message_rows(&container).iter().enumerate() {
+            if index % 2 == 0 && *row != visible && *row != below {
+                row.set_attribute("style", "display: none").unwrap();
+            }
+        }
+        settle_scroll(&container, &scroller).await;
+        let visible_top = visible.get_bounding_client_rect().top();
+        assert!(
+            first_visible_row(&container, &scroller) == visible,
+            "precondition: the reader is still on the same row"
+        );
+        grow(&below, 300);
+        settle_scroll(&container, &scroller).await;
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
+        assert!(
+            moved.abs() <= 1.0,
+            "growth below the viewport moved the visible row by {moved}px among hidden rows"
         );
 
         // A row straddling the viewport top grows at its bottom, as a
@@ -5986,16 +5877,8 @@ mod wasm_tests {
                 && visible.get_bounding_client_rect().bottom() > viewport_top,
             "the visible row straddles the viewport top"
         );
-        let scroll_before = scroller.scroll_top();
-        let growth = document.create_element("div").unwrap();
-        growth.set_attribute("style", "height: 300px").unwrap();
-        visible.append_child(&growth).unwrap();
+        grow(&visible, 300);
         settle_scroll(&container, &scroller).await;
-        assert_eq!(
-            scroller.scroll_top(),
-            scroll_before,
-            "growth inside a straddling row leaves the reading position alone"
-        );
         let moved = visible.get_bounding_client_rect().top() - straddling_top;
         assert!(
             moved.abs() <= 1.0,
@@ -6069,9 +5952,10 @@ mod wasm_tests {
             scroller.scroll_height() > scroller.client_height(),
             "precondition: transcript must be scrollable"
         );
-        scroller.set_scroll_top(scroller.scroll_height());
-        let bottom_before = scroller.scroll_height() - scroller.client_height();
-        assert_eq!(scroller.scroll_top(), bottom_before);
+        assert!(
+            hidden_below_viewport(&container).abs() <= 1.0,
+            "precondition: the transcript starts at the bottom"
+        );
 
         js_sys::eval(
             r#"
@@ -6095,10 +5979,9 @@ mod wasm_tests {
             .unwrap();
         next_animation_frame().await;
 
-        let distance_from_bottom =
-            scroller.scroll_height() - scroller.client_height() - scroller.scroll_top();
+        let distance_from_bottom = hidden_below_viewport(&container);
         assert!(
-            distance_from_bottom.abs() <= 1,
+            distance_from_bottom.abs() <= 1.0,
             "typing without changing composer height must keep the transcript at bottom; \
              it moved {distance_from_bottom}px away"
         );

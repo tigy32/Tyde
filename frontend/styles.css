@@ -2913,12 +2913,28 @@ kbd {
     position: absolute;
     inset: 0;
     overflow-y: auto;
-    /* ChatView anchors rows itself; WebKit has no native anchoring. */
+    /* Reversed so the scroll offset is measured from the newest message:
+       the engine keeps the bottom in view as the transcript grows, and rows
+       added above the viewport never move it. ChatView handles the one
+       remaining case itself, so native anchoring stays off in every engine. */
     overflow-anchor: none;
+    display: flex;
+    flex-direction: column-reverse;
+}
+
+.chat-transcript {
+    flex: 0 0 auto;
+    /* A transcript shorter than the viewport starts at the top. */
+    margin-bottom: auto;
     padding: 8px 8px 24px 8px;
     display: flex;
     flex-direction: column;
-    gap: 0;
+}
+
+.chat-rows {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
 }
 
 /* ===== Scroll-to-Bottom Button ===== */
@@ -2973,12 +2989,6 @@ kbd {
     margin-top: 6px;
 }
 
-/* Virtualized chat history. Rows outside the viewport (plus a small
-   overscan) are unmounted; their absence is reserved by `.virt-spacer`
-   divs whose height is computed in Rust from estimated/measured row
-   heights. `display: block` on `.virt-row` is intentional — flex
-   layouts on the parent don't apply to spacers, which would otherwise
-   collapse to zero. */
 .virt-row {
     display: block;
 }
@@ -2987,12 +2997,7 @@ kbd {
     margin-top: 6px;
 }
 
-.virt-spacer {
-    flex: 0 0 auto;
-    width: 100%;
-}
-
-/* Collapsed-history banner: shown above the windowed list when a long
+/* Collapsed-history banner: shown above the row list when a long
    restored session renders only its last message. The button reveals the
    earlier messages; the note clarifies the AI still has full context. */
 .chat-history-collapsed {
@@ -3026,10 +3031,10 @@ kbd {
     max-width: 42ch;
 }
 
-/* Hidden orchestration panels and live banners can sit between the spacer
-   and streaming reply. Preserve the history-row gap without requiring
-   adjacent siblings or adding margins to the virtualizer's spacers. */
-.virt-spacer-bottom ~ .chat-card {
+/* Hidden orchestration panels and live banners can sit between the rows
+   and a following card. Preserve the history-row gap without requiring
+   adjacent siblings. */
+.chat-rows ~ .chat-card {
     margin-top: 6px;
 }
 

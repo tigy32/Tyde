@@ -4241,7 +4241,9 @@ class WasmToolScriptTests(unittest.TestCase):
                 self.assertNotEqual(targets[0].resolve(), targets[1].resolve())
                 for target in targets:
                     self.assertFalse(target.is_symlink())
-                    self.assertTrue(list(target.glob(f"{triple}/debug/deps/libcheck_cache_dependency-*.rlib")))
+                    # Cargo 1.100 writes each unit under build/<package>/<hash>/out
+                    # instead of deps/, so locate the artifact wherever it lands.
+                    self.assertTrue(list(target.glob(f"{triple}/debug/**/libcheck_cache_dependency-*.rlib")))
 
                 source.write_text("pub fn version() -> u8 { 2 }\n", encoding="utf-8")
                 changed = run_checkout(fixtures[1], 2)

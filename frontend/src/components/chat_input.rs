@@ -44,16 +44,6 @@ fn target_instance_stream(
 }
 
 fn resize_composer(textarea: &web_sys::HtmlTextAreaElement, measure: &web_sys::HtmlElement) {
-    let textarea_element: &web_sys::Element = textarea.unchecked_ref();
-    let scroller = textarea_element
-        .closest(".chat-view-main")
-        .ok()
-        .flatten()
-        .and_then(|main| main.query_selector(".chat-messages").ok().flatten());
-    let was_at_bottom = scroller
-        .as_ref()
-        .is_some_and(|el| el.scroll_height() - el.scroll_top() - el.client_height() <= 1);
-
     measure.set_text_content(Some(&format!("{}\u{200b}", textarea.value())));
     let measure_style = measure.style();
     let _ = measure_style.set_property("width", &format!("{}px", textarea.offset_width()));
@@ -70,10 +60,6 @@ fn resize_composer(textarea: &web_sys::HtmlTextAreaElement, measure: &web_sys::H
         "hidden"
     };
     let _ = style.set_property("overflow-y", overflow);
-
-    if let Some(scroller) = scroller.filter(|_| was_at_bottom) {
-        scroller.set_scroll_top(scroller.scroll_height());
-    }
 }
 
 fn target_instance_stream_tracked(

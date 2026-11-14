@@ -72,7 +72,9 @@ around the incident. These new lines are pasteable, content-free diagnostics:
   registration origin of selected Leptos effect futures. Each entry contains
   `producer` and `work` (the same six counters/times as `task_work`). At most
   five entries exist: `chat_scroll_restore`, `chat_auto_scroll`,
-  `chat_row_measure`, `tab_strip_visibility`, and `unattributed`. Origins are
+  `chat_row_measure`, `tab_strip_visibility`, and `unattributed`. Current
+  builds no longer register `chat_auto_scroll` or `chat_row_measure`; the names
+  remain valid for logs written by older builds. Origins are
   captured synchronously around the real `Effect::new` call, before its future
   is submitted to the existing executor, and retained until that future drops.
   Later polls, including dependency checks that do not execute the callback,

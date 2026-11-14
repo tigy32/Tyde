@@ -1226,6 +1226,15 @@ pub struct TabScrollState {
     pub user_scrolled_up: bool,
 }
 
+/// Where a scrolled-up reader is in a chat transcript: `row`'s top edge sits
+/// `offset` px below the top of the viewport. Absent while the transcript is
+/// at its newest message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatReadingPosition {
+    pub row: ChatRowId,
+    pub offset: i32,
+}
+
 pub fn next_tab_id() -> TabId {
     NEXT_TAB_ID.with(|cell| {
         let id = cell.get();
@@ -4073,6 +4082,7 @@ pub struct AppState {
     /// pane's active tab so one pane cannot evict the other.
     pub tab_lru: RwSignal<Vec<TabId>>,
     pub tab_scroll_state: RwSignal<HashMap<TabId, TabScrollState>>,
+    pub chat_reading_position: RwSignal<HashMap<TabId, ChatReadingPosition>>,
     pub tabs_enabled: RwSignal<bool>,
     pub sidebar_backend_labels: RwSignal<bool>,
     pub sidebar_layout: RwSignal<crate::sidebar_layout::ClientLayouts>,
@@ -4643,6 +4653,7 @@ impl AppState {
             center_split_ratio: RwSignal::new(SplitRatio::default()),
             tab_lru: RwSignal::new(initial_lru),
             tab_scroll_state: RwSignal::new(HashMap::new()),
+            chat_reading_position: RwSignal::new(HashMap::new()),
             tabs_enabled: RwSignal::new(true),
             sidebar_backend_labels: RwSignal::new(true),
             sidebar_layout: RwSignal::new(crate::sidebar_layout::ClientLayouts::default()),
@@ -8090,6 +8101,9 @@ impl AppState {
         self.tab_scroll_state.update(|scroll| {
             scroll.remove(&id);
         });
+        self.chat_reading_position.update(|positions| {
+            positions.remove(&id);
+        });
     }
 
     pub(crate) fn forget_removed_tab_occurrence_state(&self, doomed: &HashSet<TabId>) {
@@ -8101,6 +8115,9 @@ impl AppState {
         });
         self.tab_scroll_state.update(|scroll| {
             scroll.retain(|id, _| !doomed.contains(id));
+        });
+        self.chat_reading_position.update(|positions| {
+            positions.retain(|id, _| !doomed.contains(id));
         });
         self.forget_composers(doomed);
         self.code_intel_hover.update(|hover| {
