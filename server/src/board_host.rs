@@ -5,6 +5,87 @@ use protocol::{
 };
 
 impl HostHandle {
+    pub(crate) async fn subscribe_board_membership_changes(&self) -> watch::Receiver<()> {
+        self.state
+            .with(|state| state.board_membership_changes.subscribe())
+            .await
+    }
+
+    pub(crate) async fn board_membership_snapshot(
+        &self,
+        caller: &AgentId,
+        project: &ProjectId,
+        input: &protocol::AwaitBoardInput,
+    ) -> Result<protocol::AwaitBoardResult, String> {
+        if self.board_caller_project(caller).await?.as_ref() != Some(project) {
+            return Err("board await caller changed project or is no longer active".into());
+        }
+        let board = self
+            .board_snapshot(project.clone())
+            .await
+            .map_err(|error| error.message)?;
+        if !board.customized {
+            return Err("board tools are not enabled until lanes are edited".into());
+        }
+        if let protocol::BoardMembershipScope::Lane { lane_id } = &input.scope
+            && !board.lanes.iter().any(|lane| &lane.id == lane_id)
+        {
+            return Err("watched board lane no longer exists".into());
+        }
+        let mut members = Vec::new();
+        for card in &board.cards {
+            let included = match &input.scope {
+                protocol::BoardMembershipScope::Board => true,
+                protocol::BoardMembershipScope::Lane { lane_id } => {
+                    let location = match &card.location {
+                        protocol::BoardLocation::Parent { card_id } => {
+                            &board
+                                .cards
+                                .iter()
+                                .find(|parent| &parent.id == card_id)
+                                .ok_or("nested board card has no parent")?
+                                .location
+                        }
+                        location => location,
+                    };
+                    match location {
+                        protocol::BoardLocation::Lane {
+                            project_id,
+                            lane_id: current,
+                        } => project_id == project && current == lane_id,
+                        protocol::BoardLocation::Parent { .. } => {
+                            return Err("board nesting exceeds one level".into());
+                        }
+                    }
+                }
+            };
+            if included {
+                members.push(card.id.clone());
+            }
+        }
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        let previous: HashSet<_> = input.members.iter().collect();
+        let current: HashSet<_> = members.iter().collect();
+        let added = members
+            .iter()
+            .filter(|id| !previous.contains(id))
+            .cloned()
+            .collect();
+        let mut removed: Vec<_> = input
+            .members
+            .iter()
+            .filter(|id| !current.contains(id))
+            .cloned()
+            .collect();
+        removed.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(protocol::AwaitBoardResult {
+            project_id: project.clone(),
+            scope: input.scope.clone(),
+            members,
+            added,
+            removed,
+        })
+    }
     pub(crate) async fn board_lane_sections(&self) -> Result<HashMap<ProjectId, String>, String> {
         let board = self.state.with(|state| state.board.clone()).await;
         let mut sections = board.sections().await?;
@@ -59,7 +140,7 @@ impl HostHandle {
             .map_err(|error| error.message)?;
         Ok(match tool {
             "tyde_board_lanes" => role != protocol::AgentTydePermissions::Agent,
-            "tyde_board_read" | "tyde_board_move" => board.customized,
+            "tyde_board_read" | "tyde_board_move" | "tyde_await_board" => board.customized,
             _ => true,
         })
     }
@@ -157,7 +238,11 @@ impl HostHandle {
                 Box::pin(async move {
                     let live = live_cards(state)
                         .map_err(|message| fail(BoardErrorCode::NotFound, message))?;
+                    let mutation = !matches!(command, BoardCommandPayload::Read(_));
                     let result = board.apply(command, live, actor).await?;
+                    if mutation {
+                        state.board_membership_changes.send_replace(());
+                    }
                     let payload = serde_json::to_value(&result)
                         .map_err(|error| fail(BoardErrorCode::Storage, error.to_string()))?;
                     state.host_streams.retain(|path, subscriber| {
@@ -267,6 +352,7 @@ pub(super) fn start_live_updates(
             let projects = host
                 .state
                 .with(|state| {
+                    state.board_membership_changes.send_replace(());
                     state
                         .board_subscriptions
                         .values()

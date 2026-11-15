@@ -939,3 +939,249 @@ async fn board_lanes_cards_tools_steering_and_restart() {
         .expect("typed subscription failure");
     assert_eq!(error.code, BoardErrorCode::Storage);
 }
+
+struct BoardWait {
+    response: reqwest::Response,
+    buffered: String,
+}
+impl BoardWait {
+    async fn event(&mut self) -> Value {
+        loop {
+            if let Some(end) = self.buffered.find("\n\n") {
+                let frame: String = self.buffered.drain(..end + 2).collect();
+                if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+                    return serde_json::from_str(data).expect("board await SSE JSON");
+                }
+            } else {
+                let chunk = self
+                    .response
+                    .chunk()
+                    .await
+                    .expect("board await SSE chunk")
+                    .expect("board await stream remains open");
+                self.buffered
+                    .push_str(std::str::from_utf8(&chunk).expect("SSE UTF-8"));
+            }
+        }
+    }
+    async fn result(mut self) -> Value {
+        loop {
+            let event = self.event().await;
+            if event.get("id").is_some() {
+                return event;
+            }
+        }
+    }
+}
+async fn waiting(
+    caller: &server::AgentControlMcpCaller,
+    scope: Value,
+    members: Value,
+) -> BoardWait {
+    let response = reqwest::Client::new()
+        .post(&caller.await_url)
+        .header("Authorization", &caller.authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .json(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"tyde_await_board","arguments":{"scope":scope,"members":members},
+                "_meta":{"progressToken":"board-membership"}
+            }}),
+        )
+        .send()
+        .await
+        .expect("open board wait");
+    assert!(response.status().is_success());
+    let mut wait = BoardWait {
+        response,
+        buffered: String::new(),
+    };
+    let ready = wait.event().await;
+    assert_eq!(
+        ready["method"], "notifications/progress",
+        "wait must reach its unchanged snapshot"
+    );
+    wait
+}
+fn membership(response: Value) -> AwaitBoardResult {
+    assert_ne!(
+        response["result"]["isError"], true,
+        "board await must succeed"
+    );
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("membership response text"),
+    )
+    .expect("typed board membership")
+}
+
+#[tokio::test]
+async fn board_membership_waits_are_scoped_event_driven_and_cancelled() {
+    let mut f = Fixture::new().await;
+    f.client
+        .project_create(ProjectCreatePayload {
+            name: "Membership".into(),
+            roots: vec![ProjectRootPath("/tmp".into())],
+        })
+        .await
+        .expect("create membership project");
+    let ProjectNotifyPayload::Upsert { project } =
+        next_frame_matching_on(&mut f.client, "membership project", |frame| {
+            frame.kind == FrameKind::ProjectNotify
+        })
+        .await
+        .parse_payload()
+        .expect("project notify")
+    else {
+        panic!("project upsert")
+    };
+    let (a, _) = spawn(&mut f, &project.id, "Watcher").await;
+    let caller = f.agent_control_caller(&a.new_agent.agent_id).await;
+    let mut await_caller = caller.clone();
+    await_caller.url = caller.await_url.clone();
+    assert!(
+        !rpc(&await_caller, "tools/list", json!({})).await["result"]["tools"]
+            .as_array()
+            .expect("await tools")
+            .iter()
+            .any(|tool| tool["name"] == "tyde_await_board")
+    );
+    let original = read(&mut f, &project.id).await;
+    let mut configured = original.lanes.clone();
+    configured[0].name = "In Progress".into();
+    configured[1].name = "Pending Merge".into();
+    let mut board = lanes(&mut f, &original, configured).await;
+    assert!(
+        rpc(&await_caller, "tools/list", json!({})).await["result"]["tools"]
+            .as_array()
+            .expect("await tools")
+            .iter()
+            .any(|tool| tool["name"] == "tyde_await_board")
+    );
+    assert!(
+        !rpc(&caller, "tools/list", json!({})).await["result"]["tools"]
+            .as_array()
+            .expect("control tools")
+            .iter()
+            .any(|tool| tool["name"] == "tyde_await_board")
+    );
+    let lane = json!({"kind":"lane","lane_id":board.lanes[1].id});
+    let wait = waiting(&caller, lane.clone(), json!([])).await;
+    let (b, _) = spawn(&mut f, &project.id, "Worker").await;
+    board = read(&mut f, &project.id).await;
+    let bid = board
+        .cards
+        .iter()
+        .find(|card| card.agent_id == b.new_agent.agent_id)
+        .expect("worker card")
+        .id
+        .clone();
+    // Unrelated lane membership and lane renaming must not complete the wait.
+    let mut renamed = board.lanes.clone();
+    renamed[1].name = "Ready".into();
+    board = lanes(&mut f, &board, renamed).await;
+    board = move_card(
+        &mut f,
+        &board,
+        &bid,
+        BoardDestination::Lane {
+            name: "Ready".into(),
+        },
+    )
+    .await;
+    let entered = membership(wait.result().await);
+    assert_eq!(entered.members.as_slice(), std::slice::from_ref(&bid));
+    assert_eq!(entered.added.as_slice(), std::slice::from_ref(&bid));
+    assert!(entered.removed.is_empty());
+    // A change made before the next call must return immediately, not be lost.
+    let immediate = membership(
+        rpc(
+            &await_caller,
+            "tools/call",
+            json!({
+                "name":"tyde_await_board","arguments":{"scope":lane,"members":[]}
+            }),
+        )
+        .await,
+    );
+    assert_eq!(immediate.members, entered.members);
+    let wait = waiting(&caller, lane.clone(), json!([bid])).await;
+    let aid = board
+        .cards
+        .iter()
+        .find(|card| card.agent_id == a.new_agent.agent_id)
+        .expect("watcher card")
+        .id
+        .clone();
+    board = move_card(
+        &mut f,
+        &board,
+        &aid,
+        BoardDestination::Parent {
+            card_id: bid.clone(),
+        },
+    )
+    .await;
+    let nested = membership(wait.result().await);
+    assert_eq!(nested.added.as_slice(), std::slice::from_ref(&aid));
+    assert_eq!(nested.members.len(), 2);
+    let wait = waiting(&caller, lane.clone(), json!(nested.members)).await;
+    board = move_card(
+        &mut f,
+        &board,
+        &bid,
+        BoardDestination::Lane {
+            name: "In Progress".into(),
+        },
+    )
+    .await;
+    let left = membership(wait.result().await);
+    assert!(left.members.is_empty());
+    assert_eq!(left.removed.len(), 2);
+    let baseline: Vec<_> = board.cards.iter().map(|card| card.id.clone()).collect();
+    let wait = waiting(&caller, json!({"kind":"board"}), json!(baseline)).await;
+    board = move_card(
+        &mut f,
+        &board,
+        &aid,
+        BoardDestination::Lane {
+            name: "In Progress".into(),
+        },
+    )
+    .await;
+    let (c, _) = spawn(&mut f, &project.id, "New member").await;
+    let born = membership(wait.result().await);
+    assert_eq!(born.added.len(), 1);
+    let cid = born.added[0].clone();
+    let wait = waiting(&caller, json!({"kind":"board"}), json!(born.members)).await;
+    f.client
+        .close_agent(&c.stream)
+        .await
+        .expect("close untouched member");
+    let closed = membership(wait.result().await);
+    assert_eq!(closed.removed, [cid]);
+    assert!(closed.added.is_empty());
+    let wait = waiting(&caller, lane.clone(), json!([])).await;
+    let retained_lanes = vec![board.lanes[0].clone()];
+    board = lanes(&mut f, &board, retained_lanes).await;
+    assert_eq!(board.lanes.len(), 1);
+    assert_eq!(wait.result().await["result"]["isError"], true);
+    let invalid = rpc(
+        &await_caller,
+        "tools/call",
+        json!({
+            "name":"tyde_await_board","arguments":{"scope":{"kind":"board"},"members":[aid,aid]}
+        }),
+    )
+    .await;
+    assert_eq!(invalid["result"]["isError"], true);
+    let current = read(&mut f, &project.id).await;
+    let ids: Vec<_> = current.cards.iter().map(|card| card.id.clone()).collect();
+    let wait = waiting(&caller, json!({"kind":"board"}), json!(ids)).await;
+    f.client
+        .close_agent(&a.stream)
+        .await
+        .expect("close waiting caller");
+    assert_eq!(wait.result().await["result"]["isError"], true);
+}

@@ -11776,6 +11776,28 @@ pub struct BoardToolMoveInput {
     pub note: Option<String>,
     pub card_id: Option<BoardCardId>,
 }
+/// Membership ignores ordering, titles, runtime activity and agent/session rebinding.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoardMembershipScope {
+    Board,
+    Lane { lane_id: BoardLaneId },
+}
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AwaitBoardInput {
+    pub scope: BoardMembershipScope,
+    /// The last observed set of stable card IDs. Empty means wait for a nonempty set.
+    pub members: Vec<BoardCardId>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwaitBoardResult {
+    pub project_id: ProjectId,
+    pub scope: BoardMembershipScope,
+    pub members: Vec<BoardCardId>,
+    pub added: Vec<BoardCardId>,
+    pub removed: Vec<BoardCardId>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct BoardToolLanesInput {
     pub lanes: Option<Vec<BoardLane>>,

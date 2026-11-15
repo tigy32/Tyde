@@ -486,7 +486,7 @@ impl AgentControlDiscovery {
             .map_err(|error| error.message)?;
         let mut names = vec![];
         if board.customized {
-            names.extend(["tyde_board_read", "tyde_board_move"]);
+            names.extend(["tyde_board_read", "tyde_board_move", "tyde_await_board"]);
         }
         if start.tyde_permissions != protocol::AgentTydePermissions::Agent {
             names.push("tyde_board_lanes");
@@ -1274,7 +1274,7 @@ async fn require_authenticated_caller(
         .ok_or_else(|| format!("{tool_name} requires an agent-control bearer credential"))?;
     if matches!(
         tool_name,
-        "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes"
+        "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes" | "tyde_await_board"
     ) && !server.host.board_tool_allowed(&caller, tool_name).await?
     {
         return Err("board tool is not enabled for this caller".into());
@@ -2370,6 +2370,103 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
+        description = "Wait until this project's board or lane membership differs from members, the last observed set of stable card IDs. Returns immediately if already different; otherwise event-waits without a timeout. Lane scope includes nested cards. Ignores order, titles, activity and session rebinding. Returns current members plus added/removed IDs; use board_read for card details. No agent messages are sent."
+    )]
+    async fn tyde_await_board(
+        &self,
+        Parameters(input): Parameters<protocol::AwaitBoardInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let _active_request = ActiveAwaitRequestGuard::new(Arc::clone(&self.active_await_requests));
+        let caller = match require_authenticated_caller(self, &parts, "tyde_await_board").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let (_guard, cancellation) = AgentAwaitCancellationGuard::register(
+            Arc::clone(&self.await_request_cancellations),
+            caller.clone(),
+        );
+        let reporter = AwaitProgressReporter::from_context(&context);
+        let mut progress = 0.0;
+        let mut tick = tokio::time::interval_at(
+            Instant::now() + AWAIT_TOOL_PROGRESS_INTERVAL,
+            AWAIT_TOOL_PROGRESS_INTERVAL,
+        );
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let members: std::collections::HashSet<_> = input.members.iter().cloned().collect();
+        if members.len() != input.members.len() {
+            return Ok(err_text("members must contain unique card IDs"));
+        }
+        let project = match self.host.board_caller_project(&caller).await {
+            Ok(Some(project)) => project,
+            Ok(None) => return Ok(err_text("caller has no top-level project card")),
+            Err(error) => return Ok(err_text(error)),
+        };
+        // Subscribe before the first snapshot so a concurrent move cannot be lost.
+        let mut changes = self.host.subscribe_board_membership_changes().await;
+        let mut initial = true;
+        loop {
+            let snapshot = self
+                .host
+                .board_membership_snapshot(&caller, &project, &input)
+                .await;
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Ok(err_text(error)),
+            };
+            if !snapshot.added.is_empty() || !snapshot.removed.is_empty() {
+                return ok_json(snapshot);
+            }
+            if initial {
+                if let Some(reporter) = &reporter {
+                    progress += 1.0;
+                    if let Err(error) = reporter
+                        .peer
+                        .notify_progress(ProgressNotificationParam {
+                            progress_token: reporter.progress_token.clone(),
+                            progress,
+                            total: None,
+                            message: Some("Waiting for board membership changes".into()),
+                        })
+                        .await
+                    {
+                        return Ok(err_text(format!(
+                            "Cannot report board wait progress: {error}"
+                        )));
+                    }
+                }
+                initial = false;
+            }
+            loop {
+                tokio::select! {
+                biased;
+                _ = self.await_expiration.cancelled() => return AwaitToolFailure::HostStopping.into_tool_result("tyde_await_board"),
+                _ = cancellation.cancelled() => return Ok(err_text("board await request cancelled")),
+                _ = context.ct.cancelled() => return Ok(err_text("board await request cancelled")),
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Ok(err_text("board membership notification channel closed"));
+                    }
+                    break;
+                },
+                _ = tick.tick(), if reporter.is_some() => {
+                    if let Some(reporter) = &reporter {
+                        progress += 1.0;
+                        if let Err(error) = reporter.peer.notify_progress(ProgressNotificationParam {
+                            progress_token: reporter.progress_token.clone(), progress, total: None,
+                            message: Some("Waiting for board membership changes".into()),
+                        }).await {
+                            return Ok(err_text(format!("Cannot report board wait progress: {error}")));
+                        }
+                    }
+                }
+                }
+            }
+        }
+    }
+
+    #[tool(
         description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
@@ -3023,7 +3120,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
                 "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_review on the await server to run configured advisory reviewers and return completion/counts in one call. Use ID-scoped list/read/edit/resolve tools on this server; full audit history is bounded and on demand. Completion is not approval. Review results never arrive as injected messages. Read your current Tyde permissions with tyde_get_permissions. Agent controls only its own children; Tyde Orchestrator can control any agent and add new steering or review aspects; Root can use every Tyde control. Configuration changes are only within your human-assigned role."
             }
             AgentControlMcpSurface::Await => {
-                "Long-running tools without local work timers: tyde_request_permissions waits for a human permission-mode decision; tyde_await_agents waits for direct children; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."
+                "Long-running tools without local work timers: tyde_request_permissions waits for a human permission-mode decision; tyde_await_agents waits for direct children; tyde_await_board waits for board/lane membership changes; tyde_review runs configured advisory review and returns completion/counts in one call. Repeat its request_id to reattach after interruption. Use control tools for bounded finding details and audit history."
             }
         };
         ServerInfo {
@@ -3116,7 +3213,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
         tools.retain(|tool| {
             !matches!(
                 tool.name.as_ref(),
-                "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes"
+                "tyde_board_read" | "tyde_board_move" | "tyde_board_lanes" | "tyde_await_board"
             ) || board_tools.contains(&tool.name.as_ref())
         });
         if let Some(discovered) = &discovered {
@@ -3132,12 +3229,18 @@ impl ServerHandler for TydeAgentControlMcpServer {
         tools.retain(|tool| match self.surface {
             AgentControlMcpSurface::Control => !matches!(
                 tool.name.as_ref(),
-                "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+                "tyde_await_agents"
+                    | "tyde_await_board"
+                    | "tyde_review"
+                    | "tyde_request_permissions"
             ),
             AgentControlMcpSurface::Await => {
                 matches!(
                     tool.name.as_ref(),
-                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+                    "tyde_await_agents"
+                        | "tyde_await_board"
+                        | "tyde_review"
+                        | "tyde_request_permissions"
                 )
             }
         });
@@ -3286,11 +3389,11 @@ impl ServerHandler for TydeAgentControlMcpServer {
             let allowed = match self.surface {
                 AgentControlMcpSurface::Control => !matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+                    "tyde_await_agents" | "tyde_await_board" | "tyde_review" | "tyde_request_permissions"
                 ),
                 AgentControlMcpSurface::Await => matches!(
                     request.name.as_ref(),
-                    "tyde_await_agents" | "tyde_review" | "tyde_request_permissions"
+                    "tyde_await_agents" | "tyde_await_board" | "tyde_review" | "tyde_request_permissions"
                 ),
             };
             if !allowed {

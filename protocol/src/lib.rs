@@ -289,3 +289,5 @@ pub use types::{
 pub use types::{BoardCardNavigation, BoardNavigationTarget};
 
 pub use types::BoardToolReadResult;
+
+pub use types::{AwaitBoardInput, AwaitBoardResult, BoardMembershipScope};

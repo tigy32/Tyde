@@ -897,6 +897,7 @@ pub(crate) struct HostState {
     dots: crate::dots::DotsHandle,
     board: crate::board::BoardHandle,
     board_subscriptions: HashMap<StreamPath, HashSet<ProjectId>>,
+    board_membership_changes: watch::Sender<()>,
     #[cfg(feature = "test-support")]
     tychat_bridge_disabled: bool,
     pub swarm_registry: SwarmRegistryHandle,
@@ -9363,6 +9364,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             if final_commit {
                 host.project_catalog.published(stream);
             }
+            state.board_membership_changes.send_replace(());
             for change in changes {
                 if let ProjectNotifyPayload::Delete { project } = &change {
                     for projects in state.board_subscriptions.values_mut() { projects.remove(&project.id); }
@@ -20917,6 +20919,7 @@ fn spawn_host_inner(
         workbench_support,
         board,
         board_subscriptions: HashMap::new(),
+        board_membership_changes: watch::channel(()).0,
         dots,
         #[cfg(feature = "test-support")]
         tychat_bridge_disabled: runtime_config.tychat_bridge_disabled,

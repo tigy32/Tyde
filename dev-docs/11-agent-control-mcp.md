@@ -892,3 +892,36 @@ command, so concurrent edits still reject rather than overwrite.
 `tyde_board_read` returns `BoardToolReadResult`: the typed board snapshot plus
 `own_card_id`, resolved from the bearer identity. Agents do not guess which
 card is theirs from names or history.
+
+### Await board membership
+
+`tyde_await_board` is on **agent-await**, not agent-control. Like board read,
+it is discoverable only for a top-level caller with customized lanes, scoped
+to the standalone parent project (including its workbenches). Children and
+swarm members cannot use it. All roles may watch their own project.
+
+Input is `{scope, members}`. Scope is `{kind: "board"}` or
+`{kind: "lane", lane_id: "<stable lane ID>"}`; `members` is the last observed
+set of stable `BoardCardId`s, with no duplicates. Lane membership includes
+nested cards in their parent's lane. Board membership includes every card,
+regardless of placement. Compare sets, not ordering, names, activity, session
+bindings, card versions or the lane-configuration version.
+
+Return `{project_id, scope, members, added, removed}` immediately if the current
+set differs, otherwise wait for a server event without a deadline. Empty input
+membership returns existing members immediately, or waits if the scope is empty.
+Use board read for card details; carry the returned membership into the next
+wait. For a landing queue, snapshot ready commits, process that batch, then
+wait with the previously observed membership: arrivals during the batch return
+immediately. A leave-and-return between observations is not a net membership
+change and is intentionally not an event journal.
+
+The host subscribes before reading the authoritative board; mutations and live
+card lifecycle changes signal its actor-owned watch channel. Notifications are
+runtime invalidations, not a second board model. Unrelated activity can cause
+an internal reread, never a successful unchanged result. Progress notifications
+keep the MCP transport alive but do not poll state. Cancellation, closing the
+caller, and host restart use the same await lifecycle as agent waits. Removing
+the watched lane, deleting the project, moving the caller to another parent
+project, or storage failures explicitly fail the wait. Lane renaming preserves
+the watch. No move sends a message or starts an agent.

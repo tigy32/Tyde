@@ -580,3 +580,6 @@ agents. Moves have no steering, messaging, lifecycle or backend side effects.
 Lane locations carry both `project_id` and `lane_id`, including immutable move
 history. This keeps prior ownership explicit after cross-project reassignment;
 a project's default lane IDs are not a global namespace.
+
+Membership-only agent waits use `tyde_await_board` on the await MCP surface;
+see [Await board membership](11-agent-control-mcp.md#await-board-membership).
