@@ -472,6 +472,27 @@ pub fn ChatView(
         StoredValue::new_local(ReadingAnchor::default());
     // Animation frames left before a scroll gesture counts as over.
     let gesture_frames = StoredValue::new(0_u8);
+    let gesture_shift = StoredValue::new(0.0_f64);
+    // Moves the transcript on screen without touching the scroll offset.
+    let shift_transcript = move |shift: f64| {
+        if gesture_shift.get_value() == shift {
+            return;
+        }
+        let Some(transcript) = transcript_ref.get_untracked() else {
+            return;
+        };
+        let transcript: web_sys::HtmlElement = transcript.into();
+        let style = transcript.style();
+        let applied = if shift == 0.0 {
+            style.remove_property("transform").map(drop)
+        } else {
+            style.set_property("transform", &format!("translateY({shift}px)"))
+        };
+        match applied {
+            Ok(()) => gesture_shift.set_value(shift),
+            Err(_) => log::error!("chat transcript rejected its gesture shift"),
+        }
+    };
 
     let reveal_from = RwSignal::new(
         saved_position.map_or(RevealFrom::Tail, |position| RevealFrom::Row(position.row)),
@@ -506,6 +527,7 @@ pub fn ChatView(
                         .with_untracked(|positions| positions.get(&tab_id).copied()),
                 );
                 anchor.set_value(ReadingAnchor::default());
+                shift_transcript(0.0);
             }
             return;
         }
@@ -513,6 +535,16 @@ pub fn ChatView(
         let Some(mut top) = read_scroll_top(&scroller) else {
             return;
         };
+        // A scroll gesture owns the offset while it lasts, and WebKit's
+        // momentum does not survive a write. Until it ends, what would be
+        // written is shown by shifting the transcript instead; removing the
+        // shift here leaves it to the correction below.
+        let gesturing = gesture_frames.get_value() > 0
+            && top < -BOTTOM_EPSILON_PX
+            && pending_restore.with_value(Option::is_none);
+        if !gesturing {
+            shift_transcript(0.0);
+        }
         let viewport_top = scroller.get_bounding_client_rect().top();
         let start = first_mounted.get_untracked();
         let mut held = None;
@@ -574,11 +606,10 @@ pub fn ChatView(
             if let Some((element, expected)) = held.clone() {
                 let drift = || element.get_bounding_client_rect().top() - viewport_top - expected;
                 let moved = drift();
-                if gesture_frames.get_value() > 0 {
-                    // The offset belongs to the gesture while it lasts.
-                    // WebKit's momentum does not survive a write, so the
-                    // reader's position is taken afresh instead.
-                    held = None;
+                if gesturing {
+                    if moved.round() != 0.0 {
+                        shift_transcript(gesture_shift.get_value() - moved.round());
+                    }
                 } else if moved.abs() >= 1.0 {
                     let Some(corrected) = write_scroll_top(&scroller, top + moved) else {
                         return;
@@ -769,7 +800,7 @@ pub fn ChatView(
             };
             gesture_frames.set_value(GESTURE_QUIET_FRAMES);
             if frames == 0 {
-                count_down_gesture(gesture_frames);
+                count_down_gesture(gesture_frames, reconcile);
             }
         });
         // Passive, so the listener never delays the scroll it reports.
@@ -1093,8 +1124,8 @@ struct ReadingAnchor {
     rows_after: u32,
 }
 
-/// The elements crossing the viewport's top edge at `y`, from `row` inward,
-/// each with the distance of its top edge below `y`. `held` keeps the
+/// The topmost elements still showing below the viewport's top edge at `y`,
+/// from `row` inward, each with the distance of its top edge below `y`. `held` keeps the
 /// distance it already has instead of a fresh measurement, so a position
 /// corrected many times cannot creep by the rounding of each correction.
 fn reading_chain(
@@ -1105,13 +1136,7 @@ fn reading_chain(
     let mut chain = Vec::new();
     let mut next = Some(row);
     while let Some(element) = next {
-        let children = element.children();
-        next = first_row_ending_below(&children, y)
-            .and_then(|index| children.item(index))
-            .filter(|child| {
-                let rect = child.get_bounding_client_rect();
-                rect.top() <= y && rect.bottom() > y && moves_with_content(child)
-            });
+        next = topmost_child_ending_below(&element, y);
         let offset = match held {
             Some((kept, offset)) if *kept == element => *offset,
             _ => element.get_bounding_client_rect().top() - y,
@@ -1119,6 +1144,31 @@ fn reading_chain(
         chain.push((element, offset));
     }
     chain
+}
+
+/// The child of `element` reaching below `y` whose top edge is highest: the
+/// one crossing `y`, or the first one under it when `y` falls in the space
+/// between two. A grid does not lay its children out in document order, so
+/// those are compared one by one.
+fn topmost_child_ending_below(element: &web_sys::Element, y: f64) -> Option<web_sys::Element> {
+    let children = element.children();
+    if !computed_style(element, "display").is_some_and(|display| display.contains("grid")) {
+        return first_row_ending_below(&children, y)
+            .and_then(|index| children.item(index))
+            .filter(moves_with_content);
+    }
+    let mut topmost: Option<(f64, web_sys::Element)> = None;
+    for child in (0..children.length()).filter_map(|index| children.item(index)) {
+        let rect = child.get_bounding_client_rect();
+        if rect.bottom() > y
+            && topmost.as_ref().is_none_or(|(top, _)| rect.top() < *top)
+            && child.get_client_rects().length() > 0
+            && moves_with_content(&child)
+        {
+            topmost = Some((rect.top(), child));
+        }
+    }
+    topmost.map(|(_, child)| child)
 }
 
 /// A reply that completes is rendered anew in a row of its own, leaving
@@ -1146,7 +1196,9 @@ fn same_text_in_successor(
     };
     let (before, mut after) = (alike(replaced)?, alike(&successor)?);
     let place = match before.iter().position(|element| element == lost) {
-        Some(place) if before.len() == after.len() => place,
+        // The completed reply can hold text that never streamed, after
+        // everything that did.
+        Some(place) if before.len() <= after.len() => place,
         // A re-render since the position was taken already replaced it.
         None if after.len() == 1 => 0,
         _ => return None,
@@ -1157,13 +1209,17 @@ fn same_text_in_successor(
 
 /// Sticky and out-of-flow boxes do not move with the text around them.
 fn moves_with_content(element: &web_sys::Element) -> bool {
-    web_sys::window()
-        .and_then(|window| window.get_computed_style(element).ok().flatten())
-        .and_then(|style| style.get_property_value("position").ok())
+    computed_style(element, "position")
         .is_some_and(|position| position == "static" || position == "relative")
 }
 
-fn count_down_gesture(frames: StoredValue<u8>) {
+fn computed_style(element: &web_sys::Element, property: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|window| window.get_computed_style(element).ok().flatten())
+        .and_then(|style| style.get_property_value(property).ok())
+}
+
+fn count_down_gesture(frames: StoredValue<u8>, ended: impl Fn() + Copy + 'static) {
     request_animation_frame(move || {
         let Some(left) = frames.try_get_value() else {
             return;
@@ -1171,7 +1227,9 @@ fn count_down_gesture(frames: StoredValue<u8>) {
         let left = left.saturating_sub(1);
         frames.set_value(left);
         if left > 0 {
-            count_down_gesture(frames);
+            count_down_gesture(frames, ended);
+        } else {
+            ended();
         }
     });
 }
@@ -6187,7 +6245,7 @@ mod wasm_tests {
 
         // Every paragraph of the reply reads the same, so only its place
         // among them tells the one being read from the others. The top edge
-        // of the viewport is put a few pixels into it.
+        // of the viewport is put in the space just above it.
         let viewport_top = scroller.get_bounding_client_rect().top();
         let reading = reply_paragraphs()
             .iter()
@@ -6199,11 +6257,22 @@ mod wasm_tests {
         );
         let paragraph = || reply_paragraphs().swap_remove(reading);
         let offset = || paragraph().get_bounding_client_rect().top() - viewport_top;
-        scroller.set_scroll_top(scroller.scroll_top() + offset().round() as i32 + 4);
+        let previous_bottom = || {
+            reply_paragraphs()
+                .swap_remove(reading - 1)
+                .get_bounding_client_rect()
+                .bottom()
+        };
+        let gap = paragraph().get_bounding_client_rect().top() - previous_bottom();
+        assert!(
+            gap >= 6.0,
+            "precondition: paragraphs are spaced apart, {gap}px"
+        );
+        scroller.set_scroll_top(scroller.scroll_top() + (offset() - gap / 2.0).round() as i32);
         settle_scroll(&container, &scroller).await;
         assert!(
-            offset() < 0.0 && paragraph().get_bounding_client_rect().bottom() > viewport_top,
-            "precondition: the paragraph being read crosses the top of the viewport"
+            offset() > 0.0 && previous_bottom() < viewport_top,
+            "precondition: the top of the viewport falls between two paragraphs"
         );
         let reply_height = || {
             paragraph()
@@ -6243,7 +6312,8 @@ mod wasm_tests {
         let offset_before = offset();
         let streaming_height = reply_height();
         let streaming_paragraph = paragraph();
-        let mut completed = mk_user_msg(&paragraphs(0..160)).message;
+        // The last paragraph reaches the reader only with the completed reply.
+        let mut completed = mk_user_msg(&paragraphs(0..161)).message;
         completed.sender = MessageSender::Assistant {
             agent: "Agent".to_owned(),
         };
@@ -6334,23 +6404,41 @@ mod wasm_tests {
             .expect("rows are mounted below the viewport");
 
         let offset = scroller.scroll_top();
+        let visible_top = visible.get_bounding_client_rect().top();
         let wheel = web_sys::EventInit::new();
         wheel.set_bubbles(true);
         visible
             .dispatch_event(&web_sys::Event::new_with_event_init_dict("wheel", &wheel).unwrap())
             .unwrap();
         grow(&below, 300);
-        settle_scroll(&container, &scroller).await;
+        // Fewer frames than the gesture stays active for.
+        for _ in 0..3 {
+            next_animation_frame().await;
+        }
         assert_eq!(
             scroller.scroll_top(),
             offset,
-            "the transcript was repositioned under an active scroll gesture"
+            "the scroll offset was written under an active scroll gesture"
+        );
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
+        assert!(
+            moved.abs() <= 1.0,
+            "growth below the viewport during the gesture moved the visible row by {moved}px"
         );
 
         for _ in 0..12 {
             next_animation_frame().await;
         }
-        let visible_top = visible.get_bounding_client_rect().top();
+        settle_scroll(&container, &scroller).await;
+        assert!(
+            scroller.scroll_top() <= offset - 299,
+            "the growth was not taken into the scroll offset once the gesture ended"
+        );
+        let moved = visible.get_bounding_client_rect().top() - visible_top;
+        assert!(
+            moved.abs() <= 1.0,
+            "the gesture ending moved the visible row by {moved}px"
+        );
         grow(&below, 300);
         settle_scroll(&container, &scroller).await;
         let moved = visible.get_bounding_client_rect().top() - visible_top;
