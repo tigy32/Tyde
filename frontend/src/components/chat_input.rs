@@ -343,6 +343,28 @@ fn restore_submitted_input(
     }
 }
 
+/// Restores a refused Cancel + send, which can arrive after the composer has
+/// unmounted: its draft text outlives the component, its attachment list does
+/// not. Returns false when attachments were lost that way.
+fn restore_refused_redirect(
+    composer: &ComposerHandle,
+    pending_images: RwSignal<Vec<PendingImage>>,
+    draft: String,
+    images: Vec<PendingImage>,
+) -> bool {
+    let Some(current_images) = pending_images.try_get_untracked() else {
+        if composer.text.get_untracked().is_empty() {
+            composer.text.set(draft);
+        }
+        return images.is_empty();
+    };
+    if composer.text.get_untracked().is_empty() && current_images.is_empty() {
+        composer.text.set(draft);
+        pending_images.set(images);
+    }
+    true
+}
+
 fn submit_chat_input(
     state: &AppState,
     composer: &ComposerHandle,
@@ -615,6 +637,11 @@ fn submit_default_chat_input(
     }
 }
 
+enum RunningFrame {
+    Redirect(protocol::HumanInputPayload),
+    Steer(SendMessagePayload),
+}
+
 fn send_running_chat_input(
     state: &AppState,
     composer: &ComposerHandle,
@@ -647,62 +674,66 @@ fn send_running_chat_input(
         }
     };
 
-    let agent_id = active_agent.agent_id;
-    if matches!(action, RunningSendAction::CancelAndSend) && !claim_interrupt_slot(state, &agent_id)
-    {
-        return;
-    }
-    let pending_interrupt = state.interrupt_pending;
+    let input = SendMessagePayload {
+        message: text,
+        images: payload_images,
+        origin: None,
+        tool_response: None,
+    };
+    // One frame: the server queues the prompt before it interrupts the turn,
+    // so the two can never be split. Its verdict arrives as HumanInputStatus.
+    let frame = match action {
+        RunningSendAction::CancelAndSend => {
+            match crate::send::new_human_input(protocol::HumanInputAction::InterruptAndSend, input)
+            {
+                Ok(payload) => RunningFrame::Redirect(payload),
+                Err(error) => {
+                    log::error!("failed to build Cancel + send input: {error}");
+                    crate::notices::report_agent_error(&active_agent, error);
+                    return;
+                }
+            }
+        }
+        RunningSendAction::Steer => RunningFrame::Steer(input),
+    };
 
     composer.text.set(String::new());
     pending_images.set(Vec::new());
-    let restore_composer = composer.clone();
-    let restore_draft = draft.clone();
-    let restore_images = images.clone();
+    let composer = composer.clone();
 
-    spawn_local(async move {
-        let frame_kind = match action {
-            RunningSendAction::CancelAndSend => {
-                if let Err(error) = send_frame(
-                    &host_id,
-                    instance_stream.clone(),
-                    FrameKind::Interrupt,
-                    &InterruptPayload::default(),
-                )
-                .await
-                {
-                    log::error!("failed to interrupt conversation for Cancel + send: {error}");
-                    let _ = pending_interrupt.try_update(|pending| {
-                        pending.remove(&agent_id);
-                    });
-                    restore_submitted_input(
-                        &restore_composer,
-                        pending_images,
-                        restore_draft,
-                        restore_images,
-                    );
-                    return;
-                }
-                FrameKind::SendMessage
-            }
-            RunningSendAction::Steer => FrameKind::SteerMessage,
-        };
-        let payload = SendMessagePayload {
-            message: text,
-            images: payload_images,
-            origin: None,
-            tool_response: None,
-        };
-        if let Err(e) = send_frame(&host_id, instance_stream, frame_kind, &payload).await {
-            log::error!("failed to send running-turn message: {e}");
-            restore_submitted_input(
-                &restore_composer,
-                pending_images,
-                restore_draft,
-                restore_images,
+    match frame {
+        RunningFrame::Redirect(payload) => {
+            let id = payload.id.clone();
+            state.begin_composer_redirect(
+                id.clone(),
+                crate::state::ComposerRedirect {
+                    agent: active_agent,
+                    restore: Box::new(move || {
+                        restore_refused_redirect(&composer, pending_images, draft, images)
+                    }),
+                },
             );
+            let state = state.clone();
+            spawn_local(async move {
+                if let Err(e) =
+                    send_frame(&host_id, instance_stream, FrameKind::HumanInput, &payload).await
+                {
+                    log::error!("failed to send Cancel + send: {e}");
+                    if let Some(redirect) = state.take_composer_redirect(&host_id, &id) {
+                        (redirect.restore)();
+                    }
+                }
+            });
         }
-    });
+        RunningFrame::Steer(input) => spawn_local(async move {
+            if let Err(e) =
+                send_frame(&host_id, instance_stream, FrameKind::SteerMessage, &input).await
+            {
+                log::error!("failed to send steer: {e}");
+                restore_submitted_input(&composer, pending_images, draft, images);
+            }
+        }),
+    }
 }
 
 pub(crate) fn data_transfer_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
@@ -2089,7 +2120,7 @@ pub fn ChatInput(
                             if mode.1 && !is_steer_now && !readonly {
                                 interrupt_in_flight.get()
                             } else {
-                                !can_send() || default_send_action.get().is_none() || (is_steer_now && default_send_action.get() == Some(DefaultSendAction::CancelAndSend) && interrupt_in_flight.get())
+                                !can_send() || default_send_action.get().is_none()
                             }
                         }
                         on:click=on_click_primary
@@ -2207,7 +2238,6 @@ pub fn ChatInput(
                                     class="chat-send-menu-item"
                                     role="menuitem"
                                     data-test="chat-send-menu-cancel-send"
-                                    disabled=move || interrupt_in_flight.get()
                                     title="Cancel the current turn and send your message (Cmd/Ctrl+Enter)"
                                     on:click=on_menu_cancel_send
                                 >
@@ -5184,7 +5214,7 @@ mod wasm_tests {
             next_tick().await;
             assert_eq!(
                 calls.length(),
-                3,
+                2,
                 "explicit correction re-enables default Cancel + send"
             );
             drop(error_handle);
@@ -5269,14 +5299,15 @@ mod wasm_tests {
         dispatch_keydown(&field, "Enter", false, false);
         next_tick().await;
         next_tick().await;
-        assert_eq!(calls.length(), 2, "default Enter interrupts then sends");
+        assert_eq!(
+            calls.length(),
+            1,
+            "default Enter interrupts and sends in one frame"
+        );
         let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
         let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["kind"], "interrupt");
-        let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
-        let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
         assert_eq!(
-            assert_human_payload(&envelope, protocol::HumanInputAction::Send)["message"],
+            assert_human_payload(&envelope, protocol::HumanInputAction::InterruptAndSend)["message"],
             "default redirect"
         );
 
@@ -5320,27 +5351,16 @@ mod wasm_tests {
             }
             next_tick().await;
             next_tick().await;
-            let default_frames = if value == "cancel_and_send" { 2 } else { 1 };
+            let default_frames = 1;
             assert_eq!(calls.length(), default_frames);
-            if value == "cancel_and_send" {
-                let args: JsonValue =
-                    serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
-                let envelope: JsonValue =
-                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
-                assert_eq!(
-                    envelope["kind"], "interrupt",
-                    "primary click cancels before sending"
-                );
-            }
-            let args: JsonValue =
-                serde_json::from_str(&calls.get(default_frames - 1).as_string().unwrap()).unwrap();
+            let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
             let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
             assert_human_payload(
                 &envelope,
-                if value == "steer" {
-                    protocol::HumanInputAction::Steer
-                } else {
-                    protocol::HumanInputAction::Send
+                match value {
+                    "cancel_and_send" => protocol::HumanInputAction::InterruptAndSend,
+                    "steer" => protocol::HumanInputAction::Steer,
+                    _ => protocol::HumanInputAction::Send,
                 },
             );
             restored
@@ -5363,17 +5383,19 @@ mod wasm_tests {
             .click();
             next_tick().await;
             next_tick().await;
-            let override_frames = if value == "cancel_and_send" { 1 } else { 2 };
+            let override_frames = 1;
             assert_eq!(calls.length(), default_frames + override_frames);
-            let args: JsonValue = serde_json::from_str(
-                &calls
-                    .get(default_frames + override_frames - 1)
-                    .as_string()
-                    .unwrap(),
-            )
-            .unwrap();
+            let args: JsonValue =
+                serde_json::from_str(&calls.get(default_frames).as_string().unwrap()).unwrap();
             let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
-            assert_human_payload(&envelope, protocol::HumanInputAction::Send);
+            assert_human_payload(
+                &envelope,
+                if value == "cancel_and_send" {
+                    protocol::HumanInputAction::Send
+                } else {
+                    protocol::HumanInputAction::InterruptAndSend
+                },
+            );
             assert_eq!(
                 storage
                     .get_item("tyde-default-send-action")
@@ -5525,53 +5547,107 @@ mod wasm_tests {
             }
             next_tick().await;
             next_tick().await;
+            assert_eq!(calls.length(), 1, "Cancel + send must be one atomic frame");
+            let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
             assert_eq!(
-                calls.length(),
-                2,
-                "Cancel + send must send exactly two frames"
+                assert_human_payload(&envelope, protocol::HumanInputAction::InterruptAndSend)["message"],
+                "stop and redirect"
             );
-            for (index, kind) in [(0, "interrupt"), (1, "human_input")] {
-                let args: JsonValue =
-                    serde_json::from_str(&calls.get(index).as_string().unwrap()).unwrap();
-                let envelope: JsonValue =
-                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
-                assert_eq!(envelope["kind"], kind, "Cancel must precede send");
-                if index == 1 {
-                    assert_eq!(
-                        assert_human_payload(&envelope, protocol::HumanInputAction::Send)["message"],
-                        "stop and redirect"
-                    );
-                }
-            }
             let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
             assert_eq!(
                 field.value(),
                 "",
                 "Cancel + send must clear the visible draft"
             );
+            // A pending Stop must not swallow or block the next redirect.
+            state.interrupt_pending.update(|pending| {
+                pending.insert(AgentId(AGENT.to_owned()));
+            });
             state
                 .composer_untracked()
                 .text
-                .set("keep the next draft".to_owned());
+                .set("redirect during stop".to_owned());
             next_tick().await;
             open_menu(&container).await;
             assert!(
-                query(&container, "[data-test='chat-send-menu-cancel-send']")
+                !query(&container, "[data-test='chat-send-menu-cancel-send']")
                     .unwrap()
                     .has_attribute("disabled")
             );
             caret(&container).dyn_into::<HtmlElement>().unwrap().click();
             dispatch_keydown(&textarea(&container), "Enter", true, false);
             next_tick().await;
+            next_tick().await;
+            assert_eq!(calls.length(), 2, "Redirect during Stop must be delivered");
+            let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
+            let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
             assert_eq!(
-                calls.length(),
-                2,
-                "An unanswered interrupt must not be repeated"
+                assert_human_payload(&envelope, protocol::HumanInputAction::InterruptAndSend)["message"],
+                "redirect during stop"
             );
-            assert_eq!(field.value(), "keep the next draft");
+            assert_eq!(interrupt_frames(&calls), 0);
+            assert_eq!(field.value(), "");
             state.interrupt_pending.update(|pending| {
                 pending.remove(&AgentId(AGENT.to_owned()));
             });
+            if menu {
+                // The server's verdict is the only report of a refused redirect:
+                // acceptance is silent, refusal puts the draft back.
+                let sent_id = |index: u32| {
+                    let args: JsonValue =
+                        serde_json::from_str(&calls.get(index).as_string().unwrap()).unwrap();
+                    let envelope: JsonValue =
+                        serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                    serde_json::from_value::<protocol::HumanInputPayload>(
+                        envelope["payload"].clone(),
+                    )
+                    .unwrap()
+                    .id
+                };
+                let scope =
+                    crate::notices::NoticeScope::Agent(HOST.to_owned(), AgentId(AGENT.to_owned()));
+                crate::notices::clear_scope(&scope);
+                let stream = StreamPath("/agent/agent-1/inst".to_owned());
+                crate::dispatch::clear_stream_seq_for_tests(HOST, &stream);
+                for (seq, index, status) in [
+                    (0, 0, protocol::HumanInputStatus::Accepted { warning: None }),
+                    (
+                        1,
+                        1,
+                        protocol::HumanInputStatus::Refused {
+                            reason: "redirect refused".to_owned(),
+                        },
+                    ),
+                ] {
+                    crate::dispatch::dispatch_envelope(
+                        &state,
+                        HOST,
+                        protocol::Envelope::from_payload(
+                            stream.clone(),
+                            FrameKind::HumanInputStatus,
+                            seq,
+                            &protocol::HumanInputStatusPayload {
+                                agent_id: AgentId(AGENT.to_owned()),
+                                id: sent_id(index),
+                                status,
+                            },
+                        )
+                        .unwrap(),
+                    );
+                    next_tick().await;
+                    let refused = seq == 1;
+                    assert_eq!(crate::notices::has_notice(&scope), refused);
+                    assert_eq!(
+                        field.value(),
+                        if refused { "redirect during stop" } else { "" },
+                        "a refused redirect returns its draft to the composer"
+                    );
+                }
+                crate::notices::clear_scope(&scope);
+                state.composer_untracked().text.set(String::new());
+                next_tick().await;
+            }
         }
 
         let calls = stub_send_recording();
@@ -5591,11 +5667,9 @@ mod wasm_tests {
             "steer with control"
         );
 
-        for (failure_kind, alt, expected_calls) in [
-            ("interrupt", false, 1),
-            ("send", false, 2),
-            ("steer", true, 1),
-        ] {
+        for (failure_kind, alt, expected_calls) in
+            [("interrupt_and_send", false, 1), ("steer", true, 1)]
+        {
             let calls = stub_send_recording();
             js_sys::eval(&format!(r#"
                 (function() {{
@@ -5629,7 +5703,7 @@ mod wasm_tests {
             );
             let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
             assert_eq!(field.value(), "preserve failed draft");
-            if failure_kind == "interrupt" {
+            if failure_kind == "interrupt_and_send" {
                 open_menu(&container).await;
                 assert!(
                     !query(&container, "[data-test='chat-send-menu-cancel-send']")
@@ -5643,6 +5717,30 @@ mod wasm_tests {
                 pending.remove(&AgentId(AGENT.to_owned()));
             });
         }
+
+        // A disconnect before the verdict leaves delivery unknown: say so, and
+        // keep the draft cleared rather than inviting a duplicate.
+        let calls = stub_send_recording();
+        let scope = crate::notices::NoticeScope::Agent(HOST.to_owned(), AgentId(AGENT.to_owned()));
+        crate::notices::clear_scope(&scope);
+        state
+            .composer_untracked()
+            .text
+            .set("redirect before disconnect".to_owned());
+        next_tick().await;
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(calls.length(), 1);
+        assert!(!crate::notices::has_notice(&scope));
+        state.clear_host_runtime(HOST);
+        next_tick().await;
+        assert!(
+            crate::notices::has_notice(&scope),
+            "an unconfirmed redirect must be reported"
+        );
+        assert_eq!(state.composer_untracked().text.get_untracked(), "");
+        crate::notices::clear_scope(&scope);
 
         stub_send_host_line();
         container.remove();

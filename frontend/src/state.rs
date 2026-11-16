@@ -3913,6 +3913,15 @@ impl ComposerHandle {
 type UserQuestionDraftKey = (Option<AgentId>, String);
 type UserQuestionDraftMap = HashMap<UserQuestionDraftKey, UserQuestionDraftState>;
 
+pub struct ComposerRedirect {
+    pub agent: ActiveAgentRef,
+    /// Puts the submitted draft back into its composer. False when its
+    /// attachments could not be restored because the composer has unmounted.
+    pub restore: Box<dyn FnOnce() -> bool>,
+}
+
+type ComposerRedirectMap = HashMap<(String, protocol::HumanInputId), ComposerRedirect>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub app_update_status: RwSignal<Option<host_config::updates::AppUpdateStatus>>,
@@ -4134,6 +4143,9 @@ pub struct AppState {
     /// gets no sign the first one was heard. Cleared by `OperationCancelled`, by
     /// any typing transition, and by agent teardown.
     pub interrupt_pending: RwSignal<HashSet<AgentId>>,
+    /// Composer Cancel + send submissions awaiting the server's verdict, keyed
+    /// by host and human-input id. A refusal restores the draft it carried.
+    composer_redirects: StoredValue<ComposerRedirectMap, LocalStorage>,
     /// Current server-owned cancellation outcome, separate from its notice.
     /// Cleared by typed working, replaced by bootstrap, removed on teardown.
     pub last_turn_cancelled: RwSignal<HashSet<AgentId>>,
@@ -4674,6 +4686,7 @@ impl AppState {
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
             interrupt_pending: RwSignal::new(HashSet::new()),
+            composer_redirects: StoredValue::new_local(HashMap::new()),
             last_turn_cancelled: RwSignal::new(HashSet::new()),
             browse_dialog: RwSignal::new(None),
             project_view_memory: RwSignal::new(HashMap::new()),
@@ -7194,6 +7207,7 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        self.unconfirm_composer_redirects(host_id);
         self.agents_with_background_work.update(|agents| {
             agents.retain(|agent| agent.host_id != host_id);
         });
@@ -7693,11 +7707,14 @@ impl AppState {
         draft
     }
 
+    /// Settles the question draft that submitted `payload.id`. Returns false
+    /// when no draft owns that submission.
     pub fn apply_question_answer_status(
         &self,
         host_id: &str,
-        payload: protocol::HumanInputStatusPayload,
-    ) {
+        payload: &protocol::HumanInputStatusPayload,
+    ) -> bool {
+        let mut matched = false;
         let drafts = self
             .user_question_drafts
             .lock()
@@ -7712,6 +7729,7 @@ impl AppState {
             {
                 continue;
             }
+            matched = true;
             draft.sending.set(false);
             match &payload.status {
                 protocol::HumanInputStatus::Accepted { warning } => {
@@ -7728,6 +7746,50 @@ impl AppState {
                 }
             }
         }
+        matched
+    }
+
+    pub fn begin_composer_redirect(&self, id: protocol::HumanInputId, redirect: ComposerRedirect) {
+        let key = (redirect.agent.host_id.clone(), id);
+        self.composer_redirects.update_value(|redirects| {
+            redirects.insert(key, redirect);
+        });
+    }
+
+    /// The connection closed before the server judged these submissions, so
+    /// whether they reached the agent is unknown; their drafts stay cleared.
+    pub fn unconfirm_composer_redirects(&self, host_id: &str) {
+        let unsettled = self
+            .composer_redirects
+            .try_update_value(|redirects| {
+                let keys: Vec<_> = redirects
+                    .keys()
+                    .filter(|(host, _)| host == host_id)
+                    .cloned()
+                    .collect();
+                keys.into_iter()
+                    .filter_map(|key| redirects.remove(&key))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for redirect in unsettled {
+            crate::notices::report_agent_error(
+                &redirect.agent,
+                "The connection closed before the server confirmed Cancel + send.",
+            );
+        }
+    }
+
+    /// Removes the composer submission that `id` identifies, if any.
+    pub fn take_composer_redirect(
+        &self,
+        host_id: &str,
+        id: &protocol::HumanInputId,
+    ) -> Option<ComposerRedirect> {
+        let key = (host_id.to_owned(), id.clone());
+        self.composer_redirects
+            .try_update_value(|redirects| redirects.remove(&key))
+            .flatten()
     }
 
     pub fn complete_question_draft(&self, agent_id: &AgentId, tool_call_id: &str) {

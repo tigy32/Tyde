@@ -1386,7 +1386,16 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::HumanInputStatus => {
             match envelope.parse_payload::<protocol::HumanInputStatusPayload>() {
-                Ok(payload) => state.apply_question_answer_status(host_id, payload),
+                Ok(payload) => {
+                    if !state.apply_question_answer_status(host_id, &payload) {
+                        match state.take_composer_redirect(host_id, &payload.id) {
+                            Some(redirect) => settle_composer_redirect(redirect, payload.status),
+                            None => log::warn!(
+                                "human input status for a submission this client no longer tracks"
+                            ),
+                        }
+                    }
+                }
                 Err(error) => report_dispatch_error(
                     state,
                     host_id,
@@ -11220,4 +11229,27 @@ fn apply_agent_project_assignment(state: &AppState, host_id: &str, start: &Agent
             agent.workspace_roots = start.workspace_roots.clone();
         }
     });
+}
+
+/// The server reports a Cancel + send verdict only here. A refusal never
+/// reached the agent, so its draft goes back into the composer.
+fn settle_composer_redirect(
+    redirect: crate::state::ComposerRedirect,
+    status: protocol::HumanInputStatus,
+) {
+    let message = match status {
+        protocol::HumanInputStatus::Accepted { warning: None } => return,
+        protocol::HumanInputStatus::Refused { reason } => {
+            if (redirect.restore)() {
+                reason
+            } else {
+                format!("{reason} Its attached images could not be restored.")
+            }
+        }
+        protocol::HumanInputStatus::Accepted {
+            warning: Some(message),
+        }
+        | protocol::HumanInputStatus::Unconfirmed { reason: message } => message,
+    };
+    crate::notices::report_agent_error(&redirect.agent, message);
 }

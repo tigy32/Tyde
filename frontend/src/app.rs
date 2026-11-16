@@ -1213,6 +1213,7 @@ pub(crate) async fn install_host_listeners(
                     },
                 );
             });
+            state.unconfirm_composer_redirects(&host_id);
             let epoch = state.cancel_host_connect(&host_id);
             spawn_local(async move {
                 if wait_for_host_retry(&state, &host_id, epoch).await {
@@ -1235,6 +1236,7 @@ pub(crate) async fn install_host_listeners(
                 "{}",
                 reported_host_error_message(label.as_deref(), &event.message)
             );
+            error_state.unconfirm_composer_redirects(&event.host_id);
             error_state.connection_statuses.update(|statuses| {
                 statuses.insert(event.host_id, ConnectionStatus::Error(event.message));
             });
