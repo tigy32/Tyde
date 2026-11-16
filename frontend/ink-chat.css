@@ -236,10 +236,6 @@
     margin-left: 0;
 }
 
-.chat-view[data-chat-chrome="ink"] .chat-card-streaming {
-    border-left: 0;
-}
-
 .chat-view[data-chat-chrome="ink"] .chat-card-streaming > .chat-card-header {
     margin-bottom: 10px;
     gap: 8px;

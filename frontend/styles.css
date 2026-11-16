@@ -3244,7 +3244,6 @@ kbd {
 
 .chat-card-agent {
     background: color-mix(in srgb, var(--success) 6%, var(--surface-1));
-    border-left: 2px solid var(--success);
 }
 
 .chat-tyde-permissions-toggle {
@@ -3374,14 +3373,13 @@ kbd {
     line-height: 1.5;
 }
 
-/* ===== Card Reasoning (Purple accent, matching legacy) ===== */
+/* ===== Card Reasoning ===== */
 .chat-card-reasoning {
     margin: 6px 0;
     padding: 0;
     background: rgba(180, 0, 255, 0.06);
     border-radius: 6px;
     border: 1px solid rgba(207, 92, 255, 0.15);
-    border-left: 2px solid rgba(214, 102, 255, 0.6);
     overflow: hidden;
 }
 
@@ -3694,7 +3692,6 @@ kbd {
     flex-direction: column;
     gap: 3px;
     margin-top: var(--space-2);
-    border-left: 2px solid color-mix(in srgb, var(--accent-primary) 50%, transparent);
     background: color-mix(in srgb, var(--accent-primary) 3%, transparent);
     border-radius: 4px;
     padding: 3px 0 3px 4px;
@@ -4352,10 +4349,6 @@ kbd {
 }
 
 /* ===== Streaming Indicator ===== */
-.chat-card-streaming {
-    border-left: 2px solid var(--accent-primary);
-}
-
 .streaming-dot {
     display: inline-block;
     width: 7px;
