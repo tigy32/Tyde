@@ -1411,7 +1411,7 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_teardown() {
 }
 
 #[tokio::test]
-async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
+async fn workbench_remove_cascades_agents_terminals_and_sessions() {
     let mut fixture = Fixture::new().await;
 
     let agent_repo = init_git_repo("agent-blocker");
@@ -1737,48 +1737,100 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
             .iter()
             .all(|session| session.project_id.as_ref() != Some(&session_workbench.id))
     );
+}
 
-    let steering_repo = init_git_repo("steering-blocker");
-    let steering_parent = create_project(&mut fixture.client, vec![steering_repo.path()]).await;
-    let steering_workbench =
-        create_workbench(&mut fixture.client, &steering_parent, "steering-blocker").await;
+#[tokio::test]
+async fn workbench_agents_inherit_parent_project_steering() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("steering-parent");
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let workbench = create_workbench(&mut fixture.client, &parent, "steering-child").await;
+
     fixture
         .client
         .steering_upsert(SteeringUpsertPayload {
             steering: Steering {
                 id: SteeringId("workbench-steering".to_owned()),
-                scope: SteeringScope::Project(steering_workbench.id.clone()),
+                scope: SteeringScope::Project(workbench.id.clone()),
                 title: "Workbench steering".to_owned(),
-                content: "Do not remove yet".to_owned(),
+                content: "workbench-only steering body".to_owned(),
             },
         })
         .await
-        .expect("steering_upsert failed");
-    fixture
-        .client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: steering_workbench.id.clone(),
-            force: false,
-        })
-        .await
-        .expect("workbench_remove write failed");
-    let deleted: ProjectNotifyPayload = expect_kind(
+        .expect("steering_upsert write failed");
+    let rejected: CommandErrorPayload = expect_kind(
         &mut fixture.client,
-        FrameKind::ProjectNotify,
-        "steering workbench delete",
+        FrameKind::CommandError,
+        "workbench-scoped steering is rejected",
     )
     .await
     .parse_payload()
-    .expect("parse steering workbench delete");
+    .expect("parse CommandError");
     assert!(
-        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == steering_workbench.id)
+        rejected.message.contains("top-level project"),
+        "workbench steering rejection must name the top-level project: {}",
+        rejected.message
     );
-    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+
+    fixture
+        .client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: Steering {
+                id: SteeringId("parent-steering".to_owned()),
+                scope: SteeringScope::Project(parent.id.clone()),
+                title: "Parent steering".to_owned(),
+                content: "parent project steering body".to_owned(),
+            },
+        })
+        .await
+        .expect("parent steering_upsert failed");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::SteeringNotify,
+        "parent steering notify",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: Some("workbench-steering-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(workbench.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&workbench),
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn workbench agent");
+    let delta = next_frame_matching_on(
+        &mut fixture.client,
+        "workbench agent reports its resolved steering",
+        |env| {
+            env.kind == FrameKind::ChatEvent
+                && matches!(
+                    env.parse_payload::<protocol::ChatEvent>(),
+                    Ok(protocol::ChatEvent::StreamDelta(_))
+                )
+        },
+    )
+    .await;
+    let Ok(protocol::ChatEvent::StreamDelta(delta)) = delta.parse_payload() else {
+        unreachable!("matched a StreamDelta");
+    };
     assert!(
-        bootstrap
-            .steering
-            .iter()
-            .all(|steering| !matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &steering_workbench.id))
+        delta.text.contains("parent project steering body"),
+        "a workbench agent must receive its parent project's steering: {}",
+        delta.text
     );
 }
 

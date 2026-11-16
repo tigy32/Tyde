@@ -6218,7 +6218,7 @@ impl HostHandle {
                         let steering_store = steering_store.clone();
                         let project_id = project_id.clone();
                         let workspace_roots = workspace_roots.clone();
-                        let board_sections = self.board_lane_sections().await;
+                        let project_guidance = self.project_guidance().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6236,7 +6236,7 @@ impl HostHandle {
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
-                                    board_sections: &board_sections,
+                                    project_guidance: &project_guidance,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => {
@@ -6534,7 +6534,7 @@ impl HostHandle {
                             let project_id = project_id.clone();
                             let startup_mcp_servers = startup_mcp_servers.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
-                            let board_sections = self.board_lane_sections().await;
+                            let project_guidance = self.project_guidance().await;
                             self.state.with(move |state| {
 let stored_custom_agent_id = &stored_custom_agent_id;
 let custom_agents = &state.custom_agent_store;
@@ -6552,7 +6552,7 @@ let custom_agents = &state.custom_agent_store;
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
                                 steering_store: &steering,
-                                    board_sections: &board_sections,
+                                    project_guidance: &project_guidance,
                                 skill_store: skills,
                             })
                             .unwrap_or_else(|err| {
@@ -6577,7 +6577,7 @@ let custom_agents = &state.custom_agent_store;
                             let project_id = project_id.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
                             let startup_mcp_servers = startup_mcp_servers.clone();
-                            let board_sections = self.board_lane_sections().await;
+                            let project_guidance = self.project_guidance().await;
                             self.state
                                 .with(move |state| {
                                     let stored_custom_agent_id = &stored_custom_agent_id;
@@ -6596,7 +6596,7 @@ let custom_agents = &state.custom_agent_store;
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
                                         steering_store: &steering,
-                                        board_sections: &board_sections,
+                                        project_guidance: &project_guidance,
                                         skill_store: skills,
                                     }) {
                                         Ok(resolved) => (
@@ -6621,7 +6621,7 @@ let custom_agents = &state.custom_agent_store;
                         let steering_store = steering_store.clone();
                         let record = record.clone();
                         let project_id = project_id.clone();
-                        let board_sections = self.board_lane_sections().await;
+                        let project_guidance = self.project_guidance().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6637,7 +6637,7 @@ let custom_agents = &state.custom_agent_store;
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
-                                    board_sections: &board_sections,
+                                    project_guidance: &project_guidance,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => (None, resolved, None, None),
@@ -6877,7 +6877,7 @@ let custom_agents = &state.custom_agent_store;
                             let workspace_roots = workspace_roots.clone();
                             let startup_mcp_servers = startup_mcp_servers.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
-                            let board_sections = self.board_lane_sections().await;
+                            let project_guidance = self.project_guidance().await;
                             self.state.with(move |state| {
 let stored_custom_agent_id = &stored_custom_agent_id;
 let custom_agents = &state.custom_agent_store;
@@ -6895,7 +6895,7 @@ let custom_agents = &state.custom_agent_store;
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
                                 steering_store: &steering,
-                                    board_sections: &board_sections,
+                                    project_guidance: &project_guidance,
                                 skill_store: skills,
                             })
                             .unwrap_or_else(|err| {
@@ -6920,7 +6920,7 @@ let custom_agents = &state.custom_agent_store;
                             let workspace_roots = workspace_roots.clone();
                             let stored_custom_agent_id = stored_custom_agent_id.to_owned();
                             let startup_mcp_servers = startup_mcp_servers.clone();
-                            let board_sections = self.board_lane_sections().await;
+                            let project_guidance = self.project_guidance().await;
                             self.state
                                 .with(move |state| {
                                     let stored_custom_agent_id = &stored_custom_agent_id;
@@ -6939,7 +6939,7 @@ let custom_agents = &state.custom_agent_store;
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
                                         steering_store: &steering,
-                                        board_sections: &board_sections,
+                                        project_guidance: &project_guidance,
                                         skill_store: skills,
                                     }) {
                                         Ok(resolved) => (
@@ -6965,7 +6965,7 @@ let custom_agents = &state.custom_agent_store;
                     {
                         let project_id = project_id.clone();
                         let workspace_roots = workspace_roots.clone();
-                        let board_sections = self.board_lane_sections().await;
+                        let project_guidance = self.project_guidance().await;
                         self.state
                             .with(move |state| {
                                 let custom_agents = &state.custom_agent_store;
@@ -6981,7 +6981,7 @@ let custom_agents = &state.custom_agent_store;
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
                                     steering_store: &steering,
-                                    board_sections: &board_sections,
+                                    project_guidance: &project_guidance,
                                     skill_store: skills,
                                 }) {
                                     Ok(resolved) => (None, resolved, None, None),
@@ -9647,6 +9647,24 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 OPERATION,
                 format!(
                     "cannot upsert project-scoped steering {} for missing project {}",
+                    payload.steering.id, project_id
+                ),
+            ));
+        }
+        if let SteeringScope::Project(project_id) = &payload.steering.scope
+            && state
+                .project_store
+                .get(project_id)
+                .is_some_and(|project| project.is_workbench())
+            && state
+                .steering_store
+                .get(&payload.steering.id)
+                .is_none_or(|existing| existing.scope != payload.steering.scope)
+        {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "steering {} must be scoped to the top-level project; workbench {} inherits it",
                     payload.steering.id, project_id
                 ),
             ));
@@ -16062,7 +16080,7 @@ let project_id = &project_id;
                 let definition = definition.clone();
                 let project_id = project_id.clone();
                 let workspace_roots = workspace_roots.clone();
-                let board_sections = self.board_lane_sections().await;
+                let project_guidance = self.project_guidance().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -16078,7 +16096,7 @@ let project_id = &project_id;
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
-                            board_sections: &board_sections,
+                            project_guidance: &project_guidance,
                             skill_store: skills,
                         })
                     })
@@ -18998,7 +19016,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                 let project_roots = project_roots.clone();
                 let project_id = project_id.clone();
                 let custom_agent_id = custom_agent_id.clone();
-                let board_sections = self.board_lane_sections().await;
+                let project_guidance = self.project_guidance().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -19014,7 +19032,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
-                            board_sections: &board_sections,
+                            project_guidance: &project_guidance,
                             skill_store: skills,
                         })
                         .map_err(|error| {
@@ -19651,7 +19669,7 @@ self.state.with(move |state| {
             {
                 let project_id = request.review.project_id.clone();
                 let roots = roots.clone();
-                let board_sections = self.board_lane_sections().await;
+                let project_guidance = self.project_guidance().await;
                 self.state
                     .with(move |state| {
                         let custom_agents = &state.custom_agent_store;
@@ -19670,7 +19688,7 @@ self.state.with(move |state| {
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
                             steering_store: &steering,
-                            board_sections: &board_sections,
+                            project_guidance: &project_guidance,
                             skill_store: skills,
                         })
                     })

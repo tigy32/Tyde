@@ -86,21 +86,25 @@ impl HostHandle {
             removed,
         })
     }
-    pub(crate) async fn board_lane_sections(&self) -> Result<HashMap<ProjectId, String>, String> {
+    pub(crate) async fn project_guidance(
+        &self,
+    ) -> Result<crate::agent::customization::ProjectGuidance, String> {
         let board = self.state.with(|state| state.board.clone()).await;
-        let mut sections = board.sections().await?;
-        for project in self
+        let board_sections = board.sections().await?;
+        let workbench_parents = self
             .project_catalog
             .list()
             .map_err(|error| error.to_string())?
-        {
-            if let Some(parent) = project.parent_project_id()
-                && let Some(section) = sections.get(parent).cloned()
-            {
-                sections.insert(project.id, section);
-            }
-        }
-        Ok(sections)
+            .into_iter()
+            .filter_map(|project| {
+                let parent = project.parent_project_id()?.clone();
+                Some((project.id, parent))
+            })
+            .collect();
+        Ok(crate::agent::customization::ProjectGuidance {
+            board_sections,
+            workbench_parents,
+        })
     }
     pub(crate) async fn board_caller_project(
         &self,

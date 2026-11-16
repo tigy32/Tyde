@@ -10011,6 +10011,7 @@ fn SteeringEditor(
     let title_sig = form.title;
     let content_sig = form.content;
 
+    let original_scope = scope_kind_sig.get_untracked();
     let state_for_projects = state.clone();
     let available_projects = Memo::new(move |_| {
         let Some(host_id) = state_for_projects.selected_host_id.get() else {
@@ -10020,7 +10021,10 @@ fn SteeringEditor(
             .projects
             .get()
             .into_iter()
-            .filter(|p| p.host_id == host_id)
+            .filter(|p| {
+                p.host_id == host_id
+                    && (!p.project.is_workbench() || p.project.id.0 == original_scope)
+            })
             .collect::<Vec<_>>()
     });
 

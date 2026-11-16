@@ -33,9 +33,12 @@ The non-negotiable claims of this design:
   cross-host workbench. Routing falls out of "connect to host A → its
   `ProjectNotify::Upsert` events include workbench projects."
 - Invalid states are unrepresentable: a workbench cannot exist without its
-  parent, a parent cannot be deleted while it has live workbenches, and a
-  workbench cannot be deleted while sessions, agents, terminals, or
-  project-scoped steering reference it.
+  parent, and a parent cannot be deleted while it has live workbenches.
+  Removing a workbench cascades its own state (§6.7).
+- Steering and board lanes belong to the top-level project. Every workbench
+  agent receives its parent project's steering and lane instructions. The
+  server rejects new workbench-scoped steering; an entry saved on a
+  workbench earlier keeps its scope and is removed with the workbench.
 
 This is one new variant on `Project.source`, two new frame kinds, and a small
 set of preconditions on existing project handlers.

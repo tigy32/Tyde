@@ -146,7 +146,7 @@ pub(crate) struct ResolveSpawnConfigRequest<'a> {
     pub built_in_mcp_servers: &'a [StartupMcpServer],
     pub custom_agent_store: &'a CustomAgentStore,
     pub mcp_server_store: &'a McpServerStore,
-    pub board_sections: &'a Result<HashMap<ProjectId, String>, String>,
+    pub project_guidance: &'a Result<ProjectGuidance, String>,
     pub steering_store: &'a SteeringStore,
     pub skill_store: &'a SkillStore,
 }
@@ -164,11 +164,9 @@ pub(crate) fn resolve_spawn_config(
         .iter()
         .map(startup_mcp_server_to_protocol)
         .collect();
-    resolved.steering_body = resolve_steering_body(
-        request.steering_store,
-        request.project_id,
-        Some(request.board_sections.as_ref().map_err(Clone::clone)?),
-    )?;
+    let guidance = request.project_guidance.as_ref().map_err(Clone::clone)?;
+    resolved.steering_body =
+        resolve_steering_body(request.steering_store, request.project_id, Some(guidance))?;
     resolved.skill_delivery = crate::backend::skill_delivery(request.backend_kind);
     match &request.customization {
         SpawnCustomization::User(custom_agent_id) => {
@@ -424,17 +422,29 @@ fn resolve_skill(skill_store: &SkillStore, skill_id: &SkillId) -> Result<Resolve
     ))
 }
 
+/// Steering and board lanes belong to top-level projects; a workbench
+/// agent receives everything configured on its parent project. Steering
+/// saved on a workbench before that rule still applies to that workbench.
+pub(crate) struct ProjectGuidance {
+    pub board_sections: HashMap<ProjectId, String>,
+    pub workbench_parents: HashMap<ProjectId, ProjectId>,
+}
+
 pub(crate) fn resolve_steering_body(
     steering_store: &SteeringStore,
     project_id: Option<&ProjectId>,
-    board_sections: Option<&HashMap<ProjectId, String>>,
+    guidance: Option<&ProjectGuidance>,
 ) -> Result<String, String> {
+    let parent_id =
+        project_id.and_then(|id| guidance.and_then(|guidance| guidance.workbench_parents.get(id)));
     let mut entries = steering_store
         .list()?
         .into_iter()
         .filter(|steering| match &steering.scope {
             protocol::SteeringScope::Host => true,
-            protocol::SteeringScope::Project(candidate) => project_id == Some(candidate),
+            protocol::SteeringScope::Project(candidate) => {
+                project_id == Some(candidate) || parent_id == Some(candidate)
+            }
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
@@ -447,7 +457,10 @@ pub(crate) fn resolve_steering_body(
         .map(|entry| entry.content)
         .collect::<Vec<_>>()
         .join("\n\n");
-    if let Some(section) = project_id.and_then(|id| board_sections?.get(id)) {
+    if let Some(section) = parent_id
+        .or(project_id)
+        .and_then(|id| guidance?.board_sections.get(id))
+    {
         if !body.is_empty() {
             body.push_str("\n\n");
         }

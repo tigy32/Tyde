@@ -1396,13 +1396,14 @@ pub fn ProjectPage(host_id: String, project_id: ProjectId) -> impl IntoView {
     let steering_count = {
         let steering = state.steering;
         Signal::derive(move || {
+            let steering_project = board_project.get();
             target
                 .with_value(|target| {
                     steering.with(|map| {
                         map.get(&target.host_id).map_or(0, |items| {
                             items
                                 .values()
-                                .filter(|item| steering_in_project(item, &target.project_id))
+                                .filter(|item| steering_in_project(item, &steering_project))
                                 .count()
                         })
                     })
@@ -1547,7 +1548,8 @@ pub fn ProjectPage(host_id: String, project_id: ProjectId) -> impl IntoView {
         });
     });
     let open_steering = Callback::new(move |_| {
-        let (state, target) = (state_sv.get_value(), target.get_value());
+        let (state, mut target) = (state_sv.get_value(), target.get_value());
+        target.project_id = board_project.get_untracked();
         spawn_local(async move {
             if let Err(error) = crate::actions::select_new_chat_host(&state, &target.host_id).await
             {
@@ -2236,6 +2238,35 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn workbench_page_shows_inherited_parent_steering() {
+        install_frame_capture();
+        let container = make_container();
+        let state = seed();
+        let mounted = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            view! { <ProjectPage host_id=HOST.to_owned() project_id=ProjectId("wb-busy".to_owned()) /> }
+        });
+        next_tick().await;
+        let steering_row = row_with(&container, "Steering");
+        assert_eq!(
+            text(&steering_row).trim_start_matches("Steering").trim(),
+            "1",
+            "a workbench inherits its parent project's steering"
+        );
+        click(&steering_row);
+        settled_commands(&state).await;
+        assert_eq!(
+            state
+                .steering_project_filter
+                .get_untracked()
+                .map(|filter| filter.project_id),
+            Some(page_id()),
+            "workbench steering opens the parent project's rules"
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn page_projects_board_and_details_and_routes_clicks() {
         install_frame_capture();
         reset_user_notice_for_tests();
@@ -2888,6 +2919,22 @@ mod wasm_tests {
         assert!(
             !surface_text.contains("Host rule"),
             "Steering shows only what the page counted"
+        );
+        click(
+            &elements(&surfaces, "button")
+                .into_iter()
+                .find(|button| text(button).contains("New steering"))
+                .expect("Steering offers a new rule"),
+        );
+        next_tick().await;
+        let scopes: Vec<String> = elements(&surfaces, "select option")
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(
+            scopes,
+            ["Host", "Project · Tyde"],
+            "steering scopes are top-level projects; workbenches inherit them"
         );
 
         click(&row_with(&container, "Swarms"));
