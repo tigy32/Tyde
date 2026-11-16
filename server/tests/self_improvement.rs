@@ -634,10 +634,18 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
             "fenced-input",
         )])
     );
+    // The rejected reply is returned to the same analyzer session with the
+    // parse error, and its corrected reply is applied.
     fixture
         .host_for_test()
-        .set_learning_script_for_test(MockScript::one(MockTurn::text(fenced)))
-        .expect("install fenced analyzer reply");
+        .set_learning_script_for_test(MockScript::one(MockTurn::text(fenced)).then(MockTurn::text(
+            response(vec![operation(
+                None,
+                steering("Keep every explicit constraint the human states."),
+                "fenced-input",
+            )]),
+        )))
+        .expect("install fenced analyzer reply and its correction");
     save(&mut fixture, unsupported, config(LearningMode::Automatic)).await;
     let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
     assert!(bootstrap.self_improvement.usage.is_empty());
@@ -651,49 +659,52 @@ async fn disabled_unsupported_replay_and_restart_do_not_schedule_or_apply() {
         "Always retain my explicit constraints.",
     )
     .await;
-    let rejected: SelfImprovementState =
-        next_frame_matching_on(&mut observer, "fenced analyzer run settled", |frame| {
+    let corrected: SelfImprovementState =
+        next_frame_matching_on(&mut observer, "corrected analyzer run applied", |frame| {
             frame.kind == FrameKind::SelfImprovementNotify
                 && frame
                     .parse_payload::<SelfImprovementState>()
                     .is_ok_and(|state| {
-                        state.usage.len() == 1
-                            && state
-                                .scopes
-                                .iter()
-                                .all(|scope| !matches!(scope.status, LearningStatus::Running))
+                        state
+                            .changes
+                            .iter()
+                            .any(|change| matches!(change.status, LearningChangeStatus::Applied))
                     })
         })
         .await
         .parse_payload()
-        .expect("parse fenced analyzer state");
-    eprintln!("LEARNING FENCED phase=invalid_reply_settled");
+        .expect("parse corrected analyzer state");
+    eprintln!("LEARNING FENCED phase=corrected_reply_applied");
+    assert_eq!(
+        corrected.usage.len(),
+        1,
+        "A corrected reply belongs to the same batch accounting"
+    );
+    assert_eq!(corrected.changes.len(), 1);
     assert!(
-        rejected.scopes.iter().any(|scope| matches!(
-            &scope.status,
-            LearningStatus::Failed { reason }
-                if reason == "Analyzer returned invalid structured results; no changes applied"
-        )),
-        "A fenced reply must fail as invalid structured results, got {:?}",
-        rejected
+        corrected
+            .scopes
+            .iter()
+            .all(|scope| matches!(scope.status, LearningStatus::Ready)),
+        "A corrected reply must settle the batch, got {:?}",
+        corrected
             .scopes
             .iter()
             .map(|scope| &scope.status)
             .collect::<Vec<_>>()
     );
+    let steering = fixture.connect_with_bootstrap().await.1.steering;
     assert!(
-        rejected.changes.is_empty(),
-        "A reply outside the canonical JSON contract must not propose or apply a rule"
-    );
-    assert!(
-        fixture
-            .connect_with_bootstrap()
-            .await
-            .1
-            .steering
+        steering
             .iter()
             .all(|steering| steering.content != "Retain explicit constraints."),
         "Automatic mode must not apply a rule from a non-canonical reply"
+    );
+    assert!(
+        steering
+            .iter()
+            .any(|steering| steering.content == "Keep every explicit constraint the human states."),
+        "Automatic mode applies the analyzer's corrected reply"
     );
 }
 
@@ -1298,15 +1309,26 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
             "project-protected",
         )]))))
         .expect("install fresh analyzer batch");
-    fixture
-        .host_for_test()
-        .set_learning_script_for_test(MockScript::one(MockTurn::text(response(vec![operation(
+    // Every correction repeats the violation; the batch fails with the
+    // specific reason once the attempt budget is spent, before a fifth
+    // reply would exhaust this script.
+    let escaping = || {
+        MockTurn::text(response(vec![operation(
             Some(LearningRule::Steering {
                 steering: outside.clone(),
             }),
-            escape,
+            escape.clone(),
             "project-escape",
-        )]))))
+        )]))
+    };
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(
+            MockScript::one(escaping())
+                .then(escaping())
+                .then(escaping())
+                .then(escaping()),
+        )
         .expect("install replacement context");
     human(
         &mut fixture,
@@ -1836,6 +1858,17 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         .expect("scope failure")
     };
     assert_eq!(failed.usage.len(), 4);
+    assert!(
+        failed.scopes.iter().any(|job| job.scope == scope
+            && matches!(&job.status, LearningStatus::Failed { reason }
+                if reason == "Analyzer tried to update a rule that is not editable in this scope")),
+        "Exhausted corrections must report the analyzer's last violation, got {:?}",
+        failed
+            .scopes
+            .iter()
+            .map(|job| &job.status)
+            .collect::<Vec<_>>()
+    );
     let steering = fixture.connect_with_bootstrap().await.1.steering;
     assert_eq!(steering.len(), 2);
     assert!(

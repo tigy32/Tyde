@@ -20088,7 +20088,8 @@ pub(crate) struct LearningHelper {
     backend: BackendHandle,
     events: EventStream,
     _workspace: tempfile::TempDir,
-    kind: BackendKind,
+    tracker: AgentActivityStatsTracker,
+    seq: u64,
 }
 
 impl LearningHelper {
@@ -20129,38 +20130,59 @@ impl LearningHelper {
             backend,
             events,
             _workspace: workspace,
-            kind: if use_mock {
+            tracker: AgentActivityStatsTracker::for_backend(if use_mock {
                 BackendKind::Claude
             } else {
                 analyzer.backend_kind
-            },
+            }),
+            seq: 0,
         })
     }
 
+    /// Collects the analyzer's next reply. `correction` starts a follow-up
+    /// turn in the same session first. Usage is cumulative across turns.
     pub(crate) async fn collect(
         &mut self,
         cancelled: &tokio_util::sync::CancellationToken,
-    ) -> (
-        Result<protocol::LearningAnalysis, String>,
-        TaskTokenUsageScope,
-    ) {
-        let mut tracker = AgentActivityStatsTracker::for_backend(self.kind);
+        correction: Option<String>,
+    ) -> (Result<String, String>, TaskTokenUsageScope) {
+        let mut failure = None;
+        if let Some(message) = correction {
+            let outcome = self
+                .backend
+                .send_with_outcome(AgentInput::SendMessage(SendMessagePayload {
+                    message,
+                    images: None,
+                    origin: Some(MessageOrigin::System),
+                    tool_response: None,
+                }))
+                .await;
+            match outcome {
+                crate::backend::SendOutcome::Accepted => {}
+                crate::backend::SendOutcome::Busy(_) => {
+                    failure = Some("Analyzer was still busy when its correction was sent".into());
+                }
+                crate::backend::SendOutcome::Closed => {
+                    failure = Some("Analyzer closed before its correction was sent".into());
+                }
+            }
+        }
+        let tracker = &mut self.tracker;
         let mut output = None;
         let mut streamed = String::new();
-        let mut failure = None;
-        let mut seq = 0;
-        loop {
+        let seq = &mut self.seq;
+        while failure.is_none() {
             let next = tokio::select! { _ = cancelled.cancelled() => { failure = Some("Analyzer was disabled or reconfigured".into()); break; }, event = self.events.recv_backend() => event };
             let Some(event) = next else {
                 break;
             };
-            seq += 1;
+            *seq += 1;
             match event {
                 crate::backend::BackendEvent::ModelRequestTokenUsage(usage) => {
-                    tracker.observe_model_request_token_usage(usage, seq);
+                    tracker.observe_model_request_token_usage(usage, *seq);
                 }
                 crate::backend::BackendEvent::Chat(mut event) => {
-                    tracker.observe_chat_event(&mut event, seq, &streamed);
+                    tracker.observe_chat_event(&mut event, *seq, &streamed);
                     match event {
                         ChatEvent::StreamDelta(delta) => {
                             if streamed.len() + delta.text.len() > 32768 {
@@ -20244,9 +20266,7 @@ impl LearningHelper {
         };
         let result = match failure {
             Some(reason) => Err(reason),
-            None => output
-                .ok_or_else(|| "Analyzer ended without a completed response".to_owned())
-                .and_then(|text| crate::self_improvement::parse_learning_analysis(&text)),
+            None => output.ok_or_else(|| "Analyzer ended without a completed response".to_owned()),
         };
         (result, usage)
     }

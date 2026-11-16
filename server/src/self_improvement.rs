@@ -44,8 +44,11 @@ enum Command {
     Finished {
         scope: SteeringScope,
         batch_id: LearningChangeId,
-        result: Result<LearningAnalysis, String>,
+        result: Result<String, String>,
         usage: TaskTokenUsageScope,
+        /// Receives validation feedback when the analyzer should correct its
+        /// reply in the same session; dropped when the batch is settled.
+        correction: oneshot::Sender<String>,
     },
     WorkerStopped {
         scope: SteeringScope,
@@ -68,7 +71,11 @@ struct Worker {
     scope: SteeringScope,
     config: LearningConfig,
     cancel: CancellationToken,
+    attempts: u32,
 }
+/// Replies the analyzer may give for one batch: the first answer plus
+/// corrections after server validation feedback.
+const ANALYZER_ATTEMPTS: u32 = 4;
 struct ConfigActor {
     settings: Arc<HostSettingsStore>,
     steering: Arc<SteeringStore>,
@@ -327,8 +334,11 @@ impl ConfigActor {
                     batch_id,
                     result,
                     usage,
+                    correction,
                 } => {
-                    if let Err(reason) = self.finish(scope, batch_id, result, usage) {
+                    if let Err(reason) =
+                        self.finish(scope, batch_id, result, usage, Some(correction))
+                    {
                         self.error = Some(reason);
                     }
                 }
@@ -430,6 +440,7 @@ impl ConfigActor {
                                 .into(),
                         ),
                         usage,
+                        None,
                     ) {
                         tracing::error!(reason = %reason, "Cannot retain stopped analyzer accounting");
                     }
@@ -613,6 +624,16 @@ impl ConfigActor {
             }
         }
         for (scope, batch) in interrupted {
+            // A batch interrupted during a correction already holds its
+            // measured usage record.
+            if self
+                .journal
+                .usage
+                .iter()
+                .any(|record| record.batch_id == batch.id)
+            {
+                continue;
+            }
             if let Some(analyzer) = batch.config.analyzer {
                 self.journal.usage.push(LearningUsage {
                     scope,
@@ -859,16 +880,34 @@ impl ConfigActor {
                 match crate::agent::LearningHelper::start(&analyzer, prompt, use_mock, script).await
                 {
                     Ok(mut helper) => {
-                        let (result, usage) = helper.collect(&stop).await;
-                        let _ = results.send(Command::Finished {
-                            scope: worker_scope.clone(),
-                            batch_id: batch.id,
-                            result,
-                            usage,
-                        });
+                        let mut correction = None;
+                        loop {
+                            let (result, usage) = helper.collect(&stop, correction.take()).await;
+                            let (reply, feedback) = oneshot::channel();
+                            if results
+                                .send(Command::Finished {
+                                    scope: worker_scope.clone(),
+                                    batch_id: batch.id.clone(),
+                                    result,
+                                    usage,
+                                    correction: reply,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = stop.cancelled() => break,
+                                feedback = feedback => match feedback {
+                                    Ok(feedback) => correction = Some(feedback),
+                                    Err(_) => break,
+                                },
+                            }
+                        }
                         helper.shutdown().await;
                     }
                     Err(reason) => {
+                        let (correction, _) = oneshot::channel();
                         let _ = results.send(Command::Finished {
                             scope: worker_scope.clone(),
                             batch_id: batch.id,
@@ -876,6 +915,7 @@ impl ConfigActor {
                             usage: TaskTokenUsageScope::Unavailable {
                                 reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
                             },
+                            correction,
                         });
                     }
                 }
@@ -887,6 +927,7 @@ impl ConfigActor {
                 scope,
                 config,
                 cancel,
+                attempts: 1,
             });
         }
         Ok(())
@@ -895,8 +936,9 @@ impl ConfigActor {
         &mut self,
         scope: SteeringScope,
         batch_id: LearningChangeId,
-        result: Result<LearningAnalysis, String>,
+        result: Result<String, String>,
         usage: TaskTokenUsageScope,
+        correction: Option<oneshot::Sender<String>>,
     ) -> Result<(), String> {
         let index = self
             .journal
@@ -926,29 +968,38 @@ impl ConfigActor {
             .analyzer
             .clone()
             .ok_or("Analyzer model missing")?;
-        self.journal.usage.push(LearningUsage {
-            scope: scope.clone(),
-            origin_session_ids: batch
-                .inputs
-                .iter()
-                .filter_map(|input| input.session_id.clone())
-                .collect(),
-            batch_id,
-            origin_agent_ids: batch
-                .inputs
-                .iter()
-                .map(|input| input.agent_id.clone())
-                .collect(),
-            input_ids: batch.inputs.iter().map(|input| input.id.clone()).collect(),
-            analyzer,
-            usage,
-        });
+        match self
+            .journal
+            .usage
+            .iter_mut()
+            .find(|record| record.batch_id == batch_id)
+        {
+            Some(record) => record.usage = usage,
+            None => self.journal.usage.push(LearningUsage {
+                scope: scope.clone(),
+                origin_session_ids: batch
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.session_id.clone())
+                    .collect(),
+                batch_id,
+                origin_agent_ids: batch
+                    .inputs
+                    .iter()
+                    .map(|input| input.agent_id.clone())
+                    .collect(),
+                input_ids: batch.inputs.iter().map(|input| input.id.clone()).collect(),
+                analyzer,
+                usage,
+            }),
+        }
         self.journal.jobs[index].state.last_checked_ms = Some(now_ms());
-        // Persist measured usage even if output validation fails. No repair or
-        // retry call is made; another model may not silently substitute.
+        // Persist measured usage even if output validation fails. Only the
+        // configured analyzer may correct its own reply; no other model
+        // substitutes.
         self.save()?;
-        let analysis = match result {
-            Ok(analysis) => analysis,
+        let raw = match result {
+            Ok(raw) => raw,
             Err(reason) => {
                 self.journal.jobs[index].active = None;
                 self.journal.jobs[index].state.status = LearningStatus::Failed { reason };
@@ -956,77 +1007,22 @@ impl ConfigActor {
                 return Ok(());
             }
         };
-        if analysis.operations.len() > 8 {
-            return self.fail_job(index, "Analyzer proposed too many operations");
-        }
-        let mut changes = Vec::new();
-        for proposal in analysis.operations {
-            let Some(origin) = batch
-                .inputs
-                .iter()
-                .find(|input| input.id == proposal.origin_id)
-            else {
-                return self.fail_job(index, "Analyzer referenced an input outside this batch");
-            };
-            let operation = match self.resolve_proposal(&scope, proposal) {
-                Ok(operation) => operation,
-                Err(reason) => return self.fail_job(index, &reason),
-            };
-            if let Err(reason) = validate_operation(&operation, &scope, &batch.config) {
+        let changes = match self.plan_changes(&scope, &batch, &raw) {
+            Ok(changes) => changes,
+            Err(reason) => {
+                let worker = self.workers.iter_mut().find(|worker| worker.scope == scope);
+                if let (Some(correction), Some(worker)) = (correction, worker)
+                    && worker.attempts < ANALYZER_ATTEMPTS
+                {
+                    worker.attempts += 1;
+                    let feedback = analyzer_correction(&reason);
+                    if correction.send(feedback).is_ok() {
+                        return Ok(());
+                    }
+                }
                 return self.fail_job(index, &reason);
             }
-            let key = rule_key(&operation.after);
-            let expected_revision = batch.revisions.get(&key).copied().unwrap_or(0);
-            if self.current(&operation.after)? == Some(operation.after.clone()) {
-                continue;
-            }
-            if self.journal.changes.iter().any(|change| {
-                change.scope == scope
-                    && change.operation.before == operation.before
-                    && change.operation.after == operation.after
-                    && matches!(
-                        change.status,
-                        LearningChangeStatus::Pending | LearningChangeStatus::Applied
-                    )
-            }) {
-                continue;
-            }
-            let duplicate = self.rules(&scope)?.iter().any(|rule| {
-                rule_key(rule) != key
-                    && (rule_text(rule)
-                        .1
-                        .trim()
-                        .eq_ignore_ascii_case(rule_text(&operation.after).1.trim())
-                        || rule_text(rule)
-                            .0
-                            .trim()
-                            .eq_ignore_ascii_case(rule_text(&operation.after).0.trim()))
-            });
-            if duplicate {
-                return self.fail_job(
-                    index,
-                    "Analyzer proposed a duplicate rule; edit or merge the existing rule instead",
-                );
-            }
-            let managed = operation
-                .before
-                .as_ref()
-                .is_some_and(|before| self.journal.managed.get(&key) == Some(before));
-            let requires_approval = operation.before.is_some() && !managed;
-            changes.push(LearningChange {
-                id: LearningChangeId(uuid::Uuid::new_v4().to_string()),
-                scope: scope.clone(),
-                operation,
-                origin_agent_id: origin.agent_id.clone(),
-                origin_message: origin.message.clone(),
-                created_at_ms: now_ms(),
-                status: LearningChangeStatus::Pending,
-                requires_approval,
-                expected_revision,
-                applied_revision: None,
-                last_edit_id: None,
-            });
-        }
+        };
         let ids = changes
             .iter()
             .map(|change| change.id.clone())
@@ -1049,6 +1045,86 @@ impl ConfigActor {
             }
         }
         Ok(())
+    }
+    /// Validates a complete analyzer reply against canonical state without
+    /// changing it, so a rejected reply can be corrected as a whole.
+    fn plan_changes(
+        &self,
+        scope: &SteeringScope,
+        batch: &LearningBatch,
+        raw: &str,
+    ) -> Result<Vec<LearningChange>, String> {
+        let analysis = parse_learning_analysis(raw)?;
+        if analysis.operations.len() > 8 {
+            return Err(format!(
+                "Analyzer proposed {} operations; at most 8 are allowed",
+                analysis.operations.len()
+            ));
+        }
+        let mut changes = Vec::new();
+        for proposal in analysis.operations {
+            let Some(origin) = batch
+                .inputs
+                .iter()
+                .find(|input| input.id == proposal.origin_id)
+            else {
+                return Err("Analyzer referenced an input outside this batch".into());
+            };
+            let operation = self.resolve_proposal(scope, proposal)?;
+            validate_operation(&operation, scope, &batch.config)?;
+            let key = rule_key(&operation.after);
+            let expected_revision = batch.revisions.get(&key).copied().unwrap_or(0);
+            if self.current(&operation.after)? == Some(operation.after.clone()) {
+                continue;
+            }
+            if self.journal.changes.iter().any(|change| {
+                change.scope == *scope
+                    && change.operation.before == operation.before
+                    && change.operation.after == operation.after
+                    && matches!(
+                        change.status,
+                        LearningChangeStatus::Pending | LearningChangeStatus::Applied
+                    )
+            }) {
+                continue;
+            }
+            let duplicate = self.rules(scope)?.iter().any(|rule| {
+                rule_key(rule) != key
+                    && (rule_text(rule)
+                        .1
+                        .trim()
+                        .eq_ignore_ascii_case(rule_text(&operation.after).1.trim())
+                        || rule_text(rule)
+                            .0
+                            .trim()
+                            .eq_ignore_ascii_case(rule_text(&operation.after).0.trim()))
+            });
+            if duplicate {
+                return Err(
+                    "Analyzer proposed a duplicate rule; edit or merge the existing rule instead"
+                        .into(),
+                );
+            }
+            let managed = operation
+                .before
+                .as_ref()
+                .is_some_and(|before| self.journal.managed.get(&key) == Some(before));
+            let requires_approval = operation.before.is_some() && !managed;
+            changes.push(LearningChange {
+                id: LearningChangeId(uuid::Uuid::new_v4().to_string()),
+                scope: scope.clone(),
+                operation,
+                origin_agent_id: origin.agent_id.clone(),
+                origin_message: origin.message.clone(),
+                created_at_ms: now_ms(),
+                status: LearningChangeStatus::Pending,
+                requires_approval,
+                expected_revision,
+                applied_revision: None,
+                last_edit_id: None,
+            });
+        }
+        Ok(changes)
     }
     /// Binds a model proposal to canonical state: an update always revises
     /// the current text of an existing rule in this scope, and a new rule
@@ -1400,7 +1476,12 @@ impl ConfigActor {
                 job.state.status = LearningStatus::Ready;
             }
             if let Some(batch) = job.active.take() {
-                if let Some(analyzer) = batch.config.analyzer {
+                let recorded = self
+                    .journal
+                    .usage
+                    .iter()
+                    .any(|record| record.batch_id == batch.id);
+                if let Some(analyzer) = batch.config.analyzer.filter(|_| !recorded) {
                     self.journal.usage.push(LearningUsage {
                         scope: job.state.scope.clone(),
                         batch_id: batch.id,
@@ -1495,6 +1576,37 @@ pub(crate) fn rule_text(rule: &LearningRule) -> (&str, &str) {
         LearningRule::ReviewAspect { aspect, .. } => (&aspect.name, &aspect.instructions),
     }
 }
+const ID_LIMIT: usize = 180;
+const TITLE_LIMIT: usize = 120;
+const TEXT_LIMIT: usize = 2048;
+const REASON_LIMIT: usize = 400;
+const DESCRIPTION_LIMIT: usize = 400;
+fn nonempty(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(match field {
+            "title" => "Enter a rule title",
+            "text" => "Enter the rule text",
+            "reason" => "Enter a reason for the change",
+            _ => "Enter a rule identifier",
+        }
+        .into());
+    }
+    Ok(())
+}
+fn bounded(field: &str, value: &str, limit: usize) -> Result<(), String> {
+    if value.len() > limit {
+        return Err(format!(
+            "Rule {field} is {} bytes; the limit is {limit}",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+fn analyzer_correction(reason: &str) -> String {
+    format!(
+        "Your reply was rejected and nothing was applied: {reason}. Reply again with the complete corrected JSON object containing every operation you still propose, following all of the original rules. If the lesson cannot fit the limits without losing meaning, return {{\"operations\":[]}}."
+    )
+}
 fn validate_operation(
     operation: &LearningOperation,
     scope: &SteeringScope,
@@ -1515,26 +1627,23 @@ fn validate_operation(
     let id = match &operation.after {
         LearningRule::Steering { steering } => &steering.id.0,
         LearningRule::ReviewAspect { id, aspect, .. } => {
-            if aspect.description.len() > 400 {
-                return Err("Analyzer description exceeded the bounded rule format".into());
-            }
+            bounded(
+                "review aspect description",
+                &aspect.description,
+                DESCRIPTION_LIMIT,
+            )?;
             id
         }
     };
     let (title, text) = rule_text(&operation.after);
-    if title.trim().is_empty() {
-        return Err("Enter a rule title".into());
-    }
-    if id.trim().is_empty()
-        || title.len() > 120
-        || text.trim().is_empty()
-        || text.len() > 2048
-        || operation.reason.trim().is_empty()
-        || operation.reason.len() > 400
-        || rule_key(&operation.after).len() > 200
-    {
-        return Err("Analyzer operation exceeded the bounded rule format".into());
-    }
+    nonempty("id", id)?;
+    nonempty("title", title)?;
+    nonempty("text", text)?;
+    nonempty("reason", &operation.reason)?;
+    bounded("id", id, ID_LIMIT)?;
+    bounded("title", title, TITLE_LIMIT)?;
+    bounded("text", text, TEXT_LIMIT)?;
+    bounded("reason", &operation.reason, REASON_LIMIT)?;
     // The helper never has authority over policy files, security controls,
     // release actions, execution gates, or reviewer/model configuration.
     let normalized = format!("{title} {text}").to_lowercase();
@@ -1642,6 +1751,7 @@ Style
 - title: a few words naming the topic.
 - text: concise and scannable, roughly tweet-sized as a guideline, plain sentences without lists or markdown.
 - reason: one short sentence naming the lesson; do not quote the feedback.
+- Hard limits in UTF-8 bytes: id {ID_LIMIT}, title {TITLE_LIMIT}, text {TEXT_LIMIT}, reason {REASON_LIMIT}. If merging into an existing entry would exceed the text limit, tighten the merged wording without dropping meaning; if it still cannot fit, propose nothing.
 
 Reply with one JSON object. Each operation has exactly these fields; replace the example values with the actual feedback and rule values:
 {{"operations":[{{"origin_id":"feedback-id","target":"steering","update":false,"id":"new-rule-id","title":"Short title","text":"One durable instruction.","reason":"One short rationale."}}]}}
@@ -1659,8 +1769,9 @@ Return exactly one raw JSON object now. Start with {{ and end with }}. Do not wr
     ))
 }
 pub fn parse_learning_analysis(text: &str) -> Result<LearningAnalysis, String> {
-    serde_json::from_str(text)
-        .map_err(|_| "Analyzer returned invalid structured results; no changes applied".to_owned())
+    serde_json::from_str(text).map_err(|error| {
+        format!("Analyzer returned invalid structured results ({error}); no changes applied")
+    })
 }
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
