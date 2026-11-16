@@ -18209,12 +18209,18 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .learning-sidebar-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-4); }
 .learning-sidebar-header h2 { margin: 0; font-size: 1rem; font-weight: 600; }
 .learning-sidebar-header button { min-width: 28px; min-height: 28px; color: var(--text-secondary); }
-.learning-sidebar-scope { display: flex; flex-direction: column; gap: var(--space-2); padding: 0 var(--space-4) var(--space-3); }
-.learning-sidebar-scope .settings-select { width: 100%; min-width: 0; text-overflow: ellipsis; }
 .learning-sidebar-tabs { display: flex; border-bottom: 1px solid var(--border-primary); }
 .learning-sidebar-tabs button { flex: 1; min-width: 0; padding: var(--space-3); border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); font: inherit; cursor: pointer; }
 .learning-sidebar-tabs button[aria-selected="true"] { border-bottom-color: var(--accent-primary); color: var(--text-primary); }
-.learning-sidebar-content { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-3); }
+.learning-sidebar-content { flex: 1; min-height: 0; overflow-y: auto; padding: 0 var(--space-3) var(--space-3); }
+.learning-group > summary { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; list-style: none; gap: var(--space-2); padding: var(--space-3) var(--space-1) var(--space-2); background: var(--surface-1); cursor: pointer; font-weight: 600; min-width: 0; }
+.learning-group > summary::-webkit-details-marker { display: none; }
+.learning-group > summary::before { content: ""; flex-shrink: 0; width: 5px; height: 5px; margin: 0 var(--space-1); border-right: 1.5px solid var(--text-tertiary); border-bottom: 1.5px solid var(--text-tertiary); transform: rotate(-45deg); transition: transform .12s; }
+.learning-group[open] > summary::before { transform: rotate(45deg); }
+.learning-group-name { overflow-wrap: anywhere; min-width: 0; }
+.learning-group-host { color: var(--text-tertiary); font-weight: 400; white-space: nowrap; }
+.learning-group > summary .learning-count { margin-left: auto; font-weight: 400; }
+.learning-group > .learning-error { margin: 0 var(--space-1) var(--space-3); }
 .learning-empty { text-align: center; color: var(--text-secondary); margin: var(--space-5) 0; }
 .learning-count { display: inline-block; border-radius: 10px; padding: 1px 5px; font-size: .8rem; color: var(--text-primary); background: var(--surface-3); }
 .learning-change { padding: var(--space-3); gap: var(--space-3); }

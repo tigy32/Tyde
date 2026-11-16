@@ -3472,15 +3472,12 @@ fn apply_learning_settings_write_result(
     payload: &protocol::SettingsWriteResultPayload,
 ) {
     let pending = state.self_improvement_open_after_write.get_untracked();
-    if let Some((host, write_id, scope)) = pending
+    if let Some((host, write_id)) = pending
         && host == host_id
         && write_id == payload.write_id
     {
         state.self_improvement_open_after_write.set(None);
         if payload.applied {
-            state
-                .self_improvement_scope_request
-                .set(Some((host, scope)));
             state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
         }
     }

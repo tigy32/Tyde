@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use protocol::{
     FrameKind, LearningChange, LearningChangeId, LearningChangeStatus, LearningEditId,
-    LearningOperation, LearningRule, SelfImprovementAction,
+    LearningOperation, LearningRule, SelfImprovementAction, SelfImprovementState,
 };
 use wasm_bindgen_futures::spawn_local;
 
@@ -57,11 +57,7 @@ fn status_label(change: &LearningChange) -> Option<String> {
 }
 
 #[component]
-pub fn LearningChangeCard(
-    host_id: String,
-    id: LearningChangeId,
-    in_scope: Signal<bool>,
-) -> impl IntoView {
+pub fn LearningChangeCard(host_id: String, id: LearningChangeId) -> impl IntoView {
     let state = expect_context::<AppState>();
     let store = StoredValue::new(state.clone());
     let host = StoredValue::new(host_id);
@@ -143,12 +139,6 @@ pub fn LearningChangeCard(
         })
     };
     let action = move |action| {
-        if !in_scope.get_untracked() {
-            action_error.set(Some(
-                "Suggestion scope changed; return to its scope before editing".into(),
-            ));
-            return;
-        }
         action_error.set(None);
         send_learning_action(&store.get_value(), &host.get_value(), action, action_error);
     };
@@ -238,9 +228,6 @@ pub fn LearningChangeCard(
         }
     };
     let open_rule = move |_| {
-        if !in_scope.get_untracked() {
-            return;
-        }
         if let Some(change) = current.get_untracked() {
             let state = store.get_value();
             state.selected_host_id.set(Some(host.get_value()));
@@ -287,8 +274,8 @@ pub fn LearningChangeCard(
                         format!("{title}\n\n{text}")
                     })}</pre>
                 </details>
-                <Show when=pending><button class="settings-btn" disabled=move || !in_scope.get() on:click=move |_| {
-                    if let Some(change) = current.get_untracked() && pending() && in_scope.get_untracked() {
+                <Show when=pending><button class="settings-btn" on:click=move |_| {
+                    if let Some(change) = current.get_untracked() && pending() {
                         base.set(Some(change.operation)); submitted.set(None);
                         crate::notices::clear_self_improvement_change(&host.get_value(), &change.id);
                         action_error.set(None);
@@ -325,7 +312,7 @@ pub fn LearningChangeCard(
                         readonly=move || !pending() prop:value=move || draft_text.get() on:input=move |ev| draft_text.set(event_target_value(&ev)) />
                     <div class="learning-change-actions">
                         <Show when=pending>
-                            <button class="settings-btn settings-btn-primary" disabled=move || !in_scope.get() || outdated() || !dirty() on:click=save>"Save"</button>
+                            <button class="settings-btn settings-btn-primary" disabled=move || outdated() || !dirty() on:click=save>"Save"</button>
                         </Show>
                         <Show when=move || !pending() || outdated()>
                             <button class="settings-btn" on:click=move |_| {
@@ -352,166 +339,292 @@ pub fn LearningChangeCard(
             <Show when=move || !editing.get() && (pending() || applied() || restorable() || dismissible())>
                 <div class="learning-change-actions">
                     <Show when=pending>
-                        <button class="settings-btn settings-btn-primary" disabled=move || !in_scope.get() on:click=apply>"Accept"</button>
-                        <button class="settings-btn" disabled=move || !in_scope.get() on:click=edit>"Edit"</button>
+                        <button class="settings-btn settings-btn-primary" on:click=apply>"Accept"</button>
+                        <button class="settings-btn" on:click=edit>"Edit"</button>
                     </Show>
-                    <Show when=dismissible><button class=move || if pending() { "learning-dismiss" } else { "settings-btn" } disabled=move || !in_scope.get() on:click=dismiss>"Dismiss"</button></Show>
-                    <Show when=restorable><button class="settings-btn" disabled=move || !in_scope.get() on:click=restore>"Restore"</button></Show>
-                    <Show when=applied><button class="settings-btn" disabled=move || !in_scope.get() on:click=undo>"Undo"</button></Show>
+                    <Show when=dismissible><button class=move || if pending() { "learning-dismiss" } else { "settings-btn" } on:click=dismiss>"Dismiss"</button></Show>
+                    <Show when=restorable><button class="settings-btn" on:click=restore>"Restore"</button></Show>
+                    <Show when=applied><button class="settings-btn" on:click=undo>"Undo"</button></Show>
                 </div>
             </Show>
         </article>
     }
 }
 
+fn awaiting_review(change: &LearningChange) -> bool {
+    matches!(
+        change.status,
+        LearningChangeStatus::Pending
+            | LearningChangeStatus::Applying
+            | LearningChangeStatus::Conflict { .. }
+    ) && change.applied_revision.is_none()
+}
+
+fn in_history(change: &LearningChange) -> bool {
+    matches!(
+        change.status,
+        LearningChangeStatus::Applied
+            | LearningChangeStatus::Undoing
+            | LearningChangeStatus::Undone
+            | LearningChangeStatus::Dismissed
+    ) || (matches!(change.status, LearningChangeStatus::Conflict { .. })
+        && change.applied_revision.is_some())
+}
+
+fn scope_failure(
+    snapshot: &protocol::SelfImprovementState,
+    scope: &SteeringScope,
+) -> Option<String> {
+    snapshot
+        .scopes
+        .iter()
+        .find(|entry| &entry.scope == scope)
+        .and_then(|entry| match &entry.status {
+            protocol::LearningStatus::Failed { reason }
+            | protocol::LearningStatus::Unsupported { reason } => Some(reason.clone()),
+            _ => None,
+        })
+}
+
+fn with_configured_snapshots<R>(
+    state: &AppState,
+    f: impl FnOnce(&[(&str, Option<&SelfImprovementState>)]) -> R,
+) -> R {
+    state.configured_hosts.with(|configured| {
+        state.self_improvement_by_host.with(|hosts| {
+            let snapshots = configured
+                .iter()
+                .map(|host| (host.id.as_str(), hosts.get(&host.id)))
+                .collect::<Vec<_>>();
+            f(&snapshots)
+        })
+    })
+}
+
+fn pending_count(state: &AppState) -> usize {
+    with_configured_snapshots(state, |snapshots| {
+        snapshots
+            .iter()
+            .filter_map(|(_, snapshot)| *snapshot)
+            .flat_map(|snapshot| snapshot.changes.iter())
+            .filter(|change| awaiting_review(change))
+            .count()
+    })
+}
+
 #[component]
 pub fn PendingBadge() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let count = Memo::new(move |_| {
-        let host = state.chat_context_host_id();
-        let project = state.active_project.get();
-        state.self_improvement_by_host.with(|hosts| {
-            host.as_ref()
-                .and_then(|host| hosts.get(host))
-                .map_or(0, |snapshot| {
-                    snapshot
-                        .changes
-                        .iter()
-                        .filter(|change| {
-                            matches!(change.status, LearningChangeStatus::Pending)
-                                && match &change.scope {
-                                    SteeringScope::Host => true,
-                                    SteeringScope::Project(id) => {
-                                        project.as_ref().is_some_and(|project| {
-                                            Some(&project.host_id) == host.as_ref()
-                                                && state.projects.with(|projects| {
-                                                    projects.iter().any(|entry| {
-                                                        entry.host_id == project.host_id
-                                                            && entry.project.id
-                                                                == project.project_id
-                                                            && match entry
-                                                                .project
-                                                                .parent_project_id()
-                                                            {
-                                                                Some(parent) => parent == id,
-                                                                None => &entry.project.id == id,
-                                                            }
-                                                    })
-                                                })
-                                        })
-                                    }
-                                }
-                        })
-                        .count()
-                })
-        })
-    });
+    let count = Memo::new(move |_| pending_count(&state));
     view! { <Show when=move || { count.get() > 0 }><span class="learning-count" aria-label=move || format!("{} pending suggestions", count.get())>{move || count.get()}</span></Show> }
+}
+
+#[component]
+fn SuggestionGroup(host: String, scope: SteeringScope, history: RwSignal<bool>) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let store = StoredValue::new(state.clone());
+    let host = StoredValue::new(host);
+    let scope = StoredValue::new(scope);
+    let snapshot = Memo::new(move |_| {
+        store
+            .get_value()
+            .self_improvement_by_host
+            .with(|hosts| hosts.get(&host.get_value()).cloned())
+    });
+    let changes = Memo::new(move |_| {
+        let mut changes = snapshot
+            .get()
+            .map(|snapshot| {
+                snapshot
+                    .changes
+                    .into_iter()
+                    .filter(|change| change.scope == scope.get_value())
+                    .map(|change| (change.id.clone(), change.created_at_ms, in_history(&change)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        changes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+        changes
+    });
+    let shown = Memo::new(move |_| {
+        changes
+            .get()
+            .iter()
+            .filter(|(_, _, history_row)| *history_row == history.get())
+            .count()
+    });
+    let host_error = Memo::new(move |_| {
+        if scope.get_value() != SteeringScope::Host {
+            return None;
+        }
+        match snapshot.get() {
+            Some(snapshot) => snapshot.error,
+            None => Some("Suggestions unavailable".to_owned()),
+        }
+    });
+    let failure = Memo::new(move |_| {
+        snapshot
+            .get()
+            .and_then(|snapshot| scope_failure(&snapshot, &scope.get_value()))
+    });
+    let host_wide = scope.get_value() == SteeringScope::Host;
+    let notices = Signal::derive(move || {
+        if host_wide {
+            vec![crate::notices::NoticeScope::SelfImprovement(
+                host.get_value(),
+            )]
+        } else {
+            Vec::new()
+        }
+    });
+    let label = move || {
+        let state = store.get_value();
+        match scope.get_value() {
+            SteeringScope::Host => "Every project".to_owned(),
+            SteeringScope::Project(id) => {
+                let name = state.projects.with(|projects| {
+                    projects
+                        .iter()
+                        .find(|entry| entry.host_id == host.get_value() && entry.project.id == id)
+                        .map(|entry| entry.project.name.clone())
+                });
+                name.map_or_else(
+                    || "Unknown project".to_owned(),
+                    |name| format!("{name} only"),
+                )
+            }
+        }
+    };
+    let host_label = move || {
+        let state = store.get_value();
+        state.configured_hosts.with(|hosts| {
+            (hosts.len() > 1)
+                .then(|| {
+                    hosts
+                        .iter()
+                        .find(|entry| entry.id == host.get_value())
+                        .map(|entry| format!("on {}", entry.label))
+                })
+                .flatten()
+        })
+    };
+    let visible = move || shown.get() > 0 || host_error.get().is_some() || failure.get().is_some();
+    view! {
+        <details class="learning-group" open style=move || if visible() { "" } else { "display:none" }>
+            <summary>
+                <span class="learning-group-name">{label}</span>
+                {move || host_label().map(|label| view! { <span class="learning-group-host">{label}</span> })}
+                <Show when=move || { shown.get() > 0 }><span class="learning-count">{move || shown.get()}</span></Show>
+            </summary>
+            <crate::notices::InlineNotices scopes=notices />
+            {move || host_error.get().map(|error| view! { <p class="learning-error" role="alert">{error}</p> })}
+            {move || failure.get().map(|reason| view! { <p class="learning-error" role="alert">{reason}</p> })}
+            <div class="learning-changes">
+                <For each=move || changes.get() key=|(id, _, _)| id.clone() children=move |(id, _, _)| {
+                    let row_id = StoredValue::new(id.clone());
+                    let row_visible = move || changes.get().iter().any(|(id, _, history_row)| *id == row_id.get_value() && *history_row == history.get());
+                    view! { <div style=move || if row_visible() { "" } else { "display:none" }><LearningChangeCard host_id=host.get_value() id /></div> }
+                } />
+            </div>
+        </details>
+    }
 }
 
 #[component]
 pub fn SelfImprovementSidebar() -> impl IntoView {
     let state = expect_context::<AppState>();
     let store = StoredValue::new(state.clone());
-    let selection = RwSignal::new(None::<(String, SteeringScope)>);
     let history = RwSignal::new(false);
-    let navigation_scope = Memo::new(move |_| {
+    let active_scope = Memo::new(move |_| {
         let state = store.get_value();
-        let host = state.chat_context_host_id();
-        let project = state.active_project.get();
-        host.and_then(|host| {
-            let scope = match project.filter(|project| project.host_id == host) {
-                Some(active) => state.projects.with(|projects| {
-                    projects
-                        .iter()
-                        .find(|entry| {
-                            entry.host_id == host && entry.project.id == active.project_id
-                        })
-                        .map(|entry| {
-                            SteeringScope::Project(match entry.project.parent_project_id() {
-                                Some(parent) => parent.clone(),
-                                None => entry.project.id.clone(),
-                            })
-                        })
-                })?,
-                None => SteeringScope::Host,
-            };
-            Some((host, scope))
+        let active = state.active_project.get()?;
+        state.projects.with(|projects| {
+            projects
+                .iter()
+                .find(|entry| {
+                    entry.host_id == active.host_id && entry.project.id == active.project_id
+                })
+                .map(|entry| {
+                    (
+                        active.host_id.clone(),
+                        SteeringScope::Project(
+                            entry
+                                .project
+                                .parent_project_id()
+                                .unwrap_or(&entry.project.id)
+                                .clone(),
+                        ),
+                    )
+                })
         })
     });
-    Effect::new(move |_| selection.set(navigation_scope.get()));
-    Effect::new(move |_| {
+    let groups = Memo::new(move |_| {
         let state = store.get_value();
-        if let Some(request) = state.self_improvement_scope_request.get() {
-            selection.set(Some(request));
-            state.self_improvement_scope_request.set(None);
-        }
+        let active = active_scope.get();
+        with_configured_snapshots(&state, |snapshots| {
+            let mut groups: Vec<(String, SteeringScope, u64)> = Vec::new();
+            for (host, snapshot) in snapshots {
+                let host = (*host).to_owned();
+                let mut add = |scope: &SteeringScope, at: u64| match groups
+                    .iter_mut()
+                    .find(|(h, s, _)| *h == host && s == scope)
+                {
+                    Some(group) => group.2 = group.2.max(at),
+                    None => groups.push((host.clone(), scope.clone(), at)),
+                };
+                add(&SteeringScope::Host, 0);
+                let Some(snapshot) = snapshot else { continue };
+                for change in &snapshot.changes {
+                    add(&change.scope, change.created_at_ms);
+                }
+                for entry in &snapshot.scopes {
+                    add(&entry.scope, 0);
+                }
+            }
+            groups.sort_by(|a, b| {
+                let rank = |group: &(String, SteeringScope, u64)| {
+                    if group.1 == SteeringScope::Host {
+                        0
+                    } else if active
+                        .as_ref()
+                        .is_some_and(|(h, s)| *h == group.0 && *s == group.1)
+                    {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                rank(a).cmp(&rank(b)).then_with(|| {
+                    if rank(a) == 0 {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        b.2.cmp(&a.2).then(a.0.cmp(&b.0))
+                    }
+                })
+            });
+            groups
+                .into_iter()
+                .map(|(host, scope, _)| (host, scope))
+                .collect::<Vec<_>>()
+        })
     });
-    let snapshot = Memo::new(move |_| {
-        let (host, _) = selection.get()?;
-        store
-            .get_value()
-            .self_improvement_by_host
-            .with(|hosts| hosts.get(&host).cloned())
-    });
-    let changes = Memo::new(move |_| {
-        let Some((_, scope)) = selection.get() else {
-            return Vec::new();
-        };
-        snapshot
-            .get()
-            .map(|snapshot| {
-                snapshot
-                    .changes
-                    .into_iter()
-                    .filter(|change| change.scope == scope)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    });
-    let pending = move || {
-        changes
-            .get()
-            .iter()
-            .filter(|change| {
-                matches!(
-                    change.status,
-                    LearningChangeStatus::Pending
-                        | LearningChangeStatus::Applying
-                        | LearningChangeStatus::Conflict { .. }
-                ) && change.applied_revision.is_none()
-            })
-            .count()
-    };
-    let is_history = |change: &LearningChange| {
-        matches!(
-            change.status,
-            LearningChangeStatus::Applied
-                | LearningChangeStatus::Undoing
-                | LearningChangeStatus::Undone
-                | LearningChangeStatus::Dismissed
-        ) || (matches!(change.status, LearningChangeStatus::Conflict { .. })
-            && change.applied_revision.is_some())
-    };
+    let pending = Memo::new(move |_| pending_count(&store.get_value()));
     let empty = move || {
-        !changes
-            .get()
-            .iter()
-            .any(|change| is_history(change) == history.get())
-    };
-    let all_rows = move || {
-        store.get_value().self_improvement_by_host.with(|hosts| {
-            let mut rows = hosts
-                .iter()
-                .flat_map(|(host, snapshot)| {
-                    snapshot
+        with_configured_snapshots(&store.get_value(), |snapshots| {
+            !snapshots.iter().any(|(_, snapshot)| {
+                let Some(snapshot) = snapshot else {
+                    return true;
+                };
+                snapshot.error.is_some()
+                    || snapshot
+                        .scopes
+                        .iter()
+                        .any(|entry| scope_failure(snapshot, &entry.scope).is_some())
+                    || snapshot
                         .changes
                         .iter()
-                        .map(|change| (host.clone(), change.id.clone(), change.created_at_ms))
-                })
-                .collect::<Vec<_>>();
-            rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.0.cmp(&b.1.0)));
-            rows
+                        .any(|change| in_history(change) == history.get())
+            })
         })
     };
     view! {
@@ -520,62 +633,19 @@ pub fn SelfImprovementSidebar() -> impl IntoView {
                 <h2>"Self-improvement"</h2>
                 <button class="learning-link" aria-label="Self-improvement settings" title="Self-improvement settings" on:click=move |_| {
                     let state = store.get_value();
-                    if let Some((host, _)) = selection.get_untracked() {
-                        state.selected_host_id.set(Some(host));
-                    }
                     state.settings_tab_request.set(Some("Self-improvement"));
                     state.settings_open.set(true);
                 }>"⚙"</button>
             </header>
-            <div class="learning-sidebar-scope">
-                <select class="settings-select" aria-label="Suggestions host"
-                    prop:value=move || selection.get().map(|(host, _)| host).unwrap_or_default()
-                    on:change=move |ev| selection.set(Some((event_target_value(&ev), SteeringScope::Host)))>
-                    <option value="" disabled>"Choose a host"</option>
-                    {move || store.get_value().configured_hosts.get().into_iter().map(|host| view! { <option value=host.id>{host.label}</option> }).collect_view()}
-                </select>
-                <select class="settings-select" aria-label="Suggestions scope"
-                    prop:value=move || selection.get().map(|(_, scope)| match scope { SteeringScope::Host => String::new(), SteeringScope::Project(id) => id.0 }).unwrap_or_default()
-                    on:change=move |ev| {
-                        if let Some((host, _)) = selection.get_untracked() {
-                            let value = event_target_value(&ev);
-                            selection.set(Some((host, if value.is_empty() { SteeringScope::Host } else { SteeringScope::Project(protocol::ProjectId(value)) })));
-                        }
-                    }>
-                    <option value="">"All projects (host-wide)"</option>
-                    {move || store.get_value().projects.get().into_iter().filter(|project| selection.get().is_some_and(|(host, _)| host == project.host_id) && !project.project.is_workbench()).map(|project| view! { <option value=project.project.id.0>{project.project.name}</option> }).collect_view()}
-                </select>
-            </div>
             <div class="learning-sidebar-tabs" role="tablist" aria-label="Suggestions">
-                <button role="tab" aria-selected=move || (!history.get()).to_string() on:click=move |_| history.set(false)>"Pending" <span class="learning-count">{pending}</span></button>
+                <button role="tab" aria-selected=move || (!history.get()).to_string() on:click=move |_| history.set(false)>"Pending" <Show when=move || { pending.get() > 0 }><span class="learning-count">{move || pending.get()}</span></Show></button>
                 <button role="tab" aria-selected=move || history.get().to_string() on:click=move |_| history.set(true)>"History"</button>
             </div>
             <div class="learning-sidebar-content">
-                <Show when=move || selection.get().is_none()><p class="learning-empty">"Choose a host"</p></Show>
-                <Show when=move || selection.get().is_some() && snapshot.get().is_none()><p class="learning-empty" role="status">"Suggestions unavailable"</p></Show>
-                <crate::notices::InlineNotices scopes=Signal::derive(move || selection.get().map(|(host, _)| vec![crate::notices::NoticeScope::SelfImprovement(host)]).unwrap_or_default()) />
-                {move || snapshot.get().and_then(|snapshot| snapshot.error).map(|error| view! { <p class="learning-error" role="alert"><strong>"Host: "</strong>{error}</p> })}
-                {move || {
-                    let (_, scope) = selection.get()?;
-                    let status = snapshot.get()?.scopes.into_iter().find(|entry| entry.scope == scope)?.status;
-                    match status {
-                        protocol::LearningStatus::Failed { reason } | protocol::LearningStatus::Unsupported { reason } => Some(view! { <p class="learning-error" role="alert">{reason}</p> }),
-                        _ => None,
-                    }
-                }}
-                <Show when=move || snapshot.get().is_some() && empty()><p class="learning-empty">"No suggestions"</p></Show>
-                <div class="learning-changes">
-                    <For each=all_rows key=|(host, id, _)| (host.clone(), id.clone()) children=move |(host, id, _)| {
-                        let row_host = StoredValue::new(host.clone());
-                        let row_id = StoredValue::new(id.clone());
-                        let in_scope = Signal::derive(move || {
-                            let Some((host, scope)) = selection.get() else { return false; };
-                            host == row_host.get_value() && store.get_value().self_improvement_by_host.with(|hosts| hosts.get(&host).is_some_and(|snapshot| snapshot.changes.iter().any(|change| change.id == row_id.get_value() && change.scope == scope)))
-                        });
-                        let visible = move || in_scope.get() && store.get_value().self_improvement_by_host.with(|hosts| hosts.get(&row_host.get_value()).is_some_and(|snapshot| snapshot.changes.iter().any(|change| change.id == row_id.get_value() && is_history(change) == history.get())));
-                        view! { <div style=move || if visible() { "" } else { "display:none" }><LearningChangeCard host_id=host id in_scope /></div> }
-                    } />
-                </div>
+                <Show when=empty><p class="learning-empty">"No suggestions"</p></Show>
+                <For each=move || groups.get() key=|(host, scope)| (host.clone(), match scope { SteeringScope::Host => None, SteeringScope::Project(id) => Some(id.0.clone()) }) children=move |(host, scope)| view! {
+                    <SuggestionGroup host scope history />
+                } />
             </div>
         </div>
     }

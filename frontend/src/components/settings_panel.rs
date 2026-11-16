@@ -7929,7 +7929,7 @@ fn send_host_change_with_id(
         {
             if pending_open
                 .get_untracked()
-                .is_some_and(|(host, id, _)| host == host_id && id == payload.write_id)
+                .is_some_and(|(host, id)| host == host_id && id == payload.write_id)
             {
                 pending_open.set(None);
             }
@@ -9492,7 +9492,7 @@ fn SelfImprovementTab() -> impl IntoView {
             move |doc| replace_setting_op(doc, path, value).map(|op| vec![op]),
             move |id| {
                 if should_open && let Some(host) = host {
-                    pending_open.set(Some((host, id, selected_scope)));
+                    pending_open.set(Some((host, id)));
                 }
             },
         );
@@ -9717,16 +9717,10 @@ fn SelfImprovementTab() -> impl IntoView {
                 <Show when=move || snapshot.get().error.is_some()>
                     <p class="learning-error" role="alert">{move || snapshot.get().error}</p>
                 </Show>
-                <button class="settings-btn" disabled=move || store.get_value().selected_host_id.get().is_none() || scope.get().is_none() on:click=move |_| {
+                <button class="settings-btn" on:click=move |_| {
                     let state = store.get_value();
-                    match (state.selected_host_id.get_untracked(), scope.get_untracked()) {
-                        (Some(host), Some(scope)) => {
-                            state.self_improvement_scope_request.set(Some((host, scope)));
-                            state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
-                            state.settings_open.set(false);
-                        }
-                        _ => crate::notices::report_settings_error(&state, "Choose a host and scope"),
-                    }
+                    state.activate_sidebar_tab(crate::state::SidebarTab::SelfImprovement);
+                    state.settings_open.set(false);
                 }>"Open suggestions"</button>
                 {move || {
                     let usage = snapshot.get().usage.into_iter()
@@ -23999,6 +23993,12 @@ mod wasm_tests {
                 },
             },
         ]);
+        let learning_projects = state
+            .projects
+            .get_untracked()
+            .into_iter()
+            .map(|entry| entry.project)
+            .collect::<Vec<_>>();
         let root = make_container();
         root.set_attribute("style", "width: 1000px; height: 800px")
             .unwrap();
@@ -24040,17 +24040,18 @@ mod wasm_tests {
             .dyn_into::<web_sys::HtmlButtonElement>()
             .unwrap();
         assert_eq!(select.value(), "host", "New Chat defaults to host-wide");
-        for selector in [
-            "#learning-settings select[aria-label='Self-improvement scope']",
-            "#learning-sidebar select[aria-label='Suggestions scope']",
-        ] {
-            let options = surface(selector).text_content().unwrap();
-            assert!(options.contains("Learning project"));
-            assert!(
-                !options.contains("Learning workbench"),
-                "Only top-level projects are learning scopes"
-            );
-        }
+        let options = surface("#learning-settings select[aria-label='Self-improvement scope']")
+            .text_content()
+            .unwrap();
+        assert!(options.contains("Learning project"));
+        assert!(
+            !options.contains("Learning workbench"),
+            "Only top-level projects are learning scopes"
+        );
+        assert!(
+            sidebar.query_selector("select").unwrap().is_none(),
+            "Suggestions span every host and project without a scope picker"
+        );
 
         assert!(!open.disabled());
         state
@@ -24064,14 +24065,6 @@ mod wasm_tests {
             select.value(),
             "host",
             "Project navigation must not change scope"
-        );
-        assert_eq!(
-            surface("#learning-sidebar select[aria-label='Suggestions scope']")
-                .dyn_into::<HtmlSelectElement>()
-                .unwrap()
-                .value(),
-            "learning-project",
-            "Workbench navigation selects its parent learning scope"
         );
 
         sidebar
@@ -24129,7 +24122,7 @@ mod wasm_tests {
             !state.sidebar_layout.get_untracked().current().right.visible,
             "Sending is not confirmation"
         );
-        let (_, write_id, _) = state
+        let (_, write_id) = state
             .self_improvement_open_after_write
             .get_untracked()
             .unwrap();
@@ -24171,7 +24164,7 @@ mod wasm_tests {
         enabled.set_checked(true);
         dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
         next_tick().await;
-        let (_, rejected_id, _) = state
+        let (_, rejected_id) = state
             .self_improvement_open_after_write
             .get_untracked()
             .unwrap();
@@ -24185,7 +24178,7 @@ mod wasm_tests {
         enabled.set_checked(true);
         dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
         next_tick().await;
-        let (_, removed_write, _) = state
+        let (_, removed_write) = state
             .self_improvement_open_after_write
             .get_untracked()
             .unwrap();
@@ -24236,7 +24229,7 @@ mod wasm_tests {
         enabled.set_checked(true);
         dispatch_event_from_js(enabled.unchecked_ref(), "change", None);
         next_tick().await;
-        let (_, compact_write, _) = state
+        let (_, compact_write) = state
             .self_improvement_open_after_write
             .get_untracked()
             .unwrap();
@@ -24414,13 +24407,9 @@ mod wasm_tests {
         state.selected_host_id.set(Some("another-host".into()));
         next_tick().await;
         assert_eq!(editor.value(), "Retain my draft across views");
-        let before_calls = calls.length();
-        find_button_by_text(&card, "Save").unwrap().click();
-        next_tick().await;
-        assert_eq!(
-            calls.length(),
-            before_calls,
-            "Stale scope must not send an action"
+        assert!(
+            card.get_bounding_client_rect().height() > 0.0,
+            "Switching the selected host keeps every host's suggestions visible"
         );
         state.selected_host_id.set(Some(host.into()));
         state
@@ -24800,15 +24789,6 @@ mod wasm_tests {
                 project_id: ProjectId("active-chat-project".into()),
             }));
         next_tick().await;
-        let sidebar_scope = sidebar
-            .query_selector("select[aria-label='Suggestions scope']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlSelectElement>()
-            .unwrap();
-        sidebar_scope.set_value("");
-        dispatch_event_from_js(sidebar_scope.unchecked_ref(), "change", None);
-        next_tick().await;
         sidebar
             .query_selector("[aria-label='Self-improvement settings']")
             .unwrap()
@@ -24820,7 +24800,7 @@ mod wasm_tests {
         assert_eq!(
             select.value(),
             "host",
-            "The gear preserves the dock's host-wide scope instead of configuring the active chat project"
+            "The gear opens host-wide settings instead of configuring the active chat project"
         );
         assert_eq!(
             state.active_project.get_untracked().unwrap().project_id.0,
@@ -24828,6 +24808,148 @@ mod wasm_tests {
             "Opening scoped Settings must not navigate the chat"
         );
         assert_eq!(composer.value(), "Keep this unsent draft");
+
+        let air = "learning-air";
+        state.configured_hosts.set(vec![
+            settings_host(host, "Sidebar host"),
+            settings_host(air, "Air host"),
+            settings_host("learning-offline", "Offline host"),
+        ]);
+        let pending_in = |id: &str, scope: SteeringScope, at: u64| LearningChange {
+            id: LearningChangeId(id.into()),
+            scope,
+            created_at_ms: at,
+            status: LearningChangeStatus::Pending,
+            applied_revision: None,
+            last_edit_id: None,
+            ..snapshot.changes[0].clone()
+        };
+        let project = |id: &str| SteeringScope::Project(ProjectId(id.into()));
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, host, |bootstrap| {
+            bootstrap.projects = learning_projects.clone();
+            bootstrap.self_improvement = SelfImprovementState {
+                changes: vec![
+                    pending_in("sidebar-project", project("learning-project"), 5),
+                    pending_in("sidebar-host", SteeringScope::Host, 1),
+                    pending_in("sidebar-gone", project("deleted-project"), 3),
+                ],
+                ..Default::default()
+            };
+        });
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, air, |bootstrap| {
+            bootstrap.projects = vec![protocol::Project {
+                id: ProjectId("air-project".into()),
+                name: "Air project".into(),
+                sort_order: 0,
+                source: protocol::ProjectSource::Standalone { roots: vec![] },
+            }];
+            bootstrap.self_improvement = SelfImprovementState {
+                changes: vec![
+                    pending_in("air-project", project("air-project"), 9),
+                    pending_in("air-host", SteeringScope::Host, 2),
+                ],
+                error: Some("Air analyzer unavailable".into()),
+                ..Default::default()
+            };
+        });
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.into(),
+                project_id: ProjectId("learning-workbench".into()),
+            }));
+        next_tick().await;
+        let group_headings = || {
+            let headings = sidebar.query_selector_all("summary").unwrap();
+            (0..headings.length())
+                .map(|i| headings.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
+                .filter(|summary| summary.get_bounding_client_rect().height() > 0.0)
+                .filter(|summary| summary.closest("article").unwrap().is_none())
+                .map(|summary| {
+                    let parts = summary.children();
+                    (0..parts.length())
+                        .map(|i| parts.item(i).unwrap().text_content().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            group_headings(),
+            [
+                "Every project | on Sidebar host | 1",
+                "Every project | on Air host | 1",
+                "Every project | on Offline host",
+                "Learning project only | on Sidebar host | 1",
+                "Air project only | on Air host | 1",
+                "Unknown project | on Sidebar host | 1",
+            ],
+            "Host-wide rules lead in host order, then the active workbench's parent project, then newest"
+        );
+        let text = sidebar.text_content().unwrap();
+        assert!(
+            text.contains("Air analyzer unavailable"),
+            "Another host's error appears in its own group"
+        );
+        assert!(
+            text.contains("Suggestions unavailable"),
+            "A configured host without suggestions loaded says so instead of looking empty"
+        );
+        let air_card = sidebar.query_selector_all("article").unwrap();
+        let air_card = (0..air_card.length())
+            .map(|i| air_card.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
+            .find(|card| {
+                card.get_bounding_client_rect().height() > 0.0
+                    && card
+                        .closest("details")
+                        .unwrap()
+                        .unwrap()
+                        .text_content()
+                        .unwrap()
+                        .contains("Air project only")
+            })
+            .expect("Another host's project suggestion is visible");
+        assert!(
+            !find_button_by_text(&air_card, "Accept")
+                .unwrap()
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+                .disabled(),
+            "Suggestions outside the chat's host and project stay actionable"
+        );
+        assert_eq!(
+            root.query_selector("#learning-header [aria-label$='pending suggestions']")
+                .unwrap()
+                .unwrap()
+                .get_attribute("aria-label")
+                .as_deref(),
+            Some("5 pending suggestions"),
+            "The dock badge counts every host and project"
+        );
+
+        state
+            .configured_hosts
+            .update(|hosts| hosts.retain(|entry| entry.id != air));
+        next_tick().await;
+        assert_eq!(
+            group_headings(),
+            [
+                "Every project | on Sidebar host | 1",
+                "Every project | on Offline host",
+                "Learning project only | on Sidebar host | 1",
+                "Unknown project | on Sidebar host | 1",
+            ],
+            "Removing a host removes its groups"
+        );
+        assert_eq!(
+            root.query_selector("#learning-header [aria-label$='pending suggestions']")
+                .unwrap()
+                .unwrap()
+                .get_attribute("aria-label")
+                .as_deref(),
+            Some("3 pending suggestions"),
+            "A removed host's suggestions leave the dock badge"
+        );
         drop(handle);
         root.remove();
         style.remove();
