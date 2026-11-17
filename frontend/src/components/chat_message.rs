@@ -323,6 +323,36 @@ pub fn ChatMessageView(
         });
     };
 
+    let copy_button = move || {
+        view! {
+            <button
+                class=move || {
+                    match copy_state.get() {
+                        "copied" => "footer-copy-btn copied",
+                        "failed" => "footer-copy-btn copy-failed",
+                        _ => "footer-copy-btn",
+                    }
+                }
+                title=move || match copy_state.get() {
+                    "copied" => "Message copied".to_owned(),
+                    "failed" => format!(
+                        "Copy failed: {}",
+                        copy_error.get().unwrap_or_default()
+                    ),
+                    _ => "Copy message".to_owned(),
+                }
+                aria-label="Copy message"
+                on:click=on_copy
+            >
+                {move || match copy_state.get() {
+                    "copied" => "\u{2713}",
+                    "failed" => "!",
+                    _ => "\u{29C9}",
+                }}
+            </button>
+        }
+    };
+
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
     let reasoning_open = RwSignal::new(false);
 
@@ -340,6 +370,13 @@ pub fn ChatMessageView(
                         <span class="chat-card-model">{m}</span>
                     })}
                     <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
+                    {move || {
+                        let is_user = card_meta.with(|(_, _, is_user, _, _)| *is_user);
+                        let has_content = entry_slot.with_value(|entry| {
+                            entry.with(|entry| !entry.message.content.is_empty())
+                        });
+                        (is_user && has_content).then(copy_button)
+                    }}
                 </div>
             </Show>
 
@@ -530,7 +567,6 @@ pub fn ChatMessageView(
                     .unwrap_or_default();
                 let footer_time = format_relative_time(e.message.timestamp);
                 let footer_content_empty = e.message.content.is_empty();
-                let on_copy_handler = on_copy;
 
                 Some(view! {
                     <div class="chat-card-footer">
@@ -549,33 +585,7 @@ pub fn ChatMessageView(
                         </span>
                         <span class="chat-card-footer-right">
                             <span class="footer-time">{footer_time}</span>
-                            {(!footer_content_empty).then(move || view! {
-                                <button
-                                    class=move || {
-                                        match copy_state.get() {
-                                            "copied" => "footer-copy-btn copied",
-                                            "failed" => "footer-copy-btn copy-failed",
-                                            _ => "footer-copy-btn",
-                                        }
-                                    }
-                                    title=move || match copy_state.get() {
-                                        "copied" => "Message copied".to_owned(),
-                                        "failed" => format!(
-                                            "Copy failed: {}",
-                                            copy_error.get().unwrap_or_default()
-                                        ),
-                                        _ => "Copy message".to_owned(),
-                                    }
-                                    aria-label="Copy message"
-                                    on:click=on_copy_handler
-                                >
-                                    {move || match copy_state.get() {
-                                        "copied" => "\u{2713}",
-                                        "failed" => "!",
-                                        _ => "\u{29C9}",
-                                    }}
-                                </button>
-                            })}
+                            {(!footer_content_empty).then(copy_button)}
                         </span>
                     </div>
                 })
@@ -1226,10 +1236,19 @@ mod wasm_tests {
                 window.__messageClipboardFixture = {
                     tauri: window.__TAURI__,
                     clipboard: Object.getOwnPropertyDescriptor(navigator, 'clipboard'),
+                    setTimeout: window.setTimeout.bind(window),
+                    timers: [],
                     browserWrites: 0,
                     calls: [],
                 };
                 const fixture = window.__messageClipboardFixture;
+                window.setTimeout = (callback, delay, ...args) => {
+                    if (delay === 1200) {
+                        fixture.timers.push(() => callback(...args));
+                        return 0;
+                    }
+                    return fixture.setTimeout(callback, delay, ...args);
+                };
                 Object.defineProperty(navigator, 'clipboard', {
                     configurable: true,
                     value: { writeText: () => {
@@ -1257,6 +1276,7 @@ mod wasm_tests {
             js_sys::eval(
                 r#"
                 const fixture = window.__messageClipboardFixture;
+                window.setTimeout = fixture.setTimeout;
                 if (fixture.tauri === undefined) delete window.__TAURI__;
                 else window.__TAURI__ = fixture.tauri;
                 if (fixture.clipboard) {
@@ -1273,10 +1293,25 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn message_copy_uses_native_clipboard_and_reports_failures() {
-        let _fixture = ClipboardFixture::install();
-        let mut entry = assistant_msg(None);
         let content = "**Copy exactly**\n\n```rust\nlet café = \"🦀\";\n```\n";
-        entry.message.content = content.to_owned();
+        let mut assistant = assistant_msg(None);
+        assistant.message.content = content.to_owned();
+        for entry in [assistant, user_msg(content)] {
+            assert_message_copy(entry, content).await;
+        }
+        let empty = mount_message(user_msg(""));
+        next_tick().await;
+        assert!(
+            empty
+                .query_selector("button[aria-label='Copy message']")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn assert_message_copy(entry: ChatMessageEntry, content: &str) {
+        let _fixture = ClipboardFixture::install();
+        let is_user = matches!(entry.message.sender, MessageSender::User);
         let container = mount_message(entry);
         next_tick().await;
         let button: HtmlElement = container
@@ -1285,6 +1320,18 @@ mod wasm_tests {
             .expect("message copy button")
             .dyn_into()
             .unwrap();
+        if is_user {
+            assert!(
+                container
+                    .query_selector(".user-text")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref()
+                    == Some(content),
+                "user prompt formatting must remain untouched"
+            );
+        }
         button.click();
         next_tick().await;
         assert_eq!(
@@ -1342,13 +1389,8 @@ mod wasm_tests {
             Some(0.0),
             "desktop copying must not depend on browser clipboard permission"
         );
-        let promise = js_sys::Promise::new(&mut |resolve, _| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1300)
-                .unwrap();
-        });
-        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        js_sys::eval("window.__messageClipboardFixture.timers.splice(0).forEach(run => run())")
+            .unwrap();
         next_tick().await;
         assert_eq!(button.text_content().as_deref(), Some("⧉"));
         assert_eq!(
