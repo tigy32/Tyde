@@ -3834,7 +3834,7 @@ fn spawn_device_accept_task(
                     return;
                 }
                 Err(error) => {
-                    tracing::debug!(code = ?error.code, "mobile signaling accept failed; applying reconnect policy");
+                    tracing::warn!(device_id = %record.device_id, code = ?error.code, message = %error.message, "mobile signaling accept failed; applying reconnect policy");
                     let terminal = terminal_device_accept_error(error.code);
                     let _ = tx.send(MobileAccessCommand::DeviceAcceptFailed {
                         device_id: record.device_id.clone(),

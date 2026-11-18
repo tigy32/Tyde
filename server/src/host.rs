@@ -894,7 +894,9 @@ pub(crate) struct HostState {
     tychat: crate::tychat::TychatService,
     dots: crate::dots::DotsHandle,
     board: crate::board::BoardHandle,
-    board_subscriptions: HashMap<StreamPath, HashSet<ProjectId>>,
+    /// Board projects each host stream follows, with the last state payload
+    /// published to it. Fan-out skips a subscriber whose board did not change.
+    board_subscriptions: HashMap<StreamPath, HashMap<ProjectId, Option<serde_json::Value>>>,
     board_membership_changes: watch::Sender<()>,
     #[cfg(feature = "test-support")]
     tychat_bridge_disabled: bool,

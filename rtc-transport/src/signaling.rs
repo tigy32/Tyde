@@ -246,7 +246,7 @@ impl HostSocket {
                     "signaling socket",
                     format!("service refused WebSocket upgrade (HTTP {}); check service compatibility and credentials", response.status()),
                 ),
-                _ => failure("signaling socket", "WebSocket upgrade failed"),
+                error => failure("signaling socket", format!("WebSocket upgrade failed: {error}")),
             })?;
         // Protocol pings do not invoke the service's billed application handler.
         const PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -271,7 +271,7 @@ impl HostSocket {
                         self.socket.flush().await.map_err(|_| failure("signaling socket", "control frame flush failed"))?;
                     }
                     Some(Ok(Message::Close(_))) | None => return Err(failure("signaling socket", "connection closed")),
-                    Some(Err(_)) => return Err(failure("signaling socket", "connection failed")),
+                    Some(Err(error)) => return Err(failure("signaling socket", format!("connection failed: {error}"))),
                     Some(Ok(_)) => return Err(failure("signaling socket", "expected JSON text frame")),
                 }
             }

@@ -711,7 +711,8 @@ async fn project_store_keeps_foreign_records_across_rename() {
 
 #[tokio::test]
 async fn slow_client_chat_backlog_is_bounded_by_bytes_not_frames() {
-    for (name_bytes, updates, should_close) in [(32, 512, false), (64 * 1024, 140, true)] {
+    // 1040 updates of 64 KiB overflow the 64 MiB per-lane byte bound.
+    for (name_bytes, updates, should_close) in [(32, 512, false), (64 * 1024, 1040, true)] {
         let mut fixture = Fixture::new().await;
         let project = create_project(
             &mut fixture.client,

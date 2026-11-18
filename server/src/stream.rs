@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use protocol::{Envelope, FrameKind, ProtocolFrame, StreamPath, VoiceAudioPayload};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-const CONTROL_LIMIT: usize = 64;
-const BULK_LIMIT: usize = 256;
 const AUDIO_PACKET_LIMIT: usize = 8;
-const CONTROL_BYTE_LIMIT: usize = 1024 * 1024;
-const CHAT_BYTE_LIMIT: usize = 8 * 1024 * 1024;
-const BULK_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+// Every lane shares one generous byte bound. An overflow means a producer is
+// outrunning the transport, which must surface as a loud close, not a quiet
+// frame-count trip.
+pub(crate) const LANE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputLane {
@@ -364,9 +363,7 @@ impl OutputQueue {
             return Ok(());
         }
         let (limit, byte_limit) = match output.lane {
-            OutputLane::Control => (Some(CONTROL_LIMIT), CONTROL_BYTE_LIMIT),
-            OutputLane::Chat => (None, CHAT_BYTE_LIMIT),
-            OutputLane::Bulk => (Some(BULK_LIMIT), BULK_BYTE_LIMIT),
+            OutputLane::Control | OutputLane::Chat | OutputLane::Bulk => (None, LANE_BYTE_LIMIT),
             // A ready actor acquires a slot before constructing its snapshot.
             // Its separate window cannot consume ordinary bulk/control capacity.
             OutputLane::Replay => (Some(2), protocol::framing::MAX_LOGICAL_HEADER),

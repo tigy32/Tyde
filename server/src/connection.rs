@@ -563,10 +563,14 @@ where
                         .as_ref()
                         .is_some_and(|stream| stream == &item.frame.envelope.stream)
                     {
-                        if deferred_same_stream.len() >= 64
-                            || deferred_same_stream_bytes.saturating_add(item.bytes)
-                                > 8 * 1024 * 1024
+                        if deferred_same_stream_bytes.saturating_add(item.bytes)
+                            > crate::stream::LANE_BYTE_LIMIT
                         {
+                            tracing::warn!(stream = %item.frame.envelope.stream,
+                                kind = %item.frame.envelope.kind,
+                                frame_bytes = item.bytes,
+                                deferred_bytes = deferred_same_stream_bytes,
+                                "closing connection after deferred same-stream output limit exceeded");
                             return Err(crate::stream::StreamClosed);
                         }
                         deferred_same_stream_bytes =
@@ -595,7 +599,7 @@ where
             } => {
                 let next: Result<WriterNext, crate::stream::StreamClosed> = next;
                 let next = next.map_err(|_| {
-                    FrameError::Protocol("connection control lane overflow".into())
+                    FrameError::Protocol("connection output queue overflow".into())
                 })?;
                 let WriterNext::Output(mut queued) = next else {
                     match next {

@@ -250,20 +250,19 @@ impl HostHandle {
                     let payload = serde_json::to_value(&result)
                         .map_err(|error| fail(BoardErrorCode::Storage, error.to_string()))?;
                     state.host_streams.retain(|path, subscriber| {
-                        if state
+                        let Some(published) = state
                             .board_subscriptions
-                            .get(path)
-                            .is_some_and(|projects| projects.contains(&result.project_id))
-                        {
-                            emit_or_queue_host_frame(
-                                subscriber,
-                                FrameKind::BoardState,
-                                payload.clone(),
-                            )
-                            .is_ok()
-                        } else {
-                            true
+                            .get_mut(path)
+                            .and_then(|projects| projects.get_mut(&result.project_id))
+                        else {
+                            return true;
+                        };
+                        if published.as_ref() == Some(&payload) {
+                            return true;
                         }
+                        *published = Some(payload.clone());
+                        emit_or_queue_host_frame(subscriber, FrameKind::BoardState, payload.clone())
+                            .is_ok()
                     });
                     Ok(result)
                 })
@@ -306,11 +305,13 @@ impl HostHandle {
         let id = project.parent_project_id().cloned().unwrap_or(project.id);
         self.state
             .with(move |state| {
+                // An explicit client command re-arms delivery so it always
+                // receives the resulting state, even when unchanged.
                 state
                     .board_subscriptions
                     .entry(stream)
                     .or_default()
-                    .insert(id);
+                    .insert(id, None);
             })
             .await;
         Ok(())
@@ -360,7 +361,7 @@ pub(super) fn start_live_updates(
                     state
                         .board_subscriptions
                         .values()
-                        .flatten()
+                        .flat_map(|projects| projects.keys())
                         .cloned()
                         .collect::<HashSet<_>>()
                 })
@@ -381,7 +382,7 @@ pub(super) fn start_live_updates(
                                 .with(move |state| {
                                     state.host_streams.retain(|path, subscriber| {
                                         if state.board_subscriptions.get_mut(path).is_some_and(
-                                            |projects| projects.remove(&failed_project),
+                                            |projects| projects.remove(&failed_project).is_some(),
                                         ) {
                                             emit_or_queue_host_frame(
                                                 subscriber,

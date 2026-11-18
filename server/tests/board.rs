@@ -392,6 +392,17 @@ async fn board_lanes_cards_tools_steering_and_restart() {
     let (b, after) = spawn(&mut f, &workbench.id, "Card B").await;
     assert!(after.contains("Lanes. Call tyde_board_read to see which one you're in.\\n\\nIn Progress: Keep work scoped."));
     let b_caller = f.agent_control_caller(&b.new_agent.agent_id).await;
+    // Reads publish nothing: the next state an observer sees must be a change.
+    let (mut observer, _) = f.connect_with_bootstrap().await;
+    observer
+        .board_command(BoardCommandPayload::Read(BoardReadPayload {
+            project_id: project.id.clone(),
+        }))
+        .await
+        .expect("subscribe board observer");
+    let observed =
+        serde_json::to_value(state_on(&mut observer, |board| board.project_id == project.id).await)
+            .expect("observed board json");
     let inventory = tools(&b_caller).await;
     assert!(
         inventory.contains(&"tyde_board_read".into())
@@ -431,6 +442,17 @@ async fn board_lanes_cards_tools_steering_and_restart() {
         },
     )
     .await;
+    let mut previous = observed;
+    loop {
+        let next = state_on(&mut observer, |_| true).await;
+        let json = serde_json::to_value(&next).expect("next board json");
+        assert_ne!(json, previous, "reads re-published an unchanged board");
+        if card(&next, &aid).location == card(&board, &aid).location {
+            break;
+        }
+        previous = json;
+    }
+    drop(observer);
     assert_eq!(card(&board, &aid).history.len(), 1);
     assert!(matches!(
         card(&board, &aid).history[0].actor,

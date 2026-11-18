@@ -2395,9 +2395,9 @@ fi
                          "checksum mismatch", "fragment reassembly"):
             self.assertIn(required, protocol_source)
         scheduler = (REPO_ROOT / "server/src/stream.rs").read_text()
-        # Chat remains bounded by 8 MiB; requiring CHAT_LIMIT incorrectly
-        # rejects byte-bounded queues that admit bursts of small updates.
-        for required in ("CONTROL_LIMIT", "CHAT_BYTE_LIMIT: usize = 8 * 1024 * 1024", "BULK_LIMIT",
+        # Output lanes stay byte-bounded; a frame-count limit would reject
+        # bursts of small updates that the transport can absorb.
+        for required in ("LANE_BYTE_LIMIT: usize = 64 * 1024 * 1024",
                          "AUDIO_PACKET_LIMIT: usize = 8", "discard_voice_audio"):
             self.assertIn(required, scheduler)
         voice_tests = (REPO_ROOT / "tests/tests/native_voice.rs").read_text()
