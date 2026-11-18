@@ -3775,13 +3775,25 @@ pub async fn delegate_native<B: Backend>(
     }
 }
 
-type CodexScenario = for<'a> fn(
-    &'a mut Harness<server::backend::codex::CodexBackend>,
-) -> futures_util::future::LocalBoxFuture<'a, ()>;
+type NativeScenario<B> =
+    for<'a> fn(&'a mut Harness<B>) -> futures_util::future::LocalBoxFuture<'a, ()>;
 
-pub fn run_codex_scenario(name: &'static str, profile: Profile, scenario: CodexScenario) {
+pub fn run_codex_scenario(
+    name: &'static str,
+    profile: Profile,
+    scenario: NativeScenario<server::backend::codex::CodexBackend>,
+) {
+    run_native_scenario(name, "codex", profile, scenario);
+}
+
+pub fn run_native_scenario<B: Backend>(
+    name: &'static str,
+    backend: &str,
+    profile: Profile,
+    scenario: NativeScenario<B>,
+) {
     authorize_paid_run();
-    if !backend_selected("codex") {
+    if !backend_selected(backend) {
         return;
     }
     std::thread::Builder::new()

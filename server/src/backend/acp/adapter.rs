@@ -422,3 +422,24 @@ pub fn adapter_for_spec(spec: &AcpAgentSpec) -> Arc<dyn AcpAgentAdapter> {
         )),
     }
 }
+
+pub(super) async fn adapter_for_session(
+    spec: &AcpAgentSpec,
+    config: &crate::backend::ResolvedSpawnConfig,
+) -> Result<(Arc<dyn AcpAgentAdapter>, Option<String>), String> {
+    if spec.adapter == AcpAdapterId::Opencode
+        && config.access_mode == protocol::BackendAccessMode::ReadOnly
+    {
+        let adapter =
+            super::adapters::opencode::OpenCodeAdapter::with_read_only_advisory(spec.clone())
+                .await?;
+        return Ok((
+            Arc::new(adapter),
+            crate::backend::render_spawn_instructions(config, false),
+        ));
+    }
+    Ok((
+        adapter_for_spec(spec),
+        crate::backend::render_combined_spawn_instructions(config),
+    ))
+}

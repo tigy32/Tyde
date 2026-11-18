@@ -3148,8 +3148,15 @@ pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value 
 }
 
 pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -> Option<String> {
+    render_spawn_instructions(config, config.access_mode == BackendAccessMode::ReadOnly)
+}
+
+fn render_spawn_instructions(
+    config: &ResolvedSpawnConfig,
+    include_read_only: bool,
+) -> Option<String> {
     let mut sections = Vec::new();
-    if config.access_mode == BackendAccessMode::ReadOnly {
+    if include_read_only {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if !config.builtin_steering.trim().is_empty() {

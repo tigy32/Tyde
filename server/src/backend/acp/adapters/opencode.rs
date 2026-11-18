@@ -1,11 +1,14 @@
 use std::borrow::Cow;
+use std::io::Write;
 
 use futures_util::future::BoxFuture;
 use protocol::{
     AcpAdapterId, AcpAgentSpec, BackendKind, MessageTokenUsage, SlashCommand, TokenUsage,
 };
 use serde_json::{Value, json};
+use tyde_process_env::launch::WorkspacePath;
 
+use crate::backend::READ_ONLY_ACCESS_MODE_INSTRUCTIONS;
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
     AcpAgentAdapter, AcpSessionKind, AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan,
@@ -19,11 +22,35 @@ const OPENCODE_TYDE_COMMANDS: &[(&str, &str)] = &[
 
 pub struct OpenCodeAdapter {
     spec: AcpAgentSpec,
+    read_only_instruction: Option<tempfile::TempPath>,
 }
 
 impl OpenCodeAdapter {
     pub fn new(spec: AcpAgentSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            read_only_instruction: None,
+        }
+    }
+
+    pub(in crate::backend::acp) async fn with_read_only_advisory(
+        spec: AcpAgentSpec,
+    ) -> Result<Self, String> {
+        let instruction = crate::backend::subprocess::spawn_blocking(|| {
+            let mut file = tempfile::Builder::new()
+                .prefix("tyde-opencode-read-only-")
+                .suffix(".md")
+                .tempfile()?;
+            file.write_all(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.as_bytes())?;
+            Ok::<_, std::io::Error>(file.into_temp_path())
+        })
+        .await
+        .map_err(|error| format!("OpenCode instruction preparation task failed: {error}"))?
+        .map_err(|error| format!("Could not prepare the OpenCode read-only advisory: {error}"))?;
+        Ok(Self {
+            spec,
+            read_only_instruction: Some(instruction),
+        })
     }
 
     fn command(&self) -> &str {
@@ -52,6 +79,15 @@ impl OpenCodeAdapter {
             permission
                 .entry("external_directory")
                 .or_insert_with(|| Value::String("allow".to_owned()));
+        }
+        if let Some(file) = &self.read_only_instruction {
+            let path = WorkspacePath::host(file)?.execution_string()?;
+            config
+                .entry("instructions")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or("OPENCODE_CONFIG_CONTENT instructions must be an array")?
+                .push(Value::String(path));
         }
         serde_json::to_string(config)
             .map_err(|error| format!("failed to serialize OpenCode configuration: {error}"))

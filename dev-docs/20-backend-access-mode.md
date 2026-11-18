@@ -133,6 +133,12 @@ ACP read-only uses ACP advisory behavior rather than ACP hard blocking:
 
 The shared advisory is the only access-mode difference.
 
+OpenCode registers the advisory as an additional native `instructions` file
+for the ACP process, not as part of the user prompt. OpenCode still loads its
+base prompt and existing instruction files. The file belongs to the adapter
+and is reused if the ACP process restarts for workspace relocation. Tyde
+supports new and resumed OpenCode sessions, but not native forks.
+
 ### Antigravity
 
 Antigravity has no known workspace-write middle mode: `agy --sandbox` is the hard

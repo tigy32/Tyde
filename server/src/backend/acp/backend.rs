@@ -21,7 +21,7 @@ use protocol::{
 
 use crate::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpRequestCtx,
-    AcpSessionKind, AcpSlashCommandCtx, AcpSlashCommandPlan, adapter_for_spec,
+    AcpSessionKind, AcpSlashCommandCtx, AcpSlashCommandPlan, adapter_for_session, adapter_for_spec,
 };
 use crate::acp::{
     AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, AcpStateActor, acp_mcp_servers_json,
@@ -32,8 +32,8 @@ use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
 use crate::backend::{
-    BackendDiscoveryError, BackendStartupError, SessionCommand, StartupMcpServer,
-    backend_fork_unsupported_message, normalize_mcp_call_tool_result,
+    BackendDiscoveryError, BackendStartupError, ResolvedSpawnConfig, SessionCommand,
+    StartupMcpServer, backend_fork_unsupported_message, normalize_mcp_call_tool_result,
     render_combined_spawn_instructions,
 };
 use crate::process_env;
@@ -355,8 +355,15 @@ impl KiroSession {
         agent: Option<&protocol::AcpAgentSpec>,
         initial_model: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
+        config: &ResolvedSpawnConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let (adapter, steering_content) = match agent {
+            Some(spec) => adapter_for_session(spec, config).await?,
+            None => (
+                kiro_adapter(None),
+                render_combined_spawn_instructions(config),
+            ),
+        };
         Self::spawn_with_mode(
             workspace_roots,
             KiroSpawnMode {
@@ -364,8 +371,8 @@ impl KiroSession {
                 admin_session: false,
                 initial_model,
                 startup_mcp_servers,
-                steering_content,
-                adapter: agent.map_or_else(|| kiro_adapter(None), adapter_for_spec),
+                steering_content: steering_content.as_deref(),
+                adapter,
                 probe_deadline: None,
             },
         )
@@ -7668,14 +7675,12 @@ impl Backend for KiroBackend {
         let startup_task = crate::backend::subprocess::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
                 Some(ready_tx);
-            let combined_instructions =
-                render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn_for_agent(
                 &workspace_roots,
                 config.acp_agent.as_ref(),
                 None,
                 &config.startup_mcp_servers,
-                combined_instructions.as_deref(),
+                &config.resolved_spawn_config,
             )
             .await
             {
@@ -7860,14 +7865,12 @@ impl Backend for KiroBackend {
         let startup_task = crate::backend::subprocess::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
                 Some(ready_tx);
-            let combined_instructions =
-                render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn_for_agent(
                 &workspace_roots,
                 config.acp_agent.as_ref(),
                 None,
                 &config.startup_mcp_servers,
-                combined_instructions.as_deref(),
+                &config.resolved_spawn_config,
             )
             .await
             {

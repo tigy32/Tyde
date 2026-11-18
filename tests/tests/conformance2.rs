@@ -29,6 +29,103 @@ use fixture::*;
 
 const READY_MARKER: &str = "TYDE_READY";
 
+#[test]
+#[ignore = "real backend conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_opencode_native_advisory() {
+    let model = std::env::var("TYDE_OPENCODE_TEST_MODEL")
+        .unwrap_or_else(|_| "opencode/big-pickle".to_owned());
+    run_native_scenario::<server::backend::opencode::OpencodeBackend>(
+        "real_opencode_native_advisory",
+        "opencode",
+        Profile::new(&[&model], &[("model", &model), ("mode", "build")]),
+        |host| Box::pin(opencode_native_advisory(host)),
+    );
+}
+
+async fn opencode_native_advisory<B: Backend>(host: &mut Harness<B>) {
+    use std::fs;
+
+    let root = host.workspace().to_owned();
+    let plugins = root.join(".opencode/plugins");
+    let receipt = root.join("advisory.jsonl");
+    fs::create_dir_all(&plugins).expect("create native OpenCode plugin directory");
+    fs::write(
+        root.join("opencode.json"),
+        r#"{"agent":{"build":{"prompt":"Existing native base instruction."}},"instructions":["guide.md"]}"#,
+    )
+    .expect("configure the native base and extra instructions");
+    fs::write(root.join("guide.md"), "Existing configured guidance.")
+        .expect("write extra guidance");
+    // Observe real provider input without modifying it or retaining any prompt text.
+    fs::write(
+        plugins.join("observe.js"),
+        r#"
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+export const Observe = async ({ directory }) => {
+  const record = (value) => appendFileSync(join(directory, "advisory.jsonl"), JSON.stringify(value) + "\n");
+  const advisory = "Backend access mode is read-only (best effort).";
+  return {
+    "experimental.chat.messages.transform": async (_, { messages }) => {
+      const message = messages.filter(({ info }) => info.role === "user").at(-1);
+      if (!message) return;
+      const text = message.parts.map(part => part.type === "text" ? part.text : "").join("");
+      if (text.includes("TYDE_READY")) record({ surface: "user", advisory: text.includes(advisory) });
+    },
+    "experimental.chat.system.transform": async (_, { system }) => {
+      const text = system.join("\n");
+      if (text.includes("Existing configured guidance.")) record({
+        surface: "system", base: text.includes("Existing native base instruction."),
+        advisory: text.includes(advisory)
+      });
+    }
+  };
+};
+"#,
+    )
+    .expect("install native OpenCode request observer");
+
+    let assert_delivery = |phase| {
+        let raw = fs::read_to_string(&receipt).expect("native OpenCode observer wrote receipts");
+        let mut system_count = 0;
+        let mut user_count = 0;
+        for row in raw.lines() {
+            let row: Value = serde_json::from_str(row).expect("parse receipt");
+            match row["surface"].as_str() {
+                Some("system") => {
+                    system_count += 1;
+                    assert_eq!(row["base"], true, "{phase}: native base was not preserved");
+                    assert_eq!(row["advisory"], true, "{phase}: missing native advisory");
+                }
+                Some("user") => {
+                    user_count += 1;
+                    assert_eq!(
+                        row["advisory"], false,
+                        "{phase}: advisory was in user input"
+                    );
+                }
+                _ => panic!("{phase}: unrecognized OpenCode receipt surface"),
+            }
+        }
+        assert!(
+            user_count > 0 && system_count > 0,
+            "{phase}: missing request receipts"
+        );
+        fs::remove_file(&receipt).expect("clear receipts after provider turn settled");
+    };
+
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::ReadOnly;
+    let prompt = launch_prompt();
+    let fresh = spawn_agent(host, &prompt).await;
+    assert_ready_handshake(&collect_turn(host, &fresh, &prompt).await);
+    assert_clean_close(host, &fresh).await;
+    assert_delivery("fresh");
+    let resumed = resume_agent(host, &fresh.session_id).await;
+    assert_ready_handshake(&ask(host, &resumed, &prompt).await);
+    assert_clean_close(host, &resumed).await;
+    assert_delivery("resumed");
+}
+
 const MAPPING_FILE: &str = "mapping.txt";
 
 const MAPPED_CREATE_MARKER: &str = "TYDE_MAPPED_CREATE";
