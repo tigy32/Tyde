@@ -11576,7 +11576,10 @@ pub struct TychatOutboundSnapshot {
 pub enum DotsConnectionStatus {
     #[default]
     Disabled,
-    Connecting,
+    Connecting {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_failure: Option<String>,
+    },
     AwaitingPairing,
     Connected,
     Failed {

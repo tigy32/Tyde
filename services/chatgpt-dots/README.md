@@ -36,8 +36,10 @@ user-facing name for the same integration, not an additional boolean.
 
 Disabling Remote MCP closes the host connection and independently blocks tool
 execution on the host. Already-running agents continue. Re-enabling uses the
-existing host registration and OAuth grant. Disconnect revokes the host
-registration, invalidating all associated access/refresh tokens, and removes
+existing host registration and OAuth grant. Tyde checks relay liveness over
+WebSocket and reconnects interrupted connections without re-pairing. In-flight
+tool calls fail on the lost socket; they are never replayed. Disconnect revokes
+the host registration, invalidating all associated access/refresh tokens, and removes
 its local credentials before offering a new pairing.
 
 ## ChatGPT setup guide

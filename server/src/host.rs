@@ -429,6 +429,8 @@ pub struct HostRuntimeConfig {
     /// Hold connection reconfiguration while real MCP requests continue across the transport.
     #[cfg(feature = "test-support")]
     pub dots_configuration_gate: Option<watch::Receiver<bool>>,
+    #[cfg(feature = "test-support")]
+    pub dots_heartbeat_ticks: Option<Arc<tokio::sync::Semaphore>>,
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -492,6 +494,8 @@ impl Default for HostRuntimeConfig {
             dots_service_origin: None,
             #[cfg(feature = "test-support")]
             dots_configuration_gate: None,
+            #[cfg(feature = "test-support")]
+            dots_heartbeat_ticks: None,
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
@@ -21326,6 +21330,10 @@ fn spawn_host_inner(
             path: dots_path,
             origin: dots_origin,
             configuration_gate: dots_configuration_gate,
+            #[cfg(feature = "test-support")]
+            heartbeat_ticks: runtime_config.dots_heartbeat_ticks,
+            #[cfg(not(feature = "test-support"))]
+            heartbeat_ticks: None,
         },
         host.restart.stopped.clone(),
         host.restart.complete.subscribe(),

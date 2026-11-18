@@ -198,15 +198,20 @@ export class DotsBroker extends DurableObject {
       if (request.method === "DELETE" && !hostMatch[2]) {
         await this.ctx.storage.delete(`host:${host_id}`);
         if (host.pairing_hash) await this.ctx.storage.delete(`pair:${host.pairing_hash}`);
-        for (const socket of this.ctx.getWebSockets(host_id)) socket.close(1000, "Disconnected");
+        for (const socket of this.ctx.getWebSockets(host_id)) {
+          this.disconnected(socket);
+          socket.close(1000, "Disconnected");
+        }
         return json({ disconnected: true });
       }
       if (hostMatch[2] && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-        for (const old of this.ctx.getWebSockets(host_id)) old.close(1000, "Connection replaced");
+        for (const old of this.ctx.getWebSockets(host_id)) {
+          this.disconnected(old);
+          if (old.readyState === WebSocket.OPEN) old.close(1000, "Connection replaced");
+        }
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
         this.ctx.acceptWebSocket(server, [host_id]);
-        server.serializeAttachment({ host_id });
         server.send(Relay.connection(host.paired));
         return new Response(null, { status: 101, webSocket: client });
       }
@@ -324,14 +329,16 @@ export class DotsBroker extends DurableObject {
         return json({ error: "unauthorized" }, 401, { "WWW-Authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource", scope="${SCOPE}"` });
       }
       if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
-      const sockets = this.ctx.getWebSockets(token.host_id);
+      const payload = await body(request);
+      // Cloudflare can return a replaced socket until its peer acknowledges Close.
+      const sockets = this.ctx.getWebSockets(token.host_id).filter(socket => socket.readyState === WebSocket.OPEN);
       if (sockets.length !== 1) return json({ error: "host_offline" }, 503);
       if (this.pending.size >= 64) return json({ error: "busy" }, 503);
+      const [socket] = sockets;
       const transport_id = random();
-      const payload = await body(request);
       return await new Promise(resolve => {
-        this.pending.set(transport_id, { host_id: token.host_id, resolve });
-        try { sockets[0].send(Relay.request(payload, transport_id)); }
+        this.pending.set(transport_id, { socket, resolve });
+        try { socket.send(Relay.request(payload, transport_id)); }
         catch { this.pending.delete(transport_id); resolve(json({ error: "host_offline" }, 503)); }
       });
     }
@@ -343,7 +350,7 @@ export class DotsBroker extends DurableObject {
     let frame;
     try { frame = Relay.decode(message); } catch { socket.close(1003, "Invalid transport response"); return; }
     const pending = this.pending.get(frame.transport_id);
-    if (!pending || pending.host_id !== socket.deserializeAttachment().host_id) return;
+    if (!pending || pending.socket !== socket) return;
     if (!Relay.isResponse(frame) || frame.status < 200 || frame.status > 599) {
       socket.close(1003, "Invalid transport response"); return;
     }
@@ -354,8 +361,7 @@ export class DotsBroker extends DurableObject {
   webSocketClose(socket) { this.disconnected(socket); }
   webSocketError(socket) { this.disconnected(socket); }
   disconnected(socket) {
-    const host_id = socket.deserializeAttachment().host_id;
-    for (const [id, pending] of this.pending) if (pending.host_id === host_id) {
+    for (const [id, pending] of this.pending) if (pending.socket === socket) {
       this.pending.delete(id); pending.resolve(json({ error: "host_offline" }, 503));
     }
   }

@@ -13079,10 +13079,21 @@ mod wasm_tests {
             )
         };
         publish(
+            protocol::DotsConnectionStatus::Connecting {
+                last_failure: Some("Relay heartbeat missed".into()),
+            },
+            3,
+        );
+        next_tick().await;
+        let retrying = container.text_content().unwrap();
+        assert!(retrying.contains("Reconnecting") && retrying.contains("Relay heartbeat missed"));
+        assert!(!retrying.contains("Retry"));
+
+        publish(
             protocol::DotsConnectionStatus::Failed {
                 reason: "Connection interrupted".into(),
             },
-            3,
+            4,
         );
         next_tick().await;
         assert!(
@@ -13098,7 +13109,7 @@ mod wasm_tests {
             commands().as_slice(),
             [protocol::DotsCommandPayload::Retry]
         ));
-        publish(protocol::DotsConnectionStatus::AwaitingPairing, 4);
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 5);
         next_tick().await;
         click_tab(&container, "New pairing code");
         next_tick().await;
@@ -13109,7 +13120,7 @@ mod wasm_tests {
                 protocol::DotsCommandPayload::Retry
             ]
         ));
-        publish(protocol::DotsConnectionStatus::Connected, 5);
+        publish(protocol::DotsConnectionStatus::Connected, 6);
         next_tick().await;
         js_sys::eval(r#"window.__dots_confirm_answer = 'Cancel'; const dotsOriginalInvoke = window.__TAURI__.core.invoke; window.__TAURI__.core.invoke = function(cmd, args) { if (cmd === 'plugin:dialog|message') { window.__test_send_calls.push([cmd, JSON.stringify(args)]); return Promise.resolve(window.__dots_confirm_answer); } return dotsOriginalInvoke(cmd, args); };"#).unwrap();
         click_tab(&container, "Revoke remote MCP access");
@@ -13129,7 +13140,7 @@ mod wasm_tests {
             commands().last(),
             Some(protocol::DotsCommandPayload::Disconnect)
         ));
-        publish(protocol::DotsConnectionStatus::AwaitingPairing, 6);
+        publish(protocol::DotsConnectionStatus::AwaitingPairing, 7);
         next_tick().await;
         assert!(
             container

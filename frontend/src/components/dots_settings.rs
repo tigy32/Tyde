@@ -56,7 +56,7 @@ pub fn DotsTab() -> impl IntoView {
                 <div class="settings-panel-header">
                     <h2 class="settings-panel-title">"Integrations"</h2>
                     <span class=move || match snapshot.get().map(|s| s.status) {
-                        None | Some(DotsConnectionStatus::Connecting) => "settings-status-chip loading",
+                        None | Some(DotsConnectionStatus::Connecting { .. }) => "settings-status-chip loading",
                         Some(DotsConnectionStatus::Disabled) => "settings-status-chip unsupported",
                         Some(DotsConnectionStatus::AwaitingPairing) => "settings-status-chip missing",
                         Some(DotsConnectionStatus::Connected) => "settings-status-chip installed",
@@ -64,7 +64,8 @@ pub fn DotsTab() -> impl IntoView {
                     } role="status">{move || match snapshot.get().map(|s| s.status) {
                         None => "Loading",
                         Some(DotsConnectionStatus::Disabled) => "Disabled",
-                        Some(DotsConnectionStatus::Connecting) => "Connecting",
+                        Some(DotsConnectionStatus::Connecting { last_failure: None }) => "Connecting",
+                        Some(DotsConnectionStatus::Connecting { last_failure: Some(_) }) => "Reconnecting",
                         Some(DotsConnectionStatus::AwaitingPairing) => "Awaiting pairing",
                         Some(DotsConnectionStatus::Connected) => "Connected",
                         Some(DotsConnectionStatus::Failed { .. }) => "Failed",
@@ -196,7 +197,10 @@ pub fn DotsTab() -> impl IntoView {
                             </div>
                         </section>
                     }.into_any()),
-                    DotsConnectionStatus::Disabled | DotsConnectionStatus::Connecting => None,
+                    DotsConnectionStatus::Connecting { last_failure: Some(reason) } => Some(view! {
+                        <p class="settings-tychat-problem" role="status">{reason}</p>
+                    }.into_any()),
+                    DotsConnectionStatus::Disabled | DotsConnectionStatus::Connecting { last_failure: None } => None,
                 })}
                 <section class="settings-dots-disclosure" aria-label="Access and privacy">
                     <h3 class="settings-label">"Access & privacy"</h3>

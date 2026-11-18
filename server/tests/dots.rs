@@ -55,6 +55,53 @@ async fn rpc(
     result["result"].clone()
 }
 
+async fn pausable_relay(
+    upstream: std::net::SocketAddr,
+) -> (
+    String,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinSet<()>,
+) {
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::watch,
+        task::JoinSet,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (forwarding, ready) = watch::channel(true);
+    let mut proxy = JoinSet::new();
+    proxy.spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                client = listener.accept() => {
+                    let (mut downstream, _) = client.unwrap();
+                    let mut ready = ready.clone();
+                    connections.spawn(async move {
+                        let Ok(mut upstream) = TcpStream::connect(upstream).await else { return };
+                        loop {
+                            if *ready.borrow_and_update() {
+                                tokio::select! {
+                                    biased;
+                                    change = ready.changed() => if change.is_err() { break },
+                                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => break,
+                                }
+                            } else if ready.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                finished = connections.join_next(), if !connections.is_empty() => {
+                    finished.unwrap().unwrap();
+                }
+            }
+        }
+    });
+    (origin, forwarding, proxy)
+}
+
 #[tokio::test]
 async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,6 +120,12 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         .await
         .expect("service output")
         .expect("service endpoint");
+    let upstream = url::Url::parse(&origin)
+        .unwrap()
+        .socket_addrs(|| None)
+        .unwrap()[0];
+    let (origin, forwarding, _relay_proxy) = pausable_relay(upstream).await;
+    let heartbeat_ticks = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let settings = settings_model::HostSettings {
         workbenches: Default::default(),
         enabled_backends: vec![BackendKind::Claude],
@@ -100,6 +153,7 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         server::HostRuntimeConfig {
             dots_service_origin: Some(url::Url::parse(&origin).unwrap()),
             dots_configuration_gate: Some(configuration_ready),
+            dots_heartbeat_ticks: Some(heartbeat_ticks.clone()),
             ..Default::default()
         },
         &json!({"settings":settings}).to_string(),
@@ -258,6 +312,25 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
         connected.pairing_code.is_none(),
         "Consumed pairing code must disappear from UI state"
     );
+    // Leave TCP open but stop forwarding. Advance the heartbeat without wall-clock waits.
+    forwarding.send_replace(false);
+    heartbeat_ticks.add_permits(2);
+    let reconnecting = snapshot(&mut fixture, "silent socket detected", |status| {
+        matches!(status, DotsConnectionStatus::Connecting { .. })
+    })
+    .await;
+    assert!(matches!(
+        reconnecting.status,
+        DotsConnectionStatus::Connecting { last_failure: Some(reason) }
+            if reason == "Remote MCP relay missed a WebSocket heartbeat"
+    ));
+    forwarding.send_replace(true);
+    snapshot(
+        &mut fixture,
+        "silent socket recovered without re-pairing",
+        |status| matches!(status, DotsConnectionStatus::Connected),
+    )
+    .await;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let credential: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixture.dots_secret_path()).unwrap()).unwrap();
@@ -274,25 +347,25 @@ async fn dots_pairing_controls_the_real_host_and_disable_revokes_transport() {
             .parse()
             .unwrap(),
     );
-    let (mut replacement_socket, _) = tokio_tungstenite::connect_async(request)
+    let (replacement_socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("Host owner can replace the real service connection");
-    snapshot(&mut fixture, "replaced host connection failure", |status| {
-        matches!(status, DotsConnectionStatus::Failed { .. })
-    })
+    snapshot(
+        &mut fixture,
+        "replacement triggers reconnection",
+        |status| matches!(status, DotsConnectionStatus::Connecting { .. }),
+    )
     .await;
-    replacement_socket.close(None).await.unwrap();
-    fixture
-        .client
-        .dots_command(DotsCommandPayload::Retry)
-        .await
-        .unwrap();
-    snapshot(&mut fixture, "retried connection", |status| {
-        matches!(status, DotsConnectionStatus::Connected)
-    })
+    snapshot(
+        &mut fixture,
+        "automatically reconnected using the same pairing",
+        |status| matches!(status, DotsConnectionStatus::Connected),
+    )
     .await;
     let initialized = rpc(&http, &origin, token, "initialize", json!({"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"boundary-test", "version":"1"}})).await;
     assert!(initialized["capabilities"]["tools"].is_object());
+    // It has not read or acknowledged the relay's Close while the new socket served MCP.
+    drop(replacement_socket);
     let tools = rpc(&http, &origin, token, "tools/list", json!({})).await;
     let await_tool = tools["tools"]
         .as_array()
