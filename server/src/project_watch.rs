@@ -68,13 +68,6 @@ impl EventSink {
                     queue_limit = 128,
                     "project watch queue full; scheduling catch-up rescan"
                 );
-                #[cfg(feature = "test-support")]
-                for root in &self.roots {
-                    crate::project_stream::scan_test_support::run(
-                        root,
-                        crate::project_stream::scan_test_support::ScanPoint::WatcherOverflow,
-                    );
-                }
             }
             true
         };

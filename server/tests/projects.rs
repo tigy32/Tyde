@@ -6240,13 +6240,13 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         );
         fs::write(repos[1].path().join("src/dir/leaf.rs"), "stall worker\n").unwrap();
         (blocked_rx).await.unwrap();
-        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
-        let overflow = fixture.on_project_scan(
-            repos[1].path().to_owned(),
-            server::ScanPoint::WatcherOverflow,
-            move || {
-                let _ = overflow_tx.send(());
-            },
+        eprintln!("PROJECT WATCH EVIDENCE: shared watcher worker held");
+        // A full queue can drop events while an earlier rescan is pending.
+        // Wait for an actual drop, not for a new rescan to be scheduled.
+        let (overflow, overflow_rx) = watch_completion(
+            &fixture,
+            &repos[1].path().join("src/burst-299.rs"),
+            server::ScanPoint::WatcherDropped,
         );
         for index in 0..300 {
             fs::write(
@@ -6255,7 +6255,9 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             )
             .unwrap();
         }
-        (overflow_rx).await.unwrap();
+        overflow_rx
+            .await
+            .expect("shared watcher dropped a burst event");
         fs::remove_dir_all(repos[1].path().join("src/dir")).unwrap();
         write_file(
             &repos[1].path().join("src/dir/leaf.rs"),
