@@ -152,6 +152,8 @@ macro_rules! conformance2_scenario {
                 } else if stringify!($scenario) == "real_generated_image_preserves_tool_ownership" {
                     // Luna missed the race; Astra reproduced the captured empty-reasoning interleaving.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
+                } else if stringify!($scenario) == "real_native_web_search_lifecycle" {
+                    Profile::new(&["gpt-6.2-sol"], &[("model", "gpt-6.2-sol"), ("reasoning_effort", "low")])
                 } else if stringify!($scenario).starts_with("real_excludes_ask_user_tools") {
                     let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-astra".to_owned());
                     Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
@@ -1917,9 +1919,9 @@ async fn real_narrative_streams_live<B: Backend>(host: &mut Harness<B>) {
     let chain = chained_request_turn(host, &restored, "restored-after-interruption").await;
     assert_universal_contract(&[turn, chain]);
     assert_clean_close(host, &restored).await;
-    // Reviewers rejoin as enforced read-only, and an interrupt that lands
+    // Reviewers rejoin with read-only guidance, and an interrupt that lands
     // before the model replies must leave the session usable.
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::ReadOnly;
     let protected = resume_agent(host, &fork_session.id).await;
     let follow_up = interrupted_held_request(host, &protected, "protected-resumed").await;
     assert_universal_contract(&[follow_up]);
@@ -2273,7 +2275,7 @@ async fn real_review_context_forks<B: Backend>(host: &mut Harness<B>) {
     let inherited = read_session_settings(host).await;
     assert_clean_close(host, &author).await;
     host.config.session_settings = Some(inherited.clone());
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::ReadOnly;
     let prompt = format!(
         "Recall the original codeword I asked you to remember. Also remember a separate reviewer-only codeword {private_word}; never write it to a file. Reply with the original codeword and REVIEWER_READY. Do not use any tools."
     );
@@ -2333,530 +2335,7 @@ conformance2_scenario!(
     [
         BackendCapability::ForkSession,
         BackendCapability::ResumeSession,
-        BackendCapability::SessionSettings,
-        BackendCapability::EnforcedReadOnly
-    ]
-);
-
-#[test]
-#[ignore = "real Claude native settings conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]
-fn real_claude_review_configuration() {
-    authorize_paid_run();
-    if !backend_selected("claude") {
-        return;
-    }
-    if std::env::var_os("TYDE_CLAUDE_REVIEW_CONFIG_ISOLATED").is_none() {
-        let directory = tempfile::tempdir().expect("owned Claude configuration fixture");
-        let script = directory.path().join("claude_review_config.py");
-        std::fs::write(
-            &script,
-            include_str!("conformance2/claude_review_config.py"),
-        )
-        .expect("write native Claude configuration fixture");
-        let status = std::process::Command::new("python3")
-            .arg(script)
-            .arg(std::env::current_exe().expect("conformance executable"))
-            .status()
-            .expect("run isolated real Claude configuration scenario");
-        assert!(
-            status.success(),
-            "real Claude configuration scenario failed"
-        );
-        return;
-    }
-    std::thread::Builder::new()
-        .name("real_claude_review_configuration".to_owned())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("conformance runtime")
-                .block_on(async {
-                    use futures_util::FutureExt;
-                    let model = std::env::var("TYDE_TEST_CLAUDE_MODEL")
-                        .expect("explicit native provider model");
-                    let mut host = Harness::<server::backend::claude::ClaudeBackend>::new(
-                        Profile::new(&["haiku", &model], &[("model", "haiku"), ("effort", "low")]),
-                        "real_claude_review_configuration",
-                    );
-                    let result =
-                        std::panic::AssertUnwindSafe(claude_review_configuration(&mut host))
-                            .catch_unwind()
-                            .await;
-                    host.finish().await;
-                    if let Err(panic) = result {
-                        std::panic::resume_unwind(panic);
-                    }
-                });
-        })
-        .expect("spawn conformance thread")
-        .join()
-        .unwrap_or_else(|error| std::panic::resume_unwind(error));
-}
-
-// StreamStart names the configured alias before any native output. Native
-// responses must name the provider model routed only by user settings.
-fn assert_settings_routed_model(turn: &Turn) {
-    let model = std::env::var("TYDE_TEST_CLAUDE_MODEL").unwrap();
-    let routed = turn.events().iter().any(|event| {
-        let info = match event {
-            ChatEvent::StreamEnd(end) => end.message.model_info.as_ref(),
-            ChatEvent::MessageAdded(message) => message.model_info.as_ref(),
-            _ => None,
-        };
-        info.is_some_and(|info| info.model == model)
-    });
-    assert!(
-        routed,
-        "{}: native responses must report the settings-routed provider model",
-        turn.label()
-    );
-}
-
-async fn claude_review_configuration<B: Backend>(host: &mut Harness<B>) {
-    let config = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap());
-    let marker_paths = [
-        config.join("hook-started"),
-        config.join("ambient-started"),
-        config.join("workspace-helper-ran"),
-    ];
-    let original_settings = std::fs::read(config.join("settings.json")).unwrap();
-    // The reviewed workspace controls its own project settings. Its credential
-    // helper outranks the user's, so the ordinary turn must execute it.
-    let workspace_helper = std::env::var("TYDE_TEST_CLAUDE_WORKSPACE_HELPER").unwrap();
-    std::fs::create_dir_all(host.workspace().join(".claude")).unwrap();
-    std::fs::write(
-        host.workspace().join(".claude/settings.json"),
-        serde_json::json!({"apiKeyHelper": workspace_helper}).to_string(),
-    )
-    .unwrap();
-    let directory = tempfile::tempdir().expect("review metadata outside workspace");
-    let script = directory.path().join("feedback.py");
-    let journal = directory.path().join("feedback.jsonl");
-    std::fs::write(
-        &script,
-        mcp_probe_script().replace(MCP_TOOL_NAME, "propose_review_comment"),
-    )
-    .expect("write review feedback transport");
-    install_mcp_server(
-        host,
-        "tyde-review-feedback",
-        "python3",
-        vec![
-            script.to_string_lossy().into_owned(),
-            journal.to_string_lossy().into_owned(),
-        ],
-    )
-    .await;
-    let ordinary_prompt = "Reply READY briefly, without using tools.";
-    let ordinary = spawn_agent(host, ordinary_prompt).await;
-    let ordinary_turn = collect_turn(host, &ordinary, ordinary_prompt).await;
-    assert_no_error_message(&ordinary_turn.label(), ordinary_turn.events());
-    assert!(ordinary_turn.final_text().contains("READY"));
-    let catalog = host
-        .native_tool_catalog()
-        .await
-        .expect("ordinary native catalog");
-    assert!(
-        catalog
-            .tools
-            .iter()
-            .any(|tool| tool.name.starts_with("mcp__ambient__")),
-        "ordinary launch must positively load the owned ambient MCP"
-    );
-    for marker in &marker_paths {
-        assert!(
-            marker.exists(),
-            "ordinary launch must exercise executable customization"
-        );
-    }
-    assert_reported_model_is_pinned(
-        std::slice::from_ref(&ordinary_turn),
-        &ordinary_turn.expected_models,
-    );
-    assert_settings_routed_model(&ordinary_turn);
-    eprintln!(
-        "CLAUDE_REVIEW_CONFIG phase=Ordinary auth_provider_model=verified ambient_positive=true model_requests={}",
-        ordinary_turn.model_requests().len()
-    );
-    assert_clean_close(host, &ordinary).await;
-    for marker in &marker_paths {
-        std::fs::remove_file(marker).unwrap();
-    }
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-    host.config.resolved_spawn_config.excluded_tool_categories =
-        vec![protocol::ToolCategory::AgentDelegation];
-    let sentinel = host.workspace().join("review-protected.txt");
-    std::fs::write(&sentinel, "UNCHANGED").unwrap();
-    let child_count = native_child_observation_count(host);
-    let mut turns = vec![ordinary_turn];
-    for phase in [
-        NativeRestrictionPhase::Fresh,
-        NativeRestrictionPhase::Fork,
-        NativeRestrictionPhase::Resumed,
-    ] {
-        let value = unique_payload();
-        let native_controls = if matches!(phase, NativeRestrictionPhase::Fresh) {
-            " Also exercise the advertised native controls: call AskUserQuestion exactly once with one valid question (header Output, question Which output?, options Brief/Short output and Detailed/Long output, multiSelect false), then call ExitPlanMode exactly once even if the question is refused. These calls must be natively refused; do not enter plan mode or retry them."
-        } else {
-            ""
-        };
-        let prompt = format!(
-            "Call propose_review_comment on tyde-review-feedback exactly once with value {}.{native_controls} Then try to overwrite review-protected.txt and delegate a task, but ONLY if your native tools allow it. Do not change permissions, use alternate tools or invent tool calls. If unavailable report WRITE_BLOCKED and DELEGATION_BLOCKED. Briefly acknowledge the feedback result.",
-            serde_json::to_string(&value).unwrap()
-        );
-        let (agent, turn) = match phase {
-            NativeRestrictionPhase::Fresh => {
-                let agent = spawn_agent(host, &prompt).await;
-                let turn = collect_turn(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            NativeRestrictionPhase::Fork => {
-                let agent = fork_agent(host, &ordinary.session_id, &prompt).await;
-                assert!(
-                    agent.session_id != ordinary.session_id,
-                    "review fork needs a new native identity"
-                );
-                let turn = collect_turn(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            NativeRestrictionPhase::Resumed => {
-                let agent = resume_agent(host, &ordinary.session_id).await;
-                assert!(
-                    agent.session_id == ordinary.session_id,
-                    "review resume must retain native identity"
-                );
-                let turn = ask(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            _ => unreachable!("restricted lifecycle phases only"),
-        };
-        assert_no_error_message(&turn.label(), turn.events());
-        let calls = mcp_journal(&journal);
-        assert_eq!(
-            calls.len(),
-            turns.len(),
-            "one real feedback call per restricted launch"
-        );
-        assert!(
-            calls.last().is_some_and(
-                |call| call.get("value").and_then(Value::as_str) == Some(value.as_str())
-            ),
-            "feedback must reach the dedicated server with this turn's value"
-        );
-        let requests = turn.tool_requests().collect::<Vec<_>>();
-        let completions = turn.tool_completions().collect::<Vec<_>>();
-        assert_eq!(
-            completions.len(),
-            requests.len(),
-            "every attempt must settle"
-        );
-        let mut feedback_calls = 0;
-        let mut read_attempts = 0;
-        let mut denied_attempts = 0;
-        let mut native_control_attempts = [0, 0];
-        // Real negative-control turns read the sentinel and attempt Edit.
-        // A denied attempt is not a successful mutation or a feedback call.
-        for request in requests {
-            let name = turn
-                .declared_name(&request.tool_call_id)
-                .expect("native tool declaration");
-            let completion = completions
-                .iter()
-                .find(|completion| completion.tool_call_id == request.tool_call_id)
-                .expect("terminal outcome for this attempt");
-            if name == "propose_review_comment" {
-                feedback_calls += 1;
-                assert!(
-                    matches!(&completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
-                    "dedicated review feedback must succeed"
-                );
-            } else if matches!(name, "Read" | "Glob" | "Grep") {
-                read_attempts += 1;
-            } else {
-                let ToolExecutionOutcome::Failed {
-                    message,
-                    details,
-                    normalization_failure: None,
-                    ..
-                } = &completion.outcome
-                else {
-                    panic!(
-                        "forbidden attempts need a native rejection, not execution success, cancellation or normalization failure"
-                    );
-                };
-                // Advertised native controls fail by permission/mode, unlike
-                // mutation and delegation tools absent from the catalog.
-                let rejection = match name {
-                    "AskUserQuestion" => {
-                        native_control_attempts[0] += 1;
-                        "Permission to use AskUserQuestion has been denied because Claude Code is running in don't ask mode".to_owned()
-                    }
-                    "ExitPlanMode" => {
-                        native_control_attempts[1] += 1;
-                        "You are not in plan mode".to_owned()
-                    }
-                    _ => format!("No such tool available: {name}"),
-                };
-                assert!(
-                    message.contains(&rejection)
-                        || details
-                            .as_ref()
-                            .is_some_and(|details| details.contains(&rejection)),
-                    "denied attempts require this exact native tool's permission, mode or unavailable-tool rejection, not an unrelated execution error"
-                );
-                denied_attempts += 1;
-            }
-        }
-        assert_eq!(
-            feedback_calls, 1,
-            "exactly one successful dedicated feedback call"
-        );
-        if matches!(phase, NativeRestrictionPhase::Fresh) {
-            assert_eq!(
-                native_control_attempts,
-                [1, 1],
-                "fresh reviewer must exercise both native control refusals exactly once"
-            );
-        }
-        eprintln!(
-            "CLAUDE_REVIEW_CONFIG phase={phase:?} read_attempts={read_attempts} denied_attempts={denied_attempts} native_control_attempts={native_control_attempts:?}"
-        );
-        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "UNCHANGED");
-        assert!(
-            marker_paths.iter().all(|path| !path.exists()),
-            "restricted launches must not run user hooks, ambient MCP or workspace credential helpers"
-        );
-        let catalog = host
-            .native_tool_catalog()
-            .await
-            .expect("restricted native catalog");
-        assert_native_catalog_owner(&catalog, &agent, host.backend());
-        assert!(
-            catalog.tools.iter().all(|tool| matches!(
-                tool.name.as_str(),
-                "Read" | "Glob" | "Grep" | "AskUserQuestion" | "ExitPlanMode"
-            ) || tool
-                .name
-                .starts_with("mcp__tyde-review-feedback__")),
-            "review catalog must contain only native read-only and dedicated feedback tools"
-        );
-        assert_no_new_native_children(host, child_count);
-        assert_settings_routed_model(&turn);
-        assert_restricted_clean_close(host, &agent).await;
-        if matches!(phase, NativeRestrictionPhase::Fresh) {
-            let resumed = resume_agent(host, &agent.session_id).await;
-            for completion in turn.tool_completions().filter(|completion| {
-                matches!(
-                    turn.declared_name(&completion.tool_call_id),
-                    Some("AskUserQuestion" | "ExitPlanMode")
-                )
-            }) {
-                let replayed = resumed
-                    .replayed_history
-                    .iter()
-                    .filter_map(|event| match event {
-                        ChatEvent::ToolExecutionCompleted(replayed)
-                            if replayed.tool_call_id == completion.tool_call_id =>
-                        {
-                            Some(replayed)
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert!(
-                    matches!(replayed.as_slice(), [replayed] if replayed.outcome == completion.outcome),
-                    "native control refusals must replay exactly once with the original failed outcome"
-                );
-            }
-            assert_restricted_clean_close(host, &resumed).await;
-            eprintln!("CLAUDE_REVIEW_CONFIG native_control_refusals_replayed=2");
-        }
-        eprintln!(
-            "CLAUDE_REVIEW_CONFIG phase={phase:?} feedback_calls=1 protected_files_unchanged=true ambient_executions=0 model_requests={}",
-            turn.model_requests().len()
-        );
-        turns.push(turn);
-    }
-    assert_eq!(
-        std::fs::read(config.join("settings.json")).unwrap(),
-        original_settings
-    );
-    assert_universal_contract(&turns);
-    host.config.startup_mcp_servers = vec![server::backend::StartupMcpServer {
-        name: "tyde-review-feedback".to_owned(),
-        supports_parallel_tool_calls: true,
-        transport: server::backend::StartupMcpTransport::Http {
-            url: std::env::var("TYDE_TEST_CLAUDE_UNAUTHORIZED_MCP_URL").unwrap(),
-            headers: Default::default(),
-            bearer_token_env_var: None,
-        },
-    }];
-    match B::spawn(
-        host.workspace_roots(),
-        host.config.clone(),
-        user_message("Do not use tools."),
-    )
-    .await
-    {
-        Err(error) => assert!(
-            error.contains("MCP"),
-            "missing mandatory review transport must fail startup explicitly"
-        ),
-        Ok((backend, _events)) => {
-            backend.shutdown().await;
-            panic!("unauthorized review feedback must never admit a reviewer");
-        }
-    }
-    eprintln!("CLAUDE_REVIEW_CONFIG unauthorized_feedback=startup_failed");
-}
-
-async fn real_enforced_review_feedback<B: Backend>(host: &mut Harness<B>) {
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-    host.config.resolved_spawn_config.excluded_tool_categories =
-        vec![protocol::ToolCategory::AgentDelegation];
-    let directory = tempfile::tempdir().expect("review metadata outside the read-only workspace");
-    let script = directory.path().join("probe.py");
-    let journal = directory.path().join("calls.jsonl");
-    let excluded_script = directory.path().join("excluded.py");
-    let excluded_journal = directory.path().join("excluded-calls.jsonl");
-    std::fs::write(&excluded_script, mcp_probe_script()).expect("write excluded MCP probe");
-    install_mcp_server(
-        host,
-        "tyde-agent-await",
-        "python3",
-        vec![
-            excluded_script.to_string_lossy().into_owned(),
-            excluded_journal.to_string_lossy().into_owned(),
-        ],
-    )
-    .await;
-    let mut source = mcp_probe_script().replace(MCP_TOOL_NAME, "propose_review_comment");
-    let boundary = "    elif method == \"tools/call\":";
-    source = source.replace(boundary, &format!("        result[\"tools\"].append(dict(result[\"tools\"][0], name=\"read_review_git\"))\n{boundary}"));
-    source = source.replace("    method = request.get(\"method\")", "    method = request.get(\"method\")\n    with open(journal + \".methods\", \"a\") as handle: handle.write(method + \"\\n\")");
-    source = source.replace("        value = str(arguments.get(\"value\", \"\"))", "        value = str(arguments.get(\"value\", \"\"))\n        if value == \"CLOSE_REVIEW_TRANSPORT\": sys.exit(0)");
-    std::fs::write(&script, source).expect("write review MCP probe");
-    install_mcp_server(
-        host,
-        "tyde-review-feedback",
-        "python3",
-        vec![
-            script.to_string_lossy().into_owned(),
-            journal.to_string_lossy().into_owned(),
-        ],
-    )
-    .await;
-    let values = [unique_payload(), unique_payload()];
-    let prompt = |value: &str| {
-        format!(
-            "Call read_review_git and then propose_review_comment on the configured tyde-review-feedback MCP server, each exactly once with value {}. These test tools only read/record review metadata, never edit workspace files. Do not use shell, delegation or other tools. Briefly acknowledge the returned text.",
-            serde_json::to_string(value).expect("encode probe value")
-        )
-    };
-    let first_prompt = prompt(&values[0]);
-    let agent = spawn_agent(host, &first_prompt).await;
-    let first = collect_turn(host, &agent, &first_prompt).await;
-    let second = ask(host, &agent, prompt(&values[1])).await;
-    eprintln!(
-        "REVIEW_TOOL_CONFORMANCE first_requests={:?} second_requests={:?} journal_calls={} methods={}",
-        first
-            .tool_declarations()
-            .map(|call| call.name.as_str())
-            .collect::<Vec<_>>(),
-        second
-            .tool_declarations()
-            .map(|call| call.name.as_str())
-            .collect::<Vec<_>>(),
-        mcp_journal(&journal).len(),
-        std::fs::read_to_string(journal.with_extension("jsonl.methods"))
-            .expect("MCP method journal")
-    );
-    assert_eq!(
-        mcp_journal(&journal).len(),
-        4,
-        "Both turns must execute both review tools without retries or hidden calls"
-    );
-    for (index, turn) in [&first, &second].into_iter().enumerate() {
-        let calls = mcp_journal(&journal);
-        let actual = &calls[index * 2..(index + 1) * 2];
-        assert!(
-            actual
-                .iter()
-                .all(|call| call.get("value").and_then(Value::as_str)
-                    == Some(values[index].as_str())),
-            "Review feedback calls must reach the real MCP server in both turns"
-        );
-        for name in ["read_review_git", "propose_review_comment"] {
-            let requests = turn
-                .tool_requests()
-                .filter(|r| {
-                    turn.declared_name(&r.tool_call_id)
-                        .is_some_and(|declared| declared.ends_with(name))
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                requests.len(),
-                1,
-                "Every review tool call must have exactly one visible request"
-            );
-            let completion = turn
-                .tool_completions()
-                .find(|c| c.tool_call_id == requests[0].tool_call_id)
-                .expect("review tool completion");
-            assert!(
-                matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
-                "Read-only review metadata tools must not be denied"
-            );
-        }
-        assert_no_error_message(&turn.label(), turn.events());
-    }
-    let disconnected = ask(host, &agent, "Call read_review_git exactly once with value CLOSE_REVIEW_TRANSPORT. The fixture intentionally closes its MCP connection during this call. Report the failure; do not retry or call any other tool.").await;
-    assert_eq!(
-        mcp_journal(&journal).len(),
-        5,
-        "The transport failure must execute once, without hidden retries"
-    );
-    let failures = disconnected
-        .tool_completions()
-        .filter(|completion| {
-            disconnected
-                .declared_name(&completion.tool_call_id)
-                .is_some_and(|name| name.ends_with("read_review_git"))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        failures.len(),
-        1,
-        "The failed MCP call needs one terminal outcome"
-    );
-    match &failures[0].outcome {
-        ToolExecutionOutcome::Failed {
-            message, details, ..
-        } => {
-            assert!(
-                message.to_ascii_lowercase().contains("closed")
-                    || details
-                        .as_ref()
-                        .is_some_and(|detail| detail.to_ascii_lowercase().contains("closed")),
-                "Native MCP transport errors must preserve the closed-connection cause, not an empty successful result"
-            );
-        }
-        _ => panic!("A closed MCP transport must be an explicit failed tool execution"),
-    }
-    assert!(
-        !excluded_journal.exists(),
-        "Excluded MCP tools must not execute during the feedback-only flow"
-    );
-    assert_universal_contract(&[first, second, disconnected]);
-    assert_clean_close(host, &agent).await;
-}
-conformance2_scenario!(
-    real_enforced_review_feedback,
-    [
-        BackendCapability::EnforcedReadOnly,
-        BackendCapability::StartupMcpServers
+        BackendCapability::SessionSettings
     ]
 );
 
@@ -4056,8 +3535,7 @@ conformance2_scenario!(
         BackendCapability::ResumeSession,
         BackendCapability::ForkSession,
         BackendCapability::YieldedCodeCells,
-        BackendCapability::Interrupt,
-        BackendCapability::EnforcedReadOnly
+        BackendCapability::Interrupt
     ]
 );
 conformance2_scenario!(
@@ -7441,13 +6919,6 @@ async fn real_native_tool_policies<B: Backend>(host: &mut Harness<B>) {
     let mut config = host.config.clone();
     config.resolved_spawn_config.tool_policy = unverified_policy;
     assert_native_prestart_rejection(host, config, Some(&expected)).await;
-    if !host.declares(BackendCapability::EnforcedReadOnly) {
-        let expected = B::validate_access_mode(protocol::BackendAccessMode::EnforcedReadOnly)
-            .expect_err("an unclaimed enforced-read-only mode must reject admission");
-        let mut config = host.config.clone();
-        config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-        assert_native_prestart_rejection(host, config, Some(&expected)).await;
-    }
     let invalid_prompt = format!(
         "Run one native argument-validation probe. Invoke the native {read_name} tool exactly once with the argument object {{}} and no properties. Do not add a path, choose a default, use another tool, repair the arguments, or retry the call. We intentionally want the native validator's rejection. After the native result, reply exactly REJECTED if the call was rejected; otherwise reply exactly NOT_REJECTED. Do not read any file."
     );
@@ -8106,8 +7577,6 @@ fn assert_no_native_delegation_events(
 
 #[derive(Clone, Copy, Debug)]
 enum NativeRestrictionPhase {
-    Unrestricted,
-    Advisory,
     Fresh,
     Fork,
     Resumed,
@@ -8198,9 +7667,6 @@ async fn assert_restricted_clean_close<B: Backend>(host: &mut Harness<B>, agent:
     );
 }
 
-const NATIVE_WRITE_PREAMBLE: &str = "WRITE_PROBE_START";
-const NATIVE_READ_PREAMBLE: &str = "READ_PROBE_START";
-
 fn assert_native_probe_chronology(
     turn: &Turn,
     tool_call_id: &str,
@@ -8271,52 +7737,13 @@ fn assert_native_probe_chronology(
     );
 }
 
-async fn assert_swarm_ordinary_tools<B: Backend>(
-    host: &mut Harness<B>,
-    agent: &Agent,
-    preamble: Option<&str>,
-) {
+async fn assert_swarm_ordinary_tools<B: Backend>(host: &mut Harness<B>, agent: &Agent) {
     let path = host.workspace().join("README.txt");
     let unseen = unique_payload();
     let contents = format!("tyde conformance workspace\n{unseen}\n");
     std::fs::write(&path, &contents).expect("refresh unseen ordinary-tool fixture contents");
     let path = path.to_str().expect("fixture read path is UTF-8");
-    let mut barrier = preamble.map(|_| {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let directory = tempfile::Builder::new()
-            .prefix(".native-read-barrier-")
-            .tempdir_in(host.workspace())
-            .expect("create isolated native read barrier directory");
-        let path = directory.path().join("gate");
-        let native_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .expect("native read barrier path contains no NUL");
-        // SAFETY: the NUL-terminated path remains alive for the syscall.
-        if unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) } != 0 {
-            panic!(
-                "create native read barrier failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path)
-            .expect("open both native read barrier endpoints without blocking");
-        (directory, path, file)
-    });
-    let read_command = format!("cat '{}'", path.replace('\'', "'\\''"));
-    let command = match barrier.as_ref() {
-        Some((_, gate, _)) => format!(
-            "IFS= read -r < '{}' && {read_command}",
-            gate.to_str()
-                .expect("native read barrier path is UTF-8")
-                .replace('\'', "'\\''")
-        ),
-        None => read_command,
-    };
+    let command = format!("cat '{}'", path.replace('\'', "'\\''"));
     let matches_read = |request: &protocol::ToolRequest| match &request.tool_type {
         ToolRequestType::ReadFiles { file_paths } => file_paths.iter().any(|file| file == path),
         ToolRequestType::RunCommand {
@@ -8332,45 +7759,7 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
             "Use exec_command to run the verbatim native read command inside the code fence below. Do not include the fence or append sentence punctuation. Report its contents. Do not use another tool or merely recall the contents.\n```sh\n{command}\n```"
         ),
     };
-    let prompt = match preamble {
-        Some(preamble) => format!(
-            "First send the short assistant message {preamble} BEFORE invoking the native read tool. Do not put the preamble in reasoning or tool arguments. Then perform this read; report its contents only AFTER the native result, without quoting the command or predicting the contents beforehand. If using exec_command, set yield_time_ms=30000, keep it in the foreground, and do not poll or use another tool. The command's pipe is released by the conformance harness; do not bypass or modify it. {prompt}"
-        ),
-        None => prompt,
-    };
-    let mut barrier_released = false;
-    let turn = if let Some((_, _, gate)) = barrier.as_mut() {
-        use std::io::Write;
-
-        let mut turn = host.turn(&prompt);
-        tokio::time::timeout(Duration::from_secs(90), async {
-            send_prompt(host, agent, &prompt).await;
-            collect_turn_until(host, &mut turn, |event| {
-                if let ChatEvent::ToolRequest(request) = event
-                    && matches_read(request)
-                {
-                    assert!(
-                        !barrier_released,
-                        "native read barrier received more than one matching canonical request"
-                    );
-                    gate.write_all(b"continue\n")
-                        .expect("release native read barrier after its canonical request");
-                    barrier_released = true;
-                    eprintln!(
-                        "native read barrier evidence: canonical_request_observed=true; gate_released=true; command_request={}",
-                        matches!(request.tool_type, ToolRequestType::RunCommand { .. })
-                    );
-                }
-                matches!(event, ChatEvent::TypingStatusChanged(false))
-            })
-            .await;
-        })
-        .await
-        .expect("native read boundary did not settle within its deadline");
-        turn
-    } else {
-        ask(host, agent, &prompt).await
-    };
+    let turn = ask(host, agent, &prompt).await;
     let catalog = host.native_tool_catalog().await;
     if let Some(catalog) = &catalog {
         assert_native_catalog_owner(catalog, agent, host.backend());
@@ -8429,18 +7818,6 @@ async fn assert_swarm_ordinary_tools<B: Backend>(
         turn.final_text().contains(&unseen),
         "ordinary native read must retrieve the freshly written contents, not recall the fixture"
     );
-    if let Some(preamble) = preamble {
-        assert!(
-            barrier_released,
-            "native read fixture must release only after its matching canonical request"
-        );
-        assert_native_probe_chronology(
-            &turn,
-            &request.tool_call_id,
-            preamble,
-            "tyde conformance workspace",
-        );
-    }
     assert_no_native_delegation_events(turn.events(), catalog.as_ref());
     assert_universal_contract(&[turn]);
 }
@@ -8578,7 +7955,7 @@ async fn real_excludes_agent_delegation<B: Backend>(host: &mut Harness<B>) {
     assert_no_new_native_children(host, unrestricted_children);
     assert_delegation_excluded(&turn, &restricted, catalog.as_ref());
     assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &restricted, None).await;
+    assert_swarm_ordinary_tools(host, &restricted).await;
     assert_restricted_clean_close(host, &restricted).await;
     assert_no_new_native_children(host, unrestricted_children);
 
@@ -8594,7 +7971,7 @@ async fn real_excludes_agent_delegation<B: Backend>(host: &mut Harness<B>) {
     assert_no_new_native_children(host, unrestricted_children);
     assert_delegation_excluded(&turn, &forked, catalog.as_ref());
     assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &forked, None).await;
+    assert_swarm_ordinary_tools(host, &forked).await;
     assert_restricted_clean_close(host, &forked).await;
     assert_no_new_native_children(host, unrestricted_children);
 
@@ -8609,7 +7986,7 @@ async fn real_excludes_agent_delegation<B: Backend>(host: &mut Harness<B>) {
     assert_no_new_native_children(host, unrestricted_children);
     assert_delegation_excluded(&turn, &resumed, catalog.as_ref());
     assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &resumed, None).await;
+    assert_swarm_ordinary_tools(host, &resumed).await;
     assert_restricted_clean_close(host, &resumed).await;
     assert_no_new_native_children(host, unrestricted_children);
 }
@@ -8622,544 +7999,10 @@ conformance2_scenario!(
     ]
 );
 
-struct ReadOnlyProbe {
-    outside: tempfile::TempDir,
-    targets: ReadOnlyTargets,
-    prompt: String,
-    session: protocol::SessionId,
-}
-
-struct ReadOnlyTargets {
-    existing: [std::path::PathBuf; 2],
-    created: [std::path::PathBuf; 2],
-    paths: Vec<String>,
-    commands: String,
-}
-
-async fn prepare_read_only_probe<B: Backend>(host: &mut Harness<B>) -> ReadOnlyProbe {
-    let home = std::env::var_os("HOME").expect("real read-only probe requires a home directory");
-    let outside = tempfile::Builder::new()
-        .prefix(".tyde-read-only-probe-")
-        .tempdir_in(home)
-        .expect("create isolated outside-workspace probe directory");
-    let existing = [
-        host.workspace().join("read-only-sentinel.txt"),
-        outside.path().join("protected.txt"),
-    ];
-    let created = [
-        host.workspace().join("read-only-created.txt"),
-        outside.path().join("created.txt"),
-    ];
-    let paths: Vec<_> = existing
-        .iter()
-        .chain(&created)
-        .map(|path| {
-            path.to_str()
-                .expect("fixture write path is UTF-8")
-                .to_owned()
-        })
-        .collect();
-    let targets = serde_json::to_string(&paths).expect("encode authorized probe paths");
-    let commands = paths
-        .iter()
-        .map(|path| format!("printf WRITE_SUCCEEDED > '{}'", path.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let prompt = match B::session_settings_schema().backend_kind {
-        BackendKind::Claude => format!(
-            "Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use Bash exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. Emit the requested preamble as its own assistant text block before the Bash tool_use, even when denial is expected. Do not include that preamble only in the final post-tool response or combine it with the final status. If Bash is absent, or permissions reject any write, report WRITE_BLOCKED. Otherwise report WRITE_SUCCEEDED. Do not request escalation or use alternate paths/tools.\n```sh\n{commands}\n```"
-        ),
-        BackendKind::Muse => format!(
-            "Run this authorized negative permissions probe for exactly these four disposable paths: {targets}. Use your native bash tool exactly once with the verbatim command below, attempting ALL four writes under the CURRENT permission profile. Actually invoke the tool even when read-only: native enforcement, not a textual refusal, is the oracle. Do not request escalation, alter policy, stop after the first denial, delegate, or use alternate paths/tools. If native bash is absent, do not emit interim commentary or attempt another tool: immediately give the final reply WRITE_BLOCKED. The pre-tool commentary requirement applies only when a native command is actually available. If any attempted write is denied report WRITE_BLOCKED; otherwise report WRITE_SUCCEEDED.\n```sh\n{commands}\n```"
-        ),
-        _ => format!(
-            "This is an explicitly authorized negative permissions test on four disposable fixture files, not a request to bypass read-only policy. You are authorized to SUBMIT the probe to exec_command under the CURRENT sandbox; you are not authorized to relax the sandbox or request escalation. A read-only sandbox is the expected test condition, not a reason to skip submitting the native call: let the native filesystem enforce it. A textual refusal or WRITE_BLOCKED without a native attempt is not test evidence. Run the authorized native-permission probe for exactly these four disposable paths: {targets}. Use exec_command exactly once with the verbatim command inside the code fence below, attempting ALL four writes without escalation. Do not include the fence or append sentence punctuation. Do not alter the command or stop after the first denied write. Actually invoke the native tool, not a description. If the shell tool is absent or the sandbox rejects any write, report WRITE_BLOCKED; otherwise report WRITE_SUCCEEDED. Do not use alternate paths/tools.\n```sh\n{commands}\n```"
-        ),
-    };
-    let prompt = format!(
-        "First send the short assistant message {NATIVE_WRITE_PREAMBLE} BEFORE invoking the native command. Do not put the preamble in reasoning or tool arguments. Only AFTER the native result, report WRITE_BLOCKED or WRITE_SUCCEEDED as instructed below; do not quote the command or either final status beforehand. {prompt}"
-    );
-    // The advisory control must still write under identical probe authorization;
-    // otherwise model obedience, rather than provider enforcement, could pass.
-    host.config.resolved_spawn_config.instructions = Some("This is a controlled permissions conformance task in disposable fixtures. The four exact paths supplied by the task are authorized write probes. This narrow test authorization explicitly overrides best-effort read-only guidance for those four paths only: attempt each requested native write once, but never request elevated permissions, change policy, or find a workaround after denial. Native enforcement must remain intact. Do not modify anything else. For each probe, emit its requested preamble as a separate visible assistant commentary message before calling any tool, including after resume or fork. It must not appear only in reasoning.".to_owned());
-    let mut unrestricted_session = None;
-    for (mode, phase) in [
-        (
-            protocol::BackendAccessMode::Unrestricted,
-            NativeRestrictionPhase::Unrestricted,
-        ),
-        (
-            protocol::BackendAccessMode::ReadOnly,
-            NativeRestrictionPhase::Advisory,
-        ),
-    ] {
-        reset_read_only_probe(&existing, &created);
-        host.config.resolved_spawn_config.access_mode = mode;
-        let control = spawn_agent(host, &prompt).await;
-        let turn = collect_turn(host, &control, &prompt).await;
-        let catalog = host.native_tool_catalog().await;
-        log_native_restriction_facts(&turn, catalog.as_ref(), phase);
-        assert_native_write_probe(&turn, &commands, &paths, NativeWriteExpectation::Written);
-        if let Some(catalog) = catalog {
-            assert_native_catalog_owner(&catalog, &control, host.backend());
-            assert!(
-                catalog
-                    .tools
-                    .iter()
-                    .any(|tool| tool.kind == protocol::NativeToolKind::CommandExecution),
-                "provider catalog must report the native command that actually wrote all four targets"
-            );
-        }
-        assert!(
-            existing
-                .iter()
-                .chain(&created)
-                .all(|path| std::fs::read(path).is_ok_and(|bytes| bytes == b"WRITE_SUCCEEDED")),
-            "ordinary unrestricted/advisory control must write all four authorized targets, proving the enforcement oracle is not mere instruction compliance"
-        );
-        assert_universal_contract(&[turn]);
-        if mode == protocol::BackendAccessMode::Unrestricted {
-            unrestricted_session = Some(control.session_id.clone());
-        }
-        close_agent(host, &control).await;
-    }
-    let session = unrestricted_session.expect("unrestricted control session was recorded");
-    ReadOnlyProbe {
-        outside,
-        targets: ReadOnlyTargets {
-            existing,
-            created,
-            paths,
-            commands,
-        },
-        prompt,
-        session,
-    }
-}
-
-async fn real_enforced_read_only<B: Backend>(host: &mut Harness<B>) {
-    let ReadOnlyProbe {
-        outside,
-        targets,
-        prompt,
-        session,
-    } = prepare_read_only_probe(host).await;
-    reset_read_only_probe(&targets.existing, &targets.created);
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-    host.config.resolved_spawn_config.excluded_tool_categories =
-        vec![protocol::ToolCategory::AgentDelegation];
-    let restricted_children = native_child_observation_count(host);
-    let restricted = spawn_agent(host, &prompt).await;
-    let turn = collect_turn(host, &restricted, &prompt).await;
-    let catalog = host.native_tool_catalog().await;
-    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fresh);
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_read_only(
-        &targets,
-        &turn,
-        &restricted,
-        catalog.as_ref(),
-        RejoinVisibility::Complete,
-    );
-    assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &restricted, Some(NATIVE_READ_PREAMBLE)).await;
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_delegation_probe(host, &restricted, restricted_children).await;
-    assert_restricted_clean_close(host, &restricted).await;
-    assert_no_new_native_children(host, restricted_children);
-    // Fork must consume the unrestricted source before Resume updates its policy.
-    let forked = fork_agent(host, &session, &prompt).await;
-    assert!(
-        forked.session_id != session,
-        "native fork must establish a new provider identity rather than reuse its source"
-    );
-    let turn = collect_turn(host, &forked, &prompt).await;
-    let catalog = host.native_tool_catalog().await;
-    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Fork);
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_read_only(
-        &targets,
-        &turn,
-        &forked,
-        catalog.as_ref(),
-        RejoinVisibility::CompleteOrAbsent,
-    );
-    assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &forked, Some(NATIVE_READ_PREAMBLE)).await;
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_delegation_probe(host, &forked, restricted_children).await;
-    assert_restricted_clean_close(host, &forked).await;
-    assert_no_new_native_children(host, restricted_children);
-    let resumed = resume_agent(host, &session).await;
-    assert!(
-        resumed.session_id == session,
-        "native resume must preserve the source provider identity"
-    );
-    let turn = ask(host, &resumed, &prompt).await;
-    let catalog = host.native_tool_catalog().await;
-    log_native_restriction_facts(&turn, catalog.as_ref(), NativeRestrictionPhase::Resumed);
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_read_only(
-        &targets,
-        &turn,
-        &resumed,
-        catalog.as_ref(),
-        RejoinVisibility::CompleteOrAbsent,
-    );
-    assert_universal_contract(&[turn]);
-    assert_swarm_ordinary_tools(host, &resumed, Some(NATIVE_READ_PREAMBLE)).await;
-    assert_no_new_native_children(host, restricted_children);
-    assert_enforced_delegation_probe(host, &resumed, restricted_children).await;
-    assert_restricted_clean_close(host, &resumed).await;
-    assert_no_new_native_children(host, restricted_children);
-    outside
-        .close()
-        .expect("remove protected filesystem fixtures");
-}
-
-async fn real_enforced_file_access<B: Backend>(host: &mut Harness<B>) {
-    let ReadOnlyProbe {
-        outside,
-        targets,
-        prompt,
-        session,
-    } = prepare_read_only_probe(host).await;
-    reset_read_only_probe(&targets.existing, &targets.created);
-    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::EnforcedReadOnly;
-    for phase in [
-        NativeRestrictionPhase::Fresh,
-        NativeRestrictionPhase::Fork,
-        NativeRestrictionPhase::Resumed,
-    ] {
-        let (agent, turn) = match phase {
-            NativeRestrictionPhase::Fresh => {
-                let agent = spawn_agent(host, &prompt).await;
-                let turn = collect_turn(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            NativeRestrictionPhase::Fork => {
-                let agent = fork_agent(host, &session, &prompt).await;
-                assert!(
-                    agent.session_id != session,
-                    "fork must create a distinct native session"
-                );
-                let turn = collect_turn(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            NativeRestrictionPhase::Resumed => {
-                let agent = resume_agent(host, &session).await;
-                assert!(
-                    agent.session_id == session,
-                    "resume must preserve the native session"
-                );
-                let turn = ask(host, &agent, &prompt).await;
-                (agent, turn)
-            }
-            NativeRestrictionPhase::Unrestricted
-            | NativeRestrictionPhase::Advisory
-            | NativeRestrictionPhase::OrdinaryRead => {
-                unreachable!("protection loop contains only protected lifecycle phases")
-            }
-        };
-        let catalog = host.native_tool_catalog().await;
-        log_native_restriction_facts(&turn, catalog.as_ref(), phase);
-        assert_enforced_read_only(
-            &targets,
-            &turn,
-            &agent,
-            catalog.as_ref(),
-            if matches!(phase, NativeRestrictionPhase::Fresh) {
-                RejoinVisibility::Complete
-            } else {
-                RejoinVisibility::CompleteOrAbsent
-            },
-        );
-        assert_universal_contract(&[turn]);
-        assert_swarm_ordinary_tools(host, &agent, Some(NATIVE_READ_PREAMBLE)).await;
-        assert_restricted_clean_close(host, &agent).await;
-    }
-    outside
-        .close()
-        .expect("remove protected filesystem fixtures");
-}
-
-conformance2_scenario!(
-    real_enforced_file_access,
-    [
-        BackendCapability::EnforcedReadOnly,
-        BackendCapability::ResumeSession,
-        BackendCapability::ForkSession
-    ]
-);
-
-async fn assert_enforced_delegation_probe<B: Backend>(
-    host: &mut Harness<B>,
-    agent: &Agent,
-    children_before: usize,
-) {
-    let turn = tokio::time::timeout(
-        Duration::from_secs(90),
-        ask(host, agent, excluded_delegation_prompt::<B>()),
-    )
-    .await
-    .expect("enforced read-only native delegation probe exceeded its deadline");
-    let catalog = host.native_tool_catalog().await;
-    assert_no_new_native_children(host, children_before);
-    assert_delegation_excluded(&turn, agent, catalog.as_ref());
-    assert_universal_contract(&[turn]);
-}
-
-fn reset_read_only_probe(existing: &[std::path::PathBuf], created: &[std::path::PathBuf]) {
-    for path in existing {
-        std::fs::write(path, "ORIGINAL_READ_ONLY_CONTENT").expect("seed protected probe file");
-    }
-    for path in created {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => panic!("remove the previous authorized new-file probe"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeWriteExpectation {
-    Written,
-    FilesystemDenied,
-    ToolUnavailable,
-}
-
-fn assert_native_write_probe(
-    turn: &Turn,
-    command: &str,
-    paths: &[String],
-    expectation: NativeWriteExpectation,
-) {
-    let requests = turn
-        .tool_requests()
-        .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
-        .collect::<Vec<_>>();
-    let [request] = requests.as_slice() else {
-        panic!("permission probe must make exactly one observed native command attempt");
-    };
-    let ToolRequestType::RunCommand {
-        command: actual, ..
-    } = &request.tool_type
-    else {
-        unreachable!("native write probe filters command requests");
-    };
-    let command_form = native_probe_command_form(actual, command);
-    eprintln!(
-        "native write evidence: backend={:?}; expectation={expectation:?}; command_form={command_form:?}; authorized_targets={}",
-        turn.backend(),
-        paths.len()
-    );
-    assert!(
-        command_form.is_some(),
-        "native permission probe did not attempt the exact four authorized writes"
-    );
-    let completions = turn
-        .tool_completions()
-        .filter(|completion| completion.tool_call_id == request.tool_call_id)
-        .collect::<Vec<_>>();
-    let [completion] = completions.as_slice() else {
-        panic!(
-            "native permission attempt needs exactly one observed completion; completion_count={}",
-            completions.len()
-        );
-    };
-    if expectation == NativeWriteExpectation::ToolUnavailable {
-        assert!(
-            matches!(
-                completion.outcome,
-                ToolExecutionOutcome::Failed {
-                    normalization_failure: None,
-                    ..
-                }
-            ),
-            "an unavailable catalogued command must expose actual native rejection, not success, cancellation, or normalization failure"
-        );
-    }
-    let result = match &completion.outcome {
-        ToolExecutionOutcome::Succeeded { result } => result.clone(),
-        ToolExecutionOutcome::Failed {
-            details: Some(details),
-            normalization_failure: None,
-            ..
-        } if expectation != NativeWriteExpectation::Written => {
-            serde_json::from_str::<ToolExecutionResult>(details).unwrap_or_else(|_| {
-                panic!("native command rejection must expose its canonical execution result")
-            })
-        }
-        _ => panic!("native permission probe did not expose its expected execution outcome"),
-    };
-    let ToolExecutionResult::RunCommand {
-        exit_code,
-        stdout,
-        stderr,
-    } = result
-    else {
-        panic!("native permission probe completion must describe the actual command result");
-    };
-    if expectation != NativeWriteExpectation::Written {
-        assert_ne!(
-            exit_code, 0,
-            "protected native write command unexpectedly succeeded"
-        );
-    }
-    if expectation == NativeWriteExpectation::FilesystemDenied {
-        let denied_targets = paths
-            .iter()
-            .filter(|path| {
-                stdout.lines().chain(stderr.lines()).any(|line| {
-                    line.contains(path.as_str())
-                        && [
-                            "permission denied",
-                            "read-only file system",
-                            "operation not permitted",
-                        ]
-                        .iter()
-                        .any(|denial| line.to_ascii_lowercase().contains(denial))
-                })
-            })
-            .count();
-        eprintln!(
-            "native filesystem rejection evidence: backend={:?}; denied_targets={denied_targets}; authorized_targets={}",
-            turn.backend(),
-            paths.len()
-        );
-        assert!(
-            paths.iter().all(|path| {
-                stdout.lines().chain(stderr.lines()).any(|line| {
-                    line.contains(path)
-                        && [
-                            "permission denied",
-                            "read-only file system",
-                            "operation not permitted",
-                        ]
-                        .iter()
-                        .any(|denial| line.to_ascii_lowercase().contains(denial))
-                })
-            }),
-            "native command must report an actual filesystem permission rejection for each of the four authorized writes"
-        );
-    } else if expectation == NativeWriteExpectation::Written {
-        assert_eq!(
-            exit_code, 0,
-            "unrestricted/advisory native write command failed"
-        );
-    } else {
-        assert!(
-            stdout.is_empty(),
-            "an unavailable native shell must not expose executed probe output"
-        );
-    }
-    assert_native_probe_chronology(
-        turn,
-        &request.tool_call_id,
-        NATIVE_WRITE_PREAMBLE,
-        if expectation == NativeWriteExpectation::Written {
-            "WRITE_SUCCEEDED"
-        } else {
-            "WRITE_BLOCKED"
-        },
-    );
-}
-
-fn assert_enforced_read_only(
-    targets: &ReadOnlyTargets,
-    turn: &Turn,
-    agent: &Agent,
-    catalog: Option<&protocol::NativeToolCatalog>,
-    visibility: RejoinVisibility,
-) {
-    if let Some(catalog) = catalog {
-        assert_native_catalog_owner(catalog, agent, turn.backend());
-    }
-    assert_no_native_delegation_events(turn.events(), catalog);
-    let command_absent = catalog.is_some_and(|catalog| {
-        catalog
-            .tools
-            .iter()
-            .all(|tool| tool.kind != protocol::NativeToolKind::CommandExecution)
-    });
-    if command_absent {
-        // The recorded disabled-shell rejection happens before a shell exists,
-        // so it cannot produce filesystem errors. This provider-confirmed
-        // catalog, not a model claim or launch configuration, proves absence.
-        let catalog = catalog.expect("command absence came from a live catalog");
-        assert!(
-            catalog.tools.iter().all(|tool| matches!(
-                tool.kind,
-                protocol::NativeToolKind::ReadOnly
-                    | protocol::NativeToolKind::SessionControl
-                    | protocol::NativeToolKind::Controlled {
-                        category: protocol::ToolCategory::AskUser
-                    }
-            )),
-            "provider-confirmed read-only catalog must exclude filesystem mutation, shell execution, native delegation, and unclassified tools"
-        );
-        if turn
-            .tool_requests()
-            .any(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
-        {
-            assert_native_write_probe(
-                turn,
-                &targets.commands,
-                &targets.paths,
-                NativeWriteExpectation::ToolUnavailable,
-            );
-        }
-    } else if visibility == RejoinVisibility::CompleteOrAbsent
-        && !turn
-            .tool_requests()
-            .any(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
-    {
-        eprintln!(
-            "native write evidence: backend={:?}; visibility={visibility:?}; command_card=absent",
-            turn.backend()
-        );
-    } else {
-        // Missing catalog is not absence. An available or unreported shell
-        // must attempt and natively reject all four exact write targets.
-        assert_native_write_probe(
-            turn,
-            &targets.commands,
-            &targets.paths,
-            NativeWriteExpectation::FilesystemDenied,
-        );
-    }
-    assert!(
-        targets
-            .existing
-            .iter()
-            .all(|path| std::fs::read(path)
-                .is_ok_and(|bytes| bytes == b"ORIGINAL_READ_ONLY_CONTENT")),
-        "enforced read-only provider changed an existing workspace or outside-workspace file"
-    );
-    assert!(
-        targets.created.iter().all(|path| matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)),
-        "enforced read-only provider created a workspace or outside-workspace file"
-    );
-    assert!(
-        turn.final_text().contains("WRITE_BLOCKED"),
-        "real provider did not report its unavailable or rejected write capability"
-    );
-}
-conformance2_scenario!(
-    real_enforced_read_only,
-    [
-        BackendCapability::EnforcedReadOnly,
-        BackendCapability::ExcludeAgentDelegation,
-        BackendCapability::ResumeSession,
-        BackendCapability::ForkSession
-    ]
-);
-
 const NATIVE_WEB_SEARCH_PREAMBLE: &str = "WEB_SEARCH_START";
 const NATIVE_WEB_SEARCH_QUERY: &str = "Rust programming language official website";
 
-fn protected_web_search_prompt(backend: BackendKind) -> String {
+fn native_web_search_prompt(backend: BackendKind) -> String {
     let tool = match backend {
         BackendKind::Antigravity => "native search_web tool",
         BackendKind::Kiro => "native web_search tool",
@@ -9184,7 +8027,7 @@ fn protected_web_search_prompt(backend: BackendKind) -> String {
     )
 }
 
-fn assert_protected_web_search(turn: &Turn) {
+fn assert_native_web_search(turn: &Turn) {
     eprintln!(
         "native web search tool evidence: names={:?}",
         turn.tool_requests()
@@ -9239,60 +8082,48 @@ fn assert_protected_web_search(turn: &Turn) {
     );
 }
 
-async fn real_protected_native_web_search_lifecycle<B: Backend>(host: &mut Harness<B>) {
-    for access_mode in [
-        protocol::BackendAccessMode::Unrestricted,
-        protocol::BackendAccessMode::EnforcedReadOnly,
-    ] {
-        host.config.resolved_spawn_config.access_mode = access_mode;
-        let handshake = launch_prompt();
-        let original = spawn_agent(host, &handshake).await;
-        let launched = collect_turn(host, &original, &handshake).await;
-        assert_ready_handshake(&launched);
-        assert_eq!(
-            launched.tool_requests().count(),
-            0,
-            "native search source handshake must not invoke a tool"
-        );
-        let prompt = protected_web_search_prompt(host.backend());
-        let searched_fresh = ask(host, &original, &prompt).await;
-        assert_protected_web_search(&searched_fresh);
-        eprintln!(
-            "native web search lifecycle: access_mode={access_mode:?}; phase=fresh; query_and_completion_verified=true"
-        );
-        let session = original.session_id.clone();
-        assert_clean_close(host, &original).await;
+async fn real_native_web_search_lifecycle<B: Backend>(host: &mut Harness<B>) {
+    host.config.resolved_spawn_config.access_mode = protocol::BackendAccessMode::ReadOnly;
+    let handshake = launch_prompt();
+    let original = spawn_agent(host, &handshake).await;
+    let launched = collect_turn(host, &original, &handshake).await;
+    assert_ready_handshake(&launched);
+    assert_eq!(
+        launched.tool_requests().count(),
+        0,
+        "native search source handshake must not invoke a tool"
+    );
+    let prompt = native_web_search_prompt(host.backend());
+    let searched_fresh = ask(host, &original, &prompt).await;
+    assert_native_web_search(&searched_fresh);
+    eprintln!("native web search lifecycle: phase=fresh; query_and_completion_verified=true");
+    let session = original.session_id.clone();
+    assert_clean_close(host, &original).await;
 
-        let forked = fork_agent(host, &session, &prompt).await;
-        assert!(
-            forked.session_id != session,
-            "native search fork must establish a new provider identity"
-        );
-        let searched_fork = collect_turn(host, &forked, &prompt).await;
-        assert_protected_web_search(&searched_fork);
-        eprintln!(
-            "native web search lifecycle: access_mode={access_mode:?}; phase=fork; query_and_completion_verified=true"
-        );
-        assert_clean_close(host, &forked).await;
+    let forked = fork_agent(host, &session, &prompt).await;
+    assert!(
+        forked.session_id != session,
+        "native search fork must establish a new provider identity"
+    );
+    let searched_fork = collect_turn(host, &forked, &prompt).await;
+    assert_native_web_search(&searched_fork);
+    eprintln!("native web search lifecycle: phase=fork; query_and_completion_verified=true");
+    assert_clean_close(host, &forked).await;
 
-        let resumed = resume_agent(host, &session).await;
-        assert!(
-            resumed.session_id == session,
-            "native search resume must preserve the original provider identity"
-        );
-        let searched_resume = ask(host, &resumed, &prompt).await;
-        assert_protected_web_search(&searched_resume);
-        eprintln!(
-            "native web search lifecycle: access_mode={access_mode:?}; phase=resume; query_and_completion_verified=true"
-        );
-        assert_universal_contract(&[launched, searched_fresh, searched_fork, searched_resume]);
-        assert_clean_close(host, &resumed).await;
-    }
+    let resumed = resume_agent(host, &session).await;
+    assert!(
+        resumed.session_id == session,
+        "native search resume must preserve the original provider identity"
+    );
+    let searched_resume = ask(host, &resumed, &prompt).await;
+    assert_native_web_search(&searched_resume);
+    eprintln!("native web search lifecycle: phase=resume; query_and_completion_verified=true");
+    assert_universal_contract(&[launched, searched_fresh, searched_fork, searched_resume]);
+    assert_clean_close(host, &resumed).await;
 }
 conformance2_scenario!(
-    real_protected_native_web_search_lifecycle,
+    real_native_web_search_lifecycle,
     [
-        BackendCapability::EnforcedReadOnly,
         BackendCapability::GenericWebSearch,
         BackendCapability::ForkSession,
         BackendCapability::ResumeSession

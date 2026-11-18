@@ -138,8 +138,8 @@ And matches the proven debug MCP pattern:
   must be unique across the normal managed server set. Discovery and dispatch enforce the same scope,
   and the spawn path independently rejects further implementation levels
 - configured reviewers use the existing dedicated reviewer path, not ordinary
-  implementation-spawn admission: native author forks remain enforced read-only
-  with agent delegation excluded and only review-feedback MCP
+  implementation-spawn admission: Tyde injects only review-feedback MCP
+  and asks reviewers not to edit files
 - `tyde_spawn_agent` returns current server-owned `agent_control` capabilities:
   root-inclusive `depth`, `max_depth`, and `scope` (`delegation`, `review_only`,
   or `disabled`). This is not an MCP handshake or callable-tool attestation.

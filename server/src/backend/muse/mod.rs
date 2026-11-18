@@ -7,9 +7,9 @@ mod wire;
 use std::collections::BTreeMap;
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, NativeToolCatalog, SelectOption,
-    SendMessagePayload, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, ToolCategory, ToolPolicy,
+    AgentInput, BackendKind, NativeToolCatalog, SelectOption, SendMessagePayload, SessionId,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SessionSettingsValues, ToolCategory, ToolPolicy,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -74,7 +74,6 @@ impl MuseBackend {
             .first()
             .ok_or("Muse requires a workspace root")?
             .clone();
-        Self::validate_access_mode(config.resolved_spawn_config.access_mode)?;
         if config.execution_mode == super::BackendExecutionMode::InferenceOnly {
             validate_inference_only(&config, source.is_some())?;
         } else {
@@ -111,10 +110,7 @@ impl MuseBackend {
             "model".to_owned(),
             SessionSettingValue::String(model.clone()),
         );
-        let profile = match config.resolved_spawn_config.access_mode {
-            BackendAccessMode::EnforcedReadOnly => ":read-only",
-            BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => ":unrestricted",
-        };
+        let profile = ":unrestricted";
         tracing::info!(
             host_roots = roots.len(),
             execution_roots = execution_roots.len(),
@@ -332,14 +328,6 @@ impl Backend for MuseBackend {
     }
     fn default_child_workspace_roots(parent: &[String]) -> Vec<String> {
         parent.to_vec()
-    }
-    fn validate_access_mode(mode: BackendAccessMode) -> Result<(), String> {
-        match mode {
-            BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => Ok(()),
-            BackendAccessMode::EnforcedReadOnly => Err(
-                "Muse does not support enforced read-only access: native mutation-path protection is not verified".to_owned(),
-            ),
-        }
     }
     fn validate_tool_categories(categories: &[ToolCategory]) -> Result<(), String> {
         for category in categories {

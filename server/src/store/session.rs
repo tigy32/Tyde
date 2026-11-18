@@ -202,7 +202,7 @@ pub struct SessionRecord {
     #[serde(default)]
     pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_saved_access_mode")]
     pub access_mode: protocol::BackendAccessMode,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
@@ -250,6 +250,21 @@ pub struct SessionRecord {
     /// replacement host reconstruct them through the ordinary resume path.
     #[serde(default)]
     pub(crate) restore_state: Option<SessionRestoreState>,
+}
+
+fn deserialize_saved_access_mode<'de, D>(
+    deserializer: D,
+) -> Result<protocol::BackendAccessMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    match name.as_str() {
+        "enforced_read_only" => Ok(protocol::BackendAccessMode::ReadOnly),
+        _ => protocol::BackendAccessMode::deserialize(serde::de::value::StringDeserializer::new(
+            name,
+        )),
+    }
 }
 
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 use protocol::{
     AgentErrorPayload, AgentId, ChatEvent, FrameKind, ReviewAnchorStatus, ReviewLocation,
-    ReviewSeverity, ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ToolPolicy,
+    ReviewSeverity, ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState,
 };
 use uuid::Uuid;
 
@@ -9,10 +9,6 @@ use crate::review::ReviewHandle;
 use crate::stream::Stream;
 
 pub(crate) const REVIEWER_TOOL_NAME: &str = "propose_review_comment";
-
-pub(crate) fn reviewer_tool_policy() -> ToolPolicy {
-    ToolPolicy::Unrestricted
-}
 
 pub(crate) struct ReviewerToolBridge;
 

@@ -471,9 +471,8 @@ managed by the existing list/upsert/delete tools and storage.
 
 Forks use `Backend::fork`, never transcript copying. A non-forkable author
 gets an explicit, previewed `Fresh` reviewer, never a silent substitution.
-Reviewers run `EnforcedReadOnly` (and exclude agent delegation) where the
-backend declares it; other backends review under `ReadOnly` with the read-only
-reviewer system prompt as advisory guidance. Codex calls native `thread/fork` and Claude uses `--resume` with
+Reviewers get an instruction not to edit files. Their native permissions
+and tools are not changed for review. Codex calls native `thread/fork` and Claude uses `--resume` with
 `--fork-session`; both provide separate provider identities. Primary API
 sources: [Codex fork protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)
 and [Claude CLI reference](https://code.claude.com/docs/en/cli-reference).
@@ -484,8 +483,7 @@ Installed provider incompatibility remains a typed startup failure, never a
 clean review. Forks consume tokens. The scoped
 `real_review_context_forks` conformance case verifies inherited model context,
 selected model, independent sibling identity, and author/sibling isolation
-against every backend declaring ForkSession, ResumeSession, SessionSettings
-and EnforcedReadOnly (currently Codex and Claude).
+against every backend declaring ForkSession, ResumeSession, and SessionSettings.
 
 Scoped provider evidence (2026-10-19): `real_review_context_forks` passed on
 Claude Haiku (`haiku`, low effort) and Codex GPT Luna (`gpt-5.6-luna`, low
@@ -557,9 +555,8 @@ aspect guidance, source/model configuration or closed sessions invalidate only
 the affected contexts. Failed contexts stay failures until explicitly closed
 or reconfigured; no automatic replacement masks a failure.
 
-Reviewers use the workbench's exact project roots and enforced read-only access,
-with ordinary native read tools, read-only Git operations and review-feedback
-MCP tools. Backends unable to enforce these permissions fail explicitly.
+Reviewers use the workbench's exact project roots, normal native tools, and
+review-feedback MCP. The review prompt asks them not to edit files.
 A stable system instruction describes the advisory role; the concise turn
 assignment provides current review/execution IDs, scope, focus and pending count.
 Reviewers decide what to inspect through normal workspace/file/Git tools. Startup

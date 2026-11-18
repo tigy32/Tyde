@@ -145,7 +145,6 @@ exhaustive_capabilities! {
     RetainedNativeSubagentSessions,
     NativeSubagentHierarchy,
     ExcludeAgentDelegation,
-    EnforcedReadOnly,
     // Exact allow and deny lists are enforced by the native tool catalogue.
     NativeToolPolicies,
     NativeSubagentWaitProgress,

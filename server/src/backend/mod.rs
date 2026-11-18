@@ -1600,19 +1600,6 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
-    fn validate_access_mode(mode: BackendAccessMode) -> Result<(), String>
-    where
-        Self: Sized,
-    {
-        if mode == BackendAccessMode::EnforcedReadOnly
-            && !Self::capabilities()
-                .contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly)
-        {
-            return Err("Backend cannot enforce read-only workspace access".to_owned());
-        }
-        Ok(())
-    }
-
     fn validate_tool_policy(policy: &protocol::ToolPolicy) -> Result<(), String>
     where
         Self: Sized,
@@ -2222,13 +2209,6 @@ pub(crate) async fn read_capacity_out_of_band(
 
 pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
     with_backend_type!(kind, |B| B::capabilities(), removed => BackendCapabilities::default())
-}
-
-pub(crate) fn can_exclude_tool_category(
-    kind: BackendKind,
-    category: protocol::ToolCategory,
-) -> bool {
-    with_backend_type!(kind, |B| B::validate_tool_categories(&[category]).is_ok(), removed => false)
 }
 
 pub(crate) fn supports_running_redirect(kind: BackendKind) -> bool {
@@ -3159,10 +3139,7 @@ pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value 
 
 pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -> Option<String> {
     let mut sections = Vec::new();
-    if matches!(
-        config.access_mode,
-        BackendAccessMode::ReadOnly | BackendAccessMode::EnforcedReadOnly
-    ) {
+    if config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if !config.builtin_steering.trim().is_empty() {

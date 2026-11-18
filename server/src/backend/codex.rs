@@ -68,9 +68,6 @@ const CODEX_AGENT_DELEGATION_EXCLUSION_KEYS: [&str; 3] = [
     "features.multi_agent",
     "agents.enabled",
 ];
-const CODEX_READ_ONLY_MCP_OMITTED_SURFACES: [&str; 2] = ["code_mode", "deferred"];
-const CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES: [&str; 3] =
-    ["functions", "web", "mcp__tyde_review_feedback"];
 const CODEX_MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 /// How often a thread is asked which of its command executions are still
 /// running as background terminals. A matched yielded-session raw result
@@ -1913,7 +1910,6 @@ impl CodexSession {
             ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
-            access_mode,
             execution_mode,
             excluded_tool_categories,
         )
@@ -2010,7 +2006,7 @@ impl CodexSession {
         let ephemeral = ephemeral || execution_mode == BackendExecutionMode::InferenceOnly;
         let mut thread_start_params = json!({
             "cwd": cwd,
-            "sandbox": codex_sandbox_mode(access_mode, execution_mode),
+            "sandbox": codex_sandbox_mode(execution_mode),
             "approvalPolicy": codex_approval_policy(execution_mode),
             "ephemeral": ephemeral,
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
@@ -2047,25 +2043,6 @@ impl CodexSession {
                     cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
                         .await;
                     return Err(err);
-                }
-            }
-        }
-        if access_mode == BackendAccessMode::EnforcedReadOnly {
-            match codex_restricted_thread_config(
-                &rpc,
-                &cwd,
-                &[
-                    AGENT_CONTROL_MCP_SERVER_NAME,
-                    REVIEW_FEEDBACK_MCP_SERVER_NAME,
-                ],
-            )
-            .await
-            {
-                Ok(config) => thread_start_params["config"] = config,
-                Err(error) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(error);
                 }
             }
         }
@@ -2194,7 +2171,6 @@ impl CodexSession {
             ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
-            access_mode,
             BackendExecutionMode::Agent,
             excluded_tool_categories,
         )
@@ -2278,7 +2254,7 @@ impl CodexSession {
         let mut fork_params = json!({
             "threadId": from_thread_id,
             "cwd": cwd.clone(),
-            "sandbox": codex_sandbox_mode(access_mode, BackendExecutionMode::Agent),
+            "sandbox": codex_sandbox_mode(BackendExecutionMode::Agent),
             "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
             "ephemeral": false,
             "persistExtendedHistory": false
@@ -2286,25 +2262,6 @@ impl CodexSession {
         fork_params["runtimeWorkspaceRoots"] =
             json!(codex_runtime_workspace_roots(workspace_roots, &cwd)?);
 
-        if access_mode == BackendAccessMode::EnforcedReadOnly {
-            match codex_restricted_thread_config(
-                &rpc,
-                &cwd,
-                &[
-                    AGENT_CONTROL_MCP_SERVER_NAME,
-                    REVIEW_FEEDBACK_MCP_SERVER_NAME,
-                ],
-            )
-            .await
-            {
-                Ok(config) => fork_params["config"] = config,
-                Err(error) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(error);
-                }
-            }
-        }
         let thread_forked = match rpc.request("thread/fork", fork_params).await {
             Ok(value) => value,
             Err(err) => {
@@ -2820,7 +2777,6 @@ pub(crate) async fn read_capacity_out_of_band(
         None,
         &[],
         None,
-        BackendAccessMode::Unrestricted,
         BackendExecutionMode::Agent,
         program,
         &[],
@@ -2887,7 +2843,6 @@ pub(crate) async fn probe_session_settings_schema(
         None,
         &[],
         None,
-        BackendAccessMode::Unrestricted,
         BackendExecutionMode::Agent,
         program,
         &[],
@@ -7216,11 +7171,8 @@ impl CodexInner {
                         let approval_policy = state.approval_policy.clone().unwrap_or_else(|| {
                             codex_approval_policy(state.execution_mode).to_string()
                         });
-                        let sandbox_policy = codex_sandbox_policy(
-                            state.access_mode,
-                            state.turn_network_access,
-                            state.execution_mode,
-                        );
+                        let sandbox_policy =
+                            codex_sandbox_policy(state.turn_network_access, state.execution_mode);
                         Some((
                             state.thread_id.clone(),
                             wakes,
@@ -9106,7 +9058,6 @@ impl CodexInner {
             model_override,
             effort_override,
             approval_policy_override,
-            access_mode,
             execution_mode,
             turn_network_access,
         ) = {
@@ -9118,7 +9069,6 @@ impl CodexInner {
                         state.model_override.clone(),
                         state.reasoning_effort_override.clone(),
                         state.approval_policy.clone(),
-                        state.access_mode,
                         state.execution_mode,
                         state.turn_network_access,
                     )
@@ -9143,8 +9093,7 @@ impl CodexInner {
         let approval_policy = approval_policy_override
             .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string());
         params["approvalPolicy"] = Value::String(approval_policy);
-        params["sandboxPolicy"] =
-            codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
+        params["sandboxPolicy"] = codex_sandbox_policy(turn_network_access, execution_mode);
 
         if let Some(roots) = &self
             .state
@@ -9413,7 +9362,7 @@ impl CodexInner {
                 .with(|state| {
                     (
                         json!(state.workspace_roots_override.as_deref().unwrap_or(&[])),
-                        json!(codex_sandbox_mode(state.access_mode, state.execution_mode)),
+                        json!(codex_sandbox_mode(state.execution_mode)),
                         json!(codex_approval_policy(state.execution_mode)),
                     )
                 })
@@ -9422,33 +9371,6 @@ impl CodexInner {
             params["runtimeWorkspaceRoots"] = runtime_workspace_roots;
             params["sandbox"] = sandbox;
             params["approvalPolicy"] = approval_policy;
-            if self.state.with(move |state| state.access_mode).await
-                == BackendAccessMode::EnforcedReadOnly
-            {
-                let config = codex_restricted_thread_config(
-                    &self.rpc,
-                    &self.launch_cwd,
-                    &[
-                        AGENT_CONTROL_MCP_SERVER_NAME,
-                        REVIEW_FEEDBACK_MCP_SERVER_NAME,
-                    ],
-                )
-                .await?;
-                let map = params
-                    .as_object_mut()
-                    .ok_or("Codex resume parameters must be an object")?;
-                let target = map
-                    .entry("config")
-                    .or_insert_with(|| json!({}))
-                    .as_object_mut()
-                    .ok_or("Codex resume config must be an object")?;
-                target.extend(
-                    config
-                        .as_object()
-                        .ok_or("Codex restricted config must be an object")?
-                        .clone(),
-                );
-            }
             // Upstream Codex ignores this on thread/resume and acknowledges
             // false; resumed sessions therefore lack raw-only activity. That
             // is an accepted upstream limitation, not something Tyde recovers.
@@ -20892,16 +20814,10 @@ fn codex_has_http_mcp_servers(startup_mcp_servers: &[StartupMcpServer]) -> bool 
     })
 }
 
-fn codex_sandbox_mode(
-    access_mode: BackendAccessMode,
-    execution_mode: BackendExecutionMode,
-) -> &'static str {
-    if execution_mode == BackendExecutionMode::InferenceOnly {
-        return CODEX_INFERENCE_SANDBOX;
-    }
-    match access_mode {
-        BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => CODEX_UNRESTRICTED_SANDBOX,
-        BackendAccessMode::EnforcedReadOnly => CODEX_INFERENCE_SANDBOX,
+fn codex_sandbox_mode(execution_mode: BackendExecutionMode) -> &'static str {
+    match execution_mode {
+        BackendExecutionMode::Agent => CODEX_UNRESTRICTED_SANDBOX,
+        BackendExecutionMode::InferenceOnly => CODEX_INFERENCE_SANDBOX,
     }
 }
 
@@ -20923,21 +20839,10 @@ fn codex_inference_sandbox_policy() -> Value {
     })
 }
 
-fn codex_sandbox_policy(
-    access_mode: BackendAccessMode,
-    network_access: bool,
-    execution_mode: BackendExecutionMode,
-) -> Value {
-    if execution_mode == BackendExecutionMode::InferenceOnly {
-        return codex_inference_sandbox_policy();
-    }
-    match access_mode {
-        BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
-            codex_danger_full_access_sandbox_policy(network_access)
-        }
-        BackendAccessMode::EnforcedReadOnly => {
-            json!({ "type": "readOnly", "networkAccess": false })
-        }
+fn codex_sandbox_policy(network_access: bool, execution_mode: BackendExecutionMode) -> Value {
+    match execution_mode {
+        BackendExecutionMode::Agent => codex_danger_full_access_sandbox_policy(network_access),
+        BackendExecutionMode::InferenceOnly => codex_inference_sandbox_policy(),
     }
 }
 
@@ -20976,13 +20881,6 @@ fn codex_inference_config_overrides() -> Vec<String> {
 }
 
 async fn codex_inference_thread_config(rpc: &CodexRpc, cwd: &str) -> Result<Value, String> {
-    codex_restricted_thread_config(rpc, cwd, &[]).await
-}
-async fn codex_restricted_thread_config(
-    rpc: &CodexRpc,
-    cwd: &str,
-    allowed_servers: &[&str],
-) -> Result<Value, String> {
     let effective_config = rpc
         .request(
             "config/read",
@@ -20996,12 +20894,6 @@ async fn codex_restricted_thread_config(
         .pointer("/config/mcp_servers")
         .and_then(Value::as_object)
         .ok_or("Codex config/read response missing config.mcp_servers")?;
-    if rpc.read_only_agentcontrol_direct_tools
-        && allowed_servers.contains(&AGENT_CONTROL_MCP_SERVER_NAME)
-        && !mcp_servers.contains_key(AGENT_CONTROL_MCP_SERVER_NAME)
-    {
-        return Err("Codex config/read is missing the required agentcontrol server".to_owned());
-    }
     let mut restricted_mcp_servers = serde_json::Map::new();
     for (name, server) in mcp_servers {
         // Lifecycle overrides replace the entire table. Disabled entries still
@@ -21016,31 +20908,8 @@ async fn codex_restricted_thread_config(
             omitted_optional_field_count = native_field_count - config.len(),
             "Omitting unset native MCP fields from TOML lifecycle overrides"
         );
-        if !allowed_servers.contains(&name.as_str()) {
-            config.insert("enabled".to_owned(), json!(false));
-        }
-        let mut server = Value::Object(config);
-        if rpc.read_only_builtins_direct_tools
-            && matches!(
-                name.as_str(),
-                AGENT_CONTROL_MCP_SERVER_NAME | REVIEW_FEEDBACK_MCP_SERVER_NAME
-            )
-            && allowed_servers.contains(&name.as_str())
-        {
-            server
-                .as_object_mut()
-                .ok_or("Codex config/read agentcontrol configuration must be an object")?
-                .insert(
-                    "omit_tools_from".to_owned(),
-                    json!(CODEX_READ_ONLY_MCP_OMITTED_SURFACES),
-                );
-            tracing::info!(
-                omitted_surface_count = CODEX_READ_ONLY_MCP_OMITTED_SURFACES.len(),
-                server_name = name.as_str(),
-                "Retaining authenticated Codex read-only MCP tools as direct-only tools"
-            );
-        }
-        restricted_mcp_servers.insert(name.clone(), server);
+        config.insert("enabled".to_owned(), json!(false));
+        restricted_mcp_servers.insert(name.clone(), Value::Object(config));
     }
     Ok(json!({
         "mcp_servers": restricted_mcp_servers,
@@ -21049,13 +20918,12 @@ async fn codex_restricted_thread_config(
 }
 
 fn codex_app_server_args(
-    access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
     config_overrides: &[String],
 ) -> Vec<String> {
     let mut args = vec![
         "--sandbox".to_string(),
-        codex_sandbox_mode(access_mode, execution_mode).to_string(),
+        codex_sandbox_mode(execution_mode).to_string(),
         "app-server".to_string(),
         "--listen".to_string(),
         "stdio://".to_string(),
@@ -22035,8 +21903,6 @@ struct CodexRpc {
     rollout_trace_root: Option<tempfile::TempDir>,
     tool_catalog: Option<tempfile::NamedTempFile>,
     agent_delegation_excluded: bool,
-    read_only_agentcontrol_direct_tools: bool,
-    read_only_builtins_direct_tools: bool,
     compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
 }
 
@@ -22062,7 +21928,6 @@ impl CodexRpc {
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
-        access_mode: BackendAccessMode,
         execution_mode: BackendExecutionMode,
         excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
@@ -22070,7 +21935,6 @@ impl CodexRpc {
             ssh_host,
             startup_mcp_servers,
             steering_tempfile,
-            access_mode,
             execution_mode,
             None,
             excluded_tool_categories,
@@ -22082,14 +21946,11 @@ impl CodexRpc {
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
-        access_mode: BackendAccessMode,
         execution_mode: BackendExecutionMode,
         local_program: Option<&str>,
         excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
-        if access_mode == BackendAccessMode::EnforcedReadOnly
-            || execution_mode == BackendExecutionMode::InferenceOnly
-        {
+        if execution_mode == BackendExecutionMode::InferenceOnly {
             process_env::launch::require_nested_namespaces()?;
         }
         if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
@@ -22100,18 +21961,6 @@ impl CodexRpc {
         // Native cleanup waits for both no subscribers and authoritative idle.
         // A zero retention delay makes unsubscribe an event-driven unload boundary.
         config_overrides.push("thread_unload_delay_secs=0".to_owned());
-        let read_only_builtins_direct_tools = access_mode == BackendAccessMode::EnforcedReadOnly
-            && execution_mode == BackendExecutionMode::Agent;
-        let read_only_agentcontrol_direct_tools = read_only_builtins_direct_tools
-            && startup_mcp_servers
-                .iter()
-                .any(|server| server.name.trim() == AGENT_CONTROL_MCP_SERVER_NAME);
-        if read_only_agentcontrol_direct_tools {
-            config_overrides.push(format!(
-                "mcp_servers.{AGENT_CONTROL_MCP_SERVER_NAME}.omit_tools_from={}",
-                json!(CODEX_READ_ONLY_MCP_OMITTED_SURFACES)
-            ));
-        }
         let agent_delegation_excluded =
             excluded_tool_categories.contains(&protocol::ToolCategory::AgentDelegation);
         if execution_mode == BackendExecutionMode::Agent {
@@ -22123,28 +21972,6 @@ impl CodexRpc {
                 config_overrides.push("features.multi_agent_v2=true".to_owned());
             }
             config_overrides.push("tools.update_plan.enabled=true".to_owned());
-        }
-        if access_mode == BackendAccessMode::EnforcedReadOnly {
-            config_overrides.extend(
-                [
-                    "features.request_permissions_tool=false",
-                    "features.apps=false",
-                    "features.enable_mcp_apps=false",
-                    "features.plugins=false",
-                    "features.tool_suggest=false",
-                    "features.js_repl=false",
-                    "features.code_mode=false",
-                    "features.code_mode_host=false",
-                    "features.code_mode_only=false",
-                ]
-                .map(str::to_owned),
-            );
-        }
-        if read_only_builtins_direct_tools {
-            config_overrides.push(format!(
-                "features.code_mode.direct_only_tool_namespaces={}",
-                json!(CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES)
-            ));
         }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
@@ -22179,12 +22006,8 @@ impl CodexRpc {
                 toml_quoted(&path.display().to_string())
             ));
         }
-        // The rollout trace only reconciles code-mode cells, which enforced
-        // read-only sessions disable.
-        let rollout_trace_root = if ssh_host.is_none()
-            && execution_mode == BackendExecutionMode::Agent
-            && !read_only_builtins_direct_tools
-        {
+        let local_agent = ssh_host.is_none() && execution_mode == BackendExecutionMode::Agent;
+        let rollout_trace_root = if local_agent {
             let root = tempfile::Builder::new()
                 .prefix(CODEX_ROLLOUT_TRACE_ROOT_PREFIX)
                 .tempdir()
@@ -22196,14 +22019,14 @@ impl CodexRpc {
         };
         let usage_is_remote = ssh_host.is_some();
         let mut child = if let Some(host) = ssh_host {
-            let remote_args = codex_app_server_args(access_mode, execution_mode, &config_overrides);
+            let remote_args = codex_app_server_args(execution_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = match local_program {
                 Some(program) => crate::backend::subprocess::command(program)?,
                 None => crate::backend::subprocess::command("codex")?,
             };
-            for arg in codex_app_server_args(access_mode, execution_mode, &config_overrides) {
+            for arg in codex_app_server_args(execution_mode, &config_overrides) {
                 cmd.arg(arg);
             }
             if let Some(root) = rollout_trace_root.as_ref() {
@@ -22340,8 +22163,6 @@ impl CodexRpc {
                 rollout_trace_root,
                 tool_catalog,
                 agent_delegation_excluded,
-                read_only_agentcontrol_direct_tools,
-                read_only_builtins_direct_tools,
                 compaction_capability: Arc::new(std::sync::Mutex::new(
                     BackendCompactionCapability::unknown(
                         BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -22439,7 +22260,7 @@ impl CodexRpc {
     }
 
     async fn request(&self, method: &str, mut params: Value) -> Result<Value, String> {
-        if (self.agent_delegation_excluded || self.read_only_builtins_direct_tools)
+        if self.agent_delegation_excluded
             && matches!(method, "thread/start" | "thread/fork" | "thread/resume")
         {
             let config = params
@@ -22449,34 +22270,17 @@ impl CodexRpc {
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .ok_or("Codex thread config must be an object")?;
-            if self.agent_delegation_excluded {
-                // Feature flags alone allow Fork/Resume to inherit V2 from history.
-                // agents.enabled=false supplies the native explicit Disabled override.
-                for key in CODEX_AGENT_DELEGATION_EXCLUSION_KEYS {
-                    config.insert(key.to_owned(), Value::Bool(false));
-                }
-                tracing::info!(
-                    native_operation = method,
-                    agent_delegation_excluded = true,
-                    native_override_count = CODEX_AGENT_DELEGATION_EXCLUSION_KEYS.len(),
-                    "Applying native Codex delegation exclusion at thread boundary"
-                );
+            // Feature flags alone allow Fork/Resume to inherit V2 from history.
+            // agents.enabled=false supplies the native explicit Disabled override.
+            for key in CODEX_AGENT_DELEGATION_EXCLUSION_KEYS {
+                config.insert(key.to_owned(), Value::Bool(false));
             }
-            if self.read_only_builtins_direct_tools {
-                // Native model metadata can select CodeModeOnly even with the
-                // kernel disabled. Expose its existing sandboxed tools directly.
-                config.insert("features.code_mode.enabled".to_owned(), Value::Bool(false));
-                config.insert(
-                    "features.code_mode.direct_only_tool_namespaces".to_owned(),
-                    json!(CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES),
-                );
-                tracing::info!(
-                    native_operation = method,
-                    direct_namespace_count = CODEX_READ_ONLY_DIRECT_TOOL_NAMESPACES.len(),
-                    code_mode_enabled = false,
-                    "Applying direct-only sandboxed Codex builtins at thread boundary"
-                );
-            }
+            tracing::info!(
+                native_operation = method,
+                agent_delegation_excluded = true,
+                native_override_count = CODEX_AGENT_DELEGATION_EXCLUSION_KEYS.len(),
+                "Applying native Codex delegation exclusion at thread boundary"
+            );
         }
         self.request_typed(method, params)
             .await
@@ -24353,7 +24157,6 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::RetainedNativeSubagentSessions,
             tyde_agent_adapter::BackendCapability::ExcludeAgentDelegation,
-            tyde_agent_adapter::BackendCapability::EnforcedReadOnly,
             tyde_agent_adapter::BackendCapability::NativeSubagentWaitProgress,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
@@ -24957,7 +24760,6 @@ impl Backend for CodexBackend {
             None,
             &[],
             None,
-            BackendAccessMode::Unrestricted,
             BackendExecutionMode::Agent,
             context.program.as_deref(),
             &[],

@@ -546,7 +546,6 @@ fn ConstraintsFields(
                     />
                     <span>
                         <span class="swarm-radio-title">"Read-only project access"</span>
-                        <span class="swarm-field-help">"Members read and discuss; nobody edits files."</span>
                     </span>
                 </label>
                 <label class="swarm-radio" class:disabled=move || !selected_is_workbench.get()>

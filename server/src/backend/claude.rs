@@ -228,7 +228,6 @@ struct ClaudeSpawnMode<'a> {
     steering_content: Option<&'a str>,
     agent_identity: Option<&'a AgentIdentity>,
     tool_policy: ToolPolicy,
-    access_mode: BackendAccessMode,
     skills: ClaudeSkillExposure,
 }
 
@@ -239,7 +238,6 @@ struct ClaudeForkConfig<'a> {
     steering_content: Option<&'a str>,
     agent_identity: Option<&'a AgentIdentity>,
     tool_policy: ToolPolicy,
-    access_mode: BackendAccessMode,
     skills: ClaudeSkillExposure,
 }
 
@@ -402,7 +400,6 @@ impl ClaudeSession {
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
         tool_policy: ToolPolicy,
-        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_skills(
             workspace_roots,
@@ -411,7 +408,6 @@ impl ClaudeSession {
             steering_content,
             agent_identity,
             tool_policy,
-            access_mode,
             ClaudeSkillExposure::default(),
         )
         .await
@@ -419,7 +415,6 @@ impl ClaudeSession {
 
     /// [`spawn`](Self::spawn), taking ownership of the session's inline skill
     /// plugin so the root outlives every process the session starts.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_with_skills(
         workspace_roots: &[String],
         ssh_host: Option<String>,
@@ -427,7 +422,6 @@ impl ClaudeSession {
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
         tool_policy: ToolPolicy,
-        access_mode: BackendAccessMode,
         skills: ClaudeSkillExposure,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
@@ -440,7 +434,6 @@ impl ClaudeSession {
                 steering_content,
                 agent_identity,
                 tool_policy,
-                access_mode,
                 skills,
             },
         )
@@ -454,7 +447,6 @@ impl ClaudeSession {
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
         tool_policy: ToolPolicy,
-        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -466,7 +458,6 @@ impl ClaudeSession {
                 steering_content,
                 agent_identity,
                 tool_policy,
-                access_mode,
                 skills: ClaudeSkillExposure::default(),
             },
         )
@@ -489,7 +480,6 @@ impl ClaudeSession {
                 steering_content: fork_config.steering_content,
                 agent_identity: fork_config.agent_identity,
                 tool_policy: fork_config.tool_policy,
-                access_mode: fork_config.access_mode,
                 skills: fork_config.skills,
             },
         )
@@ -540,10 +530,7 @@ impl ClaudeSession {
                 model: None,
                 effort: None,
                 fast_mode: None,
-                access_mode: mode.access_mode,
-                permission_mode: Some(
-                    claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
-                ),
+                permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                 startup_mcp_config_json: build_claude_mcp_config_json(mode.startup_mcp_servers),
                 steering_content: mode.steering_content.map(|s| s.to_string()),
                 agent_identity: mode.agent_identity.cloned(),
@@ -772,7 +759,6 @@ struct ClaudeState {
     model: Option<String>,
     effort: Option<ClaudeEffort>,
     fast_mode: Option<bool>,
-    access_mode: BackendAccessMode,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -865,7 +851,6 @@ impl Default for ClaudeState {
             model: None,
             effort: None,
             fast_mode: None,
-            access_mode: BackendAccessMode::Unrestricted,
             permission_mode: None,
             startup_mcp_config_json: None,
             steering_content: None,
@@ -2352,7 +2337,6 @@ struct ClaudeProcessSpawnConfig {
     model: Option<String>,
     effort: Option<ClaudeEffort>,
     fast_mode: Option<bool>,
-    access_mode: BackendAccessMode,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -2563,21 +2547,14 @@ impl ClaudeInner {
                                 .or_else(|| obj.get("permissionMode"))
                                 .or_else(|| obj.get("approval_policy"))
                             {
-                                if state.access_mode == BackendAccessMode::EnforcedReadOnly {
-                                    if !matches!(permission_mode_value.as_str(), Some("dontAsk")) {
-                                        return Err(
-                                            "Cannot change permissions under enforced read-only access"
-                                                .to_owned(),
-                                        );
-                                    }
-                                } else if permission_mode_value.is_null() {
+                                if permission_mode_value.is_null() {
                                     changed_process_setting |= state.permission_mode.is_some();
                                     state.permission_mode = None;
                                 } else if let Some(permission_mode) =
                                     normalize_claude_permission_mode(permission_mode_value)
                                 {
-                                    changed_process_setting |=
-                                        state.permission_mode.as_deref() != Some(permission_mode.as_str());
+                                    changed_process_setting |= state.permission_mode.as_deref()
+                                        != Some(permission_mode.as_str());
                                     state.permission_mode = Some(permission_mode);
                                 }
                             }
@@ -4307,7 +4284,6 @@ impl ClaudeInner {
                     model: state.model.clone(),
                     effort: state.effort,
                     fast_mode: state.fast_mode,
-                    access_mode: state.access_mode,
                     permission_mode: state.permission_mode.clone(),
                     startup_mcp_config_json: state.startup_mcp_config_json.clone(),
                     steering_content: state.steering_content.clone(),
@@ -4368,7 +4344,6 @@ impl ClaudeInner {
             None => serde_json::Map::new(),
         };
         let startup_mcp_names = startup_mcp_servers.keys().cloned().collect::<HashSet<_>>();
-        let enforced_read_only = config.access_mode == BackendAccessMode::EnforcedReadOnly;
         let spawned = tokio::select! {
             biased;
             _ = self.process_start_cancellation.cancelled() => {
@@ -4451,11 +4426,7 @@ impl ClaudeInner {
                 }
                 self.configure_capacity_from_initialize(&response).await;
                 self.schedule_capacity_refresh().await;
-                let mcp_ready = if enforced_read_only {
-                    // Safe mode suppresses even --mcp-config. Register only the
-                    // host-owned servers after initialization, before any turn.
-                    self.configure_restricted_mcp(startup_mcp_servers).await
-                } else if !startup_mcp_names.is_empty() {
+                let mcp_ready = if !startup_mcp_names.is_empty() {
                     self.await_startup_mcp_ready(&startup_mcp_names, process_generation)
                         .await
                 } else {
@@ -4478,107 +4449,6 @@ impl ClaudeInner {
             }
         }
 
-        Ok(())
-    }
-
-    async fn configure_restricted_mcp(
-        &self,
-        mut servers: serde_json::Map<String, Value>,
-    ) -> Result<(), String> {
-        let configured_server_count = servers.len();
-        servers.retain(|name, _| {
-            matches!(
-                name.as_str(),
-                crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME
-                    | crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME
-            )
-        });
-        tracing::info!(
-            excluded_server_count = configured_server_count - servers.len(),
-            "Excluding MCP servers outside Claude's enforced read-only allowance"
-        );
-        let expected = servers.keys().cloned().collect::<HashSet<_>>();
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let response = self
-            .send_control_request_value(
-                request_id.clone(),
-                json!({
-                    "type": "control_request",
-                    "request_id": request_id,
-                    "request": {"subtype": "mcp_set_servers", "servers": servers},
-                }),
-                None,
-            )
-            .await?;
-        let added = response
-            .get("added")
-            .and_then(Value::as_array)
-            .and_then(|names| {
-                names
-                    .iter()
-                    .map(Value::as_str)
-                    .collect::<Option<HashSet<_>>>()
-            })
-            .ok_or_else(|| {
-                "Claude omitted restricted MCP registration acknowledgement".to_owned()
-            })?;
-        let errors = response
-            .get("errors")
-            .and_then(Value::as_object)
-            .ok_or_else(|| "Claude omitted restricted MCP registration errors".to_owned())?;
-        let removed = response
-            .get("removed")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Claude omitted restricted MCP removal acknowledgement".to_owned())?;
-        if !errors.is_empty()
-            || !removed.is_empty()
-            || added != expected.iter().map(String::as_str).collect::<HashSet<_>>()
-        {
-            return Err("Claude failed to register the exact restricted MCP server set".to_owned());
-        }
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let status = self
-            .send_control_request_value(
-                request_id.clone(),
-                json!({"type": "control_request", "request_id": request_id,
-                    "request": {"subtype": "mcp_status"}}),
-                None,
-            )
-            .await?;
-        let observed = status
-            .get("mcpServers")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Claude omitted restricted MCP connection state".to_owned())?;
-        if observed.len() != expected.len() {
-            return Err("Claude reported a different restricted MCP server set".to_owned());
-        }
-        for name in &expected {
-            let server = observed
-                .iter()
-                .find(|server| server.get("name").and_then(Value::as_str) == Some(name))
-                .ok_or_else(|| "Claude omitted a restricted MCP server".to_owned())?;
-            match server.get("status").and_then(Value::as_str) {
-                Some("connected") => {}
-                Some("needs-auth") => {
-                    return Err("Claude review MCP server requires authorization".to_owned());
-                }
-                Some("failed" | "disabled") => {
-                    return Err(
-                        "Claude review MCP server connection failed or was disabled".to_owned()
-                    );
-                }
-                _ => {
-                    return Err(
-                        "Claude completed MCP registration without confirming a settled connection"
-                            .to_owned(),
-                    );
-                }
-            }
-        }
-        tracing::info!(
-            server_count = added.len(),
-            "Connected isolated Claude review MCP servers"
-        );
         Ok(())
     }
 
@@ -4892,8 +4762,7 @@ impl ClaudeInner {
                 if state.process_generation != process_generation || state.closing {
                     return Ok(());
                 }
-                let verification_required = state.access_mode == BackendAccessMode::EnforcedReadOnly
-                    || !state.excluded_tool_categories.is_empty();
+                let verification_required = !state.excluded_tool_categories.is_empty();
                 let Some(reported) = reported else {
                     if state.native_tool_catalog.is_none()
                         && state.resume_bootstrap.is_none()
@@ -4941,30 +4810,6 @@ impl ClaudeInner {
                         && state.excluded_tool_categories.contains(&category)
                     {
                         return Err("Claude advertised an excluded native tool category".to_owned());
-                    }
-                    if state.access_mode == BackendAccessMode::EnforcedReadOnly
-                        && !REVIEW_FEEDBACK_TOOLS.contains(&tool.name.as_str())
-                        && !matches!(
-                            tool.name.as_str(),
-                            "Read"
-                                | "Glob"
-                                | "Grep"
-                                | "AskUserQuestion"
-                                | "ExitPlanMode"
-                                | "mcp__tyde-agent-control__tyde_swarm_describe"
-                                | "mcp__tyde-agent-control__tyde_swarm_list_threads"
-                                | "mcp__tyde-agent-control__tyde_swarm_read_summary"
-                                | "mcp__tyde-agent-control__tyde_swarm_read_deltas"
-                                | "mcp__tyde-agent-control__tyde_swarm_create_thread"
-                                | "mcp__tyde-agent-control__tyde_swarm_update_thread"
-                                | "mcp__tyde-agent-control__tyde_swarm_read_board"
-                                | "mcp__tyde-agent-control__tyde_swarm_read_thread"
-                                | "mcp__tyde-agent-control__tyde_swarm_read_image"
-                        )
-                    {
-                        return Err(
-                            "Claude advertised a tool outside its enforced read-only allowance".to_owned(),
-                        );
                     }
                 }
                 tracing::info!(
@@ -7045,15 +6890,10 @@ async fn claude_supports_plugin_dir() -> Result<bool, String> {
 }
 
 fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String>, String> {
-    let enforced_read_only = config.access_mode == BackendAccessMode::EnforcedReadOnly;
-    let effective_permission_mode = if enforced_read_only {
-        "dontAsk"
-    } else {
-        config
-            .permission_mode
-            .as_deref()
-            .unwrap_or(CLAUDE_DEFAULT_PERMISSION_MODE)
-    };
+    let effective_permission_mode = config
+        .permission_mode
+        .as_deref()
+        .unwrap_or(CLAUDE_DEFAULT_PERMISSION_MODE);
     let mut cli_args: Vec<String> = vec![
         "--print".to_string(),
         "--verbose".to_string(),
@@ -7089,30 +6929,6 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String
     }
 
     let mut cli_settings = serde_json::Map::new();
-    if enforced_read_only {
-        cli_args.extend([
-            "--tools".to_owned(),
-            "Read,Glob,Grep,AskUserQuestion,ExitPlanMode".to_owned(),
-            // Keep the user's native auth/provider/model settings, not
-            // executable customization. Safe mode still runs credential
-            // helpers, so workspace-controlled project/local settings stay
-            // excluded. --bare would also discard OAuth/keychain auth.
-            "--safe-mode".to_owned(),
-            "--setting-sources".to_owned(),
-            "user".to_owned(),
-            "--disable-slash-commands".to_owned(),
-            "--no-chrome".to_owned(),
-            "--strict-mcp-config".to_owned(),
-            "--allowedTools".to_owned(),
-            format!(
-                "Read,Glob,Grep,mcp__tyde-agent-control__*,{}",
-                REVIEW_FEEDBACK_TOOLS.join(",")
-            ),
-        ]);
-        // Disables user hooks only. Administrator-managed policy hooks still
-        // run by Claude's contract; Tyde does not override organization policy.
-        cli_settings.insert("disableAllHooks".to_owned(), json!(true));
-    }
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
         cli_args.push("--model".to_string());
         cli_args.push(model_name.clone());
@@ -7140,11 +6956,10 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Result<Vec<String
         cli_args.push(effort_level.as_str().to_string());
     }
 
-    if !enforced_read_only
-        && let Some(mcp_config_json) = config
-            .startup_mcp_config_json
-            .as_deref()
-            .and_then(normalize_nonempty)
+    if let Some(mcp_config_json) = config
+        .startup_mcp_config_json
+        .as_deref()
+        .and_then(normalize_nonempty)
     {
         cli_args.push("--mcp-config".to_string());
         cli_args.push(mcp_config_json);
@@ -7857,7 +7672,7 @@ async fn read_claude_stdout_persistent(
         if handle_ask_user_question_control_request(&value, &inner, &mut turn_state, &stdin).await {
             continue;
         }
-        if respond_to_control_request(&value, &stdin, &inner).await {
+        if respond_to_control_request(&value, &stdin).await {
             continue;
         }
 
@@ -8578,13 +8393,8 @@ async fn handle_exit_plan_mode_control_request(
     true
 }
 
-async fn respond_to_control_request(
-    value: &Value,
-    stdin: &ClaudeStdinWriter,
-    inner: &Arc<ClaudeInner>,
-) -> bool {
-    let access_mode = inner.state.with(|state| state.access_mode).await;
-    let Some(payload) = control_response_payload_for_request(value, access_mode) else {
+async fn respond_to_control_request(value: &Value, stdin: &ClaudeStdinWriter) -> bool {
+    let Some(payload) = control_response_payload_for_request(value) else {
         return false;
     };
     if payload.is_null() {
@@ -8795,10 +8605,7 @@ fn ensure_exit_plan_mode_tool_request_emitted(
     tool_call
 }
 
-fn control_response_payload_for_request(
-    value: &Value,
-    access_mode: BackendAccessMode,
-) -> Option<Value> {
+fn control_response_payload_for_request(value: &Value) -> Option<Value> {
     if value.get("type").and_then(Value::as_str) != Some("control_request") {
         return None;
     }
@@ -8820,30 +8627,6 @@ fn control_response_payload_for_request(
 
     let response = if is_tool_permission_subtype(subtype) {
         let tool_name = control_request_tool_name(value, request).unwrap_or_default();
-        if access_mode == BackendAccessMode::EnforcedReadOnly
-            && !REVIEW_FEEDBACK_TOOLS.contains(&tool_name)
-            && !matches!(
-                tool_name,
-                "Read" | "Glob" | "Grep" | "AskUserQuestion" | "ExitPlanMode"
-            )
-            && !matches!(
-                tool_name,
-                "mcp__tyde-agent-control__tyde_swarm_describe"
-                    | "mcp__tyde-agent-control__tyde_swarm_list_threads"
-                    | "mcp__tyde-agent-control__tyde_swarm_read_summary"
-                    | "mcp__tyde-agent-control__tyde_swarm_read_deltas"
-                    | "mcp__tyde-agent-control__tyde_swarm_create_thread"
-                    | "mcp__tyde-agent-control__tyde_swarm_update_thread"
-                    | "mcp__tyde-agent-control__tyde_swarm_read_board"
-                    | "mcp__tyde-agent-control__tyde_swarm_read_thread"
-                    | "mcp__tyde-agent-control__tyde_swarm_read_image"
-            )
-        {
-            return Some(tool_permission_control_response_payload(
-                &request_id,
-                json!({"behavior": "deny", "message": "Tool unavailable under enforced read-only access."}),
-            ));
-        }
         if claude_is_ask_user_question_tool_name(tool_name) {
             return Some(tool_permission_control_response_payload(
                 &request_id,
@@ -16112,15 +15895,6 @@ use super::{
 
 type ClaudeReadyTx = Option<oneshot::Sender<Result<(), String>>>;
 
-fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'static str {
-    match access_mode {
-        BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
-            CLAUDE_DEFAULT_PERMISSION_MODE
-        }
-        BackendAccessMode::EnforcedReadOnly => "dontAsk",
-    }
-}
-
 /// Minimal Backend-trait handle for the Claude CLI.
 ///
 /// Holds an `mpsc::UnboundedSender<AgentInput>` that the spawned task reads from;
@@ -16148,11 +15922,6 @@ impl ClaudeBackend {
         fork_from_session_id: Option<SessionId>,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly
-            && !config.resolved_spawn_config.skills.is_empty()
-        {
-            return Err("Claude enforced read-only sessions cannot load selected skills in native safe mode".to_owned());
-        }
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
@@ -16207,7 +15976,6 @@ impl ClaudeBackend {
                         steering_content: steering_content.as_deref(),
                         agent_identity: agent_identity.as_ref(),
                         tool_policy: config.resolved_spawn_config.tool_policy.clone(),
-                        access_mode: config.resolved_spawn_config.access_mode,
                         // A fork is a new CLI process, so it needs its own
                         // handle on the same root the session materialized.
                         skills,
@@ -16222,7 +15990,6 @@ impl ClaudeBackend {
                     steering_content.as_deref(),
                     agent_identity.as_ref(),
                     config.resolved_spawn_config.tool_policy.clone(),
-                    config.resolved_spawn_config.access_mode,
                     skills,
                 )
                 .await
@@ -16268,9 +16035,7 @@ impl ClaudeBackend {
                 let mut settings = json!({
                     "model": model_override,
                     "effort": effort_override,
-                    "permission_mode": claude_permission_mode_for_access_mode(
-                        config.resolved_spawn_config.access_mode,
-                    ),
+                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
                 });
                 if resolved_settings.0.contains_key("speed") {
                     settings["speed"] =
@@ -16293,27 +16058,6 @@ impl ClaudeBackend {
 
             if let Some(emitter) = initial_emitter {
                 session.set_subagent_emitter(emitter).await;
-            }
-
-            // The CLI emits session-bearing frames before initialization, so a
-            // reviewer whose mandatory MCP set fails verification would
-            // otherwise report ready. Verify before admitting a turn, as
-            // resume does.
-            if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly {
-                let verified = tokio::select! {
-                    biased;
-                    _ = &mut startup_cancel_rx => {
-                        session.shutdown().await;
-                        return;
-                    }
-                    verified = session.inner.ensure_process_ready() => verified,
-                };
-                if let Err(err) = verified {
-                    let _ =
-                        ready_tx.send(Err(format!("Failed to initialize Claude session: {err}")));
-                    session.shutdown().await;
-                    return;
-                }
             }
 
             // The forward task is the sole owner of the readiness reply; an
@@ -16545,10 +16289,7 @@ fn claude_steering_content(
     skills: ClaudeSkillSteering,
 ) -> Result<Option<String>, String> {
     let mut sections = Vec::new();
-    if matches!(
-        config.resolved_spawn_config.access_mode,
-        BackendAccessMode::ReadOnly | BackendAccessMode::EnforcedReadOnly
-    ) {
+    if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if !config
@@ -17239,7 +16980,6 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
             tyde_agent_adapter::BackendCapability::ExcludeAgentDelegation,
-            tyde_agent_adapter::BackendCapability::EnforcedReadOnly,
             tyde_agent_adapter::BackendCapability::ForegroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
@@ -17289,7 +17029,6 @@ impl Backend for ClaudeBackend {
             None,
             None,
             ToolPolicy::Unrestricted,
-            BackendAccessMode::ReadOnly,
         )
         .await?;
         drop(events);
@@ -17331,11 +17070,6 @@ impl Backend for ClaudeBackend {
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
-        if config.resolved_spawn_config.access_mode == BackendAccessMode::EnforcedReadOnly
-            && !config.resolved_spawn_config.skills.is_empty()
-        {
-            return Err("Claude enforced read-only sessions cannot load selected skills in native safe mode".to_owned());
-        }
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
@@ -17359,7 +17093,6 @@ impl Backend for ClaudeBackend {
             steering_content.as_deref(),
             agent_identity.as_ref(),
             config.resolved_spawn_config.tool_policy.clone(),
-            config.resolved_spawn_config.access_mode,
             skills,
         )
         .await
@@ -17399,9 +17132,7 @@ impl Backend for ClaudeBackend {
             let mut settings = json!({
                 "model": model_override,
                 "effort": effort_override,
-                "permission_mode": claude_permission_mode_for_access_mode(
-                    config.resolved_spawn_config.access_mode,
-                ),
+                "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
             });
             if resolved_settings.0.contains_key("speed") {
                 settings["speed"] = session_settings_to_json(&resolved_settings)["speed"].clone();

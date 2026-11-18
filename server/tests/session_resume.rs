@@ -5678,7 +5678,7 @@ async fn session_sqlite_import_preserves_json_and_survives_restart() {
     })
     .await;
 
-    let sessions = r#"{"write_seq":9,"records":{"imported":{"id":"imported","backend_kind":"claude","workspace_roots":["/tmp/test"],"alias":"Imported conversation","user_alias":"My saved name","created_at_ms":1,"updated_at_ms":2,"message_count":7,"token_count":123,"access_mode":"read_only","queued_messages":[],"future_metadata":{"preserve":true}}}}"#;
+    let sessions = r#"{"write_seq":9,"records":{"imported":{"id":"imported","backend_kind":"claude","workspace_roots":["/tmp/test"],"alias":"Imported conversation","user_alias":"My saved name","created_at_ms":1,"updated_at_ms":2,"message_count":7,"token_count":123,"access_mode":"enforced_read_only","queued_messages":[],"future_metadata":{"preserve":true}}}}"#;
     let tasks = r#"{"records":{"imported":{"title":"Saved tasks","tasks":[{"id":1,"description":"Keep this task","status":"pending"}]}}}"#;
     let sessions = sessions.replace("imported", &session_id.0);
     let tasks = tasks.replace("imported", &session_id.0);
@@ -5745,6 +5745,25 @@ async fn session_sqlite_import_preserves_json_and_survives_restart() {
     assert!(
         matches!(task_event, ChatEvent::TaskUpdate(list) if list.title == "Saved tasks" && list.tasks.len() == 1 && list.tasks[0].description == "Keep this task"),
         "resume must expose imported tasks"
+    );
+
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "after migration".to_owned())
+        .await
+        .expect("send to the migrated session");
+    let turn = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "migrated advisory read-only turn",
+        |event| {
+            matches!(event, ChatEvent::StreamEnd(end) if end.message.content.contains("after migration"))
+        },
+    )
+    .await;
+    assert!(
+        matches!(turn, ChatEvent::StreamEnd(end) if end.message.content.contains("[access_mode: ReadOnly]")),
+        "the migrated session must resume with advisory read-only access"
     );
 
     fixture

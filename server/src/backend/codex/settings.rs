@@ -325,16 +325,9 @@ fn user_layer(response: &Value) -> Result<&Value, String> {
 }
 
 async fn open_config() -> Result<CodexRpc, String> {
-    let (rpc, _) = CodexRpc::spawn_with_local_program(
-        None,
-        &[],
-        None,
-        BackendAccessMode::Unrestricted,
-        BackendExecutionMode::Agent,
-        None,
-        &[],
-    )
-    .await?;
+    let (rpc, _) =
+        CodexRpc::spawn_with_local_program(None, &[], None, BackendExecutionMode::Agent, None, &[])
+            .await?;
     let initialized = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, rpc.request("initialize", json!({
         "clientInfo":{"name":"tyde-settings","version":"1"}, "capabilities":{"experimentalApi":true}
     }))).await.map_err(|_| "Codex settings initialization timed out".to_owned()).and_then(|result| result);

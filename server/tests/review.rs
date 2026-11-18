@@ -1197,12 +1197,20 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         "reviewer has no agent control: {response}"
     );
     assert!(
-        response.contains("[access_mode: EnforcedReadOnly]"),
+        response.contains("[access_mode: ReadOnly]"),
         "reviewer lost read-only mode: {response}"
     );
     assert!(
         !response.contains("[tool_policy:"),
-        "reviewer lost tool restrictions: {response}"
+        "reviewer unexpectedly restricted native tools: {response}"
+    );
+    assert!(
+        !response.contains("[excluded_tool_categories:"),
+        "reviewer unexpectedly excluded native tool categories: {response}"
+    );
+    assert!(
+        response.contains("Do not edit files"),
+        "missing review instructions"
     );
     client
         .send_message(

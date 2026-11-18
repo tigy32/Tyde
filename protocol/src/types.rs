@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 99;
+pub const PROTOCOL_VERSION: u32 = 100;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -772,8 +772,6 @@ pub enum BackendAccessMode {
     /// This does not reduce backend permissions, remove tools, or reject MCP
     /// operations.
     ReadOnly,
-    /// Enforces provider-side removal or sandbox denial of filesystem writes.
-    EnforcedReadOnly,
 }
 
 /// Provenance of a live agent — who created it.

@@ -4,6 +4,16 @@ The backend conformance suite is `tests/tests/conformance2.rs`. Its harness call
 
 The 31 scenarios below retain the original scenario names. Native-provider configuration and filesystem regressions also retain their original provider-specific oracles. Capability exclusions come from backend declarations; they are not passing backend runs.
 
+## Advisory review access
+
+Tyde no longer supplies an enforced read-only mode. Its reviewers and read-only
+swarm members get guidance, not a reconstructed provider permissions policy.
+The retired enforced-write-denial and restricted-review cases below are
+historical evidence. The current suites cover reviewer assignment and prompt
+delivery, native fork context, native MCP success/failure, and exact native web
+search across advisory fresh/fork/resume. Hidden inference utilities retain
+their separate execution mode.
+
 ## Migration coverage
 
 Passing real runs recorded on 2026-09-09; `real_slash_commands` was recorded on 2026-09-14 (Claude, Codex, Antigravity) and 2026-09-15 (Kiro, Grok, OpenCode, Hermes); `real_mid_turn_steering` was recorded on 2026-09-20. A dash means the backend does not declare the case’s required capabilities or native skill delivery. The existing Codex configuration case applies only to Codex.

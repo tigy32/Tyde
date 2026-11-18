@@ -8,13 +8,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, CapacityBucket, CapacityBucketId, CapacityCoverage,
-    CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
-    CapacityUnavailableReason, CapacityWindow, ChatEvent, MessageTokenUsage, ModelInfo,
-    ModelRequestId, ModelRequestTokenUsage, ModelTurnId, SelectOption, SessionId,
-    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SessionSettingsValues, SpawnCostHint, ToolExecutionOutcome, ToolExecutionResult,
-    ToolRequestType, ToolUseData, ValueProvenance,
+    AgentInput, BackendKind, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
+    CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
+    CapacityWindow, ChatEvent, MessageTokenUsage, ModelInfo, ModelRequestId,
+    ModelRequestTokenUsage, ModelTurnId, SelectOption, SessionId, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    SpawnCostHint, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType, ToolUseData,
+    ValueProvenance,
 };
 use serde_json::{Map, Value, json, to_value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -163,7 +163,6 @@ struct AgyLaunch {
     workspace_roots: Vec<String>,
     primary_root: String,
     extra_roots: Vec<String>,
-    access_mode: BackendAccessMode,
     model: String,
     /// `(name, value)` naming this session's bridge descriptor, applied to
     /// every `agy` process this session starts — including the ones a restart
@@ -310,14 +309,7 @@ impl AgyLaunch {
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
-        match self.access_mode {
-            // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
-            // must use the non-sandbox path to let build/test commands write target/.
-            BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
-                args.push("--dangerously-skip-permissions".to_string())
-            }
-            BackendAccessMode::EnforcedReadOnly => {}
-        }
+        args.push("--dangerously-skip-permissions".to_string());
         args.push("--model".to_string());
         args.push(self.model.clone());
         if let Some(conversation_id) = conversation_id {
@@ -356,9 +348,6 @@ impl AgyProcess {
         resume: Option<&str>,
         emitter: Arc<TurnEmitter>,
     ) -> Result<Self, String> {
-        if launch.access_mode == BackendAccessMode::EnforcedReadOnly {
-            return Err("Antigravity cannot enforce read-only workspace access".into());
-        }
         let mut command = crate::backend::subprocess::command("agy")?;
         command.args(launch.args(resume)?);
         if let Some((name, value)) = launch.bridge_env.as_ref() {
@@ -3635,7 +3624,6 @@ impl AntigravityBackend {
             workspace_roots,
             primary_root,
             extra_roots,
-            access_mode: config.resolved_spawn_config.access_mode,
             model: model.clone(),
             bridge_env: bridge.as_ref().map(AntigravityMcpBridge::env),
         };

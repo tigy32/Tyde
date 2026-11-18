@@ -159,22 +159,12 @@ pub(super) fn apply_swarm_spawn_policy(
             "Backend cannot enforce native delegation exclusion",
         ));
     }
-    if policy == SwarmWorkspacePolicy::ReadOnly
-        && !request.use_mock_backend
-        && !crate::backend::capabilities_for_backend_kind(request.backend_kind)
-            .contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly)
-    {
-        return Err(fail(
-            SwarmErrorCode::Unsupported,
-            "Backend cannot enforce read-only workspace access",
-        ));
-    }
     request
         .resolved_spawn_config
         .excluded_tool_categories
         .push(protocol::ToolCategory::AgentDelegation);
     request.resolved_spawn_config.access_mode = match policy {
-        SwarmWorkspacePolicy::ReadOnly => protocol::BackendAccessMode::EnforcedReadOnly,
+        SwarmWorkspacePolicy::ReadOnly => protocol::BackendAccessMode::ReadOnly,
         SwarmWorkspacePolicy::SharedWorkbench {
             writable_consent: true,
         }
@@ -964,16 +954,6 @@ Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(PrivateAdmission::Admitted
             ));
         }
         for allocation in &constraints.allocations {
-            if constraints.workspace_policy == SwarmWorkspacePolicy::ReadOnly
-                && !mock
-                && !crate::backend::capabilities_for_backend_kind(allocation.backend_kind)
-                    .contains(tyde_agent_adapter::BackendCapability::EnforcedReadOnly)
-            {
-                return Err(fail(
-                    SwarmErrorCode::Unsupported,
-                    "Selected backend cannot enforce read-only workspace access",
-                ));
-            }
             if !mock
                 && !crate::backend::capabilities_for_backend_kind(allocation.backend_kind)
                     .contains(tyde_agent_adapter::BackendCapability::ExcludeAgentDelegation)
@@ -2020,9 +2000,7 @@ Ok::<_, SwarmFailure>(std::ops::ControlFlow::Continue(()))
                     launch_profile_id: Some(batch.member.spec.launch_profile_id.clone()),
                     cost_hint: None,
                     access_mode: match batch.constraints.workspace_policy {
-                        SwarmWorkspacePolicy::ReadOnly => {
-                            protocol::BackendAccessMode::EnforcedReadOnly
-                        }
+                        SwarmWorkspacePolicy::ReadOnly => protocol::BackendAccessMode::ReadOnly,
                         SwarmWorkspacePolicy::SharedWorkbench { .. }
                         | SwarmWorkspacePolicy::SharedProject { .. }
                         | SwarmWorkspacePolicy::SharedHost { .. } => {

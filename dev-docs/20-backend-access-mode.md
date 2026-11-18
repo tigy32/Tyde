@@ -1,10 +1,5 @@
 # Backend Access Mode
 
-`BackendAccessMode` is the protocol-level access contract for a session. It is
-separate from `ToolPolicy`, the backend-specific tool allowance. The existing
-`ReadOnly` mode remains advisory; `EnforcedReadOnly` is a distinct native
-restriction used by read-only swarms. The two must never be substituted.
-
 Advisory read-only mode is guidance only. Tyde advises the agent not to mutate source or
 external state, but it does not reduce sandbox permissions, remove tools, or
 reject MCP operations. A read-only agent has the same effective capabilities as
@@ -12,7 +7,7 @@ an unrestricted agent and is instructed not to use them for mutation.
 
 ## Protocol flow
 
-`protocol::BackendAccessMode` has three values:
+`protocol::BackendAccessMode` has two values:
 
 - `Unrestricted` (default): the backend may use its normal tools and CLI
   permissions.
@@ -22,10 +17,6 @@ an unrestricted agent and is instructed not to use them for mutation.
   intentionally create, edit, or delete source files, use write/edit/apply-patch
   tools for source mutation, run destructive git commands, or modify external
   state.
-- `EnforcedReadOnly`: require backend-native filesystem/tool restrictions.
-  The host rejects a backend that does not declare this capability. Adding an
-  advisory or hiding a UI action is not enforcement.
-
 The value is carried on `SpawnAgentParams::New` from the frontend or
 agent-control MCP bridge into `HostHandle::spawn_agent`. The host resolves the
 normal `ResolvedSpawnConfig`, copies the requested `access_mode` into that
@@ -34,7 +25,7 @@ Built-in spawns that already construct a `ResolvedSpawnConfig` directly, such as
 the AI reviewer, set the field explicitly.
 
 Ordinary resume controls do not accept a new access mode. The server reapplies
-the resolved policy at the native lifecycle boundary. Swarm recovery and
+the advisory at the native lifecycle boundary. Swarm recovery and
 reviewed legacy conversion retain membership ownership and reapply the swarm's
 workspace policy before admitting work; unrestricted native history must not
 silently override that policy.
@@ -64,25 +55,6 @@ unrestricted mode. The advisory is its only access-mode difference.
 Independent authorization, ownership, and `ToolPolicy` checks still apply; they
 are not read-only enforcement.
 
-### Enforced read-only swarms
-
-Read-only swarm admission requires both native enforced-read-only support and
-native agent-delegation exclusion. Claude and Codex implement those contracts;
-other backends fail admission rather than receiving a weaker substitute.
-
-- Claude restricts the native tool catalog, withholds shell and file-mutation
-  tools, and rejects other tool permissions. Native safe mode with user
-  settings only keeps the user's auth, provider and model settings but
-  disables user hooks, ambient MCP servers, skills and other executable
-  customization. Workspace project and local settings, including their
-  credential helpers, are not loaded. Administrator-managed policy, including
-  its hooks, still applies by Claude's contract; Tyde does not bypass
-  organization policy.
-- Codex applies its native read-only sandbox and approval policy at process,
-  start, fork, resume, and turn boundaries. Code-execution kernels and native
-  delegation remain disabled; supported native read tools are exposed directly
-  rather than through a disabled wrapper. Native web search remains available;
-  filesystem read-only access is not a promise of network isolation.
 - Read-only and single-workbench members receive the four authenticated board
   tools, not the user's other configured MCP servers. Writable project and
   host members additionally receive scoped workbench listing, creation, and
@@ -93,8 +65,7 @@ other backends fail admission rather than receiving a weaker substitute.
   a selected Git workbench, a parent project and all its workbenches, or every
   project and workbench on the selected host. The selected project is the
   starting working directory for host scope, not its permission boundary.
-  These policies are separate from enforced read-only, not a relaxation of an
-  active read-only session. Existing sessions cannot change workspace policy.
+  Existing sessions cannot change workspace policy.
 - The server resolves project membership and workspace roots from the current
   project registry at launch and resume. `tyde_swarm_describe` returns typed
   `workspace_projects` from that same registry on every call. Project scope
@@ -120,8 +91,6 @@ no card for a command rejected before it starts, or for raw-only polling.
 Tyde accepts these upstream limitations: it reconstructs nothing and shows no
 warning. Native web-search completion items do carry the actual query after
 rejoin; Tyde projects that query directly into the search card.
-Protected Resume and Fork use the same rejoin path as unrestricted sessions;
-the native sandbox alone enforces read-only.
 
 Shared board posts remain live server events and are never copied from private
 final messages.
@@ -135,8 +104,6 @@ Claude read-only uses unrestricted permissions plus the shared advisory:
 - `BackendAccessMode::ReadOnly` maps to `--permission-mode bypassPermissions`,
   exactly like unrestricted mode.
 - Tyde appends the shared read-only advisory to Claude's system prompt.
-- The existing reviewer `ToolPolicy::AllowList` is still translated to Claude's
-  `--allowedTools` flags.
 
 Claude `plan` mode is not used for Tyde read-only because access mode must not
 change actual capabilities.
@@ -152,11 +119,6 @@ sandbox knob:
 Tyde keeps the forced approval policy and prepends the shared read-only
 advisory. The advisory is the only difference from unrestricted mode.
 
-### Tycode
-
-Tycode receives the shared advisory through its projected steering file. It
-keeps the same root-agent selection, native tools, and configured MCP tools as
-an unrestricted session.
 
 ### ACP
 
@@ -197,11 +159,7 @@ in mock summaries. Tests can assert that read-only mode reached the backend.
 
 ## AI reviewer
 
-The AI reviewer sets:
-
-- `access_mode: BackendAccessMode::ReadOnly`
-- the existing reviewer `ToolPolicy::AllowList`
-
-The server does not reject non-Claude reviewer backends. Any enabled backend may
-be selected; the backend adds the read-only advisory. The reviewer's separate
-`ToolPolicy::AllowList` remains independently enforced where supported.
+Reviewers use `BackendAccessMode::ReadOnly` and receive the review system
+prompt and the review-feedback MCP server. Tyde does not restrict their native
+tools, sandbox, or approvals. On load, the session store maps the retired
+`enforced_read_only` value to `read_only` for existing sessions.

@@ -4263,7 +4263,6 @@ async fn spawn_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
 ) -> BackendSpawnResult {
-    B::validate_access_mode(config.resolved_spawn_config.access_mode)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::spawn(workspace_roots, config, initial_input).await?;
     let session_id = Backend::session_id(&backend);
@@ -4292,7 +4291,6 @@ async fn resume_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     session_id: SessionId,
 ) -> BackendResumeResult {
-    B::validate_access_mode(config.resolved_spawn_config.access_mode)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::resume(workspace_roots, config, session_id).await?;
     Ok((Box::new(backend), events))
@@ -4330,8 +4328,6 @@ async fn fork_through_trait<B: Backend>(
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
 ) -> BackendForkResult {
-    B::validate_access_mode(config.resolved_spawn_config.access_mode)
-        .map_err(BackendStartupError::backend_failed)?;
     B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)
         .map_err(BackendStartupError::backend_failed)?;
     let (backend, events) =
