@@ -2335,7 +2335,7 @@ async fn managed_revocation_retains_credentials_until_authority_confirms() {
 }
 
 #[tokio::test]
-async fn managed_idle_listener_reuses_credentials_after_socket_close() {
+async fn managed_idle_listener_reconnects_closed_or_silent_signaling() {
     use axum::{
         Json, Router,
         extract::{State, WebSocketUpgrade},
@@ -2356,6 +2356,8 @@ async fn managed_idle_listener_reuses_credentials_after_socket_close() {
         url: String,
         mints: Arc<AtomicUsize>,
         sockets: mpsc::UnboundedSender<oneshot::Sender<()>>,
+        heartbeats: mpsc::UnboundedSender<(usize, String)>,
+        opened: Arc<AtomicUsize>,
     }
     async fn mint(
         State(state): State<Signaling>,
@@ -2400,20 +2402,45 @@ async fn managed_idle_listener_reuses_credentials_after_socket_close() {
                 .is_some_and(|value| value == "Bearer local-idle-token")
         );
         upgrade.on_upgrade(move |mut socket| async move {
-            let (close, closed) = oneshot::channel();
+            use axum::extract::ws::Message;
+            // Only the first service socket keeps its object leg alive.
+            let index = state.opened.fetch_add(1, Ordering::SeqCst);
+            let answers = index == 0;
+            let (close, mut closed) = oneshot::channel();
             state.sockets.send(close).unwrap();
-            closed.await.unwrap();
-            let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+            loop {
+                tokio::select! {
+                    _ = &mut closed => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                    frame = socket.recv() => match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            let _ = state.heartbeats.send((index, text.to_string()));
+                            if answers && text.as_str() == "tyde-signaling-heartbeat" {
+                                let _ = socket
+                                    .send(Message::Text("tyde-signaling-heartbeat-ack".into()))
+                                    .await;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+            }
         })
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let (sockets, mut connected) = mpsc::unbounded_channel();
+    let (heartbeats, mut heard) = mpsc::unbounded_channel();
     let mints = Arc::new(AtomicUsize::new(0));
     let state = Signaling {
         url: format!("{endpoint}/signal"),
         mints: mints.clone(),
         sockets,
+        heartbeats,
+        opened: Arc::new(AtomicUsize::new(0)),
     };
     let service = tokio::spawn(async move {
         axum::serve(
@@ -2452,6 +2479,7 @@ async fn managed_idle_listener_reuses_credentials_after_socket_close() {
         store.path().into(),
         server::HostRuntimeConfig {
             mobile_managed_service_base_url: Some(endpoint),
+            mobile_signaling_heartbeat: Some(std::time::Duration::from_secs(2)),
             ..Default::default()
         },
     )
@@ -2463,8 +2491,32 @@ async fn managed_idle_listener_reuses_credentials_after_socket_close() {
         .unwrap();
     let first = connected.recv().await.expect("initial host WebSocket");
     assert_eq!(mints.load(Ordering::SeqCst), 1);
-    first.send(()).unwrap();
-    let second = connected.recv().await.expect("host reconnects after close");
+    // A second heartbeat on the same socket proves the first ack was accepted.
+    for _ in 0..2 {
+        assert_eq!(
+            heard.recv().await,
+            Some((0, "tyde-signaling-heartbeat".to_owned())),
+            "an answered heartbeat keeps the signaling socket"
+        );
+    }
+    let _ = first.send(());
+    let _silent_close = connected.recv().await.expect("host reconnects after close");
+    // Edge pings can outlive the service object; only its heartbeat proves it.
+    let silent = loop {
+        let frame = heard.recv().await.expect("heartbeat frames");
+        if frame.0 != 0 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        silent,
+        (1, "tyde-signaling-heartbeat".to_owned()),
+        "host must heartbeat the signaling service"
+    );
+    let second = connected
+        .recv()
+        .await
+        .expect("host reconnects after an unanswered heartbeat");
     assert_eq!(
         mints.load(Ordering::SeqCst),
         1,
@@ -2481,6 +2533,6 @@ async fn managed_idle_listener_reuses_credentials_after_socket_close() {
         .replace_setting("/enable_mobile_connections", false, true)
         .await
         .unwrap();
-    second.send(()).unwrap();
+    let _ = second.send(());
     service.abort();
 }

@@ -243,6 +243,7 @@ pub(crate) struct MobileAccessInit {
     pub(crate) initial_settings: HostSettings,
     pub(crate) pairing_ttl: Duration,
     pub(crate) managed_service_base_url: Option<String>,
+    pub(crate) signaling_heartbeat: Duration,
     #[cfg(feature = "test-support")]
     pub(crate) bootstrap_http: Option<reqwest::Client>,
 }
@@ -641,6 +642,7 @@ impl Drop for MobilePairingsLease {
 struct ManagedMobileServiceClient {
     base: ManagedServiceBaseUrl,
     http: reqwest::Client,
+    signaling_heartbeat: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -847,7 +849,10 @@ impl ManagedMobileServiceClient {
         Ok(credentials)
     }
 
-    fn new(configured_base_url: Option<String>) -> Result<Self, String> {
+    fn new(
+        configured_base_url: Option<String>,
+        signaling_heartbeat: Duration,
+    ) -> Result<Self, String> {
         // `reqwest` uses no-provider rustls; ensure a default crypto provider is
         // installed before building the client or `Client::new` panics with
         // "No provider set". Idempotent, so binaries that already installed one
@@ -856,6 +861,7 @@ impl ManagedMobileServiceClient {
         Ok(Self {
             base: ManagedServiceBaseUrl::new(configured_base_url)?,
             http: reqwest::Client::new(),
+            signaling_heartbeat,
         })
     }
 
@@ -1332,7 +1338,10 @@ impl MobileAccessActor {
         if pairings.normalize_startup_runtime_state() {
             init.pairings_store.save(&pairings)?;
         }
-        let managed_service = ManagedMobileServiceClient::new(init.managed_service_base_url)?;
+        let managed_service = ManagedMobileServiceClient::new(
+            init.managed_service_base_url,
+            init.signaling_heartbeat,
+        )?;
         #[cfg(feature = "test-support")]
         let bootstrap_http = init.bootstrap_http;
         #[cfg(not(feature = "test-support"))]
@@ -4085,12 +4094,17 @@ async fn connect_mobile_device_stream(
         .as_ref()
         .ok_or_else(|| MobileTaskError::transport("missing host RTC credentials"))?
         .clone();
-    rtc_transport::connect(credentials, record.psk.as_bytes(), |_| {})
-        .await
-        .map(|stream| Box::new(stream) as BoxedMobileTransport)
-        .map_err(|error| {
-            MobileTaskError::transport(format!("managed WebRTC transport failed: {error}"))
-        })
+    rtc_transport::connect_with_signaling_heartbeat(
+        credentials,
+        record.psk.as_bytes(),
+        |_| {},
+        managed_service.signaling_heartbeat,
+    )
+    .await
+    .map(|stream| Box::new(stream) as BoxedMobileTransport)
+    .map_err(|error| {
+        MobileTaskError::transport(format!("managed WebRTC transport failed: {error}"))
+    })
 }
 
 async fn bridge_authenticated_mobile(

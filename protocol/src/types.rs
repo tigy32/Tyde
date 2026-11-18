@@ -55,7 +55,7 @@ pub mod mobile_rtc {
     rtc_identifier!(MobileSignalingUrl);
     rtc_identifier!(MobileTurnUrl);
 
-    pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 2;
+    pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 3;
     pub const MOBILE_RTC_CHANNEL_LABEL: &str = "tyde.v1";
     pub const MOBILE_RTC_CHANNEL_ID: u16 = 0;
 

@@ -10,14 +10,40 @@ use crate::{
 
 use tyde_time::timeout;
 
+/// The service answers this exact frame beside its signaling object. Edge
+/// protocol pings can keep succeeding after the edge-to-object leg dies.
+pub const SIGNALING_HEARTBEAT: &str = "tyde-signaling-heartbeat";
+pub const SIGNALING_HEARTBEAT_ACK: &str = "tyde-signaling-heartbeat-ack";
+pub const DEFAULT_SIGNALING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 pub async fn connect(
     credentials: MobileRtcCredentials,
     pairing_key: &[u8; 32],
     progress: impl FnMut(ConnectStage),
 ) -> Result<RtcStream, Error> {
-    connect_with(credentials, pairing_key, progress, |servers| async move {
-        Peer::new(&servers).await
-    })
+    connect_with_signaling_heartbeat(
+        credentials,
+        pairing_key,
+        progress,
+        DEFAULT_SIGNALING_HEARTBEAT_INTERVAL,
+    )
+    .await
+}
+
+/// A host listener fails when a heartbeat is unanswered by the next one.
+pub async fn connect_with_signaling_heartbeat(
+    credentials: MobileRtcCredentials,
+    pairing_key: &[u8; 32],
+    progress: impl FnMut(ConnectStage),
+    heartbeat: Duration,
+) -> Result<RtcStream, Error> {
+    connect_with(
+        credentials,
+        pairing_key,
+        progress,
+        heartbeat,
+        |servers| async move { Peer::new(&servers).await },
+    )
     .await
 }
 
@@ -28,9 +54,13 @@ pub async fn connect_with_tls_roots(
     progress: impl FnMut(ConnectStage),
     roots: tokio_rustls::rustls::RootCertStore,
 ) -> Result<RtcStream, Error> {
-    connect_with(credentials, pairing_key, progress, |servers| async move {
-        Peer::with_tls_roots(&servers, roots).await
-    })
+    connect_with(
+        credentials,
+        pairing_key,
+        progress,
+        DEFAULT_SIGNALING_HEARTBEAT_INTERVAL,
+        |servers| async move { Peer::with_tls_roots(&servers, roots).await },
+    )
     .await
 }
 
@@ -38,6 +68,7 @@ async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
     credentials: MobileRtcCredentials,
     pairing_key: &[u8; 32],
     mut progress: impl FnMut(ConnectStage),
+    heartbeat: Duration,
     new_peer: impl FnOnce(Vec<protocol::MobileIceServer>) -> F,
 ) -> Result<RtcStream, Error> {
     if credentials.protocol_version != MOBILE_RTC_PROTOCOL_VERSION {
@@ -130,7 +161,7 @@ async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
             }
             MobilePeerRole::Host => {
                 advance(ConnectStage::AwaitMobileOffer);
-                let mut socket = HostSocket::open(&signal.credentials).await?;
+                let mut socket = HostSocket::open(&signal.credentials, heartbeat).await?;
                 let description = require_description(socket.receive().await?)?;
                 let session_id = description.session_id.clone();
                 verify_description(&description, &session_id, MobileSdpKind::Offer, pairing_key)?;
@@ -215,12 +246,14 @@ struct HostSocket {
     socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-    ping: tokio::time::Interval,
+    heartbeat: tokio::time::Interval,
+    heartbeat_period: Duration,
+    awaiting_ack: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HostSocket {
-    async fn open(credentials: &MobileRtcCredentials) -> Result<Self, Error> {
+    async fn open(credentials: &MobileRtcCredentials, period: Duration) -> Result<Self, Error> {
         use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
         let mut url = url::Url::parse(credentials.signaling_url.as_str())
             .map_err(|error| failure("signaling URL", error))?;
@@ -248,13 +281,15 @@ impl HostSocket {
                 ),
                 error => failure("signaling socket", format!("WebSocket upgrade failed: {error}")),
             })?;
-        // Protocol pings do not invoke the service's billed application handler.
-        const PING_INTERVAL: Duration = Duration::from_secs(25);
-        let mut ping =
-            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::debug!("host signaling socket connected");
-        Ok(Self { socket, ping })
+        Ok(Self {
+            socket,
+            heartbeat,
+            heartbeat_period: period,
+            awaiting_ack: false,
+        })
     }
 
     async fn receive(&mut self) -> Result<MobileSignalEvent, Error> {
@@ -262,9 +297,12 @@ impl HostSocket {
         use tokio_tungstenite::tungstenite::Message;
         loop {
             tokio::select! {
-                _ = self.ping.tick() => self.socket.send(Message::Ping(Vec::new().into())).await
-                    .map_err(|_| failure("signaling socket", "ping failed"))?,
+                // A buffered acknowledgement must win over an overdue tick.
+                biased;
                 frame = self.socket.next() => match frame {
+                    Some(Ok(Message::Text(text))) if text.as_str() == SIGNALING_HEARTBEAT_ACK => {
+                        self.awaiting_ack = false;
+                    }
                     Some(Ok(Message::Text(text))) => return serde_json::from_str(&text)
                         .map_err(|error| failure("signaling socket response", error)),
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
@@ -273,6 +311,17 @@ impl HostSocket {
                     Some(Ok(Message::Close(_))) | None => return Err(failure("signaling socket", "connection closed")),
                     Some(Err(error)) => return Err(failure("signaling socket", format!("connection failed: {error}"))),
                     Some(Ok(_)) => return Err(failure("signaling socket", "expected JSON text frame")),
+                },
+                _ = self.heartbeat.tick() => {
+                    if self.awaiting_ack {
+                        return Err(failure(
+                            "signaling socket",
+                            format!("service heartbeat unanswered for {:?}", self.heartbeat_period),
+                        ));
+                    }
+                    self.socket.send(Message::Text(SIGNALING_HEARTBEAT.into())).await
+                        .map_err(|_| failure("signaling socket", "heartbeat send failed"))?;
+                    self.awaiting_ack = true;
                 }
             }
         }
@@ -303,7 +352,7 @@ struct HostSocket;
 
 #[cfg(target_arch = "wasm32")]
 impl HostSocket {
-    async fn open(_: &MobileRtcCredentials) -> Result<Self, Error> {
+    async fn open(_: &MobileRtcCredentials, _: Duration) -> Result<Self, Error> {
         Err(failure(
             "configuration",
             "browser cannot act as a signaling host",

@@ -16,7 +16,7 @@ callback bodies without a transport version increase.
 ## Connection establishment
 
 1. Pairing keeps its durable host/device secrets and the QR-shared pairing key.
-   New managed QR offers advertise WebRTC transport version 2. Existing stored
+   New managed QR offers advertise WebRTC transport version 3. Existing stored
    managed identities can connect after both applications and the service update.
 2. Each reconnect signs `POST /pairings/{id}/webrtc` with its role's pairing
    secret. Mobile also needs its current Tyggs Pass session cookie. The service
@@ -25,9 +25,13 @@ callback bodies without a transport version increase.
    reconnects, renewing only within 60 seconds of expiry. They are never persisted.
 3. Host opens the credentials' `signaling_url` as a WebSocket (HTTPS becomes
    WSS), with `Authorization: Bearer <signaling_token>` on the GET upgrade.
-   While idle it sends only WebSocket protocol pings every 25 seconds, not JSON
-   heartbeat requests. A new socket replaces the pairing's previous socket.
-   A close or transport error reaches the existing jittered accept-task backoff.
+   While idle it sends the text frame `tyde-signaling-heartbeat` every 15
+   seconds. The Durable Object runtime auto-answers `tyde-signaling-heartbeat-ack`
+   without waking the object. Cloudflare's edge can keep answering protocol
+   pings after its leg to the object dies, so an unanswered heartbeat at the
+   next interval fails the socket. A new socket replaces the pairing's previous
+   socket. A close, transport error or lost heartbeat reaches the existing
+   jittered accept-task backoff.
    The host allocates no TURN peer until an offer arrives.
 4. Mobile POSTs `MobileSignalCommand::Publish { description: offer }` with the
    same bearer authorization. The service holds that request until the host
@@ -341,12 +345,14 @@ host client release. Native bootstrap compares the descriptor's application
 protocol, transport protocol, artifact hash and native ABI to that manifest
 before loading it (`web/loader/native-bootstrap.js`, `loader.js`). The desktop
 also rejects a published descriptor with a different transport version. Both
-RTC peers reject credential protocol versions other than 2 before connecting;
-credential mint requests explicitly advertise version 2. A v1 grant must not
-be returned to a v2 request: these clients reject it rather than polling.
+RTC peers reject credential protocol versions other than 3 before connecting;
+credential mint requests explicitly advertise version 3. Version 3 is the v2
+push protocol plus the host heartbeat in step 3. A grant for another version
+must not be returned to a v3 request: these clients reject it.
 
-Deploy the matching service contract and publish a new immutable desktop/mobile
-release whose manifest advertises transport 2. Do not overwrite an old version's
+Deploy the matching service contract first (TydeMobileService 3def8a9 accepts
+versions 1, 2 and 3), then publish a new immutable desktop/mobile release whose
+manifest advertises transport 3. Do not overwrite an old version's
 mobile bundle. Existing pairings keep their secrets; no re-pairing is required,
 but each desktop needs its matching client bundle. Until that bundle is
 published, a new desktop fails publication compatibility explicitly. The service

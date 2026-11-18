@@ -25,9 +25,12 @@ mod browser;
 pub use browser::Peer;
 
 mod signaling;
-pub use signaling::connect;
 #[cfg(not(target_arch = "wasm32"))]
 pub use signaling::connect_with_tls_roots;
+pub use signaling::{
+    DEFAULT_SIGNALING_HEARTBEAT_INTERVAL, SIGNALING_HEARTBEAT, SIGNALING_HEARTBEAT_ACK, connect,
+    connect_with_signaling_heartbeat,
+};
 
 const WINDOW_CHUNKS: usize = 4;
 const CHUNK_BYTES: usize = 16 * 1024;

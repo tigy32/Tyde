@@ -498,6 +498,9 @@ async fn push_socket(fixture: PushSignaling, mut socket: axum::extract::ws::WebS
                 }
             },
             frame = socket.recv() => match frame {
+                Some(Ok(Message::Text(text))) if text.as_str() == rtc_transport::SIGNALING_HEARTBEAT => {
+                    if socket.send(Message::Text(rtc_transport::SIGNALING_HEARTBEAT_ACK.into())).await.is_err() { break; }
+                }
                 Some(Ok(Message::Text(text))) => {
                     let MobileSignalCommand::Publish { description } = serde_json::from_str(&text).expect("typed host answer");
                     assert_eq!(description.kind, MobileSdpKind::Answer);
