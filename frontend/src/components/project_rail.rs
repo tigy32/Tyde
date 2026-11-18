@@ -2827,6 +2827,20 @@ mod wasm_tests {
                 .contains("?? implementation.md"),
             "a dirty removal must not paint an app-wide notice"
         );
+        open_workbench_menu(&container, "Tyde2");
+        next_tick().await;
+        assert!(
+            !button(&container, "New Workbench").has_attribute("disabled"),
+            "an in-flight removal must leave creation available on the parent"
+        );
+        container
+            .query_selector(".rail-context-backdrop")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
         open_workbench_menu(&container, "feature-login");
         next_tick().await;
         button(&container, "Remove Workbench").click();
@@ -2837,8 +2851,8 @@ mod wasm_tests {
             .expect("dirty removal modal");
         assert_eq!(modal.get_attribute("role").as_deref(), Some("alertdialog"));
         assert!(
-            button(&container, "Delete Anyway").has_attribute("disabled"),
-            "inspection must not allow force removal while another family operation is running"
+            !button(&container, "Delete Anyway").has_attribute("disabled"),
+            "removal of a different workbench must not disable this action"
         );
         assert!(
             modal
@@ -2966,16 +2980,6 @@ mod wasm_tests {
             .dyn_into::<HtmlElement>()
             .unwrap()
             .click();
-        operation_event(
-            &state,
-            2,
-            "/project-operation/remove-other",
-            protocol::ProjectMutation::RemoveWorkbench(protocol::WorkbenchRemovePayload {
-                id: ProjectId("wb-fix".to_owned()),
-                force: false,
-            }),
-            protocol::ProjectOperationState::Committed { warnings: vec![] },
-        );
         next_tick().await;
         open_workbench_menu(&container, "feature-login");
         next_tick().await;

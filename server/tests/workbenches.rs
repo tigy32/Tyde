@@ -520,15 +520,20 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
     observer
         .workbench_create(WorkbenchCreatePayload {
             parent_project_id: parent.id.clone(),
-            branch: GitBranchName("conflicting-operation".into()),
-            name: "conflicting operation".into(),
+            branch: GitBranchName("feature-login".into()),
+            name: "Conflicting worktree path".into(),
         })
         .await
         .unwrap();
-    let conflict = expect_command_error(&mut observer, "held catalog family conflict").await;
+    let conflict = expect_command_error(&mut observer, "held worktree root conflict").await;
     assert_eq!(conflict.code, CommandErrorCode::Conflict);
     assert!(
-        matches!(conflict.context, Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, .. }) if parent_project_id == parent.id)
+        conflict
+            .message
+            .contains(&format!("Workbench {:?} is being removed", workbench.name))
+    );
+    assert!(
+        matches!(conflict.context, Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, branch }) if parent_project_id == parent.id && branch.0 == "feature-login")
     );
 
     let (mut reconnect, _) = fixture.connect_with_bootstrap().await;
@@ -3035,6 +3040,22 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
         BackendAccessMode::Unrestricted,
     )
     .await;
+    let entry_gate = MockGateHandle::new();
+    let entry_launch = fixture
+        .reserve_next_mock_launch(
+            "Sibling entrant",
+            MockScript::one(MockTurn::gated_text("Ready to enter", &entry_gate)),
+        )
+        .await;
+    let entrant = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "Sibling entrant",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    entry_gate.wait_until_entered().await;
+    drop(entry_launch);
     let workbench = create_workbench(&mut fixture.client, &parent, "feature/remove-spawn").await;
     let (author_agent, author_start) = fixture
         .spawn_with(SpawnAgentPayload {
@@ -3273,6 +3294,37 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
         .expect("send concurrent remove");
     (hook.wait_until_reached()).await;
 
+    let third_sibling =
+        create_workbench(&mut fixture.client, &parent, "feature/removal-in-flight").await;
+    assert!(expected_worktree_path(repo.path(), "feature-removal-in-flight").exists());
+    let (failed, _) = call_agent_control(
+        &fixture,
+        &entrant.agent_id,
+        "tyde_move_to_project",
+        json!({"project_id": third_sibling.id.0}),
+    )
+    .await;
+    assert!(!failed, "entry into the new sibling must schedule");
+    entry_gate.release_one();
+    fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "scheduled sibling entry while removal is held",
+        |env| {
+            if env.kind == FrameKind::AgentError && env.stream == entrant.instance_stream {
+                panic!("scheduled sibling entry failed while removal is held");
+            }
+            env.kind == FrameKind::AgentProjectChanged
+                && env.parse_payload::<AgentStartPayload>().is_ok_and(|start| {
+                    start.agent_id == entrant.agent_id
+                        && start.project_id.as_ref() == Some(&third_sibling.id)
+                        && start.workspace_roots == project_roots(&third_sibling)
+                })
+        },
+    )
+    .await;
+
+    let removal_message = format!("Workbench {:?} is being removed", workbench.name);
+
     let caller_auth = fixture.agent_control_caller(&caller.agent_id).await;
     let bearer = caller_auth
         .authorization
@@ -3298,8 +3350,8 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     let (is_error, body) = spawn_task.await.expect("spawn task join");
     assert!(is_error, "spawn must reject while removal is still held");
     assert!(
-        body.contains("being removed"),
-        "admission must report the held removal conflict"
+        body.contains(&removal_message),
+        "binding admission must identify the held removal"
     );
     hook.resume();
 
@@ -3318,7 +3370,7 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     eprintln!(
         "CATALOG BINDING EVIDENCE: held removal rejected MCP spawn; removal completed without losing spawn registration"
     );
-    for sibling in [first_sibling, second_sibling] {
+    for sibling in [first_sibling, second_sibling, third_sibling] {
         fixture
             .client
             .workbench_remove(WorkbenchRemovePayload {

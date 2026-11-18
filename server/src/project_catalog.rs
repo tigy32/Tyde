@@ -49,11 +49,11 @@ struct Pending {
     destructive: bool,
 }
 
-#[derive(Clone, Copy)]
 enum FamilyUse {
     Mutation,
     Creation,
-    Binding,
+    Binding(ProjectId),
+    Removal(ProjectId),
 }
 
 enum Resource {
@@ -594,10 +594,17 @@ impl ProjectCatalogActor {
                             if stopping { let _ = reply.send(Err(AppError::conflict(operation, "project catalog is stopping"))); continue; }
                             let Some(handle) = self.handle.upgrade() else { let _ = reply.send(Err(AppError::conflict(operation, "project catalog stopped"))); continue; };
                             let resources = match resources(&handle, &mutation) { Ok(resources) => resources, Err(error) => { let _ = reply.send(Err(error)); continue; } };
-                            let durable = durable_resources(&handle.snapshot.borrow().store, match &mutation { ProjectMutation::RecoverWorkbench(payload) => Some(&payload.operation), _ => None });
-                            if conflicts(&resources, active.values().flat_map(|pending| &pending.resources).chain(bindings.values().flatten()).chain(durable.iter())) {
+                            let recovering = match &mutation { ProjectMutation::RecoverWorkbench(payload) => Some(&payload.operation), _ => None };
+                            let blocker = active_conflict(&handle, &resources, &active)
+                                .or_else(|| bindings.iter().find(|(_, held)| conflicts(&resources, held))
+                                    .map(|(stream, _)| {
+                                        tracing::info!(target: "tyde::project_operation", blocker_stream = %stream, "catalog conflict with active project binding");
+                                        "Another action is using this project".to_owned()
+                                    }))
+                                .or_else(|| creation_conflict(&handle.snapshot.borrow().store, &resources, recovering));
+                            if let Some(blocker) = blocker {
                                 tracing::info!(target: "tyde::project_operation", operation, stage = "admission", accepted = false, "catalog resource conflict");
-                                let _ = reply.send(Err(AppError::conflict(operation, "project resources have a conflicting mutation or binding in flight"))); continue;
+                                let _ = reply.send(Err(AppError::conflict(operation, blocker))); continue;
                             }
                             let Some(worker_host) = host.upgrade() else { let _ = reply.send(Err(AppError::conflict(operation, "host stopped"))); continue; };
                             let stream = StreamPath(format!("/project-operation/{}", Uuid::new_v4()));
@@ -626,19 +633,22 @@ impl ProjectCatalogActor {
                         }
                         Command::Bind { projects, reply } => {
                             let Some(handle) = self.handle.upgrade() else { let _ = reply.send(Err("project catalog stopped".into())); continue; };
-                            let result = if stopping { Err("project catalog is stopping".into()) }
-                            else if projects.iter().any(|id| handle.get(id).is_some_and(|project| project.is_removing_workbench())) { Err("Workbench removal is in progress".into()) }
-                            else {
-                                match projects.iter().map(|id| family(&handle, id, FamilyUse::Binding)).collect::<AppResult<Vec<_>>>() {
-                                    Err(error) => Err(error.message),
-                                    Ok(resources) if conflicts(&resources, active.values().flat_map(|pending| &pending.resources).chain(durable_resources(&handle.snapshot.borrow().store, None).iter())) => Err("project is being removed or mutated by an admitted operation".into()),
-                                    Ok(resources) => {
-                                        let stream = StreamPath(format!("/project-binding/{}", Uuid::new_v4()));
-                                        bindings.insert(stream.clone(), resources);
-                                        Ok(ProjectBindingReservation { stream, tx: handle.tx.clone() })
-                                    }
+                            let result = (|| {
+                                if stopping { return Err("project catalog is stopping".into()); }
+                                let resources = projects.iter()
+                                    .map(|id| family(&handle, id, FamilyUse::Binding(id.clone())))
+                                    .collect::<AppResult<Vec<_>>>()
+                                    .map_err(|error| error.message)?;
+                                if let Some(blocker) = active_conflict(&handle, &resources, &active) {
+                                    return Err(blocker);
                                 }
-                            };
+                                if let Some(project) = projects.iter().filter_map(|id| handle.get(id)).find(Project::is_removing_workbench) {
+                                    return Err(format!("Workbench {:?} is marked for removal", project.name));
+                                }
+                                let stream = StreamPath(format!("/project-binding/{}", Uuid::new_v4()));
+                                bindings.insert(stream.clone(), resources);
+                                Ok(ProjectBindingReservation { stream, tx: handle.tx.clone() })
+                            })();
                             tracing::info!(target: "tyde::project_operation", operation = "project_bind", stage = "admission", accepted = result.is_ok(), project_count = projects.len(), active_count = active.len(), "catalog binding admission completed");
                             let _ = reply.send(result);
                         }
@@ -779,7 +789,29 @@ fn resources(
             held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
         }
         ProjectMutation::RemoveWorkbench(payload) => {
-            held.push(family(catalog, &payload.id, FamilyUse::Mutation)?);
+            let project = catalog.get(&payload.id).ok_or_else(|| {
+                AppError::not_found("workbench_remove", "cannot remove missing workbench")
+            })?;
+            let ProjectSource::GitWorkbench {
+                parent_project_id,
+                roots,
+                ..
+            } = project.source
+            else {
+                return Err(AppError::invalid(
+                    "workbench_remove",
+                    "cannot remove non-workbench project as workbench",
+                ));
+            };
+            held.push(Resource::Family(
+                parent_project_id,
+                FamilyUse::Removal(payload.id.clone()),
+            ));
+            held.extend(
+                roots
+                    .into_iter()
+                    .map(|root| Resource::Root(root.worktree_root)),
+            );
         }
         ProjectMutation::RecoverWorkbench(payload) => {
             let intent = catalog
@@ -842,8 +874,8 @@ fn resources(
     Ok(held)
 }
 
-fn conflicts<'a>(resources: &[Resource], held: impl Iterator<Item = &'a Resource>) -> bool {
-    held.into_iter().any(|held| {
+fn conflicts(resources: &[Resource], held: &[Resource]) -> bool {
+    held.iter().any(|held| {
         resources.iter().any(|resource| match resource {
             Resource::Family(id, usage) => match held {
                 Resource::Family(held_id, held_usage) => {
@@ -852,9 +884,20 @@ fn conflicts<'a>(resources: &[Resource], held: impl Iterator<Item = &'a Resource
                             (FamilyUse::Mutation, _)
                             | (_, FamilyUse::Mutation)
                             | (FamilyUse::Creation, FamilyUse::Creation) => true,
-                            (FamilyUse::Creation, FamilyUse::Binding)
-                            | (FamilyUse::Binding, FamilyUse::Creation)
-                            | (FamilyUse::Binding, FamilyUse::Binding) => false,
+                            (
+                                FamilyUse::Removal(id),
+                                FamilyUse::Removal(other) | FamilyUse::Binding(other),
+                            )
+                            | (FamilyUse::Binding(id), FamilyUse::Removal(other)) => id == other,
+                            (
+                                FamilyUse::Creation,
+                                FamilyUse::Binding(_) | FamilyUse::Removal(_),
+                            )
+                            | (
+                                FamilyUse::Binding(_) | FamilyUse::Removal(_),
+                                FamilyUse::Creation,
+                            )
+                            | (FamilyUse::Binding(_), FamilyUse::Binding(_)) => false,
                         }
                 }
                 Resource::Root(_) | Resource::TopLevelOrder => false,
@@ -862,6 +905,36 @@ fn conflicts<'a>(resources: &[Resource], held: impl Iterator<Item = &'a Resource
             Resource::Root(root) => matches!(held, Resource::Root(held_root) if root == held_root),
             Resource::TopLevelOrder => matches!(held, Resource::TopLevelOrder),
         })
+    })
+}
+
+fn active_conflict(
+    catalog: &ProjectCatalogHandle,
+    resources: &[Resource],
+    active: &HashMap<StreamPath, Pending>,
+) -> Option<String> {
+    let blocker = &active
+        .values()
+        .find(|pending| conflicts(resources, &pending.resources))?
+        .progress;
+    tracing::info!(target: "tyde::project_operation", blocker_operation = mutation_name(&blocker.mutation), blocker_stream = %blocker.stream, "catalog conflict with admitted operation");
+    Some(match &blocker.mutation {
+        ProjectMutation::RemoveWorkbench(payload) => match catalog.get(&payload.id) {
+            Some(project) => format!("Workbench {:?} is being removed", project.name),
+            None => "Workbench removal is finishing".to_owned(),
+        },
+        ProjectMutation::Create(_) => "Project creation is in progress".to_owned(),
+        ProjectMutation::Delete(_) => "Project deletion is in progress".to_owned(),
+        ProjectMutation::AddRoot(_) => "A project root is being added".to_owned(),
+        ProjectMutation::DeleteRoot(_) => "A project root is being removed".to_owned(),
+        ProjectMutation::Rename(_) => "A project is being renamed".to_owned(),
+        ProjectMutation::Reorder(_) => "Projects are being reordered".to_owned(),
+        ProjectMutation::CreateWorkbench(payload) => {
+            format!("Workbench {:?} is being created", payload.name)
+        }
+        ProjectMutation::RecoverWorkbench(_) => {
+            "Interrupted workbench creation is being cleaned up".to_owned()
+        }
     })
 }
 
@@ -1690,13 +1763,24 @@ fn creation_resources(intent: &protocol::WorkbenchCreationIntent) -> Vec<Resourc
     .collect()
 }
 
-fn durable_resources(store: &ProjectStore, except: Option<&StreamPath>) -> Vec<Resource> {
+fn creation_conflict(
+    store: &ProjectStore,
+    resources: &[Resource],
+    except: Option<&StreamPath>,
+) -> Option<String> {
     store
         .creations()
-        .iter()
-        .filter(|intent| Some(&intent.operation) != except)
-        .flat_map(creation_resources)
-        .collect()
+        .into_iter()
+        .find(|intent| {
+            Some(&intent.operation) != except && conflicts(resources, &creation_resources(intent))
+        })
+        .map(|intent| {
+            tracing::info!(target: "tyde::project_operation", blocker_stream = %intent.operation, "catalog conflict with interrupted workbench creation");
+            format!(
+                "Recover the interrupted creation of workbench {:?} first",
+                intent.payload.name
+            )
+        })
 }
 
 fn operation_snapshot(

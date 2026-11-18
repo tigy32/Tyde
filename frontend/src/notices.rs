@@ -420,16 +420,6 @@ pub fn ActionError(error: ArcRwSignal<Option<String>>) -> impl IntoView {
 }
 
 pub fn project_mutation_pending(state: &AppState, host: &str, project: &ProjectId) -> bool {
-    let family = |id: &ProjectId| {
-        state.projects.with(|projects| {
-            projects
-                .iter()
-                .find(|entry| entry.host_id == host && &entry.project.id == id)
-                .and_then(|entry| entry.project.parent_project_id().cloned())
-                .unwrap_or_else(|| id.clone())
-        })
-    };
-    let target = family(project);
     state.project_operations.with(|operations| {
         operations.iter().any(|((owner, _), operation)| {
             owner == host
@@ -438,7 +428,7 @@ pub fn project_mutation_pending(state: &AppState, host: &str, project: &ProjectI
                     protocol::ProjectOperationState::Admitted
                         | protocol::ProjectOperationState::Running { .. }
                 )
-                && mutation_project(&operation.mutation).is_some_and(|id| family(id) == target)
+                && mutation_project(&operation.mutation) == Some(project)
         })
     })
 }
