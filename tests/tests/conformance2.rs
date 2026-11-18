@@ -11504,6 +11504,78 @@ async fn real_usage_accounting<B: Backend>(host: &mut Harness<B>) {
 }
 
 conformance2_scenario!(
+    real_stop_first_fork_question,
+    [
+        BackendCapability::ForkSession,
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::Interrupt,
+    ]
+);
+
+async fn real_stop_first_fork_question<B: Backend>(host: &mut Harness<B>) {
+    tokio::time::timeout(Duration::from_secs(600), async {
+        let ready = launch_prompt();
+        let parent = spawn_agent(host, &ready).await;
+        assert_ready_handshake(&collect_turn(host, &parent, &ready).await);
+        assert_clean_close(host, &parent).await;
+
+        let prompt = match host.backend() {
+            BackendKind::Claude => format!(
+                "Use the native AskUserQuestion tool. {}",
+                question_prompt::<B>()
+            ),
+            BackendKind::Codex => format!(
+                "Use the native request_user_input_async tool. {}",
+                question_prompt::<B>()
+            ),
+            _ => question_prompt::<B>(),
+        };
+        let child = fork_agent(host, &parent.session_id, &prompt).await;
+        let mut turn = host.turn(&prompt);
+        let mut question_id = None;
+        collect_turn_until(host, &mut turn, |event| {
+            if let ChatEvent::ToolRequest(request) = event
+                && matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. })
+            {
+                question_id = Some(request.tool_call_id.clone());
+                return true;
+            }
+            false
+        })
+        .await;
+        let question_id = question_id.expect("native question");
+        interrupt_backend(host).await;
+        let mut cancelled = false;
+        loop {
+            let event = host.next_chat_unbounded().await;
+            cancelled |= matches!(event, ChatEvent::OperationCancelled(_));
+            let settled = cancelled && matches!(event, ChatEvent::TypingStatusChanged(false));
+            turn.events.push(event);
+            if settled {
+                break;
+            }
+        }
+        assert_no_error_message("first fork question cancellation", turn.events());
+        assert_eq!(
+            turn.events()
+                .iter()
+                .filter(|event| matches!(event,
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == question_id
+                        && matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. })
+                ))
+                .count(),
+            1,
+            "Stop must retire the fork's unanswered question exactly once"
+        );
+        assert_ready_handshake(&ask_expecting_delivery(host, &child, &ready).await);
+        assert_clean_close(host, &child).await;
+    })
+    .await
+    .expect("first fork question flow hung");
+}
+
+conformance2_scenario!(
     real_fork_own_request_usage,
     [
         BackendCapability::ModelRequestUsageReported,

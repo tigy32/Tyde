@@ -572,7 +572,6 @@ impl ClaudeSession {
                 provider_version: None,
                 process_generation: 0,
                 resume_bootstrap: None,
-                resume_empty_result_generation: None,
                 pending_compaction: None,
                 closing: false,
                 stale_process_generation: None,
@@ -811,7 +810,6 @@ struct ClaudeState {
     provider_version: Option<String>,
     process_generation: u64,
     resume_bootstrap: Option<ClaudeResumeBootstrap>,
-    resume_empty_result_generation: Option<u64>,
     pending_compaction: Option<PendingClaudeCompaction>,
     /// Set by `shutdown`. Blocks new turns (including CLI-initiated ones) and
     /// process respawn after the backend has been told to close.
@@ -896,7 +894,6 @@ impl Default for ClaudeState {
             provider_version: None,
             process_generation: 0,
             resume_bootstrap: None,
-            resume_empty_result_generation: None,
             pending_compaction: None,
             closing: false,
             stale_process_generation: None,
@@ -917,7 +914,6 @@ impl Default for ClaudeState {
 
 struct ClaudeResumeBootstrap {
     generation: u64,
-    fork_session: bool,
     completions: Vec<oneshot::Sender<Result<(), String>>>,
     quarantined_frames: usize,
 }
@@ -4331,14 +4327,13 @@ impl ClaudeInner {
                 if requires_resume_bootstrap {
                     state.resume_bootstrap = Some(ClaudeResumeBootstrap {
                         generation: process_generation,
-                        fork_session: config.fork_from_session_id.is_some(),
                         completions: Vec::new(),
                         quarantined_frames: 0,
                     });
                     tracing::info!(
                         process_generation,
                         fork = config.fork_from_session_id.is_some(),
-                        "quarantining Claude CLI resume bootstrap until its terminal result"
+                        "quarantining Claude CLI resume bootstrap until the first turn's init"
                     );
                 } else {
                     state.resume_bootstrap = None;
@@ -4776,38 +4771,25 @@ impl ClaudeInner {
         process_generation: u64,
         value: &Value,
     ) -> bool {
-        let terminal = value.get("type").and_then(Value::as_str) == Some("result");
         let init = value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("init");
-        let empty_result = value
-            .get("result")
-            .and_then(Value::as_str)
-            .is_none_or(|result| result.trim().is_empty());
         let completions = self
             .state
             .with(move |state| {
                 let Some(bootstrap) = state.resume_bootstrap.as_mut() else {
-                    let startup_result = state.resume_empty_result_generation
-                        == Some(process_generation)
-                        && terminal;
-                    let ignore_empty = startup_result && empty_result;
-                    if startup_result {
-                        state.resume_empty_result_generation = None;
-                    }
-                    return Err(ignore_empty);
+                    return Err(false);
                 };
                 if bootstrap.generation != process_generation {
                     return Err(false);
                 }
                 bootstrap.quarantined_frames = bootstrap.quarantined_frames.saturating_add(1);
+                // The first prompt produces system/init. Past that boundary a
+                // terminal result belongs to the live turn, even on cancellation.
                 if init {
                     let bootstrap = state
                         .resume_bootstrap
                         .take()
                         .expect("matching Claude resume bootstrap disappeared");
-                    if bootstrap.fork_session {
-                        state.resume_empty_result_generation = Some(process_generation);
-                    }
                     Ok(Some((bootstrap.completions, bootstrap.quarantined_frames)))
                 } else {
                     Ok(None)
