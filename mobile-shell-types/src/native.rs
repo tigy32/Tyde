@@ -174,9 +174,13 @@ native_struct!(NativeBackChatDock {
     back_label: [String], connection_status: [Option<NativeChatConnectionStatus>],
     sidebar_available: [bool], sidebar_open: [bool], chat_actions: [bool]
 });
+native_struct!(NativeActivityRail {
+    back_label: [Option<String>], new_chat: [Option<bool>]
+});
 native_struct!(NativeBackDestination {
     tab: [NativeTab], route: [NativeRoute], title: [String],
-    connected_status: [Option<NativeConnectedStatus>], chat_dock: [Option<NativeBackChatDock>]
+    connected_status: [Option<NativeConnectedStatus>], chat_dock: [Option<NativeBackChatDock>],
+    activity_rail: [Option<NativeActivityRail>]
 });
 native_struct!(NativePresentation {
     version: [u32], client_ready: [bool], workspace: [bool], tab: [NativeTab], route: [NativeRoute],
@@ -185,6 +189,7 @@ native_struct!(NativePresentation {
     root_status_owner: [Option<NativeRootStatusOwner>], root_connected_status: [Option<NativeConnectedStatus>],
     chat_dock_owner: [Option<NativeChatDockOwner>], chat_connection_status: [Option<NativeChatConnectionStatus>],
     chat_back_label: [Option<String>],
+    board_toolbar: [Option<bool>], activity_rail: [Option<NativeActivityRail>],
     back_surface_version: [Option<u32>], navigation_revision: [Option<u64>], back_ready_revision: [Option<u64>], back_destination: [Option<NativeBackDestination>]
 });
 native_struct!(NativeHttpRequest {
@@ -227,6 +232,8 @@ pub fn bootstrap_javascript() -> Result<String, serde_json::Error> {
         chat_dock_owner: None,
         chat_connection_status: None,
         chat_back_label: None,
+        board_toolbar: None,
+        activity_rail: None,
         back_surface_version: None,
         navigation_revision: None,
         back_ready_revision: None,
@@ -260,6 +267,7 @@ pub fn swift_source() -> String {
         NativeBackPhase::swift(),
         NativeBackUpdate::swift(),
         NativeBackChatDock::swift(),
+        NativeActivityRail::swift(),
         NativeBackDestination::swift(),
         NativeIntent::swift(),
         NativeEndpoint::swift(),

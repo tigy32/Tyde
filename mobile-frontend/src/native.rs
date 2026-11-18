@@ -1,8 +1,8 @@
 use leptos::prelude::*;
 use mobile_shell_types::native::{
-    NATIVE_BACK_SURFACE_VERSION, NATIVE_BRIDGE_VERSION, NativeBackDestination, NativeBackPhase,
-    NativeBackUpdate, NativeEndpoint, NativeIntent, NativeLayout, NativePresentation, NativeRoute,
-    NativeTab, NativeTheme,
+    NATIVE_BACK_SURFACE_VERSION, NATIVE_BRIDGE_VERSION, NativeActivityRail, NativeBackDestination,
+    NativeBackPhase, NativeBackUpdate, NativeEndpoint, NativeIntent, NativeLayout,
+    NativePresentation, NativeRoute, NativeTab, NativeTheme,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
@@ -119,13 +119,18 @@ pub fn install(state: AppState) {
             Option<mobile_shell_types::native::NativeChatDockOwner>,
         >(dock)
         .map_err(|error| format!("Invalid native chat dock ownership: {error}"))?;
-        Ok((chat, root, dock))
+        let rail = js_sys::Reflect::get(&api, &"activityRail".into())
+            .map_err(|_| "Native activity rail capability is unavailable".to_owned())?;
+        let rail = serde_wasm_bindgen::from_value::<Option<bool>>(rail)
+            .map_err(|error| format!("Invalid native activity rail capability: {error}"))?;
+        Ok((chat, root, dock, rail))
     })();
     match owner {
-        Ok((chat, root, dock)) => {
+        Ok((chat, root, dock, rail)) => {
             state.native_chat_header_owner.set(chat);
             state.native_root_status_owner.set(root);
             state.native_chat_dock_owner.set(dock);
+            state.native_activity_rail_supported.set(rail == Some(true));
         }
         Err(error) => {
             report(&state, error);
@@ -299,6 +304,10 @@ pub fn install(state: AppState) {
             );
         });
     }
+    let compose_state = state.clone();
+    let compose_enabled = Memo::new(move |_| {
+        activity_rail_owned(&compose_state) && can_leave_workspace(&compose_state)
+    });
     let projection_state = state.clone();
     Effect::new(move |_| {
         let presentation = presentation(
@@ -306,6 +315,7 @@ pub fn install(state: AppState) {
             navigation_revision.get(),
             back_ready_revision.get(),
             live_back,
+            compose_enabled.get(),
         );
         let state = projection_state.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -401,13 +411,42 @@ pub(crate) fn handle_intent(state: &AppState, intent: NativeIntent) {
             batch(|| {
                 if state.app_mode.get_untracked() == AppMode::HostPicker {
                     state.app_mode.set(AppMode::Workspace);
+                } else if board_toolbar_target(state).is_some() {
+                    state.board_project.set(None);
+                } else if let Some((_, back)) = agents_detail_back(state) {
+                    back.run(());
                 } else {
                     state.back_from_chat();
                 }
                 state.native_back_progress.set(None);
             });
         }
-        NativeIntent::NewChat => crate::actions::begin_new_chat(state),
+        NativeIntent::NewChat => {
+            let rail = activity_rail_owned(state);
+            if rail && (!activity_can_compose(state) || !can_leave_workspace(state)) {
+                return;
+            }
+            let project = board_toolbar_target(state).or_else(|| {
+                if !rail || !chat_visible(state) {
+                    return None;
+                }
+                let owner = state.active_agent.get()?;
+                state.agents.with(|agents| {
+                    let agent = agents
+                        .iter()
+                        .find(|agent| agent.agent_ref() == owner.as_agent_ref())?;
+                    Some(crate::state::ActiveProjectRef {
+                        local_host_id: agent.local_host_id.clone(),
+                        project_id: agent.project_id.clone()?,
+                    })
+                })
+            });
+            if let Some(project) = project {
+                crate::actions::open_project_chat(state, project);
+            } else {
+                crate::actions::begin_new_chat(state);
+            }
+        }
         NativeIntent::ChatDockShell => state
             .native_chat_dock_owner
             .set(Some(mobile_shell_types::native::NativeChatDockOwner::Shell)),
@@ -607,6 +646,76 @@ pub fn sidebar_visible(state: &AppState) -> bool {
     sidebar_available(state) && state.native_sidebar_open.get()
 }
 
+fn board_toolbar_target(state: &AppState) -> Option<crate::state::ActiveProjectRef> {
+    if !activity_rail_owned(state)
+        || state.app_mode.get() != AppMode::Workspace
+        || state.active_tab.get() != MobileTab::Home
+        || chat_visible(state)
+    {
+        return None;
+    }
+    state.active_board_project()
+}
+
+pub(crate) fn board_toolbar_owned(state: &AppState) -> bool {
+    board_toolbar_target(state).is_some()
+}
+
+pub(crate) fn activity_rail_owned(state: &AppState) -> bool {
+    state.native_activity_rail_supported.get()
+        && state.native_chat_dock_owner.get()
+            == Some(mobile_shell_types::native::NativeChatDockOwner::Shell)
+        && state.active_local_host_id.get().is_some()
+        && matches!(
+            state.app_mode.get(),
+            AppMode::Workspace | AppMode::HostPicker
+        )
+}
+
+pub(crate) fn agents_detail_rail_owned(state: &AppState) -> bool {
+    activity_rail_owned(state)
+        && state.app_mode.get() == AppMode::Workspace
+        && state.active_tab.get() == MobileTab::Agents
+        && !chat_visible(state)
+}
+
+fn agents_detail_back(state: &AppState) -> Option<crate::state::NativeDetailBack> {
+    agents_detail_rail_owned(state)
+        .then(|| state.native_agents_detail_back.get())
+        .flatten()
+}
+
+pub(crate) fn track_agents_detail_back(label: Signal<String>, back: Callback<()>) {
+    if !is_native() {
+        return;
+    }
+    let source = expect_context::<AppState>().native_agents_detail_back;
+    source.set(Some((label, back)));
+    on_cleanup(move || {
+        if source
+            .with_untracked(|current| current.as_ref().is_some_and(|(owner, _)| *owner == label))
+        {
+            source.set(None);
+        }
+    });
+}
+
+fn activity_can_compose(state: &AppState) -> bool {
+    state.app_mode.get() == AppMode::Workspace
+        && (!chat_visible(state) || state.active_agent.get().is_some())
+}
+
+fn activity_rail(
+    state: &AppState,
+    back_label: Option<String>,
+    new_chat: Option<bool>,
+) -> Option<NativeActivityRail> {
+    activity_rail_owned(state).then_some(NativeActivityRail {
+        back_label,
+        new_chat,
+    })
+}
+
 fn home_title(state: &AppState) -> String {
     match state.active_host_label() {
         Some(label) => label,
@@ -619,6 +728,7 @@ fn presentation(
     navigation_revision: u64,
     back_ready_revision: Option<u64>,
     live_back: bool,
+    compose_enabled: bool,
 ) -> NativePresentation {
     let tab = state.active_tab.get();
     let hosts = state.app_mode.get() == AppMode::HostPicker;
@@ -691,6 +801,20 @@ fn presentation(
                     None
                 },
                 chat_dock: None,
+                activity_rail: activity_rail(
+                    state,
+                    match tab {
+                        MobileTab::Home if state.active_board_project().is_some() => {
+                            Some("Back to projects".into())
+                        }
+                        MobileTab::Agents => state
+                            .native_agents_detail_back
+                            .get()
+                            .map(|(label, _)| label.get()),
+                        _ => None,
+                    },
+                    Some(compose_enabled),
+                ),
                 title: match tab {
                     MobileTab::Home => home_title(state),
                     MobileTab::Agents => "Agents".into(),
@@ -724,6 +848,11 @@ fn presentation(
                         }
                     }),
                 connected_status: None,
+                activity_rail: activity_rail(
+                    state,
+                    Some(state.back_destination_chat_back_label()),
+                    owner.is_some().then_some(compose_enabled),
+                ),
                 chat_dock: (state.native_chat_dock_owner.get()
                     == Some(mobile_shell_types::native::NativeChatDockOwner::Shell))
                 .then(|| {
@@ -765,6 +894,20 @@ fn presentation(
         subtitle,
         chat_actions: chat && state.active_agent.get().is_some(),
         modal: modal_open(state),
+        board_toolbar: board_toolbar_owned(state).then_some(true),
+        activity_rail: activity_rail(
+            state,
+            if chat {
+                Some(state.chat_back_label())
+            } else if hosts {
+                Some("Back from Hosts".into())
+            } else if board_toolbar_owned(state) {
+                Some("Back to projects".into())
+            } else {
+                agents_detail_back(state).map(|(label, _)| label.get())
+            },
+            activity_can_compose(state).then_some(compose_enabled),
+        ),
         sidebar_available: sidebar_available(state),
         sidebar_open: sidebar_visible(state),
         chat_header_owner: state.native_chat_header_owner.get(),

@@ -2212,6 +2212,7 @@ mod wasm_tests {
         js_sys::Reflect::set(&native, &"chatHeaderOwner".into(), &"client".into()).unwrap();
         js_sys::Reflect::set(&native, &"rootStatusOwner".into(), &"shell".into()).unwrap();
         js_sys::Reflect::set(&native, &"chatDockOwner".into(), &"shell".into()).unwrap();
+        js_sys::Reflect::set(&native, &"activityRail".into(), &true.into()).unwrap();
         install_loader_boundary();
         js_sys::Reflect::set(&window, &"__tydeNativeHost".into(), &native).unwrap();
         let state = AppState::new();
@@ -2389,10 +2390,15 @@ mod wasm_tests {
             state.paired_hosts.set(vec![host]);
             state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
             state.heartbeat_round_trip_ms_by_host.update(|values| { values.insert(host_id.clone(), 47); });
-            for destination in [NativeIntent::Home, NativeIntent::Agents] {
+            let previous_dock_owner = state.native_chat_dock_owner.get_untracked();
+            navigate(NativeIntent::ChatDockShell)?;
+            for destination in [NativeIntent::Home, NativeIntent::Agents, NativeIntent::Sessions, NativeIntent::Settings] {
                 navigate(destination)?;
                 next_tick().await;
                 let root = projected()?;
+                check(root.activity_rail.as_ref().is_some_and(|rail| rail.new_chat == Some(true) && rail.back_label.is_none()),
+                    &format!("{} root: New Chat without Back (rail present: {}, compose: {:?})",
+                        root.tab, root.activity_rail.is_some(), root.activity_rail.as_ref().and_then(|rail| rail.new_chat)))?;
                 check(root.root_status_owner == Some(mobile_shell_types::native::NativeRootStatusOwner::Shell)
                     && root.root_connected_status.as_ref().and_then(|status| status.round_trip_ms) == Some(47)
                     && find("[data-mobile-test='connection-banner']")?.get_bounding_client_rect().height() == 0.0,
@@ -2405,6 +2411,14 @@ mod wasm_tests {
                         "Home transfers host status to native chrome while its bootstrap placeholder stays visible")?;
                 }
             }
+            navigate(NativeIntent::Hosts)?;
+            next_tick().await;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_some() && rail.new_chat.is_none()),
+                "The host picker has rail Back but no New Chat")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            check(projected()?.route == mobile_shell_types::native::NativeRoute::Root,
+                "The rail Back action closes the host picker")?;
             navigate(NativeIntent::Home)?;
             state.native_root_status_owner.set(None);
             next_tick().await;
@@ -2423,6 +2437,43 @@ mod wasm_tests {
                     source: protocol::ProjectSource::Standalone { roots: vec![] },
                 },
             }]);
+            let open_board = || -> Result<(), String> {
+                find(".home-project-row")?.unchecked_into::<web_sys::HtmlElement>().click();
+                Ok(())
+            };
+            let board = "[data-mobile-test='project-board']";
+            let previous_project = state.active_project.get_untracked();
+            next_tick().await;
+            navigate(NativeIntent::ChatDockClient)?;
+            open_board()?;
+            next_tick().await;
+            check(projected()?.board_toolbar.is_none() && projected()?.activity_rail.is_none()
+                && find("[data-mobile-test='project-board'] button")?.text_content().as_deref() == Some("Back"),
+                "Horizontal bars keep the board's web actions")?;
+            navigate(NativeIntent::ChatDockShell)?;
+            next_tick().await;
+            check(projected()?.board_toolbar == Some(true)
+                && projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_some() && rail.new_chat == Some(true))
+                && find(board)?.text_content().is_some_and(|text| !text.contains("New agent") && !text.contains("Back"))
+                && find("[data-mobile-test='project-board'] h1")?.text_content().as_deref() == Some("Entry project"),
+                "The vertical shell takes both actions without losing the project heading")?;
+            navigate(NativeIntent::NewChat)?;
+            next_tick().await;
+            check(projected()?.board_toolbar.is_none()
+                && projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_some() && rail.new_chat.is_none())
+                && projected()?.route == mobile_shell_types::native::NativeRoute::Chat
+                && state.active_project.get().is_some_and(|project| project.project_id.0 == "entry-project")
+                && !state.project_picker_open.get(),
+                "Board Compose opens a draft for the board's project without asking again")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            check(projected()?.board_toolbar == Some(true), "Back from Compose returns to the same board")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            check(projected()?.board_toolbar.is_none()
+                && projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_none() && rail.new_chat == Some(true))
+                && find(".home-project-row")?.get_bounding_client_rect().height() > 0.0,
+                "Board Back returns to the project list with the root rail")?;
             state.agents.set([("entry-loose", "Loose agent", None),
                 ("entry-project-agent", "Project agent", Some(protocol::ProjectId("entry-project".into())))]
                 .into_iter().map(|(id, name, project_id)| crate::state::AgentInfo {
@@ -2436,6 +2487,74 @@ mod wasm_tests {
                     instance_stream: protocol::StreamPath(format!("/agent/{id}")),
                     started: true, fatal_error: None, review_recipient: false,
                 }).collect());
+            next_tick().await;
+            navigate(NativeIntent::Agents)?;
+            state.open_agent_chat(crate::state::ActiveAgentRef {
+                local_host_id: host_id.clone(), agent_id: protocol::AgentId("entry-project-agent".into()),
+            });
+            state.set_chat_input("Keep this draft".into());
+            next_tick().await;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_some() && rail.new_chat == Some(false)),
+                "Existing chats have rail Back and Compose, but Compose must not discard edits")?;
+            navigate(NativeIntent::NewChat)?;
+            check(state.chat_input.get_untracked() == "Keep this draft",
+                "A stale Compose activation cannot discard edits")?;
+            state.set_chat_input(String::new());
+            next_tick().await;
+            navigate(NativeIntent::NewChat)?;
+            next_tick().await;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_some() && rail.new_chat.is_none())
+                && state.active_project.get_untracked().is_some_and(|project| project.project_id.0 == "entry-project"),
+                "Chat Compose stays in the agent's project and does not show another Compose button")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            check(state.active_agent.get_untracked().is_some_and(|agent| agent.agent_id.0 == "entry-project-agent"),
+                "Back from the new draft returns to the prior chat")?;
+            navigate(NativeIntent::Back)?;
+            navigate(NativeIntent::Home)?;
+            state.active_project.set(previous_project);
+            navigate(NativeIntent::Agents)?;
+            let swarm = crate::components::fixture_swarm();
+            let swarm_id = swarm.id.clone();
+            let post_id = protocol::SwarmPostId("rail-test".into());
+            state.swarm_posts.update(|posts| {
+                posts.insert((host_id.clone(), swarm_id.clone()), std::collections::HashMap::from([
+                    (post_id.clone(), protocol::SwarmPost {
+                        id: post_id, swarm_id: swarm_id.clone(), thread_id: protocol::SwarmThreadId("rail-test".into()),
+                        board: protocol::SwarmBoard::Briefing, author: protocol::SwarmAuthor::Human,
+                        publication_id: protocol::SwarmPublicationId("rail-test".into()), cursor: 1,
+                        thread_seq: Some(1), thread_change: None, result: false, body: vec![], attachments: vec![],
+                        images: vec![], round_id: protocol::SwarmRoundId("rail-test".into()), created_at_ms: 0,
+                    })
+                ]));
+            });
+            state.swarms_by_host.update(|hosts| {
+                hosts.insert(host_id.clone(), std::collections::HashMap::from([(swarm_id.clone(), swarm)]));
+            });
+            next_tick().await;
+            find("[data-mobile-test='agents-segment-swarms']")?.unchecked_into::<HtmlElement>().click();
+            next_tick().await;
+            find("[data-mobile-test='swarm-open']")?.unchecked_into::<HtmlElement>().click();
+            next_tick().await;
+            find("[data-mobile-test='swarm-thread']")?.unchecked_into::<HtmlElement>().click();
+            next_tick().await;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.as_deref() == Some("Back to threads"))
+                && container.query_selector("[data-mobile-test='swarm-back-to-board']").unwrap().is_none(),
+                "The active Duo swarm thread moves Back out of the page and into the rail")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            find("[data-mobile-test='swarm-thread']")?;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.as_deref() == Some("All swarms")),
+                "One rail Back returns to the threads, not the swarm list")?;
+            navigate(NativeIntent::Back)?;
+            next_tick().await;
+            find("[data-mobile-test='swarm-open']")?;
+            check(projected()?.activity_rail.is_some_and(|rail| rail.back_label.is_none()),
+                "The second rail Back returns to the swarm list and removes Back")?;
+            state.swarms_by_host.update(|hosts| { hosts.remove(&host_id); });
+            state.swarm_posts.update(|posts| { posts.remove(&(host_id.clone(), swarm_id)); });
+            navigate(NativeIntent::Home)?;
+            state.native_chat_dock_owner.set(previous_dock_owner);
             next_tick().await;
             for (layout, open) in [
                 (NativeIntent::RegularLandscape, true),

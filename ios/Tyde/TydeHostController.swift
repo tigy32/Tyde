@@ -663,7 +663,14 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         }
         #endif
         overrideUserInterfaceStyle = state.theme == .dark ? .dark : .light
-        webView.backgroundColor = state.theme == .dark ? UIColor(white: 0.071, alpha: 1) : UIColor(white: 0.98, alpha: 1)
+        // Match the client's base surface across the safe-area edge and behind the rail.
+        let boardBackground: UIColor? = state.board_toolbar == true
+            ? (state.theme == .dark ? UIColor(white: 18 / 255, alpha: 1) : UIColor(red: 248 / 255, green: 249 / 255, blue: 250 / 255, alpha: 1))
+            : nil
+        webView.backgroundColor = boardBackground ?? UIColor(white: state.theme == .dark ? 0.071 : 0.98, alpha: 1)
+        tabs.view.backgroundColor = boardBackground
+        navigations[.home]?.view.backgroundColor = boardBackground
+        view.backgroundColor = boardBackground ?? UIColor(white: 0.071, alpha: 1)
         guard state.workspace else {
             showContainer(entry)
             attach(to: entry)
@@ -708,9 +715,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         if let destination = state.back_destination {
             resetNavigationItem(root)
             configureHeading(root, title: destination.title, subtitle: nil, chat: destination.route == .chat,
-                connectedStatus: destination.connected_status)
+                connectedStatus: destination.activity_rail == nil ? destination.connected_status : nil)
             root.navigationItem.leftBarButtonItems = []
-            if destination.route == .root { configureRootActions(root, tab: destination.tab) }
+            if destination.route == .root { configureRootActions(root, tab: destination.tab, rail: destination.activity_rail != nil) }
             else { root.navigationItem.rightBarButtonItems = [] }
             if destination.route == .chat, state.chat_dock_owner == .shell {
                 guard state.chat_header_owner == .client, let dock = destination.chat_dock else {
@@ -719,16 +726,22 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                 if #available(iOS 27.1, *) {
                     NativeChatDock.apply(to: root, dock: dock, modal: state.modal,
                         menu: moreMenu(agentActions: dock.chat_actions, composerActions: true),
+                        newChat: railNewChat(destination.activity_rail, modal: state.modal),
                         send: { [weak self] intent in self?.send(intent) })
                 } else { fail("Native chat dock requires iOS 27.1 or later"); return }
+            } else if let rail = destination.activity_rail {
+                if #available(iOS 27.1, *) {
+                    applyActivityRail(to: root, rail: rail, status: destination.connected_status, modal: state.modal)
+                } else { fail("Native activity rail requires iOS 27.1 or later"); return }
             }
         }
         configureHeading(content, title: state.title, subtitle: state.subtitle, chat: state.route == .chat,
-            connectedStatus: state.route != .chat && state.root_status_owner == .shell ? state.root_connected_status : nil)
+            connectedStatus: state.route != .chat && state.root_status_owner == .shell && state.activity_rail == nil
+                ? state.root_connected_status : nil)
         if state.route == .chat {
             content.navigationItem.rightBarButtonItems = [moreButton(agentActions: state.chat_actions, composerActions: state.chat_header_owner == .client)]
         } else if state.route == .root {
-            configureRootActions(content, tab: state.tab)
+            configureRootActions(content, tab: state.tab, rail: state.activity_rail != nil)
         } else {
             content.navigationItem.rightBarButtonItems = []
         }
@@ -751,12 +764,18 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
                 do {
                     try NativeChatDock.apply(to: content, state: state,
                         menu: moreMenu(agentActions: state.chat_actions, composerActions: true),
+                        newChat: railNewChat(state.activity_rail, modal: state.modal),
                         send: { [weak self] intent in self?.send(intent) })
                 } catch { fail(error.localizedDescription); return }
             } else {
                 fail("Native chat dock requires iOS 27.1 or later")
                 return
             }
+        }
+        if state.route != .chat, let rail = state.activity_rail {
+            if #available(iOS 27.1, *) {
+                applyActivityRail(to: content, rail: rail, status: state.root_connected_status, modal: state.modal)
+            } else { fail("Native activity rail requires iOS 27.1 or later"); return }
         }
         attach(to: navigation)
         reportLayout()
@@ -842,9 +861,9 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         } else { content.navigationItem.titleView = nil }
     }
 
-    private func configureRootActions(_ content: ContentController, tab: NativeTab) {
+    private func configureRootActions(_ content: ContentController, tab: NativeTab, rail: Bool) {
         switch tab {
-        case .agents: content.navigationItem.rightBarButtonItems = [newChatButton()]
+        case .agents: content.navigationItem.rightBarButtonItems = rail ? [] : [newChatButton()]
         case .home:
             let hosts = UIBarButtonItem(title: "Hosts", primaryAction: UIAction(title: "Hosts") { [weak self] _ in self?.send(.hosts) })
             hosts.accessibilityLabel = "Hosts"
@@ -859,6 +878,30 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
         button.accessibilityLabel = "New chat"
         button.accessibilityIdentifier = "native-new-chat"
         return button
+    }
+
+    private func railNewChat(_ rail: NativeActivityRail?, modal: Bool) -> UIBarButtonItem? {
+        guard let enabled = rail?.new_chat else { return nil }
+        let item = newChatButton()
+        item.isEnabled = enabled && !modal
+        return item
+    }
+
+    @available(iOS 27.1, *)
+    private func applyActivityRail(to content: ContentController, rail: NativeActivityRail,
+                                   status: NativeConnectedStatus?, modal: Bool) {
+        let connection = status.map { NativeChatConnectionStatus(phase: .connected, round_trip_ms: $0.round_trip_ms) }
+        var groups = [NativeActivityRailChrome.status(on: content, status: connection,
+            identifier: "native-root-connection-status")]
+        content.navigationItem.hidesBackButton = true
+        content.navigationItem.leftItemsSupplementBackButton = false
+        if let back = rail.back_label {
+            groups.append(NativeActivityRailChrome.back(label: back, enabled: !modal, send: { [weak self] in self?.send($0) }))
+        }
+        if let compose = railNewChat(rail, modal: modal) {
+            groups.append(NativeActivityRailChrome.group(compose))
+        }
+        content.navigationItem.leadingItemGroups = groups
     }
 
     private func moreMenu(agentActions: Bool, composerActions: Bool) -> UIMenu {

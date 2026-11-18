@@ -112,12 +112,15 @@ pub fn AgentsView() -> impl IntoView {
     });
 
     let on_new_chat = crate::components::new_chat_callback(&state);
+    let rail_state = state.clone();
+    let rail_owned = Signal::derive(move || crate::native::activity_rail_owned(&rail_state));
     view! {
         <div class="view agents-view" data-mobile-test="agents-view">
             <div class="shell-header tws-header">
             <header class="view-header">
                 <h1 class="view-title">{move || if segment.get() == AgentsSegment::Swarms { "Swarms" } else { "Agents" }}</h1>
                 <Show when=move || segment.get() == AgentsSegment::Agents>
+                <Show when=move || !rail_owned.get()>
                 <Button
                     label="New chat"
                     variant=ButtonVariant::Primary
@@ -125,6 +128,7 @@ pub fn AgentsView() -> impl IntoView {
                     data_mobile_test="agents-new-chat"
                     on_click=on_new_chat
                 />
+                </Show>
                 {(!crate::native::is_native()).then(|| view! { <AgentFilters hide_sub_agents show_workbenches /> })}
                 </Show>
             </header>

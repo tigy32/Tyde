@@ -89,22 +89,57 @@ final class NativeConnectionDockView: UILabel {
 
 @available(iOS 27.1, *)
 @MainActor
+enum NativeActivityRailChrome {
+    static func group(_ item: UIBarButtonItem) -> UIBarButtonItemGroup {
+        item.axisBehavior = .verticalPreferred
+        item.sharesBackground = false
+        return UIBarButtonItemGroup(barButtonItems: [item], representativeItem: nil)
+    }
+
+    static func status(on content: ContentController, status: NativeChatConnectionStatus?,
+                       identifier: String? = nil) -> UIBarButtonItemGroup {
+        let health = NativeConnectionDockView(frame: .zero)
+        if let status {
+            health.render(status)
+            if let identifier { health.accessibilityIdentifier = identifier }
+            content.connectedStatusView = health
+        } else {
+            // Reserve the first row so the actions don't move when the status disappears.
+            health.reserveSlot()
+        }
+        let item = UIBarButtonItem(customView: health)
+        item.hidesSharedBackground = true
+        return group(item)
+    }
+
+    static func back(label: String, enabled: Bool, send: @escaping (NativeIntent) -> Void) -> UIBarButtonItemGroup {
+        let back = UIBarButtonItem(title: label, image: UIImage(systemName: "chevron.backward"),
+            primaryAction: UIAction(title: label) { _ in send(.back) })
+        back.accessibilityLabel = label
+        back.accessibilityIdentifier = "native-rail-back"
+        back.isEnabled = enabled
+        return group(back)
+    }
+}
+
+@available(iOS 27.1, *)
+@MainActor
 enum NativeChatDock {
     static func owner(for traits: UITraitCollection) -> NativeChatDockOwner {
         traits.verticalBarEdge == .unspecified ? .client : .shell
     }
 
-    static func apply(to content: ContentController, state: NativePresentation, menu: UIMenu,
+    static func apply(to content: ContentController, state: NativePresentation, menu: UIMenu, newChat: UIBarButtonItem? = nil,
                       send: @escaping (NativeIntent) -> Void) throws {
         guard state.chat_header_owner == .client, let backLabel = state.chat_back_label else {
             throw HostError("Native chat dock requires its chat-local heading and Back label")
         }
         let dock = NativeBackChatDock(back_label: backLabel, connection_status: state.chat_connection_status,
             sidebar_available: state.sidebar_available, sidebar_open: state.sidebar_open, chat_actions: state.chat_actions)
-        apply(to: content, dock: dock, modal: state.modal, menu: menu, send: send)
+        apply(to: content, dock: dock, modal: state.modal, menu: menu, newChat: newChat, send: send)
     }
 
-    static func apply(to content: ContentController, dock: NativeBackChatDock, modal: Bool, menu: UIMenu,
+    static func apply(to content: ContentController, dock: NativeBackChatDock, modal: Bool, menu: UIMenu, newChat: UIBarButtonItem? = nil,
                       send: @escaping (NativeIntent) -> Void) {
         content.connectedStatusView = nil
         content.navigationItem.title = nil
@@ -116,27 +151,12 @@ enum NativeChatDock {
         content.navigationItem.hidesBackButton = true
         content.navigationItem.leftItemsSupplementBackButton = false
         content.navigationItem.backAction = nil
-        var groups: [UIBarButtonItemGroup] = []
-        let health = NativeConnectionDockView(frame: .zero)
-        if let status = dock.connection_status {
-            health.render(status)
-            content.connectedStatusView = health
-        } else {
-            // Without health, Back would rise into its row in Duo's shared bar.
-            health.reserveSlot()
-        }
-        // Leave the item enabled: disabling it greys the label, including its status dot.
-        let healthItem = UIBarButtonItem(customView: health)
-        healthItem.axisBehavior = .verticalPreferred
-        healthItem.hidesSharedBackground = true
-        groups.append(UIBarButtonItemGroup(barButtonItems: [healthItem], representativeItem: nil))
+        var groups = [NativeActivityRailChrome.status(on: content, status: dock.connection_status)]
         if !modal {
-            let back = UIBarButtonItem(title: dock.back_label, image: UIImage(systemName: "chevron.backward"),
-                primaryAction: UIAction(title: dock.back_label) { _ in send(.back) })
-            back.accessibilityLabel = dock.back_label
-            // Back keeps its own glass; adjacent leading items would otherwise merge into one capsule.
-            back.sharesBackground = false
-            groups.append(UIBarButtonItemGroup(barButtonItems: [back], representativeItem: nil))
+            groups.append(NativeActivityRailChrome.back(label: dock.back_label, enabled: true, send: send))
+            if let newChat {
+                groups.append(NativeActivityRailChrome.group(newChat))
+            }
             if dock.sidebar_available {
                 let title = dock.sidebar_open ? "Hide Agents" : "Show Agents"
                 let sidebar = UIBarButtonItem(title: title, image: UIImage(systemName: "sidebar.left"),

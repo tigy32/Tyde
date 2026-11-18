@@ -167,6 +167,29 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
         send(command_state.clone(), host, command, error);
     });
     let compose_open = RwSignal::new(false);
+    let back_to_threads = Callback::new(move |_| {
+        thread.set(None);
+        compose_open.set(false);
+    });
+    let rail_state = state.clone();
+    let rail_owned = Signal::derive(move || crate::native::agents_detail_rail_owned(&rail_state));
+    crate::native::track_agents_detail_back(
+        Signal::derive(move || {
+            if thread.get().is_some() {
+                "Back to threads"
+            } else {
+                "All swarms"
+            }
+            .into()
+        }),
+        Callback::new(move |_| {
+            if thread.get_untracked().is_some() {
+                back_to_threads.run(());
+            } else {
+                on_back.run(());
+            }
+        }),
+    );
     let connection = Memo::new(move |_| {
         let (host, _) = target.get_value();
         let connected = state
@@ -277,7 +300,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
     });
     view! {
         <section class="mobile-swarm-conversation" data-mobile-test="swarm-conversation">
-            <header class="mobile-swarm-header"><button class="mobile-swarm-back mobile-swarm-back-icon" type="button" aria-label="All swarms" title="All swarms" on:click=move |_| on_back.run(())>"←"</button><div><h2>{move || swarm.get().map(|s| s.name)}</h2><span class="mobile-swarm-muted">{move || swarm.get().map(|s| lifecycle_label(s.lifecycle))}</span></div>
+            <header class="mobile-swarm-header"><Show when=move || !rail_owned.get()><button class="mobile-swarm-back mobile-swarm-back-icon" type="button" aria-label="All swarms" title="All swarms" on:click=move |_| on_back.run(())>"←"</button></Show><div><h2>{move || swarm.get().map(|s| s.name)}</h2><span class="mobile-swarm-muted">{move || swarm.get().map(|s| lifecycle_label(s.lifecycle))}</span></div>
                 <button type="button" class="mobile-swarm-control" data-mobile-test="swarm-pause-resume" disabled=move || swarm.get().is_none_or(|s| s.lifecycle == SwarmLifecycle::Pausing) on:click=move |_| {
                     if let Some(s) = swarm.get_untracked() {
                         command.run(if matches!(s.lifecycle, SwarmLifecycle::Paused | SwarmLifecycle::AttentionRequired) { SwarmCommandPayload::Resume { swarm_id: s.id } } else { SwarmCommandPayload::Pause { swarm_id: s.id } });
@@ -310,7 +333,7 @@ fn SwarmConversation(host: LocalHostId, swarm_id: SwarmId, on_back: Callback<()>
             </details>
             </div>
             <p class="mobile-swarm-board-hint">{move || if board.get() == SwarmBoard::Briefing { "One request, one thread. Newest requests first." } else { "Threads agents opened to coordinate on your requests." }}</p>
-            <Show when=move || thread.get().is_some()><button class="mobile-swarm-back" type="button" data-mobile-test="swarm-back-to-board" on:click=move |_| { thread.set(None); compose_open.set(false); }>"← Back to threads"</button></Show>
+            <Show when=move || !rail_owned.get() && thread.get().is_some()><button class="mobile-swarm-back" type="button" data-mobile-test="swarm-back-to-board" on:click=move |_| back_to_threads.run(())>"← Back to threads"</button></Show>
             <Show when=move || thread.get().is_none()>
                 <div class="mobile-swarm-inbox-heading"><span class="mobile-swarm-muted">{move || if board.get() == SwarmBoard::Briefing { "Your requests" } else { "Coordination threads" }}</span><Show when=move || board.get() == SwarmBoard::Briefing><button type="button" class="mobile-swarm-control" data-mobile-test="swarm-new-thread" on:click=move |_| compose_open.set(true)>"+ New request"</button></Show></div>
             </Show>

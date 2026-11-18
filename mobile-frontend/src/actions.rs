@@ -1,4 +1,4 @@
-use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
+use leptos::prelude::{GetUntracked, Set, Update, WithUntracked, batch};
 use protocol::types::AgentCompactPayload;
 
 use crate::bridge::{Accepted, SendRejected};
@@ -493,16 +493,24 @@ pub fn begin_new_chat(state: &AppState) {
     state.project_picker_open.set(true);
 }
 
+pub(crate) fn open_project_chat(state: &AppState, project: crate::state::ActiveProjectRef) {
+    batch(|| {
+        state.active_project.set(Some(project));
+        open_new_chat(state);
+    });
+}
+
 /// Open the composer for a chat that has no agent yet. Called once the project
 /// question is answered; `spawn_new_chat` reads `active_project` when the first
 /// message is actually sent.
 pub fn open_new_chat(state: &AppState) {
-    state.chat_draft_id.set(uuid::Uuid::new_v4());
-    state.project_picker_open.set(false);
-    state.active_agent.set(None);
-    state.set_chat_input(String::new());
-    state.chat_images.set(Vec::new());
-    state.show_chat();
+    batch(|| {
+        state.chat_draft_id.set(uuid::Uuid::new_v4());
+        state.project_picker_open.set(false);
+        state.show_new_chat();
+        state.set_chat_input(String::new());
+        state.chat_images.set(Vec::new());
+    });
 }
 
 pub async fn request_project_file(

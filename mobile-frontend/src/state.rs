@@ -999,6 +999,8 @@ pub struct NativeChatDestination {
     pub clears_draft_options: bool,
 }
 
+pub(crate) type NativeDetailBack = (Signal<String>, Callback<()>);
+
 #[derive(Clone)]
 pub struct AppState {
     pub host_releases: RwSignal<HashMap<LocalHostId, crate::bundle::HostRelease>>,
@@ -1066,12 +1068,14 @@ pub struct AppState {
     pub native_sidebar_open: RwSignal<bool>,
     pub native_modal_sources: RwSignal<Vec<Signal<bool>>>,
     pub native_unsaved_sources: RwSignal<Vec<Signal<bool>>>,
+    pub native_agents_detail_back: RwSignal<Option<NativeDetailBack>>,
     pub native_chat_destination: RwSignal<Option<NativeChatDestination>>,
     pub native_auth_recovery: RwSignal<Option<NativeAuthRecovery>>,
     pub chat_send_menu_open: RwSignal<bool>,
     pub native_chat_header_owner:
         RwSignal<Option<mobile_shell_types::native::NativeChatHeaderOwner>>,
     pub native_chat_dock_owner: RwSignal<Option<mobile_shell_types::native::NativeChatDockOwner>>,
+    pub native_activity_rail_supported: RwSignal<bool>,
     pub native_root_status_owner:
         RwSignal<Option<mobile_shell_types::native::NativeRootStatusOwner>>,
     pub native_chat_action: RwSignal<Option<mobile_shell_types::native::NativeIntent>>,
@@ -1296,6 +1300,19 @@ impl AppState {
         self.enter_chat(Vec::new());
     }
 
+    pub(crate) fn show_new_chat(&self) {
+        let mut parents = Vec::new();
+        if crate::native::activity_rail_owned(self)
+            && crate::native::chat_visible(self)
+            && let Some(owner) = self.active_agent.get_untracked()
+        {
+            parents = self.chat_back_stack.get_untracked();
+            parents.push(owner);
+        }
+        self.active_agent.set(None);
+        self.enter_chat(parents);
+    }
+
     pub fn open_agent_chat(&self, target: ActiveAgentRef) {
         let path = self.agents.with_untracked(|agents| {
             let mut current = target.clone();
@@ -1358,6 +1375,13 @@ impl AppState {
         } else {
             MobileTab::Agents
         }
+    }
+
+    pub(crate) fn active_board_project(&self) -> Option<ActiveProjectRef> {
+        let host = self.active_local_host_id.get();
+        self.board_project
+            .get()
+            .filter(|target| host.as_ref() == Some(&target.local_host_id))
     }
 
     pub fn back_destination(&self) -> Option<BackDestination> {
@@ -1477,11 +1501,13 @@ impl AppState {
             native_sidebar_open: RwSignal::new(true),
             native_modal_sources: RwSignal::new(Vec::new()),
             native_unsaved_sources: RwSignal::new(Vec::new()),
+            native_agents_detail_back: RwSignal::new(None),
             native_chat_destination: RwSignal::new(None),
             native_auth_recovery: RwSignal::new(None),
             chat_send_menu_open: RwSignal::new(false),
             native_chat_header_owner: RwSignal::new(None),
             native_chat_dock_owner: RwSignal::new(None),
+            native_activity_rail_supported: RwSignal::new(false),
             native_root_status_owner: RwSignal::new(None),
             native_chat_action: RwSignal::new(None),
             native_chat_heading: RwSignal::new(("New Chat".into(), None)),

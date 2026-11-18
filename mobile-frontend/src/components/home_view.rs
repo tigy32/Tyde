@@ -74,6 +74,7 @@ pub fn HomeView() -> impl IntoView {
         });
 
     let on_new_chat = crate::components::new_chat_callback(&state);
+    let rail_state = state.clone();
 
     let native_heading_state = state.clone();
     let s_recent = state.clone();
@@ -104,11 +105,7 @@ pub fn HomeView() -> impl IntoView {
 
     let board_state = state.clone();
     let project_state = state.clone();
-    let showing_board = Memo::new(move |_| {
-        board_state.board_project.get().filter(|target| {
-            Some(target.local_host_id.clone()) == board_state.active_local_host_id.get()
-        })
-    });
+    let showing_board = Memo::new(move |_| board_state.active_board_project());
     view! {
         <Show when=move || showing_board.get().is_some()>
             {move || showing_board.get().map(|target| view! { <super::project_board::ProjectBoard target=target /> })}
@@ -188,6 +185,8 @@ pub fn HomeView() -> impl IntoView {
                                 <Skeleton width="100%".to_string() height="52px".to_string() rounded=false />
                             </div>
                         }.into_any()
+                    } else if crate::native::activity_rail_owned(&rail_state) {
+                        ().into_any()
                     } else {
                         view! {
                             <div class="home-new-chat">

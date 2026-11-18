@@ -5979,6 +5979,8 @@ button.mobile-swarm-member { width: 100%; min-height: 44px; border-left: 0; bord
 .mobile-project-page > .view-body { min-height: 0; }
 .mobile-project-page .view-header { gap: 8px; }
 .mobile-project-page .view-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-project-page > .shell-header:has(> .board-title) { margin-inline: 0; }
+.mobile-project-page .board-title { margin: 0; padding-inline: 16px; font-size: 22px; font-weight: 600; overflow-wrap: anywhere; }
 .mobile-project-page .board-lanes { gap: 24px; padding: 16px 16px max(16px, var(--tws-clear-bottom, 16px)); }
 .board-lane { min-width: 0; }
 .board-lane-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 16px; margin: 0 0 12px; }

@@ -84,9 +84,10 @@ pub fn ProjectBoard(target: ActiveProjectRef) -> impl IntoView {
     let new_state = state.clone();
     let new_target = target.clone();
     let new_chat = Callback::new(move |_| {
-        new_state.active_project.set(Some(new_target.clone()));
-        crate::actions::open_new_chat(&new_state);
+        crate::actions::open_project_chat(&new_state, new_target.clone());
     });
+    let toolbar_state = state.clone();
+    let shell_toolbar = move || crate::native::board_toolbar_owned(&toolbar_state);
     let error_state = state.clone();
     let error_key = (host.clone(), project.clone());
     let server_error = Signal::derive(move || {
@@ -123,12 +124,19 @@ pub fn ProjectBoard(target: ActiveProjectRef) -> impl IntoView {
     view! {
         <div class="view mobile-project-page" data-mobile-test="project-board">
             <div class="shell-header tws-header">
-                <header class="view-header">
-                    <Button label="Back" variant=ButtonVariant::Ghost size=ButtonSize::Compact
-                        on_click=Callback::new(move |_| back_state.board_project.set(None)) />
-                    <h1 class="view-title">{title}</h1>
-                    <Button label="New agent" variant=ButtonVariant::Primary size=ButtonSize::Compact on_click=new_chat />
-                </header>
+                {move || if shell_toolbar() {
+                    view! { <h1 class="board-title">{title.clone()}</h1> }.into_any()
+                } else {
+                    let back_state = back_state.clone();
+                    view! {
+                        <header class="view-header">
+                            <Button label="Back" variant=ButtonVariant::Ghost size=ButtonSize::Compact
+                                on_click=Callback::new(move |_| back_state.board_project.set(None)) />
+                            <h1 class="view-title">{title.clone()}</h1>
+                            <Button label="New agent" variant=ButtonVariant::Primary size=ButtonSize::Compact on_click=new_chat />
+                        </header>
+                    }.into_any()
+                }}
                 <super::ConnectionBanner inline=true />
                 {move || error_text().map(|message| view! {
                     <div class="board-error" role="alert"><span>{message}</span>
