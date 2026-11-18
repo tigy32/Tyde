@@ -1,33 +1,11 @@
 use protocol::*;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::{collections::HashMap, path::PathBuf};
-use tokio::sync::{mpsc, oneshot};
+use std::{collections::HashMap, sync::Arc};
+
+use crate::store::session::{SessionStore, SessionStoreHandle};
 
 #[derive(Clone)]
-pub(crate) struct BoardHandle(mpsc::UnboundedSender<Request>);
-
-enum Request {
-    Apply {
-        command: BoardCommandPayload,
-        live: Vec<(ProjectId, AgentStartPayload)>,
-        actor: BoardActor,
-        reply: oneshot::Sender<Result<BoardStatePayload, BoardErrorPayload>>,
-    },
-    Settle(
-        AgentStartPayload,
-        Option<ProjectId>,
-        oneshot::Sender<Result<(), String>>,
-    ),
-    Sections(oneshot::Sender<Result<HashMap<ProjectId, String>, String>>),
-    Rotate {
-        old: AgentId,
-        new: AgentId,
-        session: SessionId,
-        old_session: SessionId,
-        summary: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-}
+pub(crate) struct BoardHandle(Arc<SessionStoreHandle>);
 
 fn storage(error: impl std::fmt::Display) -> String {
     format!("board storage: {error}")
@@ -53,93 +31,23 @@ pub(crate) fn command_project(command: &BoardCommandPayload) -> &ProjectId {
     }
 }
 
-impl BoardHandle {
-    pub(crate) fn start(path: PathBuf) -> Result<Self, String> {
-        let mut connection = Connection::open(path).map_err(storage)?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(storage)?;
+pub(crate) fn initialize(store: &SessionStore) -> Result<(), String> {
+    store.with_writer(|connection| {
         connection.execute_batch("CREATE TABLE IF NOT EXISTS board_versions (project_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS board_lanes (project_id TEXT NOT NULL, id TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(project_id,id));
             CREATE TABLE IF NOT EXISTS board_cards (project_id TEXT NOT NULL, id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, session_id TEXT, record TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS board_cards_project ON board_cards(project_id);
             CREATE UNIQUE INDEX IF NOT EXISTS board_cards_agent ON board_cards(agent_id);
             CREATE UNIQUE INDEX IF NOT EXISTS board_cards_session ON board_cards(session_id);
-            CREATE TABLE IF NOT EXISTS board_moves (card_id TEXT NOT NULL, seq INTEGER NOT NULL, record TEXT NOT NULL, PRIMARY KEY(card_id,seq));").map_err(storage)?;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        std::thread::Builder::new()
-            .name("board-store".into())
-            .spawn(move || {
-                while let Some(request) = rx.blocking_recv() {
-                    match request {
-                        Request::Apply {
-                            command,
-                            live,
-                            actor,
-                            reply,
-                        } => {
-                            let id = command_project(&command).clone();
-                            let result = apply(&mut connection, command, live, actor)
-                                .map_err(|error| failure(&id, BoardErrorCode::Storage, error))
-                                .and_then(|result| result);
-                            let _ = reply.send(result);
-                        }
-                        Request::Settle(start, owner, reply) => {
-                            let result = (|| {
-                                let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage)?;
-                                if let Some(owner) = owner { reconcile(&transaction,&[(owner,start.clone())])?; }
-                                let mut statement = transaction
-                                    .prepare("SELECT project_id,record FROM board_cards WHERE agent_id=? OR session_id=?")
-                                    .map_err(storage)?;
-                                let rows = statement
-                                    .query_map(params![start.agent_id.0,start.session_id.as_ref().map(|id| &id.0)], |row| {
-                                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                                    })
-                                    .map_err(storage)?
-                                    .collect::<Result<Vec<_>, _>>()
-                                    .map_err(storage)?;
-                                drop(statement);
-                                for (project, record) in rows {
-                                    let mut card: BoardCard =
-                                        serde_json::from_str(&record).map_err(storage)?;
-                                    if card.agent_id != start.agent_id && !start.session_id.as_ref().is_some_and(|session| card.session_id.as_ref() == Some(session)) {
-                                        return Err("board card identity index disagrees with its record".into());
-                                    }
-                                    card.agent_id = start.agent_id.clone();
-                                    card.title = start.name.clone();
-                                    card.session_id = start.session_id.clone();
-                                    persist_card(&transaction, &ProjectId(project), &card)?;
-                                }
-                                transaction.commit().map_err(storage)
-                            })();
-                            let _ = reply.send(result);
-                        }
-                        Request::Sections(reply) => {
-                            let _ = reply.send(sections(&connection));
-                        }
-                        Request::Rotate {
-                            old,
-                            new,
-                            session,
-                            old_session,
-                            summary,
-                            reply,
-                        } => {
-                            let _ = reply.send(rotate(
-                                &mut connection,
-                                old,
-                                new,
-                                old_session,
-                                session,
-                                summary,
-                            ));
-                        }
-                    }
-                }
-            })
-            .map_err(storage)?;
-        Ok(Self(tx))
+            CREATE TABLE IF NOT EXISTS board_moves (card_id TEXT NOT NULL, seq INTEGER NOT NULL, record TEXT NOT NULL, PRIMARY KEY(card_id,seq));").map_err(storage)
+    })
+}
+
+impl BoardHandle {
+    pub(crate) fn new(store: Arc<SessionStoreHandle>) -> Self {
+        Self(store)
     }
+
     pub(crate) async fn apply(
         &self,
         command: BoardCommandPayload,
@@ -147,34 +55,26 @@ impl BoardHandle {
         actor: BoardActor,
     ) -> Result<BoardStatePayload, BoardErrorPayload> {
         let id = command_project(&command).clone();
-        let (reply, rx) = oneshot::channel();
         self.0
-            .send(Request::Apply {
-                command,
-                live,
-                actor,
-                reply,
-            })
-            .map_err(|_| failure(&id, BoardErrorCode::Storage, "board actor stopped"))?;
-        rx.await
-            .map_err(|_| failure(&id, BoardErrorCode::Storage, "board actor stopped"))?
+            .apply_board(move |db| apply(db, command, live, actor))
+            .await
+            .map_err(|error| failure(&id, BoardErrorCode::Storage, error))?
     }
+
     pub(crate) async fn settle_card(
         &self,
         start: AgentStartPayload,
         owner: Option<ProjectId>,
     ) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
         self.0
-            .send(Request::Settle(start, owner, reply))
-            .map_err(storage)?;
-        rx.await.map_err(storage)?
+            .call(move |store| store.with_writer(|db| settle_card(db, start, owner)))
+            .await
     }
+
     pub(crate) async fn sections(&self) -> Result<HashMap<ProjectId, String>, String> {
-        let (reply, rx) = oneshot::channel();
-        self.0.send(Request::Sections(reply)).map_err(storage)?;
-        rx.await.map_err(storage)?
+        self.0.read(|store| sections(&store.reader()?)).await
     }
+
     pub(crate) async fn rotate(
         &self,
         old: AgentId,
@@ -183,19 +83,53 @@ impl BoardHandle {
         session: SessionId,
         summary: String,
     ) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
         self.0
-            .send(Request::Rotate {
-                old,
-                new,
-                session,
-                old_session,
-                summary,
-                reply,
+            .call(move |store| {
+                store.with_writer(|db| rotate(db, old, new, old_session, session, summary))
             })
-            .map_err(storage)?;
-        rx.await.map_err(storage)?
+            .await
     }
+}
+
+fn settle_card(
+    db: &mut Connection,
+    start: AgentStartPayload,
+    owner: Option<ProjectId>,
+) -> Result<(), String> {
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    if let Some(owner) = owner {
+        reconcile(&tx, &[(owner, start.clone())])?;
+    }
+    let mut statement = tx
+        .prepare("SELECT project_id,record FROM board_cards WHERE agent_id=? OR session_id=?")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![start.agent_id.0, start.session_id.as_ref().map(|id| &id.0)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    drop(statement);
+    for (project, record) in rows {
+        let mut card: BoardCard = serde_json::from_str(&record).map_err(storage)?;
+        if card.agent_id != start.agent_id
+            && !start
+                .session_id
+                .as_ref()
+                .is_some_and(|session| card.session_id.as_ref() == Some(session))
+        {
+            return Err("board card identity index disagrees with its record".into());
+        }
+        card.agent_id = start.agent_id.clone();
+        card.title = start.name.clone();
+        card.session_id = start.session_id.clone();
+        persist_card(&tx, &ProjectId(project), &card)?;
+    }
+    tx.commit().map_err(storage)
 }
 
 fn default_lanes() -> Vec<BoardLane> {

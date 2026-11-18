@@ -269,7 +269,9 @@ one transaction. Project-wide operations and lineage queries can still read
 multiple rows; ordinary single-session updates do not rewrite other sessions.
 
 Runtime access uses a bounded blocking-I/O admission layer: one writer and a
-separate four-reader budget. Readers use separate read-only connections, not the
+separate four-reader budget. Board operations that reconcile or mutate cards
+use this same writer, including board snapshots that can reconcile retained
+cards. Readers use separate read-only connections, not the
 writer mutex, so an uncommitted transaction cannot expose partial state or make
 session reads wait for its flush. The writer connection stays open to avoid a
 last-connection checkpoint after every operation. Transaction timings and row

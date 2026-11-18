@@ -2772,6 +2772,12 @@ impl HostHandle {
         InstalledAgentNameGate { inner }
     }
 
+    pub async fn subscribe_queued_board_apply_for_test(&self) -> watch::Receiver<()> {
+        self.state
+            .with(|state| state.session_store.subscribe_queued_board_apply_for_test())
+            .await
+    }
+
     pub async fn install_backend_setup_refresh_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         let shared = gate.shared();
@@ -20756,10 +20762,9 @@ fn spawn_host_inner(
     let backend_storage =
         crate::backend::BackendStorage::new(runtime_config.backend_storage_roots.clone())?;
 
-    let board_path = SessionStore::database_path(&paths.session);
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
-    let board = crate::board::BoardHandle::start(board_path)?;
+    crate::board::initialize(&session_store)?;
     let project_store = ProjectStore::load(paths.project)?;
     let initial_projects = project_store.list()?;
     let workflow_catalog = WorkflowCatalog::discover(&initial_projects);
@@ -20843,6 +20848,7 @@ fn spawn_host_inner(
         .map(|snapshot| (snapshot.start.agent_id.clone(), snapshot))
         .collect();
     let session_store = Arc::new(SessionStoreHandle::new(session_store));
+    let board = crate::board::BoardHandle::new(Arc::clone(&session_store));
     let review_store = ReviewStore::new(Arc::clone(&session_store));
     let review_registry = ReviewRegistry::spawn(
         review_store,

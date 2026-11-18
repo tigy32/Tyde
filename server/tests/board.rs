@@ -276,7 +276,11 @@ async fn move_project(f: &mut Fixture, agent: &TestAgent, project: &ProjectId) {
 
 #[tokio::test]
 async fn board_lanes_cards_tools_steering_and_restart() {
-    let mut f = Fixture::new().await;
+    let mut f = Fixture::new_with_store_files(
+        r#"{"records":{"saved":{"id":"saved","backend_kind":"claude","workspace_roots":["/tmp"],"created_at_ms":1,"updated_at_ms":1}}}"#,
+        r#"{"version":2,"records":{}}"#,
+    )
+    .await;
     let root = tempfile::tempdir().expect("project root");
     for args in [
         vec!["init"],
@@ -330,7 +334,80 @@ async fn board_lanes_cards_tools_steering_and_restart() {
     else {
         panic!("workbench upsert")
     };
-    let mut board = read(&mut f, &project.id).await;
+    let mut deleting = f.connect().await;
+    let (entered, writing) = tokio::sync::oneshot::channel();
+    let (release, settle) = std::sync::mpsc::channel();
+    let commit = f.on_next_session_commit(move || {
+        entered.send(()).expect("observe session write");
+        let _ = settle.recv();
+    });
+    deleting
+        .delete_session(DeleteSessionPayload {
+            session_id: SessionId("saved".into()),
+        })
+        .await
+        .expect("delete imported session");
+    writing.await.expect("session writer holds its transaction");
+
+    // A second SQLite writer, as used by the old board path, cannot
+    // begin while the session transaction is still open.
+    {
+        let db = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
+            &f.session_store_path(),
+        ))
+        .expect("open competing connection");
+        db.busy_timeout(std::time::Duration::ZERO)
+            .expect("disable busy retry for contention probe");
+        let error = db
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect_err("session transaction excludes a second SQLite writer");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+    }
+
+    let mut queued = f
+        .host_for_test()
+        .subscribe_queued_board_apply_for_test()
+        .await;
+    send(
+        &mut f,
+        BoardCommandPayload::Read(BoardReadPayload {
+            project_id: project.id.clone(),
+        }),
+    )
+    .await;
+    let board_response =
+        |frame: &Envelope| matches!(frame.kind, FrameKind::BoardState | FrameKind::BoardError);
+    tokio::select! {
+        event = queued.changed() => event.expect("board waits on the shared writer"),
+        frame = next_frame_matching_on(&mut f.client, "premature board response", board_response) => {
+            panic!("board returned {:?} instead of queueing behind session storage", frame.kind);
+        }
+    }
+    release.send(()).expect("release session commit");
+    drop(commit);
+    let frame =
+        next_frame_matching_on(&mut f.client, "board after session commit", board_response).await;
+    assert_eq!(frame.kind, FrameKind::BoardState);
+    let mut board: BoardStatePayload = frame
+        .parse_payload()
+        .expect("board state after session commit");
+
+    deleting
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list after session commit");
+    let sessions: SessionListPayload =
+        next_frame_matching_on(&mut deleting, "settled session deletion", |frame| {
+            frame.kind == FrameKind::SessionList
+        })
+        .await
+        .parse_payload()
+        .expect("session list after deletion");
+    assert!(sessions.sessions.is_empty());
+
     assert_eq!(
         board
             .lanes

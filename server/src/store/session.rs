@@ -1791,7 +1791,15 @@ impl SessionStore {
         Ok(result)
     }
 
-    pub(super) fn reader(&self) -> Result<Connection, String> {
+    pub(crate) fn with_writer<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut connection = self.writer.lock().map_err(|_| "session writer poisoned")?;
+        operation(&mut connection)
+    }
+
+    pub(crate) fn reader(&self) -> Result<Connection, String> {
         let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql_error)?;
         connection
@@ -1858,11 +1866,30 @@ impl SessionStore {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SessionIoKind {
+    Read,
+    Write,
+    BoardApply,
+}
+
+impl SessionIoKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::BoardApply => "board_apply",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionStoreHandle {
     store: Arc<SessionStore>,
     readers: Arc<tokio::sync::Semaphore>,
     writers: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "test-support")]
+    queued_board_apply_for_test: tokio::sync::watch::Sender<()>,
 }
 
 impl SessionStoreHandle {
@@ -1871,7 +1898,14 @@ impl SessionStoreHandle {
             store: Arc::new(store),
             readers: Arc::new(tokio::sync::Semaphore::new(4)),
             writers: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "test-support")]
+            queued_board_apply_for_test: tokio::sync::watch::Sender::new(()),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn subscribe_queued_board_apply_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.queued_board_apply_for_test.subscribe()
     }
 
     pub(crate) async fn call<T, F>(&self, operation: F) -> Result<T, String>
@@ -1879,8 +1913,21 @@ impl SessionStoreHandle {
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        self.run(Arc::clone(&self.writers), "write", operation)
+        self.run(Arc::clone(&self.writers), SessionIoKind::Write, operation)
             .await
+    }
+
+    pub(crate) async fn apply_board<T, F>(&self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
+    {
+        self.run(
+            Arc::clone(&self.writers),
+            SessionIoKind::BoardApply,
+            move |store| store.with_writer(operation),
+        )
+        .await
     }
 
     pub(crate) async fn read<T, F>(&self, operation: F) -> Result<T, String>
@@ -1888,25 +1935,38 @@ impl SessionStoreHandle {
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        self.run(Arc::clone(&self.readers), "read", operation).await
+        self.run(Arc::clone(&self.readers), SessionIoKind::Read, operation)
+            .await
     }
 
     async fn run<T, F>(
         &self,
         admission: Arc<tokio::sync::Semaphore>,
-        kind: &'static str,
+        kind: SessionIoKind,
         operation: F,
     ) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        crate::host::awaited_leaf(crate::host::HostStateLeaf::SessionStore, kind, async {
+        crate::host::awaited_leaf(crate::host::HostStateLeaf::SessionStore, kind.as_str(), async {
             let admitted_at = Instant::now();
-            let permit = admission
-                .acquire_owned()
+            let acquire = admission.acquire_owned();
+            #[cfg(feature = "test-support")]
+            let acquire = async {
+                use std::future::Future;
+
+                let mut acquire = std::pin::pin!(acquire);
+                std::future::poll_fn(|cx| {
+                    let result = acquire.as_mut().poll(cx);
+                    if matches!(kind, SessionIoKind::BoardApply) && result.is_pending() {
+                        self.queued_board_apply_for_test.send_replace(());
+                    }
+                    result
+                })
                 .await
-                .map_err(|_| "session storage closed")?;
+            };
+            let permit = acquire.await.map_err(|_| "session storage closed")?;
             let admission_ms = admitted_at.elapsed().as_millis();
             let queued_at = Instant::now();
             let store = Arc::clone(&self.store);
@@ -1914,7 +1974,7 @@ impl SessionStoreHandle {
                 let worker_ms = queued_at.elapsed().as_millis();
                 let operation_at = Instant::now();
                 let result = operation(&store);
-                tracing::info!(target: "server::session_transaction", kind, admission_ms, worker_ms, operation_ms = operation_at.elapsed().as_millis(), success = result.is_ok(), "session storage operation settled");
+                tracing::info!(target: "server::session_transaction", kind = kind.as_str(), admission_ms, worker_ms, operation_ms = operation_at.elapsed().as_millis(), success = result.is_ok(), "session storage operation settled");
                 drop(permit);
                 result
             })
