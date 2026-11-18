@@ -1931,6 +1931,8 @@ pub struct HostBootstrapPayload<S = Value> {
     pub sessions: Vec<SessionSummary>,
     pub session_list: SessionListPageInfo,
     pub projects: Vec<Project>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_catalog_warning: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub skills: Vec<Skill>,
     pub steering: Vec<Steering>,

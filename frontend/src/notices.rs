@@ -15,6 +15,7 @@ pub enum NoticeScope {
     Terminal(String, StreamPath),
     Terminals,
     Browser,
+    ProjectCatalog(String),
     ProjectOperations(String),
     Workflows(String),
     SelfImprovement(String),
@@ -165,6 +166,7 @@ pub fn clear_host(host: &str) {
                 NoticeScope::Settings(Some(owner))
                 | NoticeScope::Sessions(owner)
                 | NoticeScope::Project(owner, _)
+                | NoticeScope::ProjectCatalog(owner)
                 | NoticeScope::Agent(owner, _)
                 | NoticeScope::Review(owner, _)
                 | NoticeScope::Terminal(owner, _)
@@ -509,11 +511,16 @@ pub fn ProjectDialogs() -> impl IntoView {
     let remove_prompt = state.workbench_remove_prompt;
     let browser = state.browse_dialog;
     let scopes = move || {
+        let mut scopes = state
+            .configured_hosts
+            .get()
+            .into_iter()
+            .map(|host| NoticeScope::ProjectCatalog(host.id))
+            .collect::<Vec<_>>();
         if browser.with(|dialog| dialog.is_none()) {
-            vec![NoticeScope::Browser]
-        } else {
-            Vec::new()
+            scopes.push(NoticeScope::Browser);
         }
+        scopes
     };
     view! {
         <div class="browser-notices">

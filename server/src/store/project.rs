@@ -273,7 +273,35 @@ impl ProjectStore {
     }
 
     pub fn get(&self, id: &ProjectId) -> Option<Project> {
-        self.records.get(&id.0).cloned()
+        self.records
+            .get(&id.0)
+            .filter(|project| validate_supported_project(project).is_ok())
+            .cloned()
+    }
+
+    pub(crate) fn require_supported_workspace(&self, id: &ProjectId) -> Result<(), String> {
+        if let Some(project) = self.records.get(&id.0) {
+            validate_supported_project(project)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalog_warning(&self) -> Option<String> {
+        let mut names = self
+            .records
+            .values()
+            .filter(|project| validate_supported_project(project).is_err())
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        names.sort_unstable();
+        Some(format!(
+            "Projects unavailable: {}. {} To clear this notice, stop this Tyde server before removing the obsolete entries from projects.json.",
+            names.join(", "),
+            crate::paths::SSH_WORKSPACE_ROOTS_REMOVED
+        ))
     }
 
     pub fn create(
@@ -283,6 +311,8 @@ impl ProjectStore {
     ) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
+        crate::paths::reject_ssh_workspace_roots(roots.iter().map(|root| &root.0))
+            .map_err(ProjectStoreError::invalid_input)?;
         validate_standalone_roots_for_input(&roots).map_err(ProjectStoreError::invalid_input)?;
         for root in &roots {
             if let Some(owner) = root_path_owner(&self.records, root, None) {
@@ -308,6 +338,8 @@ impl ProjectStore {
 
     pub fn rename(&mut self, id: &ProjectId, name: String) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
+        self.require_supported_workspace(id)
+            .map_err(ProjectStoreError::invalid_input)?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
         let mut records = self.records.clone();
         let Some(project) = records.get_mut(&id.0) else {
@@ -385,7 +417,11 @@ impl ProjectStore {
         root: ProjectRootPath,
     ) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
+        self.require_supported_workspace(id)
+            .map_err(ProjectStoreError::invalid_input)?;
         validate_project_root(&root).map_err(ProjectStoreError::invalid_input)?;
+        crate::paths::reject_ssh_workspace_roots([&root.0])
+            .map_err(ProjectStoreError::invalid_input)?;
         let children = self.list_children(id);
         if let Some(child) = children.first() {
             return Err(ProjectStoreError::conflict(format!(
@@ -435,6 +471,8 @@ impl ProjectStore {
         root: &ProjectRootPath,
     ) -> Result<Project, ProjectStoreError> {
         self.refresh_if_stale()?;
+        self.require_supported_workspace(id)
+            .map_err(ProjectStoreError::invalid_input)?;
         let children = self.list_children(id);
         if let Some(child) = children.first() {
             return Err(ProjectStoreError::conflict(format!(
@@ -537,7 +575,7 @@ impl ProjectStore {
                 "workbench branch must not be empty",
             ));
         }
-        let Some(parent) = self.records.get(&parent_project_id.0) else {
+        let Some(parent) = self.get(&parent_project_id) else {
             return Err(ProjectStoreError::not_found(format!(
                 "cannot create workbench for missing parent project {}",
                 parent_project_id
@@ -834,7 +872,9 @@ impl ProjectStore {
     fn ordered_projects(records: &HashMap<String, Project>) -> Vec<Project> {
         let mut top_level = records
             .values()
-            .filter(|project| !project.is_workbench())
+            .filter(|project| {
+                !project.is_workbench() && validate_supported_project(project).is_ok()
+            })
             .cloned()
             .collect::<Vec<_>>();
         sort_projects_by_sort_order(&mut top_level);
@@ -843,7 +883,10 @@ impl ProjectStore {
         for parent in top_level {
             let mut children = records
                 .values()
-                .filter(|project| project.parent_project_id() == Some(&parent.id))
+                .filter(|project| {
+                    project.parent_project_id() == Some(&parent.id)
+                        && validate_supported_project(project).is_ok()
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             sort_projects_by_sort_order(&mut children);
@@ -860,11 +903,13 @@ impl ProjectStore {
             ProjectReorderScope::TopLevel => self
                 .records
                 .values()
-                .filter(|project| !project.is_workbench())
+                .filter(|project| {
+                    !project.is_workbench() && validate_supported_project(project).is_ok()
+                })
                 .cloned()
                 .collect::<Vec<_>>(),
             ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
-                let Some(parent) = self.records.get(&parent_project_id.0) else {
+                let Some(parent) = self.get(parent_project_id) else {
                     return Err(ProjectStoreError::not_found(format!(
                         "cannot reorder workbenches for missing parent project {}",
                         parent_project_id
@@ -878,7 +923,10 @@ impl ProjectStore {
                 }
                 self.records
                     .values()
-                    .filter(|project| project.parent_project_id() == Some(parent_project_id))
+                    .filter(|project| {
+                        project.parent_project_id() == Some(parent_project_id)
+                            && validate_supported_project(project).is_ok()
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             }
@@ -952,7 +1000,10 @@ fn heal_duplicate_standalone_roots(records: &mut HashMap<String, Project>) -> Ve
 
     let mut standalone_order: Vec<(u64, String)> = records
         .values()
-        .filter(|project| matches!(project.source, ProjectSource::Standalone { .. }))
+        .filter(|project| {
+            matches!(project.source, ProjectSource::Standalone { .. })
+                && validate_supported_project(project).is_ok()
+        })
         .map(|project| (project.sort_order, project.id.0.clone()))
         .collect();
     standalone_order.sort();
@@ -1054,6 +1105,10 @@ fn validate_records_for_load(records: &mut HashMap<String, Project>) -> Vec<Stri
     let mut projects: Vec<&Project> = records.values().collect();
     projects.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     for project in projects {
+        if let Err(error) = validate_supported_project(project) {
+            warnings.push(format!("project {} is unavailable: {error}", project.id));
+            continue;
+        }
         if let ProjectSource::Standalone { roots } = &project.source
             && let Err(error) = validate_standalone_roots_for_input(roots)
         {
@@ -1135,8 +1190,10 @@ fn validate_records(records: &HashMap<String, Project>) -> Result<(), String> {
                     format!("Invalid project store: project {} {error}", project.id)
                 })?;
                 standalone_roots.insert(project.id.clone(), roots.clone());
-                for root in roots {
-                    insert_actual_root_owner(&mut actual_root_owners, root, &project.id)?;
+                if validate_supported_project(project).is_ok() {
+                    for root in roots {
+                        insert_actual_root_owner(&mut actual_root_owners, root, &project.id)?;
+                    }
                 }
             }
             ProjectSource::GitWorkbench { branch, roots, .. } => {
@@ -1155,12 +1212,14 @@ fn validate_records(records: &HashMap<String, Project>) -> Result<(), String> {
                 validate_workbench_root_uniqueness(roots).map_err(|error| {
                     format!("Invalid project store: workbench {} {error}", project.id)
                 })?;
-                for root in roots {
-                    insert_actual_root_owner(
-                        &mut actual_root_owners,
-                        &root.worktree_root,
-                        &project.id,
-                    )?;
+                if validate_supported_project(project).is_ok() {
+                    for root in roots {
+                        insert_actual_root_owner(
+                            &mut actual_root_owners,
+                            &root.worktree_root,
+                            &project.id,
+                        )?;
+                    }
                 }
             }
         }
@@ -1209,6 +1268,20 @@ fn validate_project_name(name: &str) -> Result<(), String> {
         return Err("name must not be empty".to_owned());
     }
     Ok(())
+}
+
+// Keep obsolete records on disk without advertising them as usable projects.
+fn validate_supported_project(project: &Project) -> Result<(), String> {
+    match &project.source {
+        ProjectSource::Standalone { roots } => {
+            crate::paths::reject_ssh_workspace_roots(roots.iter().map(|root| &root.0))
+        }
+        ProjectSource::GitWorkbench { roots, .. } => crate::paths::reject_ssh_workspace_roots(
+            roots
+                .iter()
+                .flat_map(|root| [&root.parent_root.0, &root.worktree_root.0]),
+        ),
+    }
 }
 
 fn validate_project_root(root: &ProjectRootPath) -> Result<(), String> {
@@ -1301,7 +1374,7 @@ fn root_path_owner(
     except_id: Option<&ProjectId>,
 ) -> Option<ProjectId> {
     records.values().find_map(|project| {
-        if except_id == Some(&project.id) {
+        if except_id == Some(&project.id) || validate_supported_project(project).is_err() {
             return None;
         }
         project

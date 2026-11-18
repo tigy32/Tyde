@@ -104,14 +104,8 @@ pub enum AcpInbound {
 
 #[derive(Clone)]
 pub struct AcpRequestOrigin {
-    execution: AcpRequestExecution,
+    execution: tyde_process_env::launch::ExecutionContext,
     stdin: AcpStdinWriter,
-}
-
-#[derive(Clone)]
-enum AcpRequestExecution {
-    Local(tyde_process_env::launch::ExecutionContext),
-    Remote,
 }
 
 impl AcpRequestOrigin {
@@ -139,9 +133,7 @@ pub struct AcpSpawnSpec {
     pub display_name: String,
     pub local_program: String,
     pub local_args: Vec<String>,
-    pub remote_args: Vec<String>,
     pub local_cwd: Option<String>,
-    pub remote_cwd: Option<String>,
     pub local_env: Vec<(String, String)>,
 }
 
@@ -156,16 +148,12 @@ impl AcpSpawnSpec {
             .iter()
             .map(|arg| arg.to_string())
             .collect::<Vec<_>>();
-        let mut remote_args = vec![local_program.clone()];
-        remote_args.extend(local_args_vec.clone());
 
         Self {
             display_name: display_name.into(),
             local_program,
             local_args: local_args_vec,
-            remote_args,
             local_cwd: None,
-            remote_cwd: None,
             local_env: Vec::new(),
         }
     }
@@ -174,14 +162,6 @@ impl AcpSpawnSpec {
         let cwd = cwd.into();
         if !cwd.trim().is_empty() {
             self.local_cwd = Some(cwd);
-        }
-        self
-    }
-
-    pub fn with_remote_cwd(mut self, cwd: impl Into<String>) -> Self {
-        let cwd = cwd.into();
-        if !cwd.trim().is_empty() {
-            self.remote_cwd = Some(cwd);
         }
         self
     }
@@ -297,9 +277,8 @@ pub struct AcpBridge {
 impl AcpBridge {
     pub async fn spawn(
         spec: AcpSpawnSpec,
-        ssh_host: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host, None).await?;
+        let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, None).await?;
         Ok((
             Self {
                 rpc: AcpRpcOwner::spawn(rpc),
@@ -381,7 +360,7 @@ impl AcpBridge {
         rpc.stderr_task.abort();
         rpc.shutdown().await;
         prepare.await?;
-        let (replacement, _, _) = AcpRpc::spawn(spec, None, Some(self.inbound_tx.clone())).await?;
+        let (replacement, _, _) = AcpRpc::spawn(spec, Some(self.inbound_tx.clone())).await?;
         self.rpc
             .state
             .apply(move |state| state.rpc = Arc::new(replacement));
@@ -464,54 +443,28 @@ impl AcpBridge {
 
     async fn handle_builtin_request(
         &self,
-        execution: &AcpRequestExecution,
+        execution: &tyde_process_env::launch::ExecutionContext,
         method: &str,
         params: &Value,
     ) -> Result<Option<Value>, String> {
-        match (execution, method) {
-            (
-                AcpRequestExecution::Remote,
-                "fs/read_text_file"
-                | "fs/write_text_file"
-                | "terminal/create"
-                | "terminal/output"
-                | "terminal/wait_for_exit"
-                | "terminal/kill"
-                | "terminal/release",
-            ) => {
-                tracing::warn!(
-                    method,
-                    "Rejected unsupported remote ACP filesystem or terminal callback"
-                );
-                Err("Remote ACP filesystem and terminal callbacks are unsupported".to_owned())
-            }
-            (AcpRequestExecution::Local(execution), "fs/read_text_file") => self
+        match method {
+            "fs/read_text_file" => self
                 .handle_fs_read_text_file(execution, params)
                 .await
                 .map(Some),
-            (AcpRequestExecution::Local(execution), "fs/write_text_file") => self
+            "fs/write_text_file" => self
                 .handle_fs_write_text_file(execution, params)
                 .await
                 .map(Some),
-            (AcpRequestExecution::Local(execution), "terminal/create") => self
+            "terminal/create" => self
                 .handle_terminal_create(execution, params)
                 .await
                 .map(Some),
-            (AcpRequestExecution::Local(_), "terminal/output") => {
-                self.handle_terminal_output(params).await.map(Some)
-            }
-            (AcpRequestExecution::Local(_), "terminal/wait_for_exit") => {
-                self.handle_terminal_wait_for_exit(params).await.map(Some)
-            }
-            (AcpRequestExecution::Local(_), "terminal/kill") => {
-                self.handle_terminal_kill(params).await.map(Some)
-            }
-            (AcpRequestExecution::Local(_), "terminal/release") => {
-                self.handle_terminal_release(params).await.map(Some)
-            }
-            (_, "session/request_permission") => {
-                self.handle_request_permission(params).await.map(Some)
-            }
+            "terminal/output" => self.handle_terminal_output(params).await.map(Some),
+            "terminal/wait_for_exit" => self.handle_terminal_wait_for_exit(params).await.map(Some),
+            "terminal/kill" => self.handle_terminal_kill(params).await.map(Some),
+            "terminal/release" => self.handle_terminal_release(params).await.map(Some),
+            "session/request_permission" => self.handle_request_permission(params).await.map(Some),
             _ => Ok(None),
         }
     }
@@ -1589,7 +1542,6 @@ struct AcpRpc {
 impl AcpRpc {
     async fn spawn(
         spec: AcpSpawnSpec,
-        ssh_host: Option<&str>,
         existing_inbound: Option<mpsc::UnboundedSender<AcpInbound>>,
     ) -> Result<
         (
@@ -1599,37 +1551,24 @@ impl AcpRpc {
         ),
         String,
     > {
-        let (mut child, execution) = if let Some(host) = ssh_host {
-            let child = crate::remote::spawn_remote_process(
-                host,
-                &spec.remote_args[0],
-                &spec.remote_args[1..],
-                spec.remote_cwd.as_deref(),
-            )
+        let mut cmd = crate::backend::subprocess::command(&spec.local_program)?;
+        cmd.args(&spec.local_args)
+            .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+        cmd.envs(spec.local_env);
+        if let Some(path) = spec
+            .local_cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            cmd.current_dir(path);
+        }
+        let (mut child, execution) = cmd
+            .group_spawn_with_execution()
             .await
-            .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?;
-            (child, AcpRequestExecution::Remote)
-        } else {
-            let mut cmd = crate::backend::subprocess::command(&spec.local_program)?;
-            cmd.args(&spec.local_args)
-                .stdin(crate::backend::subprocess::ProcessStdio::Piped)
-                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
-                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-            cmd.envs(spec.local_env);
-            if let Some(path) = spec
-                .local_cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                cmd.current_dir(path);
-            }
-            let (child, execution) = cmd
-                .group_spawn_with_execution()
-                .await
-                .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?;
-            (child, AcpRequestExecution::Local(execution))
-        };
+            .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?;
 
         let stdin = child.take_stdin().ok_or("Failed to capture ACP stdin")?;
         let stdout = child.take_stdout().ok_or("Failed to capture ACP stdout")?;
@@ -1851,14 +1790,7 @@ impl AcpRpc {
     }
 
     async fn shutdown(&self) {
-        // Close stdin to propagate EOF through SSH to the remote process.
-        // SIGKILL on the local SSH slave doesn't give it time to send
-        // "channel close" through the ControlMaster, so the remote
-        // process never learns its client disconnected and becomes an
-        // orphan (PPID=1). Closing stdin first lets the SSH slave
-        // cleanly tear down the channel.
         self.stdin.close().await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         self.child.shutdown().await;
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
         // parent-side stdio pipe fds are released even if EOF hasn't propagated.

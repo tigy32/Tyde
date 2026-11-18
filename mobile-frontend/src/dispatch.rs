@@ -196,6 +196,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         teams: Vec::new(),
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
+        project_catalog_warning: None,
         teams_store_load_error: None,
         swarms: Vec::new(),
         swarm_drafts: Vec::new(),
@@ -3317,6 +3318,10 @@ fn apply_host_bootstrap(
         payload.teams.len(),
     );
 
+    if let Some(message) = payload.project_catalog_warning {
+        state.set_command_error(host, message);
+    }
+
     state.bootstrapped_host_streams.update(|map| {
         map.insert(host.clone(), stream.clone());
     });
@@ -4809,6 +4814,7 @@ mod wasm_tests {
             teams: Vec::new(),
             team_members: Vec::new(),
             team_member_bindings: Vec::new(),
+            project_catalog_warning: None,
             teams_store_load_error: None,
             agent_restoration_failures: Vec::new(),
             agents: vec![agent_payload.clone()],

@@ -51,12 +51,6 @@ impl MuseBackend {
         initial: Option<SendMessagePayload>,
         fork: bool,
     ) -> Result<(Self, EventStream), String> {
-        if crate::remote::parse_remote_workspace_roots(&workspace_roots)?.is_some() {
-            return Err(
-                "Muse must run on the selected Tyde host, not through a direct SSH backend path"
-                    .to_owned(),
-            );
-        }
         tracing::debug!(
             root_count = workspace_roots.len(),
             resuming = source.is_some(),

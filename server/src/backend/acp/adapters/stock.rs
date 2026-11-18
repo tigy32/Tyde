@@ -37,33 +37,6 @@ impl StockAdapter {
     }
 }
 
-/// Choose the directory an ACP agent runs in.
-///
-/// Prefers the first local root. An `ssh://` root is not a local path, so a
-/// workspace that has only remote roots is an explicit error rather than a
-/// silent fallback to some other directory.
-pub(crate) fn pick_local_workspace_root(
-    workspace_roots: &[String],
-    agent: &str,
-) -> Result<String, String> {
-    if let Some(root) = workspace_roots
-        .iter()
-        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
-        .cloned()
-    {
-        return Ok(root);
-    }
-    if workspace_roots
-        .iter()
-        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
-    {
-        return Err(format!(
-            "{agent} requires at least one local workspace root"
-        ));
-    }
-    crate::backend::tyde_owned_no_root_cwd(agent)
-}
-
 impl AcpAgentAdapter for StockAdapter {
     fn id(&self) -> AcpAdapterId {
         AcpAdapterId::Stock
@@ -76,20 +49,11 @@ impl AcpAgentAdapter for StockAdapter {
     fn resolve_roots<'a>(
         &'a self,
         workspace_roots: &'a [String],
-        ssh_host: Option<&'a str>,
         _kind: AcpSessionKind,
     ) -> BoxFuture<'a, Result<AcpSessionRoots, String>> {
         Box::pin(async move {
-            let scope_root = if ssh_host.is_some() {
-                crate::remote::parse_remote_workspace_roots(workspace_roots)?
-                    .ok_or("Expected remote workspace roots for SSH session")?
-                    .1
-                    .into_iter()
-                    .next()
-                    .ok_or("No remote workspace root found")?
-            } else {
-                pick_local_workspace_root(workspace_roots, &self.display_name)?
-            };
+            let scope_root =
+                crate::backend::pick_workspace_root(workspace_roots, &self.display_name)?;
 
             // An explicit `cwd` on the spec wins; otherwise run in the
             // workspace root itself.
@@ -109,11 +73,7 @@ impl AcpAgentAdapter for StockAdapter {
         })
     }
 
-    fn spawn_spec(
-        &self,
-        roots: &AcpSessionRoots,
-        ssh_host: Option<&str>,
-    ) -> Result<AcpSpawnSpec, String> {
+    fn spawn_spec(&self, roots: &AcpSessionRoots) -> Result<AcpSpawnSpec, String> {
         let command = self.spec.command.trim();
         if command.is_empty() {
             return Err(format!(
@@ -123,12 +83,8 @@ impl AcpAgentAdapter for StockAdapter {
         }
 
         let args: Vec<&str> = self.spec.args.iter().map(String::as_str).collect();
-        let mut spawn = AcpSpawnSpec::new(self.display_name.clone(), command, &args)
-            .with_local_cwd(roots.session_cwd.clone());
-        if ssh_host.is_some() {
-            spawn = spawn.with_remote_cwd(roots.session_cwd.clone());
-        }
-        Ok(spawn)
+        Ok(AcpSpawnSpec::new(self.display_name.clone(), command, &args)
+            .with_local_cwd(roots.session_cwd.clone()))
     }
 
     fn extra_env(&self) -> HashMap<String, String> {

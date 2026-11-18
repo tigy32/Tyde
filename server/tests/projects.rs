@@ -1583,10 +1583,42 @@ async fn projects_persist_and_replay_from_fresh_host() {
     )
     .await;
 
-    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    let replayed = bootstrap.projects;
+    let projects_path = fixture.store_dir().join("projects.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&projects_path).unwrap()).unwrap();
+    let obsolete = Project {
+        id: ProjectId("obsolete-project".to_owned()),
+        name: "Obsolete workspace".to_owned(),
+        sort_order: 2,
+        source: protocol::ProjectSource::Standalone {
+            roots: vec![
+                ProjectRootPath("/tmp/persist-c".to_owned()),
+                ProjectRootPath("ssh://example.invalid/project".to_owned()),
+            ],
+        },
+    };
+    saved["records"][&obsolete.id.0] = serde_json::to_value(&obsolete).unwrap();
+    fs::write(&projects_path, serde_json::to_vec(&saved).unwrap()).unwrap();
 
-    assert_eq!(replayed, vec![project_a, project_b]);
+    let (mut fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(bootstrap.projects, vec![project_a, project_b]);
+    let warning = bootstrap
+        .project_catalog_warning
+        .expect("obsolete workspace warning");
+    assert!(warning.contains(&obsolete.name));
+    assert!(warning.contains("Tyde server that owns the project"));
+    let project_c = create_project(
+        &mut fresh_client,
+        "Persist C",
+        vec!["/tmp/persist-c".to_owned()],
+    )
+    .await;
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(bootstrap.projects.contains(&project_c));
+    assert_eq!(
+        bootstrap.project_catalog_warning.as_deref(),
+        Some(warning.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1615,12 +1647,66 @@ async fn invalid_project_create_surfaces_command_error_and_keeps_connection_aliv
         error.message
     );
 
-    expect_no_event(
+    let obsolete_root = ProjectRootPath(" SSH://example.invalid/workspace".to_owned());
+    fixture
+        .client
+        .project_create(ProjectCreatePayload {
+            name: "Mixed roots".to_owned(),
+            roots: vec![
+                ProjectRootPath("/tmp/valid".to_owned()),
+                obsolete_root.clone(),
+            ],
+        })
+        .await
+        .expect("write mixed project create");
+    let error = expect_command_error(&mut fixture.client, "obsolete workspace rejected").await;
+    assert_eq!(error.operation, "project_create");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(error.message.contains("Tyde server that owns the project"));
+
+    let project = create_project(
         &mut fixture.client,
-        Duration::from_millis(150),
-        "connection should stay open after invalid project_create",
+        "Healthy",
+        vec!["/tmp/valid".to_owned()],
     )
     .await;
+    fixture
+        .client
+        .project_add_root(ProjectAddRootPayload {
+            id: project.id,
+            root: obsolete_root.clone(),
+        })
+        .await
+        .expect("write obsolete root addition");
+    let error = expect_command_error(&mut fixture.client, "obsolete root addition rejected").await;
+    assert_eq!(error.operation, "project_add_root");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+
+    fixture
+        .client
+        .spawn_agent(protocol::SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::Standard,
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/valid".to_owned(), obsolete_root.0],
+                prompt: "Must not launch in the first root alone".to_owned(),
+                images: None,
+                backend_kind: protocol::BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("write obsolete workspace spawn");
+    let error =
+        expect_command_error(&mut fixture.client, "obsolete workspace spawn rejected").await;
+    assert_eq!(error.operation, "spawn_agent");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
 }
 
 #[tokio::test]

@@ -61,10 +61,6 @@ Hermes was verified through `HERMES_EXECUTABLE` or PATH; if Hermes is only
 available through `HERMES_PYTHON`, Tyde does not invent a `hermes setup`
 command.
 
-Remote `ssh://host/path` workspaces spawn the same module remotely. The remote
-interpreter defaults to `python3` and can be overridden with
-`TYDE_REMOTE_HERMES_PYTHON`.
-
 Startup waits for the gateway's `gateway.ready` event. The default startup
 timeout is 15 seconds and can be overridden with
 `HERMES_TUI_STARTUP_TIMEOUT_MS`. Individual JSON-RPC requests use
@@ -84,10 +80,8 @@ spawns the gateway and MCP-registration subprocess with that profile
 directory as `HERMES_HOME`; a missing or failed named profile stays visible as
 an unavailable launch option with its probe error.
 
-Named profiles are local-only. An SSH-backed workspace cannot safely forward a
-local Hermes profile directory, so Tyde rejects that combination rather than
-silently launching the remote default. A running session cannot change
-profiles; start a new session to select another profile.
+Profiles belong to the Tyde server that launches Hermes. A running session
+cannot change profiles; start a new session to select another profile.
 
 ## MCP startup injection
 
@@ -202,10 +196,8 @@ current provider/model state without treating a form read as a destructive save.
 Hermes exposes three `Text` fields:
 
 - `default_model`: model id every new session starts with. Supplied to
-  `session.create` verbatim, so — unlike the session-settings `model` dropdown,
-  which is built from a locally probed `model.options` list — it is also correct
-  for remote `ssh://` workspaces whose authenticated providers differ from the
-  local host.
+  `session.create` verbatim. The session-settings `model` dropdown is built
+  from the selected profile's `model.options` list.
 - `default_provider`: provider slug for the default model.
 - `api_base_url`: optional base URL override applied at session start.
 

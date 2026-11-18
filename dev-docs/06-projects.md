@@ -236,8 +236,8 @@ The first root is the default working directory. Unsupported root sets are
 rejected rather than truncated. Callers must serialize relocation with other
 input, settings, and compaction. The implementations reject ongoing turns,
 tracked background work, and compaction. Initial support requires existing,
-absolute local directories and rejects empty, duplicate, missing, file, and
-remote roots; SSH sessions cannot be relocated through this operation.
+absolute directories on the server that owns the session. Relocation cannot
+move a session between servers.
 
 | Backend | Implementation | Root sets |
 | --- | --- | --- |

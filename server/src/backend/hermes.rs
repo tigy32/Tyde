@@ -27,7 +27,7 @@ use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, is_tyde_agent_control_spawn_tool_name,
     normalize_tyde_chat_event,
 };
-use crate::backend::customization::{ResolvedSpawnConfig, SkillSelection};
+use crate::backend::customization::ResolvedSpawnConfig;
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
     AdapterEventSender, Backend, BackendAcceptedCompaction, BackendCompactionCapability,
@@ -58,7 +58,6 @@ const HERMES_EXECUTABLE_ENV: &str = "HERMES_EXECUTABLE";
 const HERMES_CLI_BINARY: &str = "hermes";
 const HERMES_STARTUP_TIMEOUT_ENV: &str = "HERMES_TUI_STARTUP_TIMEOUT_MS";
 const HERMES_RPC_TIMEOUT_ENV: &str = "HERMES_TUI_RPC_TIMEOUT_MS";
-const HERMES_REMOTE_PYTHON_ENV: &str = "TYDE_REMOTE_HERMES_PYTHON";
 const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HERMES_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HERMES_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -974,7 +973,6 @@ print(json.dumps(skills.get("external_dirs", [])))
 
 #[derive(Clone)]
 pub struct HermesBackend {
-    workspace_is_local: bool,
     session_settings: SessionSettingsValues,
     command_tx: mpsc::UnboundedSender<HermesBackendCommand>,
     session_id: Arc<std::sync::Mutex<SessionId>>,
@@ -1012,12 +1010,7 @@ enum HermesBackendCommand {
 struct HermesGatewayHandle {
     tx: mpsc::UnboundedSender<HermesGatewayCommand>,
     request_timeout: Duration,
-    system_overlay_installed: bool,
     provider_version: Option<String>,
-    /// The instructions this gateway was started with. Rendered inside `spawn`,
-    /// because whether the skills can be named depends on whether registering
-    /// the store actually took — and that is only known there.
-    spawn_instructions: Option<String>,
     /// Why this session has no Tyde skills, when it was supposed to. Surfaced to
     /// the user by the caller; a session is never refused over it.
     skill_notice: Option<String>,
@@ -1075,8 +1068,7 @@ struct HermesSpawnTarget {
     program: String,
     args: Vec<String>,
     env: HashMap<String, String>,
-    cwd: Option<String>,
-    remote_host: Option<String>,
+    cwd: String,
     display_program: String,
     provider_version: Option<String>,
 }
@@ -1700,14 +1692,6 @@ impl Backend for HermesBackend {
         resolve_session_settings(config)
     }
 
-    fn session_is_resumable(
-        _session_id: &SessionId,
-        workspace_roots: &[String],
-        resolved: &ResolvedSpawnConfig,
-    ) -> bool {
-        session_is_resumable_for_workspace_roots(workspace_roots, resolved)
-    }
-
     fn helper_session_settings(
         settings: Option<&SessionSettingsValues>,
     ) -> Option<SessionSettingsValues> {
@@ -1775,33 +1759,15 @@ impl Backend for HermesBackend {
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
-        let remote_host =
-            crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
-        let dropped_skills_notice =
-            hermes_remote_skill_notice(&config.resolved_spawn_config, remote_host.as_deref());
-        let expose_skills =
-            remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
         let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
             &config.resolved_spawn_config,
-            expose_skills,
         )
         .await?;
-        let spawn_instructions = gateway.spawn_instructions.clone();
-        // Either the store could not travel, or registering it did not take.
-        // Both are notices; neither stops the session.
-        let dropped_skills_notice = dropped_skills_notice.or_else(|| gateway.skill_notice.clone());
-        let history_instructions = (!gateway.system_overlay_installed)
-            .then_some(spawn_instructions.as_deref())
-            .flatten();
-        let create_params = build_session_create_params(
-            &workspace_roots,
-            &resolved_settings,
-            history_instructions,
-        )?;
+        let create_params = build_session_create_params(&workspace_roots, &resolved_settings)?;
         let create = gateway.request("session.create", create_params).await?;
         let ids = parse_session_create_ids(&create)?;
         let startup_gateway_events = if expects_mcp_tools {
@@ -1822,7 +1788,7 @@ impl Backend for HermesBackend {
         // A Default session that could not bring its skills says so. The channel
         // is unbounded and its receiver is returned below, so this survives
         // until the client attaches.
-        if let Some(notice) = dropped_skills_notice {
+        if let Some(notice) = gateway.skill_notice.clone() {
             let _ = events_tx.send(BackendEvent::Chat(ChatEvent::MessageAdded(
                 warning_message(notice),
             )));
@@ -1863,7 +1829,6 @@ impl Backend for HermesBackend {
 
         Ok((
             Self {
-                workspace_is_local: remote_host.is_none(),
                 command_tx,
                 session_settings: resolved_settings,
                 session_id: stored_session_id,
@@ -1886,34 +1851,14 @@ impl Backend for HermesBackend {
         reject_unverified_resume_capabilities(&config)?;
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
-        let remote_host =
-            crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
-        // Resume refuses any session whose instructions cannot be installed
-        // remotely (below), which is a different question from whether the
-        // skills came along; the notice for those is surfaced with the rest.
-        let dropped_skills_notice =
-            hermes_remote_skill_notice(&config.resolved_spawn_config, remote_host.as_deref());
-        let expose_skills =
-            remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
             &config.resolved_spawn_config,
-            expose_skills,
         )
         .await?;
-        let spawn_instructions = gateway.spawn_instructions.clone();
-        let dropped_skills_notice = dropped_skills_notice.or_else(|| gateway.skill_notice.clone());
-        if spawn_instructions.is_some() && !gateway.system_overlay_installed {
-            gateway.shutdown().await;
-            return Err(
-                "Hermes cannot safely resume this remote session because the remote gateway \
-                 cannot restore Tyde system instructions"
-                    .to_string(),
-            );
-        }
         let resume = gateway
             .request(
                 "session.resume",
@@ -1976,7 +1921,7 @@ impl Backend for HermesBackend {
         // A resumed session that came back without its skills says so, exactly
         // as a fresh one does. The channel is unbounded and its receiver is
         // returned below, so this survives until the client attaches.
-        if let Some(notice) = dropped_skills_notice {
+        if let Some(notice) = gateway.skill_notice.clone() {
             let _ = events_tx.send(BackendEvent::Chat(ChatEvent::MessageAdded(
                 warning_message(notice),
             )));
@@ -2015,7 +1960,6 @@ impl Backend for HermesBackend {
 
         Ok((
             Self {
-                workspace_is_local: remote_host.is_none(),
                 command_tx,
                 session_settings: resolved_settings,
                 session_id: stored_session_id,
@@ -2047,15 +1991,13 @@ impl Backend for HermesBackend {
             &protocol::ToolPolicy::Unrestricted,
             &profile,
             &ResolvedSpawnConfig::for_backend_session(),
-            false,
         )
         .await?;
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
-        let resumable = gateway.system_overlay_installed;
         gateway.shutdown().await;
-        parse_session_list(&result?, resumable)
+        parse_session_list(&result?)
     }
 
     fn session_id(&self) -> SessionId {
@@ -2144,15 +2086,8 @@ impl Backend for HermesBackend {
         workspace_roots: Vec<String>,
     ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
     {
-        let workspace_is_local = self.workspace_is_local;
         let command_tx = self.command_tx.clone();
         async move {
-            if !workspace_is_local {
-                return Err(super::WorkspaceRelocationError::Rejected(
-                    "Hermes workspace relocation is currently supported only for local sessions"
-                        .to_owned(),
-                ));
-            }
             let roots = super::validate_local_workspace_roots(workspace_roots)
                 .map_err(super::WorkspaceRelocationError::Rejected)?;
             let (reply, result) = oneshot::channel();
@@ -2327,7 +2262,6 @@ pub(crate) async fn probe_profile_surfaces(
         &protocol::ToolPolicy::Unrestricted,
         profile,
         &ResolvedSpawnConfig::for_backend_session(),
-        false,
     )
     .await;
     let (gateway, _events) = match spawned {
@@ -2725,7 +2659,6 @@ async fn run_credential_actions_for_profile(
         &protocol::ToolPolicy::Unrestricted,
         profile,
         &ResolvedSpawnConfig::for_backend_session(),
-        false,
     )
     .await?;
     for action in gateway_actions {
@@ -4700,7 +4633,6 @@ impl HermesGatewayHandle {
         tool_policy: &protocol::ToolPolicy,
         profile: &HermesProfileRef,
         resolved: &ResolvedSpawnConfig,
-        expose_skills: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
         let excluded_toolsets = resolved
@@ -4713,27 +4645,12 @@ impl HermesGatewayHandle {
                 }
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if target.remote_host.is_some() && !excluded_toolsets.is_empty() {
-            return Err("Hermes tool category exclusions require a host-local runtime".to_owned());
-        }
         target.env.insert(
             "TYDE_HERMES_EXCLUDED_TOOLSETS".to_owned(),
             serde_json::to_string(&excluded_toolsets)
                 .map_err(|error| format!("Failed to encode Hermes tool exclusions: {error}"))?,
         );
-        // A named profile is selected by pointing HERMES_HOME at its
-        // directory. Remote spawns run over SSH without env forwarding, so a
-        // named profile there would silently run against the wrong home —
-        // fail visibly instead. The default profile sets nothing and lets
-        // Hermes resolve its own home.
         if !profile.is_default() {
-            if target.remote_host.is_some() {
-                return Err(format!(
-                    "Hermes profile '{}' cannot be used with an SSH-backed workspace; \
-                     profiles select a local HERMES_HOME directory",
-                    profile.name
-                ));
-            }
             target.env.insert(
                 crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
                 profile.home_dir.to_string_lossy().to_string(),
@@ -4744,9 +4661,8 @@ impl HermesGatewayHandle {
         // registering the store took. A registration that fails costs the
         // session its skills — never the session itself — and the prompt is then
         // rendered without them, because naming a skill Hermes cannot load is
-        // worse than silence. Remote targets never get here: the caller drops
-        // their skills, because this edits a config file on *this* machine.
-        let registration = if expose_skills && target.remote_host.is_none() {
+        // worse than silence.
+        let registration = if !resolved.skills.is_empty() {
             Some(register_hermes_skill_dirs(&target, &resolved.skills).await)
         } else {
             None
@@ -4756,12 +4672,10 @@ impl HermesGatewayHandle {
         if let Some(notice) = skill_notice.as_deref() {
             tracing::warn!("{notice}");
         }
-        let system_overlay_installed = target.remote_host.is_none();
-        if system_overlay_installed && let Some(spawn_instructions) = spawn_instructions.as_deref()
-        {
+        if let Some(spawn_instructions) = spawn_instructions {
             target.env.insert(
                 TYDE_HERMES_SYSTEM_PROMPT_ENV.to_string(),
-                spawn_instructions.to_string(),
+                spawn_instructions,
             );
         }
         let mcp_runtime = prepare_hermes_mcp_runtime(
@@ -4812,9 +4726,7 @@ impl HermesGatewayHandle {
         let handle = Self {
             tx: command_tx,
             request_timeout,
-            system_overlay_installed,
             provider_version: target.provider_version.clone(),
-            spawn_instructions,
             skill_notice,
         };
 
@@ -5454,9 +5366,6 @@ async fn prepare_hermes_mcp_runtime(
     else {
         return Ok(None);
     };
-    if target.remote_host.is_some() {
-        return Err("Hermes MCP tools are not yet available for SSH-backed workspaces".to_string());
-    }
 
     let bridge_program = crate::mcp_bridge::resolve_bridge_executable()?;
     let selected = register_hermes_mcp_bridge(
@@ -5597,9 +5506,7 @@ async fn register_hermes_mcp_bridge(
     // startup dies on the MCP-bridge readiness timeout.
     command.envs(&target.env);
     command.env_remove(HERMES_TOOLSETS_ENV);
-    if let Some(cwd) = target.cwd.as_deref() {
-        command.current_dir(cwd);
-    }
+    command.current_dir(&target.cwd);
     let output = command.output().await.map_err(|error| {
         format!(
             "Failed to register the Tyde MCP bridge with Hermes using {}: {error}",
@@ -5675,9 +5582,7 @@ async fn register_hermes_skill_dir(
     // the default profile's `config.yaml` while the gateway reads another's.
     command.envs(&target.env);
     command.env_remove(HERMES_TOOLSETS_ENV);
-    if let Some(cwd) = target.cwd.as_deref() {
-        command.current_dir(cwd);
-    }
+    command.current_dir(&target.cwd);
     let output = command.output().await.map_err(|error| {
         format!(
             "Failed to register the Tyde skills directory with Hermes using {}: {error}",
@@ -5827,16 +5732,6 @@ fn prepare_hermes_managed_toolsets(
 }
 
 async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChild, String> {
-    if let Some(host) = target.remote_host.as_deref() {
-        return crate::remote::spawn_remote_process(
-            host,
-            &target.program,
-            &target.args,
-            target.cwd.as_deref(),
-        )
-        .await;
-    }
-
     tracing::debug!(
         proxy_present = tyde_process_env::launch::environment_var("HTTPS_PROXY").is_ok(),
         "Hermes native proxy environment"
@@ -5845,13 +5740,11 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
     command.args(&target.args);
     command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
     command.envs(&target.env);
-    if let Some(cwd) = target.cwd.as_deref() {
-        command.current_dir(cwd);
-        command.env(
-            "TERMINAL_CWD",
-            tyde_process_env::launch::WorkspacePath::host(cwd)?.in_execution(),
-        );
-    }
+    command.current_dir(&target.cwd);
+    command.env(
+        "TERMINAL_CWD",
+        tyde_process_env::launch::WorkspacePath::host(&target.cwd)?.in_execution(),
+    );
     // Tyde owns the interaction surface, so ordinary Hermes approval gates
     // would only interrupt work the user already authorized by starting the
     // agent. Keep Hermes in its process-scoped YOLO mode. Hermes evaluates its
@@ -8262,7 +8155,6 @@ fn hermes_mcp_bridge_descriptor(
 fn build_session_create_params(
     workspace_roots: &[String],
     settings: &SessionSettingsValues,
-    history_instructions: Option<&str>,
 ) -> Result<Value, String> {
     let cwd = tyde_process_env::launch::WorkspacePath::host(session_cwd(workspace_roots)?)?
         .execution_string()?;
@@ -8272,10 +8164,6 @@ fn build_session_create_params(
         "cwd": cwd,
         "close_on_disconnect": false,
     });
-    if let Some(instructions) = history_instructions {
-        params["messages"] = json!([{ "role": "system", "content": instructions }]);
-    }
-
     // No model/provider baseline is injected here: the selected profile's own
     // Hermes config supplies the defaults, and Tyde manages that config
     // directly. Only an explicit per-session model selection overrides it.
@@ -8303,15 +8191,6 @@ fn build_session_create_params(
 
 /// Render the session's instructions, naming skills only when Hermes can
 /// actually load them.
-///
-/// `skills_discoverable` is the whole point of the flag: Tyde makes its store
-/// visible to Hermes by registering it in the profile's `config.yaml`, which is
-/// a file on *this* machine. A gateway running over SSH reads a different
-/// machine's config and a different machine's disk, so naming the skills there
-/// promises instructions that do not exist — which is precisely how a remote
-/// session ends up reporting every selected skill as missing. When they are not
-/// discoverable the block is omitted entirely rather than downgraded: a name
-/// with nothing behind it is worse than silence.
 fn render_hermes_spawn_instructions(
     resolved: &ResolvedSpawnConfig,
     skills_discoverable: bool,
@@ -8353,10 +8232,7 @@ fn render_hermes_spawn_instructions(
 /// Decide what this session may name and what it must report, from the outcome
 /// of registering Tyde's store with the Hermes install it will run against.
 ///
-/// `registration` is `None` when registration was never attempted — a remote
-/// gateway, or a session with no skills. Pure on purpose: the ordering it
-/// encodes is load-bearing and would otherwise only be testable through a live
-/// gateway. A registration that failed must render instructions that name *no*
+/// A registration that failed must render instructions that name *no*
 /// skills, because a name with nothing behind it makes the model report every
 /// selected skill as missing, which is the failure this whole path exists to
 /// avoid. The notice is how the user finds out instead.
@@ -8380,46 +8256,6 @@ fn hermes_skill_exposure(
         render_hermes_spawn_instructions(resolved, discoverable),
         notice,
     )
-}
-
-/// Decide what a session does about skills it cannot expose remotely.
-///
-/// Mirrors the policy every other backend uses: the skills are dropped, never
-/// the session, whatever the selection asked for. An explicitly selected skill
-/// is worth naming more loudly than one of everything-installed, but refusing to
-/// start would cost the agent every other skill and the workspace with it.
-fn hermes_remote_skill_notice(
-    resolved: &ResolvedSpawnConfig,
-    remote_host: Option<&str>,
-) -> Option<String> {
-    let host = remote_host?;
-    if resolved.skills.is_empty() {
-        return None;
-    }
-    let selection = match resolved.skill_selection {
-        SkillSelection::Explicit => "explicitly selected",
-        SkillSelection::AllInstalled => "installed",
-    };
-    Some(format!(
-        "Tyde started this Hermes session without its {} {selection} skill(s): the gateway runs \
-         on '{host}' over SSH, and Tyde's skill store is on this machine. The session works \
-         normally otherwise, and any skills installed on '{host}' are still available.",
-        resolved.skills.len()
-    ))
-}
-
-pub(crate) fn session_is_resumable_for_workspace_roots(
-    workspace_roots: &[String],
-    resolved: &ResolvedSpawnConfig,
-) -> bool {
-    let local = matches!(
-        crate::remote::parse_remote_workspace_roots(workspace_roots),
-        Ok(None)
-    );
-    // Skills are only named when they are discoverable, which a remote gateway's
-    // never are — so a remote session whose *only* instructions were its skills
-    // has nothing left to install and stays resumable.
-    render_hermes_spawn_instructions(resolved, local).is_none() || local
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8757,7 +8593,7 @@ fn session_tools_include_managed_mcp(tools: &serde_json::Map<String, Value>) -> 
     })
 }
 
-fn parse_session_list(value: &Value, resumable: bool) -> Result<Vec<BackendSession>, String> {
+fn parse_session_list(value: &Value) -> Result<Vec<BackendSession>, String> {
     let sessions = value
         .get("sessions")
         .and_then(Value::as_array)
@@ -8777,7 +8613,7 @@ fn parse_session_list(value: &Value, resumable: bool) -> Result<Vec<BackendSessi
             token_count: None,
             created_at_ms: timestamp,
             updated_at_ms: timestamp,
-            resumable,
+            resumable: true,
         });
     }
     Ok(out)
@@ -9001,26 +8837,6 @@ fn hermes_history_tool_calls(
 async fn resolve_gateway_spawn_target(
     workspace_roots: &[String],
 ) -> Result<HermesSpawnTarget, String> {
-    let remote_roots = crate::remote::parse_remote_workspace_roots(workspace_roots)?;
-    if let Some((host, roots)) = remote_roots {
-        let args = vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()];
-        let program = tyde_process_env::launch::environment_var(HERMES_REMOTE_PYTHON_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "python3".to_string());
-        let cwd = roots.first().cloned();
-        return Ok(HermesSpawnTarget {
-            display_program: format!("ssh {host} {program} -m {HERMES_PYTHON_MODULE}"),
-            program,
-            args,
-            env: HashMap::new(),
-            cwd,
-            remote_host: Some(host),
-            provider_version: None,
-        });
-    }
-
     if let Some(program) = explicit_hermes_python() {
         probe_hermes_python_gateway_import(&program)
             .await
@@ -9040,8 +8856,7 @@ fn hermes_python_spawn_target(
         program,
         args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
         env: HashMap::new(),
-        cwd: Some(session_cwd(workspace_roots)?),
-        remote_host: None,
+        cwd: session_cwd(workspace_roots)?,
         provider_version: None,
     })
 }
@@ -9060,8 +8875,7 @@ async fn resolve_hermes_cli_gateway_spawn_target(
                     program: probe.gateway_python,
                     args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
                     env: HashMap::new(),
-                    cwd: Some(session_cwd(workspace_roots)?),
-                    remote_host: None,
+                    cwd: session_cwd(workspace_roots)?,
                     display_program,
                     provider_version: probe.version,
                 })
@@ -9082,8 +8896,7 @@ async fn resolve_hermes_cli_gateway_spawn_target(
                     program: probe.gateway_python,
                     args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
                     env: HashMap::new(),
-                    cwd: Some(session_cwd(workspace_roots)?),
-                    remote_host: None,
+                    cwd: session_cwd(workspace_roots)?,
                     display_program,
                     provider_version: probe.version,
                 });
@@ -9730,11 +9543,7 @@ pub(crate) async fn probe_hermes_python_gateway_import(
 }
 
 fn session_cwd(workspace_roots: &[String]) -> Result<String, String> {
-    if let Some((_, roots)) = crate::remote::parse_remote_workspace_roots(workspace_roots)? {
-        return roots.first().cloned().ok_or_else(|| {
-            "Hermes remote session requires at least one remote workspace root".to_string()
-        });
-    }
+    crate::paths::reject_ssh_workspace_roots(workspace_roots)?;
     workspace_roots
         .first()
         .cloned()

@@ -10,7 +10,6 @@ use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
     AcpAgentAdapter, AcpSessionKind, AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan,
 };
-use crate::backend::acp::adapters::stock::pick_local_workspace_root;
 
 /// Commands Tyde answers for OpenCode, with the descriptions its own UI uses.
 const OPENCODE_TYDE_COMMANDS: &[(&str, &str)] = &[
@@ -317,11 +316,10 @@ impl AcpAgentAdapter for OpenCodeAdapter {
     fn resolve_roots<'a>(
         &'a self,
         workspace_roots: &'a [String],
-        _ssh_host: Option<&'a str>,
         _kind: AcpSessionKind,
     ) -> BoxFuture<'a, Result<AcpSessionRoots, String>> {
         Box::pin(async move {
-            let scope_root = pick_local_workspace_root(workspace_roots, "OpenCode")?;
+            let scope_root = crate::backend::pick_workspace_root(workspace_roots, "OpenCode")?;
             Ok(AcpSessionRoots {
                 session_cwd: scope_root.clone(),
                 scope_root,
@@ -329,14 +327,7 @@ impl AcpAgentAdapter for OpenCodeAdapter {
         })
     }
 
-    fn spawn_spec(
-        &self,
-        roots: &AcpSessionRoots,
-        ssh_host: Option<&str>,
-    ) -> Result<AcpSpawnSpec, String> {
-        if ssh_host.is_some() {
-            return Err("OpenCode does not yet support Tyde SSH sessions".to_owned());
-        }
+    fn spawn_spec(&self, roots: &AcpSessionRoots) -> Result<AcpSpawnSpec, String> {
         let command = self.spec.command.trim();
         let program = if command.is_empty() {
             "opencode"
@@ -353,15 +344,8 @@ impl AcpAgentAdapter for OpenCodeAdapter {
             .with_local_env("OPENCODE_CONFIG_CONTENT", self.config_content()?))
     }
 
-    fn delete_session<'a>(
-        &'a self,
-        session_id: &'a str,
-        ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if ssh_host.is_some() {
-                return Err("OpenCode does not yet support Tyde SSH sessions".to_owned());
-            }
             let output = crate::process_env::command("opencode")?
                 .args(["session", "delete", session_id])
                 .output()

@@ -223,7 +223,6 @@ pub struct ClaudeSession {
 struct ClaudeSpawnMode<'a> {
     no_session_persistence: bool,
     fork_from_session_id: Option<String>,
-    ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
     agent_identity: Option<&'a AgentIdentity>,
@@ -233,7 +232,6 @@ struct ClaudeSpawnMode<'a> {
 
 struct ClaudeForkConfig<'a> {
     from_session_id: &'a str,
-    ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
     agent_identity: Option<&'a AgentIdentity>,
@@ -255,11 +253,11 @@ struct ClaudeSkillExposure {
 }
 
 /// Decide how a Claude session exposes its selected skills, and materialize the
-/// session plugin when it is a local session.
+/// session plugin.
 ///
 /// **Nothing about a skill stops a session from starting.** A skill that cannot
 /// be exposed — a refusal, an unreadable body, a name collision, a CLI too old
-/// for `--plugin-dir`, an SSH target that cannot see this machine's disk — costs
+/// for `--plugin-dir` — costs
 /// the session that one capability. Refusing to start costs it that capability
 /// *and* every other skill, the agent, and the conversation, which is a strictly
 /// worse answer to the same problem. This holds for an explicit selection too:
@@ -275,7 +273,6 @@ struct ClaudeSkillExposure {
 /// miss would make the regression invisible.
 async fn claude_prepare_skills(
     config: &BackendSpawnConfig,
-    ssh_host: Option<&str>,
     workspace_root: &str,
 ) -> (ClaudeSkillExposure, ClaudeSkillSteering) {
     let selected = &config.resolved_spawn_config.skills;
@@ -297,26 +294,6 @@ async fn claude_prepare_skills(
             ClaudeSkillSteering::None,
         )
     };
-
-    // Keyed on the host actually handed to the low-level spawn, not on the shape
-    // of the workspace roots: a root list that merely mentions `ssh://` does not
-    // make this process remote, and must not change how a local session works.
-    //
-    // Remote native skills are not supported. A plugin root materialized on this
-    // machine is invisible to a CLI running somewhere else, and Tyde has no
-    // remote materialization path. Earlier revisions inlined bodies here
-    // instead; that branch was unreachable from any production entry point, so
-    // it documented a fallback that did not exist. The session runs remotely
-    // without them, and says so.
-    if let Some(host) = ssh_host {
-        return without_skills(format!(
-            "Tyde started this Claude session without its {} selected skill(s): Tyde \
-             materializes them into a directory on the machine it runs on, which the CLI on \
-             '{host}' cannot read. The session works normally otherwise, and any skills \
-             installed on '{host}' are still available.",
-            selected.len()
-        ));
-    }
 
     match claude_supports_plugin_dir().await {
         Ok(true) => {}
@@ -393,31 +370,8 @@ async fn claude_prepare_skills(
 }
 
 impl ClaudeSession {
-    pub async fn spawn(
-        workspace_roots: &[String],
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        agent_identity: Option<&AgentIdentity>,
-        tool_policy: ToolPolicy,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_skills(
-            workspace_roots,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            agent_identity,
-            tool_policy,
-            ClaudeSkillExposure::default(),
-        )
-        .await
-    }
-
-    /// [`spawn`](Self::spawn), taking ownership of the session's inline skill
-    /// plugin so the root outlives every process the session starts.
     async fn spawn_with_skills(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
@@ -429,7 +383,6 @@ impl ClaudeSession {
             ClaudeSpawnMode {
                 no_session_persistence: false,
                 fork_from_session_id: None,
-                ssh_host,
                 startup_mcp_servers,
                 steering_content,
                 agent_identity,
@@ -442,7 +395,6 @@ impl ClaudeSession {
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
@@ -453,7 +405,6 @@ impl ClaudeSession {
             ClaudeSpawnMode {
                 no_session_persistence: true,
                 fork_from_session_id: None,
-                ssh_host,
                 startup_mcp_servers,
                 steering_content,
                 agent_identity,
@@ -475,7 +426,6 @@ impl ClaudeSession {
             ClaudeSpawnMode {
                 no_session_persistence: false,
                 fork_from_session_id: Some(from_session_id),
-                ssh_host: fork_config.ssh_host,
                 startup_mcp_servers: fork_config.startup_mcp_servers,
                 steering_content: fork_config.steering_content,
                 agent_identity: fork_config.agent_identity,
@@ -490,18 +440,7 @@ impl ClaudeSession {
         workspace_roots: &[String],
         mode: ClaudeSpawnMode<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let (workspace_root, resolved_ssh_host) = if let Some(host) = mode.ssh_host {
-            let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
-                .ok_or("Expected remote workspace roots for SSH session")?;
-            let remote_path = parsed
-                .1
-                .into_iter()
-                .next()
-                .ok_or("No remote workspace root found")?;
-            (remote_path, Some(host))
-        } else {
-            (pick_workspace_root(workspace_roots)?, None)
-        };
+        let workspace_root = pick_workspace_root(workspace_roots)?;
         let configured_workspace_roots =
             crate::backend::session_workspace_roots(workspace_roots, &workspace_root)?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -522,7 +461,6 @@ impl ClaudeSession {
                 native_tool_catalog: None,
                 workspace_root,
                 workspace_roots: configured_workspace_roots,
-                ssh_host: resolved_ssh_host,
                 session_id: None,
                 fork_from_session_id: mode.fork_from_session_id,
                 resume_bootstrap_required: true,
@@ -751,7 +689,6 @@ struct ClaudeState {
     native_tool_catalog: Option<NativeToolCatalog>,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
-    ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
     resume_bootstrap_required: bool,
@@ -843,7 +780,6 @@ impl Default for ClaudeState {
             native_tool_catalog: None,
             workspace_root: String::new(),
             workspace_roots: None,
-            ssh_host: None,
             session_id: None,
             fork_from_session_id: None,
             resume_bootstrap_required: true,
@@ -2330,7 +2266,6 @@ struct ClaudeProcessSpawnConfig {
     program: Option<String>,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
-    ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
     ephemeral: bool,
@@ -2345,8 +2280,8 @@ struct ClaudeProcessSpawnConfig {
     excluded_tool_categories: Vec<protocol::ToolCategory>,
     /// Root of this session's inline skill plugin. Rebuilt into every process
     /// config from `ClaudeState`, so a respawned or forked process points at
-    /// the same root the session already materialized. `None` for SSH sessions
-    /// and for sessions with no exposable skill.
+    /// the same root the session already materialized. `None` when no skill
+    /// is exposable.
     skill_plugin_root: Option<String>,
 }
 
@@ -4269,7 +4204,6 @@ impl ClaudeInner {
                     program: state.program.clone(),
                     workspace_root: state.workspace_root.clone(),
                     workspace_roots: state.workspace_roots.clone(),
-                    ssh_host: state.ssh_host.clone(),
                     session_id: if state.ephemeral {
                         None
                     } else {
@@ -5012,50 +4946,28 @@ impl ClaudeInner {
         process_generation: u64,
     ) -> Result<ClaudeProcessRuntime, String> {
         let cli_args = build_claude_cli_args(&config)?;
-        let mut child = if let Some(host) = config.ssh_host.as_deref() {
-            let pinned_model = config.model.as_deref().and_then(normalize_nonempty);
-            let model_env = pinned_model.as_deref().map_or_else(Vec::new, |model| {
-                vec![
-                    ("ANTHROPIC_MODEL", model),
-                    ("CLAUDE_CODE_AUTO_MODE_MODEL", model),
-                    ("CLAUDE_CODE_BG_CLASSIFIER_MODEL", model),
-                    ("CLAUDE_CODE_SUBAGENT_MODEL", model),
-                    ("CLAUDE_CONTEXT_COLLAPSE_MODEL", model),
-                    ("CLAUDE_CODE_NO_MODEL_FALLBACK", "1"),
-                ]
-            });
-            crate::remote::spawn_remote_process_with_env(
-                host,
-                "claude",
-                &cli_args,
-                Some(&config.workspace_root),
-                &model_env,
-            )
+        let program = config.program.clone().unwrap_or_else(claude_binary);
+        let mut cmd = crate::backend::subprocess::command(program)?;
+        for arg in &cli_args {
+            cmd.arg(arg);
+        }
+        if let Some(model) = config.model.as_deref().and_then(normalize_nonempty) {
+            cmd.env("ANTHROPIC_MODEL", &model);
+            cmd.env("CLAUDE_CODE_AUTO_MODE_MODEL", &model);
+            cmd.env("CLAUDE_CODE_BG_CLASSIFIER_MODEL", &model);
+            cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", &model);
+            cmd.env("CLAUDE_CONTEXT_COLLAPSE_MODEL", &model);
+            cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
+            eprintln!("TYDE CLAUDE EXPLICIT MODEL PIN model={model}");
+        }
+        cmd.current_dir(&config.workspace_root)
+            .stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+        let mut child = cmd
+            .group_spawn()
             .await
-            .map_err(|err| format!("Failed to start Claude CLI over SSH: {err}"))?
-        } else {
-            let program = config.program.clone().unwrap_or_else(claude_binary);
-            let mut cmd = crate::backend::subprocess::command(program)?;
-            for arg in &cli_args {
-                cmd.arg(arg);
-            }
-            if let Some(model) = config.model.as_deref().and_then(normalize_nonempty) {
-                cmd.env("ANTHROPIC_MODEL", &model);
-                cmd.env("CLAUDE_CODE_AUTO_MODE_MODEL", &model);
-                cmd.env("CLAUDE_CODE_BG_CLASSIFIER_MODEL", &model);
-                cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", &model);
-                cmd.env("CLAUDE_CONTEXT_COLLAPSE_MODEL", &model);
-                cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
-                eprintln!("TYDE CLAUDE EXPLICIT MODEL PIN model={model}");
-            }
-            cmd.current_dir(&config.workspace_root)
-                .stdin(crate::backend::subprocess::ProcessStdio::Piped)
-                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
-                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-            cmd.group_spawn()
-                .await
-                .map_err(|err| format!("Failed to start Claude CLI: {err}"))?
-        };
+            .map_err(|err| format!("Failed to start Claude CLI: {err}"))?;
 
         let stdin = child
             .take_stdin()
@@ -6016,16 +5928,9 @@ impl ClaudeInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
-        let (workspace_root, ssh_host) = self
-            .state
-            .with(|state| (state.workspace_root.clone(), state.ssh_host.clone()))
-            .await;
+        let workspace_root = self.state.with(|state| state.workspace_root.clone()).await;
 
-        let sessions = if let Some(host) = &ssh_host {
-            list_claude_sessions_remote(host, &workspace_root).await?
-        } else {
-            list_claude_sessions(&workspace_root).await?
-        };
+        let sessions = list_claude_sessions(&workspace_root).await?;
         self.emitter.sessions_list(sessions);
         Ok(())
     }
@@ -6034,7 +5939,7 @@ impl ClaudeInner {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
         let session_id = normalized.clone();
-        let (workspace_root, ssh_host) = self
+        let workspace_root = self
             .state
             .with(move |state| {
                 state.session_id = Some(session_id);
@@ -6042,7 +5947,7 @@ impl ClaudeInner {
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
                 state.message_generation_usage = None;
-                (state.workspace_root.clone(), state.ssh_host.clone())
+                state.workspace_root.clone()
             })
             .await;
 
@@ -6052,11 +5957,7 @@ impl ClaudeInner {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.emitter.typing_status_changed(false);
 
-        let replay = match if let Some(host) = &ssh_host {
-            load_claude_session_history_remote(host, &workspace_root, &normalized).await
-        } else {
-            load_claude_session_history(&workspace_root, &normalized).await
-        } {
+        let replay = match load_claude_session_history(&workspace_root, &normalized).await {
             Ok(replay) => replay,
             // A missing session file used to start a fresh CLI session under the
             // same id, which reported a successful resume while `--session-id`
@@ -6109,7 +6010,7 @@ impl ClaudeInner {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
         let session_id = normalized.clone();
-        let (workspace_root, ssh_host) = self
+        let workspace_root = self
             .state
             .with(move |state| {
                 if state.session_id.as_deref() == Some(session_id.as_str()) {
@@ -6118,22 +6019,18 @@ impl ClaudeInner {
                     state.cumulative_usage = None;
                     state.cumulative_usage_complete = true;
                 }
-                (state.workspace_root.clone(), state.ssh_host.clone())
+                state.workspace_root.clone()
             })
             .await;
 
-        if let Some(host) = &ssh_host {
-            delete_claude_session_remote(host, &workspace_root, &normalized).await?;
-        } else {
-            let session_file = claude_session_file_path(&workspace_root, &normalized)?;
-            if let Err(err) = tokio_fs::remove_file(&session_file).await
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(format!(
-                    "Failed to delete Claude session '{}': {err}",
-                    session_file.display()
-                ));
-            }
+        let session_file = claude_session_file_path(&workspace_root, &normalized)?;
+        if let Err(err) = tokio_fs::remove_file(&session_file).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "Failed to delete Claude session '{}': {err}",
+                session_file.display()
+            ));
         }
         self.list_sessions().await?;
         Ok(())
@@ -15706,153 +15603,7 @@ fn system_time_to_ms(time: SystemTime) -> u64 {
 }
 
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    if let Some(root) = workspace_roots
-        .iter()
-        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
-        .cloned()
-    {
-        return Ok(root);
-    }
-    if workspace_roots
-        .iter()
-        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
-    {
-        return Err("Claude backend requires at least one local workspace root".to_string());
-    }
-    crate::backend::tyde_owned_no_root_cwd("claude")
-}
-
-// ---------------------------------------------------------------------------
-// Remote (SSH) session file helpers
-// ---------------------------------------------------------------------------
-
-async fn list_claude_sessions_remote(
-    host: &str,
-    workspace_root: &str,
-) -> Result<Vec<Value>, String> {
-    use crate::remote::run_ssh_raw;
-
-    let encoded = encode_workspace_root(workspace_root);
-    tracing::info!(
-        "list_claude_sessions_remote: host={host}, workspace_root={workspace_root}, encoded={encoded}"
-    );
-    // Avoid transferring entire session files (can be megabytes) — instead
-    // extract metadata from head+tail in a single SSH round-trip.
-    let marker = "___TYDE_SESSION_BOUNDARY___";
-    let script = format!(
-        "dir=\"$HOME/.claude/projects/{encoded}\"; \
-         [ -d \"$dir\" ] || exit 0; \
-         for f in \"$dir\"/*.jsonl; do \
-           [ -f \"$f\" ] || continue; \
-           name=$(basename \"$f\"); \
-           cnt=$(grep -c '\"type\":\"' \"$f\" 2>/dev/null || echo 0); \
-           echo \"{marker}$name $cnt\"; \
-           head -5 \"$f\"; \
-           echo; \
-           tail -5 \"$f\"; \
-         done"
-    );
-    let output = run_ssh_raw(host, &script).await?;
-    let raw = String::from_utf8_lossy(&output.stdout);
-
-    let mut sessions = Vec::new();
-    for chunk in raw.split(marker) {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let (header, contents) = match chunk.split_once('\n') {
-            Some((h, rest)) => (h.trim(), rest),
-            None => continue,
-        };
-        let (name, msg_count) = match header.rsplit_once(' ') {
-            Some((n, c)) => (n.trim(), c.trim().parse::<u64>().unwrap_or(0)),
-            None => (header, 0),
-        };
-        if !name.ends_with(".jsonl") || name.starts_with("agent-") {
-            continue;
-        }
-
-        let now = unix_now_ms();
-        if let Some(mut metadata) =
-            inspect_claude_session_contents(name, contents, workspace_root, now, now)
-        {
-            metadata["message_count"] = serde_json::json!(msg_count);
-            sessions.push(metadata);
-        }
-    }
-
-    sessions.sort_by(|a, b| {
-        let a_ts = a.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
-        let b_ts = b.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
-        b_ts.cmp(&a_ts)
-    });
-
-    Ok(sessions)
-}
-
-async fn load_claude_session_history_remote(
-    host: &str,
-    workspace_root: &str,
-    session_id: &str,
-) -> Result<ClaudeSessionReplay, ClaudeSessionHistoryError> {
-    use crate::remote::{run_ssh_raw, shell_quote_arg};
-
-    let encoded = encode_workspace_root(workspace_root);
-    let id = normalize_nonempty(session_id)
-        .ok_or_else(|| ClaudeSessionHistoryError::other("Invalid session id".to_string()))?;
-    let relative_path = format!(".claude/projects/{encoded}/{id}.jsonl");
-    let quoted_relative_path = shell_quote_arg(&relative_path);
-    let cmd = format!(
-        "file=\"$HOME\"/{quoted_relative_path}; \
-         [ -f \"$file\" ] || {{ echo \"Claude session file is missing: $file\" >&2; exit 66; }}; \
-         cat \"$file\""
-    );
-    let output = run_ssh_raw(host, &cmd).await.map_err(|err| {
-        ClaudeSessionHistoryError::other(format!(
-            "Failed to read remote Claude session '{id}': {err}"
-        ))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() == Some(66) || is_remote_missing_session_stderr(&stderr) {
-            return Err(ClaudeSessionHistoryError::missing(
-                format!("{host}:~/{relative_path}"),
-                stderr.trim().to_string(),
-            ));
-        }
-        return Err(ClaudeSessionHistoryError::other(format!(
-            "Failed to read remote Claude session '{id}': {stderr}"
-        )));
-    }
-    let contents = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_claude_session_replay(&contents))
-}
-
-fn is_remote_missing_session_stderr(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("no such file or directory")
-        || lower.contains("does not exist")
-        || (lower.contains("cannot open") && lower.contains("no such file"))
-}
-
-async fn delete_claude_session_remote(
-    host: &str,
-    workspace_root: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    use crate::remote::run_ssh_raw;
-
-    let encoded = encode_workspace_root(workspace_root);
-    let cmd = format!("rm -f \"$HOME/.claude/projects/{encoded}/{session_id}.jsonl\"");
-    let output = run_ssh_raw(host, &cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Failed to delete remote Claude session '{session_id}': {stderr}"
-        ));
-    }
-    Ok(())
+    super::pick_workspace_root(workspace_roots, "claude")
 }
 
 pub(crate) fn unix_now_ms() -> u64 {
@@ -15949,12 +15700,10 @@ impl ClaudeBackend {
             // failed materialization is one notice at startup rather than a
             // skill that turns up missing mid-turn. It never fails the spawn:
             // see `claude_prepare_skills`.
-            // `ClaudeBackend` spawns the CLI locally; the low-level session is
-            // the only layer that takes an ssh host, and it is given none here.
             let (skills, skill_steering) = tokio::select! {
                 biased;
                 _ = &mut startup_cancel_rx => return,
-                skills = claude_prepare_skills(&config, None, &probe_workspace_root) => skills,
+                skills = claude_prepare_skills(&config, &probe_workspace_root) => skills,
             };
             let steering = match claude_steering_content(&config, skill_steering) {
                 Ok(steering) => steering,
@@ -15971,7 +15720,6 @@ impl ClaudeBackend {
                     &workspace_roots,
                     ClaudeForkConfig {
                         from_session_id: &from_session_id.0,
-                        ssh_host: None,
                         startup_mcp_servers: &config.startup_mcp_servers,
                         steering_content: steering_content.as_deref(),
                         agent_identity: agent_identity.as_ref(),
@@ -15985,7 +15733,6 @@ impl ClaudeBackend {
             } else {
                 ClaudeSession::spawn_with_skills(
                     &workspace_roots,
-                    None,
                     &config.startup_mcp_servers,
                     steering_content.as_deref(),
                     agent_identity.as_ref(),
@@ -16271,15 +16018,13 @@ fn claude_agent_identity(config: &BackendSpawnConfig) -> Option<AgentIdentity> {
 
 /// How this session tells the model about skills.
 ///
-/// Locally the model discovers them itself and the overlay is guidance only —
-/// no names for the Default agent, compact names for an explicit selection, and
-/// never a body. Over SSH there is no discovery seam, so the bodies are the
-/// message.
+/// The model discovers them itself and the overlay is guidance only: no names
+/// for the Default agent, compact names for an explicit selection, and no bodies.
 #[derive(Debug)]
 enum ClaudeSkillSteering {
     /// No skill was exposed. Emits nothing.
     None,
-    /// Local session with a materialized plugin. Carries the skills that
+    /// Session with a materialized plugin. Carries the skills that
     /// actually materialized, so the overlay can never name one that did not.
     Native(SkillSelection, Vec<PreparedSkill>),
 }
@@ -17024,7 +16769,6 @@ impl Backend for ClaudeBackend {
     ) -> Result<crate::backend::BackendDiscovery, BackendDiscoveryError> {
         let (session, events) = ClaudeSession::spawn_ephemeral(
             &context.workspace_roots,
-            None,
             &[],
             None,
             None,
@@ -17081,14 +16825,12 @@ impl Backend for ClaudeBackend {
         // A resumed session gets its own plugin root: the previous session's
         // was unlinked when it shut down.
         let probe_workspace_root = pick_workspace_root(&workspace_roots)?;
-        let (skills, skill_steering) =
-            claude_prepare_skills(&config, None, &probe_workspace_root).await;
+        let (skills, skill_steering) = claude_prepare_skills(&config, &probe_workspace_root).await;
         let steering = claude_steering_content(&config, skill_steering)?;
         let steering_content = steering;
         let agent_identity = claude_agent_identity(&config);
         let (session, mut raw_events) = ClaudeSession::spawn_with_skills(
             &workspace_roots,
-            None,
             &config.startup_mcp_servers,
             steering_content.as_deref(),
             agent_identity.as_ref(),
@@ -17406,10 +17148,9 @@ impl Backend for ClaudeBackend {
             // with the busy check.
             let (relocation, cwd_result) = inner
                 .run_turn_transition(|state: &mut ClaudeState, inner: &Arc<ClaudeInner>| {
-                    if state.ssh_host.is_some() || state.ephemeral {
+                    if state.ephemeral {
                         return Err(super::WorkspaceRelocationError::Rejected(
-                            "Claude workspace relocation requires a persistent local session"
-                                .to_owned(),
+                            "Claude workspace relocation requires a persistent session".to_owned(),
                         ));
                     }
                     // The CLI wake latch permits late output; it is not outstanding work.

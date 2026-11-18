@@ -172,17 +172,12 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     fn resolve_roots<'a>(
         &'a self,
         workspace_roots: &'a [String],
-        ssh_host: Option<&'a str>,
         kind: AcpSessionKind,
     ) -> BoxFuture<'a, Result<AcpSessionRoots, String>>;
 
     /// Build the process invocation. This is where binary discovery lives —
     /// PATH lookup, sibling-binary resolution, wrapper unwrapping.
-    fn spawn_spec(
-        &self,
-        roots: &AcpSessionRoots,
-        ssh_host: Option<&str>,
-    ) -> Result<AcpSpawnSpec, String>;
+    fn spawn_spec(&self, roots: &AcpSessionRoots) -> Result<AcpSpawnSpec, String>;
 
     /// Build a read-only subscription-capacity probe when this specific agent
     /// exposes one outside ACP. The generic ACP protocol has no usage method.
@@ -193,9 +188,8 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// Client capabilities advertised in `initialize`.
     ///
     /// The default declares filesystem read/write and terminal support for
-    /// local agents. The generic backend disables these for SSH agents and
-    /// supplies `protocolVersion` and `clientInfo`; an adapter must not set
-    /// them.
+    /// adapters. The generic backend supplies `protocolVersion` and
+    /// `clientInfo`; an adapter must not set them.
     fn client_capabilities(&self) -> Value {
         serde_json::json!({
             "fs": { "readTextFile": true, "writeTextFile": true },
@@ -276,10 +270,7 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// correct for an agent that neither implements `session/list` nor stores
     /// sessions where Tyde can find them; the generic backend prefers the
     /// protocol method when the agent advertises it.
-    fn list_sessions<'a>(
-        &'a self,
-        _ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Vec<BackendSession>, String>> {
+    fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<BackendSession>, String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -288,17 +279,12 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     fn before_session_load<'a>(
         &'a self,
         _session_id: &'a str,
-        _ssh_host: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Delete a backend-native session.
-    fn delete_session<'a>(
-        &'a self,
-        _session_id: &'a str,
-        _ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    fn delete_session<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async { Err("This ACP agent does not support deleting sessions".to_string()) })
     }
 

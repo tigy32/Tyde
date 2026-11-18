@@ -1168,7 +1168,7 @@ may map `SpawnCostHint` differently:
   `sessionCapabilities.list` is listed with `session/list`, following
   `nextCursor` and filtering by `cwd`, so it needs no adapter code to be
   resumable. Adapters cover only agents that list out of band — Kiro reads its
-  own JSON session files (locally or over ssh) and advertises nothing.
+  own JSON session files on the server and advertises nothing.
 - Others: backend-specific model selection where supported
 
 ### Key design decisions

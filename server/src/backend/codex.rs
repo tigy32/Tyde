@@ -1646,59 +1646,6 @@ fn codex_skills_extra_roots_unsupported_message() -> String {
         .to_owned()
 }
 
-fn codex_selected_skills_ssh_notice(
-    ssh_host: Option<&str>,
-    selected_skills: &[ResolvedSkill],
-) -> Option<String> {
-    let host = ssh_host.filter(|_| !selected_skills.is_empty())?;
-    Some(format!(
-        "Tyde started this Codex session without its {} selected skill(s): Tyde will not send local skill paths to the app-server on SSH host '{host}', which cannot read this machine's disk",
-        selected_skills.len()
-    ))
-}
-
-fn codex_selected_skills_remote_workspace_notice(
-    workspace_roots: &[String],
-    selected_skills: &[ResolvedSkill],
-) -> Option<String> {
-    if selected_skills.is_empty() {
-        return None;
-    }
-    let detail = codex_ssh_workspace_detail(workspace_roots)?;
-    Some(format!(
-        "Tyde started this Codex session without its {} selected skill(s): Tyde will not send local skill paths to a remote app-server {detail}",
-        selected_skills.len()
-    ))
-}
-
-/// The one reason a Codex session cannot have Tyde's skills that is known before
-/// the app-server starts: it is running somewhere that cannot read this
-/// machine's disk. The skills are dropped, not the session.
-fn codex_remote_skill_notice(
-    ssh_host: Option<&str>,
-    workspace_roots: &[String],
-    selected_skills: &[ResolvedSkill],
-) -> Option<String> {
-    codex_selected_skills_ssh_notice(ssh_host, selected_skills)
-        .or_else(|| codex_selected_skills_remote_workspace_notice(workspace_roots, selected_skills))
-}
-
-fn codex_ssh_workspace_detail(workspace_roots: &[String]) -> Option<String> {
-    if !workspace_roots
-        .iter()
-        .any(|root| root.trim_start().starts_with("ssh://"))
-    {
-        return None;
-    }
-    Some(
-        match crate::remote::parse_remote_workspace_roots(workspace_roots) {
-            Ok(Some((host, _))) => format!("for SSH host '{host}'"),
-            Ok(None) => "for malformed SSH workspace roots".to_owned(),
-            Err(err) => format!("for SSH workspace roots ({err})"),
-        },
-    )
-}
-
 pub struct CodexSession {
     inner: Arc<CodexInner>,
     // The thread/start or thread/fork response is the authoritative source for
@@ -1720,17 +1667,6 @@ struct CodexSelectedSkillContext<'a> {
     selection: SkillSelection,
     installed_provider_version: Option<&'a str>,
     excluded_tool_categories: &'a [protocol::ToolCategory],
-}
-
-impl CodexSelectedSkillContext<'_> {
-    fn empty() -> Self {
-        Self {
-            skills: &[],
-            selection: SkillSelection::Explicit,
-            installed_provider_version: None,
-            excluded_tool_categories: &[],
-        }
-    }
 }
 
 struct CodexSessionForkOptions<'a> {
@@ -1759,90 +1695,8 @@ struct CodexSessionSpawnOptions<'a> {
 }
 
 impl CodexSession {
-    pub async fn spawn(
-        workspace_roots: &[String],
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            CodexSessionSpawnOptions {
-                relocation_wake: tokio::sync::watch::channel(()).0,
-                ephemeral: false,
-                access_mode,
-                subagent_emitter: None,
-                execution_mode: BackendExecutionMode::Agent,
-                installed_provider_version: None,
-                excluded_tool_categories: &[],
-                selected_skills: &[],
-                skill_selection: SkillSelection::Explicit,
-            },
-        )
-        .await
-    }
-
-    pub async fn spawn_ephemeral(
-        workspace_roots: &[String],
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            CodexSessionSpawnOptions {
-                relocation_wake: tokio::sync::watch::channel(()).0,
-                ephemeral: true,
-                access_mode,
-                subagent_emitter: None,
-                execution_mode: BackendExecutionMode::Agent,
-                installed_provider_version: None,
-                excluded_tool_categories: &[],
-                selected_skills: &[],
-                skill_selection: SkillSelection::Explicit,
-            },
-        )
-        .await
-    }
-
-    pub async fn spawn_admin(
-        workspace_roots: &[String],
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            CodexSessionSpawnOptions {
-                relocation_wake: tokio::sync::watch::channel(()).0,
-                ephemeral: true,
-                access_mode,
-                subagent_emitter: None,
-                execution_mode: BackendExecutionMode::Agent,
-                installed_provider_version: None,
-                excluded_tool_categories: &[],
-                selected_skills: &[],
-                skill_selection: SkillSelection::Explicit,
-            },
-        )
-        .await
-    }
-
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         options: CodexSessionSpawnOptions<'_>,
@@ -1858,18 +1712,10 @@ impl CodexSession {
             selected_skills,
             skill_selection,
         } = options;
+        let cwd = pick_workspace_root(workspace_roots)?;
+        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let mut skill_notices: Vec<String> = Vec::new();
         let mut selected_skills = selected_skills;
-        if let Some(notice) =
-            codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
-        {
-            if skill_selection == SkillSelection::Explicit {
-                return Err(notice);
-            }
-            tracing::warn!("{notice}");
-            skill_notices.push(notice);
-            selected_skills = &[];
-        }
         let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
             Ok(projection) => projection,
             Err(err) => {
@@ -1907,7 +1753,6 @@ impl CodexSession {
             .as_deref()
             .unwrap_or(startup_mcp_servers);
         let (rpc, inbound_rx) = match CodexRpc::spawn(
-            ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
             execution_mode,
@@ -1928,43 +1773,6 @@ impl CodexSession {
             return Err(err);
         }
 
-        let cwd = if ssh_host.is_some() {
-            // For remote sessions, extract the remote path (host already stripped)
-            match crate::remote::parse_remote_workspace_roots(workspace_roots) {
-                Ok(Some((_, paths))) => match paths.into_iter().next() {
-                    Some(path) => path,
-                    None => {
-                        cleanup_codex_startup_failure(
-                            rpc,
-                            &mut skill_projection,
-                            &steering_tempfile,
-                        )
-                        .await;
-                        return Err("No remote workspace root found".to_owned());
-                    }
-                },
-                Ok(None) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err("Expected remote workspace roots for SSH session".to_owned());
-                }
-                Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
-                }
-            }
-        } else {
-            match pick_workspace_root(workspace_roots) {
-                Ok(root) => root,
-                Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
-                }
-            }
-        };
-        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let skill_setup = if let Some(projection) = skill_projection.as_ref() {
             match configure_codex_native_skills(
                 &rpc,
@@ -2095,32 +1903,8 @@ impl CodexSession {
         Ok((session, events))
     }
 
-    pub async fn fork(
-        workspace_roots: &[String],
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
-        from_thread_id: &str,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::fork_with_selected_skills(
-            workspace_roots,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            from_thread_id,
-            CodexSessionForkOptions {
-                access_mode,
-                skills: CodexSelectedSkillContext::empty(),
-                relocation_wake: tokio::sync::watch::channel(()).0,
-            },
-        )
-        .await
-    }
-
     async fn fork_with_selected_skills(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         from_thread_id: &str,
@@ -2137,18 +1921,10 @@ impl CodexSession {
             installed_provider_version,
             excluded_tool_categories,
         } = skills;
+        let cwd = pick_workspace_root(workspace_roots)?;
+        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let mut skill_notices: Vec<String> = Vec::new();
         let mut selected_skills = selected_skills;
-        if let Some(notice) =
-            codex_remote_skill_notice(ssh_host.as_deref(), workspace_roots, selected_skills)
-        {
-            if skill_selection == SkillSelection::Explicit {
-                return Err(notice);
-            }
-            tracing::warn!("{notice}");
-            skill_notices.push(notice);
-            selected_skills = &[];
-        }
         let mut skill_projection = match CodexSkillProjection::new(selected_skills) {
             Ok(projection) => projection,
             Err(err) => {
@@ -2168,7 +1944,6 @@ impl CodexSession {
             _ => None,
         };
         let (rpc, inbound_rx) = match CodexRpc::spawn(
-            ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
             BackendExecutionMode::Agent,
@@ -2189,35 +1964,6 @@ impl CodexSession {
             return Err(err);
         }
 
-        let cwd = if ssh_host.is_some() {
-            let parsed = match crate::remote::parse_remote_workspace_roots(workspace_roots) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
-                }
-            };
-            let Some((_, paths)) = parsed else {
-                cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-                return Err("Expected remote workspace roots for SSH session".to_string());
-            };
-            let Some(path) = paths.into_iter().next() else {
-                cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-                return Err("No remote workspace root found".to_string());
-            };
-            path
-        } else {
-            match pick_workspace_root(workspace_roots) {
-                Ok(root) => root,
-                Err(err) => {
-                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
-                        .await;
-                    return Err(err);
-                }
-            }
-        };
-        let cwd = process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?;
         let skill_setup = if let Some(projection) = skill_projection.as_ref() {
             match configure_codex_native_skills(
                 &rpc,
@@ -2774,7 +2520,6 @@ pub(crate) async fn read_capacity_out_of_band(
     program: Option<&str>,
 ) -> protocol::BackendCapacityState {
     let (rpc, _inbound_rx) = match CodexRpc::spawn_with_local_program(
-        None,
         &[],
         None,
         BackendExecutionMode::Agent,
@@ -2839,16 +2584,10 @@ pub(crate) async fn read_capacity_out_of_band(
 pub(crate) async fn probe_session_settings_schema(
     program: Option<&str>,
 ) -> Result<SessionSettingsSchema, BackendDiscoveryError> {
-    let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
-        None,
-        &[],
-        None,
-        BackendExecutionMode::Agent,
-        program,
-        &[],
-    )
-    .await
-    .map_err(|err| format!("Codex model discovery failed to spawn app-server: {err}"))?;
+    let (rpc, _inbound_rx) =
+        CodexRpc::spawn_with_local_program(&[], None, BackendExecutionMode::Agent, program, &[])
+            .await
+            .map_err(|err| format!("Codex model discovery failed to spawn app-server: {err}"))?;
 
     if let Err(err) = rpc
         .request(
@@ -20983,20 +20722,7 @@ fn codex_thread_settings_update_params(thread_id: &str, settings: &Value) -> Res
 }
 
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    if let Some(root) = workspace_roots
-        .iter()
-        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
-        .cloned()
-    {
-        return Ok(root);
-    }
-    if workspace_roots
-        .iter()
-        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
-    {
-        return Err("Codex backend requires at least one local workspace root".to_string());
-    }
-    crate::backend::tyde_owned_no_root_cwd("codex")
+    super::pick_workspace_root(workspace_roots, "codex")
 }
 
 fn codex_runtime_workspace_roots(
@@ -21007,7 +20733,7 @@ fn codex_runtime_workspace_roots(
         .iter()
         .filter_map(|root| {
             let trimmed = root.trim();
-            (!trimmed.is_empty() && !trimmed.starts_with("ssh://"))
+            (!trimmed.is_empty())
                 .then(|| process_env::launch::WorkspacePath::host(trimmed)?.execution_string())
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -21304,10 +21030,7 @@ fn toml_quoted(value: &str) -> String {
 
 const CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
 
-fn codex_mcp_config_overrides(
-    startup_mcp_servers: &[StartupMcpServer],
-    tyde_loopback_reachable: bool,
-) -> Vec<String> {
+fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<String> {
     let mut overrides = Vec::new();
 
     for server in startup_mcp_servers {
@@ -21326,14 +21049,12 @@ fn codex_mcp_config_overrides(
                 overrides.push(format!("{base}.tools.{tool}.approval_mode=\"approve\""));
             }
         }
-        if tyde_loopback_reachable
-            && matches!(
-                name,
-                AGENT_CONTROL_MCP_SERVER_NAME
-                    | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
-                    | crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME
-            )
-        {
+        if matches!(
+            name,
+            AGENT_CONTROL_MCP_SERVER_NAME
+                | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                | crate::tychat_mcp::TYCHAT_MCP_SERVER_NAME
+        ) {
             // These are load-bearing Tyde conversation-control tools. Codex
             // gives optional uncached MCP servers only a short startup grace
             // before capturing the immutable tool binding for a turn.
@@ -21898,7 +21619,6 @@ struct CodexRpc {
     inbound: mpsc::UnboundedSender<CodexInbound>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
-    usage_is_remote: bool,
     rollout_trace_task: Option<JoinHandle<()>>,
     rollout_trace_root: Option<tempfile::TempDir>,
     tool_catalog: Option<tempfile::NamedTempFile>,
@@ -21925,14 +21645,12 @@ impl CodexRpc {
     }
 
     async fn spawn(
-        ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
         execution_mode: BackendExecutionMode,
         excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         Self::spawn_with_local_program(
-            ssh_host,
             startup_mcp_servers,
             steering_tempfile,
             execution_mode,
@@ -21943,7 +21661,6 @@ impl CodexRpc {
     }
 
     async fn spawn_with_local_program(
-        ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
         execution_mode: BackendExecutionMode,
@@ -21953,11 +21670,7 @@ impl CodexRpc {
         if execution_mode == BackendExecutionMode::InferenceOnly {
             process_env::launch::require_nested_namespaces()?;
         }
-        if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
-            return Err("Codex transient inference requires a local Codex process".to_owned());
-        }
-        let mut config_overrides =
-            codex_mcp_config_overrides(startup_mcp_servers, ssh_host.is_none());
+        let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
         // Native cleanup waits for both no subscribers and authoritative idle.
         // A zero retention delay makes unsubscribe an event-driven unload boundary.
         config_overrides.push("thread_unload_delay_secs=0".to_owned());
@@ -21975,9 +21688,6 @@ impl CodexRpc {
         }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
-        }
-        if ssh_host.is_some() && !excluded_tool_categories.is_empty() {
-            return Err("Codex tool category exclusions require a host-local runtime".to_owned());
         }
         let catalog_categories = excluded_tool_categories
             .iter()
@@ -22006,8 +21716,7 @@ impl CodexRpc {
                 toml_quoted(&path.display().to_string())
             ));
         }
-        let local_agent = ssh_host.is_none() && execution_mode == BackendExecutionMode::Agent;
-        let rollout_trace_root = if local_agent {
+        let rollout_trace_root = if execution_mode == BackendExecutionMode::Agent {
             let root = tempfile::Builder::new()
                 .prefix(CODEX_ROLLOUT_TRACE_ROOT_PREFIX)
                 .tempdir()
@@ -22017,28 +21726,23 @@ impl CodexRpc {
         } else {
             None
         };
-        let usage_is_remote = ssh_host.is_some();
-        let mut child = if let Some(host) = ssh_host {
-            let remote_args = codex_app_server_args(execution_mode, &config_overrides);
-            crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
-        } else {
-            let mut cmd = match local_program {
-                Some(program) => crate::backend::subprocess::command(program)?,
-                None => crate::backend::subprocess::command("codex")?,
-            };
-            for arg in codex_app_server_args(execution_mode, &config_overrides) {
-                cmd.arg(arg);
-            }
-            if let Some(root) = rollout_trace_root.as_ref() {
-                cmd.env("CODEX_ROLLOUT_TRACE_ROOT", root.path());
-            }
-            cmd.stdin(crate::backend::subprocess::ProcessStdio::Piped)
-                .stdout(crate::backend::subprocess::ProcessStdio::Piped)
-                .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-            cmd.group_spawn()
-                .await
-                .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?
+        let mut cmd = match local_program {
+            Some(program) => crate::backend::subprocess::command(program)?,
+            None => crate::backend::subprocess::command("codex")?,
         };
+        for arg in codex_app_server_args(execution_mode, &config_overrides) {
+            cmd.arg(arg);
+        }
+        if let Some(root) = rollout_trace_root.as_ref() {
+            cmd.env("CODEX_ROLLOUT_TRACE_ROOT", root.path());
+        }
+        cmd.stdin(crate::backend::subprocess::ProcessStdio::Piped)
+            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+        let mut child = cmd
+            .group_spawn()
+            .await
+            .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?;
 
         let stdin = child.take_stdin().ok_or("Failed to capture Codex stdin")?;
         let stdout = child
@@ -22158,7 +21862,6 @@ impl CodexRpc {
                 inbound: inbound_tx,
                 stdout_task,
                 stderr_task,
-                usage_is_remote,
                 rollout_trace_task,
                 rollout_trace_root,
                 tool_catalog,
@@ -22176,23 +21879,6 @@ impl CodexRpc {
     }
 
     async fn read_native_usage(&self, path: &str, offset: usize) -> Result<Vec<u8>, String> {
-        if self.usage_is_remote {
-            let file = self
-                .request("fs/readFile", json!({"path": path}))
-                .await
-                .map_err(|_| "Codex remote native accounting fs/readFile failed")?;
-            let encoded = file
-                .get("dataBase64")
-                .and_then(Value::as_str)
-                .ok_or("Codex native accounting fs/readFile omitted its contents")?;
-            let bytes = BASE64_STANDARD
-                .decode(encoded)
-                .map_err(|_| "Codex native accounting fs/readFile returned invalid encoding")?;
-            return bytes
-                .get(offset..)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| "Codex native accounting source was truncated".to_owned());
-        }
         let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|_| "Codex native accounting source could not be opened")?;
@@ -22630,7 +22316,6 @@ use super::{
 
 pub struct CodexBackend {
     relocation_wake: tokio::sync::watch::Sender<()>,
-    workspace_is_local: bool,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
     interrupt_tx: mpsc::UnboundedSender<CodexInterrupt>,
@@ -22667,16 +22352,10 @@ impl CodexBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let inference_only = config.execution_mode == BackendExecutionMode::InferenceOnly;
-        // No remote-skill guard here: a remote session drops its skills with a
-        // notice when it starts (`codex_remote_skill_notice`), rather than
-        // refusing to start at all.
         let initial_emitter = (!inference_only)
             .then(|| config.subagent_emitter.clone())
             .flatten();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let workspace_is_local = !workspace_roots
-            .iter()
-            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -22710,7 +22389,6 @@ impl CodexBackend {
             let session_result = startup_processes
                 .scope(CodexSession::spawn_with_mode(
                     &workspace_roots,
-                    None,
                     startup_mcp_servers,
                     combined_instructions.as_deref(),
                     CodexSessionSpawnOptions {
@@ -23032,7 +22710,6 @@ impl CodexBackend {
 
         Ok((
             Self {
-                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -23249,13 +22926,6 @@ fn is_codex_thread_fork_unsupported_error(error: &str) -> bool {
 fn codex_thread_fork_unsupported_message() -> String {
     "Installed Codex CLI does not expose session fork (app-server method `thread/fork`). Update Codex CLI and try again."
         .to_string()
-}
-
-fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<BackendStartupError> {
-    let detail = codex_ssh_workspace_detail(workspace_roots)?;
-    Some(BackendStartupError::unsupported(format!(
-        "Codex backend does not support session fork {detail} yet"
-    )))
 }
 
 fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexToolRequest> {
@@ -24217,9 +23887,6 @@ impl Backend for CodexBackend {
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let workspace_is_local = !workspace_roots
-            .iter()
-            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -24249,7 +23916,6 @@ impl Backend for CodexBackend {
             let (session, mut raw_events) = match startup_processes
                 .scope(CodexSession::spawn_with_mode(
                     &workspace_roots,
-                    None,
                     &config.startup_mcp_servers,
                     combined_instructions.as_deref(),
                     CodexSessionSpawnOptions {
@@ -24429,7 +24095,6 @@ impl Backend for CodexBackend {
 
         Ok((
             Self {
-                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -24452,14 +24117,7 @@ impl Backend for CodexBackend {
         from_session_id: protocol::SessionId,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
-        if let Some(error) = codex_ssh_fork_unsupported_error(&workspace_roots) {
-            return Err(error);
-        }
-
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let workspace_is_local = !workspace_roots
-            .iter()
-            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -24485,7 +24143,6 @@ impl Backend for CodexBackend {
             let (session, mut raw_events) = match startup_processes
                 .scope(CodexSession::fork_with_selected_skills(
                     &workspace_roots,
-                    None,
                     &config.startup_mcp_servers,
                     combined_instructions.as_deref(),
                     &from_session_id.0,
@@ -24736,7 +24393,6 @@ impl Backend for CodexBackend {
 
         Ok((
             Self {
-                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -24757,7 +24413,6 @@ impl Backend for CodexBackend {
         context: &crate::backend::BackendProbeContext,
     ) -> Result<Vec<BackendSession>, String> {
         let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
-            None,
             &[],
             None,
             BackendExecutionMode::Agent,
@@ -24883,19 +24538,12 @@ impl Backend for CodexBackend {
         workspace_roots: Vec<String>,
     ) -> impl std::future::Future<Output = Result<(), super::WorkspaceRelocationError>> + Send + 'static
     {
-        let workspace_is_local = self.workspace_is_local;
         let handle = self
             .compaction_handle
             .lock()
             .expect("Codex command handle mutex poisoned")
             .clone();
         async move {
-            if !workspace_is_local {
-                return Err(super::WorkspaceRelocationError::Rejected(
-                    "Codex workspace relocation is currently supported only for local sessions"
-                        .to_owned(),
-                ));
-            }
             let roots = super::validate_local_workspace_roots(workspace_roots)
                 .map_err(super::WorkspaceRelocationError::Rejected)?;
             let handle = handle.ok_or_else(|| {

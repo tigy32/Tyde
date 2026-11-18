@@ -3984,6 +3984,7 @@ impl HostHandle {
             sessions,
             session_list,
             projects,
+            project_catalog_warning: state.project_store.catalog_warning(),
             mcp_servers,
             skills,
             steering,
@@ -6167,6 +6168,9 @@ impl HostHandle {
                     .await?;
                 let (project_id, missing_project_failure) = match payload.project_id.clone() {
                     Some(project_id) => {
+                        project_store
+                            .require_supported_workspace(&project_id)
+                            .map_err(|error| AppError::invalid("spawn_agent", error))?;
                         if removing_projects.is_removing(&project_id) {
                             (
                                 None,
@@ -6407,6 +6411,13 @@ impl HostHandle {
                         )
                         .await;
                 };
+                crate::paths::reject_ssh_workspace_roots(&record.workspace_roots)
+                    .map_err(|error| AppError::invalid("spawn_agent", error))?;
+                if let Some(project_id) = &record.project_id {
+                    project_store
+                        .require_supported_workspace(project_id)
+                        .map_err(|error| AppError::invalid("spawn_agent", error))?;
+                }
                 if !session_record_is_resumable(&record, &backend_storage) {
                     let resolved_name = payload
                         .name
@@ -6487,6 +6498,9 @@ impl HostHandle {
                 let requested_project_id = payload.project_id.or(record.project_id.clone());
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
+                        project_store
+                            .require_supported_workspace(&project_id)
+                            .map_err(|error| AppError::invalid("spawn_agent", error))?;
                         if removing_projects.is_removing(&project_id) {
                             let warning = format!(
                                 "workbench {} is being removed; resuming without a project",
@@ -6820,9 +6834,14 @@ let custom_agents = &state.custom_agent_store;
                     );
                 }
 
+                crate::paths::reject_ssh_workspace_roots(&record.workspace_roots)
+                    .map_err(|error| AppError::invalid("spawn_agent", error))?;
                 let requested_project_id = record.project_id.clone();
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
+                        project_store
+                            .require_supported_workspace(&project_id)
+                            .map_err(|error| AppError::invalid("spawn_agent", error))?;
                         if removing_projects.is_removing(&project_id) {
                             let warning = format!(
                                 "workbench {} is being removed; forking without a project",
@@ -8097,6 +8116,8 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         request: ResolvedSpawnRequest,
         operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
     ) -> AppResult<AgentId> {
+        crate::paths::reject_ssh_workspace_roots(&request.workspace_roots)
+            .map_err(|error| AppError::invalid("spawn_agent", error))?;
         let project_binding = if let Some(project_id) = request.project_id.as_ref() {
             Some(
                 self.project_catalog
@@ -8933,6 +8954,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         agent_id: Option<&AgentId>,
         path: &str,
     ) -> Result<String, String> {
+        crate::paths::reject_ssh_workspace_roots([path])?;
         let Some(agent_id) = agent_id else {
             return Ok(path.to_owned());
         };

@@ -25,7 +25,6 @@ pub use tyde_process_env as process_env;
 pub(crate) mod project_stream;
 mod project_watch;
 pub mod recovery;
-pub mod remote;
 pub(crate) mod review;
 pub(crate) mod review_mcp;
 pub(crate) mod router;

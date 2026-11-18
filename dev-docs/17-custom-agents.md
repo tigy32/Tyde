@@ -572,8 +572,6 @@ lookup and no silent degradation.
 - project-scoped MCP servers
 - project-scoped skills
 - per-backend session-setting overrides in the custom-agent editor
-- remote-host skill materialization over SSH before the proper remote-host
-  design lands
 
 ---
 

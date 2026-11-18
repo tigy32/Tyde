@@ -832,7 +832,7 @@ inferred-state code the philosophy doc forbids.
 The frontend sends `WorkbenchCreate` on the host stream of the host that owns
 the parent project. The remote server runs `git worktree add` against its own
 filesystem. The resulting `ProjectNotify::Upsert` flows back on the same host
-connection. No `ssh://` paths, no local-vs-remote branching in the frontend.
+connection. The frontend uses the same project flow for every host.
 
 Workbenches **cannot** span hosts. A workbench whose worktree lives on a
 different host than its parent is not a workbench; that is a clone, and is

@@ -225,6 +225,7 @@ pub fn prime_host_with_bootstrap_for_tests(
         teams: Vec::new(),
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
+        project_catalog_warning: None,
         teams_store_load_error: None,
         agent_restoration_failures: Vec::new(),
         agents: Vec::new(),
@@ -7045,6 +7046,12 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         payload.team_members.len(),
     );
 
+    let catalog_notice = crate::notices::NoticeScope::ProjectCatalog(host_id.to_owned());
+    crate::notices::clear_scope(&catalog_notice);
+    if let Some(message) = payload.project_catalog_warning {
+        crate::notices::report_error(catalog_notice, message);
+    }
+
     state.self_improvement_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.self_improvement);
     });
@@ -8047,6 +8054,7 @@ pub(crate) mod restore_fixtures {
                 teams: Vec::new(),
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
+                project_catalog_warning: None,
                 teams_store_load_error: None,
                 agent_restoration_failures: Vec::new(),
                 agents: Vec::new(),
@@ -8163,6 +8171,43 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_catalog_warning_renders_until_a_clear_bootstrap() {
+        let state = AppState::new();
+        let host_id = "catalog-warning-host";
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: host_id.to_owned(),
+                label: "Tyde host".to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: false,
+            }]);
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::notices::ProjectDialogs /> }
+        });
+        let message = "Projects unavailable: Retired workspace.";
+        prime_host_with_bootstrap_for_tests(&state, host_id, |bootstrap| {
+            bootstrap.project_catalog_warning = Some(message.to_owned());
+        });
+        next_tick().await;
+        assert!(container.inner_text().contains(message));
+
+        prime_host_for_tests(&state, host_id);
+        next_tick().await;
+        assert!(!container.inner_text().contains(message));
+        container.remove();
     }
 
     fn listed_session(host: &str, id: &str, count: u32, updated: u64) -> crate::state::SessionInfo {

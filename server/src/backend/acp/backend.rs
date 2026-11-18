@@ -121,7 +121,6 @@ struct KiroSpawnMode<'a> {
     ephemeral: bool,
     admin_session: bool,
     initial_model: Option<&'a str>,
-    ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
     probe_deadline: Option<tokio::time::Instant>,
@@ -164,15 +163,10 @@ async fn await_kiro_stage<T>(
 /// ACP protocol version Tyde speaks.
 const ACP_CLIENT_PROTOCOL_VERSION: u32 = 1;
 
-fn acp_initialize_params(adapter: &dyn AcpAgentAdapter, ssh_host: Option<&str>) -> Value {
-    let mut client_capabilities = adapter.client_capabilities();
-    if ssh_host.is_some() {
-        client_capabilities["fs"] = json!({"readTextFile": false, "writeTextFile": false});
-        client_capabilities["terminal"] = json!(false);
-    }
+fn acp_initialize_params(adapter: &dyn AcpAgentAdapter) -> Value {
     json!({
         "protocolVersion": ACP_CLIENT_PROTOCOL_VERSION,
-        "clientCapabilities": client_capabilities,
+        "clientCapabilities": adapter.client_capabilities(),
         "clientInfo": {
             "name": "tyde",
             "title": "Tyde",
@@ -352,24 +346,6 @@ pub struct KiroSession {
 }
 
 impl KiroSession {
-    pub async fn spawn(
-        workspace_roots: &[String],
-        initial_model: Option<&str>,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_for_agent(
-            workspace_roots,
-            None,
-            initial_model,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-        )
-        .await
-    }
-
     /// Start a session for a specific ACP agent.
     ///
     /// `agent` of `None` means the built-in Kiro agent, which is what a
@@ -378,7 +354,6 @@ impl KiroSession {
         workspace_roots: &[String],
         agent: Option<&protocol::AcpAgentSpec>,
         initial_model: Option<&str>,
-        ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
@@ -388,77 +363,9 @@ impl KiroSession {
                 ephemeral: false,
                 admin_session: false,
                 initial_model,
-                ssh_host,
                 startup_mcp_servers,
                 steering_content,
                 adapter: agent.map_or_else(|| kiro_adapter(None), adapter_for_spec),
-                probe_deadline: None,
-            },
-        )
-        .await
-        .map_err(String::from)
-    }
-
-    pub async fn spawn_ephemeral(
-        workspace_roots: &[String],
-        initial_model: Option<&str>,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            KiroSpawnMode {
-                ephemeral: true,
-                admin_session: false,
-                initial_model,
-                ssh_host,
-                startup_mcp_servers,
-                steering_content,
-                adapter: kiro_adapter(None),
-                probe_deadline: None,
-            },
-        )
-        .await
-        .map_err(String::from)
-    }
-
-    pub async fn spawn_admin(
-        workspace_roots: &[String],
-        initial_model: Option<&str>,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_admin_with_program_override(
-            workspace_roots,
-            initial_model,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            None,
-        )
-        .await
-    }
-
-    pub async fn spawn_admin_with_program_override(
-        workspace_roots: &[String],
-        initial_model: Option<&str>,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        program_override: Option<String>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            KiroSpawnMode {
-                ephemeral: true,
-                admin_session: true,
-                initial_model,
-                ssh_host,
-                startup_mcp_servers,
-                steering_content,
-                adapter: kiro_adapter(program_override),
                 probe_deadline: None,
             },
         )
@@ -477,7 +384,6 @@ impl KiroSession {
                 ephemeral: true,
                 admin_session: true,
                 initial_model: None,
-                ssh_host: None,
                 startup_mcp_servers: &[],
                 steering_content: None,
                 adapter,
@@ -497,7 +403,6 @@ impl KiroSession {
             KiroSchemaProbeStage::WorkspaceSetup,
             adapter.resolve_roots(
                 workspace_roots,
-                mode.ssh_host.as_deref(),
                 AcpSessionKind {
                     admin_session: mode.admin_session,
                     ephemeral: mode.ephemeral,
@@ -508,7 +413,7 @@ impl KiroSession {
         let configured_workspace_roots =
             crate::backend::session_workspace_roots(workspace_roots, &roots.scope_root)?;
 
-        let mut spawn_spec = adapter.spawn_spec(&roots, mode.ssh_host.as_deref())?;
+        let mut spawn_spec = adapter.spawn_spec(&roots)?;
         if let Some(model) = mode
             .initial_model
             .map(str::trim)
@@ -516,29 +421,22 @@ impl KiroSession {
         {
             spawn_spec.local_args.push("--model".to_string());
             spawn_spec.local_args.push(model.to_string());
-            spawn_spec.remote_args.push("--model".to_string());
-            spawn_spec.remote_args.push(model.to_string());
         }
 
         let acp_program = spawn_spec.local_program.clone();
         let agent_label = adapter.display_name().to_string();
         let (bridge, inbound_rx) =
             await_kiro_stage(mode.probe_deadline, KiroSchemaProbeStage::AcpSpawn, async {
-                AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref())
-                    .await
-                    .map_err(|err| {
-                        format!("Failed to start {agent_label} executable '{acp_program}': {err}")
-                    })
+                AcpBridge::spawn(spawn_spec).await.map_err(|err| {
+                    format!("Failed to start {agent_label} executable '{acp_program}': {err}")
+                })
             })
             .await?;
 
         let initialize_response = await_kiro_stage(
             mode.probe_deadline,
             KiroSchemaProbeStage::Initialize,
-            bridge.request(
-                "initialize",
-                acp_initialize_params(adapter.as_ref(), mode.ssh_host.as_deref()),
-            ),
+            bridge.request("initialize", acp_initialize_params(adapter.as_ref())),
         )
         .await?;
         let mut capabilities = parse_capabilities(&initialize_response);
@@ -615,7 +513,6 @@ impl KiroSession {
             emitter,
             shutting_down: Arc::new(AtomicBool::new(false)),
             workspace_reload_in_progress: AtomicBool::new(false),
-            ssh_host: mode.ssh_host,
             capacity_probe,
             in_flight_prompts: AtomicUsize::new(0),
             native_sessions: AcpStateActor::spawn(NativeSessionRoutes::default()),
@@ -827,45 +724,27 @@ struct PendingGrokExitPlanMode {
 ///
 /// The command prints subscription usage and exits; it starts no session and no
 /// model turn, so this is safe to call with no live agent.
-pub(crate) async fn read_capacity_from_spec(
-    spec: &AcpSpawnSpec,
-    ssh_host: Option<&str>,
-) -> BackendCapacityState {
-    let output = if let Some(host) = ssh_host {
-        let mut parts = Vec::new();
-        if let Some(cwd) = spec.remote_cwd.as_deref() {
-            parts.push(format!("cd {} &&", crate::remote::shell_quote_arg(cwd)));
+pub(crate) async fn read_capacity_from_spec(spec: &AcpSpawnSpec) -> BackendCapacityState {
+    let mut command = match crate::backend::subprocess::command(&spec.local_program) {
+        Ok(command) => command,
+        Err(_) => {
+            return BackendCapacityState::Unavailable {
+                reason: CapacityUnavailableReason::SourceUnreachable,
+            };
         }
-        parts.push(crate::remote::shell_quote_command(&spec.remote_args));
-        tokio::time::timeout(
-            ACP_CAPACITY_TIMEOUT,
-            crate::remote::run_ssh_raw(host, &parts.join(" ")),
-        )
+    };
+    command.args(&spec.local_args);
+    if let Some(cwd) = spec.local_cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(crate::backend::subprocess::ProcessStdio::Null)
+        .stdout(crate::backend::subprocess::ProcessStdio::Piped)
+        .stderr(crate::backend::subprocess::ProcessStdio::Piped);
+    let output = tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
         .await
         .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
-        .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
-    } else {
-        let mut command = match crate::backend::subprocess::command(&spec.local_program) {
-            Ok(command) => command,
-            Err(_) => {
-                return BackendCapacityState::Unavailable {
-                    reason: CapacityUnavailableReason::SourceUnreachable,
-                };
-            }
-        };
-        command.args(&spec.local_args);
-        if let Some(cwd) = spec.local_cwd.as_deref() {
-            command.current_dir(cwd);
-        }
-        command
-            .stdin(crate::backend::subprocess::ProcessStdio::Null)
-            .stdout(crate::backend::subprocess::ProcessStdio::Piped)
-            .stderr(crate::backend::subprocess::ProcessStdio::Piped);
-        tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
-            .await
-            .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
-            .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
-    };
+        .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable));
     let output = match output {
         Ok(output) => output,
         Err(reason) => return BackendCapacityState::Unavailable { reason },
@@ -934,7 +813,6 @@ struct KiroInner {
     shutting_down: Arc<AtomicBool>,
     failure_emitter: Arc<TurnEmitter>,
     workspace_reload_in_progress: AtomicBool,
-    ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
     in_flight_prompts: AtomicUsize,
     native_sessions: AcpStateActor<NativeSessionRoutes>,
@@ -1179,7 +1057,7 @@ impl KiroInner {
                 "ACP native session has closed".to_owned(),
             ));
         }
-        if self.ssh_host.is_some() || !self.capabilities.load_session {
+        if !self.capabilities.load_session {
             return Err(crate::backend::WorkspaceRelocationError::Rejected(
                 "ACP workspace relocation requires a local provider with session/load support"
                     .to_owned(),
@@ -1348,13 +1226,10 @@ impl KiroInner {
         } else if kind == protocol::BackendKind::Opencode {
             let spec = self
                 .adapter
-                .spawn_spec(
-                    &super::adapter::AcpSessionRoots {
-                        session_cwd: cwd.clone(),
-                        scope_root: cwd.clone(),
-                    },
-                    None,
-                )
+                .spawn_spec(&super::adapter::AcpSessionRoots {
+                    session_cwd: cwd.clone(),
+                    scope_root: cwd.clone(),
+                })
                 .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
             let program = spec.local_program.clone();
             self.bridge
@@ -1371,10 +1246,7 @@ impl KiroInner {
                 .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let initialized = self
                 .bridge
-                .request(
-                    "initialize",
-                    acp_initialize_params(self.adapter.as_ref(), None),
-                )
+                .request("initialize", acp_initialize_params(self.adapter.as_ref()))
                 .await
                 .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
             let capabilities = parse_capabilities(&initialized);
@@ -1527,7 +1399,7 @@ impl KiroInner {
                 reason: protocol::CapacityUnsupportedReason::ExternalProvider,
             };
         };
-        read_capacity_from_spec(spec, self.ssh_host.as_deref()).await
+        read_capacity_from_spec(spec).await
     }
 
     async fn read_grok_capacity(&self) -> BackendCapacityState {
@@ -2148,11 +2020,11 @@ impl KiroInner {
         // `session/list` is the spec's own way to enumerate sessions, so an
         // agent that advertises it needs no adapter support at all. Adapters
         // only cover agents that list out of band: Kiro reads its own JSON
-        // files (locally or over ssh) and advertises nothing.
+        // files and advertises nothing.
         let listed = if self.capabilities.session_list {
             self.list_sessions_via_acp().await?
         } else {
-            self.adapter.list_sessions(self.ssh_host.as_deref()).await?
+            self.adapter.list_sessions().await?
         };
 
         let mut sessions = listed
@@ -2192,9 +2064,7 @@ impl KiroInner {
         let normalized = normalize_optional_string(&Value::String(session_id))
             .ok_or("Invalid session id".to_string())?;
 
-        self.adapter
-            .delete_session(&normalized, self.ssh_host.as_deref())
-            .await
+        self.adapter.delete_session(&normalized).await
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
@@ -2237,10 +2107,7 @@ impl KiroInner {
         // so stale locks from dead processes block session/load. Remove the
         // lock file before attempting to load.
         // Agent-specific pre-load cleanup (Kiro's stale `.lock` files).
-        let _ = self
-            .adapter
-            .before_session_load(&session_id, self.ssh_host.as_deref())
-            .await;
+        let _ = self.adapter.before_session_load(&session_id).await;
 
         let response = match self
             .bridge
@@ -2788,20 +2655,6 @@ std::ops::ControlFlow::Continue(())
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
 
-        // The SSH ControlMaster keeps the TCP connection alive after the
-        // local slave is killed, so the remote kiro-cli-chat never gets
-        // EOF and stays running. Kill the remote process explicitly
-        // using the PID from its session lock file.
-        if let Some(host) = &self.ssh_host {
-            let session_id = self.state.with(|state| state.session_id.clone()).await;
-            let cmd = format!(
-                "PID=$(grep -oE '[0-9]+' ~/.kiro/sessions/cli/{0}.lock 2>/dev/null | head -1); \
-                 [ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null; true",
-                crate::remote::shell_quote_arg(&session_id)
-            );
-            let _ = crate::remote::run_ssh_raw(host, &cmd).await;
-        }
-
         self.bridge.shutdown().await;
         let mut children = self
             .state
@@ -3171,7 +3024,6 @@ std::ops::ControlFlow::Continue({
             state: KiroStateActor::spawn(state),
             shutting_down: Arc::clone(&self.shutting_down),
             workspace_reload_in_progress: AtomicBool::new(false),
-            ssh_host: self.ssh_host.clone(),
             capacity_probe: None,
             in_flight_prompts: AtomicUsize::new(0),
             native_sessions: self.native_sessions.clone(),
@@ -5755,34 +5607,9 @@ pub(crate) struct KiroSessionRoots {
 
 pub(crate) async fn resolve_kiro_session_roots(
     workspace_roots: &[String],
-    ssh_host: Option<&str>,
     admin_session: bool,
     ephemeral: bool,
 ) -> Result<KiroSessionRoots, String> {
-    if let Some(host) = ssh_host {
-        let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
-            .ok_or("Expected remote workspace roots for SSH session")?;
-        let scope_root = parsed
-            .1
-            .into_iter()
-            .next()
-            .ok_or("No remote workspace root found")?;
-        let session_cwd = if admin_session {
-            join_posix_path(&scope_root, KIRO_ADMIN_SESSION_SUBDIR)
-        } else if ephemeral {
-            join_posix_path(&scope_root, KIRO_EPHEMERAL_SESSION_SUBDIR)
-        } else {
-            scope_root.clone()
-        };
-        if admin_session || ephemeral {
-            ensure_remote_directory(host, &session_cwd).await?;
-        }
-        return Ok(KiroSessionRoots {
-            session_cwd,
-            scope_root,
-        });
-    }
-
     let scope_root = pick_workspace_root(workspace_roots)?;
     let session_cwd = if admin_session {
         let dir = PathBuf::from(&scope_root).join(".tyde").join("kiro-admin");
@@ -5812,33 +5639,6 @@ pub(crate) async fn resolve_kiro_session_roots(
         session_cwd,
         scope_root,
     })
-}
-
-pub(crate) async fn ensure_remote_directory(host: &str, dir: &str) -> Result<(), String> {
-    let command = format!("mkdir -p {}", crate::remote::shell_quote_arg(dir));
-    let output = crate::remote::run_ssh_raw(host, &command).await?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = if stderr.is_empty() {
-        format!("exit status {}", output.status)
-    } else {
-        stderr
-    };
-    Err(format!(
-        "Failed to create remote Kiro admin directory '{dir}' on '{host}': {detail}"
-    ))
-}
-
-pub(crate) fn join_posix_path(base: &str, suffix: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let suffix = suffix.trim_start_matches('/');
-    if base.is_empty() {
-        format!("/{}", suffix)
-    } else {
-        format!("{base}/{suffix}")
-    }
 }
 
 pub(crate) fn strip_ansi_and_controls(input: &str) -> String {
@@ -7010,7 +6810,6 @@ pub(crate) async fn read_kiro_capacity_out_of_band(
     let roots = match adapter
         .resolve_roots(
             workspace_roots,
-            None,
             AcpSessionKind {
                 admin_session: true,
                 ephemeral: true,
@@ -7031,7 +6830,7 @@ pub(crate) async fn read_kiro_capacity_out_of_band(
             reason: protocol::CapacityUnsupportedReason::ExternalProvider,
         };
     };
-    read_capacity_from_spec(&spec, None).await
+    read_capacity_from_spec(&spec).await
 }
 
 /// Reads Grok's account capacity with no conversation and no live agent.
@@ -7187,20 +6986,7 @@ pub(crate) fn resolve_kiro_chat_binary() -> String {
 }
 
 pub(crate) fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    if let Some(root) = workspace_roots
-        .iter()
-        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
-        .cloned()
-    {
-        return Ok(root);
-    }
-    if workspace_roots
-        .iter()
-        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
-    {
-        return Err("Kiro backend requires at least one local workspace root".to_string());
-    }
-    crate::backend::tyde_owned_no_root_cwd("kiro")
+    crate::backend::pick_workspace_root(workspace_roots, "Kiro")
 }
 
 /// Maps one ACP `SessionInfo` onto Tyde's `BackendSession`.
@@ -7546,28 +7332,6 @@ pub(crate) async fn clear_local_kiro_session_lock(session_id: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) async fn clear_remote_kiro_session_lock(
-    host: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    let cmd = format!(
-        "LOCKFILE=~/.kiro/sessions/cli/{0}.lock; \
-         if [ -f \"$LOCKFILE\" ]; then \
-           PID=$(grep -oE '[0-9]+' \"$LOCKFILE\" | head -1); \
-           if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then \
-             rm -f \"$LOCKFILE\"; \
-           fi; \
-         fi",
-        crate::remote::shell_quote_arg(session_id)
-    );
-    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to clear remote session lock: {stderr}"));
-    }
-    Ok(())
-}
-
 pub(crate) async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
     let sessions_dir = resolve_local_kiro_sessions_dir()?;
     for ext in &["json", "jsonl", "lock"] {
@@ -7577,19 +7341,6 @@ pub(crate) async fn delete_local_kiro_session(session_id: &str) -> Result<(), St
                 .await
                 .map_err(|err| format!("Failed to delete {}: {err}", path.display()))?;
         }
-    }
-    Ok(())
-}
-
-pub(crate) async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), String> {
-    let cmd = format!(
-        "rm -f ~/.kiro/sessions/cli/{0}.json ~/.kiro/sessions/cli/{0}.jsonl ~/.kiro/sessions/cli/{0}.lock",
-        crate::remote::shell_quote_arg(session_id)
-    );
-    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to delete remote kiro session: {stderr}"));
     }
     Ok(())
 }
@@ -7637,60 +7388,6 @@ pub(crate) async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, S
             }
         };
         result.push((session_id, metadata));
-    }
-    Ok(result)
-}
-
-pub(crate) async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, String> {
-    let cmd = concat!(
-        "for f in ~/.kiro/sessions/cli/*.json; do ",
-        "[ -f \"$f\" ] && ",
-        "printf 'TYDE_SID:%s\n' \"$(basename \"$f\" .json)\" && ",
-        "cat \"$f\" && ",
-        "printf '\nTYDE_SEND\n'; ",
-        "done"
-    );
-    let output = crate::remote::run_ssh_raw(host, cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list remote kiro sessions: {stderr}"));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_remote_session_dump(&stdout)
-}
-
-fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String> {
-    let mut result = Vec::new();
-    let mut current_id: Option<String> = None;
-    let mut current_content = String::new();
-
-    for line in dump.lines() {
-        if let Some(id) = line.strip_prefix("TYDE_SID:") {
-            if let Some(prev_id) = current_id.take()
-                && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
-            {
-                result.push((prev_id, metadata));
-            }
-            current_id = Some(id.trim().to_string());
-            current_content.clear();
-        } else if line == "TYDE_SEND" {
-            if let Some(id) = current_id.take()
-                && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
-            {
-                result.push((id, metadata));
-            }
-            current_content.clear();
-        } else if current_id.is_some() {
-            if !current_content.is_empty() {
-                current_content.push('\n');
-            }
-            current_content.push_str(line);
-        }
-    }
-    if let Some(id) = current_id
-        && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
-    {
-        result.push((id, metadata));
     }
     Ok(result)
 }
@@ -7977,7 +7674,6 @@ impl Backend for KiroBackend {
                 &workspace_roots,
                 config.acp_agent.as_ref(),
                 None,
-                None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
             )
@@ -8170,7 +7866,6 @@ impl Backend for KiroBackend {
                 &workspace_roots,
                 config.acp_agent.as_ref(),
                 None,
-                None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
             )
@@ -8354,7 +8049,7 @@ impl Backend for KiroBackend {
             .launch
             .as_ref()
             .map_or_else(|| kiro_adapter(context.program.clone()), adapter_for_spec);
-        let mut sessions = adapter.list_sessions(None).await?;
+        let mut sessions = adapter.list_sessions().await?;
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
         Ok(sessions)
     }

@@ -289,10 +289,7 @@ impl crate::backend::Backend for OpencodeBackend {
         relocation: &crate::backend::BackendSessionRelocation,
     ) -> Result<(), String> {
         let working_directory = |target: &crate::backend::BackendExecutionTarget| {
-            let root = crate::backend::acp::adapters::stock::pick_local_workspace_root(
-                &target.roots,
-                "opencode",
-            )?;
+            let root = crate::backend::pick_workspace_root(&target.roots, "opencode")?;
             target.scope.run_sync(|| {
                 tyde_process_env::launch::WorkspacePath::host(&root)?.execution_string()
             })

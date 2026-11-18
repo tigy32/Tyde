@@ -224,8 +224,14 @@ impl ProjectCatalogHandle {
     pub(crate) fn get(&self, id: &ProjectId) -> Option<Project> {
         self.record(id).map(|record| record.project)
     }
+    pub(crate) fn require_supported_workspace(&self, id: &ProjectId) -> Result<(), String> {
+        self.snapshot.borrow().store.require_supported_workspace(id)
+    }
     pub(crate) fn list(&self) -> Result<Vec<Project>, ProjectStoreError> {
         self.snapshot.borrow().store.list()
+    }
+    pub(crate) fn catalog_warning(&self) -> Option<String> {
+        self.snapshot.borrow().store.catalog_warning()
     }
     pub(crate) fn generation(&self) -> u64 {
         self.snapshot.borrow().generation
@@ -1571,6 +1577,13 @@ async fn rollback_creation_environment(directory: &Path, claim: &str) -> AppResu
 }
 
 async fn rollback_creation(intent: &protocol::WorkbenchCreationIntent) -> AppResult<()> {
+    crate::paths::reject_ssh_workspace_roots(
+        intent
+            .roots
+            .iter()
+            .flat_map(|entry| [&entry.root.parent_root.0, &entry.root.worktree_root.0]),
+    )
+    .map_err(|error| AppError::invalid("workbench_recover", error))?;
     let owner = creation_owner_ref(intent)?;
     if let Some(directory) = &intent.environment_directory {
         let directory = Path::new(&directory.0);

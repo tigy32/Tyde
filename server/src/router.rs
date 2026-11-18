@@ -323,6 +323,8 @@ pub(crate) async fn route_client_envelope(
                 let payload: ProjectAddRootPayload = parse_payload(&envelope, "project_add_root")?;
                 ensure_non_empty("project_add_root", "id", payload.id.0.as_str())?;
                 ensure_non_empty("project_add_root", "root", payload.root.0.as_str())?;
+                crate::paths::reject_ssh_workspace_roots([&payload.root.0])
+                    .map_err(|error| AppError::invalid("project_add_root", error))?;
                 host.admit_project_mutation(
                     protocol::ProjectMutation::AddRoot(payload),
                     host_output_stream.clone(),
@@ -1501,6 +1503,8 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
             launch_profile_id,
             ..
         } => {
+            crate::paths::reject_ssh_workspace_roots(workspace_roots)
+                .map_err(|error| AppError::invalid("spawn_agent", error))?;
             for root in workspace_roots {
                 ensure_non_empty("spawn_agent", "workspace_root", root)?;
             }
@@ -2242,6 +2246,8 @@ pub(crate) fn validate_project_roots(roots: &[ProjectRootPath]) -> AppResult<()>
         ));
     }
 
+    crate::paths::reject_ssh_workspace_roots(roots.iter().map(|root| &root.0))
+        .map_err(|error| AppError::invalid("project_create", error))?;
     let mut seen = HashSet::new();
     for root in roots {
         ensure_non_empty("project_create", "root", root.0.as_str())?;

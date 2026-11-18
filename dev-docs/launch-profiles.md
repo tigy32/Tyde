@@ -88,9 +88,8 @@ before `launch_profile_catalog_notify`, so a client must replace its rendered
 catalog with the latest notification rather than retain the startup snapshot.
 
 The `hermes:profile:` namespace is reserved and cannot be supplied by an
-explicit host launch-profile setting. Named Hermes profiles are local-only:
-Tyde cannot safely select a local `HERMES_HOME` through an SSH-backed workspace,
-so those launches fail visibly instead of falling back to the remote default.
+explicit host launch-profile setting. Named Hermes profiles are discovered
+on the Tyde server that runs the gateway.
 
 ## MCP
 

@@ -1,5 +1,21 @@
 use std::path::PathBuf;
 
+pub(crate) const SSH_WORKSPACE_ROOTS_REMOVED: &str = "SSH workspace roots are no longer supported. Connect to the Tyde server that owns the project and use its filesystem paths.";
+
+pub(crate) fn reject_ssh_workspace_roots(
+    roots: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), String> {
+    if roots.into_iter().any(|root| {
+        root.as_ref()
+            .trim_start()
+            .get(.."ssh://".len())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ssh://"))
+    }) {
+        return Err(SSH_WORKSPACE_ROOTS_REMOVED.to_owned());
+    }
+    Ok(())
+}
+
 pub fn home_dir() -> Result<PathBuf, String> {
     home_dir_from_env(|name| std::env::var(name).ok())
 }

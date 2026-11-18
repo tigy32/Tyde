@@ -12,7 +12,6 @@ use crate::backend::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpSessionKind,
     AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan, NormalizedUpdate,
 };
-use crate::backend::acp::adapters::stock::pick_local_workspace_root;
 
 /// Grok's terminal UI answers these from `_x.ai/session/info` itself; the
 /// agent accepts them on `session/prompt` and completes the turn without
@@ -74,11 +73,10 @@ impl AcpAgentAdapter for GrokAdapter {
     fn resolve_roots<'a>(
         &'a self,
         workspace_roots: &'a [String],
-        _ssh_host: Option<&'a str>,
         _kind: AcpSessionKind,
     ) -> BoxFuture<'a, Result<AcpSessionRoots, String>> {
         Box::pin(async move {
-            let scope_root = pick_local_workspace_root(workspace_roots, "Grok")?;
+            let scope_root = crate::backend::pick_workspace_root(workspace_roots, "Grok")?;
             Ok(AcpSessionRoots {
                 session_cwd: scope_root.clone(),
                 scope_root,
@@ -86,14 +84,7 @@ impl AcpAgentAdapter for GrokAdapter {
         })
     }
 
-    fn spawn_spec(
-        &self,
-        roots: &AcpSessionRoots,
-        ssh_host: Option<&str>,
-    ) -> Result<AcpSpawnSpec, String> {
-        if ssh_host.is_some() {
-            return Err("Grok does not yet support Tyde SSH sessions".to_owned());
-        }
+    fn spawn_spec(&self, roots: &AcpSessionRoots) -> Result<AcpSpawnSpec, String> {
         let command = self.spec.command.trim();
         let program = if command.is_empty() { "grok" } else { command };
         let args = if self.spec.args.is_empty() {
@@ -230,15 +221,8 @@ impl AcpAgentAdapter for GrokAdapter {
         Some(json!({ "kind": "WebSearch", "query": query }))
     }
 
-    fn delete_session<'a>(
-        &'a self,
-        session_id: &'a str,
-        ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if ssh_host.is_some() {
-                return Err("Grok does not yet support Tyde SSH sessions".to_owned());
-            }
             let output = crate::process_env::command("grok")?
                 .args(["sessions", "delete", session_id])
                 .output()

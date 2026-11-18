@@ -272,7 +272,7 @@ fn prepare_antigravity_tool_policy(
         })
         .to_string();
         #[cfg(not(windows))]
-        let command = format!("printf '%s' {}", crate::remote::shell_quote_arg(&response));
+        let command = format!("printf '%s' '{}'", response.replace('\'', r"'\''"));
         #[cfg(windows)]
         let command = format!("echo {response}");
         handlers.push(json!({
@@ -3869,14 +3869,12 @@ fn resolve_workspace_roots_with_no_root_cwd(
     workspace_roots: &[String],
     no_root_cwd: &Path,
 ) -> Result<(String, Vec<String>), String> {
+    crate::paths::reject_ssh_workspace_roots(workspace_roots)?;
     let mut roots = workspace_roots
         .iter()
         .map(|root| root.trim())
         .filter(|root| !root.is_empty())
         .collect::<Vec<_>>();
-    if roots.iter().any(|root| root.starts_with("ssh://")) {
-        return Err("Antigravity backend requires local workspace roots".to_string());
-    }
     if roots.is_empty() {
         fs::create_dir_all(no_root_cwd).map_err(|err| {
             format!(

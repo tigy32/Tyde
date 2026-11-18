@@ -76,8 +76,7 @@ new layer of business logic in Tauri.**
   transport lifetimes, decode shared `TYD2` records, and validate typed
   `VoiceAudio` at the native-media boundary, but it must not interpret other
   Tyde payloads or cache project/session state.
-- Do not use `ssh://...` roots as the primary abstraction for remote hosts.
-  A remote Tyde server should expose its own native paths and its own stores.
+- A remote Tyde server exposes its own native paths and stores.
 
 ---
 
@@ -88,7 +87,6 @@ This slice does **not** try to solve everything the old app did.
 - No remote install/upgrade/orchestration UI in the first slice.
 - No shell-owned project/session mirrors.
 - No single global server process that proxies multiple remote hosts.
-- No expansion of backend-side SSH path hacks as the long-term remote model.
 - No Tauri-side understanding of `FrameKind`, projects, sessions, agents, or
   terminals.
 
@@ -116,37 +114,22 @@ Each host remains a normal Tyde host:
 
 The desktop app aggregates those host-local states in the frontend.
 
-This is the key difference from the current `ssh://` backend helpers:
-
-- today: one local host sometimes reaches through SSH to run backend commands
-- target: many hosts, each one authoritative for its own projects and runtime
-
-That target is much closer to the rewrite philosophy.
+The server that owns a project launches its agents, using the same local
+adapter launch path on every host. SSH carries the connection to a Tyde
+server; it does not launch project backends directly.
 
 ---
 
-## 5. Why The Existing `ssh://` Path Model Is Not Enough
+## 5. Obsolete workspace roots
 
-The current repo already has SSH helpers in `server/src/remote.rs` and backend
-implementations that parse `ssh://host/path` roots. That is useful background,
-but it is the wrong foundation for multi-host product support.
-
-Why:
-
-- Project ownership stays local, so the local host would still be pretending to
-  own remote project inventory.
-- Project streams in `server/src/project_stream.rs` currently use local `std::fs`
-  and local `git`. They do not become remote-safe just because a root string
-  contains `ssh://`.
-- Terminals in `server/src/terminal_stream.rs` are local PTYs. They are not
-  remote terminals.
-- The frontend still cannot show host-grouped inventory because host identity
-  is missing from the app model.
-
-So this document explicitly does **not** extend the `ssh://` workspace-root
-scheme into the main remote-host architecture.
-
-Remote host support should instead rely on a real remote Tyde host connection.
+Tyde rejects `ssh://host/path` roots. Saved projects containing them are
+unavailable as a whole; Tyde keeps their records and reports why they cannot
+load. It does not extract a local path, change directories, or move sessions
+to another host. To work on the files again, connect to the Tyde server that
+owns them and open the project using its native filesystem paths. To clear
+the notice permanently, stop the reporting Tyde server, back up its project
+store (by default `~/.tyde/projects.json`), remove the obsolete project entries,
+and restart the server. This does not move or delete workspace files.
 
 ---
 
@@ -480,8 +463,6 @@ Once connected to a remote host:
 - session workspace roots are remote-native paths
 - terminals launch on the remote host
 - project streams read the remote filesystem because the remote server owns them
-
-The UI does **not** construct `ssh://...` paths for remote-host project flows.
 
 ---
 

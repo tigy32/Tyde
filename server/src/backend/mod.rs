@@ -1701,6 +1701,7 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized,
     {
         async move {
+            crate::paths::reject_ssh_workspace_roots(&workspace_roots)?;
             crate::workbench::prepare_backend_execution(config.acp_agent.as_ref()).await?;
             Self::spawn_in_workspace(workspace_roots, config, initial_input).await
         }
@@ -1733,6 +1734,7 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized,
     {
         async move {
+            crate::paths::reject_ssh_workspace_roots(&workspace_roots)?;
             crate::workbench::prepare_backend_execution(config.acp_agent.as_ref()).await?;
             Self::resume_in_workspace(workspace_roots, config, session_id).await
         }
@@ -1769,6 +1771,8 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized,
     {
         async move {
+            crate::paths::reject_ssh_workspace_roots(&workspace_roots)
+                .map_err(BackendStartupError::backend_failed)?;
             crate::workbench::prepare_backend_execution(config.acp_agent.as_ref())
                 .await
                 .map_err(BackendStartupError::backend_failed)?;
@@ -2051,6 +2055,18 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized;
 }
 
+pub(crate) fn pick_workspace_root(
+    workspace_roots: &[String],
+    agent: &str,
+) -> Result<String, String> {
+    crate::paths::reject_ssh_workspace_roots(workspace_roots)?;
+    workspace_roots
+        .iter()
+        .find(|root| !root.trim().is_empty())
+        .cloned()
+        .map_or_else(|| tyde_owned_no_root_cwd(agent), Ok)
+}
+
 pub(crate) fn session_workspace_roots(
     roots: &[String],
     cwd: &str,
@@ -2060,12 +2076,6 @@ pub(crate) fn session_workspace_roots(
     }
     if roots.len() == 1 {
         return Ok(Some(vec![cwd.to_owned()]));
-    }
-    if let Some((_, paths)) = crate::remote::parse_remote_workspace_roots(roots)? {
-        if paths.len() != roots.len() {
-            return Err("Workspace roots must all belong to the same host".to_owned());
-        }
-        return Ok(Some(paths));
     }
     validate_local_workspace_roots(roots.to_vec()).map(Some)
 }

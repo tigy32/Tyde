@@ -208,13 +208,11 @@ impl AcpAgentAdapter for KiroAdapter {
     fn resolve_roots<'a>(
         &'a self,
         workspace_roots: &'a [String],
-        ssh_host: Option<&'a str>,
         kind: AcpSessionKind,
     ) -> BoxFuture<'a, Result<AcpSessionRoots, String>> {
         Box::pin(async move {
             let roots = kiro_impl::resolve_kiro_session_roots(
                 workspace_roots,
-                ssh_host,
                 kind.admin_session,
                 kind.ephemeral,
             )
@@ -226,11 +224,7 @@ impl AcpAgentAdapter for KiroAdapter {
         })
     }
 
-    fn spawn_spec(
-        &self,
-        roots: &AcpSessionRoots,
-        ssh_host: Option<&str>,
-    ) -> Result<AcpSpawnSpec, String> {
+    fn spawn_spec(&self, roots: &AcpSessionRoots) -> Result<AcpSpawnSpec, String> {
         // An explicitly configured command wins, so a user can point the
         // built-in profile at a non-standard install; otherwise fall back to
         // sibling resolution from `kiro-cli`.
@@ -247,12 +241,7 @@ impl AcpAgentAdapter for KiroAdapter {
             self.spec.args.iter().map(String::as_str).collect()
         };
 
-        let mut spawn =
-            AcpSpawnSpec::new("Kiro ACP", program, &args).with_local_cwd(roots.session_cwd.clone());
-        if ssh_host.is_some() {
-            spawn = spawn.with_remote_cwd(roots.session_cwd.clone());
-        }
-        Ok(spawn)
+        Ok(AcpSpawnSpec::new("Kiro ACP", program, &args).with_local_cwd(roots.session_cwd.clone()))
     }
 
     fn capacity_probe_spec(&self, roots: &AcpSessionRoots) -> Option<AcpSpawnSpec> {
@@ -262,16 +251,12 @@ impl AcpAgentAdapter for KiroAdapter {
         } else {
             configured.to_string()
         };
-        let mut spec = AcpSpawnSpec::new(
+        let spec = AcpSpawnSpec::new(
             "Kiro usage",
             program,
             &["chat", "--agent-engine", "v1", "--no-interactive", "/usage"],
         )
-        .with_local_cwd(roots.session_cwd.clone())
-        .with_remote_cwd(roots.session_cwd.clone());
-        if configured.is_empty() {
-            spec.remote_args[0] = "kiro-cli-chat".to_string();
-        }
+        .with_local_cwd(roots.session_cwd.clone());
         Some(spec)
     }
 
@@ -359,15 +344,9 @@ impl AcpAgentAdapter for KiroAdapter {
         }
     }
 
-    fn list_sessions<'a>(
-        &'a self,
-        ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Vec<BackendSession>, String>> {
+    fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<BackendSession>, String>> {
         Box::pin(async move {
-            let raw = match ssh_host {
-                Some(host) => kiro_impl::load_remote_kiro_sessions(host).await?,
-                None => kiro_impl::load_local_kiro_sessions().await?,
-            };
+            let raw = kiro_impl::load_local_kiro_sessions().await?;
 
             let mut sessions = Vec::new();
             for (session_id, metadata) in raw {
@@ -400,35 +379,19 @@ impl AcpAgentAdapter for KiroAdapter {
         })
     }
 
-    fn before_session_load<'a>(
-        &'a self,
-        session_id: &'a str,
-        ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    fn before_session_load<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             // Kiro reads `.lock` files without checking whether the recorded
             // PID is alive, so a crashed session blocks `session/load`
             // forever. Clearing a stale lock is best-effort: a failure here
             // should not mask the load error that follows.
-            let _ = match ssh_host {
-                Some(host) => kiro_impl::clear_remote_kiro_session_lock(host, session_id).await,
-                None => kiro_impl::clear_local_kiro_session_lock(session_id).await,
-            };
+            let _ = kiro_impl::clear_local_kiro_session_lock(session_id).await;
             Ok(())
         })
     }
 
-    fn delete_session<'a>(
-        &'a self,
-        session_id: &'a str,
-        ssh_host: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            match ssh_host {
-                Some(host) => kiro_impl::delete_remote_kiro_session(host, session_id).await,
-                None => kiro_impl::delete_local_kiro_session(session_id).await,
-            }
-        })
+    fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move { kiro_impl::delete_local_kiro_session(session_id).await })
     }
 
     fn map_tool_request<'a>(
