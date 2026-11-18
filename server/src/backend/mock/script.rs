@@ -71,6 +71,7 @@ pub struct MockScript {
     pub(super) resume_launches: VecDeque<MockResumeLaunch>,
     pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
+    pub(super) interrupt_gate: Option<MockGate>,
     pub(super) native_child_idle_gate: Option<MockGate>,
     /// Parks every follow-up message before the provider accepts it.
     pub(super) send_gate: Option<MockGate>,
@@ -185,6 +186,11 @@ impl MockScript {
 
     pub fn with_shutdown_gate(mut self, gate: &MockGateHandle) -> Self {
         self.shutdown_gate = Some(gate.gate());
+        self
+    }
+
+    pub fn with_interrupt_gate(mut self, gate: &MockGateHandle) -> Self {
+        self.interrupt_gate = Some(gate.gate());
         self
     }
 

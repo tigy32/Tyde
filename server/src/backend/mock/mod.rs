@@ -260,6 +260,7 @@ pub struct MockBackend {
     controlled_resume_replay: Option<MockResumeReplay>,
     mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
+    interrupt_gate: Option<gate::MockGate>,
     send_gate: Option<gate::MockGate>,
     workspace_relocation_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
@@ -298,6 +299,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let interrupt_gate = launch_script.interrupt_gate.clone();
         let send_gate = launch_script.send_gate.clone();
         let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
@@ -396,6 +398,7 @@ impl MockBackend {
                 controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                interrupt_gate,
                 send_gate: send_gate.clone(),
                 workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -451,6 +454,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let interrupt_gate = launch_script.interrupt_gate.clone();
         let send_gate = launch_script.send_gate.clone();
         let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
@@ -532,6 +536,7 @@ impl MockBackend {
                     controlled_resume_replay: resume_replay.clone(),
                     mid_turn_steering,
                     shutdown_gate: shutdown_gate.clone(),
+                    interrupt_gate,
                     send_gate: send_gate.clone(),
                     workspace_relocation_gate: workspace_relocation_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
@@ -610,6 +615,7 @@ impl MockBackend {
                 controlled_resume_replay,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                interrupt_gate,
                 send_gate: send_gate.clone(),
                 workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -639,6 +645,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let interrupt_gate = launch_script.interrupt_gate.clone();
         let send_gate = launch_script.send_gate.clone();
         let workspace_relocation_gate = launch_script.workspace_relocation_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
@@ -737,6 +744,7 @@ impl MockBackend {
                 controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                interrupt_gate,
                 send_gate: send_gate.clone(),
                 workspace_relocation_gate: workspace_relocation_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -1185,6 +1193,9 @@ impl Backend for MockBackend {
     }
 
     async fn interrupt(&self) -> bool {
+        if let Some(gate) = &self.interrupt_gate {
+            gate.wait().await;
+        }
         let accepted = self.command_tx.send(MockCommand::Interrupt).is_ok();
         if accepted {
             self.control.record_interrupt_request();

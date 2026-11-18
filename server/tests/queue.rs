@@ -1610,6 +1610,77 @@ async fn steer_and_send_now_use_distinct_delivery_modes() {
 }
 
 #[tokio::test]
+async fn pending_stop_does_not_block_the_connection() {
+    let mut fixture = Fixture::new().await;
+    let stop = MockGateHandle::new();
+    let stopped = fixture
+        .spawn_scripted(
+            "held-stop",
+            MockScript::one(MockTurn::held_text("to be interrupted"))
+                .then(MockTurn::text("after stop"))
+                .with_user_bubbles()
+                .with_interrupt_gate(&stop),
+        )
+        .await;
+    let other = fixture.spawn("other-agent", "finish this").await;
+
+    fixture.client.interrupt(&stopped.stream).await.unwrap();
+    stop.wait_until_entered().await;
+    fixture
+        .client
+        .send_message(&stopped.stream, "follow-up".to_owned())
+        .await
+        .unwrap();
+    fixture.client.close_agent(&other.stream).await.unwrap();
+    let heartbeat = protocol::HeartbeatPayload {
+        client_sent_at_ms: 42,
+    };
+    fixture.client.heartbeat(heartbeat).await.unwrap();
+
+    let (mut closed, mut alive) = (false, false);
+    fixture
+        .next_frame_matching(
+            "other agent closed and heartbeat answered while Stop is pending",
+            |env| {
+                match env.kind {
+                    FrameKind::AgentClosed => {
+                        let payload: protocol::AgentClosedPayload = env.parse_payload().unwrap();
+                        closed |= payload.agent_id == other.new_agent.agent_id;
+                    }
+                    FrameKind::HeartbeatAck => {
+                        alive |=
+                            env.parse_payload::<protocol::HeartbeatPayload>().unwrap() == heartbeat;
+                    }
+                    FrameKind::ChatEvent if env.stream == stopped.stream => {
+                        let event: ChatEvent = env.parse_payload().unwrap();
+                        assert!(
+                            !is_user_message(&event, "follow-up")
+                                && !matches!(event, ChatEvent::OperationCancelled(_)),
+                            "the stopped agent must still be waiting for its interrupt"
+                        );
+                    }
+                    _ => {}
+                }
+                closed && alive
+            },
+        )
+        .await;
+
+    stop.release_one();
+    let mut cancelled = false;
+    fixture
+        .next_chat_event_matching(&stopped, "follow-up after cancellation", |event| {
+            cancelled |= matches!(event, ChatEvent::OperationCancelled(_));
+            if is_user_message(event, "follow-up") {
+                assert!(cancelled, "follow-up overtook Stop");
+                return true;
+            }
+            false
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn human_interrupt_and_send_preserves_queue_and_stop_boundaries() {
     const REJECT_QUEUE_GROWTH: &str = "CREATE TRIGGER reject_mobile_queue_growth BEFORE UPDATE OF record ON sessions
          WHEN json_array_length(NEW.record, '$.queued_messages') > json_array_length(OLD.record, '$.queued_messages')

@@ -1,20 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, MobileDeviceId, ProtocolFrame,
-    encode_frame,
+    AgentId, EncodedRecord, Envelope, FrameError, FrameKind, FrameReader, MobileDeviceId,
+    ProtocolFrame, encode_frame,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::Connection;
 use crate::error::AppError;
 use crate::host::{AgentReplayMode, HostHandle};
 use crate::project_stream::ProjectFileDelivery;
-use crate::router::route_client_envelope;
+use crate::router::{parse_agent_id, reject_agent_request, route_client_envelope};
 use crate::stream::{OutputLane, OutputQueue, QueuedOutput, SchedulerToken, Stream};
 
 /// Which client is on the other end. The mobile variant carries the device the
@@ -38,6 +39,7 @@ impl ConnectionOrigin {
 
 const BOOTSTRAP_REPLAY_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 const MOBILE_CLIENT_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_PENDING_AGENT_REQUESTS: usize = 32;
 static INBOUND_AUDIO_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static OUTBOUND_AUDIO_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
@@ -832,7 +834,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
     }
     let mut project_queues =
         HashMap::<(protocol::StreamPath, ProjectRequestLane), mpsc::Sender<Envelope>>::new();
-    let mut project_tasks = tokio::task::JoinSet::<()>::new();
+    let mut project_tasks = JoinSet::<()>::new();
     let (agent_load_tx, agent_load_rx) = mpsc::channel(32);
     project_tasks.spawn(route_queued_requests(
         host.clone(),
@@ -842,9 +844,39 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
         cancel.clone(),
         agent_load_rx,
     ));
+    // Hold the ordering barrier for one agent, not the entire connection.
+    // Only agents with in-flight work have lanes, keyed by agent rather than
+    // subscription instance so commands sent on another instance cannot pass.
+    let mut agent_queues = HashMap::<AgentId, VecDeque<Envelope>>::new();
+    let mut agent_tasks = JoinSet::new();
+    let start_agent_request = |tasks: &mut JoinSet<_>, agent_id, envelope| {
+        let host = host.clone();
+        let host_stream = host_stream.clone();
+        let output = host_output_stream.clone();
+        let origin = origin.clone();
+        tasks.spawn(async move {
+            let fatal = route_request(&host, &host_stream, &output, &origin, envelope).await;
+            (agent_id, fatal)
+        });
+    };
     let mut voice_ingress = VoiceIngressState::default();
     loop {
         tokio::select! {
+            Some(result) = agent_tasks.join_next(), if !agent_tasks.is_empty() => {
+                let (agent_id, fatal) = result.map_err(|error|
+                    FrameError::Protocol(format!("agent request task failed: {error}")))?;
+                if fatal {
+                    return Ok(());
+                }
+                let Entry::Occupied(mut lane) = agent_queues.entry(agent_id) else {
+                    return Err(FrameError::Protocol("agent request completed without its lane".into()));
+                };
+                if let Some(next) = lane.get_mut().pop_front() {
+                    start_agent_request(&mut agent_tasks, lane.key().clone(), next);
+                } else {
+                    lane.remove();
+                }
+            }
             result = project_tasks.join_next(), if !project_tasks.is_empty() => {
                 if let Some(Err(error)) = result {
                     return Err(FrameError::Protocol(format!("project request task failed: {error}")));
@@ -931,7 +963,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                 }
 
                 let request_context = command_error_context(&envelope);
-        let request_stream = envelope.stream.clone();
+                let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
                 let request_id = envelope
                     .payload
@@ -1003,33 +1035,36 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     continue;
                 }
 
-                let route_result =
-                    route_client_envelope(
-                        &host,
-                        &host_stream,
-                        &host_output_stream,
-                        &origin,
-                        envelope,
-                    )
-                        .await;
-                if let Err(error) = route_result {
-                    let error_stream = if request_kind == FrameKind::SpawnAgent && request_stream.spawn_parent().as_ref() == Some(&host_stream) {
-                        host_output_stream.with_path(request_stream.clone())
-                    } else {
-                        host_output_stream.clone()
+                if request_stream.0.starts_with("/agent/") {
+                    let agent_id = match parse_agent_id(&request_stream) {
+                        Ok(agent_id) => agent_id,
+                        Err(error) => {
+                            emit_command_error(&host_output_stream, request_stream, request_kind, request_id, request_context, &error);
+                            first_request.notify_one();
+                            continue;
+                        }
                     };
-                    emit_command_error(
-                        &error_stream,
-                        request_stream,
-                        request_kind,
-                        request_id,
-                        request_context,
-                        &error,
-                    );
-
-                    if error.fatal {
-                        return Ok(());
+                    match agent_queues.entry(agent_id) {
+                        Entry::Occupied(mut lane) => {
+                            if lane.get().len() == MAX_PENDING_AGENT_REQUESTS {
+                                let error = reject_agent_request(&host_output_stream, lane.key().clone(), &envelope);
+                                emit_command_error(&host_output_stream, request_stream, request_kind, request_id, request_context, &error);
+                            } else {
+                                lane.get_mut().push_back(envelope);
+                            }
+                        }
+                        Entry::Vacant(lane) => {
+                            let agent_id = lane.key().clone();
+                            lane.insert(VecDeque::new());
+                            start_agent_request(&mut agent_tasks, agent_id, envelope);
+                        }
                     }
+                    first_request.notify_one();
+                    continue;
+                }
+
+                if route_request(&host, &host_stream, &host_output_stream, &origin, envelope).await {
+                    return Ok(());
                 }
                 first_request.notify_one();
             }
@@ -1046,31 +1081,48 @@ async fn route_queued_requests(
     mut requests: mpsc::Receiver<Envelope>,
 ) {
     while let Some(envelope) = requests.recv().await {
-        let request_context = command_error_context(&envelope);
-        let request_stream = envelope.stream.clone();
-        let request_kind = envelope.kind;
-        let request_id = envelope
-            .payload
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned);
-        if let Err(error) =
-            route_client_envelope(&host, &host_stream, &output, &origin, envelope).await
-        {
-            emit_command_error(
-                &output,
-                request_stream,
-                request_kind,
-                request_id,
-                request_context,
-                &error,
-            );
-            if error.fatal {
-                cancel.cancel();
-                return;
-            }
+        if route_request(&host, &host_stream, &output, &origin, envelope).await {
+            cancel.cancel();
+            return;
         }
     }
+}
+
+async fn route_request(
+    host: &HostHandle,
+    host_stream: &protocol::StreamPath,
+    output: &Stream,
+    origin: &ConnectionOrigin,
+    envelope: Envelope,
+) -> bool {
+    let request_context = command_error_context(&envelope);
+    let request_stream = envelope.stream.clone();
+    let request_kind = envelope.kind;
+    let request_id = envelope
+        .payload
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let Err(error) = route_client_envelope(host, host_stream, output, origin, envelope).await
+    else {
+        return false;
+    };
+    let error_stream = if request_kind == FrameKind::SpawnAgent
+        && request_stream.spawn_parent().as_ref() == Some(host_stream)
+    {
+        output.with_path(request_stream.clone())
+    } else {
+        output.clone()
+    };
+    emit_command_error(
+        &error_stream,
+        request_stream,
+        request_kind,
+        request_id,
+        request_context,
+        &error,
+    );
+    error.fatal
 }
 
 fn is_terminal_control_command(kind: FrameKind) -> bool {

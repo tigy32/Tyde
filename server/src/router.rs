@@ -1794,7 +1794,7 @@ pub(crate) fn ensure_non_empty(
     Ok(())
 }
 
-fn parse_agent_id(stream: &StreamPath) -> AppResult<AgentId> {
+pub(crate) fn parse_agent_id(stream: &StreamPath) -> AppResult<AgentId> {
     let segments: Vec<&str> = stream.0.split('/').collect();
     if segments.len() != 4 {
         return Err(AppError::protocol(
@@ -2145,6 +2145,28 @@ fn human_input_status(
             reason: error.to_string(),
         },
     }
+}
+
+pub(crate) fn reject_agent_request(
+    output: &Stream,
+    agent_id: AgentId,
+    envelope: &Envelope,
+) -> AppError {
+    let error = AppError::conflict("agent_request", "agent request queue is full");
+    if envelope.kind == FrameKind::HumanInput {
+        match parse_payload::<protocol::HumanInputPayload>(envelope, "human_input") {
+            Ok(payload) => send_human_input_status(
+                output,
+                agent_id,
+                payload.id,
+                protocol::HumanInputStatus::Refused {
+                    reason: error.to_string(),
+                },
+            ),
+            Err(error) => return error,
+        }
+    }
+    error
 }
 
 fn send_human_input_status(
