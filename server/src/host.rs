@@ -25844,8 +25844,9 @@ fn task_timing_rollup(
         agent_time,
         accounted_agent_count: accounts.len().min(u32::MAX as usize) as u32,
     });
-    // Bounded across the task; every account keeps its exact totals.
-    let retained = (TASK_TIME_PHASE_BUDGET / accounts.len()).max(MIN_AGENT_TIME_PHASES);
+    // Bounded across the task; every account keeps its exact totals and its
+    // latest phase, which carries the account's live/ended state.
+    let retained = (TASK_TIME_PHASE_BUDGET / accounts.len()).max(1);
     summary.accounts = accounts
         .into_iter()
         .map(|(agent_id, account)| {
@@ -25861,7 +25862,6 @@ fn task_timing_rollup(
 }
 
 const TASK_TIME_PHASE_BUDGET: usize = 2048;
-const MIN_AGENT_TIME_PHASES: usize = 8;
 
 fn collect_task_token_usage_entries(
     agent_id: &AgentId,
