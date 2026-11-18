@@ -438,13 +438,18 @@ async fn hidden_templates_migrate_and_preserve_visibility_edits() {
     for agent in &fixture.bootstrap.custom_agents {
         assert_eq!(
             agent.hidden,
-            matches!(agent.id.0.as_str(), "tyde-implementer" | "tyde-lander")
+            matches!(
+                agent.id.0.as_str(),
+                "tyde-implementer" | "tyde-lander" | "tyde-review"
+            )
         );
     }
     let path = fixture.store_dir().join("custom_agents.json");
     let mut saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     let records = saved["records"].as_object_mut().unwrap();
+    // The old store predates both explicit visibility and the Review preset.
+    records.remove("tyde-review").expect("Review was seeded");
     for record in records.values_mut() {
         record.as_object_mut().unwrap().remove("hidden");
     }
@@ -464,7 +469,10 @@ async fn hidden_templates_migrate_and_preserve_visibility_edits() {
     for agent in &migrated.custom_agents {
         assert_eq!(
             agent.hidden,
-            matches!(agent.id.0.as_str(), "tyde-implementer" | "tyde-lander")
+            matches!(
+                agent.id.0.as_str(),
+                "tyde-implementer" | "tyde-lander" | "tyde-review"
+            )
         );
     }
     let mut implementer = migrated

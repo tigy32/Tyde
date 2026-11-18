@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use protocol::SkillId;
 
 /// One skill selected for a session: identity and canonical on-disk location.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedSkill {
     pub id: SkillId,
     /// Directory name in the Tyde store, which is also the name the skill is
@@ -60,7 +60,7 @@ impl ResolvedSkill {
 ///
 /// Adapters need this to scope what they tell the model: advertising "these
 /// skills were chosen for you" is only true for an explicit selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SkillSelection {
     /// The builtin Default agent: every installed skill.
     AllInstalled,
@@ -72,7 +72,7 @@ pub enum SkillSelection {
 ///
 /// This is the transport fact. Full skill bodies are never a delivery mode:
 /// backends either discover selected skills on demand or receive names only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SkillDelivery {
     /// The adapter exposes `source_dir` through the backend's own on-demand
     /// skill discovery.

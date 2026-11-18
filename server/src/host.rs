@@ -104,7 +104,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::customization::{
-    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SpawnCustomization, resolve_spawn_config,
+    ResolveSpawnConfigRequest, ResolvedSpawnConfig, resolve_spawn_config,
 };
 use crate::agent::registry::{
     AgentRegistry, AgentStartupFailure, AgentStatusTransition, InitialAgentAlias,
@@ -148,9 +148,7 @@ use crate::project_stream::{
     SearchSummary, commit, discard_file, read_diff, root_is_git_repository, search_project,
     spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
-use crate::review::reviewer::{
-    ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
-};
+use crate::review::reviewer::{ReviewerToolBridge, build_reviewer_user_prompt};
 use crate::review::state::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::{
     ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_selection,
@@ -6233,9 +6231,7 @@ impl HostHandle {
                                     backend_kind,
                                     project_id: project_id.as_ref(),
                                     workspace_roots: &workspace_roots,
-                                    customization: SpawnCustomization::User(
-                                        requested_custom_agent_id.as_ref(),
-                                    ),
+                                    custom_agent_id: requested_custom_agent_id.as_ref(),
                                     built_in_mcp_servers: &startup_mcp_servers,
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
@@ -6561,7 +6557,7 @@ let custom_agents = &state.custom_agent_store;
                                 backend_kind: record.backend_kind,
                                 project_id: project_id.as_ref(),
                                 workspace_roots: &record.workspace_roots,
-                                customization: SpawnCustomization::User(None),
+                                custom_agent_id: None,
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
@@ -6603,9 +6599,7 @@ let custom_agents = &state.custom_agent_store;
                                         backend_kind: record.backend_kind,
                                         project_id: project_id.as_ref(),
                                         workspace_roots: &record.workspace_roots,
-                                        customization: SpawnCustomization::User(Some(
-                                            stored_custom_agent_id,
-                                        )),
+                                        custom_agent_id: Some(stored_custom_agent_id),
                                         built_in_mcp_servers: &startup_mcp_servers,
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
@@ -6646,7 +6640,7 @@ let custom_agents = &state.custom_agent_store;
                                     backend_kind: record.backend_kind,
                                     project_id: project_id.as_ref(),
                                     workspace_roots: &record.workspace_roots,
-                                    customization: SpawnCustomization::User(None),
+                                    custom_agent_id: None,
                                     built_in_mcp_servers: &startup_mcp_servers,
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
@@ -6909,7 +6903,7 @@ let custom_agents = &state.custom_agent_store;
                                 backend_kind,
                                 project_id: project_id.as_ref(),
                                 workspace_roots: &workspace_roots,
-                                customization: SpawnCustomization::User(None),
+                                custom_agent_id: None,
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: custom_agents,
                                 mcp_server_store: mcp_servers,
@@ -6951,9 +6945,7 @@ let custom_agents = &state.custom_agent_store;
                                         backend_kind,
                                         project_id: project_id.as_ref(),
                                         workspace_roots: &workspace_roots,
-                                        customization: SpawnCustomization::User(Some(
-                                            stored_custom_agent_id,
-                                        )),
+                                        custom_agent_id: Some(stored_custom_agent_id),
                                         built_in_mcp_servers: &startup_mcp_servers,
                                         custom_agent_store: custom_agents,
                                         mcp_server_store: mcp_servers,
@@ -6995,7 +6987,7 @@ let custom_agents = &state.custom_agent_store;
                                     backend_kind,
                                     project_id: project_id.as_ref(),
                                     workspace_roots: &workspace_roots,
-                                    customization: SpawnCustomization::User(None),
+                                    custom_agent_id: None,
                                     built_in_mcp_servers: &startup_mcp_servers,
                                     custom_agent_store: custom_agents,
                                     mcp_server_store: mcp_servers,
@@ -16113,7 +16105,7 @@ let project_id = &project_id;
                             backend_kind: definition.summary.coordinator.backend,
                             project_id: project_id.as_ref(),
                             workspace_roots: &workspace_roots,
-                            customization: SpawnCustomization::User(None),
+                            custom_agent_id: None,
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
@@ -19049,7 +19041,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                             backend_kind,
                             project_id: Some(&project_id),
                             workspace_roots: &project_roots,
-                            customization: SpawnCustomization::User(custom_agent_id.as_ref()),
+                            custom_agent_id: custom_agent_id.as_ref(),
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: custom_agents,
                             mcp_server_store: mcp_servers,
@@ -19661,13 +19653,7 @@ self.state.with(move |state| {
         if roots.is_empty() {
             return Err("review project has no workspace roots".to_owned());
         }
-        let review_mcp_url = {
-            {
-                self.state
-                    .with(move |state| state.review_mcp.url.clone())
-                    .await
-            }
-        };
+        let review_mcp_url = self.state.with(|state| state.review_mcp.url.clone()).await;
         if review_mcp_url.trim().is_empty() {
             tracing::warn!(
                 review_id = %request.review_id,
@@ -19676,8 +19662,6 @@ self.state.with(move |state| {
             );
             return Err("review feedback MCP server is unavailable for AI review".to_owned());
         }
-        let reviewer_system_prompt = build_reviewer_system_prompt();
-        let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_mcp_servers = vec![StartupMcpServer {
             name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
             supports_parallel_tool_calls: false,
@@ -19687,37 +19671,33 @@ self.state.with(move |state| {
                 bearer_token_env_var: None,
             },
         }];
-        let reviewer_spawn_config = {
-            {
-                let project_id = request.review.project_id.clone();
-                let roots = roots.clone();
-                let project_guidance = self.project_guidance().await;
-                self.state
-                    .with(move |state| {
-                        let custom_agents = &state.custom_agent_store;
-                        let mcp_servers = &state.mcp_server_store;
-                        let steering = Arc::clone(&state.steering_store);
-                        let skills = &state.skill_store;
-
-                        resolve_spawn_config(ResolveSpawnConfigRequest {
-                            backend_kind,
-                            project_id: Some(&project_id),
-                            workspace_roots: &roots,
-                            customization: SpawnCustomization::Reviewer {
-                                instructions: reviewer_system_prompt,
-                            },
-                            built_in_mcp_servers: &reviewer_mcp_servers,
-                            custom_agent_store: custom_agents,
-                            mcp_server_store: mcp_servers,
-                            steering_store: &steering,
-                            project_guidance: &project_guidance,
-                            skill_store: skills,
-                        })
+        let mut reviewer_spawn_config = {
+            let project_id = request.review.project_id.clone();
+            let roots = roots.clone();
+            let custom_agent_id =
+                CustomAgentId(crate::store::custom_agents::REVIEW_CUSTOM_AGENT_ID.to_owned());
+            let project_guidance = self.project_guidance().await;
+            self.state
+                .with(move |state| {
+                    resolve_spawn_config(ResolveSpawnConfigRequest {
+                        backend_kind,
+                        project_id: Some(&project_id),
+                        workspace_roots: &roots,
+                        custom_agent_id: Some(&custom_agent_id),
+                        built_in_mcp_servers: &reviewer_mcp_servers,
+                        custom_agent_store: &state.custom_agent_store,
+                        mcp_server_store: &state.mcp_server_store,
+                        steering_store: &state.steering_store,
+                        project_guidance: &project_guidance,
+                        skill_store: &state.skill_store,
                     })
-                    .await?
-            }
+                })
+                .await?
         };
+        reviewer_spawn_config.bind_review_execution();
         use sha2::Digest;
+        let skills = serde_json::to_value(&reviewer_spawn_config.skills)
+            .map_err(|error| format!("Cannot encode resolved reviewer skills: {error}"))?;
         let mut configuration = serde_json::json!({
             "reviewer": config,
             "cost_hint": request.cost_hint,
@@ -19730,6 +19710,9 @@ self.state.with(move |state| {
             "system_prompt": reviewer_spawn_config.instructions,
             "steering": reviewer_spawn_config.steering_body,
             "builtin_steering": reviewer_spawn_config.builtin_steering,
+            "skills": skills,
+            "skill_selection": reviewer_spawn_config.skill_selection,
+            "skill_delivery": reviewer_spawn_config.skill_delivery,
             "mcp_servers": reviewer_spawn_config.mcp_servers,
             "tool_policy": reviewer_spawn_config.tool_policy,
             "access_mode": reviewer_spawn_config.access_mode,
@@ -19822,6 +19805,7 @@ self.state.with(move |state| {
             } else {
                 format!("Review: {name}")
             }),
+            // A history resume cannot rebuild the review execution's feedback MCP or bridge.
             custom_agent_id: None,
             parent_agent_id: request.requested_by.clone(),
             project_id: Some(request.review.project_id.clone()),
@@ -19848,7 +19832,6 @@ self.state.with(move |state| {
             review_id = %request.review_id,
             backend_kind = ?backend_kind,
             roots_count,
-            reviewer_system_prompt_len,
             prompt_len,
             "dispatching AI reviewer spawn"
         );

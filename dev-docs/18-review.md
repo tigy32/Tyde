@@ -548,16 +548,11 @@ mode values decode as team executions, with their frozen assignment snapshots
 unchanged. Legacy mode aliases on tool calls select the currently configured
 team layout; new callers use the canonical three names.
 
-Compatible follow-ups retain the existing reviewer-context key and reuse
-completed reviewers. Existing non-fork keys are not gratuitously invalidated;
-fork context keys additionally include their native source identity. Changed
-aspect guidance, source/model configuration or closed sessions invalidate only
-the affected contexts. Failed contexts stay failures until explicitly closed
-or reconfigured; no automatic replacement masks a failure.
-
-Reviewers use the workbench's exact project roots, normal native tools, and
-review-feedback MCP. The review prompt asks them not to edit files.
-A stable system instruction describes the advisory role; the concise turn
+Review launches use the built-in Review Custom Agent, hidden from New Chat.
+Live reviewer sessions remain visible and stoppable. The normal Custom Agent
+resolver includes project skills and steering from the review project's exact
+roots. Review keeps normal native tools and the review-feedback MCP. The
+preset's standing guidance asks reviewers not to edit files; the per-turn
 assignment provides current review/execution IDs, scope, focus and pending count.
 Reviewers decide what to inspect through normal workspace/file/Git tools. Startup
 reads scope metadata only: no full-file diff serialization, temporary artifacts,
@@ -567,8 +562,9 @@ review diffs and file snapshots remain intact. Genuine client diff/review
 payloads retain explicit transport bounds; an oversized full review bootstrap
 reports an error and can be requested as metadata with individual project diffs.
 
-Follow-ups reuse the same live reviewer/context when assignment, model, project
-roots, effective tools/permissions and steering remain unchanged. Each independent
+Follow-ups reuse the same live reviewer/context when the assignment, native
+fork source, model, project roots, and resolved preset inputs (instructions,
+skills, steering and tools) remain unchanged. Each independent
 configured assignment retains its own context. Changed configuration, explicit
 closure or host restart invalidates context explicitly; provider failures do not
 silently switch or replace it. Failed live reviewers must be closed or their

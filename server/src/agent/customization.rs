@@ -104,13 +104,16 @@ impl ResolvedSpawnConfig {
         });
     }
 
+    pub(crate) fn bind_review_execution(&mut self) {
+        self.policy = SpawnConfigPolicy::Reviewer;
+        self.access_mode = BackendAccessMode::ReadOnly;
+    }
+
     /// Whether a plain `Resume` rebuilds this configuration faithfully.
     ///
-    /// Only the user policy is reconstructed from the session record alone. A
-    /// reviewer carries dedicated instructions, a read-only tool policy, its
-    /// review MCP and a tool bridge that live entirely outside the record, so
-    /// resuming one produces an ordinary user agent wearing its name. The
-    /// swarm policy must instead be restored through its owning swarm. The
+    /// Only the user policy is reconstructed from the session record alone.
+    /// A review execution's feedback MCP and tool bridge are not restorable.
+    /// The swarm policy must instead be restored through its owning swarm. The
     /// remaining policies do not describe independently restorable user sessions.
     pub(crate) fn is_rebuilt_by_resume(&self) -> bool {
         matches!(self.policy, SpawnConfigPolicy::User)
@@ -129,20 +132,11 @@ impl ResolvedSpawnConfig {
     }
 }
 
-pub(crate) enum SpawnCustomization<'a> {
-    /// Includes Default (when no agent is selected), workspace/store skills,
-    /// user MCP servers, and host/project steering. Workflows are user agents.
-    User(Option<&'a CustomAgentId>),
-    /// The review role retains user steering, but only its dedicated prompt,
-    /// read-only tools and review MCP: no Default role, skills or user MCP.
-    Reviewer { instructions: String },
-}
-
 pub(crate) struct ResolveSpawnConfigRequest<'a> {
     pub backend_kind: BackendKind,
     pub project_id: Option<&'a ProjectId>,
     pub workspace_roots: &'a [String],
-    pub customization: SpawnCustomization<'a>,
+    pub custom_agent_id: Option<&'a CustomAgentId>,
     pub built_in_mcp_servers: &'a [StartupMcpServer],
     pub custom_agent_store: &'a CustomAgentStore,
     pub mcp_server_store: &'a McpServerStore,
@@ -154,11 +148,7 @@ pub(crate) struct ResolveSpawnConfigRequest<'a> {
 pub(crate) fn resolve_spawn_config(
     request: ResolveSpawnConfigRequest<'_>,
 ) -> Result<ResolvedSpawnConfig, String> {
-    let policy = match &request.customization {
-        SpawnCustomization::User(_) => SpawnConfigPolicy::User,
-        SpawnCustomization::Reviewer { .. } => SpawnConfigPolicy::Reviewer,
-    };
-    let mut resolved = ResolvedSpawnConfig::empty(policy);
+    let mut resolved = ResolvedSpawnConfig::empty(SpawnConfigPolicy::User);
     resolved.mcp_servers = request
         .built_in_mcp_servers
         .iter()
@@ -168,15 +158,7 @@ pub(crate) fn resolve_spawn_config(
     resolved.steering_body =
         resolve_steering_body(request.steering_store, request.project_id, Some(guidance))?;
     resolved.skill_delivery = crate::backend::skill_delivery(request.backend_kind);
-    match &request.customization {
-        SpawnCustomization::User(custom_agent_id) => {
-            resolve_user_customization(&request, *custom_agent_id, &mut resolved)?;
-        }
-        SpawnCustomization::Reviewer { instructions } => {
-            resolved.instructions = Some(instructions.clone());
-            resolved.access_mode = BackendAccessMode::ReadOnly;
-        }
-    }
+    resolve_user_customization(&request, &mut resolved)?;
     resolved.builtin_steering = crate::backend::builtin_steering_for_tools(
         &protocol_mcp_servers_to_startup(&resolved.mcp_servers),
     );
@@ -185,7 +167,6 @@ pub(crate) fn resolve_spawn_config(
 
 fn resolve_user_customization(
     request: &ResolveSpawnConfigRequest<'_>,
-    custom_agent_id: Option<&CustomAgentId>,
     resolved: &mut ResolvedSpawnConfig,
 ) -> Result<(), String> {
     let mut mcp_servers = std::mem::take(&mut resolved.mcp_servers);
@@ -209,7 +190,7 @@ fn resolve_user_customization(
     // builtin, so users can customize every plain chat from Settings →
     // Custom Agents. An explicit selection must exist; the implicit default
     // is best-effort (a deleted Default agent means no customization).
-    let custom_agent = match custom_agent_id {
+    let custom_agent = match request.custom_agent_id {
         Some(custom_agent_id) => Some(
             request
                 .custom_agent_store

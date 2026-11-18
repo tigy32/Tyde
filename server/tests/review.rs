@@ -1063,9 +1063,13 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         env.kind == FrameKind::CustomAgentNotify
     })
     .await;
-    let skill_dir = repo_a.join(".agents/skills/not-for-reviewer");
+    let skill_dir = repo_a.join(".agents/skills/review-project-skill");
     fs::create_dir_all(&skill_dir).expect("create workspace skill");
-    fs::write(skill_dir.join("SKILL.md"), "Skill excluded from reviewer").expect("write skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "Inspect review project conventions.",
+    )
+    .expect("write skill");
     client
         .mcp_server_upsert(protocol::McpServerUpsertPayload {
             mcp_server: protocol::McpServerConfig {
@@ -1083,6 +1087,34 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         .expect("save user MCP");
     next_frame_matching_on(&mut client, "MCP saved", |env| {
         env.kind == FrameKind::McpServerNotify
+    })
+    .await;
+
+    let mut review_preset = fixture
+        .bootstrap
+        .custom_agents
+        .iter()
+        .find(|agent| agent.name == "Review")
+        .expect("built-in Review Custom Agent")
+        .clone();
+    assert!(
+        review_preset.hidden,
+        "Review is not a regular New Chat choice"
+    );
+
+    review_preset
+        .instructions
+        .as_mut()
+        .expect("standing reviewer guidance")
+        .push_str(" Inspect project conventions first.");
+    client
+        .custom_agent_upsert(protocol::CustomAgentUpsertPayload {
+            custom_agent: review_preset,
+        })
+        .await
+        .expect("edit built-in Review customization");
+    next_frame_matching_on(&mut client, "Review preset saved", |env| {
+        env.kind == FrameKind::CustomAgentNotify
     })
     .await;
 
@@ -1115,6 +1147,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
                 assert_eq!(payload.name, "AI Review");
+                assert!(payload.custom_agent_id.is_none());
                 assert_eq!(payload.project_id, Some(project.id.clone()));
                 assert_eq!(payload.workspace_roots, project_roots(&project));
                 assert!(
@@ -1185,8 +1218,8 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         "reviewer inherited Default role: {response}"
     );
     assert!(
-        !response.contains("[skills:"),
-        "reviewer inherited skills: {response}"
+        response.contains("[skills: review-project-skill]"),
+        "reviewer did not inherit its project's skill"
     );
     assert!(
         response.contains("[startup_mcp_servers: tyde-review-feedback(http)]"),
@@ -1211,6 +1244,10 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     assert!(
         response.contains("Do not edit files"),
         "missing review instructions"
+    );
+    assert!(
+        response.contains("Inspect project conventions first."),
+        "review did not use the configured standing guidance"
     );
     client
         .send_message(
@@ -1595,6 +1632,41 @@ async fn advisory_review_does_not_depend_on_full_context_transport() {
     assert_eq!(summary["new_finding_count"], 1);
     assert_eq!(summary["outstanding_count"], 1);
     assert!(summary.to_string().len() < 512);
+    let skill_dir = root.path().join(".agents/skills/review-followup");
+    fs::create_dir_all(&skill_dir).expect("create project skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "Inspect changed workspace conventions.",
+    )
+    .expect("write project skill");
+    let replacement = fixture
+        .reserve_next_mock_launch("Review: One", MockScript::one(MockTurn::echo()))
+        .await;
+    let (failed, summary) = start_review_call(&caller, "new-project-skill", "review_team")
+        .await
+        .unwrap();
+    assert!(!failed);
+    assert_eq!(summary["status"], "completed");
+    drop(replacement);
+    let (_, host) = fixture.connect_with_bootstrap().await;
+    let state = subscribe_review_with_payload(
+        &mut client,
+        &review_id,
+        ReviewSubscribePayload {
+            include_diffs: false,
+        },
+    )
+    .await;
+    let member = &state.ai_reviewer.rounds[2].reviewers[0];
+    assert!(!member.reused_context);
+    assert_ne!(member.agent_id.as_ref(), Some(&reviewer));
+    assert!(
+        host.agents
+            .iter()
+            .any(|agent| Some(&agent.agent_id) == member.agent_id.as_ref())
+    );
+    assert!(!host.agents.iter().any(|agent| agent.agent_id == reviewer));
+
     let mut human = fixture.connect().await;
     human
         .review_subscribe(
