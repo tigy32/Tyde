@@ -4,6 +4,17 @@ use protocol::types::{
 };
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    futures_util::future::Either,
+    protocol::MobileRtcDescription,
+    std::{
+        convert::Infallible,
+        future::{Future, pending},
+        pin::{Pin, pin},
+    },
+};
+
 use crate::{
     ConnectStage, Error, Peer, RtcStream, authenticate_description, failure, verify_description,
 };
@@ -59,7 +70,10 @@ pub async fn connect_with_tls_roots(
         pairing_key,
         progress,
         DEFAULT_SIGNALING_HEARTBEAT_INTERVAL,
-        |servers| async move { Peer::with_tls_roots(&servers, roots).await },
+        |servers| {
+            let roots = roots.clone();
+            async move { Peer::with_tls_roots(&servers, roots).await }
+        },
     )
     .await
 }
@@ -69,7 +83,7 @@ async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
     pairing_key: &[u8; 32],
     mut progress: impl FnMut(ConnectStage),
     heartbeat: Duration,
-    new_peer: impl FnOnce(Vec<protocol::MobileIceServer>) -> F,
+    new_peer: impl Fn(Vec<protocol::MobileIceServer>) -> F,
 ) -> Result<RtcStream, Error> {
     if credentials.protocol_version != MOBILE_RTC_PROTOCOL_VERSION {
         return Err(failure(
@@ -160,24 +174,15 @@ async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
                 peer
             }
             MobilePeerRole::Host => {
-                advance(ConnectStage::AwaitMobileOffer);
-                let mut socket = HostSocket::open(&signal.credentials, heartbeat).await?;
-                let description = require_description(socket.receive().await?)?;
-                let session_id = description.session_id.clone();
-                verify_description(&description, &session_id, MobileSdpKind::Offer, pairing_key)?;
-                advance(ConnectStage::CreateAnswer);
-                let mut peer = new_peer(signal.credentials.ice_servers.clone()).await?;
-                let answer = peer.answer(description.sdp).await?;
-                advance(ConnectStage::PublishAnswer);
-                socket
-                    .publish(authenticate_description(
-                        session_id,
-                        MobileSdpKind::Answer,
-                        answer,
-                        pairing_key,
-                    )?)
-                    .await?;
-                peer
+                return accept_host(
+                    &signal.credentials,
+                    pairing_key,
+                    advance,
+                    heartbeat,
+                    || new_peer(signal.credentials.ice_servers.clone()),
+                    remaining,
+                )
+                .await;
             }
         };
         advance(ConnectStage::OpenChannel);
@@ -242,6 +247,94 @@ fn require_description(event: MobileSignalEvent) -> Result<protocol::MobileRtcDe
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+async fn accept_host<F: Future<Output = Result<Peer, Error>>>(
+    credentials: &MobileRtcCredentials,
+    pairing_key: &[u8; 32],
+    mut advance: impl FnMut(ConnectStage),
+    heartbeat: Duration,
+    new_peer: impl Fn() -> F,
+    remaining: impl Fn() -> Result<Duration, Error>,
+) -> Result<RtcStream, Error> {
+    advance(ConnectStage::AwaitMobileOffer);
+    let mut socket = HostSocket::open(credentials, heartbeat).await?;
+    let mut offer = match socket
+        .offer_or(pairing_key, pending::<Infallible>())
+        .await?
+    {
+        Either::Left(offer) => offer,
+        Either::Right(never) => match never {},
+    };
+    loop {
+        advance(ConnectStage::CreateAnswer);
+        let mut peer = new_peer().await?;
+        let answer = match socket.offer_or(pairing_key, peer.answer(offer.sdp)).await? {
+            Either::Left(replacement) => {
+                tracing::debug!("fresh mobile offer replaced the offer being answered");
+                offer = replacement;
+                continue;
+            }
+            Either::Right(result) => result?,
+        };
+        advance(ConnectStage::PublishAnswer);
+        socket
+            .send_answer(authenticate_description(
+                offer.session_id,
+                MobileSdpKind::Answer,
+                answer,
+                pairing_key,
+            )?)
+            .await?;
+        // A new offer can arrive before the old answer's untagged ACK.
+        // Consume that ACK before sending another answer on this socket.
+        if let Some(replacement) = socket.answer_outcome(pairing_key).await? {
+            tracing::debug!("fresh mobile offer replaced the published answer");
+            offer = replacement;
+            continue;
+        }
+        advance(ConnectStage::OpenChannel);
+        match socket
+            .offer_or(pairing_key, peer.into_stream_for(remaining()?))
+            .await?
+        {
+            Either::Left(replacement) => {
+                tracing::debug!("fresh mobile offer replaced a pending data channel");
+                offer = replacement;
+            }
+            Either::Right(result) => return result,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn accept_host<F: std::future::Future<Output = Result<Peer, Error>>>(
+    _: &MobileRtcCredentials,
+    _: &[u8; 32],
+    _: impl FnMut(ConnectStage),
+    _: Duration,
+    _: impl Fn() -> F,
+    _: impl Fn() -> Result<Duration, Error>,
+) -> Result<RtcStream, Error> {
+    Err(failure(
+        "configuration",
+        "browser cannot act as a signaling host",
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_offer(
+    description: MobileRtcDescription,
+    pairing_key: &[u8; 32],
+) -> Result<MobileRtcDescription, Error> {
+    verify_description(
+        &description,
+        &description.session_id,
+        MobileSdpKind::Offer,
+        pairing_key,
+    )?;
+    Ok(description)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct HostSocket {
     socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -292,7 +385,10 @@ impl HostSocket {
         })
     }
 
-    async fn receive(&mut self) -> Result<MobileSignalEvent, Error> {
+    async fn receive_or<F: Future>(
+        &mut self,
+        mut work: Pin<&mut F>,
+    ) -> Result<Either<MobileSignalEvent, F::Output>, Error> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         loop {
@@ -303,7 +399,7 @@ impl HostSocket {
                     Some(Ok(Message::Text(text))) if text.as_str() == SIGNALING_HEARTBEAT_ACK => {
                         self.awaiting_ack = false;
                     }
-                    Some(Ok(Message::Text(text))) => return serde_json::from_str(&text)
+                    Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).map(Either::Left)
                         .map_err(|error| failure("signaling socket response", error)),
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
                         self.socket.flush().await.map_err(|_| failure("signaling socket", "control frame flush failed"))?;
@@ -323,11 +419,25 @@ impl HostSocket {
                         .map_err(|_| failure("signaling socket", "heartbeat send failed"))?;
                     self.awaiting_ack = true;
                 }
+                result = &mut work => return Ok(Either::Right(result)),
             }
         }
     }
 
-    async fn publish(&mut self, description: protocol::MobileRtcDescription) -> Result<(), Error> {
+    async fn offer_or<F: Future>(
+        &mut self,
+        pairing_key: &[u8; 32],
+        work: F,
+    ) -> Result<Either<MobileRtcDescription, F::Output>, Error> {
+        match self.receive_or(pin!(work)).await? {
+            Either::Left(event) => {
+                verify_offer(require_description(event)?, pairing_key).map(Either::Left)
+            }
+            Either::Right(result) => Ok(Either::Right(result)),
+        }
+    }
+
+    async fn send_answer(&mut self, description: MobileRtcDescription) -> Result<(), Error> {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
         let text = serde_json::to_string(&MobileSignalCommand::Publish { description })
@@ -335,39 +445,27 @@ impl HostSocket {
         self.socket
             .send(Message::Text(text.into()))
             .await
-            .map_err(|_| failure("signaling socket", "answer send failed"))?;
-        match self.receive().await? {
-            MobileSignalEvent::Waiting => Ok(()),
-            MobileSignalEvent::Failed { message } => Err(failure("signaling", message)),
-            MobileSignalEvent::Description { .. } => Err(failure(
-                "signaling",
-                "unexpected description while awaiting answer acknowledgement",
-            )),
+            .map_err(|_| failure("signaling socket", "answer send failed"))
+    }
+
+    async fn answer_outcome(
+        &mut self,
+        pairing_key: &[u8; 32],
+    ) -> Result<Option<MobileRtcDescription>, Error> {
+        let mut next = None;
+        loop {
+            match self.receive_or(pin!(pending::<Infallible>())).await? {
+                Either::Left(MobileSignalEvent::Waiting) => return Ok(next),
+                Either::Left(MobileSignalEvent::Failed { message }) => {
+                    // An authenticated replacement has already taken over the
+                    // service's room, so an answer for the old room can fail.
+                    return next.map(Some).ok_or_else(|| failure("signaling", message));
+                }
+                Either::Left(MobileSignalEvent::Description { description }) => {
+                    next = Some(verify_offer(description, pairing_key)?);
+                }
+                Either::Right(never) => match never {},
+            }
         }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-struct HostSocket;
-
-#[cfg(target_arch = "wasm32")]
-impl HostSocket {
-    async fn open(_: &MobileRtcCredentials, _: Duration) -> Result<Self, Error> {
-        Err(failure(
-            "configuration",
-            "browser cannot act as a signaling host",
-        ))
-    }
-    async fn receive(&mut self) -> Result<MobileSignalEvent, Error> {
-        Err(failure(
-            "configuration",
-            "browser cannot act as a signaling host",
-        ))
-    }
-    async fn publish(&mut self, _: protocol::MobileRtcDescription) -> Result<(), Error> {
-        Err(failure(
-            "configuration",
-            "browser cannot act as a signaling host",
-        ))
     }
 }

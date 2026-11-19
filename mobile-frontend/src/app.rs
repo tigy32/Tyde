@@ -2029,6 +2029,17 @@ mod wasm_tests {
             next_tick().await;
             ensure!(!overlay.open() && state.active_host_connection_status() == ConnectionStatus::Connecting,
                 "Dismiss must leave the same actor reconnecting without a parallel UI lifecycle");
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+                http.call3(
+                    &wasm_bindgen::JsValue::NULL,
+                    &format!("{base}/control").into(),
+                    &"POST".into(),
+                    &"ready-after-abandoned-offer".into(),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
             resume_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
             loop {
                 let event = statuses.recv().await.unwrap();
@@ -2036,7 +2047,7 @@ mod wasm_tests {
                     continue;
                 }
                 ensure!(!matches!(event.status, PairedHostConnectionStatus::Failed { .. }),
-                    "routine reconnect must stay neutral until the new transport connects");
+                    "an unanswered data channel from an abandoned tab must not block the fresh offer");
                 if event.status == PairedHostConnectionStatus::Connected {
                     ensure!(event.connection_instance_id != Some(previous_instance),
                         "foreground recovery must establish a fresh transport epoch");

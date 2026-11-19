@@ -164,7 +164,7 @@ async fn credentials(
             }})),
         )
             .into_response(),
-        "ready" => {
+        "ready" | "ready-after-abandoned-offer" => {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("push listener");
@@ -179,17 +179,27 @@ async fn credentials(
             let mut mobile_credentials =
                 signal.credentials(MobilePeerRole::Mobile, fixture.relay.browser_ice.clone());
             mobile_credentials.pairing_id = MobilePairingId(pairing);
-            let connected = signal.clone();
+            let (ready, configured) = oneshot::channel();
             tokio::spawn(async move {
                 let flow = async {
-                    let stream = rtc_transport::connect_with_tls_roots(
+                    let host = rtc_transport::connect_with_tls_roots(
                         host_credentials,
                         &[53; 32],
                         |_| {},
                         roots,
-                    )
-                    .await
-                    .map_err(std::io::Error::other)?;
+                    );
+                    let prepare = async {
+                        signal.host_connected_after(0).await;
+                        let abandoned = if mode == "ready-after-abandoned-offer" {
+                            Some(abandon_answered_offer(&signal, &fixture.relay).await)
+                        } else {
+                            None
+                        };
+                        let _ = ready.send(());
+                        abandoned
+                    };
+                    let (stream, _abandoned) = tokio::join!(host, prepare);
+                    let stream = stream.map_err(std::io::Error::other)?;
                     service.abort();
                     assert!(
                         fixture.store.path().exists(),
@@ -216,9 +226,47 @@ async fn credentials(
                     eprintln!("reconnect fixture: host connection ended: {error}");
                 }
             });
-            connected.host_connected_after(0).await;
+            configured.await.expect("reconnect offer setup");
             Json(mobile_credentials).into_response()
         }
         _ => panic!("unexpected reconnect fixture mode"),
     }
+}
+
+async fn abandon_answered_offer(
+    signal: &crate::rtc::PushSignaling,
+    relay: &crate::rtc::RelayFixture,
+) -> rtc_transport::Peer {
+    use protocol::{MobileRtcSessionId, MobileSdpKind, MobileSignalCommand, MobileSignalEvent};
+    use rtc_transport::{Peer, authenticate_description, verify_description};
+
+    let credentials = signal.credentials(MobilePeerRole::Mobile, relay.tls_ice.clone());
+    let mut peer = Peer::with_tls_roots(&credentials.ice_servers, relay.roots.clone())
+        .await
+        .expect("abandoned peer");
+    let session = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
+    let offer = peer.offer().await.expect("abandoned offer");
+    let description =
+        authenticate_description(session.clone(), MobileSdpKind::Offer, offer, &[53; 32])
+            .expect("sign abandoned offer");
+    let response = reqwest::Client::new()
+        .post(credentials.signaling_url.as_str())
+        .bearer_auth(credentials.signaling_token)
+        .json(&MobileSignalCommand::Publish { description })
+        .send()
+        .await
+        .expect("publish abandoned offer")
+        .error_for_status()
+        .expect("signaling HTTP status")
+        .json::<MobileSignalEvent>()
+        .await
+        .expect("signaling response");
+    let MobileSignalEvent::Description { description } = response else {
+        panic!("host must answer the offer before the browser retries");
+    };
+    verify_description(&description, &session, MobileSdpKind::Answer, &[53; 32])
+        .expect("authenticated host answer");
+    // Keep the first peer alive without applying the answer, so it cannot open
+    // a channel or free the host listener on behalf of the reconnecting tab.
+    peer
 }
