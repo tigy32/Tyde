@@ -144,7 +144,8 @@ class _TydeTurnControl:
         self.interrupting = False
         self.interrupt_issued = False
 from tools import process_registry as _tyde_process_registry_module
-_tyde_original_format_process_notification = _tyde_process_registry_module.format_process_notification
+from tools import process_registry_notifications as _tyde_process_notifications
+_tyde_original_format_process_notification = _tyde_process_notifications.format_process_notification
 _tyde_original_kill_process = _tyde_process_registry_module.process_registry.kill_process
 _tyde_cancelled_process_lock = threading.Lock()
 _tyde_cancelled_processes = set()
@@ -172,7 +173,7 @@ def _tyde_format_process_notification(event):
         was_cancelled = False
     if was_cancelled:
         print(
-            f"TYDE HERMES SUPPRESSED CANCELLED PROCESS NOTIFICATION event={event!r}",
+            "TYDE HERMES SUPPRESSED CANCELLED PROCESS NOTIFICATION",
             file=sys.stderr,
             flush=True,
         )
@@ -185,6 +186,7 @@ def _tyde_format_process_notification(event):
                 _tyde_background_completions[text] = dict(event)
     return text
 
+_tyde_process_notifications.format_process_notification = _tyde_format_process_notification
 _tyde_process_registry_module.format_process_notification = _tyde_format_process_notification
 
 def _tyde_get_usage(agent):
