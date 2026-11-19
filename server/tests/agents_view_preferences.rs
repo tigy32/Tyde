@@ -695,6 +695,7 @@ async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() 
     assert!(!fresh.sidebar.hide_inactive);
     assert!(!fresh.sidebar.show_workbenches);
     assert!(!fresh.sidebar.hide_empty_projects);
+    assert!(!fresh.sidebar.always_show_backend_icons);
     assert_eq!(
         fresh.sidebar.project_visibility,
         AgentsSidebarProjectVisibility::ContextualDefault
@@ -706,6 +707,7 @@ async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() 
         hide_sub_agents: true,
         show_workbenches: true,
         project_visibility: AgentsSidebarProjectVisibility::CurrentProjectOnly,
+        always_show_backend_icons: true,
     };
 
     send_set_agents_view_preferences(

@@ -2218,6 +2218,8 @@ pub struct AgentsSidebarPreferences {
     pub show_workbenches: bool,
     #[serde(default)]
     pub project_visibility: AgentsSidebarProjectVisibility,
+    #[serde(default)]
+    pub always_show_backend_icons: bool,
 }
 
 impl Default for AgentsSidebarPreferences {
@@ -2228,6 +2230,7 @@ impl Default for AgentsSidebarPreferences {
             hide_sub_agents: true,
             show_workbenches: false,
             project_visibility: AgentsSidebarProjectVisibility::ContextualDefault,
+            always_show_backend_icons: false,
         }
     }
 }

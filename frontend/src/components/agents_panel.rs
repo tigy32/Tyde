@@ -2092,10 +2092,23 @@ pub fn AgentsPanel() -> impl IntoView {
         sidebar.hide_empty_projects = !sidebar.hide_empty_projects;
         persist_sidebar(&toggle_empty_state, sidebar);
     };
+    let icons_state = state.clone();
+    let always_show_backend_icons = Memo::new(move |_| {
+        icons_state
+            .effective_agents_sidebar_preferences()
+            .always_show_backend_icons
+    });
+    let toggle_icons_state = state.clone();
+    let toggle_backend_icons = move |_| {
+        let mut sidebar = toggle_icons_state.effective_agents_sidebar_preferences();
+        sidebar.always_show_backend_icons = !sidebar.always_show_backend_icons;
+        persist_sidebar(&toggle_icons_state, sidebar);
+    };
     let toolbar_state = state.clone();
 
     view! {
         <div class="panel agents-panel" node_ref=panel_ref
+            data-always-show-backend-icons=move || always_show_backend_icons.get().to_string()
             data-agent-dragging=move || dragged_agent.get().is_some().to_string()
             on:keydown:capture=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" && pointer_drag.get_untracked().is_some() {
@@ -2181,6 +2194,12 @@ pub fn AgentsPanel() -> impl IntoView {
                         <span>"Hide empty projects"</span>
                         <input type="checkbox" aria-label="Hide empty projects" prop:checked=move || hide_empty_projects.get()
                             on:change=toggle_empty />
+                        <span class="settings-toggle-slider" aria-hidden="true"></span>
+                    </label>
+                    <label class="agents-filter-option settings-toggle">
+                        <span>"Always show icons"</span>
+                        <input type="checkbox" aria-label="Always show icons" prop:checked=move || always_show_backend_icons.get()
+                            on:change=toggle_backend_icons />
                         <span class="settings-toggle-slider" aria-hidden="true"></span>
                     </label>
                 </div>
@@ -5870,7 +5889,7 @@ mod wasm_tests {
             menu.query_selector_all("input[type='checkbox']")
                 .unwrap()
                 .length(),
-            5,
+            6,
             "Every boolean filter exposes the same native keyboard control"
         );
         let root = theme
@@ -5892,6 +5911,7 @@ mod wasm_tests {
                 "Show other projects",
                 "Show workbenches",
                 "Hide empty projects",
+                "Always show icons",
             ] {
                 let control = filter_control(&container, name);
                 control.focus().unwrap();
@@ -13943,6 +13963,40 @@ mod wasm_tests {
                 at_rest[5] < at_rest[3] && at_rest[1] < at_rest[7],
                 "Activity leads the name; backend identity precedes actions at {width}px: {at_rest:?}"
             );
+
+            let child_glyph_painted = || {
+                painted_opacity(
+                    &child_card
+                        .query_selector(".agent-backend-glyph")
+                        .unwrap()
+                        .expect("child-agent row must render its backend glyph"),
+                )
+            };
+            assert_eq!(
+                child_glyph_painted(),
+                0.0,
+                "the backend icon waits for hover or focus by default at {width}px"
+            );
+            filter_control(&container, "Always show icons").click();
+            next_tick().await;
+            assert_eq!(
+                child_glyph_painted(),
+                1.0,
+                "Always show icons paints every row's backend icon at {width}px"
+            );
+            assert_eq!(
+                child_pin_painted(),
+                0.0,
+                "Always show icons leaves the pin hover-only at {width}px"
+            );
+            assert_eq!(
+                row_geometry(&child_card),
+                at_rest,
+                "showing the backend icon must not move the row at {width}px"
+            );
+            filter_control(&container, "Always show icons").click();
+            next_tick().await;
+            assert_eq!(child_glyph_painted(), 0.0);
 
             // Focus child-agent card to reveal its pin control via :focus-within and verify visible geometry
             child_card.focus().unwrap();

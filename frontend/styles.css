@@ -17898,9 +17898,13 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 /* Reserve tool space even when quiet: focus must never cover the name,
    status or host action. Narrow rows put tools on their own line. */
 .agents-panel .agent-card-tools-anchor { grid-column: 4; min-width: 0; }
-.agents-panel .agent-card-tools { display: flex; align-items: center; gap: 2px; padding-left: 4px; opacity: 0; pointer-events: none; }
+.agents-panel .agent-card-tools { display: flex; align-items: center; gap: 2px; padding-left: 4px; pointer-events: none; }
+.agents-panel .agent-card-tools > * { opacity: 0; }
 .agents-panel .agent-card:is(:hover, :focus-within) > .agent-card-top > .agent-card-tools-anchor > .agent-card-tools,
-.agents-panel .agent-card-tools:has(> [aria-expanded="true"]) { opacity: 1; pointer-events: auto; }
+.agents-panel .agent-card-tools:has(> [aria-expanded="true"]) { pointer-events: auto; }
+.agents-panel .agent-card:is(:hover, :focus-within) > .agent-card-top > .agent-card-tools-anchor > .agent-card-tools > *,
+.agents-panel .agent-card-tools:has(> [aria-expanded="true"]) > *,
+.agents-panel[data-always-show-backend-icons="true"] .agent-card-tools > .agent-backend-glyph { opacity: 1; }
 .agents-panel .agent-card-top:has(.agent-card-name-input) > .agent-card-tools-anchor { visibility: hidden; }
 .agents-panel .agent-card-tools > :is(.agent-card-pin, .agent-card-actions) { width: 24px; height: 24px; padding: 2px; }
 
@@ -17926,7 +17930,8 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 
 /* Touch keeps the same pin and menu targets available without hover. */
 @media (hover: none) and (pointer: coarse), (hover: none) and (pointer: fine) {
-    .agents-panel .agent-card-tools { opacity: 1; pointer-events: auto; }
+    .agents-panel .agent-card-tools { pointer-events: auto; }
+    .agents-panel .agent-card-tools > * { opacity: 1; }
     .agents-panel :is(.project-edit-pencil, .agent-new-project) { opacity: 1; }
 }
 
