@@ -363,7 +363,7 @@ fn apply(
     match command {
         BoardCommandPayload::Read(_) => {
             tx.commit().map_err(storage)?;
-            return Ok(Ok(board));
+            return Ok(Ok(visible(board)));
         }
         BoardCommandPayload::Lanes(p) => {
             if p.expected_version != board.version {
@@ -406,7 +406,7 @@ fn apply(
             }
             lanes.sort_by_key(|lane| lane.position);
             if lanes == board.lanes {
-                return Ok(Ok(board));
+                return Ok(Ok(visible(board)));
             }
             for card in &mut board.cards {
                 if !card.retained {
@@ -450,7 +450,11 @@ fn apply(
             tx.execute("INSERT INTO board_versions VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET version=excluded.version", params![id.0,i64::try_from(board.version).map_err(storage)?]).map_err(storage)?;
         }
         BoardCommandPayload::Move(p) => {
-            let Some(index) = board.cards.iter().position(|card| card.id == p.card_id) else {
+            let Some(index) = board
+                .cards
+                .iter()
+                .position(|card| card.id == p.card_id && is_live(&board, card))
+            else {
                 return Ok(Err(failure(
                     &id,
                     BoardErrorCode::NotFound,
@@ -466,11 +470,12 @@ fn apply(
             }
             let location = match p.destination {
                 BoardDestination::Lane { name } => {
-                    let Some(lane) = board
+                    let name = name.trim().to_lowercase();
+                    let lane = board
                         .lanes
                         .iter()
-                        .find(|lane| lane.name.trim().to_lowercase() == name.trim().to_lowercase())
-                    else {
+                        .find(|lane| lane.name.trim().to_lowercase() == name);
+                    let Some(lane) = lane else {
                         return Ok(Err(failure(
                             &id,
                             BoardErrorCode::NotFound,
@@ -491,9 +496,42 @@ fn apply(
                     }
                 }
                 BoardDestination::Parent { card_id } => {
-                    let Some(parent) = board.cards.iter().find(|card| card.id == card_id) else {
+                    let parent = board.cards.iter().find(|card| card.id == card_id);
+                    if !parent.is_some_and(|card| is_live(&board, card)) {
                         return invalid("parent card not found");
-                    };
+                    }
+                    // Hidden nesting must not constrain what the board shows: a parent
+                    // stored under a closed card and closed children of the moved card
+                    // move to the lane they are shown in.
+                    let hidden: std::collections::HashSet<BoardCardId> = board
+                        .cards
+                        .iter()
+                        .filter(|card| !is_live(&board, card))
+                        .map(|card| card.id.clone())
+                        .collect();
+                    for nested in 0..board.cards.len() {
+                        let card = &board.cards[nested];
+                        let BoardLocation::Parent { card_id: under } = &card.location else {
+                            continue;
+                        };
+                        let closed_child = *under == p.card_id && hidden.contains(&card.id);
+                        let parent_under_closed = card.id == card_id && hidden.contains(under);
+                        if !closed_child && !parent_under_closed {
+                            continue;
+                        }
+                        let lane = BoardLocation::Lane {
+                            project_id: id.clone(),
+                            lane_id: lane_of(card, &board.cards)?,
+                        };
+                        let card = &mut board.cards[nested];
+                        record_move(card, lane, &actor, None)?;
+                        persist_card(&tx, &id, card)?;
+                    }
+                    let parent = board
+                        .cards
+                        .iter()
+                        .find(|card| card.id == card_id)
+                        .ok_or("parent disappeared")?;
                     if card_id == p.card_id
                         || matches!(parent.location, BoardLocation::Parent { .. })
                         || board.cards.iter().any(|card| {
@@ -574,7 +612,36 @@ fn apply(
     }
     board.navigation = navigation(&tx, &board.cards, &board.live_agents)?;
     tx.commit().map_err(storage)?;
-    Ok(Ok(board))
+    Ok(Ok(visible(board)))
+}
+fn is_live(board: &BoardStatePayload, card: &BoardCard) -> bool {
+    board
+        .live_agents
+        .iter()
+        .any(|agent| agent.agent_id == card.agent_id)
+}
+/// Closed agents' cards stay persisted so a resumed session returns to its
+/// lane, but boards only show live agents. A live child of a closed parent is
+/// shown in its parent's lane.
+fn visible(mut board: BoardStatePayload) -> BoardStatePayload {
+    let hidden: HashMap<BoardCardId, BoardLocation> = board
+        .cards
+        .iter()
+        .filter(|card| !is_live(&board, card))
+        .map(|card| (card.id.clone(), card.location.clone()))
+        .collect();
+    board.cards.retain(|card| !hidden.contains_key(&card.id));
+    for card in &mut board.cards {
+        if let BoardLocation::Parent { card_id } = &card.location
+            && let Some(location) = hidden.get(card_id)
+        {
+            card.location = location.clone();
+        }
+    }
+    board
+        .navigation
+        .retain(|entry| !hidden.contains_key(&entry.card_id));
+    board
 }
 fn sections(db: &Connection) -> Result<HashMap<ProjectId, String>, String> {
     let mut statement = db

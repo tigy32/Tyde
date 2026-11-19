@@ -711,6 +711,7 @@ async fn board_lanes_cards_tools_steering_and_restart() {
     .await;
     assert!(!card(&board, &cid).retained && card(&board, &cid).history.is_empty());
     assert!(!cleared.contains("Lanes. Call tyde_board_read"));
+    let prior = card(&board, &aid).clone();
     for agent in [&a, &b, &c] {
         f.client
             .close_agent(&agent.stream)
@@ -725,8 +726,7 @@ async fn board_lanes_cards_tools_steering_and_restart() {
         .await;
     }
     board = state_on(&mut observer, |next| next.live_agents.is_empty()).await;
-    assert_eq!(board.cards.len(), 2);
-    let prior = card(&board, &aid).clone();
+    assert!(board.cards.is_empty() && board.navigation.is_empty());
     eprintln!("BOARD FLOW phase=resume");
     let session = prior.session_id.clone().expect("retained session");
     // Restart disconnects every board viewer; resume/compaction must not depend on subscriptions.
@@ -787,7 +787,7 @@ async fn board_lanes_cards_tools_steering_and_restart() {
         .await
         .assert_stream_end_contains("Replacement ready");
     let reopened = read(&mut f, &project.id).await;
-    assert_eq!(reopened.cards.len(), 2);
+    assert_eq!(reopened.cards.len(), 1);
     assert!(card(&reopened, &aid).agent_id == resumed.new_agent.agent_id);
     assert!(card(&reopened, &aid).history == prior.history);
     send(
@@ -803,12 +803,8 @@ async fn board_lanes_cards_tools_steering_and_restart() {
             .any(|card| card.id == aid && card.agent_id == resumed.new_agent.agent_id)
     })
     .await;
-    assert_eq!(board.cards.len(), 2);
+    assert_eq!(board.cards.len(), 1);
     assert!(card(&board, &aid).history == prior.history);
-    let session = card(&board, &aid)
-        .session_id
-        .clone()
-        .expect("rotated retained session");
     let caller = f.agent_control_caller(&resumed.new_agent.agent_id).await;
     let result = rpc(&caller,"tools/call",json!({"name":"tyde_board_move","arguments":{"destination":{"kind":"lane","name":"In Progress"}}})).await;
     assert_ne!(result["result"]["isError"], true);
@@ -914,24 +910,32 @@ async fn board_lanes_cards_tools_steering_and_restart() {
     f.finish_turn(&resumed)
         .await
         .assert_stream_end_contains("Continue after failed compaction");
+    eprintln!("BOARD FLOW phase=closed_parent");
+    let (child, _) = spawn(&mut f, &project.id, "Card D").await;
+    let did = BoardCardId(child.new_agent.agent_id.0.clone());
+    board = read(&mut f, &project.id).await;
+    assert!(board.cards.iter().any(|card| card.id == did));
+    board = move_card(
+        &mut f,
+        &board,
+        &did,
+        BoardDestination::Parent {
+            card_id: aid.clone(),
+        },
+    )
+    .await;
+    let parent_location = card(&board, &aid).location.clone();
     let mut closed_viewer = observe(&f, &project.id).await;
     f.client
         .close_agent(&resumed.stream)
         .await
         .expect("close resumed card");
-    state_on(&mut closed_viewer, |next| {
-        next.navigation.iter().any(|entry| {
-            entry.card_id == aid
-                && matches!(
-                    &entry.target,
-                    BoardNavigationTarget::Saved { session_id, backend_kind, project_id }
-                        if *session_id == session
-                            && *backend_kind == resumed.new_agent.backend_kind
-                            && project_id.as_ref() == Some(&project.id)
-                )
-        })
+    board = state_on(&mut closed_viewer, |next| {
+        !next.cards.iter().any(|card| card.id == aid)
     })
     .await;
+    assert!(!board.navigation.iter().any(|entry| entry.card_id == aid));
+    assert_eq!(card(&board, &did).location, parent_location);
     next_frame_matching_on(&mut f.client, "resumed card closed", |frame| {
         frame.kind == FrameKind::AgentClosed
             && frame
@@ -939,66 +943,53 @@ async fn board_lanes_cards_tools_steering_and_restart() {
                 .is_ok_and(|closed| closed.agent_id == resumed.new_agent.agent_id)
     })
     .await;
-    f.client
-        .delete_session(DeleteSessionPayload {
-            session_id: session,
-        })
-        .await
-        .expect("delete retained session");
-    state(&mut f, |next| {
-        next.navigation.iter().any(|entry| {
-            entry.card_id == aid && matches!(entry.target, BoardNavigationTarget::Unavailable)
-        })
-    })
-    .await;
-    f.client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: workbench.id.clone(),
-            force: false,
-        })
-        .await
-        .expect("remove workbench");
-    board = state(&mut f, |next| {
-        next.navigation.iter().any(|entry| {
-            entry.card_id == bid && matches!(entry.target, BoardNavigationTarget::Unavailable)
-        })
-    })
-    .await;
-    let history = card(&board, &bid).history.clone();
-    assert_eq!(card(&board, &bid).title, "Card B");
-    eprintln!("BOARD FLOW phase=restart");
-    f.restart_host().await;
+    let (parent, _) = spawn(&mut f, &project.id, "Card E").await;
+    let eid = BoardCardId(parent.new_agent.agent_id.0.clone());
+    let (target, _) = spawn(&mut f, &project.id, "Card F").await;
+    let fid = BoardCardId(target.new_agent.agent_id.0.clone());
     board = read(&mut f, &project.id).await;
-    assert!(card(&board, &bid).history == history);
-    assert_eq!(board.cards.len(), 2);
-    assert_eq!(card(&board, &bid).title, "Card B");
+    assert!(board.cards.iter().any(|card| card.id == eid));
+    assert!(board.cards.iter().any(|card| card.id == fid));
+    // D is shown in a lane, so it accepts a child even though it is stored under closed A.
     board = move_card(
         &mut f,
         &board,
-        &bid,
+        &eid,
         BoardDestination::Parent {
-            card_id: aid.clone(),
+            card_id: did.clone(),
         },
     )
     .await;
-    let version = card(&board, &aid).version;
-    send(
-        &mut f,
-        BoardCommandPayload::Remove {
-            project_id: project.id.clone(),
-            card_id: aid.clone(),
-            expected_version: version,
-        },
-    )
-    .await;
-    board = state(&mut f, |next| {
-        next.cards.len() == 1 && next.cards[0].id == bid
+    assert_eq!(card(&board, &did).location, parent_location);
+    f.client
+        .close_agent(&parent.stream)
+        .await
+        .expect("close nested child");
+    board = state_on(&mut closed_viewer, |next| {
+        next.cards.iter().any(|card| card.id == fid)
+            && !next.cards.iter().any(|card| card.id == eid)
     })
     .await;
-    assert!(matches!(
-        card(&board, &bid).location,
-        BoardLocation::Lane { .. }
-    ));
+    // E is hidden, so D shows no child and can nest under F.
+    board = move_card(
+        &mut f,
+        &board,
+        &did,
+        BoardDestination::Parent {
+            card_id: fid.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        card(&board, &did).location,
+        BoardLocation::Parent {
+            card_id: fid.clone()
+        }
+    );
+    eprintln!("BOARD FLOW phase=restart");
+    f.restart_host().await;
+    board = read(&mut f, &project.id).await;
+    assert!(board.cards.is_empty() && board.live_agents.is_empty());
     let database = rusqlite::Connection::open(server::store::session::SessionStore::database_path(
         &f.session_store_path(),
     ))
@@ -1006,7 +997,7 @@ async fn board_lanes_cards_tools_steering_and_restart() {
     database
         .execute(
             "UPDATE board_cards SET record='invalid-json' WHERE id=?",
-            [&bid.0],
+            [&aid.0],
         )
         .expect("inject storage decode failure");
     f.client
