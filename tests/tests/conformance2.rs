@@ -3599,7 +3599,6 @@ const WAITED_MARKER: &str = "TYDE_WAITED";
 const REPORTED_MARKER: &str = "TYDE_REPORTED";
 const HELLO_FILE: &str = "hello.txt";
 const BG_FILE: &str = "background.txt";
-const CANCEL_FILE: &str = "cancelled.txt";
 const COUNTED_MARKER: &str = "TYDE_COUNTED";
 const RAN_MARKER: &str = "TYDE_RAN";
 const INTERRUPT_PROOF_FILE: &str = "interrupt_proof.txt";
@@ -3615,8 +3614,6 @@ const TIMED_OUT_COMMAND_SECONDS: u64 = 20;
 const TIMED_OUT_COMMAND_TIMEOUT_MS: u64 = 5000;
 const SLOW_COMMAND_SECONDS: u64 = 25;
 const KILL_SETTLE: Duration = Duration::from_secs(30);
-const CANCEL_COMMAND_SECONDS: u64 = 25;
-const CANCEL_SETTLE: Duration = Duration::from_secs(35);
 const MID_ANSWER_CHARS: usize = 200;
 const INTERRUPT_BUDGET: Duration = Duration::from_secs(20);
 async fn real_background_task_outlives_its_turn<B: Backend>(host: &mut Harness<B>) {
@@ -4610,38 +4607,34 @@ async fn real_background_event_wakes_the_agent<B: Backend>(host: &mut Harness<B>
 }
 
 async fn real_background_task_cancel<B: Backend>(host: &mut Harness<B>) {
-    let workspace = host.workspace().to_path_buf();
-    let prompt = background_prompt(
-        &workspace,
-        host.backend(),
-        CANCEL_COMMAND_SECONDS,
-        CANCEL_FILE,
+    use tokio::io::AsyncReadExt;
+    let (receipt_tx, mut receipts) = tokio::sync::mpsc::unbounded_channel();
+    NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = Some(receipt_tx));
+    let gate = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind command lifetime probe");
+    let port = gate.local_addr().unwrap().port();
+    let command = format!(
+        "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',{port})); s.recv(1)\""
     );
-    let proof = host.workspace().join(CANCEL_FILE);
+    let launch = match host.backend() {
+        BackendKind::Codex => {
+            "Use exec_command with yield_time_ms=1. Do not use shell backgrounding."
+        }
+        BackendKind::Hermes => "Use terminal with background=true and notify=true.",
+        BackendKind::Muse => {
+            "Use native bash with yield_time_ms=1000; do not use monitor, polling, or shell backgrounding."
+        }
+        _ => "Use Bash with run_in_background=true.",
+    };
+    let prompt = format!(
+        "{launch} Run exactly this command once: {command}. Leave it running, do not poll it, and end your turn."
+    );
     let agent = spawn_agent(host, &prompt).await;
     let started = collect_turn(host, &agent, &prompt).await;
-
     assert_no_error_message(&started.label(), started.events());
     assert_streams_are_balanced(&started);
     assert_reached_idle(&started);
-
-    // Same guard as `real_background_task_outlives_its_turn`: a backend
-    // that started nothing finishes fast and satisfies every stream
-    // assertion, so without this a green result means nothing.
-    let requests = started.tool_requests().count();
-    assert!(
-        requests >= 1,
-        "{}: emitted zero tool requests, so no command was ever started and there was \
-         nothing to cancel",
-        started.label()
-    );
-    assert!(
-        !proof.is_file(),
-        "{}: found {} already written when the turn ended, so the command had already \
-         finished and cancelling it asserted nothing",
-        started.label(),
-        proof.display()
-    );
 
     // The card the UI would offer cancel on is the one whose progress
     // says it is cancellable. Selecting it any other way would test a
@@ -4671,48 +4664,76 @@ async fn real_background_task_cancel<B: Backend>(host: &mut Harness<B>) {
         started.label()
     );
 
+    let (mut process, _) = gate.accept().await.expect("command connected before Stop");
     cancel_background_task(host, &agent, &target).await;
-
-    let settled = drain_events_for(host, CANCEL_SETTLE).await;
-    assert_no_error_message(&format!("{:?} cancel settle", host.backend()), &settled);
-
-    let outcome = settled
-        .iter()
-        .filter_map(|event| match event {
-            ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == target => {
-                Some(&completion.outcome)
+    assert_eq!(
+        process
+            .read(&mut [0])
+            .await
+            .expect("read command lifetime probe"),
+        0,
+        "stopped process must close its socket"
+    );
+    let mut stop = host.turn("background Stop");
+    collect_turn_until(host, &mut stop, |event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == target)).await;
+    assert_owned_background_terminal(stop.events(), &target);
+    let message = stop
+        .tool_completions()
+        .find_map(|completion| match &completion.outcome {
+            ToolExecutionOutcome::Cancelled { message } if completion.tool_call_id == target => {
+                Some(message.to_ascii_lowercase())
             }
             _ => None,
         })
-        .next_back()
-        .unwrap_or_else(|| {
-            panic!(
-                "{}: card {target} never completed after it was cancelled, so it is stuck \
-                 open in the tray forever",
-                started.label()
-            )
-        });
-    let ToolExecutionOutcome::Cancelled { message } = outcome else {
-        panic!(
-            "{}: card {target} completed as {outcome:?} after the user cancelled it, \
-             which blames the command for what the user did",
-            started.label()
-        );
-    };
-    assert_cancelled_card_explains_the_stop(&started.label(), &target, message);
-
-    // The whole point. Everything above is satisfied by a backend that
-    // closes the card and leaves the process running.
+        .expect("stopped card must explain its cancellation");
     assert!(
-        !proof.is_file(),
-        "{}: waited {}s after cancelling and {} was written anyway, so the command was \
-         reported cancelled but never actually killed",
-        started.label(),
-        CANCEL_SETTLE.as_secs(),
-        proof.display()
+        ["cancel", "stop", "interrupt", "kill"]
+            .iter()
+            .any(|word| message.contains(word))
+            && !message.contains("unknown")
+            && !message.contains("did not state an exit code"),
+        "the card must identify a user stop, not a parser error"
     );
-
+    let prompt = "Reply with exactly STOP_FOLLOWUP, without tools.";
+    while let Ok(receipt) = receipts.try_recv() {
+        assert_ne!(receipt, NativeReceipt::AdapterBackgroundWake);
+    }
+    send_prompt(host, &agent, prompt).await;
+    let mut native_queued = false;
+    while let Ok(receipt) = receipts.try_recv() {
+        assert_ne!(receipt, NativeReceipt::AdapterBackgroundWake);
+        native_queued |= receipt == NativeReceipt::NativeInputQueued;
+    }
+    // Muse can return disposition=queued: its native task notification is
+    // already running. Only that explicit receipt permits an intervening idle.
+    if native_queued {
+        let prior = collect_turn(host, &agent, "native task notification").await;
+        assert_no_error_message(&prior.label(), prior.events());
+        assert!(!prior.final_text().contains("STOP_FOLLOWUP"));
+        assert_owned_background_terminal(stop.events().iter().chain(prior.events()), &target);
+    }
+    let followup = collect_turn(host, &agent, prompt).await;
+    eprintln!("Background Stop follow-up: user_echo={} assistant_text={} requests={} errors={} busy_markers={} idle_markers={}",
+        followup.user_messages().any(|message| message.content == prompt),
+        !followup.final_text().is_empty(), followup.tool_requests().count(),
+        followup.events().iter().filter(|event| matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error))).count(),
+        followup.events().iter().filter(|event| matches!(event, ChatEvent::TypingStatusChanged(true))).count(),
+        followup.events().iter().filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false))).count());
+    assert_final_text_contains(&followup, "STOP_FOLLOWUP");
+    assert_owned_background_terminal(stop.events().iter().chain(followup.events()), &target);
+    assert!(
+        host.protocol_violations().is_empty(),
+        "background Stop violated the tool contract"
+    );
     assert_clean_close(host, &agent).await;
+    NARRATIVE_RECEIPTS.with(|sender| *sender.borrow_mut() = None);
+    while let Ok(receipt) = receipts.try_recv() {
+        assert_ne!(
+            receipt,
+            NativeReceipt::AdapterBackgroundWake,
+            "Stop must not inject a background completion turn"
+        );
+    }
 }
 
 async fn real_exhausted_account_stays_open<B: Backend>(host: &mut Harness<B>) {
@@ -9801,21 +9822,6 @@ fn assert_cancelled_command_really_stopped(interrupted: &Interrupted, proof: &Pa
          cancelled. The card says the user stopped it and the work happened anyway.",
         interrupted.label(),
         proof.display()
-    );
-}
-
-fn assert_cancelled_card_explains_the_stop(label: &str, card_id: &str, message: &str) {
-    let message_lower = message.to_ascii_lowercase();
-    let describes_stop = ["cancel", "stop", "interrupt", "kill"]
-        .iter()
-        .any(|word| message_lower.contains(word));
-    assert!(
-        describes_stop
-            && !message_lower.contains("unknown")
-            && !message_lower.contains("did not state an exit code"),
-        "{label}: cancelled card {card_id} explains the user-initiated stop as {message:?}. A \
-         cancelled card must say it was stopped, not report an output-parser error or an unknown \
-         status."
     );
 }
 

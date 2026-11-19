@@ -2152,7 +2152,7 @@ impl Actor {
                 match self.connection.request("turn/start", params).await {
                     Ok(result) => {
                         let disposition = result.get("disposition").and_then(Value::as_str);
-                        tracing::debug!(disposition, "Muse native input admission acknowledged");
+                        tracing::debug!(target: "tyde_muse_dispatch_receipt", disposition, native_input_queued = disposition == Some("queued"), "Muse native input admission acknowledged");
                         if !matches!(disposition, Some("started" | "queued"))
                             && !(goal_active && disposition == Some("steered"))
                         {

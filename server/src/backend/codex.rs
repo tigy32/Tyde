@@ -4328,6 +4328,7 @@ struct CodexState {
     pending_tool_call_ids: HashSet<String>,
     tool_call_identities: CodexToolCallIdentities,
     background_commands: HashMap<(String, String), CodexBackgroundCommand>,
+    background_stops: HashMap<(String, String), oneshot::Receiver<bool>>,
     background_command_results: HashMap<(String, String), Vec<CodexBackgroundCommandResult>>,
     background_command_owner_active: bool,
     /// `commandExecution` items that have started and not yet completed, keyed
@@ -4501,6 +4502,7 @@ fn initial_codex_state(
         pending_tool_call_ids: HashSet::new(),
         tool_call_identities: CodexToolCallIdentities::default(),
         background_commands: HashMap::new(),
+        background_stops: HashMap::new(),
         background_command_results: HashMap::new(),
         background_command_owner_active: true,
         outstanding_command_executions: HashMap::new(),
@@ -6392,26 +6394,38 @@ impl CodexInner {
         }
     }
 
-    async fn forget_command_execution(
+    /// Claim the native receipt and its Stop decision together. RPC replies
+    /// arrive on the independent stdout reader, not the notification worker.
+    async fn take_command_receipt(
         &self,
         params: &Value,
         provider_item_id: &str,
-    ) -> Option<CodexOutstandingCommand> {
-        let provider_item_id = provider_item_id.to_owned();
-        let notification_thread_id = extract_notification_thread_id(params);
-        self.state
+    ) -> Option<(
+        Option<CodexBackgroundCommand>,
+        Option<CodexOutstandingCommand>,
+    )> {
+        let item = provider_item_id.to_owned();
+        let thread = extract_notification_thread_id(params);
+        let (background, outstanding, stop) = self
+            .state
             .with(move |state| {
-                let provider_item_id = provider_item_id.as_str();
-                let thread_id = notification_thread_id.unwrap_or_else(|| state.thread_id.clone());
-                let outstanding = state
-                    .outstanding_command_executions
-                    .remove(&(thread_id.clone(), provider_item_id.to_owned()));
-                state
-                    .unowned_command_executions
-                    .remove(&(thread_id, provider_item_id.to_owned()));
-                outstanding
+                let key = (thread.unwrap_or_else(|| state.thread_id.clone()), item);
+                state.unowned_command_executions.remove(&key);
+                (
+                    state.background_commands.remove(&key),
+                    state.outstanding_command_executions.remove(&key),
+                    state.background_stops.remove(&key),
+                )
             })
-            .await
+            .await;
+        if let Some(stop) = stop
+            && matches!(stop.await, Ok(true))
+        {
+            tracing::info!("Consumed native command exit for accepted background Stop");
+            None
+        } else {
+            Some((background, outstanding))
+        }
     }
 
     /// Start watching `thread/backgroundTerminals/list` if nothing is watching
@@ -6537,74 +6551,144 @@ impl CodexInner {
     /// tracked either as a task (`background_commands`, keyed by its Codex task
     /// id) or as a still-running execution (`outstanding_command_executions`,
     /// keyed by its process id); both are addressed by the same terminate RPC.
-    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
-        let target = {
-            {
-                let tool_call_id = tool_call_id.to_owned();
-                self.state
-                    .with(move |state| {
-                        let tool_call_id = tool_call_id.as_str();
-                        state
-                            .background_commands
-                            .iter()
-                            .find(|(_, command)| command.tool_call_id == tool_call_id)
-                            .map(|((thread_id, _), command)| {
-                                (thread_id.clone(), command.task_id.clone())
-                            })
-                            .or_else(|| {
-                                state
-                                    .outstanding_command_executions
-                                    .iter()
-                                    .find(|(_, command)| command.tool_call_id == tool_call_id)
-                                    .and_then(|((thread_id, _), command)| {
-                                        command.process_id.as_ref().map(|process_id| {
-                                            (thread_id.clone(), process_id.clone())
-                                        })
-                                    })
-                            })
-                    })
-                    .await
-            }
-        };
-        let Some((thread_id, process_id)) = target else {
-            tracing::warn!("no running Codex background command matches the cancelled card");
-            return CancelBackgroundTaskOutcome::NotTracked;
-        };
-        if let Err(error) = self
-            .rpc
-            .request(
-                "thread/backgroundTerminals/terminate",
-                json!({ "threadId": thread_id, "processId": process_id }),
-            )
+    async fn cancel_background_task(
+        self: &Arc<Self>,
+        tool_call_id: &str,
+    ) -> CancelBackgroundTaskOutcome {
+        let owner = Arc::clone(self);
+        let card = tool_call_id.to_owned();
+        crate::backend::subprocess::spawn(async move { owner.stop_command_card(&card).await })
             .await
-        {
-            tracing::error!(
-                process_id,
-                error = %error,
-                "failed to terminate a cancelled Codex background command"
-            );
+            .unwrap_or_else(|err| {
+                CancelBackgroundTaskOutcome::Failed(format!("Codex Stop task failed: {err}"))
+            })
+    }
+
+    async fn stop_command_card(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
+        let card = tool_call_id.to_owned();
+        let root_emitter = self.emitter.clone();
+        let targets = self
+            .state
+            .with(move |state| {
+                let mut processes = HashMap::new();
+                for (key, command) in &state.background_commands {
+                    if command.tool_call_id == card {
+                        processes.insert(key.clone(), command.task_id.clone());
+                    }
+                }
+                for (key, command) in &state.outstanding_command_executions {
+                    if command.tool_call_id == card && !processes.contains_key(key) {
+                        let Some(process) = command.process_id.clone() else {
+                            return Err("Codex did not provide a process handle for this command");
+                        };
+                        processes.insert(key.clone(), process);
+                    }
+                }
+                if processes
+                    .keys()
+                    .any(|key| state.background_stops.contains_key(key))
+                {
+                    return Err("This command is already being stopped");
+                }
+                let Some((thread, _)) = processes.keys().next() else {
+                    return Ok(None);
+                };
+                let thread = thread.clone();
+                let emitter = if thread == state.thread_id {
+                    root_emitter
+                } else {
+                    state
+                        .subagent_streams
+                        .get(&thread)
+                        .map(|child| child.emitter.clone())
+                        .ok_or("Codex background command owner is gone")?
+                };
+                Ok(Some((
+                    thread,
+                    emitter,
+                    processes
+                        .into_iter()
+                        .map(|(key, process)| {
+                            let (tx, rx) = oneshot::channel();
+                            state.background_stops.insert(key.clone(), rx);
+                            (key, process, tx)
+                        })
+                        .collect::<Vec<_>>(),
+                )))
+            })
+            .await;
+        let (thread, emitter, targets) = match targets {
+            Ok(None) => return CancelBackgroundTaskOutcome::NotTracked,
+            Ok(Some(targets)) => targets,
+            Err(error) => return CancelBackgroundTaskOutcome::Failed(error.to_owned()),
+        };
+        let mut error = None;
+        let mut decisions = Vec::new();
+        for (key, process, decision) in targets {
+            if let Err(cause) = self
+                .rpc
+                .request(
+                    "thread/backgroundTerminals/terminate",
+                    json!({"threadId": key.0, "processId": process}),
+                )
+                .await
+            {
+                error = Some(cause);
+            }
+            decisions.push((key, decision));
+        }
+        let accepted = error.is_none();
+        self.state
+            .with(move |state| {
+                for (key, decision) in decisions {
+                    if accepted {
+                        state.background_commands.remove(&key);
+                        state.outstanding_command_executions.remove(&key);
+                    } else {
+                        state.background_stops.remove(&key);
+                    }
+                    let _ = decision.send(accepted);
+                }
+            })
+            .await;
+        if let Some(error) = error {
             return CancelBackgroundTaskOutcome::Failed(format!(
-                "Codex could not stop the background command: {error}"
+                "Codex could not stop the entire background command: {error}"
             ));
         }
-        // Killing the process makes Codex report the exec as failed, which
-        // would blame the command for what the user did. Close the card as
-        // cancelled and record the id so the late failure is dropped.
-        self.emitter
-            .cancel_pending_tool(tool_call_id, "Tool execution was cancelled by user");
-        {
-            let tool_call_id = tool_call_id.to_owned();
-            self.state
-                .with(move |state| {
-                    let tool_call_id = tool_call_id.as_str();
-                    state.pending_tool_call_ids.remove(tool_call_id);
-                    state
-                        .cancelled_tool_call_ids
-                        .insert(tool_call_id.to_owned());
-                    CancelBackgroundTaskOutcome::Cancelled
-                })
-                .await
+        emitter.cancel_pending_tool(tool_call_id, "Tool execution was cancelled by user");
+        if thread == self.state.with(|state| state.thread_id.clone()).await {
+            self.mark_tool_completed(tool_call_id).await;
+        } else {
+            self.complete_subagent_tool_calls(&thread, &[tool_call_id.to_owned()])
+                .await;
         }
+        let group = (thread.clone(), tool_call_id.to_owned());
+        let terminal = self
+            .state
+            .with(move |state| {
+                state.background_command_results.remove(&group);
+                let running = state
+                    .background_commands
+                    .keys()
+                    .chain(state.outstanding_command_executions.keys())
+                    .any(|key| key.0 == thread);
+                if running {
+                    None
+                } else {
+                    state
+                        .subagent_streams
+                        .get_mut(&thread)
+                        .and_then(|child| child.pending_spawn_terminal_status.take())
+                        .map(|status| (thread, status))
+                }
+            })
+            .await;
+        if let Some((thread, status)) = terminal {
+            self.terminalize_codex_subagent_spawn(&thread, &status)
+                .await;
+        }
+        CancelBackgroundTaskOutcome::Cancelled
     }
 
     async fn terminate_background_terminals(&self) {
@@ -6785,24 +6869,6 @@ impl CodexInner {
         }
     }
 
-    async fn take_background_command(
-        &self,
-        params: &Value,
-        provider_item_id: &str,
-    ) -> Option<CodexBackgroundCommand> {
-        let provider_item_id = provider_item_id.to_owned();
-        let notification_thread_id = extract_notification_thread_id(params);
-        self.state
-            .with(move |state| {
-                let provider_item_id = provider_item_id.as_str();
-                let thread_id = notification_thread_id.unwrap_or_else(|| state.thread_id.clone());
-                state
-                    .background_commands
-                    .remove(&(thread_id, provider_item_id.to_owned()))
-            })
-            .await
-    }
-
     async fn complete_background_command_group(
         &self,
         thread_id: &str,
@@ -6927,6 +6993,7 @@ impl CodexInner {
                 return;
             };
 
+            tracing::debug!(target: "tyde_codex_dispatch_receipt", adapter_background_wake = true, "Submitting background completion turn");
             let notification = codex_background_wake_notification(&wakes);
             let mut params = json!({
                 "threadId": thread_id,
@@ -8854,7 +8921,7 @@ impl CodexInner {
         Ok(())
     }
 
-    async fn execute(&self, command: SessionCommand) -> Result<(), String> {
+    async fn execute(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage {
                 message,
@@ -10749,11 +10816,11 @@ impl CodexInner {
         match item_type {
             "commandExecution" => {
                 tracing::debug!("Codex command execution completed");
-                let background_command =
-                    self.take_background_command(params, provider_item_id).await;
-                let outstanding_command = self
-                    .forget_command_execution(params, provider_item_id)
-                    .await;
+                let Some((background_command, outstanding_command)) =
+                    self.take_command_receipt(params, provider_item_id).await
+                else {
+                    return;
+                };
                 let Some(tool_call_id) = background_command
                     .as_ref()
                     .map(|command| command.tool_call_id.clone())
@@ -11708,10 +11775,10 @@ impl CodexInner {
                 let tool_call_id = self
                     .tool_call_completed_id(params, provider_item_id, "run_command")
                     .await;
-                let command = self.take_background_command(params, provider_item_id).await;
-                let _ = self
-                    .forget_command_execution(params, provider_item_id)
-                    .await;
+                let Some((command, _)) = self.take_command_receipt(params, provider_item_id).await
+                else {
+                    return;
+                };
                 self.warn_codex_raw_contract_drift_once_if_needed().await;
                 self.state
                     .with(move |state| state.cancelled_tool_call_ids.remove(&tool_call_id))
@@ -12771,10 +12838,11 @@ impl CodexInner {
                     && item.get("type").and_then(Value::as_str) == Some("commandExecution")
                     && let Some(provider_item_id) = item.get("id").and_then(Value::as_str)
                 {
-                    let command = self.take_background_command(params, provider_item_id).await;
-                    let _ = self
-                        .forget_command_execution(params, provider_item_id)
-                        .await;
+                    let Some((command, _)) =
+                        self.take_command_receipt(params, provider_item_id).await
+                    else {
+                        return;
+                    };
                     self.warn_codex_raw_contract_drift_once_if_needed().await;
                     if let Some(command) = command
                         && let Some(emitter) = self.codex_subagent_emitter(stream_key).await
@@ -13589,10 +13657,10 @@ let stream_key = stream_key.as_str();
             && item.get("type").and_then(Value::as_str) == Some("commandExecution")
             && let Some(provider_item_id) = item.get("id").and_then(Value::as_str)
         {
-            let command = self.take_background_command(params, provider_item_id).await;
-            let _ = self
-                .forget_command_execution(params, provider_item_id)
-                .await;
+            let Some((command, _)) = self.take_command_receipt(params, provider_item_id).await
+            else {
+                return;
+            };
             self.warn_codex_raw_contract_drift_once_if_needed().await;
             if let Some(command) = command {
                 let emitter = {
@@ -14384,10 +14452,9 @@ let stream_key = stream_key.as_str();
                 let item_id = self
                     .tool_call_completed_id(params, provider_item_id, "run_command")
                     .await;
-                self.take_background_command(params, provider_item_id).await;
-                let _ = self
-                    .forget_command_execution(params, provider_item_id)
-                    .await;
+                let Some((_, _)) = self.take_command_receipt(params, provider_item_id).await else {
+                    return;
+                };
                 self.warn_codex_raw_contract_drift_once_if_needed().await;
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
@@ -16990,11 +17057,11 @@ let stream_key = stream_key.as_str();
                 let item_id = self
                     .tool_call_completed_id(params, provider_item_id, "run_command")
                     .await;
-                let background_command =
-                    self.take_background_command(params, provider_item_id).await;
-                let _ = self
-                    .forget_command_execution(params, provider_item_id)
-                    .await;
+                let Some((background_command, _)) =
+                    self.take_command_receipt(params, provider_item_id).await
+                else {
+                    return;
+                };
                 self.warn_codex_raw_contract_drift_once_if_needed().await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
                 let output = item
@@ -20354,6 +20421,7 @@ fn take_codex_commands_for_thread(
 }
 
 fn take_all_codex_commands(state: &mut CodexState) -> Vec<CodexCommandTermination> {
+    state.background_stops.clear();
     let thread_ids = state
         .outstanding_command_executions
         .keys()

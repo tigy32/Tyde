@@ -530,8 +530,10 @@ pub struct Agent {
     pub replayed_model_requests: Vec<ModelRequestTokenUsage>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeReceipt {
+    AdapterBackgroundWake,
+    NativeInputQueued,
     Narrative,
     ToolCompletion,
     ControlStartPending,
@@ -555,6 +557,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NarrativeReceiptCa
                     self.0 = Some(NativeReceipt::ControlStartPending);
                 } else if value {
                     self.0 = match field.name() {
+                        "native_input_queued" => Some(NativeReceipt::NativeInputQueued),
+                        "adapter_background_wake" => Some(NativeReceipt::AdapterBackgroundWake),
                         "codex_native_code_cell_failed_received" => {
                             Some(NativeReceipt::NativeCodeCellFailed)
                         }
@@ -671,7 +675,8 @@ impl<B: Backend> Harness<B> {
                     NarrativeReceiptCapture.with_filter(
                         tracing_subscriber::filter::Targets::new()
                             .with_target(DISPATCH_RECEIPT_TARGET, tracing::Level::DEBUG)
-                            .with_target("tyde_claude_dispatch_receipt", tracing::Level::DEBUG),
+                            .with_target("tyde_claude_dispatch_receipt", tracing::Level::DEBUG)
+                            .with_target("tyde_muse_dispatch_receipt", tracing::Level::DEBUG),
                     ),
                 )
                 .try_init();
