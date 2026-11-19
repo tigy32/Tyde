@@ -413,9 +413,8 @@ they do not record conversation contents or credentials.
 
 Required close cleanup settles before its in-memory removal and current-client
 fanout, retaining Usage's accounting-before-Completed-before-Closed ordering.
-Workbench session cleanup reuses canonical session-deletion ownership and
-navigation updates; dependent references are cleaned before session identities
-are consumed. Corrupt required annotation storage is an explicit cleanup
+Workbench removal moves agents and sessions to the parent project before any
+dependent cleanup, so a failed cleanup never consumes them. Corrupt required annotation storage is an explicit cleanup
 failure, not an empty store. Repair and an explicit retry can finish partial
 cleanup without a journal. Known post-commit publication/workflow errors are
 committed warnings; later watcher/scan failures remain project-owned typed

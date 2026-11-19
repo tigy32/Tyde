@@ -1390,8 +1390,9 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_teardown() {
                 .breakdown
                 .iter()
                 .any(|entry| entry.agent_id == saved_start.agent_id
-                    && matches!(entry.navigation, protocol::TaskUsageNavigation::Unavailable)),
-            "deleted session accounting must no longer navigate to that saved session"
+                    && matches!(&entry.navigation, protocol::TaskUsageNavigation::SavedSession { session_id }
+                        if Some(session_id) == saved_start.session_id.as_ref())),
+            "a saved session outlives its workbench and stays navigable"
         );
         assert!(
             usage
@@ -1416,61 +1417,50 @@ async fn lifecycle_completion_does_not_wait_for_unrelated_teardown() {
 }
 
 #[tokio::test]
-async fn workbench_remove_cascades_agents_terminals_and_sessions() {
+async fn workbench_remove_relocates_agents_and_sessions_to_parent() {
     let mut fixture = Fixture::new().await;
 
     let agent_repo = init_git_repo("agent-blocker");
     let agent_parent = create_project(&mut fixture.client, vec![agent_repo.path()]).await;
     let agent_workbench =
         create_workbench(&mut fixture.client, &agent_parent, "agent-blocker").await;
-    let hold_gate = MockGateHandle::new();
-    let reservation = fixture
-        .reserve_next_mock_launch(
-            "workbench-live-agent",
-            MockScript::one(MockTurn::gated_text("hold workbench", &hold_gate)),
-        )
+    let parent_roots = project_roots(&agent_parent);
+    let spawn = |name: &str, parent_agent_id: Option<AgentId>| SpawnAgentPayload {
+        launch_context: protocol::AgentLaunchContext::Standard,
+        name: Some(name.to_owned()),
+        custom_agent_id: None,
+        parent_agent_id,
+        project_id: Some(agent_workbench.id.clone()),
+        params: SpawnAgentParams::New {
+            workspace_roots: project_roots(&agent_workbench),
+            prompt: "Ready".into(),
+            images: None,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            cost_hint: None,
+            access_mode: Default::default(),
+            session_settings: None,
+        },
+    };
+    let (owner, owner_start) = fixture.spawn_with(spawn("workbench-owner", None)).await;
+    fixture.finish_turn(&owner).await;
+    let (child, child_start) = fixture
+        .spawn_with(spawn("workbench-child", Some(owner_start.agent_id.clone())))
+        .await;
+    fixture.finish_turn(&child).await;
+    let busy = MockGateHandle::new();
+    fixture
+        .mock(&owner)
+        .await
+        .enqueue(MockTurn::gated_text("Owner working in workbench", &busy))
         .await;
     fixture
         .client
-        .spawn_agent(SpawnAgentPayload {
-            launch_context: protocol::AgentLaunchContext::Standard,
-            name: Some("workbench-live-agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: Some(agent_workbench.id.clone()),
-            params: SpawnAgentParams::New {
-                workspace_roots: project_roots(&agent_workbench),
-                prompt: "hold workbench".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
+        .send_message(&owner.stream, "Keep working".into())
         .await
-        .expect("spawn live workbench agent");
-    let live_agent: NewAgentPayload = expect_kind(
-        &mut fixture.client,
-        FrameKind::NewAgent,
-        "live agent NewAgent",
-    )
-    .await
-    .parse_payload()
-    .expect("parse live agent");
-    let _ = expect_kind(
-        &mut fixture.client,
-        FrameKind::ChatEvent,
-        "live agent persisted session",
-    )
-    .await;
-    hold_gate.wait_until_entered().await;
-    drop(reservation);
-    let close_gate = fixture
-        .host_for_test()
-        .install_restore_marker_withdraw_test_gate()
-        .await;
+        .unwrap();
+    busy.wait_until_entered().await;
+
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -1479,62 +1469,118 @@ async fn workbench_remove_cascades_agents_terminals_and_sessions() {
         })
         .await
         .expect("workbench_remove write failed");
-    close_gate.wait_until_entered().await;
-    let (mut late_observer, late_bootstrap) = fixture.connect_with_bootstrap().await;
+    let mut failure = None;
+    let mut child_moves = Vec::new();
+    next_frame_matching_on(&mut fixture.client, "busy owner blocks workbench removal", |env| {
+        assert_ne!(env.kind, FrameKind::AgentClosed, "workbench removal must not close agents");
+        if env.kind == FrameKind::AgentProjectChanged {
+            let start: AgentStartPayload = env.parse_payload().unwrap();
+            assert_eq!(start.agent_id, child_start.agent_id, "the busy owner never moves");
+            child_moves.push((start.project_id, start.workspace_roots));
+            return false;
+        }
+        if env.kind != FrameKind::ProjectOperation {
+            return false;
+        }
+        let operation: protocol::ProjectOperationPayload = env.parse_payload().unwrap();
+        if !matches!(&operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == agent_workbench.id) {
+            return false;
+        }
+        assert!(
+            !matches!(operation.state, protocol::ProjectOperationState::Committed { .. }),
+            "a busy agent must block removal instead of being closed"
+        );
+        if let protocol::ProjectOperationState::Failed { message, .. } = operation.state {
+            failure = Some(message);
+            true
+        } else {
+            false
+        }
+    })
+    .await;
+    let failure = failure.unwrap();
     assert!(
-        late_bootstrap
-            .agents
-            .iter()
-            .any(|agent| agent.agent_id == live_agent.agent_id)
+        failure.contains("workbench-owner"),
+        "removal names the busy agent: {failure}"
     );
-    drop(close_gate);
-    // The close command cannot reach a backend parked behind this gate.
-    drop(hold_gate);
-    let _ = expect_kind(
+    assert_eq!(
+        child_moves,
+        vec![
+            (Some(agent_parent.id.clone()), parent_roots.clone()),
+            (
+                Some(agent_workbench.id.clone()),
+                project_roots(&agent_workbench)
+            ),
+        ],
+        "a failed removal returns already-moved children to their owner's workbench"
+    );
+    assert!(
+        Path::new(&project_roots(&agent_workbench)[0]).exists(),
+        "failed removal keeps the worktree"
+    );
+
+    busy.release_one();
+    fixture::next_chat_event_matching_on(
         &mut fixture.client,
-        FrameKind::AgentClosed,
-        "cascaded agent close",
+        &owner.stream,
+        "workbench owner idle",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
     )
     .await;
-    let deleted: ProjectNotifyPayload = expect_kind(
-        &mut fixture.client,
-        FrameKind::ProjectNotify,
-        "agent workbench delete",
-    )
-    .await
-    .parse_payload()
-    .expect("parse agent workbench delete");
-    assert!(
-        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == agent_workbench.id)
-    );
-    let mut observed_close = false;
-    next_frame_matching_on(&mut late_observer, "late subscriber sees completed workbench cleanup", |env| {
-        if env.kind == FrameKind::AgentClosed {
-            observed_close |= env.parse_payload::<protocol::AgentClosedPayload>().unwrap().agent_id == live_agent.agent_id;
-        }
-        env.kind == FrameKind::ProjectOperation && env.parse_payload::<protocol::ProjectOperationPayload>().is_ok_and(|operation| {
-            matches!(operation.mutation, protocol::ProjectMutation::RemoveWorkbench(payload) if payload.id == agent_workbench.id)
-                && matches!(operation.state, protocol::ProjectOperationState::Committed { .. })
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: agent_workbench.id.clone(),
+            force: false,
         })
-    }).await;
-    assert!(
-        observed_close,
-        "a client bootstrapped during required close cleanup must receive AgentClosed before deletion completes"
+        .await
+        .expect("workbench_remove write failed");
+    let mut moved = Vec::new();
+    let mut deleted = false;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "agents move to parent before workbench delete",
+        |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::AgentClosed,
+                "workbench removal must not close agents"
+            );
+            match env.kind {
+                FrameKind::AgentProjectChanged => {
+                    let start: AgentStartPayload = env.parse_payload().unwrap();
+                    assert!(!deleted, "agents move before the workbench is deleted");
+                    assert_eq!(start.project_id.as_ref(), Some(&agent_parent.id));
+                    assert_eq!(start.workspace_roots, parent_roots);
+                    moved.push(start.agent_id);
+                }
+                FrameKind::ProjectNotify => {
+                    deleted |= matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                    ProjectNotifyPayload::Delete { project } if project.id == agent_workbench.id);
+                }
+                _ => {}
+            }
+            deleted
+        },
+    )
+    .await;
+    assert_eq!(
+        moved,
+        vec![child_start.agent_id.clone(), owner_start.agent_id.clone()],
+        "children move before their owner"
     );
-    eprintln!(
-        "CLOSE PUBLICATION EVIDENCE: client bootstrapped during held close received AgentClosed before workbench completion"
-    );
-    assert!(
-        !fixture.agent_ids().await.contains(&live_agent.agent_id),
-        "cascaded agent remained live"
-    );
+    let live = fixture.agent_ids().await;
+    assert!(live.contains(&owner_start.agent_id) && live.contains(&child_start.agent_id));
     let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    assert!(
-        bootstrap
+    for agent in [&owner_start, &child_start] {
+        let session = bootstrap
             .sessions
             .iter()
-            .all(|session| session.project_id.as_ref() != Some(&agent_workbench.id))
-    );
+            .find(|session| session.user_alias.as_deref() == Some(agent.name.as_str()))
+            .unwrap_or_else(|| panic!("{} session survives workbench removal", agent.name));
+        assert_eq!(session.project_id.as_ref(), Some(&agent_parent.id));
+        assert_eq!(session.workspace_roots, parent_roots);
+    }
 
     let terminal_repo = init_git_repo("terminal-blocker");
     let terminal_parent = create_project(&mut fixture.client, vec![terminal_repo.path()]).await;
@@ -1705,16 +1751,16 @@ async fn workbench_remove_cascades_agents_terminals_and_sessions() {
             .iter()
             .any(|project| project.id == session_workbench.id)
     );
-    assert!(
-        incomplete
-            .sessions
-            .iter()
-            .any(|session| session.project_id.as_ref() == Some(&session_workbench.id)),
-        "dependent cleanup must not consume session identities before it can complete"
-    );
+    let relocated = incomplete
+        .sessions
+        .iter()
+        .find(|session| session.user_alias.as_deref() == Some("workbench-session-agent"))
+        .expect("failed removal keeps the saved session");
+    assert_eq!(relocated.project_id.as_ref(), Some(&session_parent.id));
+    assert_eq!(relocated.workspace_roots, project_roots(&session_parent));
     fs::write(&annotation_path, saved_annotations).unwrap();
     eprintln!(
-        "PROJECT MUTATION EVIDENCE: corrupt required annotations reject deletion; catalog and session identities remain for explicit repair/retry"
+        "PROJECT MUTATION EVIDENCE: corrupt required annotations reject deletion; catalog remains for explicit repair/retry and sessions stay in the parent"
     );
     fixture
         .client
@@ -1742,6 +1788,10 @@ async fn workbench_remove_cascades_agents_terminals_and_sessions() {
             .iter()
             .all(|session| session.project_id.as_ref() != Some(&session_workbench.id))
     );
+    assert!(bootstrap.sessions.iter().any(|session| {
+        session.user_alias.as_deref() == Some("workbench-session-agent")
+            && session.project_id.as_ref() == Some(&session_parent.id)
+    }));
 }
 
 #[tokio::test]
@@ -2860,25 +2910,42 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         })
         .await
         .unwrap();
+    let mut child_relocated = false;
     next_frame_matching_on(
         &mut fixture.client,
-        "Home agent stops before workspace removal",
+        "child leaves the removed workspace for its parent project",
         |env| {
-            env.kind == FrameKind::AgentClosed
-                && env
-                    .parse_payload::<protocol::AgentClosedPayload>()
-                    .unwrap()
-                    .agent_id
-                    == child.agent_id
+            assert_ne!(
+                env.kind,
+                FrameKind::AgentClosed,
+                "removal must not close agents"
+            );
+            if env.kind == FrameKind::AgentProjectChanged {
+                let start: AgentStartPayload = env.parse_payload().unwrap();
+                if start.agent_id == child.agent_id {
+                    assert_eq!(start.project_id.as_ref(), Some(&other.id));
+                    assert_eq!(start.workspace_roots, project_roots(&other));
+                    child_relocated = true;
+                }
+            }
+            env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                    ProjectNotifyPayload::Delete { project } if project.id == other_workbench.id)
         },
     )
     .await;
+    assert!(
+        child_relocated,
+        "the child moves before its workspace is deleted"
+    );
     let (_, state) = fixture.connect_with_bootstrap().await;
     assert!(
-        !state
+        state
             .agents
             .iter()
-            .any(|entry| entry.agent_id == child.agent_id)
+            .any(|entry| entry.agent_id == child.agent_id
+                && entry.project_id.as_ref() == Some(&other.id)),
+        "removing the child's workspace keeps it running in the parent project"
     );
     assert!(
         state
@@ -3044,7 +3111,8 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     let entry_launch = fixture
         .reserve_next_mock_launch(
             "Sibling entrant",
-            MockScript::one(MockTurn::gated_text("Ready to enter", &entry_gate)),
+            MockScript::one(MockTurn::gated_text("Ready to enter", &entry_gate))
+                .then(MockTurn::text("Settled in sibling")),
         )
         .await;
     let entrant = spawn_project_caller(
@@ -3282,7 +3350,7 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
         "CATALOG BINDING EVIDENCE: direct spawn registered in existing sibling after reverse-order creation"
     );
     git(&workbench_root, &["restore", "README.md"]);
-    fixture.client = creator;
+    let mut entrant_viewer = std::mem::replace(&mut fixture.client, creator);
     let hook = fixture.install_workbench_remove_test_hook();
     let (mut remove_client, _) = fixture.connect_with_bootstrap().await;
     remove_client
@@ -3322,6 +3390,21 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
         },
     )
     .await;
+    // Entry continues automatically; the sibling can be removed once it settles.
+    fixture::next_chat_event_matching_on(
+        &mut entrant_viewer,
+        &entrant.instance_stream,
+        "entrant continuation in the new sibling",
+        |event| matches!(event, protocol::ChatEvent::StreamEnd(end) if end.message.content == "Settled in sibling"),
+    )
+    .await;
+    fixture::next_chat_event_matching_on(
+        &mut entrant_viewer,
+        &entrant.instance_stream,
+        "entrant settles in the new sibling",
+        |event| matches!(event, protocol::ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
 
     let removal_message = format!("Workbench {:?} is being removed", workbench.name);
 
@@ -3355,12 +3438,28 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
     );
     hook.resume();
 
-    let ProjectNotifyPayload::Delete { project } =
-        expect_project_notify(&mut fixture.client, "concurrent remove winner").await
-    else {
-        panic!("removal did not emit Delete after winning the shared lock")
-    };
-    assert_eq!(project.id, workbench.id);
+    let mut relocated = 0;
+    next_frame_matching_on(&mut fixture.client, "concurrent remove winner", |env| {
+        if env.kind == FrameKind::AgentProjectChanged {
+            let start: AgentStartPayload = env.parse_payload().unwrap();
+            assert_eq!(start.project_id.as_ref(), Some(&parent.id));
+            relocated += 1;
+            return false;
+        }
+        assert_ne!(
+            env.kind,
+            FrameKind::NewAgent,
+            "losing concurrent spawn must not register"
+        );
+        env.kind == FrameKind::ProjectNotify
+            && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                ProjectNotifyPayload::Delete { project } if project.id == workbench.id)
+    })
+    .await;
+    assert!(
+        relocated > 0,
+        "workbench agents move to the parent before Delete"
+    );
     assert_no_new_agent(
         &mut fixture.client,
         "verifying losing concurrent spawn did not register",
@@ -3379,10 +3478,17 @@ async fn workbench_creation_bindings_and_removal_are_resource_scoped() {
             })
             .await
             .unwrap();
-        assert!(matches!(
-            expect_project_notify(&mut fixture.client, "sibling cleanup").await,
-            ProjectNotifyPayload::Delete { project } if project.id == sibling.id
-        ));
+        next_frame_matching_on(&mut fixture.client, "sibling cleanup", |env| {
+            if env.kind == FrameKind::AgentProjectChanged {
+                let start: AgentStartPayload = env.parse_payload().unwrap();
+                assert_eq!(start.project_id.as_ref(), Some(&parent.id));
+                return false;
+            }
+            env.kind == FrameKind::ProjectNotify
+                && matches!(env.parse_payload::<ProjectNotifyPayload>().unwrap(),
+                    ProjectNotifyPayload::Delete { project } if project.id == sibling.id)
+        })
+        .await;
     }
 }
 
@@ -5895,6 +6001,8 @@ async fn bubblewrap_engine_settings_terminal_boundary_and_replay() {
         mapped.parent_agent_id.as_ref() == Some(&caller.agent_id),
         "MCP child must preserve its authenticated caller as parent"
     );
+    // Removal relocates live agents, which requires them to be idle.
+    fixture::finish_turn_on(&mut fixture.client, &mapped.instance_stream).await;
     for agent_id in [&caller.agent_id, &mapped.agent_id] {
         let (failed, body) =
             call_agent_control(&fixture, agent_id, "tyde_list_workbenches", json!({})).await;
@@ -6199,7 +6307,8 @@ print('\n' + json.dumps({{'boundary': evidence}}))
     assert_eq!(
         removed.kind,
         FrameKind::ProjectNotify,
-        "a committed clone with only ignored output must remove without force"
+        "a committed clone with only ignored output must remove without force: {}",
+        removed.payload
     );
     assert!(
         !child.exists(),

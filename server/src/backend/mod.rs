@@ -479,7 +479,7 @@ pub struct BackendSessionRelocation {
 }
 
 impl BackendSessionRelocation {
-    fn reversed(&self) -> Self {
+    pub(crate) fn reversed(&self) -> Self {
         Self {
             source: self.destination.clone(),
             destination: self.source.clone(),
@@ -2548,6 +2548,27 @@ pub(crate) struct BackendRestartRequest {
     pub drain: BackendRestartDrain,
     pub commit: BackendRestartCommit,
     pub cancel: tokio::sync::watch::Receiver<BackendRestartCancel>,
+}
+
+/// Makes a stopped saved session resumable from `relocation.destination`.
+pub(crate) async fn relocate_saved_session(
+    kind: BackendKind,
+    use_mock_backend: bool,
+    provider_session_id: &SessionId,
+    relocation: &BackendSessionRelocation,
+) -> Result<(), String> {
+    for target in [&relocation.source, &relocation.destination] {
+        target
+            .scope
+            .run(crate::workbench::prepare_backend_execution(None))
+            .await?;
+    }
+    if use_mock_backend {
+        return mock::MockBackend::relocate_stopped_session(provider_session_id, relocation).await;
+    }
+    // Removed Tycode sessions have no native state left to relocate.
+    with_backend_type!(kind, |B| B::relocate_stopped_session(provider_session_id, relocation)
+        .await, removed => Ok(()))
 }
 
 pub(crate) async fn restart_agent_backend(

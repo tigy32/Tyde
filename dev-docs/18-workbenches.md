@@ -528,12 +528,17 @@ explicit choice to open the workbench, cancel, or delete anyway. Delete Anyway
 retries with `force: true`, which permanently discards tracked and untracked
 worktree changes.
 
-All project-owned runtime and persisted state is removed as one explicit
-cascade: live agents and terminals are closed; sessions and their task lists,
-project steering, team-member project references and deleted-session bindings,
-reviews, and workflow runs are deleted; and the workflow catalog is reloaded
-after the worktree is gone. Records shared with other projects, such as teams
-and team members, survive with only the deleted references removed.
+Agents and saved sessions outlive their workbench. Live agents move to the
+parent project, children before owners, through the canonical project move;
+saved sessions move with their native backend state. Worktree roots map to the
+matching parent roots. A busy agent, or a team, workflow, swarm or Tychat
+member, blocks removal with an error naming it; nothing is closed implicitly.
+The remaining project-owned state is removed as one explicit cascade: terminals
+are closed; project steering, team-member project references, reviews, and
+workflow runs are deleted; and the workflow catalog is reloaded after the
+worktree is gone. Records shared with other projects, such as teams and team
+members, survive with only the deleted references removed. Deleting a
+standalone project detaches its sessions to no project.
 
 The authenticated agent-control MCP exposes `tyde_remove_workbench` for
 unrestricted callers. It is scoped to workbenches under the caller's canonical
@@ -558,7 +563,8 @@ Successful flow:
 
 1. Validate the target and parent relationship. Validate clean roots unless
    `force` is true.
-2. Close associated agents and terminals.
+2. Move associated agents and saved sessions to the parent project, then
+   close terminals.
 3. Stop project readers/watchers, then run
    `git worktree remove <worktree_root>` for every root, adding `--force`
    only for the explicit forced path.

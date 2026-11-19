@@ -130,6 +130,32 @@ pub(crate) struct BaseRevision(pub(crate) String);
 
 pub(crate) type CreatedWorkbenchRoot = protocol::WorkbenchCreationRoot;
 
+fn map_workbench_roots(workspace_roots: &[String], roots: &[WorkbenchRoot]) -> Vec<String> {
+    workspace_roots
+        .iter()
+        .map(|workspace| {
+            roots
+                .iter()
+                .find_map(|root| {
+                    Path::new(workspace)
+                        .strip_prefix(&root.worktree_root.0)
+                        .ok()
+                        .map(|relative| {
+                            if relative.as_os_str().is_empty() {
+                                root.parent_root.0.clone()
+                            } else {
+                                Path::new(&root.parent_root.0)
+                                    .join(relative)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            }
+                        })
+                })
+                .unwrap_or_else(|| workspace.clone())
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CreatedWorkbench {
     pub(crate) project: Project,
@@ -9109,26 +9135,21 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             .map(|record| record.id)
             .collect::<Vec<_>>();
         let session_count = session_ids.len();
-        let deleted_session_ids = if workbench {
-            session_ids.iter().cloned().collect()
-        } else {
-            HashSet::new()
-        };
+        if workbench && session_count > 0 {
+            return Err(AppError::internal(
+                OPERATION,
+                anyhow!("{session_count} saved sessions still belong to the removed workbench"),
+            ));
+        }
         if workbench && let Some(store) = annotations {
             let id = project_id.clone();
-            let annotation_sessions = session_ids.clone();
             store
-                .call(move |store| {
-                    for session_id in annotation_sessions {
-                        store.remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id)?;
-                    }
-                    store.remove_project(HostFilterId(LOCAL_HOST_ID.to_owned()), id)
-                })
+                .call(move |store| store.remove_project(HostFilterId(LOCAL_HOST_ID.to_owned()), id))
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         }
         let team_events = teams
-            .remove_project_refs(project_id.clone(), deleted_session_ids)
+            .remove_project_refs(project_id.clone(), HashSet::new())
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
         if workbench {
@@ -9142,11 +9163,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
             .delete_for_project(project_id.clone())
             .await
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        if workbench {
-            for session_id in session_ids {
-                self.delete_session(session_id).await?;
-            }
-        } else {
+        if !workbench {
             let id = project_id.clone();
             let agents = self
                 .state
@@ -9219,6 +9236,206 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
         }
     }
 
+    async fn validate_workbench_agent_relocation(
+        &self,
+        agent_id: &AgentId,
+        workbench: &Project,
+        destination: Option<&Project>,
+    ) -> Result<(), String> {
+        let Some(handle) = self.agent_handle(agent_id).await else {
+            return Ok(());
+        };
+        let start = handle.snapshot();
+        let label = &start.name;
+        if start.swarm_membership.is_some()
+            || start.team_id.is_some()
+            || start.workflow.is_some()
+            || start.origin == AgentOrigin::Tychat
+        {
+            return Err(format!(
+                "Agent {label:?} is a team, workflow, swarm, or Tychat agent and cannot move out of the workbench; close it first"
+            ));
+        }
+        if !crate::backend::capabilities_for_backend_kind(start.backend_kind)
+            .contains(tyde_agent_adapter::BackendCapability::SetWorkspaceRoots)
+        {
+            return Err(format!(
+                "Agent {label:?} cannot move a running conversation out of the workbench; close it first"
+            ));
+        }
+        if crate::workbench::requires_backend_restart(Some(workbench), destination) {
+            crate::workbench::require_backend_restart_capability(start.backend_kind)
+                .map_err(|error| format!("Agent {label:?}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Workbench removal keeps open conversations: each moves, with its own
+    /// workspace roots mapped back to the parent checkout, into the parent
+    /// project (or no project when the parent is gone).
+    async fn relocate_workbench_agent(
+        &self,
+        agent_id: &AgentId,
+        roots: &[WorkbenchRoot],
+        destination: Option<&Project>,
+    ) -> Result<Option<AgentStartPayload>, String> {
+        let Some(handle) = self.agent_handle(agent_id).await else {
+            return Ok(None);
+        };
+        let start = handle.snapshot();
+        let _move_guard = handle
+            .reserve_project_move()
+            .map_err(|error| format!("Agent {:?}: {error}", start.name))?;
+        let _binding = self
+            .project_catalog
+            .reserve_bindings(
+                destination
+                    .map(|project| project.id.clone())
+                    .into_iter()
+                    .collect(),
+            )
+            .await?;
+        let workspace_roots = crate::backend::validate_local_workspace_roots(map_workbench_roots(
+            &start.workspace_roots,
+            roots,
+        ))?;
+        handle
+            .move_to_project(
+                destination.map(|project| project.id.clone()),
+                destination.cloned(),
+                workspace_roots,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "Agent {:?} could not leave the workbench: {error}",
+                    start.name
+                )
+            })?;
+        Ok(Some(start))
+    }
+
+    /// Returns agents that already left to their workbench placement so a
+    /// failed removal never splits an owner from its children.
+    async fn restore_workbench_agents(
+        &self,
+        workbench: &Project,
+        moved: Vec<AgentStartPayload>,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for start in moved.into_iter().rev() {
+            let Some(handle) = self.agent_handle(&start.agent_id).await else {
+                continue;
+            };
+            let destination = start.project_id.as_ref().map(|_| workbench.clone());
+            let restored = match handle.reserve_project_move() {
+                Ok(_guard) => handle
+                    .move_to_project(
+                        start.project_id.clone(),
+                        destination,
+                        start.workspace_roots.clone(),
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = restored {
+                failures.push(format!(
+                    "Agent {:?} could not return to the workbench: {error}",
+                    start.name
+                ));
+            }
+        }
+        failures
+    }
+
+    /// Saved conversations outlive their workbench: their native session state
+    /// is relocated to the parent checkout and the record joins the parent
+    /// project (or no project when the parent is gone).
+    async fn relocate_workbench_sessions(
+        &self,
+        workbench: &Project,
+        roots: &[WorkbenchRoot],
+        destination: Option<&Project>,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "workbench_remove";
+        let (sessions, use_mock_backend) = self
+            .state
+            .with(|state| (state.session_store.clone(), state.use_mock_backend))
+            .await;
+        let records = sessions
+            .list()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .into_iter()
+            .filter(|record| record.project_id.as_ref() == Some(&workbench.id))
+            .collect::<Vec<_>>();
+        for record in records {
+            let destination_roots = map_workbench_roots(&record.workspace_roots, roots);
+            if let Some(binding) = record
+                .backend_bindings
+                .iter()
+                .find(|binding| binding.generation == record.active_backend_binding_generation)
+            {
+                let relocation = crate::backend::BackendSessionRelocation {
+                    source: crate::backend::BackendExecutionTarget {
+                        scope: tyde_process_env::launch::ExecutionScope::new(Some(
+                            workbench.clone(),
+                        )),
+                        roots: record.workspace_roots.clone(),
+                    },
+                    destination: crate::backend::BackendExecutionTarget {
+                        scope: tyde_process_env::launch::ExecutionScope::new(destination.cloned()),
+                        roots: destination_roots.clone(),
+                    },
+                };
+                crate::backend::relocate_saved_session(
+                    binding.backend_kind,
+                    use_mock_backend,
+                    &binding.provider_session_id,
+                    &relocation,
+                )
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                if let Err(error) = sessions
+                    .move_to_project(
+                        &record.id,
+                        destination.map(|project| project.id.clone()),
+                        destination_roots,
+                    )
+                    .await
+                {
+                    let undo = crate::backend::relocate_saved_session(
+                        binding.backend_kind,
+                        use_mock_backend,
+                        &binding.provider_session_id,
+                        &relocation.reversed(),
+                    )
+                    .await;
+                    return Err(AppError::internal(
+                        OPERATION,
+                        match undo {
+                            Ok(()) => anyhow!(error),
+                            Err(undo) => anyhow!(
+                                "{error}. The saved session could not be returned to the workbench: {undo}"
+                            ),
+                        },
+                    ));
+                }
+                continue;
+            }
+            sessions
+                .move_to_project(
+                    &record.id,
+                    destination.map(|project| project.id.clone()),
+                    destination_roots,
+                )
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+        Ok(())
+    }
+
     async fn prepare_workbench_remove(
         &self,
         payload: &WorkbenchRemovePayload,
@@ -9236,6 +9453,77 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 "cannot remove non-workbench project as workbench",
             ));
         };
+        let destination = project
+            .parent_project_id()
+            .and_then(|parent| catalog.get(parent));
+        let agents = {
+            let project_id = project.id.clone();
+            let roots = roots.clone();
+            self.state
+                .with(move |state| {
+                    let in_workbench = |start: &AgentStartPayload| {
+                        start.project_id.as_ref() == Some(&project_id)
+                            || (start.project_id.is_none()
+                                && start.workspace_roots.iter().any(|workspace| {
+                                    roots.iter().any(|root| {
+                                        Path::new(workspace).starts_with(&root.worktree_root.0)
+                                    })
+                                }))
+                    };
+                    let mut agents = state
+                        .registry
+                        .agent_ids()
+                        .into_iter()
+                        .filter_map(|id| {
+                            let start = state.registry.agent_handle(&id)?.snapshot();
+                            (in_workbench(&start) && start.origin != AgentOrigin::BackendNative)
+                                .then(|| {
+                                    let mut depth = 0usize;
+                                    let mut parent = start.parent_agent_id.clone();
+                                    while let Some(id) = parent {
+                                        depth += 1;
+                                        parent = state
+                                            .registry
+                                            .agent_handle(&id)
+                                            .and_then(|handle| handle.snapshot().parent_agent_id);
+                                    }
+                                    (depth, id)
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    // Descendants move before their owners.
+                    agents.sort_by_key(|agent| std::cmp::Reverse(agent.0));
+                    agents.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+                })
+                .await
+        };
+        for agent_id in &agents {
+            self.validate_workbench_agent_relocation(agent_id, project, destination.as_ref())
+                .await
+                .map_err(|error| AppError::conflict(OPERATION, error))?;
+        }
+        let mut moved = Vec::new();
+        for agent_id in &agents {
+            match self
+                .relocate_workbench_agent(agent_id, roots, destination.as_ref())
+                .await
+            {
+                Ok(start) => moved.extend(start),
+                Err(error) => {
+                    let failures = self.restore_workbench_agents(project, moved).await;
+                    if failures.is_empty() {
+                        return Err(AppError::conflict(OPERATION, error));
+                    }
+                    return Err(AppError::internal(
+                        OPERATION,
+                        anyhow!("{error}. {}", failures.join(". ")),
+                    ));
+                }
+            }
+        }
+        self.await_project_close_settlement(&payload.id).await?;
+        self.relocate_workbench_sessions(project, roots, destination.as_ref())
+            .await?;
         if let protocol::WorkbenchEnvironment::Bubblewrap {
             lifecycle: protocol::WorkbenchEnvironmentLifecycle::Active,
             ..
@@ -9249,47 +9537,19 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                 )
                 .await?;
         }
-        let (agents, terminals) = {
-            {
-                let project = project.to_owned();
-                let roots = roots.clone();
-                self.state
-                    .with(move |state| {
-                        let project = &project;
-
-                        let agents = state
-                            .registry
-                            .agent_ids()
-                            .into_iter()
-                            .filter(|id| {
-                                state.registry.agent_handle(id).is_some_and(|agent| {
-                                    let start = agent.snapshot();
-                                    start.project_id.as_ref() == Some(&project.id)
-                                        || (start.project_id.is_none()
-                                            && start.workspace_roots.iter().any(|workspace| {
-                                                roots.iter().any(|root| {
-                                                    Path::new(workspace)
-                                                        .starts_with(&root.worktree_root.0)
-                                                })
-                                            }))
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        let terminals = state
-                            .terminal_streams
-                            .values()
-                            .filter(|terminal| terminal.project_id() == Some(&project.id))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (agents, terminals)
-                    })
-                    .await
-            }
+        let terminals = {
+            let project_id = project.id.clone();
+            self.state
+                .with(move |state| {
+                    state
+                        .terminal_streams
+                        .values()
+                        .filter(|terminal| terminal.project_id() == Some(&project_id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .await
         };
-        for agent_id in agents {
-            self.close_agent(&agent_id).await?;
-        }
-        self.await_project_close_settlement(&payload.id).await?;
         for terminal in terminals {
             terminal.close().await;
             terminal.wait_for_exit().await;
