@@ -3778,6 +3778,8 @@ pub enum ExitPlanModeDecision {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedMessageEntry {
+    #[serde(default)]
+    pub queued_for_project_move: bool,
     pub id: QueuedMessageId,
     pub message: String,
     pub images: Vec<ImageData>,

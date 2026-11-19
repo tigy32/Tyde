@@ -4574,12 +4574,14 @@ mod wasm_tests {
                     agent_ref.clone(),
                     vec![
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-1".to_owned()),
                             message: "second pending".to_owned(),
                             images: Vec::new(),
                             origin: None,
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-2".to_owned()),
                             message: "third pending".to_owned(),
                             images: Vec::new(),
@@ -5203,12 +5205,14 @@ mod wasm_tests {
                     agent_ref,
                     vec![
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-1".to_owned()),
                             message: "first".to_owned(),
                             images: Vec::new(),
                             origin: None,
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-2".to_owned()),
                             message: "second".to_owned(),
                             images: Vec::new(),

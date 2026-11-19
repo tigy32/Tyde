@@ -5967,7 +5967,28 @@ pub(crate) fn spawn_agent_actor(
             Result<supervisor::SupervisionVerdict, supervisor::SupervisionFailure>,
         )>();
         let mut published_activity = status_handle.snapshot().await.activity();
+        let mut published_move_gate = None;
         loop {
+            let move_gate = project_moves.scheduled.is_some();
+            if published_move_gate != Some(move_gate) {
+                published_move_gate = Some(move_gate);
+                if queue
+                    .iter()
+                    .any(|queued| queued.entry.queued_for_project_move != move_gate)
+                {
+                    for queued in &mut queue {
+                        queued.entry.queued_for_project_move = move_gate;
+                    }
+                    update_queued_messages_snapshot(
+                        &canonical_stream,
+                        &mut event_log,
+                        &mut subscribers,
+                        &queue,
+                        &status_handle,
+                    )
+                    .await;
+                }
+            }
             if event_log.accounting_storage_failed {
                 tool_publication.close();
                 if let Some(backend) = backend.take() {
@@ -9720,6 +9741,7 @@ pub(crate) fn spawn_agent_actor(
                                         queue.push_back(SequencedQueuedMessage {
                                             sequence,
                                             entry: QueuedMessageEntry {
+                                                queued_for_project_move: project_moves.scheduled.is_some(),
                                                 id: queued_message_id.clone(),
                                                 message: msg.message,
                                                 images: msg.images.unwrap_or_default(),
@@ -15604,6 +15626,7 @@ fn startup_reservation(
 /// `SendOutcome::Busy`, so it can be requeued at the front.
 fn queued_entry_from_send_payload(payload: SendMessagePayload) -> QueuedMessageEntry {
     QueuedMessageEntry {
+        queued_for_project_move: false,
         id: QueuedMessageId(Uuid::new_v4().to_string()),
         message: payload.message,
         images: payload.images.unwrap_or_default(),

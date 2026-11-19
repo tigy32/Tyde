@@ -3886,6 +3886,7 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
         .await
         .unwrap();
     let ordinary = fixture.expect_queued_messages(&agent, 1).await;
+    assert!(ordinary.messages[0].queued_for_project_move);
     initial.release_one();
     fixture
         .next_chat_event_matching(
@@ -3951,6 +3952,9 @@ async fn agent_enters_its_workbench_at_turn_boundary_and_reviews_that_project() 
     .unwrap();
     assert_eq!(broadcast.project_id, changed.project_id);
     assert_eq!(broadcast.workspace_roots, changed.workspace_roots);
+    let released = fixture.expect_queued_messages(&agent, 1).await;
+    assert_eq!(released.messages[0].id, ordinary.messages[0].id);
+    assert!(!released.messages[0].queued_for_project_move);
     continued.wait_until_entered().await;
     let before_dispatch = diagnostic_mock.requests().await;
     assert_eq!(

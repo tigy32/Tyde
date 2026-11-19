@@ -317,6 +317,14 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
     }
 }
 
+fn queue_heading(count: usize, move_blocked: bool) -> String {
+    if move_blocked {
+        format!("{count} queued until project move completes")
+    } else {
+        format!("{count} queued")
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct TrayCounts {
     running: usize,
@@ -336,6 +344,7 @@ struct TraySnapshot {
     commands: Vec<ToolCallId>,
     queued: Vec<QueuedMessageId>,
     counts: TrayCounts,
+    move_blocked: bool,
 }
 
 impl TraySnapshot {
@@ -430,7 +439,10 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
     snapshot.queued = state.agent_message_queue.with(|queue| {
         queue
             .get(&parent.agent_id)
-            .map(|entries| entries.iter().map(|entry| entry.id.clone()).collect())
+            .map(|entries| {
+                snapshot.move_blocked = entries.iter().any(|entry| entry.queued_for_project_move);
+                entries.iter().map(|entry| entry.id.clone()).collect()
+            })
             .unwrap_or_default()
     });
     snapshot.counts.queued = snapshot.queued.len();
@@ -726,7 +738,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
             parts.push(format!("{} running", snapshot.counts.running));
         }
         if snapshot.counts.queued > 0 {
-            parts.push(format!("{} queued", snapshot.counts.queued));
+            parts.push(queue_heading(snapshot.counts.queued, snapshot.move_blocked));
         }
         if let Some(waiting) = waiting.get() {
             parts.push(waiting);
@@ -797,7 +809,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
         let queued = queued_row_ids.get().len();
         if queued > 0 {
-            parts.push(format!("{queued} queued"));
+            parts.push(queue_heading(queued, snapshot.move_blocked));
         }
         parts.join(" \u{b7} ")
     };
@@ -2569,6 +2581,7 @@ mod wasm_tests {
                 queue.insert(
                     parent_ref().agent_id,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: true,
                         id: QueuedMessageId("q-1".to_owned()),
                         message: "also fix the flaky test".to_owned(),
                         images: Vec::new(),
@@ -2581,7 +2594,7 @@ mod wasm_tests {
 
         let body = text(&container);
         assert!(
-            body.contains("1 queued"),
+            body.contains("1 queued until project move completes"),
             "collapsed line reports the queued count: {body}"
         );
 
@@ -2616,18 +2629,21 @@ mod wasm_tests {
                     parent_ref().agent_id,
                     vec![
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-user".to_owned()),
                             message: "editable draft".to_owned(),
                             images: Vec::new(),
                             origin: Some(MessageOrigin::User),
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-supervisor".to_owned()),
                             message: "supervisor kick".to_owned(),
                             images: Vec::new(),
                             origin: Some(MessageOrigin::Supervisor),
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-review".to_owned()),
                             message: "review follow-up".to_owned(),
                             images: Vec::new(),
@@ -2910,6 +2926,7 @@ mod wasm_tests {
             queue.get_mut(&parent_ref().agent_id).unwrap().insert(
                 0,
                 QueuedMessageEntry {
+                    queued_for_project_move: false,
                     id: QueuedMessageId("q-user".to_owned()),
                     message: "server row returned".to_owned(),
                     images: Vec::new(),
@@ -2955,6 +2972,7 @@ mod wasm_tests {
                 queue.insert(
                     parent_ref().agent_id,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-race".to_owned()),
                         message: "original".to_owned(),
                         images: Vec::new(),
@@ -3137,6 +3155,7 @@ mod wasm_tests {
                 queue.insert(
                     parent_ref().agent_id,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-fatal".to_owned()),
                         message: "do not send to the dead actor".to_owned(),
                         images: Vec::new(),

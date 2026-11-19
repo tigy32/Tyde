@@ -1836,6 +1836,16 @@ pub fn ChatInput() -> impl IntoView {
         });
     };
 
+    let reason_state = state.clone();
+    let project_move_holds_queue = Signal::derive(move || {
+        reason_state.active_agent.get().is_some_and(|active| {
+            reason_state.agent_message_queue.with(|queues| {
+                queues.get(&active.as_agent_ref()).is_some_and(|entries| {
+                    entries.iter().any(|entry| entry.queued_for_project_move)
+                })
+            })
+        })
+    });
     let queue_state = state.clone();
     let queued_rows = Memo::new(move |_| {
         let Some(active) = queue_state.active_agent.get() else {
@@ -2033,7 +2043,7 @@ pub fn ChatInput() -> impl IntoView {
                     <div class="chat-input-queued-title">
                         {move || {
                             let n = queued_rows_for_render.get().len();
-                            format!("{n} message{} queued", if n == 1 { "" } else { "s" })
+                            format!("{n} message{} queued{}", if n == 1 { "" } else { "s" }, if project_move_holds_queue.get() { " until project move completes" } else { "" })
                         }}
                     </div>
                     <For
@@ -4574,18 +4584,21 @@ mod wasm_tests {
                     agent_ref,
                     vec![
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-1".to_owned()),
                             message: "later".to_owned(),
                             images: Vec::new(),
                             origin: Some(protocol::MessageOrigin::User),
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-supervisor".to_owned()),
                             message: "supervisor kick".to_owned(),
                             images: Vec::new(),
                             origin: Some(protocol::MessageOrigin::Supervisor),
                         },
                         QueuedMessageEntry {
+                            queued_for_project_move: false,
                             id: QueuedMessageId("q-review".to_owned()),
                             message: "review follow-up".to_owned(),
                             images: Vec::new(),
@@ -4909,6 +4922,7 @@ mod wasm_tests {
                 queues.insert(
                     agent_ref,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-drain".to_owned()),
                         message: "original".to_owned(),
                         images: Vec::new(),
@@ -4976,6 +4990,7 @@ mod wasm_tests {
                         agent_id: AgentId("agent-1".to_owned()),
                     },
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-drain".to_owned()),
                         message: "server row returned".to_owned(),
                         images: Vec::new(),
@@ -5039,6 +5054,7 @@ mod wasm_tests {
                 queues.insert(
                     agent_ref,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-race".to_owned()),
                         message: "original".to_owned(),
                         images: Vec::new(),
@@ -5845,6 +5861,7 @@ mod wasm_tests {
                 m.insert(
                     agent_ref,
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-1".to_owned()),
                         message: "also fix the flaky test".to_owned(),
                         images: Vec::new(),
@@ -6105,6 +6122,7 @@ mod wasm_tests {
                         agent_id: id_m.clone(),
                     },
                     vec![QueuedMessageEntry {
+                        queued_for_project_move: false,
                         id: QueuedMessageId("q-1".to_owned()),
                         message: "still queued behind the dead agent".to_owned(),
                         images: Vec::new(),
