@@ -42,13 +42,13 @@ fn bool_from_str(value: &str) -> Option<bool> {
     }
 }
 
-fn persist_bool_pref(key: &str, value: bool) {
+pub(crate) fn persist_bool_pref(key: &str, value: bool) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(key, bool_to_str(value));
     }
 }
 
-fn restore_bool_pref(key: &str, default: bool) -> bool {
+pub(crate) fn restore_bool_pref(key: &str, default: bool) -> bool {
     let Some(storage) = local_storage() else {
         return default;
     };

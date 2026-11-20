@@ -1,8 +1,10 @@
 use leptos::html::Div;
 use leptos::prelude::*;
 
+use super::agents_view::{persist_bool_pref, restore_bool_pref};
 use crate::actions::{begin_new_chat, clear_active_project, open_new_chat, select_project};
 use crate::state::{ActiveProjectRef, AppState, ProjectInfo, sort_project_infos};
+use protocol::ProjectId;
 
 /// The project sheet that stands between "New chat" and the composer.
 ///
@@ -13,7 +15,10 @@ use crate::state::{ActiveProjectRef, AppState, ProjectInfo, sort_project_infos};
 ///
 /// **"No project" is a row, not a fallback.** A phone is where quick questions
 /// get asked, and forcing every one of them into a workspace would be the wrong
-/// default; the row is listed first and says what it does.
+/// default; the row is listed first.
+///
+/// Workbenches stay hidden unless the remembered "Show workbenches" switch is
+/// on: a new chat almost always belongs in the parent project.
 ///
 /// Selection only, deliberately: this lists projects to scope a spawn and never
 /// opens one for browsing. Files, Git, diffs, and reviews stay off the mobile
@@ -23,6 +28,14 @@ pub fn ProjectPicker() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let open = state.project_picker_open;
     crate::native::track_modal(open);
+
+    let query = RwSignal::new(String::new());
+    let show_workbenches = RwSignal::new(restore_bool_pref(STORAGE_SHOW_WORKBENCHES, false));
+    Effect::new(move |_| {
+        if open.get() {
+            query.set(String::new());
+        }
+    });
 
     let projects_state = state.clone();
     let projects = Memo::new(move |_| {
@@ -36,8 +49,50 @@ pub fn ProjectPicker() -> impl IntoView {
             .filter(|info| info.local_host_id == host)
             .collect();
         sort_project_infos(&mut projects);
+        let query = query.get().trim().to_lowercase();
+        let show_workbenches = show_workbenches.get();
+        // The current scope stays listed so its selection is never hidden.
+        let selected = projects_state.active_project.get();
+        let matches = |info: &ProjectInfo| info.project.name.to_lowercase().contains(&query);
+        let parent_matches = |parent: &ProjectId| {
+            projects
+                .iter()
+                .any(|info| &info.project.id == parent && matches(info))
+        };
+        let visible_children: Vec<&ProjectInfo> = projects
+            .iter()
+            .filter(|info| {
+                info.project.parent_project_id().is_some_and(|parent| {
+                    let is_selected = selected.as_ref().is_some_and(|selected| {
+                        selected.local_host_id == info.local_host_id
+                            && selected.project_id == info.project.id
+                    });
+                    (show_workbenches || is_selected) && (matches(info) || parent_matches(parent))
+                })
+            })
+            .collect();
         projects
+            .iter()
+            .filter(|info| match info.project.parent_project_id() {
+                Some(_) => visible_children
+                    .iter()
+                    .any(|child| child.project.id == info.project.id),
+                None => {
+                    matches(info)
+                        || visible_children.iter().any(|child| {
+                            child.project.parent_project_id() == Some(&info.project.id)
+                        })
+                }
+            })
+            .cloned()
+            .collect()
     });
+
+    let toggle_workbenches = move |event: web_sys::Event| {
+        let shown = event_target_checked(&event);
+        persist_bool_pref(STORAGE_SHOW_WORKBENCHES, shown);
+        show_workbenches.set(shown);
+    };
 
     let selected_state = state.clone();
     let selected = move || selected_state.active_project.get();
@@ -88,6 +143,25 @@ pub fn ProjectPicker() -> impl IntoView {
                             on:click=|event: web_sys::MouseEvent| event.stop_propagation()
                         >
                             <h2 class="project-sheet-title">"Start a chat in"</h2>
+                            <div class="search-bar project-sheet-search">
+                                <input type="search" placeholder="Find a project"
+                                    aria-label="Find a project"
+                                    autocapitalize="none" autocomplete="off" spellcheck="false"
+                                    data-mobile-test="project-picker-search"
+                                    prop:value=move || query.get()
+                                    on:input=move |event| query.set(event_target_value(&event)) />
+                            </div>
+                            <label class="project-sheet-toggle">
+                                <span>"Show workbenches"</span>
+                                <input
+                                    class="settings-toggle"
+                                    type="checkbox"
+                                    role="switch"
+                                    data-mobile-test="project-picker-show-workbenches"
+                                    prop:checked=move || show_workbenches.get()
+                                    on:change=toggle_workbenches
+                                />
+                            </label>
                             <div class="project-sheet-list" role="listbox">
                                 <button
                                     type="button"
@@ -99,9 +173,6 @@ pub fn ProjectPicker() -> impl IntoView {
                                     on:click=move |_| on_none.run(())
                                 >
                                     <span class="project-sheet-row-name">"No project"</span>
-                                    <span class="project-sheet-row-hint">
-                                        "Ask anything without a workspace"
-                                    </span>
                                 </button>
                                 {move || {
                                     projects
@@ -126,14 +197,6 @@ fn project_row(state: &AppState, info: ProjectInfo) -> AnyView {
     };
     let is_workbench = info.project.is_workbench();
     let name = info.project.name.clone();
-    // A workbench's roots are its worktree paths, which is the one thing that
-    // distinguishes two same-named branches of the same repository.
-    let hint = info
-        .project
-        .root_paths()
-        .first()
-        .map(|root| root.0.clone())
-        .unwrap_or_default();
 
     let selected_reference = reference.clone();
     let class_state = state.clone();
@@ -161,11 +224,12 @@ fn project_row(state: &AppState, info: ProjectInfo) -> AnyView {
             on:click=on_click
         >
             <span class="project-sheet-row-name">{name}</span>
-            <span class="project-sheet-row-hint">{hint}</span>
         </button>
     }
     .into_any()
 }
+
+const STORAGE_SHOW_WORKBENCHES: &str = "tyde-mobile-new-chat-show-workbenches";
 
 /// The "New chat" affordance every surface shares: it opens the project sheet
 /// rather than the composer, so no caller can spawn an unscoped agent by
@@ -221,6 +285,20 @@ mod wasm_tests {
                 },
             },
             ProjectInfo {
+                local_host_id: host.clone(),
+                project: Project {
+                    id: ProjectId("tyde-wb".to_owned()),
+                    name: "Picker polish".to_owned(),
+                    sort_order: 0,
+                    source: ProjectSource::GitWorkbench {
+                        environment: Default::default(),
+                        parent_project_id: ProjectId("tyde".to_owned()),
+                        branch: protocol::GitBranchName("picker-polish".to_owned()),
+                        roots: Vec::new(),
+                    },
+                },
+            },
+            ProjectInfo {
                 local_host_id: host,
                 project: Project {
                     id: ProjectId("tychat".to_owned()),
@@ -244,6 +322,7 @@ mod wasm_tests {
     /// no way to say otherwise.
     #[wasm_bindgen_test]
     async fn the_sheet_scopes_a_new_chat_and_offers_no_project() {
+        persist_bool_pref(STORAGE_SHOW_WORKBENCHES, false);
         let container = make_container();
         let state = state_with_projects();
         let state_for_mount = state.clone();
@@ -268,10 +347,98 @@ mod wasm_tests {
             "opening the sheet must not open the composer behind it"
         );
 
+        let row_names = || {
+            let rows = container
+                .query_selector_all("[data-mobile-test='project-picker-project']")
+                .unwrap();
+            (0..rows.length())
+                .map(|index| rows.item(index).unwrap().text_content().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            row_names(),
+            ["Tyde", "Tychat"],
+            "workbenches stay hidden until the switch is turned on"
+        );
+
+        let switch: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='project-picker-show-workbenches']")
+            .unwrap()
+            .expect("the sheet offers a Show workbenches switch")
+            .dyn_into()
+            .unwrap();
+        assert!(!switch.checked(), "Show workbenches is off by default");
+        switch.click();
+        next_tick().await;
+        assert_eq!(
+            row_names(),
+            ["Tyde", "Picker polish", "Tychat"],
+            "turning the switch on nests workbenches under their parent"
+        );
+        assert!(
+            restore_bool_pref(STORAGE_SHOW_WORKBENCHES, false),
+            "the switch is remembered for the next new chat"
+        );
+
+        let search: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='project-picker-search']")
+            .unwrap()
+            .expect("the sheet offers project search")
+            .dyn_into()
+            .unwrap();
+        search.set_value("polish");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            row_names(),
+            ["Tyde", "Picker polish"],
+            "a matching workbench keeps its parent for context"
+        );
+        search.set_value("chat");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(row_names(), ["Tychat"], "search narrows the projects");
+        search.set_value("");
+        search
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(row_names(), ["Tyde", "Picker polish", "Tychat"]);
+        let polish: HtmlElement = container
+            .query_selector_all("[data-mobile-test='project-picker-project']")
+            .unwrap()
+            .item(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        polish.click();
+        next_tick().await;
+        crate::actions::begin_new_chat(&state);
+        next_tick().await;
+        let switch: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='project-picker-show-workbenches']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        switch.click();
+        next_tick().await;
+        assert_eq!(
+            row_names(),
+            ["Tyde", "Picker polish", "Tychat"],
+            "the chosen workbench stays listed while workbenches are hidden"
+        );
+        clear_active_project(&state);
+        next_tick().await;
+        assert_eq!(row_names(), ["Tyde", "Tychat"]);
+
         let rows = container
             .query_selector_all("[data-mobile-test='project-picker-project']")
             .unwrap();
-        assert_eq!(rows.length(), 2, "both of the host's projects are listed");
 
         // Pick a project: it becomes the scope the spawn will read, and the
         // composer opens.
@@ -318,5 +485,6 @@ mod wasm_tests {
 
         drop(mount);
         container.remove();
+        persist_bool_pref(STORAGE_SHOW_WORKBENCHES, false);
     }
 }
