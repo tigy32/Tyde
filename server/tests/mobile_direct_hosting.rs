@@ -1703,7 +1703,8 @@ async fn native_shell_loads_exact_clients_with_retained_pairing() {
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("invalid private driver event"));
         assert!(
             value["event"].as_str() == Some(expected),
-            "driver reached an unexpected boundary"
+            "driver boundary mismatch: expected {expected}, received {}",
+            value["event"].as_str().unwrap_or("missing event kind")
         );
         value
     }
