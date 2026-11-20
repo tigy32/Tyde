@@ -107,6 +107,7 @@ struct AgentEventLog {
     accounting_history_incomplete: bool,
     accounting_storage_failed: bool,
     timing: timing::TimingTracker,
+    response_sampler: Option<crate::response_metrics::ResponseSampler>,
     own_usage: Option<(TaskTokenUsageScope, Option<String>)>,
     native_usage: Option<ModelRequestTokenUsage>,
     accounting: protocol::TaskUsageAccounting,
@@ -325,6 +326,7 @@ pub(crate) struct AgentActorRuntimeContext {
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
     pub(crate) backend_storage: crate::backend::BackendStorage,
+    pub(crate) response_metrics: crate::response_metrics::ResponseMetrics,
 }
 
 pub(crate) struct AgentActorRuntimeResources {
@@ -347,6 +349,7 @@ pub(crate) struct AgentActorRuntimeResources {
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
     pub(crate) backend_storage: crate::backend::BackendStorage,
+    pub(crate) response_metrics: crate::response_metrics::ResponseMetrics,
 }
 
 impl AgentActorRuntimeResources {
@@ -373,6 +376,7 @@ impl AgentActorRuntimeResources {
             supervisor_compaction_tx: self.supervisor_compaction_tx,
             provider_version: self.provider_version,
             backend_storage: self.backend_storage,
+            response_metrics: self.response_metrics,
         }
     }
 }
@@ -4362,6 +4366,7 @@ pub(crate) fn spawn_agent_actor(
         status_handle,
         provider_version,
         backend_storage,
+        response_metrics,
     } = runtime;
     let supervisor_capacity_tx = capacity_tx.clone();
     let sub_agent_context = HostSubAgentEmitterContext {
@@ -4515,6 +4520,8 @@ pub(crate) fn spawn_agent_actor(
                 resolved_spawn_config,
             },
         );
+        event_log.response_sampler =
+            Some(response_metrics.sampler(&current_start, Some(&current_session_settings)));
         let mut resume_recovery = None;
         let mut startup_failure = startup_failure;
         let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
@@ -8306,6 +8313,11 @@ pub(crate) fn spawn_agent_actor(
                     // count and never reach the status watch, which is why the
                     // authoritative clock lives here and not in the scheduler.
                     last_backend_event_at = Some(Instant::now());
+                    if matches!(event, ChatEvent::TypingStatusChanged(true))
+                        && let Some(sampler) = event_log.response_sampler.as_mut()
+                    {
+                        sampler.set_labels(&current_start, Some(&current_session_settings));
+                    }
                     let mut real_idle_transition = false;
                     let mut withhold_idle = backend_restart_in_flight
                         && matches!(event, ChatEvent::TypingStatusChanged(false));
@@ -12589,6 +12601,7 @@ pub(crate) struct RelayAgentRuntimeResources {
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
+    pub response_metrics: crate::response_metrics::ResponseMetrics,
 }
 
 pub(crate) fn spawn_relay_agent_actor(
@@ -12612,6 +12625,7 @@ pub(crate) fn spawn_relay_agent_actor(
         session_store,
         transcript_store,
         session_summary_count_tx,
+        response_metrics,
     } = runtime;
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
@@ -12654,6 +12668,7 @@ pub(crate) fn spawn_relay_agent_actor(
             accounting_actor,
             timing_context: Some((Arc::clone(&session_store), session_id.clone())),
             parent_session_id: Some(parent_session_id),
+            response_sampler: Some(response_metrics.sampler(&start, None)),
             ..Default::default()
         };
         let mut latest_output = AgentControlLatestOutput::default();
@@ -12960,6 +12975,11 @@ pub(crate) fn spawn_relay_agent_actor(
                     };
 
                     project_native_progress_backend(&mut event, current_start.backend_kind);
+                    if matches!(event, ChatEvent::TypingStatusChanged(true))
+                        && let Some(sampler) = event_log.response_sampler.as_mut()
+                    {
+                        sampler.set_labels(&current_start, None);
+                    }
                     if let ChatEvent::MessageAdded(message) = &mut event
                         && matches!(message.sender, MessageSender::User)
                         && message.origin.is_none()
@@ -16191,6 +16211,9 @@ async fn append_chat_event_with_transcript_metadata_unboxed(
     transcript_metadata: Option<(BackendKind, &EventStream)>,
     event: &ChatEvent,
 ) -> Result<(), String> {
+    if let Some(sampler) = event_log.response_sampler.as_mut() {
+        sampler.observe(event);
+    }
     let timing_changed = if let Some((store, session)) = event_log.timing_context.clone() {
         event_log.timing.observe(event, &store, &session).await
     } else {

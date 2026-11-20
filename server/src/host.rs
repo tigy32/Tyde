@@ -953,6 +953,7 @@ pub(crate) struct HostState {
     pub agents_view_preferences_store: Option<Arc<AgentsViewPreferencesHandle>>,
     pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
+    pub response_metrics: crate::response_metrics::ResponseMetrics,
     pub custom_agent_store: CustomAgentStore,
     pub mcp_server_store: McpServerStore,
     pub steering_store: Arc<SteeringStore>,
@@ -3238,6 +3239,16 @@ impl HostHandle {
 
 #[cfg(any(test, feature = "test-support"))]
 impl HostHandle {
+    /// Commits every response metric enqueued so far and returns the database
+    /// path for the caller to read.
+    pub async fn flush_response_metrics_for_test(&self) -> std::path::PathBuf {
+        let metrics = self
+            .state
+            .with(|state| state.response_metrics.clone())
+            .await;
+        metrics.flush().await
+    }
+
     pub async fn observe_next_session_schema_spawn_wait_for_test(
         &self,
         kind: BackendKind,
@@ -7607,6 +7618,7 @@ self.state.with_async_gated_reply(move |state| Box::pin(async move {
                         review_registry,
                         provider_version,
                         backend_storage,
+                        response_metrics: state.response_metrics.clone(),
                     },
                 )
             });
@@ -8299,6 +8311,7 @@ Ok::<_, AppError>(std::ops::ControlFlow::Continue((spawned_result, swarm_startup
                                             review_registry,
                                             provider_version,
                                             backend_storage,
+                                            response_metrics: state.response_metrics.clone(),
                                         },
                                     )
                                 },
@@ -17379,6 +17392,7 @@ Ok::<_, String>(std::ops::ControlFlow::Continue((promotion,)))
                                     session_store: Arc::clone(&activation_session_store),
                                     transcript_store,
                                     session_summary_count_tx,
+                                    response_metrics: state.response_metrics.clone(),
                                 },
                             );
 
@@ -21022,6 +21036,9 @@ fn spawn_host_inner(
     let backend_storage =
         crate::backend::BackendStorage::new(runtime_config.backend_storage_roots.clone())?;
 
+    let response_metrics = crate::response_metrics::ResponseMetrics::spawn(
+        crate::response_metrics::ResponseMetrics::path_for_session_store(&paths.session),
+    )?;
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
     crate::board::initialize(&session_store)?;
@@ -21243,6 +21260,7 @@ fn spawn_host_inner(
             .map(Arc::new),
         session_store,
         transcript_store,
+        response_metrics,
         custom_agent_store,
         mcp_server_store,
         steering_store,
