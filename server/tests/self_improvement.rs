@@ -1833,41 +1833,21 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
         "A project instruction cannot grant host-wide authority.",
     )
     .await;
-    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
-    let failed = if bootstrap
-        .self_improvement
-        .scopes
-        .iter()
-        .any(|job| job.scope == scope && matches!(job.status, LearningStatus::Failed { .. }))
-    {
-        bootstrap.self_improvement
-    } else {
-        next_frame_matching_on(&mut observer, "scope violation rejected", |frame| {
-            frame.kind == FrameKind::SelfImprovementNotify
-                && frame
-                    .parse_payload::<SelfImprovementState>()
-                    .is_ok_and(|state| {
-                        state.scopes.iter().any(|job| {
-                            job.scope == scope
-                                && matches!(job.status, LearningStatus::Failed { .. })
-                        })
-                    })
-        })
-        .await
-        .parse_payload()
-        .expect("scope failure")
-    };
-    assert_eq!(failed.usage.len(), 4);
+    // Exhausted corrections requeue the input for the next human message
+    // instead of latching the scope as failed.
+    let requeued = state(&mut fixture, |state| {
+        state.usage.len() == 4
+            && state.scopes.iter().any(|job| {
+                job.scope == scope && job.queued == 1 && matches!(job.status, LearningStatus::Ready)
+            })
+    })
+    .await;
     assert!(
-        failed.scopes.iter().any(|job| job.scope == scope
-            && matches!(&job.status, LearningStatus::Failed { reason }
-                if reason == "Analyzer tried to update a rule that is not editable in this scope")),
-        "Exhausted corrections must report the analyzer's last violation, got {:?}",
-        failed
-            .scopes
+        requeued
+            .changes
             .iter()
-            .map(|job| &job.status)
-            .collect::<Vec<_>>()
+            .all(|change| change.operation.after != escape),
+        "A rejected reply must not produce a change"
     );
     let steering = fixture.connect_with_bootstrap().await.1.steering;
     assert_eq!(steering.len(), 2);
@@ -1886,4 +1866,145 @@ async fn project_scope_reconfiguration_undo_and_human_ownership_are_enforced() {
     next_frame_matching_on(&mut fixture.client, "feedback workbench removed", |frame| {
         frame.kind == FrameKind::ProjectNotify && matches!(frame.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == workbench.id)
     }).await;
+}
+
+fn host_queue(state: &SelfImprovementState) -> Option<(LearningStatus, usize)> {
+    state
+        .scopes
+        .iter()
+        .find(|scope| scope.scope == SteeringScope::Host)
+        .map(|scope| (scope.status.clone(), scope.queued))
+}
+/// Installs the analyzer run for one human input, then waits until that run
+/// settles. Scripts are installed only after the previous run settled, so an
+/// eager retry would launch without a script and add an extra usage row.
+async fn send(
+    fixture: &mut Fixture,
+    author: &TestAgent,
+    id: &str,
+    turn: MockTurn,
+    usage: usize,
+) -> SelfImprovementState {
+    fixture
+        .host_for_test()
+        .set_learning_script_for_test(MockScript::one(turn))
+        .expect("install analyzer run");
+    human(
+        fixture,
+        author,
+        id,
+        HumanInputAction::Send,
+        "Keep changes focused.",
+    )
+    .await;
+    fixture.finish_turn(author).await;
+    state(fixture, |state| {
+        state.usage.len() == usage
+            && host_queue(state).is_some_and(|(status, _)| status == LearningStatus::Ready)
+    })
+    .await
+}
+fn provider_error() -> MockTurn {
+    MockTurn::chat_events(vec![ChatEvent::MessageAdded(ChatMessage {
+        origin: None,
+        message_id: None,
+        timestamp: 0,
+        sender: MessageSender::Error,
+        content: "We're currently experiencing high demand".into(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })])
+}
+
+#[tokio::test]
+async fn analyzer_failures_retry_on_next_input_and_drop_after_final_attempt() {
+    let mut fixture = Fixture::new_with_mock_backend_for_enabled_backends(vec![
+        BackendKind::Claude,
+        BackendKind::Codex,
+    ])
+    .await;
+    let author = fixture.spawn("Author", "One-off task").await;
+    fixture.finish_turn(&author).await;
+    save(
+        &mut fixture,
+        LearningConfig::default(),
+        config(LearningMode::Suggest),
+    )
+    .await;
+    let learned = |id: &str, content: &str| LearningRule::Steering {
+        steering: Steering {
+            id: SteeringId(id.into()),
+            scope: SteeringScope::Host,
+            title: "Learned".into(),
+            content: content.into(),
+        },
+    };
+    let failed = send(&mut fixture, &author, "first", provider_error(), 1).await;
+    assert_eq!(
+        host_queue(&failed),
+        Some((LearningStatus::Ready, 1)),
+        "A provider error must keep learning ready with its input queued"
+    );
+    assert!(failed.error.is_none() && failed.changes.is_empty());
+    let retried = send(
+        &mut fixture,
+        &author,
+        "second",
+        MockTurn::text(response(vec![operation(
+            None,
+            learned("retried", "Keep changes focused."),
+            "first",
+        )])),
+        2,
+    )
+    .await;
+    assert_eq!(host_queue(&retried), Some((LearningStatus::Ready, 0)));
+    assert_eq!(
+        retried
+            .changes
+            .iter()
+            .map(|change| change.operation.origin_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["first"],
+        "The next input must retry the failed input in the same batch"
+    );
+
+    send(&mut fixture, &author, "third", provider_error(), 3).await;
+    let second_attempt = send(&mut fixture, &author, "fourth", provider_error(), 4).await;
+    assert_eq!(
+        host_queue(&second_attempt),
+        Some((LearningStatus::Ready, 2))
+    );
+    let dropped = send(&mut fixture, &author, "fifth", provider_error(), 5).await;
+    assert_eq!(
+        host_queue(&dropped),
+        Some((LearningStatus::Ready, 2)),
+        "Only the input on its third failed attempt is dropped; later inputs keep their own count"
+    );
+    let recovered = send(
+        &mut fixture,
+        &author,
+        "sixth",
+        MockTurn::text(response(vec![operation(
+            None,
+            learned("recovered", "Explain the user-visible result."),
+            "fourth",
+        )])),
+        6,
+    )
+    .await;
+    assert_eq!(
+        recovered
+            .changes
+            .iter()
+            .map(|change| change.operation.origin_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["fourth", "first"],
+        "Learning resumes with the remaining inputs after one is dropped"
+    );
+    assert_eq!(host_queue(&recovered), Some((LearningStatus::Ready, 0)));
 }

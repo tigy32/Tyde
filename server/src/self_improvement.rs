@@ -76,6 +76,9 @@ struct Worker {
 /// Replies the analyzer may give for one batch: the first answer plus
 /// corrections after server validation feedback.
 const ANALYZER_ATTEMPTS: u32 = 4;
+/// Failed analyzer runs an input may have before it is dropped, so one input
+/// that never analyzes cannot block or bill the queue forever.
+const INPUT_ATTEMPTS: u32 = 3;
 struct ConfigActor {
     settings: Arc<HostSettingsStore>,
     steering: Arc<SteeringStore>,
@@ -435,10 +438,7 @@ impl ConfigActor {
                     if let Err(reason) = self.finish(
                         scope,
                         batch_id,
-                        Err(
-                            "Host stopped during analysis; the batch was not applied or retried"
-                                .into(),
-                        ),
+                        Err("Host stopped during analysis".into()),
                         usage,
                         None,
                     ) {
@@ -585,6 +585,8 @@ impl ConfigActor {
                     },
                     pending: Vec::new(),
                     active: None,
+                    attempts: std::collections::HashMap::new(),
+                    awaiting_input: false,
                 });
             }
             let mut status = configuration_status(&config);
@@ -610,16 +612,17 @@ impl ConfigActor {
                 .as_ref()
                 .is_some_and(|batch| batch.config != config);
             if !matches!(status, LearningStatus::Ready) || changed {
-                if !matches!(status, LearningStatus::Ready) {
-                    job.pending.clear();
-                }
                 if let Some(batch) = job.active.take() {
+                    job.pending.splice(0..0, batch.inputs.iter().cloned());
                     interrupted.push((scope, batch));
                 }
+                if !matches!(status, LearningStatus::Ready) {
+                    job.pending.clear();
+                    job.attempts.clear();
+                    job.awaiting_input = false;
+                }
                 job.state.status = status;
-            } else if job.active.is_none()
-                && !matches!(job.state.status, LearningStatus::Failed { .. })
-            {
+            } else if job.active.is_none() {
                 job.state.status = status;
             }
         }
@@ -742,7 +745,7 @@ impl ConfigActor {
         next.seen.insert(input.id.clone());
         // Disabled scopes record the boundary, never its content, so enabling
         // cannot accidentally turn reconnect replay into historical analysis.
-        let mut over_budget = false;
+        let mut skipped = false;
         for job in &mut next.jobs {
             let eligible = match &job.state.scope {
                 SteeringScope::Host => true,
@@ -754,9 +757,9 @@ impl ConfigActor {
                     LearningStatus::Ready | LearningStatus::Running
                 )
             {
+                job.awaiting_input = false;
                 if input.message.len() > 16384 || job.pending.len() >= 128 {
-                    job.state.status = LearningStatus::Failed { reason: "Human input exceeded the analyzer queue budget; no input was truncated or replayed".into() };
-                    over_budget = true;
+                    skipped = true;
                 } else {
                     job.pending.push(input.clone());
                 }
@@ -773,9 +776,14 @@ impl ConfigActor {
                 .iter()
                 .filter(|job| !job.pending.is_empty())
                 .count(),
-            over_budget,
             "accepted human input at learning boundary"
         );
+        if skipped {
+            tracing::warn!(
+                bytes = input.message.len(),
+                "skipped human input that exceeds the analyzer queue budget"
+            );
+        }
         Ok(true)
     }
     fn rules(&self, scope: &SteeringScope) -> Result<Vec<LearningRule>, String> {
@@ -812,6 +820,7 @@ impl ConfigActor {
         for index in 0..self.journal.jobs.len() {
             if self.journal.jobs[index].pending.is_empty()
                 || self.journal.jobs[index].active.is_some()
+                || self.journal.jobs[index].awaiting_input
                 || !matches!(self.journal.jobs[index].state.status, LearningStatus::Ready)
             {
                 continue;
@@ -1000,12 +1009,7 @@ impl ConfigActor {
         self.save()?;
         let raw = match result {
             Ok(raw) => raw,
-            Err(reason) => {
-                self.journal.jobs[index].active = None;
-                self.journal.jobs[index].state.status = LearningStatus::Failed { reason };
-                self.save()?;
-                return Ok(());
-            }
+            Err(reason) => return self.fail_job(index, &reason),
         };
         let changes = match self.plan_changes(&scope, &batch, &raw) {
             Ok(changes) => changes,
@@ -1029,6 +1033,9 @@ impl ConfigActor {
             .collect::<Vec<_>>();
         self.journal.changes.extend(changes);
         self.journal.jobs[index].active = None;
+        for input in &batch.inputs {
+            self.journal.jobs[index].attempts.remove(&input.id);
+        }
         self.journal.jobs[index].state.status = LearningStatus::Ready;
         self.save()?;
         if batch.config.mode == LearningMode::Automatic && self.config(&scope)? == batch.config {
@@ -1204,10 +1211,9 @@ impl ConfigActor {
         }
     }
     fn fail_job(&mut self, index: usize, reason: &str) -> Result<(), String> {
-        self.journal.jobs[index].active = None;
-        self.journal.jobs[index].state.status = LearningStatus::Failed {
-            reason: reason.into(),
-        };
+        let job = &mut self.journal.jobs[index];
+        requeue(job, reason);
+        job.awaiting_input = true;
         self.save()
     }
     fn current(&self, rule: &LearningRule) -> Result<Option<LearningRule>, String> {
@@ -1471,11 +1477,7 @@ impl ConfigActor {
     }
     fn recover(&mut self) -> Result<(), String> {
         for job in &mut self.journal.jobs {
-            if matches!(&job.state.status, LearningStatus::Failed { reason } if reason == "Analyzer context reached its bounded input budget; disable and re-enable to start a new context")
-            {
-                job.state.status = LearningStatus::Ready;
-            }
-            if let Some(batch) = job.active.take() {
+            if let Some(batch) = job.active.clone() {
                 let recorded = self
                     .journal
                     .usage
@@ -1502,7 +1504,7 @@ impl ConfigActor {
                         },
                     });
                 }
-                job.state.status = LearningStatus::Failed { reason: "Host restarted during analysis; delivery and usage are uncertain. The interrupted batch will not be retried".into() };
+                requeue(job, "Host restarted during analysis");
             }
         }
         for index in 0..self.journal.changes.len() {
@@ -1529,6 +1531,30 @@ impl ConfigActor {
     }
 }
 
+/// Returns a failed batch's inputs to the front of the queue for another
+/// attempt, dropping each input once it has used every attempt.
+fn requeue(job: &mut LearningJob, reason: &str) {
+    let Some(batch) = job.active.take() else {
+        return;
+    };
+    let mut retry = Vec::with_capacity(batch.inputs.len());
+    for input in batch.inputs {
+        let attempts = job.attempts.entry(input.id.clone()).or_default();
+        *attempts += 1;
+        if *attempts < INPUT_ATTEMPTS {
+            retry.push(input);
+        } else {
+            job.attempts.remove(&input.id);
+            tracing::warn!(
+                attempts = INPUT_ATTEMPTS,
+                reason,
+                "dropped learning input after its final analyzer attempt"
+            );
+        }
+    }
+    job.pending.splice(0..0, retry);
+    job.state.status = LearningStatus::Ready;
+}
 pub(crate) fn configuration_status(config: &LearningConfig) -> LearningStatus {
     if !config.enabled {
         return LearningStatus::Disabled;

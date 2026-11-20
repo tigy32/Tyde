@@ -244,6 +244,13 @@ pub struct LearningJob {
     pub state: LearningScopeState,
     pub pending: Vec<AcceptedHumanInput>,
     pub active: Option<LearningBatch>,
+    /// Failed analyzer attempts for each queued input that has failed.
+    #[serde(default)]
+    pub attempts: std::collections::HashMap<HumanInputId, u32>,
+    /// Set after a failed attempt so the retry waits for the next human
+    /// input instead of immediately hitting a struggling provider.
+    #[serde(default)]
+    pub awaiting_input: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LearningJournal {
