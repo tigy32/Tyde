@@ -398,6 +398,10 @@ fn acp_agent_command_candidates(agent: &ConfiguredAcpAgent) -> Vec<String> {
             .iter()
             .map(|candidate| (*candidate).to_owned())
             .collect(),
+        AcpAdapterId::Antigravity => ANTIGRAVITY_CLI_CANDIDATES
+            .iter()
+            .map(|candidate| (*candidate).to_owned())
+            .collect(),
         AcpAdapterId::Stock => Vec::new(),
     }
 }

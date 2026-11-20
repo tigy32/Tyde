@@ -25,8 +25,8 @@ use crate::acp::adapter::{
 };
 use crate::acp::{
     AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, AcpStateActor, acp_mcp_servers_json,
-    extract_message_id, extract_text_from_update, extract_tool_call_id, map_plan_status,
-    parse_tool_call_completion, parse_tool_call_request,
+    extract_images_from_update, extract_message_id, extract_text_from_update, extract_tool_call_id,
+    map_plan_status, parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -356,9 +356,10 @@ impl KiroSession {
         initial_model: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         config: &ResolvedSpawnConfig,
+        storage_root: Option<&Path>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let (adapter, steering_content) = match agent {
-            Some(spec) => adapter_for_session(spec, config).await?,
+            Some(spec) => adapter_for_session(spec, config, storage_root).await?,
             None => (
                 kiro_adapter(None),
                 render_combined_spawn_instructions(config),
@@ -465,9 +466,10 @@ impl KiroSession {
                     model: None,
                     mode: None,
                     system_prompt: mode.steering_content,
+                    workspace_roots: configured_workspace_roots.as_deref().unwrap_or(&[]),
                     capabilities: &capabilities,
                 },
-            );
+            )?;
             let session_started = await_kiro_stage(
                 mode.probe_deadline,
                 KiroSchemaProbeStage::SessionNew,
@@ -503,6 +505,10 @@ impl KiroSession {
         let backend_kind = adapter.backend_kind();
         let initial_model = extract_current_model(&session_started);
         let initial_mode = extract_current_mode(&session_started, backend_kind);
+        let initial_thought_level = extract_current_thought_level(&session_started, backend_kind);
+        let known_thought_levels = extract_known_thought_levels(&session_started, backend_kind);
+        let thought_levels_by_model =
+            extract_thought_levels_by_model(&session_started, backend_kind);
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -519,10 +525,12 @@ impl KiroSession {
             bridge: Arc::new(bridge),
             emitter,
             shutting_down: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
             workspace_reload_in_progress: AtomicBool::new(false),
             capacity_probe,
             in_flight_prompts: AtomicUsize::new(0),
             native_sessions: AcpStateActor::spawn(NativeSessionRoutes::default()),
+            antigravity_continuation_wake: Arc::new(tokio::sync::Notify::new()),
             state: KiroStateActor::spawn(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -532,10 +540,17 @@ impl KiroSession {
                 startup_mcp_servers: mode.startup_mcp_servers.to_vec(),
                 model: initial_model,
                 mode: initial_mode,
+                thought_level: initial_thought_level,
                 known_models: extract_known_models(&session_started),
                 known_modes: extract_known_modes(&session_started, backend_kind),
+                known_thought_levels,
+                thought_levels_by_model,
                 model_config_id: acp_config_id(&session_started, "model"),
                 mode_config_id: acp_config_id(&session_started, acp_mode_category(backend_kind)),
+                thought_level_config_id: acp_thought_level_config_id(
+                    &session_started,
+                    backend_kind,
+                ),
                 slash_commands: None,
                 active_response: None,
                 active_stream_text: String::new(),
@@ -586,8 +601,12 @@ impl KiroSession {
                 .state
                 .with({
                     let emitter = Arc::clone(&inner.emitter);
+                    let adapter = Arc::clone(&inner.adapter);
                     move |state| {
                         emitter.session_started(&state.session_id);
+                        if let Some(notice) = adapter.startup_warning() {
+                            emitter.warning_message(notice);
+                        }
                     }
                 })
                 .await
@@ -627,10 +646,14 @@ struct KiroState {
     startup_mcp_servers: Vec<StartupMcpServer>,
     model: Option<String>,
     mode: Option<String>,
+    thought_level: Option<String>,
     known_models: Vec<Value>,
     known_modes: Vec<Value>,
+    known_thought_levels: Vec<Value>,
+    thought_levels_by_model: std::collections::BTreeMap<String, Vec<protocol::SelectOption>>,
     model_config_id: Option<String>,
     mode_config_id: Option<String>,
+    thought_level_config_id: Option<String>,
     /// The set last advertised on the stream. Consulted to deliver an invoking
     /// message verbatim, and so only a real change is published again.
     slash_commands: Option<SlashCommandCatalog>,
@@ -656,6 +679,7 @@ struct KiroState {
     replay_assistant_text: String,
     replay_assistant_reasoning: String,
     replay_assistant_message_emitted_since_user: bool,
+    replay_user_message_index: usize,
     replay_error: Option<String>,
     grok_turn_sequence: u64,
     native_child: bool,
@@ -678,6 +702,21 @@ struct KiroState {
     opencode_pending_response_usage: Option<Value>,
     opencode_cumulative_usage: TokenUsage,
     opencode_current_context_usage: Option<CurrentContextUsage>,
+    pending_questions: Vec<String>,
+    antigravity_turn_sequence: u64,
+    antigravity_emitted_request_ids: HashSet<String>,
+    antigravity_turn_requests: Vec<super::adapter::AcpRequestUsageRecord>,
+    antigravity_attached_request_ids: HashSet<String>,
+    antigravity_seen_terminal_responses: usize,
+    antigravity_active_response_start_terminal_responses: usize,
+    antigravity_active_provider_message_id: Option<String>,
+    antigravity_turn_spawned_children: usize,
+    antigravity_active_child_relays: usize,
+    antigravity_turn_baseline_system_messages: usize,
+    antigravity_turn_baseline_planner_responses: usize,
+    antigravity_turn_received_text_non_ws: usize,
+    antigravity_cumulative_usage: TokenUsage,
+    antigravity_current_context_usage: Option<CurrentContextUsage>,
     pending_compaction: Option<PendingGrokCompaction>,
 }
 
@@ -818,11 +857,13 @@ struct KiroInner {
     emitter: Arc<TurnEmitter>,
     state: KiroStateActor,
     shutting_down: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     failure_emitter: Arc<TurnEmitter>,
     workspace_reload_in_progress: AtomicBool,
     capacity_probe: Option<AcpSpawnSpec>,
     in_flight_prompts: AtomicUsize,
     native_sessions: AcpStateActor<NativeSessionRoutes>,
+    antigravity_continuation_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -1107,6 +1148,7 @@ impl KiroInner {
                     || inner.in_flight_prompts.load(Ordering::SeqCst) > 0
                     || state.active_response.is_some()
                     || !state.active_tool_contexts.is_empty()
+                    || !state.pending_questions.is_empty()
                     || state.pending_compaction.is_some()
                     || state.replaying_history
                     || running_children > 0
@@ -1125,11 +1167,15 @@ impl KiroInner {
                 }
                 state.prompt_admission.active =
                     Some((admission_id, KiroAdmissionPhase::Relocation));
+                let mut settings = json!({"model": state.model, "mode": state.mode});
+                if let Some(thought_level) = state.thought_level.as_ref() {
+                    settings["reasoning_effort"] = Value::String(thought_level.clone());
+                }
                 Ok((
                     state.session_id.clone(),
                     state.workspace_root.clone(),
                     state.startup_mcp_servers.clone(),
-                    json!({"model": state.model, "mode": state.mode}),
+                    settings,
                 ))
             })
             .await?;
@@ -1184,6 +1230,7 @@ impl KiroInner {
         let reload_guard = AcpWorkspaceReload(&self.workspace_reload_in_progress);
         tracing::info!(roots = roots.len(), backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
         let kind = self.adapter.backend_kind();
+        let mut antigravity_rollback: Option<(PathBuf, Vec<u8>, Vec<u8>)> = None;
         if kind == protocol::BackendKind::Grok {
             let mut children = self
                 .state
@@ -1262,23 +1309,91 @@ impl KiroInner {
                 .map_err(|error| {
                     crate::backend::WorkspaceRelocationError::OutcomeUnknown(error.into())
                 })?;
+        } else if kind == protocol::BackendKind::Antigravity {
+            self.bridge
+                .request("session/close", json!({"sessionId": session_id}))
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+            let spec = self
+                .adapter
+                .spawn_spec(&super::adapter::AcpSessionRoots {
+                    session_cwd: cwd.clone(),
+                    scope_root: cwd.clone(),
+                })
+                .map_err(crate::backend::WorkspaceRelocationError::Rejected)?;
+            let storage_root = self.adapter.storage_root();
+            let mut moved = None;
+            self.bridge
+                .restart_local(spec, async {
+                    moved = Some(
+                        crate::backend::antigravity::relocate_workspace_session(
+                            storage_root,
+                            &session_id,
+                            &previous_root,
+                            roots,
+                        )
+                        .await?,
+                    );
+                    Ok(())
+                })
+                .await
+                .map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+            antigravity_rollback = moved;
         }
-        let response = self
-            .bridge
-            .request(
-                "session/load",
-                json!({
-                    "sessionId": session_id,
-                    "cwd": tyde_process_env::launch::WorkspacePath::host(cwd).and_then(|path| path.execution_string())
-                        .map_err(crate::backend::WorkspaceRelocationError::Rejected)?,
-                    "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
-                }),
-            )
+        let steering = self
+            .state
+            .with(|state| state.steering_content.clone())
             .await;
-        let drained = self.bridge.sync_inbound().await;
-        let response =
-            response.map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
-        drained.map_err(crate::backend::WorkspaceRelocationError::OutcomeUnknown)?;
+        let load_result: Result<Value, String> = async {
+            if kind == protocol::BackendKind::Antigravity {
+                let initialized = self
+                    .bridge
+                    .request("initialize", acp_initialize_params(self.adapter.as_ref()))
+                    .await?;
+                let capabilities = parse_capabilities(&initialized);
+                authenticate_if_required(&self.bridge, &capabilities, self.adapter.as_ref())
+                    .await
+                    .map_err(String::from)?;
+            }
+            let mut load_params = json!({
+                "sessionId": session_id,
+                "cwd": tyde_process_env::launch::WorkspacePath::host(cwd).and_then(|path| path.execution_string())?,
+                "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
+            });
+            self.adapter.decorate_session_load(
+                &mut load_params,
+                &AcpRequestCtx {
+                    session_id: &session_id,
+                    model: None,
+                    mode: None,
+                    system_prompt: steering.as_deref(),
+                    workspace_roots: roots,
+                    capabilities: &self.capabilities,
+                },
+            )?;
+            let response = self.bridge.request("session/load", load_params).await?;
+            self.bridge.sync_inbound().await?;
+            Ok(response)
+        }
+        .await;
+        let response = match load_result {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some((db_path, before, after)) = antigravity_rollback
+                    && let Err(rollback_error) =
+                        crate::backend::antigravity::replace_antigravity_metadata(
+                            &db_path, &after, &before,
+                        )
+                {
+                    return Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(
+                        format!("{error}; metadata rollback also failed: {rollback_error}"),
+                    ));
+                }
+                return Err(crate::backend::WorkspaceRelocationError::OutcomeUnknown(
+                    error,
+                ));
+            }
+        };
         if let Some(reported) = response
             .get("cwd")
             .or_else(|| response.get("currentWorkingDirectory"))
@@ -1357,7 +1472,10 @@ impl KiroInner {
             })
             .await;
         if self.capacity_probe.is_none()
-            && self.adapter.backend_kind() != protocol::BackendKind::Grok
+            && !matches!(
+                self.adapter.backend_kind(),
+                protocol::BackendKind::Grok | protocol::BackendKind::Antigravity
+            )
         {
             emitter.on_backend_capacity(
                 self.adapter.backend_kind(),
@@ -1400,6 +1518,9 @@ impl KiroInner {
     async fn read_capacity(&self) -> BackendCapacityState {
         if self.adapter.backend_kind() == protocol::BackendKind::Grok {
             return self.read_grok_capacity().await;
+        }
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            return crate::backend::antigravity::read_capacity_out_of_band().await;
         }
         let Some(spec) = self.capacity_probe.as_ref() else {
             return BackendCapacityState::Unsupported {
@@ -1491,312 +1612,57 @@ impl KiroInner {
                 images,
                 origin,
             } => {
-                // ACP notifications carry a session id, not a prompt id. Drain
-                // the preceding prompt before admitting another into that stream.
-                let prompt_guard = self.state.admit(KiroAdmissionPhase::Prompt).await;
-                eprintln!(
-                    "TYDE ACP PROMPT ADMITTED cancelled={}",
-                    self.state.with(|state| state.cancelled).await
-                );
-                {
-                    self.state
-                        .with({
-                            let adapter = Arc::clone(&self.adapter);
-                            move |state| {
-                                state.provider_turn_quarantined = false;
-                                if adapter.backend_kind() == protocol::BackendKind::Grok {
-                                    state.grok_turn_sequence =
-                                        state.grok_turn_sequence.saturating_add(1);
-                                    state.grok_request_usages.clear();
-                                    state.grok_last_message_id = None;
-                                    state.grok_pending_response_end = None;
-                                }
-                                if adapter.backend_kind() == protocol::BackendKind::Opencode {
-                                    state.opencode_turn_sequence =
-                                        state.opencode_turn_sequence.saturating_add(1);
-                                    state.opencode_request_usages.clear();
-                                    state.opencode_provider_request_ids.clear();
-                                    state.opencode_active_provider_message_id = None;
-                                    state.opencode_pending_response_usage = None;
-                                }
+                let echo_user = origin != Some(protocol::MessageOrigin::HostRestart);
+                if matches!(origin, None | Some(protocol::MessageOrigin::User)) {
+                    let superseded = self
+                        .state
+                        .with(|state| {
+                            let ids = std::mem::take(&mut state.pending_questions);
+                            for id in &ids {
+                                state.active_tool_contexts.remove(id);
+                                state.completed_tool_call_ids.insert(id.clone());
                             }
+                            ids
                         })
-                        .await
-                }
-                if origin != Some(protocol::MessageOrigin::HostRestart) {
-                    self.emit_user_message_added(&message, images.as_deref(), origin);
-                }
-                self.emitter.typing_status_changed(true);
-
-                let (session_id, model, mode, steering, command_plan) = {
-                    self.state
-                        .with({
-                            let message = message.clone();
-                            let adapter = Arc::clone(&self.adapter);
-                            move |state| {
-                                let plan = state
-                                    .slash_commands
-                                    .as_ref()
-                                    .and_then(|catalog| catalog.invoked_by(&message))
-                                    .map(|command| {
-                                        adapter.plan_slash_command(
-                                            command,
-                                            &message,
-                                            &AcpSlashCommandCtx {
-                                                session_id: &state.session_id,
-                                                workspace_root: &state.workspace_root,
-                                                model: state.model.as_deref(),
-                                                mode: state.mode.as_deref(),
-                                                known_models: &state.known_models,
-                                                usage: &state.opencode_cumulative_usage,
-                                                context_usage: state
-                                                    .opencode_current_context_usage
-                                                    .as_ref(),
-                                            },
-                                        )
-                                    });
-                                (
-                                    state.session_id.clone(),
-                                    state.model.clone(),
-                                    state.mode.clone(),
-                                    state.steering_content.clone(),
-                                    plan,
-                                )
-                            }
-                        })
-                        .await
-                };
-
-                let invokes_command = match command_plan {
-                    None => false,
-                    Some(AcpSlashCommandPlan::Prompt) => true,
-                    Some(AcpSlashCommandPlan::Request {
-                        method,
-                        params,
-                        render,
-                    }) => {
-                        let reply = match self.bridge.request(method, params).await {
-                            Ok(result) => render(&result),
-                            Err(err) => {
-                                self.abort_active_turn(&format!(
-                                    "{} request failed: {err}",
-                                    self.adapter.display_name()
-                                ))
-                                .await;
-                                drop(prompt_guard);
-                                return Ok(());
-                            }
-                        };
-                        self.reply_to_slash_command(reply, model.as_deref());
-                        drop(prompt_guard);
-                        return Ok(());
-                    }
-                    Some(AcpSlashCommandPlan::Reply(reply)) => {
-                        self.reply_to_slash_command(reply, model.as_deref());
-                        drop(prompt_guard);
-                        return Ok(());
-                    }
-                };
-
-                let effective_message = if invokes_command {
-                    message.clone()
-                } else {
-                    let steered = if let Some(ref s) = steering {
-                        format!("{}\n\n{}", s, message)
-                    } else {
-                        message.clone()
-                    };
-                    crate::backend::workspace_prompt(
-                        &steered,
-                        self.state
-                            .with(|state| state.workspace_roots.clone())
-                            .await
-                            .as_deref(),
-                    )?
-                };
-                let mut prompt_blocks = vec![json!({
-                    "type": "text",
-                    "text": effective_message,
-                })];
-
-                if let Some(imgs) = images {
-                    for image in imgs {
-                        prompt_blocks.push(json!({
-                            "type": "image",
-                            "mimeType": image.media_type,
-                            "data": image.data,
-                        }));
-                    }
-                }
-
-                let mut params = json!({
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                });
-
-                self.adapter.decorate_prompt(
-                    &mut params,
-                    &AcpRequestCtx {
-                        session_id: &session_id,
-                        model: model.as_deref(),
-                        mode: mode.as_deref(),
-                        system_prompt: steering.as_deref(),
-                        capabilities: &self.capabilities,
-                    },
-                );
-
-                self.state.with(|state| state.cancelled = false).await;
-
-                let response = match self.request_prompt_with_retry(params).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        // CancelConversation sets `cancelled = true` before sending
-                        // session/cancel. If the prompt error is just the stale
-                        // rejection of a cancelled request, swallow it — the cancel
-                        // handler already emitted OperationCancelled + TypingStatusChanged.
-                        if self.state.with(|state| state.cancelled).await {
-                            self.bridge.sync_inbound().await?;
-                            return Ok(());
-                        }
-                        let rejected = matches!(err, AcpRequestError::Rejected(_));
-                        tracing::warn!(
-                            backend = self.adapter.display_name(),
-                            rejected,
-                            error = %err,
-                            "ACP prompt failed"
+                        .await;
+                    for tool_call_id in superseded {
+                        self.emitter.cancel_pending_tool(
+                            &tool_call_id,
+                            "Question superseded by a new user message",
                         );
-                        if rejected {
-                            self.bridge.sync_inbound().await?;
-                        }
-                        if !self.shutting_down.load(Ordering::Acquire) {
-                            self.abort_active_turn(&format!(
-                                "{} request failed: {err}",
-                                self.adapter.display_name()
-                            ))
-                            .await;
-                        }
-                        return if rejected {
-                            Ok(())
-                        } else {
-                            Err(err.to_string())
-                        };
                     }
-                };
-
-                if let Err(err) = self.bridge.sync_inbound().await {
-                    if !self.shutting_down.load(Ordering::Acquire) {
-                        self.abort_active_turn(&format!(
-                            "{} response stream failed: {err}",
-                            self.adapter.display_name()
-                        ))
-                        .await;
-                    }
-                    return Err(err);
                 }
-
-                if self
-                    .state
-                    .with(|state| state.provider_turn_quarantined)
-                    .await
-                {
-                    return Ok(());
-                }
-
-                if let Some(model) = extract_current_model(&response) {
-                    self.state
-                        .with({
-                            let model = model.clone();
-                            move |state| {
-                                state.model = Some(model);
-                            }
-                        })
-                        .await
-                }
-                if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
-                    self.state
-                        .with({
-                            let mode = mode.clone();
-                            move |state| {
-                                state.mode = Some(mode);
-                            }
-                        })
-                        .await
-                }
-                let known_models = extract_known_models(&response);
-                if !known_models.is_empty() {
-                    self.state
-                        .with({
-                            let known_models = known_models.clone();
-                            move |state| {
-                                state.known_models = known_models;
-                            }
-                        })
-                        .await
-                }
-                let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
-                if !known_modes.is_empty() {
-                    self.state
-                        .with({
-                            let known_modes = known_modes.clone();
-                            move |state| {
-                                state.known_modes = known_modes;
-                            }
-                        })
-                        .await
-                }
-
-                let stop_reason = response
-                    .get("stopReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-
-                if stop_reason == "cancelled" {
-                    // If the user initiated the cancel, `CancelConversation` already
-                    // fired OperationCancelled + TypingStatusChanged — don't double-emit.
-                    let user_initiated = { self.state.with(|state| state.cancelled).await };
-                    if !user_initiated {
-                        self.abort_active_turn("Operation cancelled").await;
-                    }
-                    return Ok(());
-                }
-
-                if stop_reason == "failed" || stop_reason == "error" {
-                    let message = response
-                        .get("error")
-                        .and_then(|v| v.get("message"))
-                        .and_then(Value::as_str)
-                        .or_else(|| response.get("message").and_then(Value::as_str))
-                        .unwrap_or("Agent prompt failed")
-                        .to_string();
-                    self.abort_active_turn(&message).await;
-                    self.emitter.backend_error(&message);
-                    return Ok(());
-                }
-
-                if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
-                    let message_id = self
-                        .finalize_active_stream_if_any(Some(response.clone()), false)
-                        .await;
-                    self.record_opencode_request(Some(&response), message_id)
-                        .await;
-                    self.finalize_opencode_turn().await;
-                } else {
-                    self.finalize_active_stream_if_any(Some(response), true)
-                        .await;
-                }
-                self.spawn_capacity_refresh(false).await;
-                drop(prompt_guard);
-                Ok(())
+                self.send_prompt(origin, message, images, echo_user).await
             }
             SessionCommand::CancelConversation => {
-                let session_id = self
+                let (session_id, pending_questions, turn_active) = self
                     .state
                     .with(|state| {
                         state.cancelled = true;
-                        state.session_id.clone()
+                        let questions = std::mem::take(&mut state.pending_questions);
+                        for id in &questions {
+                            state.active_tool_contexts.remove(id);
+                            state.completed_tool_call_ids.insert(id.clone());
+                        }
+                        let active = state.prompt_admission.active.is_some()
+                            || state.active_response.is_some()
+                            || !state.active_tool_contexts.is_empty();
+                        (state.session_id.clone(), questions, active)
                     })
                     .await;
+                for tool_call_id in &pending_questions {
+                    self.emitter.tool_completed(
+                        tool_call_id,
+                        ToolExecutionOutcome::Cancelled {
+                            message: "Question cancelled".to_owned(),
+                        },
+                    );
+                }
+                if !turn_active && !pending_questions.is_empty() {
+                    self.state.with(|state| state.cancelled = false).await;
+                    self.emitter.operation_cancelled("Operation cancelled");
+                    return Ok(());
+                }
                 self.bridge
                     .trace_terminal_state("cancelling ACP conversation")
                     .await;
@@ -1811,17 +1677,16 @@ impl KiroInner {
                     Ok(())
                 };
                 self.abort_active_turn("Operation cancelled").await;
+                self.antigravity_continuation_wake.notify_waiters();
                 result.and(terminal_result)
             }
             SessionCommand::GetSettings => {
                 self.state
                     .with({
                         let emitter = Arc::clone(&self.emitter);
+                        let kind = self.adapter.backend_kind();
                         move |state| {
-                            emitter.settings(json!({
-                                "model": state.model,
-                                "mode": state.mode,
-                            }));
+                            emitter.settings(acp_settings_json(state, kind));
                             Ok(())
                         }
                     })
@@ -1871,6 +1736,7 @@ impl KiroInner {
                                     ),
                                 };
                                 let response = self.bridge.request(method, params).await?;
+                                self.bridge.sync_inbound().await?;
                                 self.state
                                     .with({
                                         let response = response.clone();
@@ -1916,6 +1782,7 @@ impl KiroInner {
                                 ),
                             };
                             let response = self.bridge.request(method, params).await?;
+                            self.bridge.sync_inbound().await?;
                             self.state
                                 .with({
                                     let response = response.clone();
@@ -1933,22 +1800,483 @@ impl KiroInner {
                             })
                             .await
                     }
+                    if let Some(effort_value) = obj.get("reasoning_effort") {
+                        let next_effort = normalize_optional_string(effort_value);
+                        let (session_id, config_id, allowed_efforts) = self
+                            .state
+                            .with(|state| {
+                                let allowed: Vec<String> = state
+                                    .model
+                                    .as_deref()
+                                    .and_then(|model| state.thought_levels_by_model.get(model))
+                                    .map(|options| {
+                                        options.iter().map(|option| option.value.clone()).collect()
+                                    })
+                                    .unwrap_or_else(|| {
+                                        state
+                                            .known_thought_levels
+                                            .iter()
+                                            .filter_map(|entry| {
+                                                entry
+                                                    .get("id")
+                                                    .and_then(Value::as_str)
+                                                    .map(str::to_owned)
+                                            })
+                                            .collect()
+                                    });
+                                (
+                                    state.session_id.clone(),
+                                    state.thought_level_config_id.clone(),
+                                    allowed,
+                                )
+                            })
+                            .await;
+                        if let Some(effort_id) = next_effort.clone() {
+                            let Some(config_id) = config_id else {
+                                return Err(
+                                    "Current model does not support configurable thinking level"
+                                        .to_owned(),
+                                );
+                            };
+                            if !allowed_efforts.is_empty()
+                                && !allowed_efforts.iter().any(|allowed| allowed == &effort_id)
+                            {
+                                return Err(format!(
+                                    "Thinking level '{effort_id}' is not supported by the current model"
+                                ));
+                            }
+                            let response = self
+                                .bridge
+                                .request(
+                                    "session/set_config_option",
+                                    json!({
+                                        "sessionId": session_id,
+                                        "configId": config_id,
+                                        "value": effort_id,
+                                    }),
+                                )
+                                .await?;
+                            self.bridge.sync_inbound().await?;
+                            self.state
+                                .with({
+                                    let response = response.clone();
+                                    let kind = self.adapter.backend_kind();
+                                    move |state| apply_acp_config_options(state, &response, kind)
+                                })
+                                .await;
+                        }
+                        self.state
+                            .with({
+                                let next_effort = next_effort.clone();
+                                move |state| {
+                                    if next_effort.is_none()
+                                        || state.thought_level_config_id.is_some()
+                                    {
+                                        state.thought_level = next_effort;
+                                    }
+                                }
+                            })
+                            .await;
+                    }
                 }
 
                 self.state
                     .with({
                         let emitter = Arc::clone(&self.emitter);
+                        let kind = self.adapter.backend_kind();
                         move |state| {
-                            emitter.settings(json!({
-                                "model": state.model,
-                                "mode": state.mode,
-                            }));
+                            emitter.settings(acp_settings_json(state, kind));
                             Ok(())
                         }
                     })
                     .await
             }
         }
+    }
+
+    async fn send_prompt(
+        self: &Arc<Self>,
+        origin: Option<protocol::MessageOrigin>,
+        message: String,
+        images: Option<Vec<crate::backend::subprocess::ImageAttachment>>,
+        echo_user_message: bool,
+    ) -> Result<(), String> {
+        let prompt_guard = self.state.admit(KiroAdmissionPhase::Prompt).await;
+        eprintln!(
+            "TYDE ACP PROMPT ADMITTED cancelled={}",
+            self.state.with(|state| state.cancelled).await
+        );
+        {
+            self.state
+                .with({
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        state.provider_turn_quarantined = false;
+                        if adapter.backend_kind() == protocol::BackendKind::Grok {
+                            state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
+                            state.grok_request_usages.clear();
+                            state.grok_last_message_id = None;
+                            state.grok_pending_response_end = None;
+                        }
+                        if adapter.backend_kind() == protocol::BackendKind::Opencode {
+                            state.opencode_turn_sequence =
+                                state.opencode_turn_sequence.saturating_add(1);
+                            state.opencode_request_usages.clear();
+                            state.opencode_provider_request_ids.clear();
+                            state.opencode_active_provider_message_id = None;
+                            state.opencode_pending_response_usage = None;
+                        }
+                        if adapter.backend_kind() == protocol::BackendKind::Antigravity {
+                            state.antigravity_turn_sequence =
+                                state.antigravity_turn_sequence.saturating_add(1);
+                            state.antigravity_turn_requests.clear();
+                            state.antigravity_attached_request_ids.clear();
+                            state.antigravity_active_provider_message_id = None;
+                            state.antigravity_turn_spawned_children = 0;
+                            state.antigravity_turn_received_text_non_ws = 0;
+                        }
+                    }
+                })
+                .await
+        }
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            let sid = self.state.with(|state| state.session_id.clone()).await;
+            let baseline = crate::backend::antigravity::antigravity_turn_baseline(
+                self.adapter.storage_root(),
+                &sid,
+            )
+            .await?;
+            self.state
+                .with(move |state| {
+                    state.antigravity_turn_baseline_system_messages = baseline.system_messages;
+                    state.antigravity_turn_baseline_planner_responses = baseline.planner_responses;
+                    state.antigravity_seen_terminal_responses = baseline.terminal_responses;
+                })
+                .await;
+        }
+        if echo_user_message {
+            self.emit_user_message_added(&message, images.as_deref(), origin);
+        }
+        self.emitter.typing_status_changed(true);
+
+        let (session_id, model, mode, steering, workspace_roots, command_plan) = {
+            self.state
+                .with({
+                    let message = message.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    move |state| {
+                        let is_antigravity =
+                            adapter.backend_kind() == protocol::BackendKind::Antigravity;
+                        let plan = state
+                            .slash_commands
+                            .as_ref()
+                            .and_then(|catalog| catalog.invoked_by(&message))
+                            .map(|command| {
+                                adapter.plan_slash_command(
+                                    command,
+                                    &message,
+                                    &AcpSlashCommandCtx {
+                                        session_id: &state.session_id,
+                                        workspace_root: &state.workspace_root,
+                                        model: state.model.as_deref(),
+                                        mode: state.mode.as_deref(),
+                                        known_models: &state.known_models,
+                                        usage: if is_antigravity {
+                                            &state.antigravity_cumulative_usage
+                                        } else {
+                                            &state.opencode_cumulative_usage
+                                        },
+                                        context_usage: if is_antigravity {
+                                            state.antigravity_current_context_usage.as_ref()
+                                        } else {
+                                            state.opencode_current_context_usage.as_ref()
+                                        },
+                                    },
+                                )
+                            });
+                        (
+                            state.session_id.clone(),
+                            state.model.clone(),
+                            state.mode.clone(),
+                            state.steering_content.clone(),
+                            state.workspace_roots.clone(),
+                            plan,
+                        )
+                    }
+                })
+                .await
+        };
+
+        let invokes_command = match command_plan {
+            None => false,
+            Some(AcpSlashCommandPlan::Prompt) => true,
+            Some(AcpSlashCommandPlan::Request {
+                method,
+                params,
+                render,
+            }) => {
+                let reply = match self.bridge.request(method, params).await {
+                    Ok(result) => render(&result),
+                    Err(err) => {
+                        self.abort_active_turn(&format!(
+                            "{} request failed: {err}",
+                            self.adapter.display_name()
+                        ))
+                        .await;
+                        drop(prompt_guard);
+                        return Ok(());
+                    }
+                };
+                self.reply_to_slash_command(reply, model.as_deref());
+                drop(prompt_guard);
+                return Ok(());
+            }
+            Some(AcpSlashCommandPlan::Reply(reply)) => {
+                self.reply_to_slash_command(reply, model.as_deref());
+                drop(prompt_guard);
+                return Ok(());
+            }
+        };
+
+        let effective_message = if invokes_command {
+            message.clone()
+        } else {
+            let steered = if self.adapter.delivers_system_prompt_natively() {
+                message.clone()
+            } else if let Some(ref s) = steering {
+                format!("{}\n\n{}", s, message)
+            } else {
+                message.clone()
+            };
+            crate::backend::workspace_prompt(&steered, workspace_roots.as_deref())?
+        };
+        let mut prompt_blocks = vec![json!({
+            "type": "text",
+            "text": effective_message,
+        })];
+
+        if let Some(imgs) = images {
+            for image in imgs {
+                prompt_blocks.push(json!({
+                    "type": "image",
+                    "mimeType": image.media_type,
+                    "data": image.data,
+                }));
+            }
+        }
+
+        let mut params = json!({
+            "sessionId": session_id,
+            "prompt": prompt_blocks,
+        });
+
+        let roots_slice = workspace_roots.as_deref().unwrap_or(&[]);
+        self.adapter.decorate_prompt(
+            &mut params,
+            &AcpRequestCtx {
+                session_id: &session_id,
+                model: model.as_deref(),
+                mode: mode.as_deref(),
+                system_prompt: steering.as_deref(),
+                workspace_roots: roots_slice,
+                capabilities: &self.capabilities,
+            },
+        );
+
+        self.state.with(|state| state.cancelled = false).await;
+
+        let response = match self.request_prompt_with_retry(params).await {
+            Ok(value) => value,
+            Err(err) => {
+                if self.state.with(|state| state.cancelled).await {
+                    self.bridge.sync_inbound().await?;
+                    return Ok(());
+                }
+                let rejected = matches!(err, AcpRequestError::Rejected(_));
+                tracing::warn!(
+                    backend = self.adapter.display_name(),
+                    rejected,
+                    error = %err,
+                    "ACP prompt failed"
+                );
+                if rejected {
+                    self.bridge.sync_inbound().await?;
+                }
+                if !self.shutting_down.load(Ordering::Acquire) {
+                    self.abort_active_turn(&format!(
+                        "{} request failed: {err}",
+                        self.adapter.display_name()
+                    ))
+                    .await;
+                }
+                return if rejected {
+                    Ok(())
+                } else {
+                    Err(err.to_string())
+                };
+            }
+        };
+
+        if let Err(err) = self.bridge.sync_inbound().await {
+            if !self.shutting_down.load(Ordering::Acquire) {
+                self.abort_active_turn(&format!(
+                    "{} response stream failed: {err}",
+                    self.adapter.display_name()
+                ))
+                .await;
+            }
+            return Err(err);
+        }
+
+        if self
+            .state
+            .with(|state| state.provider_turn_quarantined)
+            .await
+        {
+            return Ok(());
+        }
+
+        if let Some(model) = extract_current_model(&response) {
+            self.state
+                .with({
+                    let model = model.clone();
+                    move |state| {
+                        state.model = Some(model);
+                    }
+                })
+                .await
+        }
+        if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
+            self.state
+                .with({
+                    let mode = mode.clone();
+                    move |state| {
+                        state.mode = Some(mode);
+                    }
+                })
+                .await
+        }
+        let known_models = extract_known_models(&response);
+        if !known_models.is_empty() {
+            self.state
+                .with({
+                    let known_models = known_models.clone();
+                    move |state| {
+                        state.known_models = known_models;
+                    }
+                })
+                .await
+        }
+        let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
+        if !known_modes.is_empty() {
+            self.state
+                .with({
+                    let known_modes = known_modes.clone();
+                    move |state| {
+                        state.known_modes = known_modes;
+                    }
+                })
+                .await
+        }
+
+        let stop_reason = response
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if stop_reason == "cancelled" {
+            let user_initiated = { self.state.with(|state| state.cancelled).await };
+            if !user_initiated {
+                self.abort_active_turn("Operation cancelled").await;
+            }
+            return Ok(());
+        }
+
+        if stop_reason == "failed" || stop_reason == "error" {
+            let message = response
+                .get("error")
+                .and_then(|v| v.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| response.get("message").and_then(Value::as_str))
+                .unwrap_or("Agent prompt failed")
+                .to_string();
+            self.abort_active_turn(&message).await;
+            self.emitter.backend_error(&message);
+            return Ok(());
+        }
+
+        if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            let message_id = self
+                .finalize_active_stream_if_any(Some(response.clone()), false)
+                .await;
+            self.record_opencode_request(Some(&response), message_id)
+                .await;
+            self.finalize_opencode_turn().await;
+        } else if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            let (target_provider_id, had_tool_calls) = self
+                .state
+                .with(|state| {
+                    (
+                        state.antigravity_active_provider_message_id.take(),
+                        !state.active_stream_tool_calls.is_empty(),
+                    )
+                })
+                .await;
+            let message_id = self.finalize_active_stream_if_any(None, false).await;
+            self.sync_antigravity_requests(message_id, target_provider_id, had_tool_calls, true)
+                .await;
+            let open_tools = self.emitter.open_foreground_tool_ids();
+            let (sid, spawned_children, baseline_system_messages) = self
+                .state
+                .with(|state| {
+                    (
+                        state.session_id.clone(),
+                        state.antigravity_turn_spawned_children,
+                        state.antigravity_turn_baseline_system_messages,
+                    )
+                })
+                .await;
+            let storage_root = self.adapter.storage_root();
+            let required_system_messages: Result<Option<usize>, String> = if !open_tools.is_empty()
+            {
+                crate::backend::antigravity::antigravity_turn_baseline(storage_root, &sid)
+                    .await
+                    .map(|current| {
+                        Some(
+                            current
+                                .system_messages
+                                .saturating_add(1)
+                                .max(baseline_system_messages.saturating_add(spawned_children)),
+                        )
+                    })
+            } else if spawned_children > 0 {
+                Ok(Some(
+                    baseline_system_messages.saturating_add(spawned_children),
+                ))
+            } else {
+                Ok(None)
+            };
+            match required_system_messages {
+                Ok(Some(required)) => {
+                    if let Err(error) = self.wait_for_antigravity_continuation(required).await {
+                        drop(prompt_guard);
+                        return Err(error);
+                    }
+                }
+                Ok(None) => self.emitter.typing_status_changed(false),
+                Err(error) => {
+                    self.abort_active_turn(&error).await;
+                    self.emitter.backend_error(&error);
+                }
+            }
+        } else {
+            self.finalize_active_stream_if_any(Some(response), true)
+                .await;
+        }
+        self.spawn_capacity_refresh(false).await;
+        drop(prompt_guard);
+        Ok(())
     }
 
     /// Enumerates sessions with the spec's `session/list`, following
@@ -2075,7 +2403,7 @@ impl KiroInner {
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
-        let (cwd, startup_mcp_servers) = {
+        let (cwd, workspace_roots, steering, startup_mcp_servers) = {
             self.state
                 .with({
                     let session_id = session_id.clone();
@@ -2088,6 +2416,7 @@ impl KiroInner {
                         state.replay_assistant_text.clear();
                         state.replay_assistant_reasoning.clear();
                         state.replay_assistant_message_emitted_since_user = false;
+                        state.replay_user_message_index = 0;
                         state.replay_error = None;
                         tracing::info!(
                             target: "tyde_acp_resume",
@@ -2099,6 +2428,8 @@ impl KiroInner {
                         );
                         (
                             state.workspace_root.clone(),
+                            state.workspace_roots.clone(),
+                            state.steering_content.clone(),
                             state.startup_mcp_servers.clone(),
                         )
                     }
@@ -2116,18 +2447,23 @@ impl KiroInner {
         // Agent-specific pre-load cleanup (Kiro's stale `.lock` files).
         let _ = self.adapter.before_session_load(&session_id).await;
 
-        let response = match self
-            .bridge
-            .request(
-                "session/load",
-                json!({
-                    "sessionId": session_id,
-                    "cwd": tyde_process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?,
-                    "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
-                }),
-            )
-            .await
-        {
+        let mut load_params = json!({
+            "sessionId": session_id,
+            "cwd": tyde_process_env::launch::WorkspacePath::host(&cwd)?.execution_string()?,
+            "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
+        });
+        self.adapter.decorate_session_load(
+            &mut load_params,
+            &AcpRequestCtx {
+                session_id: &session_id,
+                model: None,
+                mode: None,
+                system_prompt: steering.as_deref(),
+                workspace_roots: workspace_roots.as_deref().unwrap_or(&[]),
+                capabilities: &self.capabilities,
+            },
+        )?;
+        let response = match self.bridge.request("session/load", load_params).await {
             Ok(response) => response,
             Err(err) => {
                 self.state
@@ -2165,6 +2501,7 @@ impl KiroInner {
                         state.replay_assistant_text.clear();
                         state.replay_assistant_reasoning.clear();
                         state.replay_assistant_message_emitted_since_user = false;
+                        state.replay_user_message_index = 0;
                         state.replay_error = None;
                         emitter.typing_status_changed(false);
                     }
@@ -2258,6 +2595,28 @@ std::ops::ControlFlow::Continue(())
         }
 
         self.flush_replay_assistant_message().await;
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            let prior = self
+                .adapter
+                .request_usages_for_session(&session_id, &cwd, None)
+                .await?;
+            self.state
+                .with(move |state| {
+                    state.antigravity_emitted_request_ids.clear();
+                    state.antigravity_attached_request_ids.clear();
+                    state.antigravity_cumulative_usage = TokenUsage::default();
+                    state.antigravity_seen_terminal_responses = prior.terminal_responses;
+                    for record in prior.records {
+                        if state
+                            .antigravity_emitted_request_ids
+                            .insert(record.provider_message_id)
+                        {
+                            add_token_usage(&mut state.antigravity_cumulative_usage, &record.usage);
+                        }
+                    }
+                })
+                .await;
+        }
         {
             self.state.with({
                 let emitter = Arc::clone(&self.emitter);
@@ -2661,7 +3020,17 @@ std::ops::ControlFlow::Continue(())
 
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.antigravity_continuation_wake.notify_waiters();
 
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            let session_id = self.state.with(|state| state.session_id.clone()).await;
+            if !session_id.is_empty() {
+                let _ = self
+                    .bridge
+                    .request("session/close", json!({ "sessionId": session_id }))
+                    .await;
+            }
+        }
         self.bridge.shutdown().await;
         let mut children = self
             .state
@@ -2702,12 +3071,14 @@ std::ops::ControlFlow::Continue(())
                 self.emitter.subprocess_stderr(&line);
             }
             AcpInbound::Closed { exit_code } => {
+                self.closed.store(true, Ordering::Release);
                 let code = if self.shutting_down.load(Ordering::Acquire) {
                     Some(0)
                 } else {
                     exit_code
                 };
                 self.fail_pending_grok_exit_plan_mode().await;
+                self.antigravity_continuation_wake.notify_waiters();
                 self.emitter.subprocess_exit(code);
             }
             AcpInbound::Notification { method, params } => {
@@ -2766,6 +3137,13 @@ std::ops::ControlFlow::Continue(())
                 .get("sessionId")
                 .or_else(|| params.get("session_id"))
                 .and_then(Value::as_str);
+            let obsolete_startup_update_kind = params
+                .get("update")
+                .unwrap_or(params)
+                .get("sessionUpdate")
+                .or_else(|| params.get("update").unwrap_or(params).get("session_update"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let foreign = {
                 match self.state.with({
                     let actual = actual.map(str::to_owned);
@@ -2775,15 +3153,25 @@ std::ops::ControlFlow::Continue(())
 let actual = actual.as_deref();
 let method = &method;
 std::ops::ControlFlow::Continue({
-                let obsolete_kiro_commands = adapter.backend_kind()
-                    == protocol::BackendKind::Kiro
-                    && method == "_kiro.dev/commands/available"
-                    && state.replaying_history
+                let obsolete_startup_metadata = state.replaying_history
                     && actual == Some(state.session_id.as_str())
                     && state
                         .replay_session_id
                         .as_deref()
-                        .is_some_and(|requested| requested != state.session_id);
+                        .is_some_and(|requested| requested != state.session_id)
+                    && ((adapter.backend_kind() == protocol::BackendKind::Kiro
+                        && method == "_kiro.dev/commands/available")
+                        || (adapter.backend_kind() == protocol::BackendKind::Antigravity
+                            && method == "session/update"
+                            && matches!(
+                                obsolete_startup_update_kind.as_deref(),
+                                Some(
+                                    "available_commands_update"
+                                        | "config_option_update"
+                                        | "usage_update"
+                                        | "session_info_update"
+                                )
+                            )));
                 let foreign = actual
                     .filter(|actual| {
                         *actual != state.session_id
@@ -2799,8 +3187,8 @@ std::ops::ControlFlow::Continue({
                     requested_identity_present = state.replay_session_id.is_some(),
                     matches_current = actual == Some(state.session_id.as_str()),
                     matches_requested = actual.is_some() && actual == state.replay_session_id.as_deref(),
-                    decision = if obsolete_kiro_commands {
-                        "drop_obsolete_kiro_commands"
+                    decision = if obsolete_startup_metadata {
+                        "drop_obsolete_startup_metadata"
                     } else if foreign.is_some() {
                         "foreign_route"
                     } else {
@@ -2809,8 +3197,8 @@ std::ops::ControlFlow::Continue({
                     "ACP notification identity routing before normalization"
                 );
                 // session/new metadata must not replace the requested session's
-                // command state: Kiro normalization mutates its subcommand table.
-                if obsolete_kiro_commands {
+                // command or config state while session/load is replaying.
+                if obsolete_startup_metadata {
                     return std::ops::ControlFlow::Break(());
                 }
                 foreign
@@ -3030,10 +3418,12 @@ std::ops::ControlFlow::Continue({
             )),
             state: KiroStateActor::spawn(state),
             shutting_down: Arc::clone(&self.shutting_down),
+            closed: Arc::clone(&self.closed),
             workspace_reload_in_progress: AtomicBool::new(false),
             capacity_probe: None,
             in_flight_prompts: AtomicUsize::new(0),
             native_sessions: self.native_sessions.clone(),
+            antigravity_continuation_wake: Arc::new(tokio::sync::Notify::new()),
         });
         self.state.apply({
             let child = Arc::clone(&child);
@@ -3253,9 +3643,10 @@ std::ops::ControlFlow::Continue({
         workspace_root: &str,
     ) -> Value {
         let wire_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
-        let normalized_kind = if self.adapter.backend_kind() == protocol::BackendKind::Grok
-            && (tool_name == "spawn_subagent"
-                || super::adapters::grok::is_exit_plan_mode_tool(tool_name))
+        let normalized_kind = if self.adapter.backend_kind() == protocol::BackendKind::Antigravity
+            || (self.adapter.backend_kind() == protocol::BackendKind::Grok
+                && (tool_name == "spawn_subagent"
+                    || super::adapters::grok::is_exit_plan_mode_tool(tool_name)))
         {
             tool_name.to_owned()
         } else if wire_kind == "other"
@@ -3361,21 +3752,42 @@ std::ops::ControlFlow::Continue({
             "tool_call_update" => self.handle_tool_call_update(update).await,
             "error" => self.handle_error_notification(update).await,
             "plan" => self.handle_plan_update(update),
-            "usage_update" if self.adapter.backend_kind() == protocol::BackendKind::Opencode => {
+            "usage_update"
+                if matches!(
+                    self.adapter.backend_kind(),
+                    protocol::BackendKind::Opencode | protocol::BackendKind::Antigravity
+                ) =>
+            {
                 let used = update.get("used").and_then(Value::as_u64);
                 let size = update.get("size").and_then(Value::as_u64);
+                let mut sync_antigravity = false;
                 if let (Some(input_tokens), Some(context_window)) = (used, size)
                     && context_window >= input_tokens
                 {
-                    self.state
+                    let kind = self.adapter.backend_kind();
+                    sync_antigravity = self
+                        .state
                         .with(move |state| {
-                            state.opencode_current_context_usage =
-                                Some(CurrentContextUsage::Known {
-                                    input_tokens,
-                                    context_window,
-                                })
+                            let context = CurrentContextUsage::Known {
+                                input_tokens,
+                                context_window,
+                            };
+                            if kind == protocol::BackendKind::Antigravity {
+                                state.antigravity_current_context_usage = Some(context);
+                                return !state.replaying_history;
+                            } else {
+                                state.opencode_current_context_usage = Some(context);
+                            }
+                            false
                         })
                         .await;
+                }
+                if sync_antigravity {
+                    self.sync_antigravity_requests(None, None, false, false)
+                        .await;
+                }
+                if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+                    self.antigravity_continuation_wake.notify_waiters();
                 }
             }
             "native_child_started" => {
@@ -3528,24 +3940,58 @@ std::ops::ControlFlow::Continue({
     }
 
     async fn handle_user_message_chunk(&self, params: &Value) {
-        let replaying = self.state.with(|state| state.replaying_history).await;
+        let (replaying, session_id, user_message_index) = self
+            .state
+            .with(|state| {
+                let idx = state.replay_user_message_index;
+                (
+                    state.replaying_history,
+                    state
+                        .replay_session_id
+                        .clone()
+                        .unwrap_or_else(|| state.session_id.clone()),
+                    idx,
+                )
+            })
+            .await;
         if !replaying {
             return;
         }
 
         let text = extract_text_from_update(params);
-        if text.trim().is_empty() {
+        let mut images = extract_images_from_update(params);
+        if text.trim().is_empty() && images.is_empty() {
             return;
+        }
+        let mut next_user_message_index = user_message_index;
+        if images.is_empty() {
+            match self
+                .adapter
+                .user_message_images_for_replay(&session_id, user_message_index, &text)
+                .await
+            {
+                Ok((recovered, next_idx)) => {
+                    images = recovered;
+                    next_user_message_index = next_idx;
+                }
+                Err(error) => {
+                    self.set_replay_error(error).await;
+                    return;
+                }
+            }
         }
 
         self.flush_replay_assistant_message().await;
         self.emitter.user_message(
             crate::backend::workspace_prompt_user_text(&text),
-            None,
+            (!images.is_empty()).then_some(images),
             None,
         );
         self.state
-            .with(|state| state.replay_assistant_message_emitted_since_user = false)
+            .with(move |state| {
+                state.replay_assistant_message_emitted_since_user = false;
+                state.replay_user_message_index = next_user_message_index;
+            })
             .await;
     }
 
@@ -3562,6 +4008,8 @@ std::ops::ControlFlow::Continue({
         }
 
         self.transition_opencode_provider_message(extract_kiro_message_id(params))
+            .await;
+        self.finalize_antigravity_response_before_new_content()
             .await;
 
         let response = {
@@ -3586,6 +4034,8 @@ std::ops::ControlFlow::Continue({
                                 state.active_response = Some(response);
                                 state.active_stream_text.clear();
                                 state.active_stream_tool_calls.clear();
+                                state.antigravity_active_response_start_terminal_responses =
+                                    state.antigravity_seen_terminal_responses;
                             }
                             state.active_response.clone().expect("response just opened")
                         })
@@ -3676,6 +4126,8 @@ std::ops::ControlFlow::Continue({
 
         self.transition_opencode_provider_message(extract_kiro_message_id(params))
             .await;
+        self.finalize_antigravity_response_before_new_content()
+            .await;
 
         if !has_renderable_stream_text(&delta) {
             let has_active_stream = self
@@ -3703,14 +4155,22 @@ std::ops::ControlFlow::Continue({
                             state.active_response = Some(emitter.stream_start(Some(&model)));
                             state.active_stream_text.clear();
                             state.active_stream_tool_calls.clear();
+                            state.antigravity_active_response_start_terminal_responses =
+                                state.antigravity_seen_terminal_responses;
                         }
                         state.active_stream_text.push_str(&delta);
+                        state.antigravity_turn_received_text_non_ws = state
+                            .antigravity_turn_received_text_non_ws
+                            .saturating_add(delta.chars().filter(|ch| !ch.is_whitespace()).count());
                         state.active_response.clone().expect("response just opened")
                     }
                 })
                 .await
         };
         self.emitter.stream_delta(&response, &delta);
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            self.antigravity_continuation_wake.notify_waiters();
+        }
     }
 
     async fn set_replay_error(&self, message: String) {
@@ -3794,6 +4254,12 @@ std::ops::ControlFlow::Continue({
             .adapter
             .normalize_tool_name(&request.tool_name, &request.args, params)
             .into_owned();
+        if let Some(unwrapped) =
+            self.adapter
+                .unwrap_mcp_tool_args(&request.tool_name, &request.args, params)
+        {
+            request.args = unwrapped;
+        }
 
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
         self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), "", false)
@@ -3817,11 +4283,17 @@ std::ops::ControlFlow::Continue({
             self.state
                 .with({
                     let request = request.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    let params = params.clone();
                     move |state| {
                         (
                             state.workspace_root.clone(),
                             kiro_is_startup_mcp_tool(
                                 &request.tool_name,
+                                &state.startup_mcp_servers,
+                            ) || adapter.is_mcp_tool(
+                                &request.tool_name,
+                                &params,
                                 &state.startup_mcp_servers,
                             ),
                         )
@@ -3899,6 +4371,9 @@ std::ops::ControlFlow::Continue({
 
         self.emitter
             .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
+        if parse_tool_call_completion(params, Some(request.tool_name)).is_some() {
+            self.handle_replay_tool_call_update(params).await;
+        }
     }
 
     async fn handle_replay_tool_call_update(&self, params: &Value) {
@@ -3943,7 +4418,10 @@ std::ops::ControlFlow::Continue({
         };
         completion.tool_call_id = resolved_tool_call_id;
 
-        let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+        let enrich_mcp = if matches!(
+            self.adapter.backend_kind(),
+            protocol::BackendKind::Opencode | protocol::BackendKind::Antigravity
+        ) {
             self.state
                 .with({
                     let tool_call_id = completion.tool_call_id.clone();
@@ -3958,18 +4436,45 @@ std::ops::ControlFlow::Continue({
         } else {
             false
         };
-        if opencode_mcp {
+        if enrich_mcp {
             let (session_id, workspace_root) = {
                 self.state
-                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .with(move |state| {
+                        (
+                            state
+                                .replay_session_id
+                                .clone()
+                                .unwrap_or_else(|| state.session_id.clone()),
+                            state.workspace_root.clone(),
+                        )
+                    })
                     .await
             };
-            if let Some(result) = self
-                .adapter
-                .result_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
-                .await
-            {
-                completion.tool_result = result;
+            let enriched = if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+                tokio::select! {
+                    result = self.adapter.result_for_tool_completion(
+                        &session_id,
+                        &workspace_root,
+                        &completion.tool_call_id,
+                    ) => result,
+                    _ = self.wait_until_antigravity_cancelled_or_closed() => return,
+                }
+            } else {
+                self.adapter
+                    .result_for_tool_completion(
+                        &session_id,
+                        &workspace_root,
+                        &completion.tool_call_id,
+                    )
+                    .await
+            };
+            match enriched {
+                Ok(Some(result)) => completion.tool_result = result,
+                Ok(None) => {}
+                Err(error) => {
+                    self.set_replay_error(error).await;
+                    return;
+                }
             }
         }
 
@@ -4059,18 +4564,48 @@ std::ops::ControlFlow::Continue({
             ));
             return;
         };
-        if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+        if matches!(
+            self.adapter.backend_kind(),
+            protocol::BackendKind::Opencode | protocol::BackendKind::Antigravity
+        ) {
             let (session_id, workspace_root) = {
                 self.state
                     .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
                     .await
             };
-            let provider_message_id = self
-                .adapter
-                .provider_message_id_for_tool(&session_id, &workspace_root, &request.tool_call_id)
-                .await;
-            self.transition_opencode_provider_message(provider_message_id)
-                .await;
+            let provider_message_id =
+                if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+                    tokio::select! {
+                        id = self.adapter.provider_message_id_for_tool(
+                            &session_id,
+                            &workspace_root,
+                            &request.tool_call_id,
+                        ) => id,
+                        _ = self.wait_until_antigravity_cancelled_or_closed() => return,
+                    }
+                } else {
+                    self.adapter
+                        .provider_message_id_for_tool(
+                            &session_id,
+                            &workspace_root,
+                            &request.tool_call_id,
+                        )
+                        .await
+                };
+            match provider_message_id {
+                Ok(provider_message_id) => {
+                    if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+                        self.transition_opencode_provider_message(provider_message_id)
+                            .await;
+                    } else {
+                        self.transition_antigravity_provider_message(provider_message_id)
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    self.emitter.backend_error(&error);
+                }
+            }
         }
         let raw_tool_name = request.tool_name.clone();
         let opencode_shell_missing_command = self.adapter.backend_kind()
@@ -4101,6 +4636,12 @@ std::ops::ControlFlow::Continue({
             .adapter
             .normalize_tool_name(&request.tool_name, &request.args, params)
             .into_owned();
+        if let Some(unwrapped) =
+            self.adapter
+                .unwrap_mcp_tool_args(&request.tool_name, &request.args, params)
+        {
+            request.args = unwrapped;
+        }
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
         let defer_request_until_completion =
             self.adapter.defer_tool_request(
@@ -4113,11 +4654,17 @@ std::ops::ControlFlow::Continue({
             self.state
                 .with({
                     let request = request.clone();
+                    let adapter = Arc::clone(&self.adapter);
+                    let params = params.clone();
                     move |state| {
                         (
                             state.workspace_root.clone(),
                             kiro_is_startup_mcp_tool(
                                 &request.tool_name,
+                                &state.startup_mcp_servers,
+                            ) || adapter.is_mcp_tool(
+                                &request.tool_name,
+                                &params,
                                 &state.startup_mcp_servers,
                             ),
                         )
@@ -4246,6 +4793,8 @@ std::ops::ControlFlow::Continue({
                     if let Some((declaration, canonical_id, tool_type)) = declaration
                         && let Some(response) = state.active_response.as_ref()
                     {
+                        let is_question = tool_type.get("kind").and_then(Value::as_str)
+                            == Some("AskUserQuestion");
                         emitter.declare_streaming_tools(response, vec![declaration]);
                         if !defer_request_until_completion {
                             emitter.tool_request(&canonical_id, kiro_tool_request_type(tool_type));
@@ -4253,11 +4802,17 @@ std::ops::ControlFlow::Continue({
                             {
                                 context.request_emitted = true;
                             }
+                            if is_question && !state.pending_questions.contains(&canonical_id) {
+                                state.pending_questions.push(canonical_id);
+                            }
                         }
                     }
                 }
             })
-            .await
+            .await;
+        if parse_tool_call_completion(params, None).is_some() {
+            self.handle_tool_call_update(params).await;
+        }
     }
 
     async fn handle_tool_call_update(&self, params: &Value) {
@@ -4309,7 +4864,10 @@ std::ops::ControlFlow::Continue({
         };
         completion.tool_call_id = resolved_tool_call_id;
 
-        let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+        let enrich_mcp = if matches!(
+            self.adapter.backend_kind(),
+            protocol::BackendKind::Opencode | protocol::BackendKind::Antigravity
+        ) {
             self.state
                 .with({
                     let tool_call_id = completion.tool_call_id.clone();
@@ -4324,18 +4882,46 @@ std::ops::ControlFlow::Continue({
         } else {
             false
         };
-        if opencode_mcp {
+        if enrich_mcp {
             let (session_id, workspace_root) = {
                 self.state
-                    .with(move |state| (state.session_id.clone(), state.workspace_root.clone()))
+                    .with(move |state| {
+                        (
+                            state
+                                .replay_session_id
+                                .clone()
+                                .unwrap_or_else(|| state.session_id.clone()),
+                            state.workspace_root.clone(),
+                        )
+                    })
                     .await
             };
-            if let Some(result) = self
-                .adapter
-                .result_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
-                .await
-            {
-                completion.tool_result = result;
+            let enriched = if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+                tokio::select! {
+                    result = self.adapter.result_for_tool_completion(
+                        &session_id,
+                        &workspace_root,
+                        &completion.tool_call_id,
+                    ) => result,
+                    _ = self.wait_until_antigravity_cancelled_or_closed() => return,
+                }
+            } else {
+                self.adapter
+                    .result_for_tool_completion(
+                        &session_id,
+                        &workspace_root,
+                        &completion.tool_call_id,
+                    )
+                    .await
+            };
+            match enriched {
+                Ok(Some(result)) => completion.tool_result = result,
+                Ok(None) => {}
+                Err(error) => {
+                    self.emitter.backend_error(&error);
+                    completion.success = false;
+                    completion.error = Some(error);
+                }
             }
         }
 
@@ -4357,6 +4943,9 @@ std::ops::ControlFlow::Continue({
             self.state
                 .with(move |state| state.opencode_pending_response_usage = usage)
                 .await;
+        } else if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            // Keep the active response open across tool completions from the
+            // same PLANNER_RESPONSE so parallel tools stay on one ChatMessage.
         } else {
             self.finalize_active_stream_if_any(None, false).await;
         }
@@ -4455,86 +5044,246 @@ std::ops::ControlFlow::Continue({
             self.register_native_child(session_id, name, &completion.tool_call_id)
                 .await;
         }
-        match self
-            .adapter
-            .native_child_transcript(
-                &parent_session_id,
-                &workspace_root,
-                &completion.tool_call_id,
-                &native_tool_name,
-            )
-            .await
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity
+            && native_tool_name == "invoke_subagent"
         {
-            Ok(Some(child)) => {
-                let emitter = self
-                    .state
-                    .with(|state| state.capacity.emitter.clone())
-                    .await;
-                if let Some(emitter) = emitter
-                    && self
-                        .state
-                        .with({
-                            let session_id = child.session_id.0.clone();
-                            move |state| state.native_child_sessions.insert(session_id)
+            let storage_root = self.adapter.storage_root().map(Path::to_path_buf);
+            let descriptor = tokio::select! {
+                result = crate::backend::antigravity::antigravity_native_child_descriptor(
+                    storage_root.as_deref(),
+                    &parent_session_id,
+                    &completion.tool_call_id,
+                ) => Some(result),
+                _ = self.wait_until_antigravity_cancelled_or_closed() => None,
+            };
+            match descriptor {
+                Some(Ok(Some((child_session_id, child_name)))) => {
+                    self.state
+                        .with(|state| {
+                            state.antigravity_turn_spawned_children =
+                                state.antigravity_turn_spawned_children.saturating_add(1);
                         })
-                        .await
-                {
-                    match emitter
-                        .on_subagent_spawned(
-                            completion.tool_call_id.clone(),
-                            child.name.clone(),
-                            String::new(),
-                            "native".to_owned(),
-                            Some(child.session_id),
-                        )
-                        .await
+                        .await;
+                    let emitter = self
+                        .state
+                        .with(|state| state.capacity.emitter.clone())
+                        .await;
+                    if let Some(subagent_emitter) = emitter
+                        && self
+                            .state
+                            .with({
+                                let session_id = child_session_id.0.clone();
+                                move |state| state.native_child_sessions.insert(session_id)
+                            })
+                            .await
                     {
-                        Ok(handle) => {
-                            eprintln!(
-                                "TYDE ACP NATIVE CHILD tool_present={} agent_present={} events={}",
-                                !completion.tool_call_id.is_empty(),
-                                !handle.agent_id.0.is_empty(),
-                                child.events.len()
-                            );
-                            let progress = |completed| protocol::ToolProgressData {
-                                tool_call_id: completion.tool_call_id.clone(),
-                                execution_mode: protocol::ToolExecutionMode::Foreground,
-                                cancellable: false,
-                                update: protocol::ToolProgressUpdate::SubAgent(
-                                    protocol::SubAgentProgress {
-                                        backend_kind: None,
-                                        agent_id: handle.agent_id.clone(),
-                                        agent_name: child.name.clone(),
-                                        last_tool_name: None,
-                                        tool_calls: child
-                                            .events
-                                            .iter()
-                                            .filter(|event| {
-                                                matches!(event, protocol::ChatEvent::ToolRequest(_))
-                                            })
-                                            .count()
-                                            as u64,
-                                        completed,
-                                        status: if completed {
-                                            protocol::SubAgentProgressStatus::Completed
-                                        } else {
-                                            protocol::SubAgentProgressStatus::Running
-                                        },
-                                    },
-                                ),
-                            };
-                            self.emitter.tool_progress(&progress(false));
-                            for event in &child.events {
-                                let _ = handle.event_tx.send(event.clone());
+                        match subagent_emitter
+                            .on_subagent_spawned(
+                                completion.tool_call_id.clone(),
+                                child_name.clone(),
+                                String::new(),
+                                "native".to_owned(),
+                                Some(child_session_id.clone()),
+                            )
+                            .await
+                        {
+                            Ok(handle) => {
+                                let tool_call_id = completion.tool_call_id.clone();
+                                let progress_tool_call_id = tool_call_id.clone();
+                                let progress_agent_id = handle.agent_id.clone();
+                                let progress_agent_name = child_name.clone();
+                                let make_progress = move |status, completed, tool_calls| {
+                                    protocol::ToolProgressData {
+                                        tool_call_id: progress_tool_call_id.clone(),
+                                        execution_mode: protocol::ToolExecutionMode::Foreground,
+                                        cancellable: false,
+                                        update: protocol::ToolProgressUpdate::SubAgent(
+                                            protocol::SubAgentProgress {
+                                                backend_kind: None,
+                                                agent_id: progress_agent_id.clone(),
+                                                agent_name: progress_agent_name.clone(),
+                                                last_tool_name: None,
+                                                tool_calls,
+                                                completed,
+                                                status,
+                                            },
+                                        ),
+                                    }
+                                };
+                                self.emitter.tool_progress(&make_progress(
+                                    protocol::SubAgentProgressStatus::Running,
+                                    false,
+                                    0,
+                                ));
+                                let relay_emitter = Arc::clone(&self.emitter);
+                                let relay_state = self.state.clone();
+                                let relay_shutting_down = Arc::clone(&self.shutting_down);
+                                let relay_closed = Arc::clone(&self.closed);
+                                let relay_wake = Arc::clone(&self.antigravity_continuation_wake);
+                                self.state
+                                    .with(move |state| {
+                                        state.antigravity_active_child_relays =
+                                            state.antigravity_active_child_relays.saturating_add(1);
+                                        state.native_relay_tasks.spawn(async move {
+                                            let outcome = tokio::select! {
+                                                result = crate::backend::antigravity::antigravity_wait_native_child_events(
+                                                    storage_root.as_deref(),
+                                                    &child_session_id,
+                                                ) => Some(result),
+                                                _ = KiroInner::wait_until_antigravity_stopped(
+                                                    &relay_shutting_down,
+                                                    &relay_closed,
+                                                    &relay_state,
+                                                    &relay_wake,
+                                                ) => None,
+                                            };
+                                            match outcome {
+                                                Some(Ok(events)) => {
+                                                    eprintln!(
+                                                        "TYDE ACP NATIVE CHILD tool_present={} agent_present={} events={}",
+                                                        !tool_call_id.is_empty(),
+                                                        !handle.agent_id.0.is_empty(),
+                                                        events.len()
+                                                    );
+                                                    let tool_calls = events
+                                                        .iter()
+                                                        .filter(|event| {
+                                                            matches!(
+                                                                event,
+                                                                protocol::ChatEvent::ToolRequest(_)
+                                                            )
+                                                        })
+                                                        .count()
+                                                        as u64;
+                                                    for event in events {
+                                                        let _ = handle.event_tx.send(event);
+                                                    }
+                                                    relay_emitter.tool_progress(&make_progress(
+                                                        protocol::SubAgentProgressStatus::Completed,
+                                                        true,
+                                                        tool_calls,
+                                                    ));
+                                                }
+                                                Some(Err(error)) => {
+                                                    relay_emitter.backend_error(&error);
+                                                    relay_emitter.tool_progress(&make_progress(
+                                                        protocol::SubAgentProgressStatus::Failed,
+                                                        true,
+                                                        0,
+                                                    ));
+                                                }
+                                                None => {
+                                                    relay_emitter.tool_progress(&make_progress(
+                                                        protocol::SubAgentProgressStatus::Stopped,
+                                                        true,
+                                                        0,
+                                                    ));
+                                                }
+                                            }
+                                            relay_state
+                                                .with(|state| {
+                                                    state.antigravity_active_child_relays = state
+                                                        .antigravity_active_child_relays
+                                                        .saturating_sub(1);
+                                                })
+                                                .await;
+                                            relay_wake.notify_waiters();
+                                        });
+                                    })
+                                    .await;
                             }
-                            self.emitter.tool_progress(&progress(true));
+                            Err(error) => self.emitter.backend_error(&error),
                         }
-                        Err(error) => self.emitter.backend_error(&error),
                     }
                 }
+                Some(Ok(None)) | None => {}
+                Some(Err(error)) => self.emitter.backend_error(&error),
             }
-            Ok(None) => {}
-            Err(error) => self.emitter.backend_error(&error),
+        } else {
+            match self
+                .adapter
+                .native_child_transcript(
+                    &parent_session_id,
+                    &workspace_root,
+                    &completion.tool_call_id,
+                    &native_tool_name,
+                )
+                .await
+            {
+                Ok(Some(child)) => {
+                    let emitter = self
+                        .state
+                        .with(|state| state.capacity.emitter.clone())
+                        .await;
+                    if let Some(emitter) = emitter
+                        && self
+                            .state
+                            .with({
+                                let session_id = child.session_id.0.clone();
+                                move |state| state.native_child_sessions.insert(session_id)
+                            })
+                            .await
+                    {
+                        match emitter
+                            .on_subagent_spawned(
+                                completion.tool_call_id.clone(),
+                                child.name.clone(),
+                                String::new(),
+                                "native".to_owned(),
+                                Some(child.session_id),
+                            )
+                            .await
+                        {
+                            Ok(handle) => {
+                                eprintln!(
+                                    "TYDE ACP NATIVE CHILD tool_present={} agent_present={} events={}",
+                                    !completion.tool_call_id.is_empty(),
+                                    !handle.agent_id.0.is_empty(),
+                                    child.events.len()
+                                );
+                                let progress = |completed| protocol::ToolProgressData {
+                                    tool_call_id: completion.tool_call_id.clone(),
+                                    execution_mode: protocol::ToolExecutionMode::Foreground,
+                                    cancellable: false,
+                                    update: protocol::ToolProgressUpdate::SubAgent(
+                                        protocol::SubAgentProgress {
+                                            backend_kind: None,
+                                            agent_id: handle.agent_id.clone(),
+                                            agent_name: child.name.clone(),
+                                            last_tool_name: None,
+                                            tool_calls: child
+                                                .events
+                                                .iter()
+                                                .filter(|event| {
+                                                    matches!(
+                                                        event,
+                                                        protocol::ChatEvent::ToolRequest(_)
+                                                    )
+                                                })
+                                                .count()
+                                                as u64,
+                                            completed,
+                                            status: if completed {
+                                                protocol::SubAgentProgressStatus::Completed
+                                            } else {
+                                                protocol::SubAgentProgressStatus::Running
+                                            },
+                                        },
+                                    ),
+                                };
+                                self.emitter.tool_progress(&progress(false));
+                                for event in &child.events {
+                                    let _ = handle.event_tx.send(event.clone());
+                                }
+                                self.emitter.tool_progress(&progress(true));
+                            }
+                            Err(error) => self.emitter.backend_error(&error),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.emitter.backend_error(&error),
+            }
         }
 
         let (emit_request_now, emit_completion_now) = {
@@ -4621,6 +5370,9 @@ std::ops::ControlFlow::Continue({
                             if emit_completion_now.is_some() {
                                 state.active_tool_contexts.remove(&completion.tool_call_id);
                                 state
+                                    .pending_questions
+                                    .retain(|id| id != &completion.tool_call_id);
+                                state
                                     .completed_tool_call_ids
                                     .insert(completion.tool_call_id.clone());
                                 remove_tool_call_aliases(
@@ -4673,6 +5425,9 @@ std::ops::ControlFlow::Continue({
         };
         if let Some(update) = pending_turn_end {
             self.finalize_grok_turn_end(&update).await;
+        }
+        if self.adapter.backend_kind() == protocol::BackendKind::Antigravity {
+            self.antigravity_continuation_wake.notify_waiters();
         }
     }
 
@@ -5158,6 +5913,418 @@ std::ops::ControlFlow::Continue({
         self.emitter.typing_status_changed(false);
     }
 
+    async fn finalize_antigravity_response_before_new_content(&self) {
+        if self.adapter.backend_kind() != protocol::BackendKind::Antigravity {
+            return;
+        }
+        let (should_finalize, target_provider_id) = self
+            .state
+            .with(|state| {
+                let finalize =
+                    state.active_response.is_some() && !state.active_stream_tool_calls.is_empty();
+                let provider_id = finalize
+                    .then(|| state.antigravity_active_provider_message_id.take())
+                    .flatten();
+                (finalize, provider_id)
+            })
+            .await;
+        if should_finalize {
+            let message_id = self.finalize_active_stream_if_any(None, false).await;
+            self.sync_antigravity_requests(message_id, target_provider_id, true, false)
+                .await;
+        }
+    }
+
+    async fn transition_antigravity_provider_message(&self, provider_message_id: Option<String>) {
+        if self.adapter.backend_kind() != protocol::BackendKind::Antigravity {
+            return;
+        }
+        let Some(provider_message_id) = provider_message_id else {
+            return;
+        };
+        let (should_finalize, previous_provider_id, had_tool_calls) = self
+            .state
+            .with({
+                let provider_message_id = provider_message_id.clone();
+                move |state| match state.antigravity_active_provider_message_id.as_deref() {
+                    None => {
+                        state.antigravity_active_provider_message_id = Some(provider_message_id);
+                        (false, None, false)
+                    }
+                    Some(active) if active == provider_message_id => (false, None, false),
+                    Some(_) => {
+                        let finalize = state.active_response.is_some();
+                        let had_tools = !state.active_stream_tool_calls.is_empty();
+                        let previous = finalize
+                            .then(|| state.antigravity_active_provider_message_id.take())
+                            .flatten();
+                        (finalize, previous, had_tools)
+                    }
+                }
+            })
+            .await;
+        if should_finalize {
+            let message_id = self.finalize_active_stream_if_any(None, false).await;
+            self.sync_antigravity_requests(message_id, previous_provider_id, had_tool_calls, false)
+                .await;
+        }
+        self.state
+            .with(move |state| {
+                state.antigravity_active_provider_message_id = Some(provider_message_id);
+            })
+            .await;
+    }
+
+    async fn wait_for_antigravity_continuation(
+        &self,
+        mut required_system_messages: usize,
+    ) -> Result<(), String> {
+        let (session_id, baseline_system_messages, baseline_planner_responses) = self
+            .state
+            .with(|state| {
+                (
+                    state.session_id.clone(),
+                    state.antigravity_turn_baseline_system_messages,
+                    state.antigravity_turn_baseline_planner_responses,
+                )
+            })
+            .await;
+        let storage_root = self.adapter.storage_root();
+        loop {
+            if self.shutting_down.load(Ordering::Acquire)
+                || self.closed.load(Ordering::Acquire)
+                || self.state.with(|state| state.cancelled).await
+            {
+                return Ok(());
+            }
+            let spawned_children = self
+                .state
+                .with(|state| state.antigravity_turn_spawned_children)
+                .await;
+            required_system_messages = required_system_messages
+                .max(baseline_system_messages.saturating_add(spawned_children));
+            let settled = tokio::select! {
+                result = crate::backend::antigravity::watch_antigravity_continuation_settled(
+                    storage_root,
+                    &session_id,
+                    required_system_messages,
+                    baseline_planner_responses,
+                ) => result,
+                _ = self.wait_until_antigravity_cancelled_or_closed() => return Ok(()),
+            };
+            let settled = match settled {
+                Ok(settled) => settled,
+                Err(error) => {
+                    self.abort_active_turn(&error).await;
+                    self.emitter.backend_error(&error);
+                    return Err(error);
+                }
+            };
+            if let Err(err) = self.bridge.sync_inbound().await {
+                let message = format!(
+                    "{} response stream failed: {err}",
+                    self.adapter.display_name()
+                );
+                if !self.shutting_down.load(Ordering::Acquire) {
+                    self.abort_active_turn(&message).await;
+                    self.emitter.backend_error(&message);
+                }
+                return Err(message);
+            }
+            if self.shutting_down.load(Ordering::Acquire)
+                || self.closed.load(Ordering::Acquire)
+                || self.state.with(|state| state.cancelled).await
+            {
+                return Ok(());
+            }
+            let (updated_spawned, active_child_relays) = self
+                .state
+                .with(|state| {
+                    (
+                        state.antigravity_turn_spawned_children,
+                        state.antigravity_active_child_relays,
+                    )
+                })
+                .await;
+            let updated_target = baseline_system_messages.saturating_add(updated_spawned);
+            if updated_target > required_system_messages {
+                required_system_messages = updated_target;
+                continue;
+            }
+            if !self.emitter.open_foreground_tool_ids().is_empty() {
+                let notified = self.antigravity_continuation_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.shutting_down.load(Ordering::Acquire)
+                    && !self.closed.load(Ordering::Acquire)
+                    && !self.state.with(|state| state.cancelled).await
+                    && !self.emitter.open_foreground_tool_ids().is_empty()
+                {
+                    notified.await;
+                }
+                continue;
+            }
+            if active_child_relays > 0 {
+                let notified = self.antigravity_continuation_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let still_waiting = !self.shutting_down.load(Ordering::Acquire)
+                    && !self.closed.load(Ordering::Acquire)
+                    && self
+                        .state
+                        .with(|state| !state.cancelled && state.antigravity_active_child_relays > 0)
+                        .await;
+                if still_waiting {
+                    notified.await;
+                }
+                continue;
+            }
+            let received_text_non_ws = self
+                .state
+                .with(|state| state.antigravity_turn_received_text_non_ws)
+                .await;
+            if received_text_non_ws < settled.expected_turn_text_non_ws {
+                let notified = self.antigravity_continuation_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let expected_turn_text_non_ws = settled.expected_turn_text_non_ws;
+                let still_waiting = !self.shutting_down.load(Ordering::Acquire)
+                    && !self.closed.load(Ordering::Acquire)
+                    && self
+                        .state
+                        .with(move |state| {
+                            !state.cancelled
+                                && state.antigravity_turn_received_text_non_ws
+                                    < expected_turn_text_non_ws
+                        })
+                        .await;
+                if still_waiting {
+                    notified.await;
+                }
+                continue;
+            }
+            let (target_provider_id, had_tool_calls) = self
+                .state
+                .with(|state| {
+                    (
+                        state.antigravity_active_provider_message_id.take(),
+                        !state.active_stream_tool_calls.is_empty(),
+                    )
+                })
+                .await;
+            let message_id = self.finalize_active_stream_if_any(None, false).await;
+            self.sync_antigravity_requests(message_id, target_provider_id, had_tool_calls, true)
+                .await;
+            self.emitter.typing_status_changed(false);
+            return Ok(());
+        }
+    }
+
+    async fn wait_until_antigravity_cancelled_or_closed(&self) {
+        Self::wait_until_antigravity_stopped(
+            &self.shutting_down,
+            &self.closed,
+            &self.state,
+            &self.antigravity_continuation_wake,
+        )
+        .await;
+    }
+
+    async fn wait_until_antigravity_stopped(
+        shutting_down: &AtomicBool,
+        closed: &AtomicBool,
+        state: &KiroStateActor,
+        wake: &tokio::sync::Notify,
+    ) {
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if shutting_down.load(Ordering::Acquire)
+                || closed.load(Ordering::Acquire)
+                || state.with(|state| state.cancelled).await
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn sync_antigravity_requests(
+        &self,
+        message_id: Option<ChatMessageId>,
+        target_provider_message_id: Option<String>,
+        had_tool_calls: bool,
+        is_turn_end: bool,
+    ) {
+        // A response that emitted tool calls must identify its provider message
+        // ID via `provider_message_id_for_tool`. If that lookup failed (already
+        // reported via `backend_error`), do not fall back to order-based waiting
+        // or order-based usage attachment.
+        let attach_message_id = if had_tool_calls && target_provider_message_id.is_none() {
+            None
+        } else {
+            message_id
+        };
+        let (session_id, workspace_root, min_text_only_ordinal, wait) = self
+            .state
+            .with({
+                let has_message = attach_message_id.is_some();
+                let target_provider_message_id = target_provider_message_id.clone();
+                move |state| {
+                    let min_text_only_ordinal = state
+                        .antigravity_active_response_start_terminal_responses
+                        .saturating_add(1);
+                    let wait = if !has_message {
+                        None
+                    } else if let Some(target_id) = target_provider_message_id {
+                        (!state.antigravity_emitted_request_ids.contains(&target_id)).then_some(
+                            super::adapter::AcpRequestUsageWait::ProviderMessageId(target_id),
+                        )
+                    } else {
+                        let has_matching_text_only =
+                            state.antigravity_turn_requests.iter().any(|record| {
+                                !record.has_tool_calls
+                                    && record.terminal_ordinal >= min_text_only_ordinal
+                                    && !state
+                                        .antigravity_attached_request_ids
+                                        .contains(&record.provider_message_id)
+                            });
+                        (!has_matching_text_only).then_some(
+                            super::adapter::AcpRequestUsageWait::TextOnlyAtOrAfter(
+                                min_text_only_ordinal,
+                            ),
+                        )
+                    };
+                    (
+                        state.session_id.clone(),
+                        state.workspace_root.clone(),
+                        min_text_only_ordinal,
+                        wait,
+                    )
+                }
+            })
+            .await;
+        let snapshot = tokio::select! {
+            result = self.adapter.request_usages_for_session(
+                &session_id,
+                &workspace_root,
+                wait,
+            ) => match result {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.emitter.backend_error(&error);
+                    return;
+                }
+            },
+            _ = self.wait_until_antigravity_cancelled_or_closed() => return,
+        };
+        self.state
+            .with({
+                let emitter = Arc::clone(&self.emitter);
+                let message_id = attach_message_id.clone();
+                move |state| {
+                    state.antigravity_seen_terminal_responses = state
+                        .antigravity_seen_terminal_responses
+                        .max(snapshot.terminal_responses);
+                    let mut turn = TokenUsage::default();
+                    for record in &state.antigravity_turn_requests {
+                        add_token_usage(&mut turn, &record.usage);
+                    }
+                    let model_context_window = state
+                        .antigravity_current_context_usage
+                        .as_ref()
+                        .and_then(|ctx| ctx.known().map(|(_, window)| window));
+                    for record in snapshot.records {
+                        if !state
+                            .antigravity_emitted_request_ids
+                            .insert(record.provider_message_id.clone())
+                        {
+                            continue;
+                        }
+                        let usage = record.usage.clone();
+                        state.antigravity_turn_requests.push(record);
+                        add_token_usage(&mut turn, &usage);
+                        add_token_usage(&mut state.antigravity_cumulative_usage, &usage);
+                        let current_context_usage = model_context_window
+                            .filter(|&window| window >= usage.total_tokens)
+                            .map(|context_window| CurrentContextUsage::Known {
+                                input_tokens: usage.total_tokens,
+                                context_window,
+                            });
+                        let Ok(sequence) = u32::try_from(state.antigravity_turn_requests.len())
+                        else {
+                            emitter.backend_error(
+                                "Antigravity model request sequence exceeded u32 range",
+                            );
+                            break;
+                        };
+                        emitter.model_request_token_usage(&ModelRequestTokenUsage {
+                            request_id: ModelRequestId {
+                                turn_id: ModelTurnId(format!(
+                                    "{}:{}",
+                                    state.session_id, state.antigravity_turn_sequence
+                                )),
+                                sequence,
+                            },
+                            request: usage,
+                            turn: turn.clone(),
+                            cumulative: state.antigravity_cumulative_usage.clone(),
+                            model_context_window,
+                            current_context_usage,
+                            estimated_context_breakdown: None,
+                        });
+                    }
+                    if let Some(message_id) = message_id {
+                        let matched = match target_provider_message_id.as_deref() {
+                            Some(target_id) => state
+                                .antigravity_turn_requests
+                                .iter()
+                                .find(|record| {
+                                    record.provider_message_id == target_id
+                                        && !state
+                                            .antigravity_attached_request_ids
+                                            .contains(&record.provider_message_id)
+                                })
+                                .map(|record| {
+                                    (record.provider_message_id.clone(), record.usage.clone())
+                                }),
+                            None => state
+                                .antigravity_turn_requests
+                                .iter()
+                                .find(|record| {
+                                    !record.has_tool_calls
+                                        && record.terminal_ordinal >= min_text_only_ordinal
+                                        && !state
+                                            .antigravity_attached_request_ids
+                                            .contains(&record.provider_message_id)
+                                })
+                                .map(|record| {
+                                    (record.provider_message_id.clone(), record.usage.clone())
+                                }),
+                        };
+                        if let Some((provider_id, request_usage)) = matched {
+                            state.antigravity_attached_request_ids.insert(provider_id);
+                            let model_info = state.model.clone().map(|model| ModelInfo { model });
+                            let token_usage = if is_turn_end {
+                                MessageTokenUsage::request_and_turn_known(request_usage, turn)
+                                    .with_cumulative(state.antigravity_cumulative_usage.clone())
+                            } else {
+                                MessageTokenUsage::request_known(request_usage)
+                            };
+                            emitter.message_metadata_updated(MessageMetadataUpdateData {
+                                message_id,
+                                model_info,
+                                token_usage: Some(token_usage),
+                                context_breakdown: None,
+                            });
+                        }
+                    }
+                }
+            })
+            .await;
+    }
+
     async fn finalize_active_stream_if_any(
         &self,
         usage: Option<Value>,
@@ -5167,6 +6334,7 @@ std::ops::ControlFlow::Continue({
             self.state
                 .with({
                     move |state| {
+                        state.antigravity_active_provider_message_id = None;
                         state.active_response.take().map(|response| {
                             (
                                 response,
@@ -5201,6 +6369,7 @@ std::ops::ControlFlow::Continue({
                     state.active_stream_tool_calls.clear();
                     state.active_tool_contexts.clear();
                     state.tool_call_aliases.clear();
+                    state.antigravity_active_provider_message_id = None;
                 }
             })
             .await
@@ -5312,12 +6481,72 @@ std::ops::ControlFlow::Continue({
     }
 
     async fn answer_pending_tool_response(
-        &self,
+        self: &Arc<Self>,
         payload: SendMessagePayload,
     ) -> Result<(), String> {
         let Some(tool_response) = payload.tool_response else {
             return Err("ACP tool response was missing".to_owned());
         };
+        if let SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            answer,
+            ..
+        } = tool_response
+        {
+            let (held, turn_active) = self
+                .state
+                .with({
+                    let tool_call_id = tool_call_id.clone();
+                    move |state| {
+                        let held = if let Some(pos) = state
+                            .pending_questions
+                            .iter()
+                            .position(|id| id == &tool_call_id)
+                        {
+                            state.pending_questions.remove(pos);
+                            state.active_tool_contexts.remove(&tool_call_id);
+                            state.completed_tool_call_ids.insert(tool_call_id);
+                            true
+                        } else {
+                            false
+                        };
+                        let active = state.prompt_admission.active.is_some()
+                            || state.active_response.is_some();
+                        (held, active)
+                    }
+                })
+                .await;
+            if !held {
+                let message = format!(
+                    "{} received an answer for a question that is not waiting on one",
+                    self.adapter.display_name()
+                );
+                if !turn_active {
+                    self.emitter.typing_status_changed(true);
+                }
+                self.emitter.backend_error(&message);
+                if !turn_active {
+                    self.emitter.typing_status_changed(false);
+                }
+                return Ok(());
+            }
+            self.emitter.tool_completed(
+                &tool_call_id,
+                ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::Other {
+                        result: json!({ "answer": answer }),
+                    },
+                },
+            );
+            return self
+                .send_prompt(
+                    payload.origin,
+                    payload.message,
+                    crate::backend::protocol_images_to_attachments(payload.images),
+                    false,
+                )
+                .await;
+        }
         let SendMessageToolResponse::ExitPlanMode {
             tool_call_id,
             decision,
@@ -5325,7 +6554,7 @@ std::ops::ControlFlow::Continue({
         } = tool_response
         else {
             return Err(
-                "this ACP backend can only answer pending ExitPlanMode tool responses".to_owned(),
+                "this ACP backend can only answer pending ExitPlanMode or AskUserQuestion tool responses".to_owned(),
             );
         };
 
@@ -6452,6 +7681,94 @@ fn acp_mode_category(backend: protocol::BackendKind) -> &'static str {
     }
 }
 
+fn acp_thought_level_config_id(value: &Value, backend: protocol::BackendKind) -> Option<String> {
+    if backend == protocol::BackendKind::Grok {
+        return None;
+    }
+    acp_config_id(value, "thought_level")
+}
+
+fn extract_current_thought_level(value: &Value, backend: protocol::BackendKind) -> Option<String> {
+    if backend == protocol::BackendKind::Grok {
+        return None;
+    }
+    acp_config_option(value, "thought_level")?
+        .get("currentValue")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn extract_known_thought_levels(value: &Value, backend: protocol::BackendKind) -> Vec<Value> {
+    if backend == protocol::BackendKind::Grok {
+        return Vec::new();
+    }
+    acp_config_choices(value, "thought_level")
+}
+
+/// Derives per-model thinking-level options from ACP `models.availableModels`
+/// (which lists `<modelId>-<level>` pairs) combined with `configOptions[model]`.
+fn extract_thought_levels_by_model(
+    value: &Value,
+    backend: protocol::BackendKind,
+) -> std::collections::BTreeMap<String, Vec<protocol::SelectOption>> {
+    let mut by_model = std::collections::BTreeMap::new();
+    if backend == protocol::BackendKind::Grok {
+        return by_model;
+    }
+    let models = acp_config_choices(value, "model");
+    let Some(available) = value
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+    else {
+        return by_model;
+    };
+    const LEVEL_ORDER: &[(&str, &str)] = &[
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("xhigh", "Extra"),
+        ("max", "Max"),
+    ];
+    let available_ids: Vec<&str> = available
+        .iter()
+        .filter_map(|entry| entry.get("modelId").and_then(Value::as_str))
+        .collect();
+    for model in &models {
+        let Some(model_id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut options = Vec::new();
+        for &(level_id, level_label) in LEVEL_ORDER {
+            let candidate = format!("{model_id}-{level_id}");
+            if available_ids.contains(&candidate.as_str()) {
+                options.push(protocol::SelectOption {
+                    value: level_id.to_owned(),
+                    label: level_label.to_owned(),
+                });
+            }
+        }
+        by_model.insert(model_id.to_owned(), options);
+    }
+    by_model
+}
+
+fn acp_settings_json(state: &KiroState, backend: protocol::BackendKind) -> Value {
+    let mut settings = json!({
+        "model": state.model,
+        "mode": state.mode,
+    });
+    if backend == protocol::BackendKind::Antigravity
+        || state.thought_level_config_id.is_some()
+        || state.thought_level.is_some()
+    {
+        settings["reasoning_effort"] = match &state.thought_level {
+            Some(level) => Value::String(level.clone()),
+            None => Value::Null,
+        };
+    }
+    settings
+}
+
 fn acp_config_option<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value
         .get("configOptions")?
@@ -6501,14 +7818,22 @@ fn apply_acp_config_options(state: &mut KiroState, value: &Value, backend: proto
     }
     state.model_config_id = acp_config_id(value, "model");
     state.mode_config_id = acp_config_id(value, acp_mode_category(backend));
+    state.thought_level_config_id = acp_thought_level_config_id(value, backend);
     let model = extract_current_model(value);
     if model != state.model {
         state.opencode_current_context_usage = None;
+        state.antigravity_current_context_usage = None;
     }
     state.model = model;
     state.mode = extract_current_mode(value, backend);
+    state.thought_level = extract_current_thought_level(value, backend);
     state.known_models = extract_known_models(value);
     state.known_modes = extract_known_modes(value, backend);
+    state.known_thought_levels = extract_known_thought_levels(value, backend);
+    let by_model = extract_thought_levels_by_model(value, backend);
+    if !by_model.is_empty() {
+        state.thought_levels_by_model = by_model;
+    }
     tracing::debug!(
         model_count = state.known_models.len(),
         mode_count = state.known_modes.len(),
@@ -6727,11 +8052,15 @@ fn extract_known_modes(value: &Value, backend: protocol::BackendKind) -> Vec<Val
 fn session_settings_schema_from_known_options(
     known_models: &[Value],
     known_modes: &[Value],
+    known_thought_levels: &[Value],
+    thought_levels_by_model: &std::collections::BTreeMap<String, Vec<protocol::SelectOption>>,
 ) -> Result<protocol::SessionSettingsSchema, String> {
     fn select_field(
         key: &str,
         label: &str,
         entries: &[Value],
+        use_slider: bool,
+        select_options_by_setting: Option<protocol::SelectOptionsBySetting>,
     ) -> Result<protocol::SessionSettingField, String> {
         let mut options = Vec::new();
         let mut default = None;
@@ -6768,8 +8097,8 @@ fn session_settings_schema_from_known_options(
             key: key.to_string(),
             label: label.to_string(),
             description: None,
-            use_slider: false,
-            select_options_by_setting: None,
+            use_slider,
+            select_options_by_setting,
             field_type: protocol::SessionSettingFieldType::Select {
                 options,
                 default,
@@ -6778,15 +8107,35 @@ fn session_settings_schema_from_known_options(
         })
     }
 
-    if known_models.is_empty() && known_modes.is_empty() {
+    if known_models.is_empty() && known_modes.is_empty() && known_thought_levels.is_empty() {
         return Err("ACP agent reported no selectable models or modes".to_string());
     }
     let mut fields = Vec::new();
     if !known_models.is_empty() {
-        fields.push(select_field("model", "Model", known_models)?);
+        fields.push(select_field("model", "Model", known_models, false, None)?);
+    }
+    if !known_thought_levels.is_empty() {
+        let conditional =
+            (!thought_levels_by_model.is_empty()).then(|| protocol::SelectOptionsBySetting {
+                setting_key: "model".to_owned(),
+                values: thought_levels_by_model
+                    .iter()
+                    .map(|(model_id, options)| protocol::SelectOptionsForValue {
+                        setting_value: model_id.clone(),
+                        options: options.clone(),
+                    })
+                    .collect(),
+            });
+        fields.push(select_field(
+            "reasoning_effort",
+            "Thinking Level",
+            known_thought_levels,
+            true,
+            conditional,
+        )?);
     }
     if !known_modes.is_empty() {
-        fields.push(select_field("mode", "Mode", known_modes)?);
+        fields.push(select_field("mode", "Mode", known_modes, false, None)?);
     }
     Ok(protocol::SessionSettingsSchema {
         model_resolutions: Default::default(),
@@ -6907,12 +8256,23 @@ pub(crate) async fn probe_session_settings_schema(
                 .ok_or_else(|| {
                     "ACP schema probe ModelsList response missing data.models array".to_string()
                 })?;
-            let known_modes = session
+            let (known_modes, known_thought_levels, thought_levels_by_model) = session
                 .inner
                 .state
-                .with(|state| state.known_modes.clone())
+                .with(|state| {
+                    (
+                        state.known_modes.clone(),
+                        state.known_thought_levels.clone(),
+                        state.thought_levels_by_model.clone(),
+                    )
+                })
                 .await;
-            return session_settings_schema_from_known_options(known_models, &known_modes);
+            return session_settings_schema_from_known_options(
+                known_models,
+                &known_modes,
+                &known_thought_levels,
+                &thought_levels_by_model,
+            );
         }
     })
     .await;
@@ -7498,6 +8858,9 @@ fn resolve_agent_session_settings(config: &BackendSpawnConfig) -> protocol::Sess
         Some(protocol::AcpAdapterId::Opencode) => {
             crate::backend::opencode::resolve_session_settings(config)
         }
+        Some(protocol::AcpAdapterId::Antigravity) => {
+            crate::backend::antigravity::resolve_session_settings(config)
+        }
         _ => resolve_session_settings(config),
     }
 }
@@ -7681,6 +9044,11 @@ impl Backend for KiroBackend {
                 None,
                 &config.startup_mcp_servers,
                 &config.resolved_spawn_config,
+                config
+                    .acp_agent
+                    .as_ref()
+                    .filter(|spec| spec.adapter == protocol::AcpAdapterId::Antigravity)
+                    .and_then(|_| config.backend_storage.root(BackendKind::Antigravity)),
             )
             .await
             {
@@ -7871,6 +9239,11 @@ impl Backend for KiroBackend {
                 None,
                 &config.startup_mcp_servers,
                 &config.resolved_spawn_config,
+                config
+                    .acp_agent
+                    .as_ref()
+                    .filter(|spec| spec.adapter == protocol::AcpAdapterId::Antigravity)
+                    .and_then(|_| config.backend_storage.root(BackendKind::Antigravity)),
             )
             .await
             {
@@ -8093,15 +9466,12 @@ impl Backend for KiroBackend {
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
+        let kind = self.command_handle.inner.adapter.backend_kind();
         self.command_handle
             .inner
             .state
-            .with({
-                move |state| {
-                    crate::backend::session_settings_from_json(
-                        json!({"model": state.model, "mode": state.mode}),
-                    )
-                }
+            .with(move |state| {
+                crate::backend::session_settings_from_json(acp_settings_json(state, kind))
             })
             .await
     }

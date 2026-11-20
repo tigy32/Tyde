@@ -8091,6 +8091,7 @@ fn acp_adapter_value(adapter: AcpAdapterId) -> &'static str {
         AcpAdapterId::Kiro => "kiro",
         AcpAdapterId::Grok => "grok",
         AcpAdapterId::Opencode => "opencode",
+        AcpAdapterId::Antigravity => "antigravity",
     }
 }
 
@@ -8100,6 +8101,7 @@ fn parse_acp_adapter(value: &str) -> Option<AcpAdapterId> {
         "kiro" => Some(AcpAdapterId::Kiro),
         "grok" => Some(AcpAdapterId::Grok),
         "opencode" => Some(AcpAdapterId::Opencode),
+        "antigravity" => Some(AcpAdapterId::Antigravity),
         _ => None,
     }
 }

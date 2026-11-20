@@ -652,12 +652,17 @@ impl AcpAgentAdapter for OpenCodeAdapter {
         session_id: &'a str,
         workspace_root: &'a str,
         tool_call_id: &'a str,
-    ) -> BoxFuture<'a, Option<Value>> {
+    ) -> BoxFuture<'a, Result<Option<Value>, String>> {
         Box::pin(async move {
-            let (_, part) = self
+            let Some((_, part)) = self
                 .exported_tool(session_id, workspace_root, tool_call_id, false, false, true)
-                .await?;
-            let state = part.get("state")?;
+                .await
+            else {
+                return Ok(None);
+            };
+            let Some(state) = part.get("state") else {
+                return Ok(None);
+            };
             let mut content = state
                 .get("output")
                 .or_else(|| state.get("error"))
@@ -674,11 +679,11 @@ impl AcpAgentAdapter for OpenCodeAdapter {
                     .flatten()
                     .filter_map(opencode_image_attachment_content),
             );
-            Some(json!({
+            Ok(Some(json!({
                 "content": content,
                 "isError": state.get("status").and_then(Value::as_str) == Some("error"),
                 "_meta": state.get("metadata").cloned().unwrap_or(Value::Null),
-            }))
+            })))
         })
     }
 
@@ -687,9 +692,9 @@ impl AcpAgentAdapter for OpenCodeAdapter {
         session_id: &'a str,
         workspace_root: &'a str,
         tool_call_id: &'a str,
-    ) -> BoxFuture<'a, Option<String>> {
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
         Box::pin(async move {
-            let (info, _) = self
+            let Some((info, _)) = self
                 .exported_tool(
                     session_id,
                     workspace_root,
@@ -698,8 +703,11 @@ impl AcpAgentAdapter for OpenCodeAdapter {
                     false,
                     false,
                 )
-                .await?;
-            info.get("id").and_then(Value::as_str).map(str::to_owned)
+                .await
+            else {
+                return Ok(None);
+            };
+            Ok(info.get("id").and_then(Value::as_str).map(str::to_owned))
         })
     }
 }

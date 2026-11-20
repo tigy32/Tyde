@@ -4,6 +4,7 @@
 //! specification. An agent that conforms needs no module — it runs on
 //! [`stock::StockAdapter`] with a user-configured command.
 
+pub mod antigravity;
 pub mod grok;
 pub mod kiro;
 pub mod opencode;

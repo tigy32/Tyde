@@ -260,12 +260,17 @@ impl AcpAgentAdapter for KiroAdapter {
         Some(spec)
     }
 
-    fn decorate_session_new(&self, params: &mut Value, ctx: &AcpRequestCtx<'_>) {
+    fn decorate_session_new(
+        &self,
+        params: &mut Value,
+        ctx: &AcpRequestCtx<'_>,
+    ) -> Result<(), String> {
         // Kiro takes Tyde's combined system/steering instructions as a
         // non-standard `systemPrompt` on session creation.
         if let Some(system_prompt) = ctx.system_prompt.filter(|value| !value.trim().is_empty()) {
             params["systemPrompt"] = Value::String(system_prompt.to_string());
         }
+        Ok(())
     }
 
     fn decorate_prompt(&self, params: &mut Value, ctx: &AcpRequestCtx<'_>) {

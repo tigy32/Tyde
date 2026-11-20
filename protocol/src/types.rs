@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 100;
+pub const PROTOCOL_VERSION: u32 = 101;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -605,11 +605,12 @@ impl BackendKind {
             Self::Kiro
             | Self::Claude
             | Self::Codex
+            | Self::Antigravity
             | Self::Hermes
             | Self::Grok
             | Self::Opencode
             | Self::Muse => true,
-            Self::Tycode | Self::Antigravity => false,
+            Self::Tycode => false,
         }
     }
 }
@@ -646,6 +647,7 @@ pub enum AcpAdapterId {
     Kiro,
     Grok,
     Opencode,
+    Antigravity,
 }
 
 /// How to launch one ACP agent. Carried by a launch profile whose

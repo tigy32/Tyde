@@ -268,13 +268,14 @@ macro_rules! conformance2_scenario {
             provider!(
                 antigravity,
                 server::backend::antigravity::AntigravityBackend,
-                if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
-                    stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_question_usage_accounting" | "real_user_question_history" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group" | "real_input_origins" | "real_process_launch" | "real_bubblewrap_workbench" | "real_bubblewrap_session_move" | "real_feedback_analysis"
-                ) {
-                    Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
-                } else {
+                if stringify!($scenario) == "real_conversation" {
+                    // Default model/effort exercises live reasoning deltas (`agent_thought_chunk`).
                     Profile::new(&[], &[])
+                } else {
+                    Profile::new(
+                        &["gemini-3.8-flash"],
+                        &[("model", "gemini-3.8-flash"), ("reasoning_effort", "low")],
+                    )
                 }
             );
             provider!(

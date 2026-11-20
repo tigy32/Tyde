@@ -1015,6 +1015,53 @@ fn extract_text_from_content(content: &Value) -> String {
     String::new()
 }
 
+pub fn extract_images_from_update(update: &Value) -> Vec<protocol::ImageData> {
+    let mut images = Vec::new();
+    if let Some(content) = update.get("content") {
+        collect_images_from_content(content, &mut images);
+    }
+    if let Some(chunks) = update.get("chunks") {
+        collect_images_from_content(chunks, &mut images);
+    }
+    images
+}
+
+fn collect_images_from_content(content: &Value, images: &mut Vec<protocol::ImageData>) {
+    if let Some(array) = content.as_array() {
+        for item in array {
+            collect_images_from_content(item, images);
+        }
+        return;
+    }
+    let Some(content_type) = content.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    if content_type == "content"
+        && let Some(inner) = content.get("content")
+    {
+        collect_images_from_content(inner, images);
+        return;
+    }
+    if content_type == "image"
+        && let (Some(media_type), Some(data)) = (
+            content
+                .get("mimeType")
+                .or_else(|| content.get("mime_type"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty()),
+            content
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty()),
+        )
+    {
+        images.push(protocol::ImageData {
+            media_type: media_type.to_owned(),
+            data: data.to_owned(),
+        });
+    }
+}
+
 pub fn extract_message_id(value: &Value) -> Option<String> {
     value
         .get("messageId")

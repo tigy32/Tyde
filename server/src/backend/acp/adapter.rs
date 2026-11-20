@@ -15,7 +15,7 @@
 //! handful of things it does differently — not reimplementing a session.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -99,7 +99,42 @@ pub struct AcpRequestCtx<'a> {
     /// Combined system/steering instructions Tyde wants applied, when the
     /// session has any.
     pub system_prompt: Option<&'a str>,
+    /// Configured workspace roots for this session, primary first.
+    pub workspace_roots: &'a [String],
     pub capabilities: &'a AcpCapabilities,
+}
+
+/// One metered model request read from provider-owned session state.
+#[derive(Debug, Clone)]
+pub struct AcpRequestUsageRecord {
+    pub provider_message_id: String,
+    pub usage: protocol::TokenUsage,
+    /// 1-based ordinal among terminal planner responses in the session.
+    pub terminal_ordinal: usize,
+    /// Whether this planner response issued tool calls.
+    pub has_tool_calls: bool,
+}
+
+/// Snapshot of metered model requests and terminal planner-response progress.
+#[derive(Debug, Clone, Default)]
+pub struct AcpRequestUsageSnapshot {
+    pub records: Vec<AcpRequestUsageRecord>,
+    /// Total terminal planner responses (completed, cancelled, or errored).
+    pub terminal_responses: usize,
+    /// Provider message IDs of terminal planner responses (any terminal status).
+    pub terminal_provider_message_ids: HashSet<String>,
+    /// 1-based ordinals of terminal planner responses that issued no tool calls.
+    pub terminal_text_only_ordinals: Vec<usize>,
+}
+
+/// Event-driven wait predicate for [`AcpAgentAdapter::request_usages_for_session`].
+#[derive(Debug, Clone)]
+pub enum AcpRequestUsageWait {
+    /// Wait until a terminal tool-less planner response exists at or after this
+    /// 1-based terminal-response ordinal.
+    TextOnlyAtOrAfter(usize),
+    /// Wait until this specific provider message ID reaches a terminal status.
+    ProviderMessageId(String),
 }
 
 /// Session facts an adapter may fold into a slash command it answers itself.
@@ -207,10 +242,57 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     }
 
     /// Add non-standard fields to `session/new`. Default: nothing.
-    fn decorate_session_new(&self, _params: &mut Value, _ctx: &AcpRequestCtx<'_>) {}
+    fn decorate_session_new(
+        &self,
+        _params: &mut Value,
+        _ctx: &AcpRequestCtx<'_>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Add non-standard fields to `session/load`. Default: nothing.
+    fn decorate_session_load(
+        &self,
+        _params: &mut Value,
+        _ctx: &AcpRequestCtx<'_>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Add non-standard fields to `session/prompt`. Default: nothing.
     fn decorate_prompt(&self, _params: &mut Value, _ctx: &AcpRequestCtx<'_>) {}
+
+    /// Configured provider storage root (when overridden by session config).
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// Whether this adapter delivers `system_prompt` natively (for example via
+    /// `session/new` metadata) rather than prepending it to every user prompt.
+    fn delivers_system_prompt_natively(&self) -> bool {
+        false
+    }
+
+    /// Recognize agent-specific MCP tool naming beyond the shared ACP markers.
+    fn is_mcp_tool(
+        &self,
+        _tool_name: &str,
+        _params: &Value,
+        _servers: &[crate::backend::StartupMcpServer],
+    ) -> bool {
+        false
+    }
+
+    /// Unwrap dispatcher arguments (for example Antigravity's `call_mcp_tool`)
+    /// so request mapping and recorded tool calls see the inner MCP arguments.
+    fn unwrap_mcp_tool_args(
+        &self,
+        _tool_name: &str,
+        _args: &Value,
+        _params: &Value,
+    ) -> Option<Value> {
+        None
+    }
 
     /// Translate a non-standard notification into standard terms, or return
     /// `None` to let the generic dispatch ignore it. Default: recognize
@@ -392,8 +474,8 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         _session_id: &'a str,
         _workspace_root: &'a str,
         _tool_call_id: &'a str,
-    ) -> BoxFuture<'a, Option<Value>> {
-        Box::pin(async { None })
+    ) -> BoxFuture<'a, Result<Option<Value>, String>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn provider_message_id_for_tool<'a>(
@@ -401,8 +483,39 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         _session_id: &'a str,
         _workspace_root: &'a str,
         _tool_call_id: &'a str,
-    ) -> BoxFuture<'a, Option<String>> {
-        Box::pin(async { None })
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Metered per-request token usages recorded by the provider for this
+    /// session, in chronological order. When `wait` is `Some(...)`, waits
+    /// on provider storage events until the predicate is satisfied.
+    fn request_usages_for_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _workspace_root: &'a str,
+        _wait: Option<AcpRequestUsageWait>,
+    ) -> BoxFuture<'a, Result<AcpRequestUsageSnapshot, String>> {
+        Box::pin(async { Ok(AcpRequestUsageSnapshot::default()) })
+    }
+
+    /// Recovers original user-uploaded image attachments for a replayed user
+    /// message when the ACP server's `session/load` omits image content blocks.
+    /// Returns `(images, next_search_index)` after matching `expected_text`
+    /// starting from `from_index`.
+    fn user_message_images_for_replay<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _from_index: usize,
+        _expected_text: &'a str,
+    ) -> BoxFuture<'a, Result<(Vec<protocol::ImageData>, usize), String>> {
+        Box::pin(async move { Ok((Vec::new(), _from_index)) })
+    }
+
+    /// Optional user-facing warning produced while preparing session resources
+    /// (for example, skipped skills), emitted once the ACP session starts.
+    fn startup_warning(&self) -> Option<&str> {
+        None
     }
 
     /// Extra environment for the agent process, merged over the spec's `env`.
@@ -420,12 +533,16 @@ pub fn adapter_for_spec(spec: &AcpAgentSpec) -> Arc<dyn AcpAgentAdapter> {
         AcpAdapterId::Opencode => Arc::new(super::adapters::opencode::OpenCodeAdapter::new(
             spec.clone(),
         )),
+        AcpAdapterId::Antigravity => Arc::new(
+            super::adapters::antigravity::AntigravityAdapter::new(spec.clone()),
+        ),
     }
 }
 
 pub(super) async fn adapter_for_session(
     spec: &AcpAgentSpec,
     config: &crate::backend::ResolvedSpawnConfig,
+    storage_root: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn AcpAgentAdapter>, Option<String>), String> {
     if spec.adapter == AcpAdapterId::Opencode
         && config.access_mode == protocol::BackendAccessMode::ReadOnly
@@ -436,6 +553,17 @@ pub(super) async fn adapter_for_session(
         return Ok((
             Arc::new(adapter),
             crate::backend::render_spawn_instructions(config, false),
+        ));
+    }
+    if spec.adapter == AcpAdapterId::Antigravity {
+        let adapter = super::adapters::antigravity::AntigravityAdapter::for_session(
+            spec.clone(),
+            config,
+            storage_root,
+        )?;
+        return Ok((
+            Arc::new(adapter),
+            crate::backend::render_combined_spawn_instructions(config),
         ));
     }
     Ok((
