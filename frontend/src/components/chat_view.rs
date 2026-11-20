@@ -2991,16 +2991,22 @@ mod wasm_tests {
             message
         };
 
-        dispatch(ChatEvent::MessageAdded(
-            mk_user_msg("Inspect the workspace").message,
-        ));
+        let mut prompt = mk_user_msg("Inspect the workspace").message;
+        prompt.timestamp = 1;
+        dispatch(ChatEvent::MessageAdded(prompt));
         async fn settle() {
             next_tick().await;
             next_animation_frame().await;
             next_animation_frame().await;
         }
         // Measure before streaming scrolls this row out of the virtualized viewport.
-        for width in [960, 360] {
+        for (appearance, width) in [
+            (ChatAppearance::Ink, 960),
+            (ChatAppearance::Ink, 360),
+            (ChatAppearance::Notebook, 960),
+            (ChatAppearance::Notebook, 360),
+        ] {
+            state.chat_appearance.set(appearance);
             container
                 .style()
                 .set_property("width", &format!("{width}px"))
@@ -3024,7 +3030,25 @@ mod wasm_tests {
                 (sender.left() - body.left()).abs() < 1.0,
                 "short user text starts beneath its sender at wide and narrow widths"
             );
+            let time = user
+                .query_selector(".chat-card-time")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            let copy = user
+                .query_selector("button[aria-label='Copy message']")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                sender.right() <= time.left()
+                    && time.right() <= copy.left()
+                    && time.bottom() <= body.top()
+                    && copy.bottom() <= body.top(),
+                "{appearance:?} keeps the timestamp and Copy in the sender byline"
+            );
         }
+        state.chat_appearance.set(ChatAppearance::Ink);
         container.style().set_property("width", "800px").unwrap();
         settle().await;
         let commands = [

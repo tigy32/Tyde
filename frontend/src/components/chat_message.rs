@@ -4,11 +4,12 @@ use leptos::prelude::*;
 use protocol::MessageSender;
 use wasm_bindgen::JsCast;
 
+use crate::appearance::ChatAppearance;
 use crate::components::image_lightbox::ImageLightbox;
 use crate::components::ink_transcript::InkRowLayout;
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, ChatMessageEntry, ToolRequestEntry};
+use crate::state::{ActiveAgentRef, AppState, ChatMessageEntry, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
 ///
@@ -203,6 +204,8 @@ pub fn ChatMessageView(
     #[prop(optional, into)]
     ink_layout: Option<Signal<Option<InkRowLayout>>>,
 ) -> impl IntoView {
+    let appearance = expect_context::<AppState>().chat_appearance;
+    let has_bubble_footer = move || appearance.get() == ChatAppearance::Current;
     let ink_layout = ink_layout.unwrap_or_else(|| Signal::derive(|| None));
     let is_ink = Memo::new(move |_| ink_layout.with(Option::is_some));
     let is_flow = Memo::new(move |_| {
@@ -286,6 +289,10 @@ pub fn ChatMessageView(
     let copy_state = RwSignal::new("copy");
     let copy_error = RwSignal::new(None::<String>);
     let entry_slot = StoredValue::new_local(entry);
+    let is_user = move || card_meta.with(|(_, _, is_user, _, _)| *is_user);
+    let has_content = move || {
+        entry_slot.with_value(|entry| entry.with(|entry| !entry.message.content.is_empty()))
+    };
 
     let on_copy = move |_| {
         let text = entry_slot
@@ -323,9 +330,10 @@ pub fn ChatMessageView(
         });
     };
 
-    let copy_button = move || {
+    let copy_button = move |quiet: bool| {
         view! {
             <button
+                type="button"
                 class=move || {
                     match copy_state.get() {
                         "copied" => "footer-copy-btn copied",
@@ -334,20 +342,29 @@ pub fn ChatMessageView(
                     }
                 }
                 title=move || match copy_state.get() {
-                    "copied" => "Message copied".to_owned(),
-                    "failed" => format!(
+                    "copied" if !quiet => Some("Message copied".to_owned()),
+                    "failed" => Some(format!(
                         "Copy failed: {}",
                         copy_error.get().unwrap_or_default()
-                    ),
-                    _ => "Copy message".to_owned(),
+                    )),
+                    _ if !quiet => Some("Copy message".to_owned()),
+                    _ => None,
                 }
                 aria-label="Copy message"
                 on:click=on_copy
             >
                 {move || match copy_state.get() {
-                    "copied" => "\u{2713}",
-                    "failed" => "!",
-                    _ => "\u{29C9}",
+                    "copied" => "✓".into_any(),
+                    "failed" => "!".into_any(),
+                    _ if quiet => view! {
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="1.75" stroke-linecap="round"
+                            stroke-linejoin="round" aria-hidden="true">
+                            <rect x="8" y="8" width="12" height="12" rx="2"/>
+                            <path d="M16 4H6a2 2 0 0 0-2 2v10"/>
+                        </svg>
+                    }.into_any(),
+                    _ => "⧉".into_any(),
                 }}
             </button>
         }
@@ -369,14 +386,12 @@ pub fn ChatMessageView(
                     {move || model_memo.get().map(|m| view! {
                         <span class="chat-card-model">{m}</span>
                     })}
-                    <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
-                    {move || {
-                        let is_user = card_meta.with(|(_, _, is_user, _, _)| *is_user);
-                        let has_content = entry_slot.with_value(|entry| {
-                            entry.with(|entry| !entry.message.content.is_empty())
-                        });
-                        (is_user && has_content).then(copy_button)
-                    }}
+                    <Show when=move || !is_user() || !has_bubble_footer()>
+                        <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
+                    </Show>
+                    <Show when=move || is_user() && !has_bubble_footer() && has_content()>
+                        {copy_button(false)}
+                    </Show>
                 </div>
             </Show>
 
@@ -539,8 +554,14 @@ pub fn ChatMessageView(
                 flush(&mut phase, &mut rendered, phase_index);
                 rendered
             }}
-
-
+            <Show when=move || is_user() && has_bubble_footer()>
+                <div class="chat-card-user-footer">
+                    <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
+                    <Show when=has_content>
+                        {copy_button(true)}
+                    </Show>
+                </div>
+            </Show>
 
             // Footer (assistant only)
             {move || {
@@ -585,7 +606,7 @@ pub fn ChatMessageView(
                         </span>
                         <span class="chat-card-footer-right">
                             <span class="footer-time">{footer_time}</span>
-                            {(!footer_content_empty).then(copy_button)}
+                            {(!footer_content_empty).then(|| copy_button(false))}
                         </span>
                     </div>
                 })
@@ -1315,11 +1336,24 @@ mod wasm_tests {
         let container = mount_message(entry);
         next_tick().await;
         let button: HtmlElement = container
-            .query_selector("button[title='Copy message']")
+            .query_selector("button[aria-label='Copy message']")
             .unwrap()
             .expect("message copy button")
             .dyn_into()
             .unwrap();
+        let assert_copy_icon = || {
+            if is_user {
+                assert!(button.query_selector("svg").unwrap().is_some());
+                assert!(!button.has_attribute("title"));
+            } else {
+                assert_eq!(button.text_content().as_deref(), Some("⧉"));
+                assert_eq!(
+                    button.get_attribute("title").as_deref(),
+                    Some("Copy message")
+                );
+            }
+        };
+        assert_copy_icon();
         if is_user {
             assert!(
                 container
@@ -1356,11 +1390,7 @@ mod wasm_tests {
             Some(content),
             "copy the original message, preserving markdown, Unicode and line breaks"
         );
-        assert_eq!(
-            button.text_content().as_deref(),
-            Some("⧉"),
-            "do not claim success before the native write completes"
-        );
+        assert_copy_icon();
         js_sys::eval("window.__messageClipboardFixture.resolve()").unwrap();
         next_tick().await;
         assert_eq!(button.text_content().as_deref(), Some("✓"));
@@ -1392,11 +1422,7 @@ mod wasm_tests {
         js_sys::eval("window.__messageClipboardFixture.timers.splice(0).forEach(run => run())")
             .unwrap();
         next_tick().await;
-        assert_eq!(button.text_content().as_deref(), Some("⧉"));
-        assert_eq!(
-            button.get_attribute("title").as_deref(),
-            Some("Copy message")
-        );
+        assert_copy_icon();
         container.remove();
     }
 
@@ -1404,7 +1430,9 @@ mod wasm_tests {
     async fn user_bubbles_fit_short_text_and_wrap_long_text() {
         ensure_styles_loaded();
 
-        let short_container = mount_message(user_msg("Why?"));
+        let mut short_message = user_msg("Why?");
+        short_message.message.timestamp = 1;
+        let short_container = mount_message(short_message);
         next_tick().await;
         let short_card: HtmlElement = short_container
             .query_selector(".chat-card-user")
@@ -1449,10 +1477,12 @@ mod wasm_tests {
             "a short user bubble must fit its content, not fill the row"
         );
 
-        let long_container = mount_message(user_msg(
+        let mut long_message = user_msg(
             "This deliberately long user message must wrap onto multiple lines \
              while remaining inside the normal user bubble width limit at desktop size.",
-        ));
+        );
+        long_message.message.timestamp = 1;
+        let long_container = mount_message(long_message);
         next_tick().await;
         let long_card: HtmlElement = long_container
             .query_selector(".chat-card-user")
@@ -1479,6 +1509,27 @@ mod wasm_tests {
             long_rect.width(),
             long_card_rect.width(),
         );
+
+        for (card, bubble) in [(short_card, short_rect), (long_card, long_rect)] {
+            let time = card.query_selector(".chat-card-time").unwrap().unwrap();
+            assert!(!time.text_content().unwrap().is_empty());
+            let time = time.get_bounding_client_rect();
+            let copy = card
+                .query_selector("button[aria-label='Copy message']")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(
+                time.top() >= bubble.bottom() && copy.top() >= bubble.bottom(),
+                "timestamp and Copy must sit below the bubble"
+            );
+            assert!(
+                time.right() <= copy.left()
+                    && ((time.top() + time.bottom()) - (copy.top() + copy.bottom())).abs() <= 1.0
+                    && (copy.right() - bubble.right()).abs() <= 1.0,
+                "timestamp and Copy must share a right-aligned row"
+            );
+        }
 
         // Native light-theme captures showed black text on the unchanged
         // dark-blue bubble. Check the rendered colour pair, not theme tokens.
