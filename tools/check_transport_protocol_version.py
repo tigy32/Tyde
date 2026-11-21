@@ -166,6 +166,11 @@ def local_progress_tokens(
             ".map_err(|_| Error::NegotiationTimeout { stage })",
             '.map_err(|_| failure("negotiation", "timed out"))',
         )]
+        replacements.append((
+            '''let mut stage = ConnectStage::AwaitMobileOffer;
+            let mut advance = |next| { stage = next; progress(next); };''',
+            "",
+        ))
         replacements.extend(
             (f"advance(ConnectStage::{stage});", "")
             for stage in (

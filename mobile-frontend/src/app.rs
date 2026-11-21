@@ -160,22 +160,6 @@ pub(crate) fn AppSurface() -> impl IntoView {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForegroundRecovery {
-    Probe,
-    Reconnect,
-}
-
-#[cfg(target_arch = "wasm32")]
-fn foreground_recovery(background_ms: u64) -> ForegroundRecovery {
-    if background_ms >= BACKGROUND_RECONNECT_AFTER.as_millis() as u64 {
-        ForegroundRecovery::Reconnect
-    } else {
-        ForegroundRecovery::Probe
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 fn install_page_visibility_recovery(state: AppState) {
     if crate::native::is_native() {
         return;
@@ -242,25 +226,77 @@ fn install_page_visibility_recovery(_state: AppState) {}
 
 #[cfg(target_arch = "wasm32")]
 async fn recover_after_foreground(state: &AppState, background_ms: u64) {
+    recover_after_foreground_with_clock(state, background_ms, sleep).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn recover_after_foreground_with_clock<F: Future<Output = ()>>(
+    state: &AppState,
+    background_ms: u64,
+    probe_deadline: impl FnOnce(Duration) -> F,
+) {
     let Some(host) = state.active_local_host_id.get_untracked() else {
         return;
     };
-    match foreground_recovery(background_ms) {
-        ForegroundRecovery::Probe => heartbeat_tick(state).await,
-        ForegroundRecovery::Reconnect => {
+    if background_ms < BACKGROUND_RECONNECT_AFTER.as_millis() as u64 {
+        heartbeat_tick(state).await;
+        return;
+    }
+    if state.active_host_connection_status() == ConnectionStatus::Connected
+        && let Some(stream) = state.host_stream_untracked(&host)
+    {
+        let now = unix_time_ms();
+        let expired = state
+            .heartbeat_pending_since_by_host
+            .with_untracked(|pending| {
+                pending.get(&host).is_some_and(|sent| {
+                    now.saturating_sub(*sent) >= HEARTBEAT_TIMEOUT.as_millis() as u64
+                })
+            });
+        if !expired {
             state.heartbeat_pending_since_by_host.update(|pending| {
-                pending.remove(&host);
+                pending.insert(host.clone(), now);
             });
-            state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
-                round_trips.remove(&host);
-            });
-            let reason = bridge::ConnectionInvalidation::ForegroundResume { background_ms };
-            if bridge::invalidate_host_connection(&host, reason).is_err()
-                && let Err(error) = bridge::connect_paired_host(&host).await
+            let probe_budget = state
+                .heartbeat_round_trip_ms_by_host
+                .with_untracked(|rtts| {
+                    Duration::from_millis(rtts.get(&host).copied().unwrap_or_default())
+                        .saturating_mul(4)
+                        .clamp(mobile_pairing::RECONNECT_INITIAL, HEARTBEAT_TIMEOUT)
+                });
+            let deadline = probe_deadline(probe_budget);
+            tokio::pin!(deadline);
+            let payload = HeartbeatPayload {
+                client_sent_at_ms: now,
+            };
+            tokio::select! {
+                _ = &mut deadline => {},
+                sent = send_frame(&host, stream.clone(), FrameKind::Heartbeat, &payload) => {
+                    if sent.is_ok() { deadline.await; }
+                }
+            }
+            if PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.get().is_some())
+                || state.host_stream_untracked(&host).as_ref() != Some(&stream)
+                || !state
+                    .heartbeat_pending_since_by_host
+                    .with_untracked(|p| p.get(&host) == Some(&now))
+                || state.active_local_host_id.get_untracked().as_ref() != Some(&host)
             {
-                log::warn!("foreground recovery could not reconnect host {host}: {error}");
+                return;
             }
         }
+    }
+    state.heartbeat_pending_since_by_host.update(|pending| {
+        pending.remove(&host);
+    });
+    state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+        round_trips.remove(&host);
+    });
+    let reason = bridge::ConnectionInvalidation::ForegroundResume { background_ms };
+    if bridge::invalidate_host_connection(&host, reason).is_err()
+        && let Err(error) = bridge::connect_paired_host(&host).await
+    {
+        log::warn!("foreground recovery could not reconnect host {host}: {error}");
     }
 }
 
@@ -1993,13 +2029,35 @@ mod wasm_tests {
                 lines.recv().await.unwrap();
             }
             let previous_instance = state.active_connection_instance_ids.get_untracked()[&host];
+            state.heartbeat_round_trip_ms_by_host.update(|round_trips| { round_trips.remove(&host); });
+            let (expire_probe, deadline) = tokio::sync::oneshot::channel();
+            let probe = recover_after_foreground_with_clock(&state, BACKGROUND_RECONNECT_AFTER.as_millis() as u64, |_| async {
+                let _ = deadline.await;
+            });
+            let observe = async {
+                while !state.heartbeat_round_trip_ms_by_host.with_untracked(|rtts| rtts.contains_key(&host)) {
+                    tokio::select! {
+                        _ = lines.recv() => {},
+                        event = statuses.recv() => {
+                            let event = event.expect("connection actor status subscription");
+                            ensure!(event.local_host_id != host || event.status == PairedHostConnectionStatus::Connected,
+                                "Healthy resume changed connection status instead of probing");
+                        }
+                    }
+                }
+                web_sys::console::info_1(&format!("Foreground heartbeat RTT: {} ms", state.heartbeat_round_trip_ms_by_host.get_untracked()[&host]).into());
+                let _ = expire_probe.send(());
+                Ok(())
+            };
+            let ((), observed) = tokio::join!(probe, observe);
+            observed?;
+            ensure!(state.active_connection_instance_ids.get_untracked()[&host] == previous_instance,
+                "foreground probe must use the existing authenticated channel");
             let reconnect_armed = pause_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
-            // Inject the suspension clock, not a transport result or a lifecycle delay.
-            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Background);
-            PAGE_HIDDEN_SINCE_MS.with(|hidden| hidden.set(Some(
-                unix_time_ms() - BACKGROUND_RECONNECT_AFTER.as_millis() as u64,
-            )));
-            crate::native::handle_intent(&state, mobile_shell_types::native::NativeIntent::Foreground);
+            {
+                let _stalled_write = bridge::test_defer_sends();
+                recover_after_foreground_with_clock(&state, BACKGROUND_RECONNECT_AFTER.as_millis() as u64, |_| std::future::ready(())).await;
+            }
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(reconnect_armed)).await.unwrap();
             loop {
                 let event = statuses.recv().await.unwrap();
@@ -2040,6 +2098,7 @@ mod wasm_tests {
             ))
             .await
             .unwrap();
+            let cold_start = unix_time_ms();
             resume_reconnect.call0(&wasm_bindgen::JsValue::NULL).unwrap();
             loop {
                 let event = statuses.recv().await.unwrap();
@@ -2057,6 +2116,7 @@ mod wasm_tests {
             while !matches!(state.active_host_connection_status(), ConnectionStatus::Connected) {
                 lines.recv().await.unwrap();
             }
+            web_sys::console::info_1(&format!("Fresh RTC negotiation through host bootstrap: {} ms", unix_time_ms().saturating_sub(cold_start)).into());
             next_tick().await;
             ensure!(container.query_selector("[aria-label^='Connected,']").unwrap().is_some(),
                 "the real host Welcome must restore the connected presentation");

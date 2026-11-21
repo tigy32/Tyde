@@ -139,7 +139,7 @@ async fn connect_with<F: std::future::Future<Output = Result<Peer, Error>>>(
         Ok(Duration::from_millis(remaining))
     };
     let deadline = remaining()?;
-    let mut stage = ConnectStage::RelayAllocation;
+    let mut stage = ConnectStage::AwaitMobileOffer;
     let mut advance = |next| {
         stage = next;
         progress(next);
@@ -255,8 +255,8 @@ async fn accept_host<F: Future<Output = Result<Peer, Error>>>(
     new_peer: impl Fn() -> F,
     remaining: impl Fn() -> Result<Duration, Error>,
 ) -> Result<RtcStream, Error> {
-    advance(ConnectStage::AwaitMobileOffer);
     let mut socket = HostSocket::open(credentials, heartbeat).await?;
+    advance(ConnectStage::AwaitMobileOffer);
     let mut offer = match socket
         .offer_or(pairing_key, pending::<Infallible>())
         .await?

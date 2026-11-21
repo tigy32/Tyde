@@ -3834,7 +3834,15 @@ fn spawn_device_accept_task(
         let mut backoff = ACCEPT_RECONNECT_INITIAL;
         let mut credentials = None;
         loop {
-            match connect_mobile_device_stream(&managed_service, &record, &mut credentials).await {
+            let mut listener_opened = None;
+            match connect_mobile_device_stream(
+                &managed_service,
+                &record,
+                &mut credentials,
+                &mut listener_opened,
+            )
+            .await
+            {
                 Ok(stream) => {
                     let _ = tx.send(MobileAccessCommand::DeviceTransportConnected {
                         device_id: record.device_id.clone(),
@@ -3853,9 +3861,25 @@ fn spawn_device_accept_task(
                     if terminal {
                         return;
                     }
-                    let delay = jittered_backoff(backoff);
-                    sleep(delay).await;
-                    backoff = backoff.saturating_mul(2).min(ACCEPT_RECONNECT_MAX);
+                    let delay = if listener_opened
+                        .is_some_and(|opened| opened.elapsed() >= ACCEPT_RECONNECT_MAX)
+                    {
+                        // A stable idle registration has already outlasted the maximum backoff.
+                        backoff = ACCEPT_RECONNECT_INITIAL;
+                        Duration::ZERO
+                    } else {
+                        let delay = jittered_backoff(backoff);
+                        backoff = backoff.saturating_mul(2).min(ACCEPT_RECONNECT_MAX);
+                        delay
+                    };
+                    tracing::info!(
+                        retry_in_ms = delay.as_millis(),
+                        idle_listener = listener_opened.is_some(),
+                        "mobile signaling listener restarting"
+                    );
+                    if !delay.is_zero() {
+                        sleep(delay).await;
+                    }
                 }
             }
         }
@@ -4076,6 +4100,7 @@ async fn connect_mobile_device_stream(
     managed_service: &ManagedMobileServiceClient,
     record: &MobilePairingRecord,
     credentials: &mut Option<protocol::MobileRtcCredentials>,
+    listener_opened: &mut Option<tokio::time::Instant>,
 ) -> Result<BoxedMobileTransport, MobileTaskError> {
     let now = now_ms().map_err(MobileTaskError::transport)?;
     if credentials
@@ -4094,10 +4119,20 @@ async fn connect_mobile_device_stream(
         .as_ref()
         .ok_or_else(|| MobileTaskError::transport("missing host RTC credentials"))?
         .clone();
+    let mut stage_started = tokio::time::Instant::now();
     rtc_transport::connect_with_signaling_heartbeat(
         credentials,
         record.psk.as_bytes(),
-        |_| {},
+        |stage| {
+            *listener_opened = matches!(stage, rtc_transport::ConnectStage::AwaitMobileOffer)
+                .then(tokio::time::Instant::now);
+            tracing::info!(
+                ?stage,
+                previous_stage_ms = stage_started.elapsed().as_millis(),
+                "mobile host negotiation advanced"
+            );
+            stage_started = tokio::time::Instant::now();
+        },
         managed_service.signaling_heartbeat,
     )
     .await

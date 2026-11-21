@@ -70,6 +70,27 @@ also resumes its existing stream after the outage. `Failed`, `Closed`, channel
 errors, and the existing application liveness deadlines still end the stream.
 Host close diagnostics identify which connection task ended and its elapsed time.
 
+A long foreground suspension is not evidence that a connected host is gone.
+Mobile sends a heartbeat on the current authenticated stream and leaves the
+workspace usable. Its probe deadline covers both sending and
+the matching reply, allowing four measured round trips within the normal
+one-second initial retry and twenty-second heartbeat bounds. An unanswered probe starts recovery; an expired outstanding
+heartbeat or interrupted negotiation does not receive another probe window.
+This budget is not a cold WebRTC setup guarantee.
+
+The host resets failure backoff when an idle signaling registration has
+already outlasted the maximum backoff interval. It then reopens immediately
+on disconnect. Short registrations and failed negotiations still back off.
+Previously an idle listener inherited up to 30 seconds of backoff even after
+a successful registration. On November 20 the host logged a reset at
+16:42:42 Pacific and the next matching Cloudflare upgrade at 16:43:12.
+The incident's two later signaling POSTs reached the same pairing shard and
+were canceled after 59–60 seconds without a host answer. No host remote-offer
+event appeared until the successful 16:59:32 exchange. These observations do
+not by themselves establish why those two offers were not answered. The host
+now records registration, authenticated offer processing, answer publication
+and channel-opening stages without credentials or SDP.
+
 The shared browser timer layer owns and cancels individual `setTimeout` calls.
 The former timer driver accumulated callbacks for cancelled long deadlines and
 stopped scheduling the next event when its reference count exceeded 20. In the
