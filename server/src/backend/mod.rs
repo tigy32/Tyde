@@ -1273,6 +1273,7 @@ pub enum CancelBackgroundTaskOutcome {
 
 #[derive(Debug, Clone, Default)]
 pub struct BackendProbeContext {
+    pub manual_capacity_refresh: bool,
     #[cfg(any(test, feature = "test-support"))]
     pub mock_discovery: Option<mock::MockDiscovery>,
     pub program: Option<String>,
@@ -2201,12 +2202,8 @@ pub(crate) fn supports_out_of_band_capacity(kind: BackendKind) -> bool {
     capabilities_for_backend_kind(kind).contains(BackendCapability::OutOfBandCapacity)
 }
 
-/// Reads one backend's account capacity without starting a conversation.
-///
-/// Every arm is a read-only provider status call answered by a short-lived
-/// process or connection: no prompt is sent, no turn starts, and no model
-/// tokens are spent. Backends without an out-of-band source are reported as
-/// such rather than probed.
+/// Reads capacity independently of user conversations. Only an explicit manual
+/// refresh may use inference when the provider requires a turn to report usage.
 pub(crate) async fn read_capacity_out_of_band(
     kind: BackendKind,
     ctx: &BackendProbeContext,

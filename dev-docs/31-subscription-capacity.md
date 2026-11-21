@@ -140,12 +140,14 @@ out-of-band source changes one declaration and everything follows.
 ### Coverage is load-bearing, not a footnote
 
 Coverage depends on the *source*, not only on the vendor, and Claude is the
-reason it exists. Its passive `rate_limit_event` reports only the single limit
-that is currently binding — the other limits still exist, and their utilization
+reason it exists. Its passive `rate_limit_event` reports the binding limit and any vendor-provided
+`unifiedWindows` — the other limits still exist, and their utilization
 is *unknown, not zero*, so that path is `RepresentativeBucketOnly`. Its
 `get_usage` control read returns the complete `limits` array and is
 `AllVendorBuckets`. Since the host polls `get_usage`, the complete report is now
-the normal case and the representative one is the fallback.
+the normal case for interactive OAuth. With a setup token, normal turns
+provide the usage windows. Explicit refresh runs one tool-free, nonpersistent
+Haiku turn. Automatic polling never starts that turn or re-dates its reading.
 
 Without `CapacityCoverage` on the wire a one-bucket report and a complete one
 would render identically, and a user looking at a healthy row would have no way
@@ -261,8 +263,7 @@ totals and is marked accordingly.
 - **Codex `account/usage/read`** — experimental, returns token counts, not quota.
 - **`anthropic-ratelimit-unified-*` headers** — land inside the Claude Code
   process; Tyde runs it as a subprocess and never sees them. (`rate_limit_event`
-  is Claude's own forwarding of this data, which is exactly why only the
-  representative bucket survives.)
+  is Claude's own forwarding of this data, including its reported windows.)
 - **`~/.claude/.credentials.json` for the plan label** — a secret-bearing file
   Tyde has never opened (and on some installs the data is in the Keychain
   instead, so a file read would be silently machine-dependent). Unnecessary

@@ -170,13 +170,25 @@ async fn poll_with_report(
     }
     let context = host.capacity_probe_context(backend_kind).await;
     let state = match context {
-        Some(context) => read_capacity_out_of_band(backend_kind, &context).await,
+        Some(mut context) => {
+            context.manual_capacity_refresh = trigger == CapacityPollTrigger::Manual;
+            read_capacity_out_of_band(backend_kind, &context).await
+        }
         // Backend probing is disabled on this host, so there is no source to
         // read rather than a source that failed.
         None => BackendCapacityState::Unsupported {
             reason: protocol::CapacityUnsupportedReason::ExternalProvider,
         },
     };
+    if matches!(
+        state,
+        BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::AwaitingFirstReport
+        }
+    ) {
+        host.end_capacity_poll(backend_kind).await;
+        return (PollOutcome::Answered, None);
+    }
     let outcome = match state {
         BackendCapacityState::Known { .. } | BackendCapacityState::Unsupported { .. } => {
             PollOutcome::Answered

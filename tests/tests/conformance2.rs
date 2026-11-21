@@ -12,10 +12,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use protocol::{
     AgentControlProgressKind, AgentControlProgressStatus, AgentId, AgentOrigin,
-    BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource, ChatEvent,
-    CurrentContextUsage, ImageData, MessageSender, MessageTokenUsage, SessionId,
-    SessionSettingsValues, SlashCommandCatalog, TaskStatus, TokenUsage, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
+    BackendCapacityState, BackendKind, CapacityMeasure, ChatEvent, CurrentContextUsage, ImageData,
+    MessageSender, MessageTokenUsage, SessionId, SessionSettingsValues, SlashCommandCatalog,
+    TaskStatus, TokenUsage, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
+    ToolProgressUpdate, ToolRequestType,
 };
 use serde_json::Value;
 use server::backend::{
@@ -11465,7 +11465,12 @@ async fn real_subscription_capacity<B: Backend>(host: &mut Harness<B>) {
 }
 
 async fn real_capacity_without_a_conversation<B: Backend>(host: &mut Harness<B>) {
-    let snapshot = host.await_known_capacity().await;
+    let automatic = B::read_capacity_out_of_band(&server::backend::BackendProbeContext {
+        workspace_roots: host.workspace_roots(),
+        ..Default::default()
+    })
+    .await;
+    let snapshot = host.refresh_capacity_and_await_report().await;
     assert_eq!(snapshot.backend_kind, host.backend());
     assert!(
         snapshot.refreshable,
@@ -11475,21 +11480,41 @@ async fn real_capacity_without_a_conversation<B: Backend>(host: &mut Harness<B>)
     let BackendCapacityState::Known { report } = snapshot.state.clone() else {
         unreachable!("await_known_capacity returns only Known")
     };
+    // Setup tokens return no idle reading. Only the explicit refresh may
+    // produce a turn-derived event; every other source must answer both reads.
+    match automatic {
+        BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
+        } => {
+            assert_eq!(
+                report.source,
+                protocol::CapacitySource::ClaudeRateLimitEvent
+            );
+            assert!(report.buckets.iter().any(|b| matches!(
+                b.id,
+                protocol::CapacityBucketId::Claude {
+                    limit: protocol::ClaudeLimitType::FiveHour
+                }
+            )));
+            assert!(report.buckets.iter().any(|b| matches!(
+                b.id,
+                protocol::CapacityBucketId::Claude {
+                    limit: protocol::ClaudeLimitType::SevenDay
+                }
+            )));
+        }
+        BackendCapacityState::Known { report: idle } => {
+            assert_ne!(idle.source, protocol::CapacitySource::ClaudeRateLimitEvent);
+            assert_eq!(idle.source, report.source);
+        }
+        _ => panic!("automatic capacity probe neither reported limits nor awaited a turn"),
+    }
     let source_matches_backend = report.source.backend_kind() == host.backend();
     assert!(
         source_matches_backend,
         "{:?}: out-of-band capacity came from the wrong source: {:?}",
         host.backend(),
         report.source
-    );
-    // `ClaudeRateLimitEvent` is the passive stream event and is only
-    // reachable from a running turn, so seeing it here would mean the
-    // report did not come from the poll this test exists to prove.
-    assert_ne!(
-        report.source,
-        CapacitySource::ClaudeRateLimitEvent,
-        "{:?}: report came from conversation traffic, not an out-of-band read",
-        host.backend()
     );
     assert!(
         !report.buckets.is_empty(),

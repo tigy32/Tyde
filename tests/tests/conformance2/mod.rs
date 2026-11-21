@@ -2507,6 +2507,7 @@ impl<B: Backend> Harness<B> {
 
     pub async fn refresh_capacity_and_await_report(&self) -> CapacityObservation {
         let state = B::read_capacity_out_of_band(&server::backend::BackendProbeContext {
+            manual_capacity_refresh: true,
             workspace_roots: self.workspace_roots(),
             ..Default::default()
         })

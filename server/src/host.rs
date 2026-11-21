@@ -13338,6 +13338,7 @@ std::ops::ControlFlow::Continue((
                 let context = crate::backend::BackendProbeContext {
                     #[cfg(any(test, feature = "test-support"))]
                     mock_discovery: mock_discovery.clone(),
+                    manual_capacity_refresh: false,
                     workspace_roots: root
                         .as_ref()
                         .map(|root| vec![root.clone()])

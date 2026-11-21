@@ -768,6 +768,7 @@ enum ClaudeCapacityAccess {
     #[default]
     Unknown,
     Subscription,
+    SetupToken,
     ApiKey,
     ExternalProvider,
 }
@@ -4843,7 +4844,9 @@ impl ClaudeInner {
                     reason: protocol::CapacityUnsupportedReason::ExternalProvider,
                 })
             }
-            ClaudeCapacityAccess::Unknown | ClaudeCapacityAccess::Subscription => None,
+            ClaudeCapacityAccess::Unknown
+            | ClaudeCapacityAccess::Subscription
+            | ClaudeCapacityAccess::SetupToken => None,
         };
         if let Some(capacity) = capacity {
             emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
@@ -16211,6 +16214,10 @@ fn claude_capacity_access_from_initialize(response: &Value) -> ClaudeCapacityAcc
                 .is_some()
             {
                 ClaudeCapacityAccess::Subscription
+            } else if account.get("tokenSource").and_then(Value::as_str)
+                == Some("CLAUDE_CODE_OAUTH_TOKEN")
+            {
+                ClaudeCapacityAccess::SetupToken
             } else {
                 ClaudeCapacityAccess::ApiKey
             }
@@ -16410,7 +16417,7 @@ pub(crate) fn map_claude_control_usage(
 }
 
 /// Maps Claude's already-received stream-json frame. The frame contains one
-/// vendor-selected binding bucket, never an inferred account-wide aggregate.
+/// binding bucket and may also carry vendor-reported usage windows.
 pub(crate) fn map_passive_rate_limit_event(
     frame: &Value,
 ) -> Result<CapacityReport, CapacityUnavailableReason> {
@@ -16418,19 +16425,51 @@ pub(crate) fn map_passive_rate_limit_event(
         .get("rate_limit_info")
         .filter(|value| value.is_object())
         .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let binding = info
+        .get("rateLimitType")
+        .and_then(Value::as_str)
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let mut buckets = Vec::new();
+    if let Some(windows) = info.get("unifiedWindows") {
+        for (kind, details) in windows
+            .as_object()
+            .ok_or(CapacityUnavailableReason::MalformedReport)?
+        {
+            buckets.push(claude_passive_bucket(kind, details)?);
+        }
+    }
+    if !info
+        .get("unifiedWindows")
+        .is_some_and(|windows| windows.get(binding).is_some())
+    {
+        buckets.push(claude_passive_bucket(binding, info)?);
+    }
+    Ok(CapacityReport {
+        source: CapacitySource::ClaudeRateLimitEvent,
+        observed_at_ms: None,
+        plan: None,
+        buckets,
+        coverage: CapacityCoverage::RepresentativeBucketOnly,
+    })
+}
+
+fn claude_passive_bucket(
+    kind: &str,
+    info: &Value,
+) -> Result<CapacityBucket, CapacityUnavailableReason> {
     let base_status = match info.get("status").and_then(Value::as_str) {
         Some("allowed") => CapacityBucketStatus::Allowed,
         Some("allowed_warning") => CapacityBucketStatus::AllowedWarning,
         Some("rejected") => CapacityBucketStatus::Rejected,
         _ => return Err(CapacityUnavailableReason::MalformedReport),
     };
-    let limit = match info.get("rateLimitType").and_then(Value::as_str) {
-        Some("five_hour") => ClaudeLimitType::FiveHour,
-        Some("seven_day") => ClaudeLimitType::SevenDay,
-        Some("seven_day_opus") => ClaudeLimitType::SevenDayOpus,
-        Some("seven_day_sonnet") => ClaudeLimitType::SevenDaySonnet,
-        Some("seven_day_overage_included") => ClaudeLimitType::SevenDayOverageIncluded,
-        Some("overage") => ClaudeLimitType::Overage,
+    let limit = match kind {
+        "five_hour" => ClaudeLimitType::FiveHour,
+        "seven_day" => ClaudeLimitType::SevenDay,
+        "seven_day_opus" => ClaudeLimitType::SevenDayOpus,
+        "seven_day_sonnet" => ClaudeLimitType::SevenDaySonnet,
+        "seven_day_overage_included" => ClaudeLimitType::SevenDayOverageIncluded,
+        "overage" => ClaudeLimitType::Overage,
         _ => return Err(CapacityUnavailableReason::MalformedReport),
     };
     let status = if matches!(limit, ClaudeLimitType::Overage) {
@@ -16482,40 +16521,23 @@ pub(crate) fn map_passive_rate_limit_event(
             .map(|at_ms| CapacityReset::At { at_ms })
             .ok_or(CapacityUnavailableReason::MalformedReport)?,
     };
-    Ok(CapacityReport {
-        source: CapacitySource::ClaudeRateLimitEvent,
-        observed_at_ms: None,
-        plan: None,
-        buckets: vec![CapacityBucket {
-            id: CapacityBucketId::Claude { limit },
-            label: label.to_string(),
-            measure,
-            scope: CapacityScope::NotReported,
-            window: CapacityWindow::NotReported,
-            reset,
-            status: Some(status),
-        }],
-        coverage: CapacityCoverage::RepresentativeBucketOnly,
+    Ok(CapacityBucket {
+        id: CapacityBucketId::Claude { limit },
+        label: label.to_string(),
+        measure,
+        scope: CapacityScope::NotReported,
+        window: CapacityWindow::NotReported,
+        reset,
+        status: Some(status),
     })
 }
 
 /// How long the whole out-of-band probe may take, spawn through response.
 const CLAUDE_CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Reads account capacity with no conversation and no live agent.
-///
-/// The CLI answers `get_usage` on the control channel as soon as it starts, so
-/// this never sends a user message, never starts a turn, and spends no tokens.
-/// `--no-session-persistence` keeps the probe out of the user's session list.
-///
-/// Measured on claude 2.1.x: the control response arrives ~1.1s after spawn and
-/// carries every bucket plus `subscription_type`, which is strictly more than
-/// the single binding bucket the passive `rate_limit_event` reports.
-pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityState {
-    claude_capacity_probe().await
-}
-
-async fn claude_capacity_probe() -> protocol::BackendCapacityState {
+/// A setup token reports limits only during inference. Only an explicit refresh
+/// may start a nonpersistent Haiku turn; scheduled probes never send a message.
+async fn claude_capacity_probe(manual: bool) -> protocol::BackendCapacityState {
     let unreachable = protocol::BackendCapacityState::Unavailable {
         reason: CapacityUnavailableReason::SourceUnreachable,
     };
@@ -16527,6 +16549,13 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
         }
     };
     command.args([
+        "--model",
+        "haiku",
+        "--tools",
+        "",
+        "--safe-mode",
+        "--system-prompt",
+        "Reply OK.",
         "--print",
         "--verbose",
         "--output-format",
@@ -16553,7 +16582,7 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
     // minutes would accumulate.
     let state = match tokio::time::timeout(
         CLAUDE_CAPACITY_PROBE_TIMEOUT,
-        claude_capacity_probe_exchange(&mut child),
+        claude_capacity_probe_exchange(&mut child, manual),
     )
     .await
     {
@@ -16571,6 +16600,7 @@ async fn claude_capacity_probe() -> protocol::BackendCapacityState {
 
 async fn claude_capacity_probe_exchange(
     child: &mut AsyncGroupChild,
+    manual: bool,
 ) -> protocol::BackendCapacityState {
     let unreachable = protocol::BackendCapacityState::Unavailable {
         reason: CapacityUnavailableReason::SourceUnreachable,
@@ -16582,53 +16612,95 @@ async fn claude_capacity_probe_exchange(
         return unreachable;
     };
 
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let request = json!({
-        "type": "control_request",
-        "request_id": request_id,
-        "request": { "subtype": "get_usage" },
-    });
-    let mut line = request.to_string();
-    line.push('\n');
-    if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
-        return unreachable;
-    }
-
     let mut reader = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if frame.get("type").and_then(Value::as_str) != Some("control_response") {
-            continue;
-        }
-        let response = frame.get("response").unwrap_or(&Value::Null);
-        if response.get("request_id").and_then(Value::as_str) != Some(request_id.as_str()) {
-            continue;
-        }
-        if response.get("subtype").and_then(Value::as_str) != Some("success") {
-            return unreachable;
-        }
-        let Some(payload) = response.get("response") else {
-            return unreachable;
-        };
-        // `rate_limits_available: false` is an authenticated API-key or
-        // external-provider account, not a failed read.
-        if payload
-            .get("rate_limits_available")
-            .and_then(Value::as_bool)
-            == Some(false)
+    let mut subtype = "initialize";
+    loop {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request =
+            json!({"type":"control_request","request_id":request_id,"request":{"subtype":subtype}});
+        if stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .is_err()
         {
-            return protocol::BackendCapacityState::Unsupported {
-                reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+            return unreachable;
+        }
+        loop {
+            let Ok(Some(line)) = reader.next_line().await else {
+                return unreachable;
+            };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame["type"] != "control_response" {
+                continue;
+            }
+            let response = frame.get("response").unwrap_or(&Value::Null);
+            if response.get("request_id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                continue;
+            }
+            if response.get("subtype").and_then(Value::as_str) != Some("success") {
+                return unreachable;
+            }
+            let Some(payload) = response.get("response") else {
+                return unreachable;
+            };
+            if subtype == "initialize" {
+                if claude_capacity_access_from_initialize(payload)
+                    == ClaudeCapacityAccess::SetupToken
+                {
+                    if !manual {
+                        return protocol::BackendCapacityState::Unavailable {
+                            reason: CapacityUnavailableReason::AwaitingFirstReport,
+                        };
+                    }
+                    let prompt =
+                        json!({"type":"user","message":{"role":"user","content":"Reply OK."}});
+                    if stdin
+                        .write_all(format!("{prompt}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return unreachable;
+                    }
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        if event["type"] == "rate_limit_event" {
+                            return match map_passive_rate_limit_event(&event) {
+                                Ok(report) => protocol::BackendCapacityState::Known { report },
+                                Err(reason) => {
+                                    protocol::BackendCapacityState::Unavailable { reason }
+                                }
+                            };
+                        }
+                        if event["type"] == "result" {
+                            break;
+                        }
+                    }
+                    return unreachable;
+                }
+                subtype = "get_usage";
+                break;
+            }
+            // `rate_limits_available: false` is an authenticated API-key or
+            // external-provider account, not a failed read.
+            if payload
+                .get("rate_limits_available")
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                return protocol::BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+                };
+            }
+            return match map_claude_control_usage(payload) {
+                Ok(report) => protocol::BackendCapacityState::Known { report },
+                Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
             };
         }
-        return match map_claude_control_usage(payload) {
-            Ok(report) => protocol::BackendCapacityState::Known { report },
-            Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
-        };
     }
-    unreachable
 }
 
 /// Route only Claude's existing stream-json capacity event through the
@@ -16698,9 +16770,9 @@ impl Backend for ClaudeBackend {
     }
 
     async fn read_capacity_out_of_band(
-        _context: &crate::backend::BackendProbeContext,
+        context: &crate::backend::BackendProbeContext,
     ) -> protocol::BackendCapacityState {
-        read_capacity_out_of_band().await
+        claude_capacity_probe(context.manual_capacity_refresh).await
     }
 
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
