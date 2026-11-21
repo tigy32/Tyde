@@ -36,7 +36,8 @@ use anyhow::{Context, anyhow};
 use futures_util::FutureExt;
 use protocol::types::{
     AgentClosedPayload, AgentCompactNotifyPayload, AgentCompactPayload, AgentCompactStatus,
-    TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
+    GroupedAgentLaunch, GroupedAgentLaunchError, TeamCompactNotifyPayload, TeamCompactPayload,
+    TeamCompactStatus,
 };
 use protocol::{
     AgentActivity, AgentActivitySummary, AgentActivitySummaryPayload,
@@ -1364,6 +1365,7 @@ struct SpawnOperation {
 
 #[derive(Clone)]
 struct SpawnOperationTerminal {
+    group_session: bool,
     request_stream: StreamPath,
     output_stream: Stream,
 }
@@ -1375,6 +1377,7 @@ struct ActiveSpawnOperation {
 }
 
 enum SpawnOperationOutcome {
+    PublishedAwaitingSession,
     Success,
     Error(AppError),
     Panicked,
@@ -1397,6 +1400,10 @@ impl SpawnOperationTerminalClaim {
         if outcome.is_some() {
             false
         } else {
+            if self.terminal.group_session {
+                *outcome = Some(SpawnOperationOutcome::PublishedAwaitingSession);
+                return true;
+            }
             *outcome = Some(SpawnOperationOutcome::Success);
             // Publication owns creation, even if later post-fanout work is cancelled.
             if self.terminal.request_stream.spawn_parent().is_some() {
@@ -1427,6 +1434,36 @@ impl SpawnOperationTerminalClaim {
         }
         #[cfg(not(feature = "test-support"))]
         let _ = claimed;
+    }
+
+    fn claim_session_result(&self, result: Result<AgentStartPayload, String>) {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .expect("spawn operation outcome mutex poisoned");
+        if !matches!(
+            *outcome,
+            Some(SpawnOperationOutcome::PublishedAwaitingSession)
+        ) {
+            return;
+        }
+        *outcome = Some(
+            match result.and_then(|start| {
+                let payload = serde_json::to_value(start).map_err(|error| error.to_string())?;
+                self.terminal
+                    .output_stream
+                    .send_value(FrameKind::AgentStart, payload)
+                    .map_err(|_| {
+                        "creation stream closed before grouped session publication".to_owned()
+                    })
+            }) {
+                Ok(()) => SpawnOperationOutcome::Success,
+                Err(error) => SpawnOperationOutcome::Error(AppError::internal(
+                    GROUPED_AGENT_SESSION_OPERATION,
+                    anyhow!(error),
+                )),
+            },
+        );
     }
 
     fn claim_resolved_result(
@@ -4543,12 +4580,130 @@ impl HostHandle {
         .await
     }
 
+    pub async fn launch_grouped_agent<F>(
+        &self,
+        mut launch: GroupedAgentLaunch,
+        exchange: impl FnOnce(HostFilterId, protocol::Envelope) -> F,
+    ) -> Result<(), GroupedAgentLaunchError>
+    where
+        F: Future<Output = Result<protocol::Envelope, GroupedAgentLaunchError>>,
+    {
+        use GroupedAgentLaunchError::{NotStarted, Placement, Unconfirmed};
+
+        let group_id = launch.group_id;
+        let group_exists = self
+            .state
+            .with({
+                let group_id = group_id.clone();
+                move |state| {
+                    state
+                        .agents_view_preferences_store
+                        .as_ref()
+                        .is_some_and(|store| {
+                            store
+                                .snapshot()
+                                .groups
+                                .groups
+                                .iter()
+                                .any(|group| group.id == group_id)
+                        })
+                }
+            })
+            .await;
+        if !group_exists {
+            return Err(NotStarted(
+                "The selected group is no longer available.".into(),
+            ));
+        }
+        if !matches!(launch.spawn.params, SpawnAgentParams::New { .. })
+            || launch.spawn.parent_agent_id.is_some()
+        {
+            return Err(NotStarted(
+                "Only a new top-level agent can be launched into a group.".into(),
+            ));
+        }
+
+        launch.spawn.launch_context = protocol::AgentLaunchContext::HumanGroupChat;
+        let stream = launch
+            .host_stream
+            .spawn_child(Uuid::new_v4())
+            .map_err(|error| NotStarted(error.to_string()))?;
+        let request = protocol::Envelope::from_payload(
+            stream.clone(),
+            FrameKind::SpawnAgent,
+            0,
+            &launch.spawn,
+        )
+        .map_err(|error| NotStarted(error.to_string()))?;
+        let host_id = launch.host_id;
+        let terminal = exchange(host_id.clone(), request).await?;
+        if terminal.stream != stream || terminal.seq != 0 {
+            return Err(Unconfirmed(
+                "The grouped launch returned an invalid creation terminal.".into(),
+            ));
+        }
+        let invalid_terminal = |error: serde_json::Error| {
+            Unconfirmed(format!("Could not read the grouped launch result: {error}"))
+        };
+        let session_id = match terminal.kind {
+            FrameKind::AgentStart => terminal
+                .parse_payload::<AgentStartPayload>()
+                .map_err(invalid_terminal)?
+                .session_id
+                .ok_or_else(|| {
+                    Placement("The new agent did not publish a session for its group.".into())
+                })?,
+            FrameKind::CommandError => {
+                let error = terminal
+                    .parse_payload::<protocol::CommandErrorPayload>()
+                    .map_err(invalid_terminal)?;
+                if error.stream != stream || error.request_kind != FrameKind::SpawnAgent {
+                    return Err(Unconfirmed(
+                        "The grouped launch returned a misaddressed creation error.".into(),
+                    ));
+                }
+                return Err(if error.operation == GROUPED_AGENT_SESSION_OPERATION {
+                    Placement(error.message)
+                } else {
+                    NotStarted(error.message)
+                });
+            }
+            _ => {
+                return Err(Unconfirmed(
+                    "The grouped launch returned an unexpected creation event.".into(),
+                ));
+            }
+        };
+
+        self.set_agent_groups(SetAgentGroupsPayload {
+            update: AgentGroupsUpdate::MoveTargets {
+                group_id: Some(group_id),
+                targets: vec![AgentAnnotationTarget::Session {
+                    host_id,
+                    session_id,
+                }],
+            },
+        })
+        .await
+        .map_err(|error| Placement(error.message))
+    }
+
     pub(crate) fn start_spawn_agent_operation(
         &self,
         payload: SpawnAgentPayload,
         request_stream: StreamPath,
         output_stream: Stream,
     ) -> AppResult<()> {
+        if payload.launch_context == protocol::AgentLaunchContext::HumanGroupChat
+            && (request_stream.spawn_parent().is_none()
+                || !matches!(payload.params, SpawnAgentParams::New { .. })
+                || payload.parent_agent_id.is_some())
+        {
+            return Err(AppError::invalid(
+                "spawn_agent",
+                "Grouped chat requires a new top-level agent on a creation stream",
+            ));
+        }
         let Some(owner) = self.spawn_operations.owner.upgrade() else {
             return Err(AppError::internal(
                 "spawn_agent",
@@ -5974,8 +6129,10 @@ impl HostHandle {
                 "Swarm members cannot create child agents",
             ));
         }
-        let human_home_launch = payload.launch_context == protocol::AgentLaunchContext::HumanChat
-            && origin == AgentOrigin::User
+        let human_home_launch = matches!(
+            payload.launch_context,
+            protocol::AgentLaunchContext::HumanChat | protocol::AgentLaunchContext::HumanGroupChat
+        ) && origin == AgentOrigin::User
             && input_origin.is_none()
             && team_context.is_none()
             && swarm_binding.is_none()
@@ -23359,6 +23516,7 @@ fn spawn_host_spawn_operation_task(
                         break;
                     };
                     let terminal = SpawnOperationTerminal {
+                        group_session: operation.payload.launch_context == protocol::AgentLaunchContext::HumanGroupChat,
                         request_stream: operation.request_stream,
                         output_stream: operation.output_stream,
                     };
@@ -23378,11 +23536,23 @@ fn spawn_host_spawn_operation_task(
                         let result = AssertUnwindSafe(async {
                             #[cfg(feature = "test-support")]
                             wait_for_spawn_operation_test_gate(&start_test_gate).await;
-                            host.spawn_agent_for_operation(
+                            let agent_id = host.spawn_agent_for_operation(
                                 operation.payload,
                                 terminal_claim.clone(),
-                            )
-                            .await
+                            ).await?;
+                            if terminal_claim.terminal.group_session {
+                                let session_result = async {
+                                    let session_id = host.wait_for_agent_session_id_result(&agent_id).await?;
+                                    let mut start = host.state.with({
+                                        let agent_id = agent_id.clone();
+                                        move |state| state.registry.agent_handle(&agent_id).map(|handle| handle.snapshot())
+                                    }).await.ok_or("The agent closed before its group could be saved.")?;
+                                    start.session_id = Some(session_id);
+                                    Ok(start)
+                                }.await;
+                                terminal_claim.claim_session_result(session_result);
+                            }
+                            Ok(agent_id)
                         })
                         .catch_unwind()
                         .await;
@@ -23401,6 +23571,8 @@ fn spawn_host_spawn_operation_task(
         }
         while let Some(operation) = rx.recv().await {
             emit_spawn_operation_shutdown(SpawnOperationTerminal {
+                group_session: operation.payload.launch_context
+                    == protocol::AgentLaunchContext::HumanGroupChat,
                 request_stream: operation.request_stream,
                 output_stream: operation.output_stream,
             });
@@ -23449,6 +23621,17 @@ async fn finish_spawn_operation_result(
         .take();
     match outcome {
         Some(SpawnOperationOutcome::Success) => {}
+        Some(SpawnOperationOutcome::PublishedAwaitingSession) => {
+            emit_spawn_operation_error(
+                &operation.terminal,
+                &AppError::internal(
+                    GROUPED_AGENT_SESSION_OPERATION,
+                    anyhow!(
+                        "The agent was created, but its session was not published for grouping."
+                    ),
+                ),
+            );
+        }
         Some(SpawnOperationOutcome::Error(error)) => {
             emit_spawn_operation_error(&operation.terminal, &error);
         }
@@ -23471,6 +23654,8 @@ async fn finish_spawn_operation_result(
         }
     }
 }
+
+const GROUPED_AGENT_SESSION_OPERATION: &str = "grouped_agent_session";
 
 fn emit_spawn_operation_error(terminal: &SpawnOperationTerminal, error: &AppError) {
     crate::connection::emit_command_error(

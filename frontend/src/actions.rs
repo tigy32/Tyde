@@ -9,16 +9,16 @@ use crate::state::{
 };
 
 use protocol::{
-    BackendKind, ByteRange, CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload,
-    CodeIntelHoverPayload, CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload,
-    CodeIntelSubscribeFilePayload, CompactionAvailabilityReason, CustomAgentId, FrameKind,
-    GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectOpenPathAction,
-    ProjectOpenPathPayload, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, RequestedCompactionAvailability, SessionId, SessionSettingsValues,
-    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    WorkbenchCreatePayload, WorkbenchRemovePayload,
+    AgentGroupId, BackendKind, ByteRange, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CompactionAvailabilityReason,
+    CustomAgentId, FrameKind, GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectFileVersion, ProjectId,
+    ProjectOpenPathAction, ProjectOpenPathPayload, ProjectPath, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchPayload, RequestedCompactionAvailability, SessionId,
+    SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -241,6 +241,7 @@ fn begin_chat_on(
     // The selection belongs to the tab just opened, so it is written after the
     // open rather than before it.
     let composer = state.composer_for(tab);
+    composer.clear_selection();
     composer.backend_override.set(backend_override);
     composer
         .custom_agent_id
@@ -265,7 +266,7 @@ pub fn begin_new_chat_with_profile(
 ) {
     let custom_agent_id =
         custom_agent_id.or_else(|| home_custom_agent(state, selection_host.as_ref()));
-    begin_profile_chat(state, profile, custom_agent_id, selection_host);
+    begin_profile_chat(state, profile, custom_agent_id, selection_host, None);
 }
 
 pub(crate) fn begin_new_chat_with_profile_in_project(
@@ -273,11 +274,18 @@ pub(crate) fn begin_new_chat_with_profile_in_project(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
     project: ActiveProjectRef,
+    group_id: Option<AgentGroupId>,
 ) {
     if state.active_project_ref_untracked().as_ref() != Some(&project) {
         state.switch_active_project(Some(project.clone()));
     }
-    begin_profile_chat(state, profile, custom_agent_id, Some(project.host_id));
+    begin_profile_chat(
+        state,
+        profile,
+        custom_agent_id,
+        Some(project.host_id),
+        group_id,
+    );
 }
 
 /// Make `host_id` the host that no-project chats open on, persisting it in the
@@ -300,10 +308,11 @@ pub(crate) async fn begin_new_chat_with_profile_at_home(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
     host_id: String,
+    group_id: Option<AgentGroupId>,
 ) -> Result<(), String> {
     select_new_chat_host(state, &host_id).await?;
     state.switch_active_project(None);
-    begin_profile_chat(state, profile, custom_agent_id, Some(host_id));
+    begin_profile_chat(state, profile, custom_agent_id, Some(host_id), group_id);
     Ok(())
 }
 
@@ -336,6 +345,7 @@ fn begin_profile_chat(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
     selection_host: Option<String>,
+    group_id: Option<AgentGroupId>,
 ) {
     // An explicit New Chat outranks a restore still waiting on its host.
     state.retire_pending_restores();
@@ -347,6 +357,7 @@ fn begin_profile_chat(
     composer.custom_agent_id.set(custom_agent_id);
     composer.launch_profile_id.set(Some(profile.id));
     composer.selection_host.set(selection_host);
+    composer.launch_group.set(group_id);
     // Show the profile's settings as the effective draft values, but mark them
     // clean so spawn defers to server-owned profile resolution unless the user
     // edits them.
@@ -531,6 +542,7 @@ pub fn spawn_new_chat(
     } else {
         Some(draft_settings.clone())
     };
+    let launch_group = composer.launch_group.get_untracked();
     let pending_settings_project_id = project_id.clone();
     let pending_settings_id = state.queue_pending_agent_session_settings(
         host_id.clone(),
@@ -538,7 +550,9 @@ pub fn spawn_new_chat(
         draft_settings,
     );
 
-    composer.clear_selection();
+    if launch_group.is_none() {
+        composer.clear_selection();
+    }
 
     let pending_state = state.clone();
     spawn_local(async move {
@@ -559,14 +573,39 @@ pub fn spawn_new_chat(
                 session_settings,
             },
         };
-        if let Err(error) = crate::send::send_frame_unreported(
-            &host_id,
-            host_stream,
-            FrameKind::SpawnAgent,
-            &payload,
-        )
-        .await
-        {
+        let result = match launch_group {
+            Some(group_id) => {
+                let launch = protocol::types::GroupedAgentLaunch {
+                    host_id: protocol::HostFilterId(host_id.clone()),
+                    host_stream,
+                    group_id,
+                    spawn: payload,
+                };
+                match crate::bridge::launch_grouped_agent(&launch).await {
+                    Ok(()) => Ok(()),
+                    Err(
+                        protocol::types::GroupedAgentLaunchError::NotStarted(message)
+                        | protocol::types::GroupedAgentLaunchError::Unconfirmed(message),
+                    ) => Err(message),
+                    Err(protocol::types::GroupedAgentLaunchError::Placement(message)) => {
+                        crate::components::header::report_user_error(format!(
+                            "The agent was created but could not be added to the group: {message}"
+                        ));
+                        Ok(())
+                    }
+                }
+            }
+            None => {
+                crate::send::send_frame_unreported(
+                    &host_id,
+                    host_stream,
+                    FrameKind::SpawnAgent,
+                    &payload,
+                )
+                .await
+            }
+        };
+        if let Err(error) = result {
             pending_state.discard_pending_agent_session_settings(
                 &host_id,
                 pending_settings_project_id.as_ref(),

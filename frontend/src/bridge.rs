@@ -180,6 +180,27 @@ pub async fn send_host_line(request: SendHostLineRequest) -> Result<(), String> 
     Ok(())
 }
 
+pub async fn launch_grouped_agent(
+    launch: &protocol::types::GroupedAgentLaunch,
+) -> Result<(), protocol::types::GroupedAgentLaunchError> {
+    use protocol::types::GroupedAgentLaunchError;
+    #[derive(Serialize)]
+    struct Args<'a> {
+        launch: &'a protocol::types::GroupedAgentLaunch,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { launch })
+        .map_err(|error| GroupedAgentLaunchError::NotStarted(error.to_string()))?;
+    tauri_invoke("launch_grouped_agent", args)
+        .await
+        .map_err(|error| match serde_wasm_bindgen::from_value(error) {
+            Ok(error) => error,
+            Err(error) => GroupedAgentLaunchError::Unconfirmed(format!(
+                "Could not confirm the grouped launch. Check the sidebar before trying again: {error}"
+            )),
+        })?;
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SendHostFrameArgs<'a> {

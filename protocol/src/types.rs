@@ -3676,6 +3676,7 @@ pub enum AgentLaunchContext {
     #[default]
     Standard,
     HumanChat,
+    HumanGroupChat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3689,6 +3690,22 @@ pub struct SpawnAgentPayload {
     pub parent_agent_id: Option<AgentId>,
     pub project_id: Option<ProjectId>,
     pub params: SpawnAgentParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupedAgentLaunch {
+    pub host_id: HostFilterId,
+    pub host_stream: StreamPath,
+    pub group_id: AgentGroupId,
+    pub spawn: SpawnAgentPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "message")]
+pub enum GroupedAgentLaunchError {
+    NotStarted(String),
+    Unconfirmed(String),
+    Placement(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

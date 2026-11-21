@@ -7,7 +7,7 @@ use std::time::Duration;
 use server::process_env::launch::{AsyncCommandGroup, AsyncGroupChild as Child, ProcessStdio};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::bridge::{
@@ -69,12 +69,19 @@ struct RouterState {
     pending: HashMap<String, ConnectionControl>,
 }
 
+struct PrivateStreamRegistration {
+    path: protocol::StreamPath,
+    terminal: oneshot::Sender<protocol::Envelope>,
+    ready: oneshot::Sender<()>,
+}
+
 struct Connection {
     connection_id: u64,
     /// Outbound frames are enqueued here; the writer task owns the receiver.
     /// Dropping every sender (i.e. removing this entry) makes the writer task
     /// finish on its own.
     outbound_tx: mpsc::UnboundedSender<Outbound>,
+    private_streams: mpsc::UnboundedSender<PrivateStreamRegistration>,
     control: ConnectionControl,
     /// Liveness flag shared with this connection's reader/stderr tasks. Cleared
     /// (non-blocking, no lock) the instant the entry is removed or superseded,
@@ -314,6 +321,7 @@ impl ProxyRouterHandle {
         };
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
+        let (private_streams, private_stream_registrations) = mpsc::unbounded_channel();
         let audio_pending = Arc::new(AtomicUsize::new(0));
 
         // Register before spawning so that an immediate reader EOF can find the
@@ -332,6 +340,7 @@ impl ProxyRouterHandle {
                     Connection {
                         connection_id,
                         outbound_tx,
+                        private_streams,
                         control: control.clone(),
                         live: live.clone(),
                         audio_pending,
@@ -359,6 +368,7 @@ impl ProxyRouterHandle {
             connection_id,
             setup.reader,
             live.clone(),
+            private_stream_registrations,
         ));
         tokio::spawn(writer_task(
             self.state.clone(),
@@ -446,6 +456,53 @@ impl ProxyRouterHandle {
             .map_err(|_| format!("host {host_id} connection is no longer available"))
     }
 
+    pub async fn exchange_creation_frame(
+        &self,
+        host_id: protocol::HostFilterId,
+        request: protocol::Envelope,
+    ) -> Result<protocol::Envelope, protocol::types::GroupedAgentLaunchError> {
+        use protocol::types::GroupedAgentLaunchError::{NotStarted, Unconfirmed};
+
+        let (writer, registrations) = self
+            .state
+            .lock()
+            .expect("router state poisoned")
+            .hosts
+            .get(&host_id.0)
+            .filter(|connection| connection.available.load(Ordering::Acquire))
+            .map(|connection| {
+                (
+                    connection.outbound_tx.clone(),
+                    connection.private_streams.clone(),
+                )
+            })
+            .ok_or_else(|| NotStarted("The launch host is disconnected.".into()))?;
+        let (terminal, completion) = oneshot::channel();
+        let (ready, registered) = oneshot::channel();
+        registrations
+            .send(PrivateStreamRegistration {
+                path: request.stream.clone(),
+                terminal,
+                ready,
+            })
+            .map_err(|_| NotStarted("The launch host disconnected before registration.".into()))?;
+        registered
+            .await
+            .map_err(|_| NotStarted("The launch host disconnected before sending.".into()))?;
+        writer
+            .send(Outbound::Frame(
+                protocol::ProtocolFrame {
+                    envelope: request,
+                    binary: Vec::new(),
+                },
+                None,
+            ))
+            .map_err(|_| NotStarted("The launch host disconnected before sending.".into()))?;
+        completion.await.map_err(|_| {
+            Unconfirmed("The host disconnected before the grouped launch could be confirmed. Check the sidebar before trying again.".into())
+        })
+    }
+
     pub fn send_frame(
         &self,
         host_id: String,
@@ -497,10 +554,28 @@ async fn reader_task(
     connection_id: u64,
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
     live: Arc<AtomicBool>,
+    mut private_stream_registrations: mpsc::UnboundedReceiver<PrivateStreamRegistration>,
 ) {
     let mut reader = protocol::FrameReader::new(reader);
+    let mut private_streams = HashMap::new();
     loop {
-        match reader.read_frame().await {
+        let frame = {
+            // Keep the in-progress read pinned across registration messages.
+            // Dropping it could discard bytes from a partially read frame.
+            let next = reader.read_frame();
+            tokio::pin!(next);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(registration) = private_stream_registrations.recv() => {
+                        private_streams.insert(registration.path, registration.terminal);
+                        let _ = registration.ready.send(());
+                    }
+                    frame = &mut next => break frame,
+                }
+            }
+        };
+        match frame {
             Ok(None) => {
                 break;
             }
@@ -511,6 +586,15 @@ async fn reader_task(
                 // connection that reused this host id.
                 if !live.load(Ordering::Relaxed) {
                     break;
+                }
+                if frame.envelope.kind == protocol::FrameKind::Welcome {
+                    private_streams.clear();
+                }
+                if let Some(terminal) = private_streams.remove(&frame.envelope.stream) {
+                    if frame.binary.is_empty() {
+                        let _ = terminal.send(frame.envelope);
+                    }
+                    continue;
                 }
                 if !frame.binary.is_empty() {
                     if frame.envelope.kind != protocol::FrameKind::VoiceAudio {
@@ -653,7 +737,7 @@ async fn writer_task(
             Outbound::Frame(frame, permit) => {
                 let result = protocol::write_frame(&mut writer, &frame)
                     .await
-                    .map_err(|e| format!("failed to write host voice frame: {e}"));
+                    .map_err(|e| format!("failed to write host protocol frame: {e}"));
                 drop(permit);
                 result
             }

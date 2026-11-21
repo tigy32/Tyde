@@ -402,7 +402,13 @@ fn LaunchProjectPicker(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchDestination {
     Project(ActiveProjectRef),
-    NoProject { host_id: String },
+    NoProject {
+        host_id: String,
+    },
+    Group {
+        host_id: String,
+        group_id: protocol::AgentGroupId,
+    },
 }
 
 #[component]
@@ -423,11 +429,34 @@ pub fn LaunchChooser(
             .active_project_ref_untracked()
             .map(LaunchDestination::Project),
     };
-    let (host, chosen_project) = match destination {
-        Some(LaunchDestination::Project(project)) => (Some(project.host_id.clone()), Some(project)),
-        Some(LaunchDestination::NoProject { host_id }) => (Some(host_id), None),
-        None => (state.chat_context_host_id_untracked(), None),
+    let (host, chosen_project, group_id) = match destination {
+        Some(LaunchDestination::Project(project)) => {
+            (Some(project.host_id.clone()), Some(project), None)
+        }
+        Some(LaunchDestination::NoProject { host_id }) => (Some(host_id), None, None),
+        Some(LaunchDestination::Group { host_id, group_id }) => {
+            (Some(host_id), None, Some(group_id))
+        }
+        None => (state.chat_context_host_id_untracked(), None, None),
     };
+    let group_id = StoredValue::new(group_id);
+    let preferences = state.agents_view_preferences;
+    let group_name = Memo::new(move |_| {
+        group_id.with_value(|id| {
+            let id = id.as_ref()?;
+            preferences.with(|snapshot| {
+                snapshot
+                    .groups
+                    .groups
+                    .iter()
+                    .find(|group| &group.id == id)
+                    .map(|group| group.name.clone())
+            })
+        })
+    });
+    let group_available =
+        move || group_name.get().is_some() || group_id.with_value(Option::is_none);
+
     let selection = RwSignal::new((host.clone(), chosen_project));
     let selected_host = Memo::new(move |_| selection.get().0);
     let hosts = state.configured_hosts;
@@ -596,6 +625,7 @@ pub fn LaunchChooser(
     let create = Callback::new(move |()| {
         if !open_sig.get_untracked()
             || !project_available.get_untracked()
+            || !group_available()
             || !role_available.get_untracked()
         {
             return;
@@ -608,14 +638,18 @@ pub fn LaunchChooser(
                     profile,
                     selected_agent.get_untracked(),
                     project,
+                    group_id.get_value(),
                 ),
                 None => {
                     if let Some(host) = selected_host.get_untracked() {
                         let state = state.clone();
                         let agent = selected_agent.get_untracked();
+                        let group_id = group_id.get_value();
                         wasm_bindgen_futures::spawn_local(async move {
-                            match begin_new_chat_with_profile_at_home(&state, profile, agent, host)
-                                .await
+                            match begin_new_chat_with_profile_at_home(
+                                &state, profile, agent, host, group_id,
+                            )
+                            .await
                             {
                                 Ok(()) => {
                                     if let Some(on_created) = on_created {
@@ -728,7 +762,9 @@ pub fn LaunchChooser(
             <div class="launch-chooser" role="dialog" aria-modal="true" aria-label="New agent"
                 node_ref=dialog_ref on:keydown=on_keydown>
                 <header class="launch-chooser-header">
-                    <div><h2>"New agent"</h2><p>"Choose a backend and an agent role."</p></div>
+                    <div><h2>{move || group_name.get().map_or_else(|| "New agent".to_owned(), |name| format!("New agent in {name}"))}</h2>
+                        {group_id.with_value(Option::is_none).then(|| view! { <p>"Choose a backend and an agent role."</p> })}
+                    </div>
                     <button type="button" class="launch-chooser-close" aria-label="Close agent chooser"
                         on:click=move |_| open_sig.set(false)>"×"</button>
                     <LaunchDestinationPicker selection on_select=change_destination id_prefix="launch" />
@@ -838,12 +874,13 @@ pub fn LaunchChooser(
                             .unwrap_or_else(|| "Choose an available backend".to_owned())}</strong>
                         <small>{context_label}</small>
                         <Show when=move || !project_available.get()><small>"The selected project is no longer available."</small></Show>
+                        <Show when=move || !group_available()><small>"The selected group is no longer available."</small></Show>
                         <Show when=move || selected_profile.get().is_some() && ready_profile.get().is_none()><small>"The selected backend is no longer available."</small></Show>
                         <Show when=move || !role_available.get()><small>"The selected role is no longer available."</small></Show>
                     </div>
                     <div class="launch-footer-actions">
                         <div><button type="button" class="launch-cancel" on:click=move |_| open_sig.set(false)>"Cancel"</button>
-                            <button type="button" class="launch-create" disabled=move || ready_profile.get().is_none() || !role_available.get() || !project_available.get()
+                            <button type="button" class="launch-create" disabled=move || ready_profile.get().is_none() || !role_available.get() || !project_available.get() || !group_available()
                                 on:click=move |_| create.run(())>"Create agent"</button></div>
                         <small>"Enter in search to create · Esc to close"</small>
                     </div>

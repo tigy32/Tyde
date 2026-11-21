@@ -6980,16 +6980,11 @@ math merror {
 .agent-sidebar-pinned,
 .agent-sidebar-host-section,
 .agent-sidebar-project-section,
-.agent-sidebar-custom-groups-section,
 .agent-sidebar-custom-group,
 .agent-sidebar-default-tree {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-}
-
-.agent-sidebar-custom-groups-section {
-    margin-bottom: var(--space-2);
 }
 
 .agent-sidebar-groups-heading {
@@ -7005,8 +7000,7 @@ math merror {
 }
 
 .agent-sidebar-host-header,
-.agent-sidebar-project-header,
-.agent-sidebar-custom-group-header {
+.agent-sidebar-project-header {
     color: var(--text-tertiary);
     font-size: 0.7rem;
     font-weight: 700;
@@ -7014,35 +7008,16 @@ math merror {
     text-transform: uppercase;
 }
 
-.agent-sidebar-custom-group-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-1);
-    min-height: 24px;
-    padding: 2px var(--space-1);
-    border: 1px solid transparent;
-    border-radius: 6px;
-}
-
-.agent-sidebar-custom-group-header:focus,
+.agent-sidebar-custom-group-header:focus-visible,
 .agent-group-keyboard-focus,
 .agent-group-keyboard-active {
     outline: 2px solid var(--accent-primary);
-    outline-offset: 2px;
+    outline-offset: -2px;
 }
 
-.agent-sidebar-custom-group-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.agent-sidebar-custom-group-actions {
-    display: inline-flex;
-    gap: 2px;
-    flex-shrink: 0;
+.agent-folder-group-icon {
+    flex: 0 0 12px;
+    color: var(--text-tertiary);
 }
 
 .agent-sidebar-group-name-input {
@@ -7076,7 +7051,6 @@ math merror {
 
 .agent-ungroup-drop-target:focus,
 .agent-ungroup-drop-target:hover,
-.agent-sidebar-custom-group-header:hover,
 .agent-sidebar-custom-group-drag-over,
 .agent-sidebar-custom-group[aria-dropeffect="move"] {
     border-color: var(--accent-primary);
@@ -17865,6 +17839,7 @@ button.swarm-card-member:hover { background: var(--surface-hover); }
 .agents-panel .agent-sidebar-host-section,
 .agents-panel .agent-sidebar-default-tree,
 .agents-panel .agent-sidebar-project-section,
+.agents-panel .agent-sidebar-custom-group,
 .agents-panel .agent-card-group { gap: 0; }
 .agents-panel .agent-sidebar-groups-heading,
 .agents-panel .agent-sidebar-host-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 24px; margin: 8px 0 2px; padding: 0 4px; border: 0; }

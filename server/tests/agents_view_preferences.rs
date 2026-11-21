@@ -1301,19 +1301,13 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
     let first =
         spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group one").await;
     let first_start = expect_agent_start_payload(&mut fixture.client, &first.instance_stream).await;
-    let second =
-        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group two").await;
-    let second_start =
-        expect_agent_start_payload(&mut fixture.client, &second.instance_stream).await;
-
     let first_target = local_session_target(first_start.session_id.expect("first session id"));
-    let second_target = local_session_target(second_start.session_id.expect("second session id"));
 
     send_set_agent_groups(
         &mut fixture.client,
         AgentGroupsUpdate::CreateGroup {
             name: "  Review Pair  ".to_owned(),
-            targets: vec![first_target.clone(), second_target.clone()],
+            targets: vec![first_target.clone()],
         },
     )
     .await;
@@ -1322,6 +1316,65 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
     let first_group_id = notify.snapshot.groups.groups[0].id.clone();
     assert_eq!(first_group_id, AgentGroupId("review-pair".to_owned()));
     assert_eq!(notify.snapshot.groups.groups[0].name, "Review Pair");
+
+    let creation = fixture
+        .client
+        .spawn_agent_on_creation_stream(SpawnAgentPayload {
+            launch_context: protocol::AgentLaunchContext::HumanGroupChat,
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/agents-view-groups".to_owned()],
+                prompt: "group two".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("launch group member");
+    let terminal =
+        fixture::next_frame_matching_on(&mut fixture.client, "group creation terminal", |event| {
+            event.stream == creation
+        })
+        .await;
+    assert_eq!(terminal.kind, FrameKind::AgentStart);
+    let second = terminal
+        .parse_payload::<AgentStartPayload>()
+        .expect("group member start");
+    let second_target = local_session_target(
+        second
+            .session_id
+            .expect("creation terminal must provide a durable session"),
+    );
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::MoveTargets {
+            group_id: Some(first_group_id.clone()),
+            targets: vec![second_target.clone()],
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify_where(
+        &mut fixture.client,
+        "place the new session in the existing group",
+        |notify| {
+            notify
+                .snapshot
+                .groups
+                .assignments
+                .contains(&AgentGroupAssignment {
+                    group_id: first_group_id.clone(),
+                    target: second_target.clone(),
+                })
+        },
+    )
+    .await;
     assert_eq!(notify.snapshot.groups.assignments.len(), 2);
     assert!(
         notify

@@ -1404,6 +1404,7 @@ fn folder_toggle(
     display_label: String,
     folder_count: FolderCount,
     open_project: Option<Callback<()>>,
+    group: bool,
 ) -> impl IntoView {
     let count = folder_count.rows();
     let toggle_key = key.clone();
@@ -1425,9 +1426,14 @@ fn folder_toggle(
             class:agent-project-disclosure=split
             aria-label=if split { format!("Toggle {label}") } else { label.clone() }
             aria-describedby=described_by.clone()
+            aria-description=group.then_some("Group")
             title=label.clone()
             aria-expanded=move || expanded.get().to_string()
-            on:keydown=move |ev: web_sys::KeyboardEvent| ev.stop_propagation()
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                if !(group && (ev.key() == "ContextMenu" || (ev.shift_key() && ev.key() == "F10"))) {
+                    ev.stop_propagation();
+                }
+            }
             on:click=move |ev: web_sys::MouseEvent| {
                 ev.stop_propagation();
                 collapsed.update(|folders| {
@@ -1446,6 +1452,15 @@ fn folder_toggle(
             {disclosure_chevron(move || expanded.get())}
             {(!split).then(|| view! { <span class="agent-folder-label">{display_label}</span> })}
             {(!split && count > 0).then(|| view! { <span class="agent-folder-count" aria-hidden="true">{format!("({count})")}</span> })}
+            {group.then(|| view! {
+                <svg class="agent-folder-group-icon" role="img" aria-label="Group"
+                    width="12" height="12" viewBox="0 0 16 16" fill="none"
+                    stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+                    <title>"Group"</title>
+                    <rect x="6" y="6" width="8.5" height="7" rx="1" />
+                    <path d="M6 10H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1H9a1 1 0 0 1 1 1v2" />
+                </svg>
+            })}
             {count_id.map(|id| view! {
                 <span id=id hidden>{folder_count.spoken()}</span>
             })}
@@ -2236,14 +2251,21 @@ pub fn AgentsPanel() -> impl IntoView {
                         let add_project_host = host_key.clone();
                         let projects = Memo::new(move |_| host.with(|host| host.projects.clone()));
                         let custom_groups = Memo::new(move |_| host.with(|host| host.custom_groups.clone()));
-                        let has_custom_group_rows = Memo::new(move |_| custom_groups.with(|groups| !groups.is_empty()));
+
                         let render_custom_group = {
                             let state = state.clone();
                             let interactions = interactions.clone();
+                            let group_host = host_key.clone();
                             move |custom_group: Memo<AgentCustomGroupSection>| {
                                             let group_id = custom_group.with_untracked(|custom_group| custom_group.group.id.clone());
                                             let group_id_attr = group_id.0.clone();
                                             let folder_key = format!("group:{}", group_id.0);
+                                            let destination = LaunchDestination::Group {
+                                                host_id: group_host.clone(),
+                                                group_id: group_id.clone(),
+                                            };
+                                            let group_menu = CardMenuPosition::new(None);
+                                            let group_anchor = NodeRef::<leptos::html::Div>::new();
                                             let header = Memo::new(move |_| custom_group.with(|custom_group| {
                                                 (custom_group.group.name.clone(), FolderCount { agents: custom_group.groups.len(), swarms: 0 })
                                             }));
@@ -2257,6 +2279,17 @@ pub fn AgentsPanel() -> impl IntoView {
                                             let keyboard_group_id = group_id.clone();
                                             let keyboard_status = group_live_status;
                                             let on_group_keydown = move |ev: web_sys::KeyboardEvent| {
+                                                if ev.key() == "ContextMenu" || (ev.shift_key() && ev.key() == "F10") {
+                                                    ev.prevent_default();
+                                                    if let Some(anchor) = group_anchor.get_untracked() {
+                                                        let rect = anchor.get_bounding_client_rect();
+                                                        group_menu.set(Some((rect.left(), rect.bottom())));
+                                                    }
+                                                    return;
+                                                }
+                                                if ev.target() != ev.current_target() {
+                                                    return;
+                                                }
                                                 match ev.key().as_str() {
                                                     " " | "Enter" => {
                                                         if let Some(agent) = keyboard_agent.get_untracked() {
@@ -2288,15 +2321,15 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 }
                                             };
                                             let rename_group_id = group_id.clone();
-                                            let on_group_rename = move |ev: web_sys::MouseEvent| {
-                                                ev.stop_propagation();
+                                            let on_group_rename = move |()| {
+                                                group_menu.set(None);
                                                 group_edit_value.set(header.with_untracked(|(name, _)| name.clone()));
                                                 editing_group.set(Some(rename_group_id.clone()));
                                             };
                                             let delete_state = state.clone();
                                             let delete_group_id = group_id.clone();
-                                            let on_group_delete = move |ev: web_sys::MouseEvent| {
-                                                ev.stop_propagation();
+                                            let on_group_delete = move |()| {
+                                                group_menu.set(None);
                                                 send_groups_update(
                                                     &delete_state,
                                                     AgentGroupsUpdate::DeleteGroup {
@@ -2305,6 +2338,8 @@ pub fn AgentsPanel() -> impl IntoView {
                                                 );
                                                 group_live_status.set("Deleted group; members return to Host and Project".to_owned());
                                             };
+                                            let rename = Callback::new(on_group_rename);
+                                            let delete = Callback::new(on_group_delete);
                                             let edit_state_base = state.clone();
                                             let edit_group_id_base = group_id.clone();
                                             let header_class_group_id = header_group_id.clone();
@@ -2323,12 +2358,18 @@ pub fn AgentsPanel() -> impl IntoView {
                                                     data-group-id=group_id_attr
                                                 >
                                                     <div
-                                                        class=move || if keyboard_target.get().as_ref() == Some(&SidebarDropTarget::Group(header_class_group_id.clone())) {
-                                                            "agent-sidebar-custom-group-header agent-group-keyboard-focus"
+                                                        class=move || if keyboard_agent.get().is_some() && keyboard_target.get().as_ref() == Some(&SidebarDropTarget::Group(header_class_group_id.clone())) {
+                                                            "agent-sidebar-project-header agent-sidebar-custom-group-header agent-group-keyboard-focus"
                                                         } else {
-                                                            "agent-sidebar-custom-group-header"
+                                                            "agent-sidebar-project-header agent-sidebar-custom-group-header"
                                                         }
                                                         tabindex="0"
+                                                        aria-haspopup="menu"
+                                                        aria-keyshortcuts="Shift+F10"
+                                                        aria-label=move || header.with(|(name, _)| format!("{name} group actions"))
+                                                        aria-expanded=move || group_menu.get().is_some().to_string()
+                                                        node_ref=group_anchor
+                                                        on:contextmenu=move |ev: web_sys::MouseEvent| open_card_menu(group_menu, &ev)
                                                         data-agent-group-keyboard-target="true"
                                                         aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
                                                         on:focus=move |_| keyboard_target.set(Some(SidebarDropTarget::Group(header_focus_group_id.clone())))
@@ -2397,32 +2438,25 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 view! {
                                                                     {
                                                                         let (group_name, member_count) = header.get();
-                                                                        folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name, member_count, None)
+                                                                        folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), group_name, member_count, None, true)
                                                                     }
                                                                 }.into_any()
                                                             }
                                                         }}
-                                                        <span class="agent-sidebar-custom-group-actions">
-                                                            <button
-                                                                type="button"
-                                                                class="filter-toggle agent-sidebar-group-rename"
-                                                                aria-label="Rename group"
-                                                                title="Rename group"
-                                                                on:click=on_group_rename
-                                                            >
-                                                                "\u{270E}"
-                                                            </button>
-                                                            <button
-                                                                type="button"
-                                                                class="filter-toggle agent-sidebar-group-delete"
-                                                                aria-label="Delete group"
-                                                                title="Delete group"
-                                                                on:click=on_group_delete
-                                                            >
-                                                                "\u{00D7}"
-                                                            </button>
-                                                        </span>
+                                                        {move || view! {
+                                                            <ProjectNewAgent
+                                                                destination=destination.clone()
+                                                                name=header.with(|(name, _)| format!("New agent in {name}"))
+                                                                launch=launch
+                                                            />
+                                                        }}
                                                     </div>
+                                                    <CardContextMenu menu=group_menu label="Group actions" anchor=group_anchor>
+                                                        <button type="button" class="context-menu-item" role="menuitem"
+                                                            on:click=move |_| rename.run(())>"Rename group"</button>
+                                                        <button type="button" class="context-menu-item" role="menuitem"
+                                                            on:click=move |_| delete.run(())>"Delete group"</button>
+                                                    </CardContextMenu>
                                                     {folder_members(state.clone(), members, interactions.clone(), collapsed_folders, members_key)}
                                                 </section>
                                             }
@@ -2453,7 +2487,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                     {folder_toggle(collapsed_folders, header_key.clone(), heading, label.clone(), member_count, target.clone().map(|target| {
                                                         let state = page_state.clone();
                                                         Callback::new(move |()| crate::components::project_page::open_project_page(&state, target.clone()))
-                                                    }))}
+                                                    }), false)}
                                                     {match target {
                                                         Some(target) => view! {
                                                             <button class="project-edit-pencil" title=edit_name.clone() aria-label=edit_name
@@ -2493,12 +2527,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                 >
                                     {keyed_rows(projects, |project| project.key.clone(), render_project)}
                                 </div>
-                                {move || has_custom_group_rows.get().then(|| view! {
-                                    <section class="agent-sidebar-custom-groups-section">
-                                        <div class="agent-sidebar-groups-heading">"Groups"</div>
-                                        {keyed_rows(custom_groups, |custom_group| custom_group.group.id.clone(), render_custom_group.clone())}
-                                    </section>
-                                })}
+                                {keyed_rows(custom_groups, |custom_group| custom_group.group.id.clone(), render_custom_group)}
                             </section>
                         }
                         };
@@ -2667,7 +2696,7 @@ fn project_members(
                             let edit_label = format!("Edit project {label}");
                             let target = target.clone();
                             view! {
-                                {folder_toggle(collapsed, header_key.clone(), format!("Workbench: {label}"), label.clone(), count, None)}
+                                {folder_toggle(collapsed, header_key.clone(), format!("Workbench: {label}"), label.clone(), count, None, false)}
                                 <button class="project-edit-pencil" title=edit_label.clone() aria-label=edit_label
                                     on:click={let target = target.clone(); move |_| editor.set(Some(target.clone()))}>"⋯"</button>
                                 <ProjectNewAgent destination=LaunchDestination::Project(target) name=format!("New agent in {label}") launch=launch />
@@ -10209,27 +10238,224 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn group_rename_and_delete_use_inline_controls_and_snapshots() {
+    async fn group_row_launches_and_keeps_management_in_its_context_menu() {
         let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
         seed_sidebar_group_fixture(&state);
         apply_group_snapshot(
             &state,
-            assigned_group("review", "Review Group", &["beta-agent"]),
+            assigned_group("review-launch", "Review Group", &["beta-agent"]),
         );
 
+        state.launch_profile_catalog.update(|catalogs| {
+            let id = protocol::LaunchProfileId("local-codex".into());
+            catalogs.insert(
+                "local".into(),
+                protocol::LaunchProfileCatalog {
+                    entries: vec![protocol::LaunchProfileEntry::Ready {
+                        profile: protocol::LaunchProfile {
+                            id: id.clone(),
+                            kind: protocol::LaunchProfileKind::BackendDefault,
+                            label: "Codex".into(),
+                            description: None,
+                            backend_kind: BackendKind::Codex,
+                            session_settings: Default::default(),
+                        },
+                    }],
+                    default_profile_id: Some(id),
+                    home_custom_agent_id: None,
+                    custom_profile_schemas: Default::default(),
+                },
+            );
+        });
         let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
 
-        let rename: HtmlElement = container
-            .query_selector(".agent-sidebar-group-rename")
+        let group_header = || {
+            container
+                .query_selector("[aria-label='Review Group group actions']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        let find_button = |selector: &str| {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+        };
+        let menu_item = |name: &str| {
+            let items = container
+                .query_selector_all("[role='menu'][aria-label='Group actions'] [role='menuitem']")
+                .unwrap();
+            (0..items.length())
+                .find_map(|index| {
+                    let item = items.item(index)?.dyn_into::<HtmlElement>().ok()?;
+                    (item.text_content().as_deref() == Some(name)).then_some(item)
+                })
+                .unwrap()
+        };
+        assert!(
+            !container
+                .inner_text()
+                .lines()
+                .any(|line| line.trim() == "Groups")
+        );
+        let plus = find_button("[aria-label='New agent in Review Group']");
+        let project_plus = find_button("[aria-label='New agent in Alpha Project']");
+        assert_eq!(plus.text_content().as_deref(), Some("+"));
+        assert_eq!(
+            plus.get_bounding_client_rect().right(),
+            project_plus.get_bounding_client_rect().right()
+        );
+        assert_eq!(
+            plus.get_bounding_client_rect().height(),
+            project_plus.get_bounding_client_rect().height()
+        );
+        assert!(
+            group_header()
+                .query_selector("[role='img'][aria-label='Group']")
+                .unwrap()
+                .is_some()
+        );
+
+        let panel = container
+            .query_selector(".agents-panel")
             .unwrap()
-            .expect("rename button")
-            .dyn_into()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
             .unwrap();
+        panel.style().set_property("width", "160px").unwrap();
+        let icon = group_header()
+            .query_selector("[role='img'][aria-label='Group']")
+            .unwrap()
+            .unwrap()
+            .get_bounding_client_rect();
+        let plus_bounds = plus.get_bounding_client_rect();
+        assert!(icon.width() > 0.0 && icon.right() <= plus_bounds.left());
+        assert!(plus_bounds.right() <= panel.get_bounding_client_rect().right());
+        panel.style().remove_property("width").unwrap();
+
+        let disclosure = find_button("[aria-label='Review Group']");
+        disclosure.click();
+        next_tick().await;
+        assert_eq!(
+            disclosure.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        plus.click();
+        next_tick().await;
+        let chooser = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .query_selector("[role='dialog'][aria-label='New agent']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chooser
+                .query_selector("h2")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("New agent in Review Group")
+        );
+        chooser
+            .query_selector(".launch-create")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(crate::actions::spawn_new_chat(
+            &state,
+            &state.composer_untracked(),
+            "Hello".into(),
+            None,
+            |_| panic!("group launch was not accepted"),
+        ));
+        next_tick().await;
+        let grouped_launches = || {
+            calls
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.dyn_into::<js_sys::Array>().unwrap();
+                    (entry.get(0).as_string().as_deref() == Some("launch_grouped_agent")).then(
+                        || {
+                            serde_json::from_str::<JsonValue>(&entry.get(1).as_string().unwrap())
+                                .unwrap()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let observed = grouped_launches();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0]["launch"]["group_id"], "review-launch");
+        assert_eq!(observed[0]["launch"]["host_id"], "local");
+        assert!(
+            observed[0]["launch"]["spawn"]["project_id"].is_null(),
+            "Group membership is independent of workspace selection"
+        );
+
+        js_sys::eval(
+            r#"
+            window.__tydeOriginalGroupedLaunchInvoke = window.__TAURI__.core.invoke;
+            window.__TAURI__.core.invoke = (cmd, args) => cmd === "launch_grouped_agent"
+                ? Promise.reject("IPC rejected launch")
+                : window.__tydeOriginalGroupedLaunchInvoke(cmd, args);
+        "#,
+        )
+        .unwrap();
+        let launch_error = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let reported_error = launch_error.clone();
+        assert!(crate::actions::spawn_new_chat(
+            &state,
+            &state.composer_untracked(),
+            "Restore this draft".into(),
+            None,
+            move |error| *reported_error.borrow_mut() = Some(error),
+        ));
+        next_tick().await;
+        assert!(
+            launch_error
+                .borrow()
+                .as_deref()
+                .is_some_and(|error| error.contains("Could not confirm"))
+        );
+        js_sys::eval("window.__TAURI__.core.invoke = window.__tydeOriginalGroupedLaunchInvoke; delete window.__tydeOriginalGroupedLaunchInvoke;").unwrap();
+
+        crate::actions::begin_new_chat_with(&state, Some(BackendKind::Codex), None);
+        assert!(crate::actions::spawn_new_chat(
+            &state,
+            &state.composer_untracked(),
+            "Unfiled chat".into(),
+            None,
+            |_| panic!("ordinary launch was not accepted"),
+        ));
+        next_tick().await;
+        assert_eq!(
+            grouped_launches().len(),
+            1,
+            "Ordinary New Chat clears the prior group"
+        );
+        assert!(
+            recorded_frames(&calls)
+                .iter()
+                .any(|(kind, _, _)| kind == "spawn_agent")
+        );
+
+        dispatch_key(&disclosure, "ContextMenu");
+        next_tick().await;
+        let rename = menu_item("Rename group");
         rename.click();
         for _ in 0..2 {
             next_tick().await;
@@ -10249,12 +10475,12 @@ mod wasm_tests {
         }
         let update = last_group_update_json(&calls);
         assert_eq!(update["kind"], "rename_group");
-        assert_eq!(update["id"], "review");
+        assert_eq!(update["id"], "review-launch");
         assert_eq!(update["name"], "Renamed Group");
 
         apply_group_snapshot(
             &state,
-            assigned_group("review", "Renamed Group", &["beta-agent"]),
+            assigned_group("review-launch", "Renamed Group", &["beta-agent"]),
         );
         for _ in 0..4 {
             next_tick().await;
@@ -10265,19 +10491,17 @@ mod wasm_tests {
             "server snapshot should render renamed group; got {text:?}"
         );
 
-        let delete: HtmlElement = container
-            .query_selector(".agent-sidebar-group-delete")
-            .unwrap()
-            .expect("delete button")
-            .dyn_into()
-            .unwrap();
+        let renamed = find_button("[aria-label='Renamed Group group actions']");
+        dispatch_context_menu(&renamed, 40.0, 80.0);
+        next_tick().await;
+        let delete = menu_item("Delete group");
         delete.click();
         for _ in 0..4 {
             next_tick().await;
         }
         let update = last_group_update_json(&calls);
         assert_eq!(update["kind"], "delete_group");
-        assert_eq!(update["id"], "review");
+        assert_eq!(update["id"], "review-launch");
     }
 
     /// The retired Hide finished control must not render in the sidebar.
@@ -13853,21 +14077,6 @@ mod wasm_tests {
                 assert!(
                     rect.right() <= panel_rect.right() + tolerance,
                     "project-edit-pencil #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
-                    rect.right(),
-                    panel_rect.right(),
-                );
-            }
-
-            // Custom group action buttons stay within bounds
-            let group_actions = container
-                .query_selector_all(".agent-sidebar-custom-group-actions")
-                .unwrap();
-            for i in 0..group_actions.length() {
-                let el: HtmlElement = group_actions.item(i).unwrap().dyn_into().unwrap();
-                let rect = el.get_bounding_client_rect();
-                assert!(
-                    rect.right() <= panel_rect.right() + tolerance,
-                    "custom group actions #{i} must remain within panel at {width}px (right: {}, panel_right: {})",
                     rect.right(),
                     panel_rect.right(),
                 );

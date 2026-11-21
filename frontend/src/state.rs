@@ -7,23 +7,24 @@ use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::FrameKind;
 use protocol::{
-    AgentActivityStats, AgentActivitySummaryState, AgentGroupMode, AgentId, AgentListDensity,
-    AgentOrderKey, AgentOrigin, AgentSortMode, AgentWorkflowMetadata, AgentsSidebarPreferences,
-    AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot, BackendKind,
-    BackendSetupInfo, ByteRange, ChatMessage, ChatMessageId, CodeIntelDiagnostic,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
-    CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
-    CompactionObservationId, CompactionOperationId, ContextCompactionNotifyPayload,
-    ContextCompactionStatus, ContextCompactionTimelineEvent, CustomAgent, CustomAgentId,
-    DiffContextMode, HistoryPageRequestId, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
-    HostPlatform, LaunchProfileCatalog, LaunchProfileId, McpServerConfig, McpServerId,
-    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
-    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
-    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, QueuedMessageEntry, RequestedCompactionAvailability, Review,
-    ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
-    SessionSettingsSchema, SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId,
-    Steering, SteeringId, StreamPath, Swarm, SwarmBoard, SwarmBoardPage, SwarmDraft, SwarmDraftId,
+    AgentActivityStats, AgentActivitySummaryState, AgentGroupId, AgentGroupMode, AgentId,
+    AgentListDensity, AgentOrderKey, AgentOrigin, AgentSortMode, AgentWorkflowMetadata,
+    AgentsSidebarPreferences, AgentsViewFilters, AgentsViewPreferences,
+    AgentsViewPreferencesSnapshot, BackendKind, BackendSetupInfo, ByteRange, ChatMessage,
+    ChatMessageId, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelLocation, CodeIntelOccurrence, CodeIntelOverviewPayload,
+    CodeIntelReferencesFileResult, CodeIntelStatusPayload, CompactionObservationId,
+    CompactionOperationId, ContextCompactionNotifyPayload, ContextCompactionStatus,
+    ContextCompactionTimelineEvent, CustomAgent, CustomAgentId, DiffContextMode,
+    HistoryPageRequestId, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
+    LaunchProfileCatalog, LaunchProfileId, McpServerConfig, McpServerId, MessageMetadataUpdateData,
+    MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
+    ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
+    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
+    QueuedMessageEntry, RequestedCompactionAvailability, Review, ReviewCommentId, ReviewId,
+    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsSchema,
+    SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId,
+    StreamPath, Swarm, SwarmBoard, SwarmBoardPage, SwarmDraft, SwarmDraftId,
     SwarmErrorNotifyPayload, SwarmId, SwarmPost, SwarmPostId, SwarmReadCursor, SwarmThreadId,
     SwarmThreadPage, TaskList, TaskTokenUsagePayload, Team, TeamDraft, TeamDraftId, TeamId,
     TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
@@ -3869,6 +3870,7 @@ pub struct ComposerHandle {
     /// Host the spawn choices above were made against. A profile id means
     /// nothing in another host's catalog, so switching hosts drops them.
     pub selection_host: ArcRwSignal<Option<String>>,
+    pub launch_group: ArcRwSignal<Option<AgentGroupId>>,
     /// Conversation identity `text` is currently checkpointed under. Tracked
     /// per tab so a pane whose chat is retargeted re-files its draft without
     /// disturbing the other pane's.
@@ -3887,6 +3889,7 @@ impl Default for ComposerHandle {
             session_settings: ArcRwSignal::new(SessionSettingsValues::default()),
             session_settings_dirty: ArcRwSignal::new(false),
             selection_host: ArcRwSignal::new(None),
+            launch_group: ArcRwSignal::new(None),
             #[cfg(target_arch = "wasm32")]
             draft_owner: ArcRwSignal::new(None),
         }
@@ -3907,6 +3910,7 @@ impl ComposerHandle {
         self.session_settings.set(SessionSettingsValues::default());
         self.session_settings_dirty.set(false);
         self.selection_host.set(None);
+        self.launch_group.set(None);
     }
 }
 

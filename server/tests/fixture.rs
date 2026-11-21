@@ -2500,7 +2500,7 @@ pub fn single_host_stream(client: &client::Connection) -> StreamPath {
     let mut host_streams = client
         .outgoing_seq
         .keys()
-        .filter(|stream| stream.0.starts_with("/host/"));
+        .filter(|stream| stream.is_host_root());
     let host_stream = host_streams
         .next()
         .cloned()

@@ -975,6 +975,27 @@ async fn send_host_line(
 }
 
 #[tauri::command]
+async fn launch_grouped_agent(
+    state: tauri::State<'_, ShellState>,
+    launch: protocol::types::GroupedAgentLaunch,
+) -> Result<(), protocol::types::GroupedAgentLaunchError> {
+    let host = state.host.clone();
+    let router = state.router.clone();
+    tokio::spawn(async move {
+        host.launch_grouped_agent(launch, |host, request| async move {
+            router.exchange_creation_frame(host, request).await
+        })
+        .await
+    })
+    .await
+    .map_err(|error| {
+        protocol::types::GroupedAgentLaunchError::Unconfirmed(format!(
+            "Could not confirm the grouped launch. Check the sidebar before trying again: {error}"
+        ))
+    })?
+}
+
+#[tauri::command]
 async fn send_host_frame(
     state: tauri::State<'_, ShellState>,
     host_id: String,
@@ -1330,6 +1351,7 @@ macro_rules! other_production_invoke_handler {
             retry_host,
             send_host_line,
             send_host_frame,
+            launch_grouped_agent,
             voice_media_start,
             voice_media_flush_output,
             voice_media_stop,
@@ -1365,6 +1387,7 @@ macro_rules! other_production_invoke_handler {
             retry_host,
             send_host_line,
             send_host_frame,
+            launch_grouped_agent,
             voice_media_supported,
             probe_configured_host_lifecycle,
             ensure_configured_host_ready,
