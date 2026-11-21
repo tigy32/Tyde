@@ -8444,16 +8444,40 @@ fn map_grok_capacity(response: &Value) -> Result<CapacityReport, CapacityUnavail
     let config = response
         .get("config")
         .ok_or(CapacityUnavailableReason::MalformedReport)?;
-    let percent = config
-        .get("creditUsagePercent")
-        .and_then(Value::as_f64)
-        .filter(|percent| (0.0..=100.0).contains(percent))
-        .ok_or(CapacityUnavailableReason::MalformedReport)?;
-    let used_percent = percent.round().clamp(0.0, 100.0) as u8;
     let period = config.get("currentPeriod");
     let period_type = period
         .and_then(|period| period.get("type"))
         .and_then(Value::as_str);
+    let observed_at_ms = unix_now_ms();
+    let period_stamp = |field| {
+        period?
+            .get(field)?
+            .as_str()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .and_then(|stamp| u64::try_from(stamp.timestamp_millis()).ok())
+    };
+    let percent = match config.get("creditUsagePercent") {
+        Some(value) => value
+            .as_f64()
+            .filter(|percent| (0.0..=100.0).contains(percent)),
+        // Grok omits the proto3 zero scalar on its unified credits snapshot.
+        // An absent scalar on a legacy, partial or expired config is not zero.
+        None if config.get("isUnifiedBillingUser").and_then(Value::as_bool) == Some(true)
+            && config.get("used").is_none()
+            && config.get("monthlyLimit").is_none()
+            && matches!(
+                period_type,
+                Some("USAGE_PERIOD_TYPE_WEEKLY" | "USAGE_PERIOD_TYPE_MONTHLY")
+            )
+            && period_stamp("start").is_some_and(|start| start <= observed_at_ms)
+            && period_stamp("end").is_some_and(|end| observed_at_ms < end) =>
+        {
+            Some(0.0)
+        }
+        None => None,
+    }
+    .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let used_percent = percent.round() as u8;
     let (bucket, label) = match period_type {
         Some("USAGE_PERIOD_TYPE_WEEKLY") => ("weekly", "weekly limit"),
         Some("USAGE_PERIOD_TYPE_MONTHLY") => ("monthly", "monthly limit"),
@@ -8476,7 +8500,7 @@ fn map_grok_capacity(response: &Value) -> Result<CapacityReport, CapacityUnavail
 
     Ok(CapacityReport {
         source: CapacitySource::GrokBilling,
-        observed_at_ms: Some(unix_now_ms()),
+        observed_at_ms: Some(observed_at_ms),
         plan,
         buckets: vec![CapacityBucket {
             id: CapacityBucketId::Grok {

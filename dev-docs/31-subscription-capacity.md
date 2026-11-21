@@ -131,6 +131,13 @@ connection-scoped account read, which is what makes an ephemeral connection
 sufficient. Grok's ephemeral connection is an admin session, and admin sessions
 are excluded from `session/list`, so the probe never appears as a conversation.
 
+On Grok CLI 1.0.41 we observed an active weekly `currentPeriod` and
+`isUnifiedBillingUser: true`, without `creditUsagePercent`, `used` or
+`monthlyLimit`. The same account’s credits protobuf confirmed that active
+period with an omitted zero-valued percentage. Tyde decodes the omitted
+scalar only for that unified, active weekly/monthly shape; it never uses
+the prepaid wallet to infer subscription usage.
+
 **Which backends can be polled is a declared capability**, not a hardcoded list.
 `BackendCapability::OutOfBandCapacity` (which requires `CapacityTelemetry`) is
 what the poller, the seeded initial state, and
