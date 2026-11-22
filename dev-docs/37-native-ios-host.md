@@ -241,9 +241,9 @@ A native archive does not publish the host-selected full client. No Git beta,
 account/IAM/team/tester/agreement change, deployment, host/device update or
 restart is authorized. Preserve credentials, tools, simulators and pairings.
 
-## Current private preview build 10 preparation
+## Historical private preview build 10 preparation
 
-Release tracks build 10; Debug remains build 1. The GET-only ASC catalog check
+At preparation, Release tracked build 10 and Debug tracked build 1. The ASC catalog check
 at `2026-11-10T00:19:00Z` found builds 2–9 VALID/COMPLETE, old build 1
 AWAITING_UPLOAD, and no build 10 record or reservation. Private Preview (A) has
 builds 2–9 and is not an all-builds group. This does not reserve 10; recheck
@@ -262,6 +262,21 @@ this team during the Apple account upgrade, so Apple may refuse signing or
 upload. A refusal for an account, team, agreement or membership reason stops
 the attempt with the verified IPA kept for retry; it does not justify another
 team, key, bundle ID or certificate.
+
+## Private preview build 11
+
+TestFlight build 10 was uploaded on Nov 9, before the Duo rail fix
+(`df47cf21`). The fix shipped in host/web beta.12, but the installed iOS
+shell must also advertise and render the native rail. Build 11 includes that
+shell change, placing Back and New Chat in the vertical rail on supported
+iOS 27.1+ layouts. Horizontal layouts keep the board header controls.
+
+Release tracks build 11; Debug remains build 1. The Nov 21 App Store Connect
+catalog showed build 10 as the newest build in Private Preview and no build
+11 upload. Recheck allocation before uploading. Follow the landed-source
+archive, export and verification steps above, then confirm Apple processed the
+build and it is available in the existing Private Preview group. The nightly
+host/web release does not publish this native build.
 
 ## Adaptive Agents hierarchy
 
