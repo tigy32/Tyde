@@ -134,7 +134,6 @@ pub(crate) fn AppSurface() -> impl IntoView {
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />
-            <components::ReconnectOverlay />
             {crate::native::is_native().then(|| view! { <components::NativeAuthRecoverySheet /> })}
             {move || {
                 // A Hosts/Back round trip must not dispose component-owned drafts.
@@ -1847,7 +1846,7 @@ mod wasm_tests {
         let rendered = state.clone();
         let handle = mount_to(container.clone(), move || {
             provide_context(rendered);
-            view! { <components::ReconnectOverlay /><components::ConnectionBanner /> }
+            view! { <components::ConnectionBanner /> }
         });
         let (tx, mut statuses) = mpsc::unbounded_channel();
         let observed = state.clone();
@@ -2074,19 +2073,10 @@ mod wasm_tests {
                 }
             }
             next_tick().await;
-            // The approved reconnect UI replaces the old spinner/label with a modal and quiet dot.
-            let overlay = container.query_selector("dialog.reconnect-dialog").unwrap().unwrap()
-                .dyn_into::<web_sys::HtmlDialogElement>().unwrap();
-            ensure!(overlay.open() && overlay.text_content().unwrap().contains("Reconnecting"),
-                "foreground recovery must open the neutral reconnect overlay");
             ensure!(container.query_selector("[role='alert']").unwrap().is_none(),
                 "routine suspension must not render a red technical error");
             ensure!(container.query_selector("[data-mobile-test='connection-banner-dot-reconnecting']").unwrap().is_some(),
                 "foreground recovery must retain the compact pending indicator");
-            overlay.query_selector("button").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
-            next_tick().await;
-            ensure!(!overlay.open() && state.active_host_connection_status() == ConnectionStatus::Connecting,
-                "Dismiss must leave the same actor reconnecting without a parallel UI lifecycle");
             wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
                 http.call3(
                     &wasm_bindgen::JsValue::NULL,
@@ -3277,17 +3267,13 @@ mod wasm_tests {
                     && wire["chat_connection_status"]["round_trip_ms"].is_null()
                     && projected()?.root_connected_status.is_none(),
                     "Connecting and Bootstrapping project explicit pending without stale RTT or root status")?;
-                check(projected()?.modal, "Reconnect overlay excludes native dock interactions")?;
-                find("[data-mobile-test='reconnect-dismiss']")?.dyn_into::<HtmlElement>().unwrap().click();
-                next_tick().await;
-                let dismissed_wire = serde_json::to_value(projected()?).map_err(|error| error.to_string())?;
-                check(!projected()?.modal && dismissed_wire["chat_connection_status"]["phase"] == "pending"
+                check(!projected()?.modal
                     && find("[data-mobile-test='chat-input']")?.is_same_node(Some(&composer))
                     && composer.value() == "Retained draft"
                     && composer.selection_start().unwrap() == Some(2) && composer.selection_end().unwrap() == Some(7)
                     && find(".chat-header")?.get_bounding_client_rect().height() == header_bounds.height()
                     && find("[data-mobile-test='chat-view']")?.get_bounding_client_rect().top() == chat_bounds.top(),
-                    "Dismiss leaves dock pending, the same readable chat geometry, draft and selection")?;
+                    "Pending connection leaves the native dock interactive and preserves chat geometry, draft and selection")?;
                 state.connection_statuses.update(|statuses| { statuses.insert(host_id.clone(), ConnectionStatus::Connected); });
                 next_tick().await;
             }
@@ -4315,33 +4301,6 @@ mod wasm_tests {
             None,
         );
         next_tick().await;
-        let overlay = container
-            .query_selector("[data-mobile-test='reconnect-dialog']")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<web_sys::HtmlDialogElement>()
-            .unwrap();
-        assert!(
-            overlay.open(),
-            "Reconnect dialog closed: native={}, workspace={}, pending={}, bundle_notice={}, command_error={}, shell_error={}",
-            crate::native::is_native(),
-            state.app_mode.get_untracked() == AppMode::Workspace,
-            matches!(
-                state.active_host_connection_status(),
-                ConnectionStatus::Connecting | ConnectionStatus::Bootstrapping
-            ),
-            state.bundle_status.get_untracked().message().is_some(),
-            state.active_host_command_error().is_some(),
-            state.mobile_shell_error.get_untracked().is_some(),
-        );
-        overlay
-            .query_selector("button")
-            .unwrap()
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
-        next_tick().await;
         let banner = container
             .query_selector("[data-mobile-test='connection-banner']")
             .unwrap()
@@ -4372,17 +4331,6 @@ mod wasm_tests {
         assert_eq!(
             state.active_host_connection_status(),
             ConnectionStatus::Connecting
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='reconnect-dialog']")
-                .unwrap()
-                .unwrap()
-                .is_same_node(Some(overlay.as_ref()))
-        );
-        assert!(
-            !overlay.open(),
-            "PWA Pair/Cancel must retain dismissal while the connection stays pending"
         );
         assert!(
             !container
@@ -4703,17 +4651,6 @@ mod wasm_tests {
                         options.set_detail(&serde_wasm_bindgen::to_value(&intent).unwrap());
                         web_sys::window().unwrap().dispatch_event(&web_sys::CustomEvent::new_with_event_init_dict("tyde-native-intent", &options).unwrap()).unwrap();
                     };
-                    // Pair completion is still Connecting here; its modal must be dismissed before native navigation.
-                    let overlay = container.query_selector("dialog.reconnect-dialog").unwrap()
-                        .ok_or("Connecting must expose its dismissible overlay")?
-                        .dyn_into::<web_sys::HtmlDialogElement>().unwrap();
-                    if !overlay.open() { return Err("Connecting must open the reconnect dialog".into()); }
-                    let pending = state.active_host_connection_status();
-                    overlay.query_selector("button").unwrap().unwrap().dyn_into::<HtmlElement>().unwrap().click();
-                    next_tick().await;
-                    if overlay.open() || state.active_host_connection_status() != pending {
-                        return Err("Dismissing the overlay must leave connection state unchanged".into());
-                    }
                     intent(NativeIntent::Hosts);
                     next_tick().await;
                     if container.query_selector(".picker-pair-another").unwrap().is_none()
