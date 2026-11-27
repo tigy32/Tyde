@@ -137,9 +137,13 @@ private final class NativeBackAnimator: NSObject, UIViewControllerAnimatedTransi
 @MainActor
 final class ContentController: UIViewController {
     var onVisible: ((ContentController) -> Void)?
+    var onLayout: ((ContentController) -> Void)?
     weak var connectedStatusView: UIView?
     override func viewDidLoad() { super.viewDidLoad(); view.backgroundColor = .clear }
     override func viewWillAppear(_ animated: Bool) { super.viewWillAppear(animated); onVisible?(self) }
+    // The tab bar's safe-area inset lands after the host's layout pass, so the
+    // host's viewport must follow this view's own layout.
+    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); onLayout?(self) }
 }
 
 @MainActor
@@ -294,6 +298,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             let root = ContentController()
             root.title = title
             root.onVisible = { [weak self] controller in self?.contentWillAppear(controller) }
+            root.onLayout = { [weak self] _ in self?.updateWorkspaceViewport() }
             let navigation = UINavigationController(rootViewController: root)
             navigation.delegate = self
             navigation.interactivePopGestureRecognizer?.isEnabled = false
@@ -704,6 +709,7 @@ final class TydeHostController: UIViewController, UITabBarControllerDelegate, UI
             else {
                 content = ContentController()
                 content.onVisible = { [weak self] controller in self?.contentWillAppear(controller) }
+                content.onLayout = { [weak self] _ in self?.updateWorkspaceViewport() }
                 detailControllers[state.tab] = content
             }
             if navigation.topViewController !== content { navigation.setViewControllers([root, content], animated: false) }
